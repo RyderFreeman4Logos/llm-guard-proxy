@@ -42,6 +42,55 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
+## GB10 Compatibility Smoke
+
+Run the live GB10 compatibility smoke from this repository with:
+
+```bash
+just smoke-gb10
+```
+
+Prerequisites:
+
+- `gb10:18009` is reachable from the local machine.
+- `curl`, `python3`, and Cargo are available.
+- The command runs the proxy locally against `http://gb10:18009/v1`; it does not deploy to GB10.
+
+The harness creates a private temporary run directory, generates a local
+`config.toml`, starts `llm-guard-proxy` on an available localhost port, and
+enables SQLite observability. The observability database lives at
+`$run_dir/observability.sqlite3`, where `$run_dir` is printed by the command.
+The run directory is removed on success or failure unless
+`LLM_GUARD_PROXY_SMOKE_KEEP=1` is set.
+
+Checks performed:
+
+- `GET /v1/models` through the proxy must return `200`, parse as JSON, and
+  preserve or enrich model context metadata when upstream exposes it.
+- `POST /v1/chat/completions` must succeed as a real OpenAI-compatible
+  non-streaming chat request. The smoke payload sets
+  `chat_template_kwargs.enable_thinking=false` for low-token AEON/vLLM runs.
+- `POST /v1/chat/completions` with `stream=true` must return
+  `text/event-stream` data.
+- `POST /v1/completions`, `POST /v1/embeddings`, and `POST /v1/rerank` are
+  probed and reported with the exact upstream status. Current GB10 observations
+  classify `/v1/embeddings` and `/v1/rerank` as upstream-unsupported when they
+  return `404`.
+- `GET /v1/../admin` is sent with `curl --path-as-is` and must be rejected by
+  the proxy with `400` before any upstream attempt.
+- SQLite observability must contain one request row per smoke call, one attempt
+  row per forwarded call, and no attempt row for the rejected dot-segment path.
+
+Useful overrides:
+
+```bash
+LLM_GUARD_PROXY_SMOKE_PORT=19009 just smoke-gb10
+LLM_GUARD_PROXY_SMOKE_MODEL=aeon-ultimate just smoke-gb10
+LLM_GUARD_PROXY_SMOKE_UPSTREAM_BASE_URL=http://gb10:18009/v1 just smoke-gb10
+LLM_GUARD_PROXY_BIN=target/debug/llm-guard-proxy just smoke-gb10
+LLM_GUARD_PROXY_SMOKE_KEEP=1 just smoke-gb10
+```
+
 Later issues will add guarded proxy behavior behind these typed configuration fields.
 
 ## Configuration

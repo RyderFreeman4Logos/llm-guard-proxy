@@ -37,6 +37,9 @@ clippy:
 test:
     cargo test --workspace --all-features
 
+smoke-gb10:
+    scripts/smoke-gb10.sh
+
 pre-commit-fast:
     just check-branch
     just check-generated-artifacts
