@@ -528,14 +528,14 @@ fn enforce_retention(
         max_bytes
     };
 
-    while usage.observed_bytes > target_bytes || usage.request_count > retention.max_records {
+    while usage.observed_bytes > target_bytes || usage.record_count > retention.max_records {
         let deleted = prune_retained_rows(connection, retention.max_records, target_bytes)?;
         if !deleted {
             break;
         }
         vacuum_database(connection)?;
         usage = read_retention_usage(connection)?;
-        if usage.request_count == 0 {
+        if usage.record_count == 0 {
             break;
         }
     }
@@ -555,12 +555,12 @@ fn prune_retained_rows(
             source,
         })?;
     let mut deleted = false;
-    let mut request_count = read_request_count(&transaction)?;
+    let mut usage = read_retention_usage(&transaction)?;
     let mut logical_bytes = read_logical_observed_bytes(&transaction)?;
 
-    while request_count > max_records
+    while usage.record_count > max_records
         || logical_bytes > target_bytes
-        || (!deleted && request_count > 0)
+        || (!deleted && usage.request_count > 0)
     {
         let Some(request_id) = oldest_request_id(&transaction)? else {
             break;
@@ -575,7 +575,7 @@ fn prune_retained_rows(
                 source,
             })?;
         deleted = true;
-        request_count = read_request_count(&transaction)?;
+        usage = read_retention_usage(&transaction)?;
         logical_bytes = read_logical_observed_bytes(&transaction)?;
     }
 
@@ -634,10 +634,14 @@ LIMIT 1
 
 fn read_retention_usage(connection: &Connection) -> Result<RetentionUsage, ObservabilityError> {
     let request_count = read_request_count(connection)?;
+    let attempt_count = read_attempt_count(connection)?;
+    let record_count = request_count.saturating_add(attempt_count);
     let observed_bytes = read_sqlite_storage_bytes(connection)?;
 
     Ok(RetentionUsage {
         request_count,
+        attempt_count,
+        record_count,
         observed_bytes,
     })
 }
@@ -650,6 +654,16 @@ fn read_request_count(connection: &Connection) -> Result<u64, ObservabilityError
             source,
         })?;
     Ok(nonnegative_i64_to_u64(request_count))
+}
+
+fn read_attempt_count(connection: &Connection) -> Result<u64, ObservabilityError> {
+    let attempt_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "read observability attempt count",
+            source,
+        })?;
+    Ok(nonnegative_i64_to_u64(attempt_count))
 }
 
 fn read_sqlite_storage_bytes(connection: &Connection) -> Result<u64, ObservabilityError> {
@@ -790,8 +804,10 @@ fn prepare_parent_directory(path: &Path) -> Result<(), ObservabilityError> {
         return Ok(());
     };
     if let Some(metadata) = inspect_path(parent)? {
+        validate_existing_parent_ancestors(parent)?;
         validate_existing_storage_directory(parent, &metadata)
     } else {
+        validate_existing_ancestor_chain(parent)?;
         create_private_directory_all(parent)?;
         validate_storage_directory(parent)
     }
@@ -842,6 +858,39 @@ fn validate_existing_storage_directory(
     validate_existing_storage_directory_permissions(path, metadata)
 }
 
+fn validate_existing_ancestor_chain(path: &Path) -> Result<(), ObservabilityError> {
+    for ancestor in path
+        .ancestors()
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+    {
+        if let Some(metadata) = inspect_path(ancestor)? {
+            validate_existing_ancestor_directory(ancestor, &metadata)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_existing_parent_ancestors(path: &Path) -> Result<(), ObservabilityError> {
+    for ancestor in path
+        .ancestors()
+        .skip(1)
+        .filter(|ancestor| !ancestor.as_os_str().is_empty())
+    {
+        if let Some(metadata) = inspect_path(ancestor)? {
+            validate_existing_ancestor_directory(ancestor, &metadata)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_existing_ancestor_directory(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ObservabilityError> {
+    validate_directory_shape(path, metadata)?;
+    validate_existing_ancestor_directory_permissions(path, metadata)
+}
+
 fn validate_directory_shape(
     path: &Path,
     metadata: &fs::Metadata,
@@ -885,9 +934,34 @@ fn validate_existing_storage_directory_permissions(
     Ok(())
 }
 
+#[cfg(unix)]
+fn validate_existing_ancestor_directory_permissions(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ObservabilityError> {
+    let mode = metadata.permissions().mode();
+    let shared_writable = mode & 0o022 != 0;
+    let sticky = mode & 0o1000 != 0;
+    if shared_writable && !sticky {
+        return Err(unsafe_storage_path(
+            path,
+            "existing observability ancestor must not be group/other-writable unless sticky",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_existing_ancestor_directory_permissions(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(), ObservabilityError> {
+    Ok(())
+}
+
 fn create_private_directory_all(path: &Path) -> Result<(), ObservabilityError> {
     if let Some(metadata) = inspect_path(path)? {
-        return validate_directory_shape(path, &metadata);
+        return validate_existing_ancestor_directory(path, &metadata);
     }
     if let Some(parent) = path
         .parent()

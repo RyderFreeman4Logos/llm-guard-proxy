@@ -18,6 +18,7 @@ use crate::ConfigManager;
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;
+const TEST_MAX_RECORDS: u64 = 100;
 
 #[test]
 fn creates_sqlite_schema_in_test_temp_directory() {
@@ -113,6 +114,81 @@ fn rejects_existing_shared_parent_without_chmodding_it() {
     assert_eq!(file_mode(&shared_parent), original_mode);
     assert!(!sqlite_path.exists());
 
+    remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_missing_parent_under_shared_ancestor_without_creating_it() {
+    let root = unique_test_dir("shared-ancestor");
+    let private_root = root.join("private");
+    let shared_ancestor = private_root.join("shared");
+    fs::create_dir_all(&shared_ancestor).expect("shared ancestor should be created");
+    fs::set_permissions(&private_root, fs::Permissions::from_mode(0o700))
+        .expect("private root should be owner-only");
+    fs::set_permissions(&shared_ancestor, fs::Permissions::from_mode(0o777))
+        .expect("shared ancestor permissions should be broadened");
+    let original_mode = file_mode(&shared_ancestor);
+
+    let missing_parent = shared_ancestor.join("storage");
+    let sqlite_path = missing_parent.join("observability.sqlite3");
+    let config_path = root.join("config.toml");
+    write_config_file(
+        &config_path,
+        &sqlite_path,
+        true,
+        false,
+        TEST_MAX_BYTES,
+        TEST_PRUNE_TO_BYTES,
+    );
+    let manager = ConfigManager::from_explicit_path(&config_path).expect("config should load");
+
+    let error = ObservabilityStore::open(manager.handle())
+        .expect_err("shared ancestor should be rejected before directory creation");
+
+    match error {
+        ObservabilityError::UnsafeStoragePath { path, reason } => {
+            assert_eq!(path, shared_ancestor);
+            assert!(reason.contains("group/other-writable"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(file_mode(&shared_ancestor), original_mode);
+    assert!(!missing_parent.exists());
+    assert!(!sqlite_path.exists());
+
+    remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn creates_sqlite_store_when_parent_is_missing_under_private_ancestor() {
+    let root = unique_test_dir("private-ancestor");
+    fs::create_dir_all(&root).expect("private ancestor should be created");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .expect("private ancestor should be owner-only");
+
+    let sqlite_path = root.join("state").join("observability.sqlite3");
+    let config_path = root.join("config.toml");
+    write_config_file(
+        &config_path,
+        &sqlite_path,
+        true,
+        false,
+        TEST_MAX_BYTES,
+        TEST_PRUNE_TO_BYTES,
+    );
+    let manager = ConfigManager::from_explicit_path(&config_path).expect("config should load");
+
+    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+
+    assert_eq!(
+        file_mode(sqlite_path.parent().expect("sqlite parent")),
+        0o700
+    );
+    assert_eq!(file_mode(&sqlite_path), 0o600);
+
+    drop(store);
     remove_dir_all(&root);
 }
 
@@ -471,6 +547,72 @@ fn retention_deletes_oldest_requests_until_actual_storage_under_prune_target() {
 }
 
 #[test]
+fn retention_max_records_counts_requests_and_attempts() {
+    let fixture = StoreFixture::new("retention-record-count");
+    let manager = fixture.manager_with_max_records(
+        true,
+        false,
+        TEST_MAX_BYTES,
+        TEST_PRUNE_TO_BYTES,
+        TEST_MAX_RECORDS,
+    );
+    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+
+    let first = request_record("req-record-count-old", RequestStatus::Succeeded, 1_000);
+    store
+        .record_request(&first)
+        .expect("request should be written");
+    for index in 0..7 {
+        let attempt = attempt_record(
+            &format!("attempt-record-count-{index}"),
+            &first.request_id,
+            AttemptStatus::Succeeded,
+            index + 1,
+            1_010 + u64::from(index),
+        );
+        store
+            .record_attempt(&attempt)
+            .expect("attempt should be written");
+    }
+
+    let before = store.retention_usage().expect("retention usage before");
+    assert_eq!(before.request_count, 1);
+    assert_eq!(before.attempt_count, 7);
+    assert_eq!(before.record_count, 8);
+
+    fixture.write_config_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 5);
+    let outcome = manager.reload().expect("config reload should succeed");
+    assert!(outcome.applied);
+
+    let second = request_record("req-record-count-new", RequestStatus::Succeeded, 2_000);
+    store
+        .record_request(&second)
+        .expect("retention trigger should be written");
+
+    let after = store.retention_usage().expect("retention usage after");
+    assert_eq!(after.request_count, 1);
+    assert_eq!(after.attempt_count, 0);
+    assert_eq!(after.record_count, 1);
+    assert!(after.record_count <= 5);
+
+    let connection = store.lock_connection().expect("connection lock");
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM requests WHERE request_id = 'req-record-count-old'",
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM requests WHERE request_id = 'req-record-count-new'",
+        ),
+        1
+    );
+}
+
+#[test]
 fn hot_reload_disabled_setting_stops_new_writes() {
     let fixture = StoreFixture::new("hot-reload-disable");
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
@@ -545,7 +687,30 @@ impl StoreFixture {
         max_bytes: u64,
         prune_to_bytes: u64,
     ) -> ConfigManager {
-        self.write_config(enabled, capture_raw_payloads, max_bytes, prune_to_bytes);
+        self.manager_with_max_records(
+            enabled,
+            capture_raw_payloads,
+            max_bytes,
+            prune_to_bytes,
+            TEST_MAX_RECORDS,
+        )
+    }
+
+    fn manager_with_max_records(
+        &self,
+        enabled: bool,
+        capture_raw_payloads: bool,
+        max_bytes: u64,
+        prune_to_bytes: u64,
+        max_records: u64,
+    ) -> ConfigManager {
+        self.write_config_with_max_records(
+            enabled,
+            capture_raw_payloads,
+            max_bytes,
+            prune_to_bytes,
+            max_records,
+        );
         ConfigManager::from_explicit_path(&self.config_path).expect("config should load")
     }
 
@@ -556,13 +721,31 @@ impl StoreFixture {
         max_bytes: u64,
         prune_to_bytes: u64,
     ) {
-        write_config_file(
+        self.write_config_with_max_records(
+            enabled,
+            capture_raw_payloads,
+            max_bytes,
+            prune_to_bytes,
+            TEST_MAX_RECORDS,
+        );
+    }
+
+    fn write_config_with_max_records(
+        &self,
+        enabled: bool,
+        capture_raw_payloads: bool,
+        max_bytes: u64,
+        prune_to_bytes: u64,
+        max_records: u64,
+    ) {
+        write_config_file_with_max_records(
             &self.config_path,
             &self.sqlite_path,
             enabled,
             capture_raw_payloads,
             max_bytes,
             prune_to_bytes,
+            max_records,
         );
     }
 }
@@ -637,6 +820,26 @@ fn write_config_file(
     max_bytes: u64,
     prune_to_bytes: u64,
 ) {
+    write_config_file_with_max_records(
+        config_path,
+        sqlite_path,
+        enabled,
+        capture_raw_payloads,
+        max_bytes,
+        prune_to_bytes,
+        TEST_MAX_RECORDS,
+    );
+}
+
+fn write_config_file_with_max_records(
+    config_path: &Path,
+    sqlite_path: &Path,
+    enabled: bool,
+    capture_raw_payloads: bool,
+    max_bytes: u64,
+    prune_to_bytes: u64,
+    max_records: u64,
+) {
     let sqlite_path = sqlite_path.display();
     fs::write(
         config_path,
@@ -650,7 +853,7 @@ capture_raw_payloads = {capture_raw_payloads}
 [observability.retention]
 max_bytes = {max_bytes}
 prune_to_bytes = {prune_to_bytes}
-max_records = 100
+max_records = {max_records}
 "#
         ),
     )

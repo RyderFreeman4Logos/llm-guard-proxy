@@ -190,6 +190,10 @@ pub enum StoreWrite {
 pub struct RetentionUsage {
     /// Number of request rows currently retained.
     pub request_count: u64,
+    /// Number of attempt rows currently retained.
+    pub attempt_count: u64,
+    /// Total indexed observability records currently retained.
+    pub record_count: u64,
     /// Actual `SQLite` page storage bytes.
     ///
     /// This includes `SQLite` schema, page, index, and freelist overhead. It can
