@@ -278,7 +278,11 @@ fn poll_reloads(manager: &ConfigManager, stop_rx: &mpsc::Receiver<()>, interval:
     loop {
         match stop_rx.recv_timeout(interval) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => if manager.reload().is_err() {},
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = manager.reload() {
+                    manager.set_last_error(Some(error.to_string()));
+                }
+            }
         }
     }
 }

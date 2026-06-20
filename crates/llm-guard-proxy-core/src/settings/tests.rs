@@ -1,7 +1,8 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use super::{
@@ -157,6 +158,59 @@ interval_secs = 3
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 3);
 
+    remove_file(&path);
+}
+
+#[test]
+fn polling_watcher_applies_reloadable_file_changes() {
+    let path = unique_test_path("polling-reload.toml");
+    write_config(
+        &path,
+        r#"
+[server]
+port = 18009
+
+[heartbeat]
+mode = "sse"
+interval_secs = 15
+"#,
+    );
+    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
+    let handle = manager.handle();
+    let watcher = manager
+        .spawn_polling(Duration::from_millis(10))
+        .expect("polling watcher should start");
+
+    write_config(
+        &path,
+        r#"
+[server]
+port = 19000
+
+[heartbeat]
+mode = "disabled"
+interval_secs = 4
+"#,
+    );
+
+    let mut observed = None;
+    for _attempt in 0..50 {
+        let snapshot = handle.snapshot().expect("snapshot should succeed");
+        if snapshot.heartbeat.mode == HeartbeatMode::Disabled
+            && snapshot.heartbeat.interval_secs == 4
+        {
+            observed = Some(snapshot);
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let snapshot = observed.expect("polling watcher should apply reload");
+    assert_eq!(snapshot.server.port, 18_009);
+    assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
+    assert_eq!(snapshot.heartbeat.interval_secs, 4);
+
+    watcher.stop().expect("watcher should stop cleanly");
     remove_file(&path);
 }
 
