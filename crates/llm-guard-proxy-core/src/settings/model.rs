@@ -1,6 +1,10 @@
 use std::path::PathBuf;
 
 use super::ValidationError;
+use url::Url;
+
+const REDACTED_URL_PART: &str = "redacted";
+const INVALID_URL_DISPLAY: &str = "[invalid URL]";
 
 /// Complete application configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -70,6 +74,12 @@ impl AppConfig {
         );
         push_change(
             &mut changes,
+            "server.max_in_flight_requests",
+            self.server.max_in_flight_requests.to_string(),
+            requested.server.max_in_flight_requests.to_string(),
+        );
+        push_change(
+            &mut changes,
             "upstream.base_url",
             self.upstream.base_url.clone(),
             requested.upstream.base_url.clone(),
@@ -91,6 +101,8 @@ pub struct ServerConfig {
     pub bind_host: String,
     /// TCP port for the proxy listener.
     pub port: u16,
+    /// Maximum proxied requests admitted into body buffering and upstream forwarding.
+    pub max_in_flight_requests: usize,
 }
 
 impl ServerConfig {
@@ -100,7 +112,12 @@ impl ServerConfig {
             "server.bind_host",
             "must not be empty",
         )?;
-        require(self.port > 0, "server.port", "must be between 1 and 65535")
+        require(self.port > 0, "server.port", "must be between 1 and 65535")?;
+        require(
+            self.max_in_flight_requests > 0,
+            "server.max_in_flight_requests",
+            "must be greater than zero",
+        )
     }
 }
 
@@ -109,6 +126,7 @@ impl Default for ServerConfig {
         Self {
             bind_host: String::from("127.0.0.1"),
             port: 18_009,
+            max_in_flight_requests: 16,
         }
     }
 }
@@ -124,14 +142,17 @@ pub struct UpstreamConfig {
 
 impl UpstreamConfig {
     fn validate(&self) -> Result<(), ValidationError> {
-        let has_supported_scheme =
-            self.base_url.starts_with("http://") || self.base_url.starts_with("https://");
-        require(
-            has_supported_scheme,
-            "upstream.base_url",
-            "must start with http:// or https://",
-        )?;
+        validate_upstream_base_url(&self.base_url)?;
         self.metadata.validate()
+    }
+
+    /// Returns a display-safe upstream base URL.
+    ///
+    /// Credentials and query strings are replaced and fragments are removed
+    /// before the string is suitable for logs or client-visible diagnostics.
+    #[must_use]
+    pub fn redacted_base_url(&self) -> String {
+        redact_upstream_base_url(&self.base_url)
     }
 }
 
@@ -142,6 +163,67 @@ impl Default for UpstreamConfig {
             metadata: MetadataConfig::default(),
         }
     }
+}
+
+/// Validates the configured upstream base URL.
+///
+/// # Errors
+///
+/// Returns a [`ValidationError`] when the URL is not absolute HTTP(S), includes
+/// userinfo, contains query parameters, or includes a fragment.
+pub fn validate_upstream_base_url(base_url: &str) -> Result<(), ValidationError> {
+    let url = Url::parse(base_url).map_err(|_error| {
+        ValidationError::new(
+            "upstream.base_url",
+            "must be a valid http:// or https:// URL",
+        )
+    })?;
+    require(
+        matches!(url.scheme(), "http" | "https"),
+        "upstream.base_url",
+        "must start with http:// or https://",
+    )?;
+    require(
+        url.username().is_empty() && url.password().is_none(),
+        "upstream.base_url",
+        "must not contain username, password, or userinfo",
+    )?;
+    if url.query().is_some() {
+        return Err(ValidationError::new(
+            "upstream.base_url",
+            "must not contain query parameters",
+        ));
+    }
+    require(
+        url.fragment().is_none(),
+        "upstream.base_url",
+        "must not contain URL fragments",
+    )?;
+    Ok(())
+}
+
+/// Returns a display-safe URL string for logs and diagnostics.
+///
+/// Invalid URLs are rendered as a fixed marker because preserving fragments of
+/// malformed input risks echoing secrets embedded in an unparsable string.
+#[must_use]
+pub fn redact_upstream_base_url(base_url: &str) -> String {
+    let Ok(mut url) = Url::parse(base_url) else {
+        return INVALID_URL_DISPLAY.to_owned();
+    };
+
+    if !url.username().is_empty() {
+        let _ignored = url.set_username(REDACTED_URL_PART);
+    }
+    if url.password().is_some() {
+        let _ignored = url.set_password(Some(REDACTED_URL_PART));
+    }
+    if url.query().is_some() {
+        url.set_query(Some(REDACTED_URL_PART));
+    }
+    url.set_fragment(None);
+
+    url.to_string()
 }
 
 /// Upstream model metadata discovery policy.

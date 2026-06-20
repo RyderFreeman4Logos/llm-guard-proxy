@@ -155,6 +155,10 @@ fn assign_server(
     match key {
         "bind_host" => config.bind_host = parse_string(value, line_number)?,
         "port" => config.port = parse_u16(value, line_number, "server.port")?,
+        "max_in_flight_requests" => {
+            config.max_in_flight_requests =
+                parse_usize(value, line_number, "server.max_in_flight_requests")?;
+        }
         _ => return unknown_key("server", key, line_number),
     }
     Ok(())
@@ -426,6 +430,16 @@ fn parse_u32(value: &str, line_number: usize, field: &str) -> Result<u32, Config
         ConfigParseError::new(
             line_number,
             format!("{field} must fit in an unsigned 32-bit integer"),
+        )
+    })
+}
+
+fn parse_usize(value: &str, line_number: usize, field: &str) -> Result<usize, ConfigParseError> {
+    let number = parse_u64(value, line_number, field)?;
+    usize::try_from(number).map_err(|_error| {
+        ConfigParseError::new(
+            line_number,
+            format!("{field} must fit in an unsigned pointer-sized integer"),
         )
     })
 }

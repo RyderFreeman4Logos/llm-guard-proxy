@@ -1,19 +1,18 @@
 #![forbid(unsafe_code)]
 
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-    process::ExitCode,
+mod proxy;
+
+use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
+
+use llm_guard_proxy_core::{
+    ConfigManager, ObservabilityStore, RequestId, redact_upstream_base_url,
 };
+use tokio::net::TcpListener;
 
-use llm_guard_proxy_core::{AppConfig, ConfigManager, Health, LICENSE, RequestId, SERVICE_NAME};
-
-fn main() -> ExitCode {
-    match run(std::env::args_os()) {
-        Ok(line) => {
-            println!("{line}");
-            ExitCode::SUCCESS
-        }
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run(std::env::args_os()).await {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
             ExitCode::FAILURE
@@ -21,7 +20,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
+async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let config_path = parse_config_path(args)?;
     let manager = match config_path {
         Some(path) => ConfigManager::from_explicit_path(path),
@@ -32,8 +31,44 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
         .handle()
         .snapshot()
         .map_err(|error| error.to_string())?;
+    let store = ObservabilityStore::open(manager.handle()).map_err(|error| error.to_string())?;
+    let _watcher = manager
+        .spawn_polling(Duration::from_secs(1))
+        .map_err(|error| error.to_string())?;
+    let bind_address = format!("{}:{}", config.server.bind_host, config.server.port);
+    let listener = TcpListener::bind(&bind_address)
+        .await
+        .map_err(|error| format!("failed to bind {bind_address}: {error}"))?;
+    let local_addr = listener
+        .local_addr()
+        .map_err(|error| format!("failed to read listener address: {error}"))?;
     let request_id = RequestId::generate();
-    Ok(render_health(&config, manager.path(), &request_id))
+    eprintln!(
+        "{}",
+        proxy::render_health(&config, manager.path(), &request_id)
+    );
+    eprintln!(
+        "{}",
+        render_listening(local_addr, &config.upstream.base_url)
+    );
+
+    let state = proxy::ProxyState::new(
+        manager.handle(),
+        manager.path().to_path_buf(),
+        store,
+        proxy::build_http_client().map_err(|error| error.to_string())?,
+        config.server.max_in_flight_requests,
+    );
+    axum::serve(listener, proxy::router(state))
+        .await
+        .map_err(|error| format!("server failed: {error}"))
+}
+
+fn render_listening(local_addr: impl std::fmt::Display, upstream_base_url: &str) -> String {
+    format!(
+        "llm-guard-proxy listening={local_addr} upstream_base_url={}",
+        redact_upstream_base_url(upstream_base_url)
+    )
 }
 
 fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> Result<Option<PathBuf>, String> {
@@ -63,29 +98,13 @@ fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> Result<Option<
     Ok(config_path)
 }
 
-#[must_use]
-fn render_health(config: &AppConfig, path: &Path, request_id: &RequestId) -> String {
-    let health = Health::current();
-    let name = SERVICE_NAME;
-    let license = LICENSE;
-    let readiness = health.readiness().as_str();
-    let config_path = path.display();
-    let heartbeat_mode = config.heartbeat.mode.as_str();
-    let heartbeat_interval_secs = config.heartbeat.interval_secs;
-    let observability_enabled = config.observability.enabled;
-
-    format!(
-        "{name} request_id={request_id} readiness={readiness} license={license} config_path={config_path} heartbeat_mode={heartbeat_mode} heartbeat_interval_secs={heartbeat_interval_secs} observability_enabled={observability_enabled}"
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use std::{ffi::OsString, path::Path};
 
     use llm_guard_proxy_core::{AppConfig, HeartbeatMode, RequestId};
 
-    use super::{parse_config_path, render_health};
+    use super::{parse_config_path, proxy::render_health, render_listening};
 
     #[test]
     fn renders_health_with_config_summary() {
@@ -114,5 +133,24 @@ mod tests {
             parse_config_path(args).expect("args should parse"),
             Some("dev.toml".into()),
         );
+    }
+
+    #[test]
+    fn renders_listening_with_redacted_upstream_base_url() {
+        let rendered = render_listening(
+            "127.0.0.1:18009",
+            "https://user:secret@example.test/v1?x-api-key=sk-test&safe=ok#token=sk-test",
+        );
+
+        assert!(
+            rendered
+                .contains("upstream_base_url=https://redacted:redacted@example.test/v1?redacted")
+        );
+        assert!(!rendered.contains("user"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("sk-test"));
+        assert!(!rendered.contains("x-api-key"));
+        assert!(!rendered.contains("safe=ok"));
+        assert!(!rendered.contains("token=sk-test"));
     }
 }

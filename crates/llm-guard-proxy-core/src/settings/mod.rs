@@ -15,7 +15,8 @@ pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
     AppConfig, CloudflareConfig, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, MetadataConfig,
     ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig, ServerConfig,
-    ShieldingConfig, ThinkingConfig, UpstreamConfig,
+    ShieldingConfig, ThinkingConfig, UpstreamConfig, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 pub use reload::{
     ConfigHandle, ConfigManager, MissingConfigPolicy, ReloadOutcome, ReloadWatcher,
@@ -55,6 +56,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
 pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "server.bind_host",
     "server.port",
+    "server.max_in_flight_requests",
     "upstream.base_url",
     "observability.sqlite_path",
 ];

@@ -8,6 +8,7 @@ use std::{
 use super::{
     AppConfig, ConfigManager, ConfigParseError, HeartbeatMode, MissingConfigPolicy,
     RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ValidationError, parse::parse_config_text,
+    redact_upstream_base_url,
 };
 
 #[test]
@@ -17,6 +18,7 @@ fn defaults_match_issue_contract() {
     config.validate().expect("default config should validate");
     assert_eq!(config.server.bind_host, "127.0.0.1");
     assert_eq!(config.server.port, 18_009);
+    assert_eq!(config.server.max_in_flight_requests, 16);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
     assert!(config.upstream.metadata.discovery_enabled);
     assert!(config.upstream.metadata.enrich_responses);
@@ -37,6 +39,7 @@ fn parses_toml_with_defaults_and_overrides() {
         r#"
 [server]
 port = 18100
+max_in_flight_requests = 2
 
 [upstream.metadata]
 context_length_override = 256000
@@ -54,6 +57,7 @@ enabled = false
 
     assert_eq!(config.server.bind_host, "127.0.0.1");
     assert_eq!(config.server.port, 18_100);
+    assert_eq!(config.server.max_in_flight_requests, 2);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
     assert_eq!(
         config.upstream.metadata.context_length_override,
@@ -92,6 +96,150 @@ fn validates_retention_hysteresis() {
         .validate()
         .expect_err("retention relation should fail");
     assert_eq!(error.field(), "observability.retention.prune_to_bytes");
+}
+
+#[test]
+fn validates_server_in_flight_limit() {
+    let mut config = AppConfig::default();
+    config.server.max_in_flight_requests = 0;
+
+    let error = config
+        .validate()
+        .expect_err("zero in-flight request limit should fail");
+
+    assert_eq!(error.field(), "server.max_in_flight_requests");
+}
+
+#[test]
+fn validates_normal_upstream_base_urls() {
+    for base_url in ["http://gb10:18009/v1", "https://host.example/v1"] {
+        let mut config = AppConfig::default();
+        config.upstream.base_url = base_url.to_owned();
+
+        config
+            .validate()
+            .expect("normal upstream URL should validate");
+    }
+}
+
+#[test]
+fn rejects_upstream_base_url_with_userinfo() {
+    let mut config = AppConfig::default();
+    config.upstream.base_url = String::from("https://user:secret@example.test/v1");
+
+    let error = config
+        .validate()
+        .expect_err("credential-bearing upstream URL should be rejected");
+
+    assert_eq!(error.field(), "upstream.base_url");
+    assert!(error.message().contains("userinfo"));
+    assert!(!error.to_string().contains("secret"));
+}
+
+#[test]
+fn rejects_upstream_base_url_with_any_query_string() {
+    for base_url in [
+        "https://example.test/v1?safe=sk-test",
+        "https://example.test/v1?q=Bearer%20sk-test",
+        "https://example.test/v1?safe=ok",
+    ] {
+        let mut config = AppConfig::default();
+        config.upstream.base_url = base_url.to_owned();
+
+        let error = config
+            .validate()
+            .expect_err("upstream base URL query strings should be rejected");
+
+        assert_eq!(error.field(), "upstream.base_url");
+        assert!(error.message().contains("query parameters"));
+        assert!(!error.to_string().contains("sk-test"));
+        assert!(!error.to_string().contains("Bearer"));
+        assert!(!error.to_string().contains("safe=sk-test"));
+        assert!(!error.to_string().contains("q=Bearer%20sk-test"));
+    }
+}
+
+#[test]
+fn rejects_upstream_base_url_with_sensitive_query_key_variants() {
+    for base_url in [
+        "https://example.test/v1?x-api-key=sk-test",
+        "https://example.test/v1?client_secret=sk-test",
+        "https://example.test/v1?refresh_token=sk-test",
+        "https://example.test/v1?secret_key=sk-test",
+    ] {
+        let mut config = AppConfig::default();
+        config.upstream.base_url = base_url.to_owned();
+
+        let error = config
+            .validate()
+            .expect_err("upstream base URL query strings should be rejected");
+
+        assert_eq!(error.field(), "upstream.base_url");
+        assert!(error.message().contains("query parameters"));
+        assert!(!error.to_string().contains("sk-test"));
+    }
+}
+
+#[test]
+fn rejects_upstream_base_url_with_fragment() {
+    for base_url in [
+        "https://example.test/v1#token=sk-test",
+        "https://example.test/v1#section",
+    ] {
+        let mut config = AppConfig::default();
+        config.upstream.base_url = base_url.to_owned();
+
+        let error = config
+            .validate()
+            .expect_err("upstream URL fragments should be rejected");
+
+        assert_eq!(error.field(), "upstream.base_url");
+        assert!(error.message().contains("fragments"));
+        assert!(!error.to_string().contains("sk-test"));
+        assert!(!error.to_string().contains("token=sk-test"));
+    }
+}
+
+#[test]
+fn redacts_upstream_base_url_for_display() {
+    let mut config = AppConfig::default();
+    config.upstream.base_url =
+        String::from("https://user:secret@example.test/v1?api_key=sk-test&safe=ok");
+
+    let redacted = config.upstream.redacted_base_url();
+
+    assert_eq!(
+        redacted,
+        "https://redacted:redacted@example.test/v1?redacted"
+    );
+    assert!(!redacted.contains("user"));
+    assert!(!redacted.contains("secret"));
+    assert!(!redacted.contains("sk-test"));
+    assert!(!redacted.contains("api_key"));
+    assert!(!redacted.contains("safe=ok"));
+}
+
+#[test]
+fn redacts_sensitive_upstream_query_variants_and_fragments_for_display() {
+    for base_url in [
+        "https://example.test/v1?x-api-key=sk-test&safe=ok",
+        "https://example.test/v1?client_secret=sk-test&safe=ok",
+        "https://example.test/v1?safe=sk-test",
+        "https://example.test/v1?q=Bearer%20sk-test",
+        "https://example.test/v1?safe=ok#token=sk-test",
+    ] {
+        let redacted = redact_upstream_base_url(base_url);
+
+        assert!(redacted.ends_with("/v1?redacted"));
+        assert!(!redacted.contains("sk-test"));
+        assert!(!redacted.contains("Bearer"));
+        assert!(!redacted.contains("client_secret=sk-test"));
+        assert!(!redacted.contains("x-api-key=sk-test"));
+        assert!(!redacted.contains("safe=sk-test"));
+        assert!(!redacted.contains("q=Bearer%20sk-test"));
+        assert!(!redacted.contains("safe=ok"));
+        assert!(!redacted.contains("token=sk-test"));
+    }
 }
 
 #[test]
@@ -218,6 +366,7 @@ interval_secs = 4
 fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"cloudflare.enabled"));
+    assert!(RESTART_REQUIRED_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"observability.sqlite_path"));
 }
