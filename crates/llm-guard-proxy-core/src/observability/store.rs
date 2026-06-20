@@ -1,13 +1,14 @@
 use std::{
     env, fs,
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 
 use super::{
     error::ObservabilityError,
@@ -41,11 +42,7 @@ impl ObservabilityStore {
         let sqlite_path = resolve_sqlite_path(&snapshot.observability.sqlite_path)?;
         prepare_parent_directory(&sqlite_path)?;
         prepare_sqlite_file(&sqlite_path)?;
-        let connection =
-            Connection::open(&sqlite_path).map_err(|source| ObservabilityError::Sqlite {
-                action: "open SQLite observability store",
-                source,
-            })?;
+        let connection = open_sqlite_connection(&sqlite_path)?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|source| ObservabilityError::Sqlite {
@@ -792,30 +789,186 @@ fn prepare_parent_directory(path: &Path) -> Result<(), ObservabilityError> {
     else {
         return Ok(());
     };
-    fs::create_dir_all(parent).map_err(|source| ObservabilityError::CreateDirectory {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    restrict_directory_permissions(parent)
+    if let Some(metadata) = inspect_path(parent)? {
+        validate_existing_storage_directory(parent, &metadata)
+    } else {
+        create_private_directory_all(parent)?;
+        validate_storage_directory(parent)
+    }
 }
 
 fn prepare_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
     if path == Path::new(":memory:") {
         return Ok(());
     }
-    create_secure_sqlite_file(path)?;
-    restrict_sqlite_file_permissions(path)
+    validate_sqlite_file_path(path)?;
+    create_secure_sqlite_file(path)
+}
+
+fn open_sqlite_connection(path: &Path) -> Result<Connection, ObservabilityError> {
+    Connection::open_with_flags(path, OpenFlags::default() | OpenFlags::SQLITE_OPEN_NOFOLLOW)
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "open SQLite observability store",
+            source,
+        })
+}
+
+fn inspect_path(path: &Path) -> Result<Option<fs::Metadata>, ObservabilityError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(ObservabilityError::InspectPath {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn validate_storage_directory(path: &Path) -> Result<(), ObservabilityError> {
+    let Some(metadata) = inspect_path(path)? else {
+        return Err(unsafe_storage_path(
+            path,
+            "directory disappeared while preparing observability storage",
+        ));
+    };
+    validate_existing_storage_directory(path, &metadata)
+}
+
+fn validate_existing_storage_directory(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ObservabilityError> {
+    validate_directory_shape(path, metadata)?;
+    validate_existing_storage_directory_permissions(path, metadata)
+}
+
+fn validate_directory_shape(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ObservabilityError> {
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(unsafe_storage_path(
+            path,
+            "observability directory must not be a symlink",
+        ));
+    }
+    if !file_type.is_dir() {
+        return Err(unsafe_storage_path(
+            path,
+            "observability directory path must be a directory",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_existing_storage_directory_permissions(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ObservabilityError> {
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        return Err(unsafe_storage_path(
+            path,
+            "existing observability directory must not grant group or other permissions",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_existing_storage_directory_permissions(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+) -> Result<(), ObservabilityError> {
+    Ok(())
+}
+
+fn create_private_directory_all(path: &Path) -> Result<(), ObservabilityError> {
+    if let Some(metadata) = inspect_path(path)? {
+        return validate_directory_shape(path, &metadata);
+    }
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_private_directory_all(parent)?;
+    }
+    create_private_directory(path)?;
+    restrict_directory_permissions(path)
+}
+
+#[cfg(unix)]
+fn create_private_directory(path: &Path) -> Result<(), ObservabilityError> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(OBSERVABILITY_DIRECTORY_MODE);
+    match builder.create(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+            validate_storage_directory(path)
+        }
+        Err(source) => Err(ObservabilityError::CreateDirectory {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_private_directory(path: &Path) -> Result<(), ObservabilityError> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        Err(source) if source.kind() == ErrorKind::AlreadyExists => {
+            validate_storage_directory(path)
+        }
+        Err(source) => Err(ObservabilityError::CreateDirectory {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn validate_sqlite_file_path(path: &Path) -> Result<(), ObservabilityError> {
+    let Some(metadata) = inspect_path(path)? else {
+        return Ok(());
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(unsafe_storage_path(
+            path,
+            "observability SQLite file must not be a symlink",
+        ));
+    }
+    if !file_type.is_file() {
+        return Err(unsafe_storage_path(
+            path,
+            "observability SQLite path must be a regular file",
+        ));
+    }
+    Ok(())
+}
+
+fn unsafe_storage_path(path: &Path, reason: &'static str) -> ObservabilityError {
+    ObservabilityError::UnsafeStoragePath {
+        path: path.to_path_buf(),
+        reason,
+    }
 }
 
 #[cfg(unix)]
 fn create_secure_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
-    fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .mode(OBSERVABILITY_SQLITE_MODE)
         .open(path)
-        .map(|_file| ())
+        .map_err(|source| ObservabilityError::RestrictPermissions {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    file.set_permissions(fs::Permissions::from_mode(OBSERVABILITY_SQLITE_MODE))
         .map_err(|source| ObservabilityError::RestrictPermissions {
             path: path.to_path_buf(),
             source,
@@ -823,8 +976,17 @@ fn create_secure_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
 }
 
 #[cfg(not(unix))]
-fn create_secure_sqlite_file(_path: &Path) -> Result<(), ObservabilityError> {
-    Ok(())
+fn create_secure_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .map(|_file| ())
+        .map_err(|source| ObservabilityError::RestrictPermissions {
+            path: path.to_path_buf(),
+            source,
+        })
 }
 
 #[cfg(unix)]
@@ -841,20 +1003,5 @@ fn restrict_directory_permissions(path: &Path) -> Result<(), ObservabilityError>
 
 #[cfg(not(unix))]
 fn restrict_directory_permissions(_path: &Path) -> Result<(), ObservabilityError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn restrict_sqlite_file_permissions(path: &Path) -> Result<(), ObservabilityError> {
-    fs::set_permissions(path, fs::Permissions::from_mode(OBSERVABILITY_SQLITE_MODE)).map_err(
-        |source| ObservabilityError::RestrictPermissions {
-            path: path.to_path_buf(),
-            source,
-        },
-    )
-}
-
-#[cfg(not(unix))]
-fn restrict_sqlite_file_permissions(_path: &Path) -> Result<(), ObservabilityError> {
     Ok(())
 }

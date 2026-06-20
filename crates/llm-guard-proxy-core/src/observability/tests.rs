@@ -6,13 +6,13 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 use rusqlite::params;
 
 use super::{
     AttemptId, AttemptRecord, AttemptStatus, DownstreamMode, ObservabilityStore, RawPayloads,
-    RequestId, RequestRecord, RequestStatus, StoreWrite, UpstreamMode,
+    RequestId, RequestRecord, RequestStatus, StoreWrite, UpstreamMode, error::ObservabilityError,
 };
 use crate::ConfigManager;
 
@@ -53,7 +53,7 @@ fn creates_sqlite_store_with_owner_only_permissions() {
     let fixture = StoreFixture::new("create-permissions");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
 
-    assert_eq!(file_mode(&fixture.root), 0o700);
+    assert_eq!(file_mode(&fixture.storage_dir()), 0o700);
     assert_eq!(file_mode(&fixture.sqlite_path), 0o600);
 
     drop(store);
@@ -63,18 +63,101 @@ fn creates_sqlite_store_with_owner_only_permissions() {
 #[test]
 fn tightens_existing_sqlite_store_permissions() {
     let fixture = StoreFixture::new("tighten-permissions");
-    fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o755))
-        .expect("test root permissions should be broadened");
+    fs::create_dir_all(fixture.storage_dir()).expect("storage directory should be created");
+    fs::set_permissions(fixture.storage_dir(), fs::Permissions::from_mode(0o700))
+        .expect("storage directory should be owner-only");
     fs::write(&fixture.sqlite_path, []).expect("existing sqlite file should be created");
     fs::set_permissions(&fixture.sqlite_path, fs::Permissions::from_mode(0o666))
         .expect("sqlite file permissions should be broadened");
 
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
 
-    assert_eq!(file_mode(&fixture.root), 0o700);
+    assert_eq!(file_mode(&fixture.storage_dir()), 0o700);
     assert_eq!(file_mode(&fixture.sqlite_path), 0o600);
 
     drop(store);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_existing_shared_parent_without_chmodding_it() {
+    let root = unique_test_dir("shared-parent");
+    let shared_parent = root.join("shared");
+    fs::create_dir_all(&shared_parent).expect("shared parent should be created");
+    fs::set_permissions(&shared_parent, fs::Permissions::from_mode(0o777))
+        .expect("shared parent permissions should be broadened");
+    let original_mode = file_mode(&shared_parent);
+
+    let sqlite_path = shared_parent.join("observability.sqlite3");
+    let config_path = root.join("config.toml");
+    write_config_file(
+        &config_path,
+        &sqlite_path,
+        true,
+        false,
+        TEST_MAX_BYTES,
+        TEST_PRUNE_TO_BYTES,
+    );
+    let manager = ConfigManager::from_explicit_path(&config_path).expect("config should load");
+
+    let error =
+        ObservabilityStore::open(manager.handle()).expect_err("shared parent should be rejected");
+
+    match error {
+        ObservabilityError::UnsafeStoragePath { path, reason } => {
+            assert_eq!(path, shared_parent);
+            assert!(reason.contains("group or other"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(file_mode(&shared_parent), original_mode);
+    assert!(!sqlite_path.exists());
+
+    remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_symlink_sqlite_path_without_chmodding_target() {
+    let root = unique_test_dir("sqlite-symlink");
+    let storage_dir = root.join("storage");
+    fs::create_dir_all(&storage_dir).expect("storage directory should be created");
+    fs::set_permissions(&storage_dir, fs::Permissions::from_mode(0o700))
+        .expect("storage directory should be owner-only");
+
+    let target_path = root.join("target.sqlite3");
+    fs::write(&target_path, []).expect("target file should be created");
+    fs::set_permissions(&target_path, fs::Permissions::from_mode(0o666))
+        .expect("target file permissions should be broadened");
+    let original_target_mode = file_mode(&target_path);
+
+    let sqlite_path = storage_dir.join("observability.sqlite3");
+    symlink(&target_path, &sqlite_path).expect("sqlite symlink should be created");
+
+    let config_path = root.join("config.toml");
+    write_config_file(
+        &config_path,
+        &sqlite_path,
+        true,
+        false,
+        TEST_MAX_BYTES,
+        TEST_PRUNE_TO_BYTES,
+    );
+    let manager = ConfigManager::from_explicit_path(&config_path).expect("config should load");
+
+    let error =
+        ObservabilityStore::open(manager.handle()).expect_err("sqlite symlink should be rejected");
+
+    match error {
+        ObservabilityError::UnsafeStoragePath { path, reason } => {
+            assert_eq!(path, sqlite_path);
+            assert!(reason.contains("symlink"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(file_mode(&target_path), original_target_mode);
+
+    remove_dir_all(&root);
 }
 
 #[test]
@@ -432,9 +515,16 @@ impl StoreFixture {
         fs::create_dir_all(&root).expect("test root should be created");
         Self {
             config_path: root.join("config.toml"),
-            sqlite_path: root.join("observability.sqlite3"),
+            sqlite_path: root.join("storage").join("observability.sqlite3"),
             root,
         }
+    }
+
+    fn storage_dir(&self) -> PathBuf {
+        self.sqlite_path
+            .parent()
+            .expect("sqlite path should have a parent")
+            .to_path_buf()
     }
 
     fn open_store(
@@ -466,24 +556,14 @@ impl StoreFixture {
         max_bytes: u64,
         prune_to_bytes: u64,
     ) {
-        let sqlite_path = self.sqlite_path.display();
-        fs::write(
+        write_config_file(
             &self.config_path,
-            format!(
-                r#"
-[observability]
-enabled = {enabled}
-sqlite_path = "{sqlite_path}"
-capture_raw_payloads = {capture_raw_payloads}
-
-[observability.retention]
-max_bytes = {max_bytes}
-prune_to_bytes = {prune_to_bytes}
-max_records = 100
-"#
-            ),
-        )
-        .expect("test config should be written");
+            &self.sqlite_path,
+            enabled,
+            capture_raw_payloads,
+            max_bytes,
+            prune_to_bytes,
+        );
     }
 }
 
@@ -547,6 +627,34 @@ fn count_rows(connection: &rusqlite::Connection, sql: &str) -> i64 {
     connection
         .query_row(sql, params![], |row| row.get(0))
         .expect("count query should succeed")
+}
+
+fn write_config_file(
+    config_path: &Path,
+    sqlite_path: &Path,
+    enabled: bool,
+    capture_raw_payloads: bool,
+    max_bytes: u64,
+    prune_to_bytes: u64,
+) {
+    let sqlite_path = sqlite_path.display();
+    fs::write(
+        config_path,
+        format!(
+            r#"
+[observability]
+enabled = {enabled}
+sqlite_path = "{sqlite_path}"
+capture_raw_payloads = {capture_raw_payloads}
+
+[observability.retention]
+max_bytes = {max_bytes}
+prune_to_bytes = {prune_to_bytes}
+max_records = 100
+"#
+        ),
+    )
+    .expect("test config should be written");
 }
 
 fn assert_redacted_raw_payloads(connection: &rusqlite::Connection, sql: &str) {

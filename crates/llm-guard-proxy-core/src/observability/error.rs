@@ -21,6 +21,22 @@ pub enum ObservabilityError {
         /// Source I/O error.
         source: std::io::Error,
     },
+    /// Inspecting an observability storage path failed.
+    #[error("failed to inspect observability storage path {path}: {source}")]
+    InspectPath {
+        /// Path whose metadata could not be inspected.
+        path: PathBuf,
+        /// Source I/O error.
+        source: std::io::Error,
+    },
+    /// The configured observability storage path is unsafe for sensitive data.
+    #[error("unsafe observability storage path {path}: {reason}")]
+    UnsafeStoragePath {
+        /// Unsafe configured path.
+        path: PathBuf,
+        /// Static reason safe to show in config errors.
+        reason: &'static str,
+    },
     /// Restricting observability storage permissions failed.
     #[error("failed to restrict observability storage permissions for {path}: {source}")]
     RestrictPermissions {
