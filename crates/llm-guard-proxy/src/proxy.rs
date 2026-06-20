@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
+    fmt,
     path::{Path, PathBuf},
     pin::Pin,
     task::{Context, Poll},
@@ -285,10 +286,62 @@ async fn send_upstream_request(
         .body(body)
         .send()
         .await
-        .map_err(|source| ProxyError::UpstreamTransport {
-            source,
-            observability: None,
+        .map_err(|source| {
+            let failure = ReqwestFailureKind::from_error(&source);
+            ProxyError::UpstreamTransport {
+                failure,
+                observability: None,
+            }
         })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReqwestFailureKind {
+    Timeout,
+    Connect,
+    Request,
+    Body,
+    Decode,
+    Other,
+}
+
+impl ReqwestFailureKind {
+    fn from_error(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::Timeout
+        } else if error.is_connect() {
+            Self::Connect
+        } else if error.is_body() {
+            Self::Body
+        } else if error.is_decode() {
+            Self::Decode
+        } else if error.is_request() {
+            Self::Request
+        } else {
+            Self::Other
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout_failure",
+            Self::Connect => "connect_failure",
+            Self::Request => "request_failure",
+            Self::Body => "body_failure",
+            Self::Decode => "decode_failure",
+            Self::Other => "unknown_failure",
+        }
+    }
+}
+
+impl fmt::Display for ReqwestFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+fn sanitized_reqwest_error(error: &reqwest::Error) -> String {
+    ReqwestFailureKind::from_error(error).to_string()
 }
 
 struct ForwardedBodyObserver {
@@ -427,7 +480,8 @@ impl Stream for ObservedUpstreamBody {
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(error))) => {
-                let completion = BodyCompletion::UpstreamStreamError(error.to_string());
+                let completion =
+                    BodyCompletion::UpstreamStreamError(sanitized_reqwest_error(&error));
                 this.record_once(&completion);
                 Poll::Ready(Some(Err(error)))
             }
@@ -947,10 +1001,9 @@ enum ProxyError {
         reason: String,
         request_metadata: Option<BTreeMap<String, String>>,
     },
-    #[error("upstream request failed: {source}")]
+    #[error("upstream request failed: {failure}")]
     UpstreamTransport {
-        #[source]
-        source: reqwest::Error,
+        failure: ReqwestFailureKind,
         observability: Option<Box<FailedUpstreamObservability>>,
     },
 }
@@ -1104,8 +1157,8 @@ impl ProxyError {
         attempt_record: AttemptRecord,
     ) -> Self {
         match self {
-            Self::UpstreamTransport { source, .. } => Self::UpstreamTransport {
-                source,
+            Self::UpstreamTransport { failure, .. } => Self::UpstreamTransport {
+                failure,
                 observability: Some(Box::new(FailedUpstreamObservability {
                     request_metadata,
                     attempt_record,

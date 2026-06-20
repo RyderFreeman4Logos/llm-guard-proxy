@@ -420,9 +420,10 @@ async fn upstream_transport_failure_writes_failed_request_and_attempt() {
 
     let response = proxy
         .client
-        .post(format!("{}/v1/completions", proxy.base_url))
-        .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"transport-failure-model","prompt":"ping"}"#)
+        .get(format!(
+            "{}/v1/models?api_key=sk-live&safe=ok",
+            proxy.base_url
+        ))
         .send()
         .await
         .expect("proxy request should complete with gateway error");
@@ -433,6 +434,7 @@ async fn upstream_transport_failure_writes_failed_request_and_attempt() {
         body.contains("upstream_transport_error"),
         "gateway error should identify upstream transport failure: {body}"
     );
+    assert_sensitive_query_absent("transport failure response body", &body);
 
     let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
     let request_count: i64 = connection
@@ -489,9 +491,11 @@ async fn upstream_transport_failure_writes_failed_request_and_attempt() {
     assert_eq!(request_row.0, "failed");
     assert_eq!(request_row.1, 502);
     assert!(request_row.2.contains("upstream_transport_error"));
-    assert_eq!(request_metadata["method"], "POST");
-    assert_eq!(request_metadata["path"], "/v1/completions");
-    assert_eq!(request_metadata["request_body_bytes"], "51");
+    assert_sensitive_query_absent("request error_reason", &request_row.2);
+    assert_eq!(request_metadata["method"], "GET");
+    assert_eq!(request_metadata["path"], "/v1/models");
+    assert_eq!(request_metadata["query_present"], "true");
+    assert_eq!(request_metadata["request_body_bytes"], "0");
     assert_eq!(request_metadata["policy_transform_applied"], "false");
     assert_eq!(
         request_response_metadata["error_type"],
@@ -500,8 +504,10 @@ async fn upstream_transport_failure_writes_failed_request_and_attempt() {
     assert_eq!(attempt_row.0, "failed");
     assert_eq!(attempt_row.1, None);
     assert!(attempt_row.2.contains("upstream_transport_error"));
-    assert_eq!(attempt_metadata["method"], "POST");
-    assert_eq!(attempt_metadata["path"], "/v1/completions");
+    assert_sensitive_query_absent("attempt error_reason", &attempt_row.2);
+    assert_eq!(attempt_metadata["method"], "GET");
+    assert_eq!(attempt_metadata["path"], "/v1/models");
+    assert_eq!(attempt_metadata["query_present"], "true");
     assert_eq!(attempt_metadata["attempt_number"], "1");
     assert_eq!(
         attempt_response_metadata["upstream_response_received"],
@@ -1036,6 +1042,21 @@ async fn assert_no_upstream_request(fake: &mut FakeUpstream) {
         fake.recv_within(Duration::from_millis(100)).await.is_none(),
         "invalid proxy path must not be forwarded upstream"
     );
+}
+
+fn assert_sensitive_query_absent(label: &str, text: &str) {
+    for sensitive in [
+        "sk-live",
+        "api_key",
+        "safe=ok",
+        "?api_key=sk-live",
+        "?api_key=sk-live&safe=ok",
+    ] {
+        assert!(
+            !text.contains(sensitive),
+            "{label} leaked sensitive query fragment {sensitive:?}: {text}"
+        );
+    }
 }
 
 async fn send_raw_proxy_get(base_url: &str, request_target: &str) -> String {
