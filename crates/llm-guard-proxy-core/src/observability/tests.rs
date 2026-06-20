@@ -5,6 +5,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use rusqlite::params;
 
 use super::{
@@ -13,10 +16,13 @@ use super::{
 };
 use crate::ConfigManager;
 
+const TEST_MAX_BYTES: u64 = 1_000_000;
+const TEST_PRUNE_TO_BYTES: u64 = 800_000;
+
 #[test]
 fn creates_sqlite_schema_in_test_temp_directory() {
     let fixture = StoreFixture::new("schema");
-    let store = fixture.open_store(true, false, 10_000, 8_000);
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
 
     assert_eq!(store.schema_version().expect("schema version"), 1);
     assert!(fixture.sqlite_path.exists());
@@ -41,10 +47,40 @@ fn creates_sqlite_schema_in_test_temp_directory() {
     assert_eq!(attempt_table_count, 1);
 }
 
+#[cfg(unix)]
+#[test]
+fn creates_sqlite_store_with_owner_only_permissions() {
+    let fixture = StoreFixture::new("create-permissions");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+
+    assert_eq!(file_mode(&fixture.root), 0o700);
+    assert_eq!(file_mode(&fixture.sqlite_path), 0o600);
+
+    drop(store);
+}
+
+#[cfg(unix)]
+#[test]
+fn tightens_existing_sqlite_store_permissions() {
+    let fixture = StoreFixture::new("tighten-permissions");
+    fs::set_permissions(&fixture.root, fs::Permissions::from_mode(0o755))
+        .expect("test root permissions should be broadened");
+    fs::write(&fixture.sqlite_path, []).expect("existing sqlite file should be created");
+    fs::set_permissions(&fixture.sqlite_path, fs::Permissions::from_mode(0o666))
+        .expect("sqlite file permissions should be broadened");
+
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+
+    assert_eq!(file_mode(&fixture.root), 0o700);
+    assert_eq!(file_mode(&fixture.sqlite_path), 0o600);
+
+    drop(store);
+}
+
 #[test]
 fn writes_success_and_failure_request_and_attempt_rows() {
     let fixture = StoreFixture::new("success-failure");
-    let store = fixture.open_store(true, false, 10_000, 8_000);
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
 
     let success = request_record("req-success", RequestStatus::Succeeded, 1_000);
     let success_attempt = attempt_record(
@@ -124,7 +160,7 @@ fn writes_success_and_failure_request_and_attempt_rows() {
 #[test]
 fn updating_request_preserves_existing_attempt_rows() {
     let fixture = StoreFixture::new("request-update-preserves-attempts");
-    let store = fixture.open_store(true, false, 10_000, 8_000);
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
     let initial_request = RequestRecord {
         finished_at_unix_ms: None,
         status: RequestStatus::Failed,
@@ -191,7 +227,7 @@ WHERE request_id = 'req-update'
 #[test]
 fn redacts_authorization_and_api_key_like_values_before_persistence() {
     let fixture = StoreFixture::new("redaction");
-    let store = fixture.open_store(true, true, 10_000, 8_000);
+    let store = fixture.open_store(true, true, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
     let mut request = request_record("req-redaction", RequestStatus::Succeeded, 1_000);
     request.request_metadata = BTreeMap::from([
         (
@@ -250,7 +286,7 @@ WHERE request_id = 'req-redaction'
 #[test]
 fn redacts_common_raw_payload_secret_forms_before_persistence() {
     let fixture = StoreFixture::new("raw-secret-forms");
-    let store = fixture.open_store(true, true, 10_000, 8_000);
+    let store = fixture.open_store(true, true, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
     let mut request = request_record("req-raw-secrets", RequestStatus::Succeeded, 1_000);
     request.raw_payloads = RawPayloads {
         input: Some(String::from(r#"{"password":"fixture-password"}"#)),
@@ -291,19 +327,23 @@ fn redacts_common_raw_payload_secret_forms_before_persistence() {
 }
 
 #[test]
-fn retention_deletes_oldest_requests_until_under_prune_target() {
+fn retention_deletes_oldest_requests_until_actual_storage_under_prune_target() {
     let fixture = StoreFixture::new("retention");
-    let store = fixture.open_store(true, true, 1_000, 800);
+    let store = fixture.open_store(true, true, 120_000, 80_000);
+    let sqlite_floor_bytes = store
+        .retention_usage()
+        .expect("initial retention usage")
+        .observed_bytes;
 
-    for index in 0..3 {
+    for index in 0..8 {
         let mut request = request_record(
             &format!("req-retention-{index}"),
             RequestStatus::Succeeded,
             1_000 + index,
         );
         request.raw_payloads = RawPayloads {
-            input: Some("x".repeat(550)),
-            output: None,
+            input: Some("x".repeat(40_000)),
+            output: Some("y".repeat(40_000)),
             reasoning: None,
             tool_calls: None,
         };
@@ -313,7 +353,21 @@ fn retention_deletes_oldest_requests_until_under_prune_target() {
     }
 
     let usage = store.retention_usage().expect("retention usage");
-    assert!(usage.observed_bytes <= 800);
+    let expected_cap = 80_000_u64.max(sqlite_floor_bytes);
+    assert!(
+        usage.observed_bytes <= expected_cap,
+        "actual SQLite bytes {} exceeded cap {}",
+        usage.observed_bytes,
+        expected_cap
+    );
+    assert_eq!(
+        usage.observed_bytes,
+        fixture
+            .sqlite_path
+            .metadata()
+            .expect("sqlite file metadata")
+            .len()
+    );
 
     let connection = store.lock_connection().expect("connection lock");
     assert_eq!(
@@ -328,14 +382,15 @@ fn retention_deletes_oldest_requests_until_under_prune_target() {
             &connection,
             "SELECT COUNT(*) FROM requests WHERE request_id = 'req-retention-2'",
         ),
-        1
+        0
     );
+    assert!(count_rows(&connection, "SELECT COUNT(*) FROM requests") < 8);
 }
 
 #[test]
 fn hot_reload_disabled_setting_stops_new_writes() {
     let fixture = StoreFixture::new("hot-reload-disable");
-    let manager = fixture.manager(true, false, 10_000, 8_000);
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
     let store = ObservabilityStore::open(manager.handle()).expect("store should open");
 
     let first = request_record("req-before-disable", RequestStatus::Succeeded, 1_000);
@@ -344,7 +399,7 @@ fn hot_reload_disabled_setting_stops_new_writes() {
         StoreWrite::Written
     );
 
-    fixture.write_config(false, false, 10_000, 8_000);
+    fixture.write_config(false, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
     let outcome = manager.reload().expect("reload should succeed");
     assert!(outcome.applied);
 
@@ -510,6 +565,15 @@ fn assert_redacted_raw_payloads(connection: &rusqlite::Connection, sql: &str) {
     assert_eq!(raw_payloads.1.as_deref(), Some("[REDACTED]"));
     assert_eq!(raw_payloads.2.as_deref(), Some("[REDACTED]"));
     assert_eq!(raw_payloads.3.as_deref(), Some("[REDACTED]"));
+}
+
+#[cfg(unix)]
+fn file_mode(path: &Path) -> u32 {
+    fs::metadata(path)
+        .expect("path metadata should be readable")
+        .permissions()
+        .mode()
+        & 0o777
 }
 
 fn unique_test_dir(name: &str) -> PathBuf {

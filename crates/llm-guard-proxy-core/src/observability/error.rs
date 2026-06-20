@@ -21,6 +21,14 @@ pub enum ObservabilityError {
         /// Source I/O error.
         source: std::io::Error,
     },
+    /// Restricting observability storage permissions failed.
+    #[error("failed to restrict observability storage permissions for {path}: {source}")]
+    RestrictPermissions {
+        /// Path whose permissions could not be restricted.
+        path: PathBuf,
+        /// Source I/O error.
+        source: std::io::Error,
+    },
     /// `SQLite` operation failed.
     #[error("failed to {action}: {source}")]
     Sqlite {

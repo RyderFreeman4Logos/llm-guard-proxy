@@ -112,6 +112,10 @@ interval_secs = 15
 enabled = true
 ```
 
+Retention byte limits apply to actual SQLite page storage. SQLite has a
+schema/page-size minimum footprint, so limits below that floor prune retained
+rows but cannot shrink the database file below the empty-store minimum.
+
 Reloadable fields:
 
 - `shielding.enabled`

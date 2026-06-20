@@ -240,9 +240,15 @@ impl Default for ObservabilityConfig {
 /// Retention limits for observability records and artifacts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetentionConfig {
-    /// Hard maximum storage budget in bytes.
+    /// Hard maximum actual storage budget in bytes.
+    ///
+    /// `SQLite` stores schema and page metadata, so a database cannot shrink
+    /// below its empty schema footprint.
     pub max_bytes: u64,
     /// Hysteresis target after pruning.
+    ///
+    /// Values below the empty `SQLite` footprint prune rows but cannot reduce
+    /// the database file below that storage floor.
     pub prune_to_bytes: u64,
     /// Maximum indexed record count.
     pub max_records: u64,

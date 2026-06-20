@@ -185,11 +185,15 @@ pub enum StoreWrite {
     Disabled,
 }
 
-/// Current logical retention usage tracked by the `SQLite` store.
+/// Current retention usage tracked by the `SQLite` store.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RetentionUsage {
     /// Number of request rows currently retained.
     pub request_count: u64,
-    /// Logical persisted bytes across request and attempt rows.
+    /// Actual `SQLite` page storage bytes.
+    ///
+    /// This includes `SQLite` schema, page, index, and freelist overhead. It can
+    /// never shrink below the minimum empty database footprint for the active
+    /// schema and page size.
     pub observed_bytes: u64,
 }

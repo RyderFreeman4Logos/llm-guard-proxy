@@ -4,6 +4,9 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
 use rusqlite::{Connection, params};
 
 use super::{
@@ -14,6 +17,10 @@ use super::{
 use crate::{ConfigHandle, RetentionConfig};
 
 const SCHEMA_VERSION: i64 = 1;
+#[cfg(unix)]
+const OBSERVABILITY_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
+const OBSERVABILITY_SQLITE_MODE: u32 = 0o600;
 
 /// `SQLite`-backed observability store.
 #[derive(Clone, Debug)]
@@ -33,6 +40,7 @@ impl ObservabilityStore {
         let snapshot = config.snapshot()?;
         let sqlite_path = resolve_sqlite_path(&snapshot.observability.sqlite_path)?;
         prepare_parent_directory(&sqlite_path)?;
+        prepare_sqlite_file(&sqlite_path)?;
         let connection =
             Connection::open(&sqlite_path).map_err(|source| ObservabilityError::Sqlite {
                 action: "open SQLite observability store",
@@ -514,17 +522,9 @@ fn enforce_retention(
     connection: &mut Connection,
     retention: &RetentionConfig,
 ) -> Result<(), ObservabilityError> {
-    let max_records = sqlite_limit(retention.max_records);
     let max_bytes = retention.max_bytes;
     let prune_to_bytes = retention.prune_to_bytes;
-
-    let transaction = connection
-        .transaction()
-        .map_err(|source| ObservabilityError::Sqlite {
-            action: "start observability retention transaction",
-            source,
-        })?;
-    let mut usage = read_retention_usage(&transaction)?;
+    let mut usage = read_retention_usage(connection)?;
     let target_bytes = if usage.observed_bytes > max_bytes {
         prune_to_bytes
     } else {
@@ -532,8 +532,40 @@ fn enforce_retention(
     };
 
     while usage.observed_bytes > target_bytes || usage.request_count > retention.max_records {
-        let next_request_id = oldest_request_id(&transaction)?;
-        let Some(request_id) = next_request_id else {
+        let deleted = prune_retained_rows(connection, retention.max_records, target_bytes)?;
+        if !deleted {
+            break;
+        }
+        vacuum_database(connection)?;
+        usage = read_retention_usage(connection)?;
+        if usage.request_count == 0 {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn prune_retained_rows(
+    connection: &mut Connection,
+    max_records: u64,
+    target_bytes: u64,
+) -> Result<bool, ObservabilityError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "start observability retention transaction",
+            source,
+        })?;
+    let mut deleted = false;
+    let mut request_count = read_request_count(&transaction)?;
+    let mut logical_bytes = read_logical_observed_bytes(&transaction)?;
+
+    while request_count > max_records
+        || logical_bytes > target_bytes
+        || (!deleted && request_count > 0)
+    {
+        let Some(request_id) = oldest_request_id(&transaction)? else {
             break;
         };
         transaction
@@ -545,16 +577,25 @@ fn enforce_retention(
                 action: "prune oldest observability request",
                 source,
             })?;
-        usage = read_retention_usage(&transaction)?;
-        if max_records == 0 {
-            break;
-        }
+        deleted = true;
+        request_count = read_request_count(&transaction)?;
+        logical_bytes = read_logical_observed_bytes(&transaction)?;
     }
 
     transaction
         .commit()
         .map_err(|source| ObservabilityError::Sqlite {
             action: "commit observability retention transaction",
+            source,
+        })?;
+    Ok(deleted)
+}
+
+fn vacuum_database(connection: &Connection) -> Result<(), ObservabilityError> {
+    connection
+        .execute_batch("VACUUM")
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "vacuum SQLite observability store",
             source,
         })
 }
@@ -595,12 +636,46 @@ LIMIT 1
 }
 
 fn read_retention_usage(connection: &Connection) -> Result<RetentionUsage, ObservabilityError> {
+    let request_count = read_request_count(connection)?;
+    let observed_bytes = read_sqlite_storage_bytes(connection)?;
+
+    Ok(RetentionUsage {
+        request_count,
+        observed_bytes,
+    })
+}
+
+fn read_request_count(connection: &Connection) -> Result<u64, ObservabilityError> {
     let request_count: i64 = connection
         .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
         .map_err(|source| ObservabilityError::Sqlite {
             action: "read observability request count",
             source,
         })?;
+    Ok(nonnegative_i64_to_u64(request_count))
+}
+
+fn read_sqlite_storage_bytes(connection: &Connection) -> Result<u64, ObservabilityError> {
+    let page_count = read_sqlite_pragma_u64(connection, "page_count")?;
+    let page_size = read_sqlite_pragma_u64(connection, "page_size")?;
+    Ok(page_count.saturating_mul(page_size))
+}
+
+fn read_sqlite_pragma_u64(
+    connection: &Connection,
+    pragma: &'static str,
+) -> Result<u64, ObservabilityError> {
+    let sql = format!("PRAGMA {pragma}");
+    let value: i64 = connection
+        .query_row(&sql, [], |row| row.get(0))
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "read SQLite storage usage",
+            source,
+        })?;
+    Ok(nonnegative_i64_to_u64(value))
+}
+
+fn read_logical_observed_bytes(connection: &Connection) -> Result<u64, ObservabilityError> {
     let observed_bytes: i64 = connection
         .query_row(
             r"
@@ -615,11 +690,7 @@ SELECT
             action: "read observability logical bytes",
             source,
         })?;
-
-    Ok(RetentionUsage {
-        request_count: nonnegative_i64_to_u64(request_count),
-        observed_bytes: nonnegative_i64_to_u64(observed_bytes),
-    })
+    Ok(nonnegative_i64_to_u64(observed_bytes))
 }
 
 fn estimate_request_bytes(
@@ -700,10 +771,6 @@ fn nonnegative_i64_to_u64(value: i64) -> u64 {
     u64::try_from(value.max(0)).unwrap_or(u64::MAX)
 }
 
-fn sqlite_limit(value: u64) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
-
 fn resolve_sqlite_path(path: &Path) -> Result<PathBuf, ObservabilityError> {
     let path_text = path.to_string_lossy();
     let Some(rest) = path_text.strip_prefix("~/") else {
@@ -728,5 +795,66 @@ fn prepare_parent_directory(path: &Path) -> Result<(), ObservabilityError> {
     fs::create_dir_all(parent).map_err(|source| ObservabilityError::CreateDirectory {
         path: parent.to_path_buf(),
         source,
+    })?;
+    restrict_directory_permissions(parent)
+}
+
+fn prepare_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
+    if path == Path::new(":memory:") {
+        return Ok(());
+    }
+    create_secure_sqlite_file(path)?;
+    restrict_sqlite_file_permissions(path)
+}
+
+#[cfg(unix)]
+fn create_secure_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(OBSERVABILITY_SQLITE_MODE)
+        .open(path)
+        .map(|_file| ())
+        .map_err(|source| ObservabilityError::RestrictPermissions {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn create_secure_sqlite_file(_path: &Path) -> Result<(), ObservabilityError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_directory_permissions(path: &Path) -> Result<(), ObservabilityError> {
+    fs::set_permissions(
+        path,
+        fs::Permissions::from_mode(OBSERVABILITY_DIRECTORY_MODE),
+    )
+    .map_err(|source| ObservabilityError::RestrictPermissions {
+        path: path.to_path_buf(),
+        source,
     })
+}
+
+#[cfg(not(unix))]
+fn restrict_directory_permissions(_path: &Path) -> Result<(), ObservabilityError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_sqlite_file_permissions(path: &Path) -> Result<(), ObservabilityError> {
+    fs::set_permissions(path, fs::Permissions::from_mode(OBSERVABILITY_SQLITE_MODE)).map_err(
+        |source| ObservabilityError::RestrictPermissions {
+            path: path.to_path_buf(),
+            source,
+        },
+    )
+}
+
+#[cfg(not(unix))]
+fn restrict_sqlite_file_permissions(_path: &Path) -> Result<(), ObservabilityError> {
+    Ok(())
 }
