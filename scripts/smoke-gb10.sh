@@ -27,10 +27,7 @@ fail() {
 
 cleanup() {
     local status=$?
-    if [[ -n "${proxy_pid}" ]] && kill -0 "${proxy_pid}" 2>/dev/null; then
-        kill "${proxy_pid}" 2>/dev/null || true
-        wait "${proxy_pid}" 2>/dev/null || true
-    fi
+    terminate_proxy
     if [[ -n "${run_dir}" ]]; then
         if [[ "${KEEP_RUN_DIR}" == "1" ]]; then
             printf 'smoke-gb10: kept run_dir=%s\n' "${run_dir}" >&2
@@ -42,10 +39,66 @@ cleanup() {
 }
 trap cleanup EXIT
 
+process_state() {
+    ps -o stat= -p "$1" 2>/dev/null | tr -d '[:space:]' || true
+}
+
+terminate_proxy() {
+    local state
+
+    if [[ -z "${proxy_pid}" ]]; then
+        return 0
+    fi
+
+    if kill -0 "${proxy_pid}" 2>/dev/null; then
+        kill "${proxy_pid}" 2>/dev/null || true
+        for _ in {1..50}; do
+            state="$(process_state "${proxy_pid}")"
+            if [[ -z "${state}" || "${state}" == Z* ]]; then
+                break
+            fi
+            sleep 0.1
+        done
+        state="$(process_state "${proxy_pid}")"
+        if [[ -n "${state}" && "${state}" != Z* ]]; then
+            kill -KILL "${proxy_pid}" 2>/dev/null || true
+        fi
+    fi
+
+    wait "${proxy_pid}" 2>/dev/null || true
+    proxy_pid=""
+}
+
 require_command() {
     local command_name="$1"
     command -v "${command_name}" >/dev/null 2>&1 \
         || fail "required command not found: ${command_name}"
+}
+
+resolve_proxy_binary() {
+    local target_dir
+    local binary_path
+
+    if [[ -n "${LLM_GUARD_PROXY_BIN:-}" ]]; then
+        binary_path="${LLM_GUARD_PROXY_BIN}"
+    else
+        cargo build --quiet -p llm-guard-proxy --bin llm-guard-proxy \
+            || fail "failed to build proxy binary"
+        target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
+        if [[ "${target_dir}" != /* ]]; then
+            target_dir="${repo_root}/${target_dir}"
+        fi
+        if [[ -n "${CARGO_BUILD_TARGET:-}" ]]; then
+            target_dir="${target_dir}/${CARGO_BUILD_TARGET}"
+        fi
+        binary_path="${target_dir}/debug/llm-guard-proxy"
+    fi
+
+    if [[ ! -x "${binary_path}" ]]; then
+        fail "proxy binary is not executable: ${binary_path}"
+    fi
+
+    printf '%s\n' "${binary_path}"
 }
 
 toml_quote() {
@@ -368,6 +421,9 @@ require_command curl
 if [[ -z "${LLM_GUARD_PROXY_BIN:-}" ]]; then
     require_command cargo
 fi
+if ! proxy_binary="$(resolve_proxy_binary)"; then
+    exit 1
+fi
 
 if [[ -z "${PORT}" ]]; then
     PORT="$(choose_port)"
@@ -436,11 +492,9 @@ printf 'smoke-gb10: observability_db=%s\n' "${sqlite_path}"
 printf 'smoke-gb10: proxy_base_url=%s upstream_base_url=%s model=%s\n' \
     "${base_url}" "${redacted_upstream_base_url}" "${MODEL}"
 
-if [[ -n "${LLM_GUARD_PROXY_BIN:-}" ]]; then
-    "${LLM_GUARD_PROXY_BIN}" --config "${config_path}" >"${proxy_log}" 2>&1 &
-else
-    cargo run --quiet -p llm-guard-proxy -- --config "${config_path}" >"${proxy_log}" 2>&1 &
-fi
+# Own the server PID directly. Using `cargo run &` would make $! point at
+# Cargo's wrapper process, leaving the proxy child outside cleanup ownership.
+"${proxy_binary}" --config "${config_path}" >"${proxy_log}" 2>&1 &
 proxy_pid=$!
 
 wait_for_readiness "${base_url}"
