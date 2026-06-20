@@ -11,6 +11,7 @@ description = "Core types for llm-guard-proxy."
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 thiserror = "2"
+url = "2"
 
 [lints]
 workspace = true

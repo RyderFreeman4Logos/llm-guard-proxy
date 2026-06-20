@@ -1,6 +1,19 @@
 use std::path::PathBuf;
 
 use super::ValidationError;
+use url::Url;
+
+const REDACTED_URL_PART: &str = "redacted";
+const INVALID_URL_DISPLAY: &str = "[invalid URL]";
+const SENSITIVE_UPSTREAM_QUERY_KEYS: &[&str] = &[
+    "apikey",
+    "accesstoken",
+    "token",
+    "password",
+    "secret",
+    "key",
+    "authorization",
+];
 
 /// Complete application configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -124,14 +137,17 @@ pub struct UpstreamConfig {
 
 impl UpstreamConfig {
     fn validate(&self) -> Result<(), ValidationError> {
-        let has_supported_scheme =
-            self.base_url.starts_with("http://") || self.base_url.starts_with("https://");
-        require(
-            has_supported_scheme,
-            "upstream.base_url",
-            "must start with http:// or https://",
-        )?;
+        validate_upstream_base_url(&self.base_url)?;
         self.metadata.validate()
+    }
+
+    /// Returns a display-safe upstream base URL.
+    ///
+    /// Credentials and sensitive query values are replaced before the string is
+    /// suitable for logs or client-visible diagnostics.
+    #[must_use]
+    pub fn redacted_base_url(&self) -> String {
+        redact_upstream_base_url(&self.base_url)
     }
 }
 
@@ -142,6 +158,94 @@ impl Default for UpstreamConfig {
             metadata: MetadataConfig::default(),
         }
     }
+}
+
+/// Validates the configured upstream base URL.
+///
+/// # Errors
+///
+/// Returns a [`ValidationError`] when the URL is not absolute HTTP(S), includes
+/// userinfo, or contains query keys that commonly carry credentials.
+pub fn validate_upstream_base_url(base_url: &str) -> Result<(), ValidationError> {
+    let url = Url::parse(base_url).map_err(|_error| {
+        ValidationError::new(
+            "upstream.base_url",
+            "must be a valid http:// or https:// URL",
+        )
+    })?;
+    require(
+        matches!(url.scheme(), "http" | "https"),
+        "upstream.base_url",
+        "must start with http:// or https://",
+    )?;
+    require(
+        url.username().is_empty() && url.password().is_none(),
+        "upstream.base_url",
+        "must not contain username, password, or userinfo",
+    )?;
+    if has_sensitive_upstream_query_key(&url) {
+        return Err(ValidationError::new(
+            "upstream.base_url",
+            "must not contain sensitive query parameters",
+        ));
+    }
+    Ok(())
+}
+
+/// Returns a display-safe URL string for logs and diagnostics.
+///
+/// Invalid URLs are rendered as a fixed marker because preserving fragments of
+/// malformed input risks echoing secrets embedded in an unparsable string.
+#[must_use]
+pub fn redact_upstream_base_url(base_url: &str) -> String {
+    let Ok(mut url) = Url::parse(base_url) else {
+        return INVALID_URL_DISPLAY.to_owned();
+    };
+
+    if !url.username().is_empty() {
+        let _ignored = url.set_username(REDACTED_URL_PART);
+    }
+    if url.password().is_some() {
+        let _ignored = url.set_password(Some(REDACTED_URL_PART));
+    }
+    if url.query().is_some() {
+        let redacted_query = url
+            .query_pairs()
+            .map(|(key, value)| {
+                if is_sensitive_upstream_query_key(&key) {
+                    (REDACTED_URL_PART.to_owned(), REDACTED_URL_PART.to_owned())
+                } else {
+                    (key.into_owned(), value.into_owned())
+                }
+            })
+            .collect::<Vec<_>>();
+        url.query_pairs_mut().clear().extend_pairs(
+            redacted_query
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
+    }
+
+    url.to_string()
+}
+
+fn has_sensitive_upstream_query_key(url: &Url) -> bool {
+    url.query_pairs()
+        .any(|(key, _value)| is_sensitive_upstream_query_key(&key))
+}
+
+fn is_sensitive_upstream_query_key(key: &str) -> bool {
+    let normalized = normalize_upstream_query_key(key);
+    SENSITIVE_UPSTREAM_QUERY_KEYS
+        .iter()
+        .any(|sensitive| normalized == *sensitive)
+}
+
+fn normalize_upstream_query_key(key: &str) -> String {
+    key.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// Upstream model metadata discovery policy.

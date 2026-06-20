@@ -4,7 +4,9 @@ mod proxy;
 
 use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
 
-use llm_guard_proxy_core::{ConfigManager, ObservabilityStore, RequestId};
+use llm_guard_proxy_core::{
+    ConfigManager, ObservabilityStore, RequestId, redact_upstream_base_url,
+};
 use tokio::net::TcpListener;
 
 #[tokio::main]
@@ -46,8 +48,8 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         proxy::render_health(&config, manager.path(), &request_id)
     );
     eprintln!(
-        "llm-guard-proxy listening={local_addr} upstream_base_url={}",
-        config.upstream.base_url
+        "{}",
+        render_listening(local_addr, &config.upstream.base_url)
     );
 
     let state = proxy::ProxyState::new(
@@ -59,6 +61,13 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     axum::serve(listener, proxy::router(state))
         .await
         .map_err(|error| format!("server failed: {error}"))
+}
+
+fn render_listening(local_addr: impl std::fmt::Display, upstream_base_url: &str) -> String {
+    format!(
+        "llm-guard-proxy listening={local_addr} upstream_base_url={}",
+        redact_upstream_base_url(upstream_base_url)
+    )
 }
 
 fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> Result<Option<PathBuf>, String> {
@@ -94,7 +103,7 @@ mod tests {
 
     use llm_guard_proxy_core::{AppConfig, HeartbeatMode, RequestId};
 
-    use super::{parse_config_path, proxy::render_health};
+    use super::{parse_config_path, proxy::render_health, render_listening};
 
     #[test]
     fn renders_health_with_config_summary() {
@@ -123,5 +132,21 @@ mod tests {
             parse_config_path(args).expect("args should parse"),
             Some("dev.toml".into()),
         );
+    }
+
+    #[test]
+    fn renders_listening_with_redacted_upstream_base_url() {
+        let rendered = render_listening(
+            "127.0.0.1:18009",
+            "https://user:secret@example.test/v1?api_key=sk-test&safe=ok",
+        );
+
+        assert!(rendered.contains(
+            "upstream_base_url=https://redacted:redacted@example.test/v1?redacted=redacted&safe=ok"
+        ));
+        assert!(!rendered.contains("user"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("sk-test"));
+        assert!(!rendered.contains("api_key"));
     }
 }

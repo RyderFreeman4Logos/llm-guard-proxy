@@ -18,7 +18,7 @@ pub use settings::{
     MissingConfigPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
     ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig, RetryConfig,
     ServerConfig, ShieldingConfig, ThinkingConfig, UpstreamConfig, ValidationError,
-    default_config_path,
+    default_config_path, redact_upstream_base_url, validate_upstream_base_url,
 };
 
 /// Public service name used by the binary and documentation.

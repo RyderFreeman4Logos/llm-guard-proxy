@@ -512,6 +512,127 @@ async fn upstream_transport_failure_writes_failed_request_and_attempt() {
 }
 
 #[tokio::test]
+async fn oversized_body_failure_writes_failed_request_without_attempt() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body_len = MAX_PROXY_BODY_BYTES + 1;
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/completions?oversize=true")
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, body_len.to_string())
+        .body(Body::from(vec![b'a'; body_len]))
+        .expect("oversized request should build");
+
+    let response = proxy_handler(State(proxy.state.clone()), request).await;
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let response_body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("error response body should read");
+    let response_body =
+        String::from_utf8(response_body.to_vec()).expect("error response should be utf-8");
+    assert!(
+        response_body.contains("request_body_error"),
+        "error should identify body read failure: {response_body}"
+    );
+    assert_no_upstream_request(&mut fake).await;
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let request_row: (String, i64, String, String) = connection
+        .query_row(
+            "SELECT status, http_status, error_reason, request_metadata_json FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("failed request row should exist");
+    let attempt_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .expect("attempt count should be readable");
+    let request_metadata: serde_json::Value =
+        serde_json::from_str(&request_row.3).expect("request metadata should be json");
+    let body_len = body_len.to_string();
+
+    assert_eq!(request_row.0, "failed");
+    assert_eq!(request_row.1, 413);
+    assert!(request_row.2.contains("request_body_error"));
+    assert_eq!(request_metadata["method"], "POST");
+    assert_eq!(request_metadata["path"], "/v1/completions");
+    assert_eq!(request_metadata["query_present"], "true");
+    assert_eq!(request_metadata["request_body_bytes"], body_len.as_str());
+    assert_eq!(request_metadata["policy_transform_applied"], "false");
+    assert_eq!(attempt_count, 0);
+}
+
+#[tokio::test]
+async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
+    let proxy = ProxyFixture::spawn("http://127.0.0.1:1/v1", true).await;
+    let uri = Uri::from_static("/v1/models?limit=2");
+    let headers = HeaderMap::new();
+    let request_id =
+        RequestId::from_string("req-invalid-upstream").expect("request id should be valid");
+    let metadata = request_metadata(&Method::GET, &uri, &headers, 0, true);
+    let error = ProxyError::invalid_upstream_url(
+        "https://user:secret@example.test/v1?api_key=sk-test",
+        String::from("must not contain sensitive query parameters"),
+    )
+    .with_request_metadata(metadata);
+    let error_type = error.error_type();
+    let error_reason = error.to_string();
+    let request_metadata = error
+        .request_metadata()
+        .cloned()
+        .expect("invalid upstream URL should carry request metadata");
+
+    record_failed_request(
+        &proxy.store,
+        FailedRequestRecord {
+            request_id,
+            started_at_unix_ms: 1_000,
+            finished_at_unix_ms: 1_050,
+            http_status: error.status().as_u16(),
+            error_type,
+            error_reason,
+            request_metadata,
+            attempt: None,
+        },
+    );
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let request_row: (String, i64, String, String) = connection
+        .query_row(
+            "SELECT status, http_status, error_reason, request_metadata_json FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("failed request row should exist");
+    let attempt_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .expect("attempt count should be readable");
+    let request_metadata: serde_json::Value =
+        serde_json::from_str(&request_row.3).expect("request metadata should be json");
+
+    assert_eq!(request_row.0, "failed");
+    assert_eq!(request_row.1, 500);
+    assert!(request_row.2.contains("invalid_upstream_url"));
+    assert!(
+        request_row
+            .2
+            .contains("https://redacted:redacted@example.test/v1?redacted=redacted")
+    );
+    assert!(!request_row.2.contains("user:secret"));
+    assert!(!request_row.2.contains("secret"));
+    assert!(!request_row.2.contains("sk-test"));
+    assert!(!request_row.2.contains("api_key"));
+    assert_eq!(request_metadata["method"], "GET");
+    assert_eq!(request_metadata["path"], "/v1/models");
+    assert_eq!(request_metadata["query_present"], "true");
+    assert_eq!(request_metadata["request_body_bytes"], "0");
+    assert_eq!(request_metadata["policy_transform_applied"], "false");
+    assert_eq!(attempt_count, 0);
+}
+
+#[tokio::test]
 async fn dot_segment_paths_are_rejected_without_forwarding() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -575,6 +696,21 @@ fn upstream_url_rejects_percent_encoded_dot_segment_paths() {
         assert_eq!(error.status(), StatusCode::BAD_REQUEST);
         assert_eq!(error.error_type(), "invalid_request_path");
     }
+}
+
+#[test]
+fn upstream_url_rejects_and_redacts_credential_bearing_base_url() {
+    let uri = Uri::from_static("/v1/models");
+    let error = build_upstream_url("https://user:secret@example.test/v1?api_key=sk-test", &uri)
+        .expect_err("credential-bearing upstream URL should be rejected");
+    let error = error.to_string();
+
+    assert!(error.contains("invalid upstream base URL"));
+    assert!(error.contains("https://redacted:redacted@example.test/v1?redacted=redacted"));
+    assert!(!error.contains("user:secret"));
+    assert!(!error.contains("secret"));
+    assert!(!error.contains("sk-test"));
+    assert!(!error.contains("api_key"));
 }
 
 async fn next_chunk<S>(body: &mut S, wait: Duration, label: &str) -> Bytes
@@ -766,6 +902,7 @@ fn delayed_stream_response(
 struct ProxyFixture {
     base_url: String,
     client: Client,
+    state: ProxyState,
     store: ObservabilityStore,
     sqlite_path: PathBuf,
     root: PathBuf,
@@ -793,7 +930,7 @@ impl ProxyFixture {
             store.clone(),
             build_http_client().expect("client should build"),
         );
-        let app = router(state);
+        let app = router(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("proxy should bind");
@@ -809,6 +946,7 @@ impl ProxyFixture {
         Self {
             base_url: format!("http://{addr}"),
             client: build_http_client().expect("client should build"),
+            state,
             store,
             sqlite_path,
             root,

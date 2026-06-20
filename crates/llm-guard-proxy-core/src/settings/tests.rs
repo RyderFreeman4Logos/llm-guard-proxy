@@ -95,6 +95,66 @@ fn validates_retention_hysteresis() {
 }
 
 #[test]
+fn validates_normal_upstream_base_urls() {
+    for base_url in ["http://gb10:18009/v1", "https://host.example/v1"] {
+        let mut config = AppConfig::default();
+        config.upstream.base_url = base_url.to_owned();
+
+        config
+            .validate()
+            .expect("normal upstream URL should validate");
+    }
+}
+
+#[test]
+fn rejects_upstream_base_url_with_userinfo() {
+    let mut config = AppConfig::default();
+    config.upstream.base_url = String::from("https://user:secret@example.test/v1");
+
+    let error = config
+        .validate()
+        .expect_err("credential-bearing upstream URL should be rejected");
+
+    assert_eq!(error.field(), "upstream.base_url");
+    assert!(error.message().contains("userinfo"));
+    assert!(!error.to_string().contains("secret"));
+}
+
+#[test]
+fn rejects_upstream_base_url_with_sensitive_query_key() {
+    let mut config = AppConfig::default();
+    config.upstream.base_url =
+        String::from("https://example.test/v1?access_token=secret-token&safe=ok");
+
+    let error = config
+        .validate()
+        .expect_err("sensitive upstream URL query key should be rejected");
+
+    assert_eq!(error.field(), "upstream.base_url");
+    assert!(error.message().contains("sensitive query parameters"));
+    assert!(!error.to_string().contains("secret-token"));
+    assert!(!error.to_string().contains("access_token"));
+}
+
+#[test]
+fn redacts_upstream_base_url_for_display() {
+    let mut config = AppConfig::default();
+    config.upstream.base_url =
+        String::from("https://user:secret@example.test/v1?api_key=sk-test&safe=ok");
+
+    let redacted = config.upstream.redacted_base_url();
+
+    assert_eq!(
+        redacted,
+        "https://redacted:redacted@example.test/v1?redacted=redacted&safe=ok"
+    );
+    assert!(!redacted.contains("user"));
+    assert!(!redacted.contains("secret"));
+    assert!(!redacted.contains("sk-test"));
+    assert!(!redacted.contains("api_key"));
+}
+
+#[test]
 fn default_path_uses_defaults_when_file_is_absent() {
     let path = unique_test_path("missing-default.toml");
     let manager = ConfigManager::from_path_with_policy(&path, MissingConfigPolicy::UseDefaults)

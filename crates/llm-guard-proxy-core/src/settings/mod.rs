@@ -15,7 +15,8 @@ pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
     AppConfig, CloudflareConfig, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, MetadataConfig,
     ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig, ServerConfig,
-    ShieldingConfig, ThinkingConfig, UpstreamConfig,
+    ShieldingConfig, ThinkingConfig, UpstreamConfig, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 pub use reload::{
     ConfigHandle, ConfigManager, MissingConfigPolicy, ReloadOutcome, ReloadWatcher,

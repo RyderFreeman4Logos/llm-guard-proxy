@@ -20,7 +20,7 @@ use futures_util::Stream;
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DownstreamMode, Health,
     LICENSE, ObservabilityStore, RawPayloads, RequestId, RequestRecord, RequestStatus,
-    SERVICE_NAME, UpstreamMode,
+    SERVICE_NAME, UpstreamMode, redact_upstream_base_url, validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -176,15 +176,23 @@ async fn forward_openai_request(
     let method = parts.method;
     let uri = parts.uri;
     let downstream_headers = parts.headers;
-    let body = read_body_bytes(body).await?;
-    let config = state
-        .config
-        .snapshot()
-        .map_err(|error| ProxyError::ConfigSnapshot(error.to_string()))?;
-    let upstream_url = build_upstream_url(&config.upstream.base_url, &uri)?;
-    let model_id = extract_model_id(&body);
-    let attempt_id = AttemptId::for_request(request_id, 1);
-    let attempt_started_at_unix_ms = unix_time_millis();
+    let shielding_enabled_hint = config_shielding_enabled(&state.config);
+    let pre_body_request_metadata =
+        pre_upstream_request_metadata(&method, &uri, &downstream_headers, shielding_enabled_hint);
+    let body = read_body_bytes(body)
+        .await
+        .map_err(|error| error.with_request_metadata(pre_body_request_metadata))?;
+    let body_read_request_metadata = base_request_metadata(
+        &method,
+        &uri,
+        &downstream_headers,
+        body.len().to_string(),
+        shielding_enabled_hint,
+    );
+    let config = state.config.snapshot().map_err(|error| {
+        ProxyError::config_snapshot(error.to_string())
+            .with_request_metadata(body_read_request_metadata)
+    })?;
     let request_metadata = request_metadata(
         &method,
         &uri,
@@ -192,10 +200,17 @@ async fn forward_openai_request(
         body.len(),
         config.shielding.enabled,
     );
+    let upstream_url = build_upstream_url(&config.upstream.base_url, &uri)
+        .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    let reqwest_method = upstream_method(&method)
+        .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    let model_id = extract_model_id(&body);
+    let attempt_id = AttemptId::for_request(request_id, 1);
+    let attempt_started_at_unix_ms = unix_time_millis();
     let attempt_request_metadata = attempt_request_metadata(&method, &uri, &downstream_headers);
     let upstream_response = match send_upstream_request(
         &state.client,
-        method.clone(),
+        reqwest_method,
         upstream_url,
         &downstream_headers,
         body.clone(),
@@ -248,21 +263,24 @@ async fn forward_openai_request(
 async fn read_body_bytes(body: Body) -> Result<Bytes, ProxyError> {
     to_bytes(body, MAX_PROXY_BODY_BYTES)
         .await
-        .map_err(|error| ProxyError::RequestBody(error.to_string()))
+        .map_err(|error| ProxyError::request_body(error.to_string()))
+}
+
+fn upstream_method(method: &Method) -> Result<reqwest::Method, ProxyError> {
+    reqwest::Method::from_bytes(method.as_str().as_bytes())
+        .map_err(|error| ProxyError::invalid_method(error.to_string()))
 }
 
 async fn send_upstream_request(
     client: &Client,
-    method: Method,
+    method: reqwest::Method,
     upstream_url: Url,
     downstream_headers: &HeaderMap,
     body: Bytes,
 ) -> Result<reqwest::Response, ProxyError> {
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
-        .map_err(|error| ProxyError::InvalidMethod(error.to_string()))?;
     let headers = forwarded_request_headers(downstream_headers);
     client
-        .request(reqwest_method, upstream_url)
+        .request(method, upstream_url)
         .headers(headers)
         .body(body)
         .send()
@@ -430,9 +448,11 @@ impl Drop for ObservedUpstreamBody {
 
 fn build_upstream_url(base_url: &str, uri: &Uri) -> Result<Url, ProxyError> {
     validate_openai_path(uri.path())?;
+    validate_upstream_base_url(base_url)
+        .map_err(|error| ProxyError::invalid_upstream_url(base_url, error.to_string()))?;
 
-    let mut base =
-        Url::parse(base_url).map_err(|error| ProxyError::InvalidUpstreamUrl(error.to_string()))?;
+    let mut base = Url::parse(base_url)
+        .map_err(|error| ProxyError::invalid_upstream_url(base_url, error.to_string()))?;
     let path = upstream_path(base.path(), uri.path());
     base.set_path("");
     base.set_query(None);
@@ -445,7 +465,7 @@ fn build_upstream_url(base_url: &str, uri: &Uri) -> Result<Url, ProxyError> {
         url.push_str(query);
     }
 
-    Url::parse(&url).map_err(|error| ProxyError::InvalidUpstreamUrl(error.to_string()))
+    Url::parse(&url).map_err(|error| ProxyError::invalid_upstream_url(base_url, error.to_string()))
 }
 
 fn upstream_path(base_path: &str, downstream_path: &str) -> String {
@@ -904,16 +924,29 @@ fn unix_time_millis() -> u64 {
 
 #[derive(Debug, Error)]
 enum ProxyError {
-    #[error("failed to read request body within proxy limit: {0}")]
-    RequestBody(String),
-    #[error("failed to read current config: {0}")]
-    ConfigSnapshot(String),
-    #[error("invalid upstream base URL: {0}")]
-    InvalidUpstreamUrl(String),
+    #[error("failed to read request body within proxy limit: {reason}")]
+    RequestBody {
+        reason: String,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
+    #[error("failed to read current config: {reason}")]
+    ConfigSnapshot {
+        reason: String,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
+    #[error("invalid upstream base URL {display_url}: {reason}")]
+    InvalidUpstreamUrl {
+        display_url: String,
+        reason: String,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
     #[error("{0}")]
     InvalidRequestPath(#[from] OpenAiPathError),
-    #[error("invalid HTTP method: {0}")]
-    InvalidMethod(String),
+    #[error("invalid HTTP method: {reason}")]
+    InvalidMethod {
+        reason: String,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
     #[error("upstream request failed: {source}")]
     UpstreamTransport {
         #[source]
@@ -923,12 +956,41 @@ enum ProxyError {
 }
 
 impl ProxyError {
+    fn request_body(reason: String) -> Self {
+        Self::RequestBody {
+            reason,
+            request_metadata: None,
+        }
+    }
+
+    fn config_snapshot(reason: String) -> Self {
+        Self::ConfigSnapshot {
+            reason,
+            request_metadata: None,
+        }
+    }
+
+    fn invalid_upstream_url(base_url: &str, reason: String) -> Self {
+        Self::InvalidUpstreamUrl {
+            display_url: redact_upstream_base_url(base_url),
+            reason,
+            request_metadata: None,
+        }
+    }
+
+    fn invalid_method(reason: String) -> Self {
+        Self::InvalidMethod {
+            reason,
+            request_metadata: None,
+        }
+    }
+
     const fn status(&self) -> StatusCode {
         match self {
-            Self::RequestBody(_) => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::ConfigSnapshot(_) | Self::InvalidUpstreamUrl(_) | Self::InvalidMethod(_) => {
-                StatusCode::INTERNAL_SERVER_ERROR
-            }
+            Self::RequestBody { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::ConfigSnapshot { .. }
+            | Self::InvalidUpstreamUrl { .. }
+            | Self::InvalidMethod { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRequestPath(error) => error.status(),
             Self::UpstreamTransport { .. } => StatusCode::BAD_GATEWAY,
         }
@@ -936,26 +998,54 @@ impl ProxyError {
 
     const fn error_type(&self) -> &'static str {
         match self {
-            Self::RequestBody(_) => "request_body_error",
-            Self::ConfigSnapshot(_) => "config_snapshot_failed",
-            Self::InvalidUpstreamUrl(_) => "invalid_upstream_url",
+            Self::RequestBody { .. } => "request_body_error",
+            Self::ConfigSnapshot { .. } => "config_snapshot_failed",
+            Self::InvalidUpstreamUrl { .. } => "invalid_upstream_url",
             Self::InvalidRequestPath(error) => error.error_type(),
-            Self::InvalidMethod(_) => "invalid_method",
+            Self::InvalidMethod { .. } => "invalid_method",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
         }
     }
 
     fn request_metadata(&self) -> Option<&BTreeMap<String, String>> {
         match self {
+            Self::RequestBody {
+                request_metadata: Some(request_metadata),
+                ..
+            }
+            | Self::ConfigSnapshot {
+                request_metadata: Some(request_metadata),
+                ..
+            }
+            | Self::InvalidUpstreamUrl {
+                request_metadata: Some(request_metadata),
+                ..
+            }
+            | Self::InvalidMethod {
+                request_metadata: Some(request_metadata),
+                ..
+            } => Some(request_metadata),
             Self::UpstreamTransport {
                 observability: Some(observability),
                 ..
             } => Some(&observability.request_metadata),
-            Self::RequestBody(_)
-            | Self::ConfigSnapshot(_)
-            | Self::InvalidUpstreamUrl(_)
+            Self::RequestBody {
+                request_metadata: None,
+                ..
+            }
+            | Self::ConfigSnapshot {
+                request_metadata: None,
+                ..
+            }
+            | Self::InvalidUpstreamUrl {
+                request_metadata: None,
+                ..
+            }
             | Self::InvalidRequestPath(_)
-            | Self::InvalidMethod(_)
+            | Self::InvalidMethod {
+                request_metadata: None,
+                ..
+            }
             | Self::UpstreamTransport {
                 observability: None,
                 ..
@@ -969,15 +1059,42 @@ impl ProxyError {
                 observability: Some(observability),
                 ..
             } => Some(&observability.attempt_record),
-            Self::RequestBody(_)
-            | Self::ConfigSnapshot(_)
-            | Self::InvalidUpstreamUrl(_)
+            Self::RequestBody { .. }
+            | Self::ConfigSnapshot { .. }
+            | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidRequestPath(_)
-            | Self::InvalidMethod(_)
+            | Self::InvalidMethod { .. }
             | Self::UpstreamTransport {
                 observability: None,
                 ..
             } => None,
+        }
+    }
+
+    fn with_request_metadata(self, request_metadata: BTreeMap<String, String>) -> Self {
+        match self {
+            Self::RequestBody { reason, .. } => Self::RequestBody {
+                reason,
+                request_metadata: Some(request_metadata),
+            },
+            Self::ConfigSnapshot { reason, .. } => Self::ConfigSnapshot {
+                reason,
+                request_metadata: Some(request_metadata),
+            },
+            Self::InvalidUpstreamUrl {
+                display_url,
+                reason,
+                ..
+            } => Self::InvalidUpstreamUrl {
+                display_url,
+                reason,
+                request_metadata: Some(request_metadata),
+            },
+            Self::InvalidMethod { reason, .. } => Self::InvalidMethod {
+                reason,
+                request_metadata: Some(request_metadata),
+            },
+            error @ (Self::InvalidRequestPath(_) | Self::UpstreamTransport { .. }) => error,
         }
     }
 
@@ -994,11 +1111,11 @@ impl ProxyError {
                     attempt_record,
                 })),
             },
-            error @ (Self::RequestBody(_)
-            | Self::ConfigSnapshot(_)
-            | Self::InvalidUpstreamUrl(_)
+            error @ (Self::RequestBody { .. }
+            | Self::ConfigSnapshot { .. }
+            | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidRequestPath(_)
-            | Self::InvalidMethod(_)) => error,
+            | Self::InvalidMethod { .. }) => error,
         }
     }
 }
