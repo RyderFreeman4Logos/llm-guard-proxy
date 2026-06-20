@@ -650,8 +650,8 @@ async fn hermes_like_context_extraction_reads_enriched_model_length() {
 }
 
 #[tokio::test]
-async fn chat_completions_forwards_body_without_policy_rewrite() {
-    let fake = FakeUpstream::spawn().await;
+async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
+    let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
     let body = Bytes::from_static(
         br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"thinking":{"budget_tokens":1},"stream":false}"#,
@@ -668,14 +668,159 @@ async fn chat_completions_forwards_body_without_policy_rewrite() {
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
-        response.text().await.expect("body should be text"),
-        r#"{"id":"chatcmpl-test","object":"chat.completion"}"#
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("content type should be rewritten for downstream JSON"),
+        "application/json"
     );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-endpoint")
+            .expect("shielded fake upstream SSE should be used"),
+        "chat-completions-sse"
+    );
+    let aggregated_body = response.text().await.expect("body should be text");
+    let aggregated: serde_json::Value =
+        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    assert_eq!(aggregated["id"], "chatcmpl-shielded");
+    assert_eq!(aggregated["object"], "chat.completion");
+    assert_eq!(aggregated["created"], 1_710_000_000);
+    assert_eq!(aggregated["model"], "test-chat");
+    assert_eq!(aggregated["choices"][0]["index"], 0);
+    assert_eq!(aggregated["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(
+        aggregated["choices"][0]["message"]["reasoning_content"],
+        "think"
+    );
+    assert_eq!(
+        aggregated["choices"][0]["message"]["tool_calls"][0]["id"],
+        "call_1"
+    );
+    assert_eq!(
+        aggregated["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "lookup"
+    );
+    assert_eq!(
+        aggregated["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        r#"{"q":"x"}"#
+    );
+    assert_eq!(aggregated["choices"][0]["finish_reason"], "stop");
+    assert_eq!(aggregated["usage"]["prompt_tokens"], 3);
+    assert_eq!(aggregated["usage"]["completion_tokens"], 2);
+    assert_eq!(aggregated["usage"]["total_tokens"], 5);
 
-    let observed = fake.recv().await;
+    let observed = fake.recv_next().await;
     assert_eq!(observed.method, Method::POST);
     assert_eq!(observed.path_and_query, "/v1/chat/completions");
-    assert_eq!(observed.body, body);
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["model"], "test-chat");
+    assert_eq!(observed_body["messages"][0]["content"], "ping");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 1);
+    assert_eq!(observed_body["stream"], true);
+}
+
+#[tokio::test]
+async fn shielded_chat_attempt_metadata_records_stream_timings_and_delta_counts() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response.text().await.expect("body should be consumed");
+    let _observed = fake.recv().await;
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let metadata_json: String = connection
+        .query_row("SELECT response_metadata_json FROM attempts", [], |row| {
+            row.get(0)
+        })
+        .expect("attempt row should exist");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&metadata_json).expect("attempt metadata should be JSON");
+
+    assert_eq!(metadata["shielded_streaming"], "true");
+    assert_eq!(metadata["upstream_stream_forced"], "true");
+    assert_eq!(
+        metadata["upstream_response_header_content-type"],
+        "text/event-stream"
+    );
+    assert_eq!(metadata["finish_reason"], "stop");
+    assert_eq!(metadata["delta_count"], "3");
+    assert_eq!(metadata["content_delta_count"], "2");
+    assert_eq!(metadata["reasoning_delta_count"], "1");
+    assert_eq!(metadata["tool_call_delta_count"], "2");
+    assert_metadata_latency(&metadata, "first_byte_latency_ms");
+    assert_metadata_latency(&metadata, "first_token_latency_ms");
+}
+
+#[tokio::test]
+async fn hot_reloaded_disabled_shielding_falls_back_to_generic_chat_forwarding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream":false}"#,
+    );
+
+    let first = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("first proxy request should complete");
+    assert_eq!(first.status(), StatusCode::OK);
+    let _first_body = first.text().await.expect("first body should be text");
+    let first_observed = fake.recv_next().await;
+    let first_body: serde_json::Value =
+        serde_json::from_slice(&first_observed.body).expect("first upstream body should be JSON");
+    assert_eq!(first_body["stream"], true);
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[shielding]
+enabled = false
+",
+    );
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("shielding reload should succeed");
+
+    let second = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("second proxy request should complete");
+
+    assert!(outcome.applied);
+    assert_eq!(second.status(), StatusCode::OK);
+    assert_eq!(
+        second.text().await.expect("second body should be text"),
+        r#"{"id":"chatcmpl-test","object":"chat.completion"}"#
+    );
+    let second_observed = fake.recv_next().await;
+    assert_eq!(second_observed.body, body);
 }
 
 #[tokio::test]
@@ -774,7 +919,11 @@ async fn upstream_redirects_are_forwarded_without_following() {
         let observed = upstream.recv().await;
         assert_eq!(observed.method, Method::POST);
         assert_eq!(observed.path_and_query, "/v1/chat/completions");
-        assert_eq!(observed.body, body);
+        let observed_body: serde_json::Value = serde_json::from_slice(&observed.body)
+            .expect("redirected upstream body should be JSON");
+        assert_eq!(observed_body["model"], "test-chat");
+        assert_eq!(observed_body["messages"][0]["content"], "secret prompt");
+        assert_eq!(observed_body["stream"], true);
         assert!(
             target
                 .recv_within(Duration::from_millis(100))
@@ -1460,6 +1609,16 @@ fn assert_normalized_context_fields(model: &serde_json::Value, expected: u64) {
     assert_eq!(model["max_model_len"].as_u64(), Some(expected));
 }
 
+fn assert_metadata_latency(metadata: &serde_json::Value, key: &str) {
+    let value = metadata
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_else(|| panic!("{key} should be present"));
+    value
+        .parse::<u64>()
+        .unwrap_or_else(|error| panic!("{key} should be a u64 latency: {error}; value={value}"));
+}
+
 fn empty_get_request(uri: &'static str) -> Request<Body> {
     Request::builder()
         .method(Method::GET)
@@ -1709,6 +1868,7 @@ async fn fake_upstream_handler(
 ) -> Response<Body> {
     let observed = observe_request(request).await;
     let path_and_query = observed.path_and_query.clone();
+    let body = observed.body.clone();
     let endpoint = observed
         .path_and_query
         .split('?')
@@ -1740,7 +1900,7 @@ async fn fake_upstream_handler(
         );
     }
 
-    fake_upstream_endpoint_response(&endpoint, &path_and_query, &state)
+    fake_upstream_endpoint_response(&endpoint, &path_and_query, &state, &body)
 }
 
 async fn observe_request(request: Request<Body>) -> ObservedRequest {
@@ -1764,6 +1924,7 @@ fn fake_upstream_endpoint_response(
     endpoint: &str,
     path_and_query: &str,
     state: &FakeUpstreamState,
+    body: &Bytes,
 ) -> Response<Body> {
     if endpoint == "/v1/models" {
         if path_and_query.contains("test=model-metadata-chunked") {
@@ -1798,6 +1959,9 @@ fn fake_upstream_endpoint_response(
 
     let (label, body) = match endpoint {
         "/v1/models" => ("models", r#"{"object":"list","data":[]}"#),
+        "/v1/chat/completions" if body_requests_stream(body) => {
+            return chat_completion_sse_response();
+        }
         "/v1/chat/completions" => (
             "chat-completions",
             r#"{"id":"chatcmpl-test","object":"chat.completion"}"#,
@@ -1851,6 +2015,96 @@ fn json_response(label: &'static str, body: String) -> Response<Body> {
         HeaderValue::from_str(label).expect("static label should be a valid header"),
     );
     response
+}
+
+fn chat_completion_sse_response() -> Response<Body> {
+    let chunks = [
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": "Hel"
+                },
+                "finish_reason": null
+            }]
+        })),
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": "lo",
+                    "reasoning_content": "think",
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "lookup",
+                            "arguments": "{\"q\""
+                        }
+                    }]
+                },
+                "finish_reason": null
+            }]
+        })),
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": ":\"x\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5
+            }
+        })),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    let body = Body::from_stream(stream::iter(
+        chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+    ));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_static("chat-completions-sse"),
+    );
+    response
+}
+
+fn sse_json(value: &serde_json::Value) -> Bytes {
+    Bytes::from(format!("data: {value}\n\n"))
+}
+
+fn body_requests_stream(body: &Bytes) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
 }
 
 fn chunked_json_response(

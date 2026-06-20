@@ -401,6 +401,7 @@ fn redacts_authorization_and_api_key_like_values_before_persistence() {
             String::from("content-type"),
             String::from("application/json"),
         ),
+        (String::from("first_token_latency_ms"), String::from("12")),
     ]);
     request.raw_payloads = RawPayloads {
         input: Some(String::from(r#"{"api_key":"sk-fixture-secret"}"#)),
@@ -434,6 +435,7 @@ WHERE request_id = 'req-redaction'
     assert!(!metadata_json.contains("sk-fixture-secret"));
     assert!(!metadata_json.contains("fixture-api-key-value"));
     assert!(metadata_json.contains("[REDACTED]"));
+    assert!(metadata_json.contains(r#""first_token_latency_ms":"12""#));
     assert_eq!(raw_input.as_deref(), Some("[REDACTED]"));
     assert_eq!(
         raw_output.as_deref(),
