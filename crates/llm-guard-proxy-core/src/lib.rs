@@ -5,6 +5,17 @@
 //! configuration, observability, retry, and storage behavior behind core
 //! interfaces.
 
+mod settings;
+
+pub use settings::{
+    AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
+    DEFAULT_CONFIG_RELATIVE_PATH, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, MetadataConfig,
+    MissingConfigPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
+    ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig, RetryConfig,
+    ServerConfig, ShieldingConfig, ThinkingConfig, UpstreamConfig, ValidationError,
+    default_config_path,
+};
+
 /// Public service name used by the binary and documentation.
 pub const SERVICE_NAME: &str = "llm-guard-proxy";
 
