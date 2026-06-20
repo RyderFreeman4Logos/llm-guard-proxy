@@ -42,6 +42,7 @@ const MODEL_METADATA_CHUNKED_FIRST: &[u8] =
 const MODEL_METADATA_CHUNKED_SECOND: &[u8] =
     br#""max_model_len":256000,"owned_by":"vllm","extra":"keep"}]}"#;
 const MODEL_METADATA_NO_CONTEXT_BODY: &str = r#"{"object":"list","data":[{"id":"fallback-model","object":"model","owned_by":"vllm","extra":"keep"}]}"#;
+const LARGE_MODEL_METADATA_EXTRA_BYTES: usize = 1024 * 1024;
 static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
@@ -163,6 +164,204 @@ async fn get_models_enriches_chunked_context_metadata_without_content_length() {
         observed.path_and_query,
         "/v1/models?test=model-metadata-chunked"
     );
+}
+
+#[tokio::test]
+async fn enriched_models_response_holds_in_flight_permit_until_downstream_body_finishes() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 1).await;
+    let first_request = empty_get_request("/v1/models?test=model-metadata-large");
+
+    let first_response = proxy_handler(State(proxy.state.clone()), first_request).await;
+
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("first models request should reach upstream and hold the only permit");
+    assert_eq!(first_observed.method, Method::GET);
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/models?test=model-metadata-large"
+    );
+    assert_eq!(
+        proxy
+            .store
+            .retention_usage()
+            .expect("usage should be readable")
+            .record_count,
+        0,
+        "enriched model responses must not be recorded before downstream body completion"
+    );
+
+    let second_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata"),
+    )
+    .await;
+
+    assert_eq!(second_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let second_body = to_bytes(second_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("limit response body should read");
+    let second_body =
+        String::from_utf8(second_body.to_vec()).expect("limit response should be utf-8");
+    assert!(
+        second_body.contains("proxy_in_flight_limit_exceeded"),
+        "second request should be rejected while first model body is undrained: {second_body}"
+    );
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "permit rejection must happen before a second upstream request is sent"
+    );
+
+    let first_body = to_bytes(first_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("first enriched model body should read");
+    let first_body =
+        String::from_utf8(first_body.to_vec()).expect("first enriched model body should be utf-8");
+    let first_model_record = first_model(&first_body);
+    assert_eq!(first_model_record["context_length"].as_u64(), Some(256_000));
+    assert_eq!(
+        first_model_record["extra"]
+            .as_str()
+            .expect("large extra field should stay present")
+            .len(),
+        LARGE_MODEL_METADATA_EXTRA_BYTES
+    );
+
+    let third_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata"),
+    )
+    .await;
+
+    assert_eq!(third_response.status(), StatusCode::OK);
+    let third_body = to_bytes(third_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("third model body should read after capacity is released");
+    let third_body =
+        String::from_utf8(third_body.to_vec()).expect("third model body should be utf-8");
+    assert_eq!(
+        first_model(&third_body)["context_length"].as_u64(),
+        Some(256_000)
+    );
+    let third_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("third request should reach upstream after first body completion");
+    assert_eq!(
+        third_observed.path_and_query,
+        "/v1/models?test=model-metadata"
+    );
+}
+
+#[tokio::test]
+async fn enriched_models_observability_records_success_after_body_consumption() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("models request should reach upstream");
+    assert_eq!(
+        proxy
+            .store
+            .retention_usage()
+            .expect("usage should be readable")
+            .record_count,
+        0,
+        "success must wait until the enriched body reaches EOF"
+    );
+
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("enriched model body should read");
+    let expected_body_len = body.len().to_string();
+    let body = String::from_utf8(body.to_vec()).expect("enriched model body should be utf-8");
+    assert_eq!(first_model(&body)["context_length"].as_u64(), Some(256_000));
+
+    assert_eq!(
+        proxy
+            .store
+            .retention_usage()
+            .expect("usage should be readable")
+            .record_count,
+        2
+    );
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+
+    assert_eq!(request_row.status, "succeeded");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(request_row.abort_reason, None);
+    assert_eq!(
+        request_row.response_metadata["response_body_bytes"],
+        expected_body_len.as_str()
+    );
+    assert_eq!(request_row.response_metadata["http_status_success"], "true");
+    assert_eq!(attempt_row.status, "succeeded");
+    assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(attempt_row.abort_reason, None);
+    assert_eq!(
+        attempt_row.response_metadata["response_body_bytes"],
+        expected_body_len.as_str()
+    );
+}
+
+#[tokio::test]
+async fn enriched_models_observability_records_abort_when_body_is_dropped() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("models request should reach upstream");
+    assert_eq!(
+        proxy
+            .store
+            .retention_usage()
+            .expect("usage should be readable")
+            .record_count,
+        0,
+        "droppable response body should own the pending observability record"
+    );
+
+    drop(response);
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+
+    assert_eq!(request_row.status, "aborted");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(
+        request_row.abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+    assert_eq!(request_row.response_metadata["response_body_bytes"], "0");
+    assert_eq!(attempt_row.status, "aborted");
+    assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(
+        attempt_row.abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+    assert_eq!(attempt_row.response_metadata["response_body_bytes"], "0");
 }
 
 #[tokio::test]
@@ -1181,6 +1380,62 @@ fn hermes_like_context_length(model: &serde_json::Value) -> Option<u64> {
         .find_map(|key| model.get(key).and_then(serde_json::Value::as_u64))
 }
 
+fn empty_get_request(uri: &'static str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())
+        .expect("GET request should build")
+}
+
+#[derive(Debug)]
+struct ForwardedRecordRow {
+    status: String,
+    http_status: i64,
+    abort_reason: Option<String>,
+    response_metadata: serde_json::Value,
+}
+
+fn read_single_forwarded_request_row(sqlite_path: &Path) -> ForwardedRecordRow {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let row: (String, i64, Option<String>, String) = connection
+        .query_row(
+            "SELECT status, http_status, abort_reason, response_metadata_json FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("request row should exist");
+    let response_metadata =
+        serde_json::from_str(&row.3).expect("request response metadata should be json");
+
+    ForwardedRecordRow {
+        status: row.0,
+        http_status: row.1,
+        abort_reason: row.2,
+        response_metadata,
+    }
+}
+
+fn read_single_forwarded_attempt_row(sqlite_path: &Path) -> ForwardedRecordRow {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let row: (String, i64, Option<String>, String) = connection
+        .query_row(
+            "SELECT status, http_status, abort_reason, response_metadata_json FROM attempts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("attempt row should exist");
+    let response_metadata =
+        serde_json::from_str(&row.3).expect("attempt response metadata should be json");
+
+    ForwardedRecordRow {
+        status: row.0,
+        http_status: row.1,
+        abort_reason: row.2,
+        response_metadata,
+    }
+}
+
 #[derive(Debug)]
 struct ObservedRequest {
     method: Method,
@@ -1438,6 +1693,9 @@ fn fake_upstream_endpoint_response(
                 MODEL_METADATA_CHUNKED_SECOND,
             );
         }
+        if path_and_query.contains("test=model-metadata-large") {
+            return json_response("models", large_model_metadata_body());
+        }
         if path_and_query.contains("test=model-metadata-changing") {
             let max_model_len = state
                 .changing_model_len
@@ -1481,6 +1739,13 @@ fn fake_upstream_endpoint_response(
 fn model_metadata_body(max_model_len: u64) -> String {
     format!(
         r#"{{"object":"list","data":[{{"id":"aeon-ultimate","object":"model","max_model_len":{max_model_len},"owned_by":"vllm","extra":"keep"}}]}}"#
+    )
+}
+
+fn large_model_metadata_body() -> String {
+    format!(
+        r#"{{"object":"list","data":[{{"id":"large-model","object":"model","max_model_len":256000,"owned_by":"vllm","extra":"{}"}}]}}"#,
+        "x".repeat(LARGE_MODEL_METADATA_EXTRA_BYTES)
     )
 }
 

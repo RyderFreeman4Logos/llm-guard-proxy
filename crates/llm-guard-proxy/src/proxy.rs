@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
+    convert::Infallible,
     fmt,
     path::{Path, PathBuf},
     pin::Pin,
@@ -502,15 +503,13 @@ async fn forward_enriched_models_response(
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
     let body = model_metadata::enrich_models_body(metadata_config, body);
-    let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
     let observer = response_parts.into_observer();
-    observer.record(body_len, &BodyCompletion::Succeeded);
-    drop(in_flight_permit);
+    let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit);
 
     Ok(downstream_response(
         upstream_status,
         &upstream_headers,
-        Body::from(body),
+        Body::from_stream(response_body),
     ))
 }
 
@@ -668,6 +667,56 @@ impl Stream for ObservedUpstreamBody {
 }
 
 impl Drop for ObservedUpstreamBody {
+    fn drop(&mut self) {
+        self.record_once(&BodyCompletion::DownstreamDropped);
+    }
+}
+
+struct ObservedBufferedBody {
+    body: Option<Bytes>,
+    observer: Option<ForwardedBodyObserver>,
+    _in_flight_permit: OwnedSemaphorePermit,
+    bytes_seen: u64,
+}
+
+impl ObservedBufferedBody {
+    fn new(
+        body: Bytes,
+        observer: ForwardedBodyObserver,
+        in_flight_permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            body: (!body.is_empty()).then_some(body),
+            observer: Some(observer),
+            _in_flight_permit: in_flight_permit,
+            bytes_seen: 0,
+        }
+    }
+
+    fn record_once(&mut self, completion: &BodyCompletion) {
+        if let Some(observer) = self.observer.take() {
+            observer.record(self.bytes_seen, completion);
+        }
+    }
+}
+
+impl Stream for ObservedBufferedBody {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(body) = this.body.take() {
+            let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+            this.bytes_seen = this.bytes_seen.saturating_add(body_len);
+            return Poll::Ready(Some(Ok(body)));
+        }
+
+        this.record_once(&BodyCompletion::Succeeded);
+        Poll::Ready(None)
+    }
+}
+
+impl Drop for ObservedBufferedBody {
     fn drop(&mut self) {
         self.record_once(&BodyCompletion::DownstreamDropped);
     }
