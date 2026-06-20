@@ -2,6 +2,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -32,6 +33,7 @@ const SSE_FIRST_CHUNK: &[u8] = b"data: first\n\n";
 const SSE_SECOND_CHUNK: &[u8] = b"data: second\n\n";
 const LONG_JSON_FIRST_CHUNK: &[u8] = br#"{"object":"list","data":["#;
 const LONG_JSON_SECOND_CHUNK: &[u8] = br"]}";
+static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
 async fn get_models_forwards_method_path_query_and_headers() {
@@ -370,6 +372,146 @@ async fn observability_disabled_skips_new_forwarded_records() {
 }
 
 #[tokio::test]
+async fn invalid_openai_path_writes_failed_request_without_attempt() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = send_raw_proxy_get(&proxy.base_url, "/v1/../admin").await;
+
+    assert!(
+        response.starts_with("HTTP/1.1 400 Bad Request"),
+        "dot-segment target should be rejected: {response}"
+    );
+    assert!(
+        response.contains("invalid_request_path"),
+        "error body should identify the path validation failure: {response}"
+    );
+    assert_no_upstream_request(&mut fake).await;
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let request_row: (String, i64, String, String) = connection
+        .query_row(
+            "SELECT status, http_status, error_reason, request_metadata_json FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("failed request row should exist");
+    let attempt_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .expect("attempt count should be readable");
+    let request_metadata: serde_json::Value =
+        serde_json::from_str(&request_row.3).expect("request metadata should be json");
+
+    assert_eq!(request_row.0, "failed");
+    assert_eq!(request_row.1, 400);
+    assert!(request_row.2.contains("invalid_request_path"));
+    assert_eq!(request_metadata["method"], "GET");
+    assert_eq!(request_metadata["path"], "/v1/../admin");
+    assert_eq!(request_metadata["query_present"], "false");
+    assert_eq!(request_metadata["policy_transform_applied"], "false");
+    assert_eq!(request_metadata["request_body_bytes"], "unknown");
+    assert_eq!(attempt_count, 0);
+}
+
+#[tokio::test]
+async fn upstream_transport_failure_writes_failed_request_and_attempt() {
+    let upstream_base_url = closed_upstream_base_url().await;
+    let proxy = ProxyFixture::spawn(&upstream_base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"transport-failure-model","prompt":"ping"}"#)
+        .send()
+        .await
+        .expect("proxy request should complete with gateway error");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("body should be text");
+    assert!(
+        body.contains("upstream_transport_error"),
+        "gateway error should identify upstream transport failure: {body}"
+    );
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let request_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+        .expect("request count should be readable");
+    let attempt_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .expect("attempt count should be readable");
+    let request_row: (String, i64, String, String, String) = connection
+        .query_row(
+            "SELECT status, http_status, error_reason, request_metadata_json, response_metadata_json FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+        )
+        .expect("failed request row should exist");
+    let attempt_row: (
+        String,
+        Option<i64>,
+        String,
+        String,
+        String,
+        Option<i64>,
+        i64,
+        i64,
+    ) = connection
+        .query_row(
+            "SELECT status, http_status, error_reason, request_metadata_json, response_metadata_json, duration_ms, started_at_unix_ms, finished_at_unix_ms FROM attempts",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .expect("failed attempt row should exist");
+    let request_metadata: serde_json::Value =
+        serde_json::from_str(&request_row.3).expect("request metadata should be json");
+    let request_response_metadata: serde_json::Value =
+        serde_json::from_str(&request_row.4).expect("request response metadata should be json");
+    let attempt_metadata: serde_json::Value =
+        serde_json::from_str(&attempt_row.3).expect("attempt metadata should be json");
+    let attempt_response_metadata: serde_json::Value =
+        serde_json::from_str(&attempt_row.4).expect("attempt response metadata should be json");
+
+    assert_eq!(request_count, 1);
+    assert_eq!(attempt_count, 1);
+    assert_eq!(request_row.0, "failed");
+    assert_eq!(request_row.1, 502);
+    assert!(request_row.2.contains("upstream_transport_error"));
+    assert_eq!(request_metadata["method"], "POST");
+    assert_eq!(request_metadata["path"], "/v1/completions");
+    assert_eq!(request_metadata["request_body_bytes"], "51");
+    assert_eq!(request_metadata["policy_transform_applied"], "false");
+    assert_eq!(
+        request_response_metadata["error_type"],
+        "upstream_transport_error"
+    );
+    assert_eq!(attempt_row.0, "failed");
+    assert_eq!(attempt_row.1, None);
+    assert!(attempt_row.2.contains("upstream_transport_error"));
+    assert_eq!(attempt_metadata["method"], "POST");
+    assert_eq!(attempt_metadata["path"], "/v1/completions");
+    assert_eq!(attempt_metadata["attempt_number"], "1");
+    assert_eq!(
+        attempt_response_metadata["upstream_response_received"],
+        "false"
+    );
+    assert!(attempt_row.5.is_some());
+    assert!(attempt_row.7 >= attempt_row.6);
+}
+
+#[tokio::test]
 async fn dot_segment_paths_are_rejected_without_forwarding() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -493,6 +635,17 @@ impl FakeUpstream {
     async fn recv_within(&mut self, wait: Duration) -> Option<ObservedRequest> {
         timeout(wait, self.receiver.recv()).await.ok().flatten()
     }
+}
+
+async fn closed_upstream_base_url() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("closed upstream listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("closed upstream address should be available");
+    drop(listener);
+    format!("http://{addr}/v1")
 }
 
 async fn fake_upstream_handler(
@@ -703,7 +856,11 @@ fn unique_test_dir(name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time should be after unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("llm-guard-proxy-{nanos}-{name}"))
+    let counter = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!(
+        "llm-guard-proxy-{}-{nanos}-{counter}-{name}",
+        std::process::id()
+    ))
 }
 
 fn set_owner_only_dir(path: &Path) {

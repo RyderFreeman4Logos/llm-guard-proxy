@@ -109,26 +109,57 @@ async fn health_handler(State(state): State<ProxyState>) -> Response<Body> {
 }
 
 async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
-    if let Err(error) = validate_openai_path(request.uri().path()) {
-        return proxy_error_response(error.status(), error.error_type(), &error.to_string());
-    }
-
     let request_id = RequestId::generate();
     let started_at_unix_ms = unix_time_millis();
+    if let Err(error) = validate_openai_path(request.uri().path()) {
+        let finished_at_unix_ms = unix_time_millis();
+        let error_type = error.error_type();
+        let error_reason = error.to_string();
+        let response = proxy_error_response(error.status(), error_type, &error_reason);
+        let request_metadata = pre_upstream_request_metadata(
+            request.method(),
+            request.uri(),
+            request.headers(),
+            config_shielding_enabled(&state.config),
+        );
+        record_failed_request(
+            &state.store,
+            FailedRequestRecord {
+                request_id,
+                started_at_unix_ms,
+                finished_at_unix_ms,
+                http_status: error.status().as_u16(),
+                error_type,
+                error_reason,
+                request_metadata,
+                attempt: None,
+            },
+        );
+        return response;
+    }
+
     match forward_openai_request(&state, &request_id, started_at_unix_ms, request).await {
         Ok(response) => response,
         Err(error) => {
             let finished_at_unix_ms = unix_time_millis();
-            let response =
-                proxy_error_response(error.status(), error.error_type(), &error.to_string());
+            let error_type = error.error_type();
+            let error_reason = error.to_string();
+            let response = proxy_error_response(error.status(), error_type, &error_reason);
+            let request_metadata = error.request_metadata().cloned().unwrap_or_else(|| {
+                BTreeMap::from([(String::from("proxy_error"), error_type.to_owned())])
+            });
             record_failed_request(
                 &state.store,
-                request_id,
-                started_at_unix_ms,
-                finished_at_unix_ms,
-                error.status().as_u16(),
-                error.error_type(),
-                &error.to_string(),
+                FailedRequestRecord {
+                    request_id,
+                    started_at_unix_ms,
+                    finished_at_unix_ms,
+                    http_status: error.status().as_u16(),
+                    error_type,
+                    error_reason,
+                    request_metadata,
+                    attempt: error.attempt_record(),
+                },
             );
             response
         }
@@ -154,18 +185,6 @@ async fn forward_openai_request(
     let model_id = extract_model_id(&body);
     let attempt_id = AttemptId::for_request(request_id, 1);
     let attempt_started_at_unix_ms = unix_time_millis();
-
-    let upstream_response = send_upstream_request(
-        &state.client,
-        method.clone(),
-        upstream_url,
-        &downstream_headers,
-        body.clone(),
-    )
-    .await?;
-    let upstream_status = upstream_response.status();
-    let upstream_headers = upstream_response.headers().clone();
-    let upstream_mode = upstream_mode_from_headers(&upstream_headers);
     let request_metadata = request_metadata(
         &method,
         &uri,
@@ -174,6 +193,34 @@ async fn forward_openai_request(
         config.shielding.enabled,
     );
     let attempt_request_metadata = attempt_request_metadata(&method, &uri, &downstream_headers);
+    let upstream_response = match send_upstream_request(
+        &state.client,
+        method.clone(),
+        upstream_url,
+        &downstream_headers,
+        body.clone(),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let finished_at_unix_ms = unix_time_millis();
+            let error_reason = error.to_string();
+            let attempt_record = failed_attempt_record(
+                attempt_id,
+                request_id.clone(),
+                attempt_started_at_unix_ms,
+                finished_at_unix_ms,
+                error.error_type(),
+                &error_reason,
+                attempt_request_metadata,
+            );
+            return Err(error.with_observability(request_metadata, attempt_record));
+        }
+    };
+    let upstream_status = upstream_response.status();
+    let upstream_headers = upstream_response.headers().clone();
+    let upstream_mode = upstream_mode_from_headers(&upstream_headers);
     let observer = ForwardedBodyObserver {
         store: state.store.clone(),
         request_id: request_id.clone(),
@@ -220,7 +267,10 @@ async fn send_upstream_request(
         .body(body)
         .send()
         .await
-        .map_err(ProxyError::UpstreamTransport)
+        .map_err(|source| ProxyError::UpstreamTransport {
+            source,
+            observability: None,
+        })
 }
 
 struct ForwardedBodyObserver {
@@ -492,6 +542,37 @@ fn request_metadata(
     body_len: usize,
     shielding_enabled: bool,
 ) -> BTreeMap<String, String> {
+    base_request_metadata(
+        method,
+        uri,
+        headers,
+        body_len.to_string(),
+        Some(shielding_enabled),
+    )
+}
+
+fn pre_upstream_request_metadata(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    shielding_enabled: Option<bool>,
+) -> BTreeMap<String, String> {
+    base_request_metadata(
+        method,
+        uri,
+        headers,
+        request_body_bytes_hint(headers),
+        shielding_enabled,
+    )
+}
+
+fn base_request_metadata(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    request_body_bytes: String,
+    shielding_enabled: Option<bool>,
+) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::from([
         (String::from("method"), method.as_str().to_owned()),
         (String::from("path"), uri.path().to_owned()),
@@ -499,10 +580,11 @@ fn request_metadata(
             String::from("query_present"),
             uri.query().is_some().to_string(),
         ),
-        (String::from("request_body_bytes"), body_len.to_string()),
+        (String::from("request_body_bytes"), request_body_bytes),
         (
             String::from("shielding_config_enabled"),
-            shielding_enabled.to_string(),
+            shielding_enabled
+                .map_or_else(|| String::from("unknown"), |enabled| enabled.to_string()),
         ),
         (
             String::from("policy_transform_applied"),
@@ -511,6 +593,14 @@ fn request_metadata(
     ]);
     copy_selected_header_metadata(&mut metadata, headers, "request");
     metadata
+}
+
+fn request_body_bytes_hint(headers: &HeaderMap) -> String {
+    headers
+        .get(CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .map_or_else(|| String::from("unknown"), |bytes| bytes.to_string())
 }
 
 fn attempt_request_metadata(
@@ -547,6 +637,26 @@ fn response_metadata(
     ]);
     copy_selected_header_metadata(&mut metadata, headers, "response");
     metadata
+}
+
+fn failed_response_metadata(
+    started_at_unix_ms: u64,
+    finished_at_unix_ms: u64,
+    error_type: &str,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (String::from("error_type"), error_type.to_owned()),
+        (
+            String::from("latency_ms"),
+            finished_at_unix_ms
+                .saturating_sub(started_at_unix_ms)
+                .to_string(),
+        ),
+        (
+            String::from("upstream_response_received"),
+            String::from("false"),
+        ),
+    ])
 }
 
 fn copy_selected_header_metadata(
@@ -669,37 +779,77 @@ const fn hex_value(byte: u8) -> Option<u8> {
     }
 }
 
-fn record_failed_request(
-    store: &ObservabilityStore,
+fn config_shielding_enabled(config: &ConfigHandle) -> Option<bool> {
+    config
+        .snapshot()
+        .ok()
+        .map(|snapshot| snapshot.shielding.enabled)
+}
+
+fn failed_attempt_record(
+    attempt_id: AttemptId,
+    request_id: RequestId,
+    started_at_unix_ms: u64,
+    finished_at_unix_ms: u64,
+    error_type: &str,
+    error_reason: &str,
+    request_metadata: BTreeMap<String, String>,
+) -> AttemptRecord {
+    AttemptRecord {
+        attempt_id,
+        request_id,
+        attempt_number: 1,
+        started_at_unix_ms,
+        finished_at_unix_ms: Some(finished_at_unix_ms),
+        upstream_mode: UpstreamMode::NotApplicable,
+        status: AttemptStatus::Failed,
+        http_status: None,
+        error_reason: Some(format!("{error_type}: {error_reason}")),
+        retry_reason: None,
+        abort_reason: None,
+        request_metadata,
+        response_metadata: failed_response_metadata(
+            started_at_unix_ms,
+            finished_at_unix_ms,
+            error_type,
+        ),
+        raw_payloads: RawPayloads::default(),
+    }
+}
+
+struct FailedRequestRecord<'attempt> {
     request_id: RequestId,
     started_at_unix_ms: u64,
     finished_at_unix_ms: u64,
     http_status: u16,
-    error_type: &str,
-    error_reason: &str,
-) {
+    error_type: &'static str,
+    error_reason: String,
+    request_metadata: BTreeMap<String, String>,
+    attempt: Option<&'attempt AttemptRecord>,
+}
+
+fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecord<'_>) {
     let request_record = RequestRecord {
-        request_id,
-        started_at_unix_ms,
-        finished_at_unix_ms: Some(finished_at_unix_ms),
+        request_id: failure.request_id,
+        started_at_unix_ms: failure.started_at_unix_ms,
+        finished_at_unix_ms: Some(failure.finished_at_unix_ms),
         downstream_mode: DownstreamMode::NonStreamJson,
         upstream_mode: UpstreamMode::NotApplicable,
         model_id: None,
         input_fingerprint: None,
         status: RequestStatus::Failed,
-        http_status: Some(http_status),
-        error_reason: Some(format!("{error_type}: {error_reason}")),
+        http_status: Some(failure.http_status),
+        error_reason: Some(format!("{}: {}", failure.error_type, failure.error_reason)),
         abort_reason: None,
-        request_metadata: BTreeMap::from([(String::from("proxy_error"), error_type.to_owned())]),
-        response_metadata: BTreeMap::from([(
-            String::from("latency_ms"),
-            finished_at_unix_ms
-                .saturating_sub(started_at_unix_ms)
-                .to_string(),
-        )]),
+        request_metadata: failure.request_metadata,
+        response_metadata: failed_response_metadata(
+            failure.started_at_unix_ms,
+            failure.finished_at_unix_ms,
+            failure.error_type,
+        ),
         raw_payloads: RawPayloads::default(),
     };
-    record_observability(store, &request_record, None);
+    record_observability(store, &request_record, failure.attempt);
 }
 
 fn record_observability(
@@ -764,8 +914,12 @@ enum ProxyError {
     InvalidRequestPath(#[from] OpenAiPathError),
     #[error("invalid HTTP method: {0}")]
     InvalidMethod(String),
-    #[error("upstream request failed: {0}")]
-    UpstreamTransport(#[source] reqwest::Error),
+    #[error("upstream request failed: {source}")]
+    UpstreamTransport {
+        #[source]
+        source: reqwest::Error,
+        observability: Option<Box<FailedUpstreamObservability>>,
+    },
 }
 
 impl ProxyError {
@@ -776,7 +930,7 @@ impl ProxyError {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
             Self::InvalidRequestPath(error) => error.status(),
-            Self::UpstreamTransport(_) => StatusCode::BAD_GATEWAY,
+            Self::UpstreamTransport { .. } => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -787,9 +941,72 @@ impl ProxyError {
             Self::InvalidUpstreamUrl(_) => "invalid_upstream_url",
             Self::InvalidRequestPath(error) => error.error_type(),
             Self::InvalidMethod(_) => "invalid_method",
-            Self::UpstreamTransport(_) => "upstream_transport_error",
+            Self::UpstreamTransport { .. } => "upstream_transport_error",
         }
     }
+
+    fn request_metadata(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            Self::UpstreamTransport {
+                observability: Some(observability),
+                ..
+            } => Some(&observability.request_metadata),
+            Self::RequestBody(_)
+            | Self::ConfigSnapshot(_)
+            | Self::InvalidUpstreamUrl(_)
+            | Self::InvalidRequestPath(_)
+            | Self::InvalidMethod(_)
+            | Self::UpstreamTransport {
+                observability: None,
+                ..
+            } => None,
+        }
+    }
+
+    fn attempt_record(&self) -> Option<&AttemptRecord> {
+        match self {
+            Self::UpstreamTransport {
+                observability: Some(observability),
+                ..
+            } => Some(&observability.attempt_record),
+            Self::RequestBody(_)
+            | Self::ConfigSnapshot(_)
+            | Self::InvalidUpstreamUrl(_)
+            | Self::InvalidRequestPath(_)
+            | Self::InvalidMethod(_)
+            | Self::UpstreamTransport {
+                observability: None,
+                ..
+            } => None,
+        }
+    }
+
+    fn with_observability(
+        self,
+        request_metadata: BTreeMap<String, String>,
+        attempt_record: AttemptRecord,
+    ) -> Self {
+        match self {
+            Self::UpstreamTransport { source, .. } => Self::UpstreamTransport {
+                source,
+                observability: Some(Box::new(FailedUpstreamObservability {
+                    request_metadata,
+                    attempt_record,
+                })),
+            },
+            error @ (Self::RequestBody(_)
+            | Self::ConfigSnapshot(_)
+            | Self::InvalidUpstreamUrl(_)
+            | Self::InvalidRequestPath(_)
+            | Self::InvalidMethod(_)) => error,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FailedUpstreamObservability {
+    request_metadata: BTreeMap<String, String>,
+    attempt_record: AttemptRecord,
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
