@@ -41,14 +41,9 @@ fn enrich_model_record(config: &MetadataConfig, record: &mut Map<String, Value>)
     };
 
     let mut changed = false;
-    changed |= set_u64_field(record, "context_length", context_length);
-    changed |= set_u64_field(record, "max_context_length", context_length);
-
-    let max_model_len = numeric_field(record, "max_model_len")
-        .or_else(|| config.max_model_len_override.map(u64::from))
-        .unwrap_or(context_length);
-    changed |= set_u64_field(record, "max_model_len", max_model_len);
-
+    for field in ["context_length", "max_context_length", "max_model_len"] {
+        changed |= set_u64_field(record, field, context_length);
+    }
     changed
 }
 

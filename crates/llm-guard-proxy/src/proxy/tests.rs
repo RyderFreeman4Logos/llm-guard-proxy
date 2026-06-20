@@ -42,6 +42,8 @@ const MODEL_METADATA_CHUNKED_FIRST: &[u8] =
 const MODEL_METADATA_CHUNKED_SECOND: &[u8] =
     br#""max_model_len":256000,"owned_by":"vllm","extra":"keep"}]}"#;
 const MODEL_METADATA_NO_CONTEXT_BODY: &str = r#"{"object":"list","data":[{"id":"fallback-model","object":"model","owned_by":"vllm","extra":"keep"}]}"#;
+const MODEL_METADATA_CONTEXT_LENGTH_BODY: &str = r#"{"object":"list","data":[{"id":"context-length-model","object":"model","context_length":256000,"owned_by":"vllm","extra":"keep"}]}"#;
+const MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY: &str = r#"{"object":"list","data":[{"id":"max-context-length-model","object":"model","max_context_length":256000,"owned_by":"vllm","extra":"keep"}]}"#;
 const LARGE_MODEL_METADATA_EXTRA_BYTES: usize = 1024 * 1024;
 static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -163,6 +165,78 @@ async fn get_models_enriches_chunked_context_metadata_without_content_length() {
     assert_eq!(
         observed.path_and_query,
         "/v1/models?test=model-metadata-chunked"
+    );
+}
+
+#[tokio::test]
+async fn upstream_context_length_overrides_stale_max_model_len_fallback() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_metadata_config(
+        &fake.base_url,
+        true,
+        r"
+[upstream.metadata]
+max_model_len_override = 8192
+",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-context-length",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("body should be text");
+    let model = first_model(&body);
+    assert_eq!(model["id"], "context-length-model");
+    assert_normalized_context_fields(&model, 256_000);
+
+    let observed = fake.recv().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=model-metadata-context-length"
+    );
+}
+
+#[tokio::test]
+async fn upstream_max_context_length_overrides_stale_max_model_len_fallback() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_metadata_config(
+        &fake.base_url,
+        true,
+        r"
+[upstream.metadata]
+max_model_len_override = 8192
+",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-max-context-length",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("body should be text");
+    let model = first_model(&body);
+    assert_eq!(model["id"], "max-context-length-model");
+    assert_normalized_context_fields(&model, 256_000);
+
+    let observed = fake.recv().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=model-metadata-max-context-length"
     );
 }
 
@@ -1380,6 +1454,12 @@ fn hermes_like_context_length(model: &serde_json::Value) -> Option<u64> {
         .find_map(|key| model.get(key).and_then(serde_json::Value::as_u64))
 }
 
+fn assert_normalized_context_fields(model: &serde_json::Value, expected: u64) {
+    assert_eq!(model["context_length"].as_u64(), Some(expected));
+    assert_eq!(model["max_context_length"].as_u64(), Some(expected));
+    assert_eq!(model["max_model_len"].as_u64(), Some(expected));
+}
+
 fn empty_get_request(uri: &'static str) -> Request<Body> {
     Request::builder()
         .method(Method::GET)
@@ -1704,6 +1784,12 @@ fn fake_upstream_endpoint_response(
         }
         if path_and_query.contains("test=model-metadata-no-context") {
             return json_response("models", MODEL_METADATA_NO_CONTEXT_BODY.to_owned());
+        }
+        if path_and_query.contains("test=model-metadata-context-length") {
+            return json_response("models", MODEL_METADATA_CONTEXT_LENGTH_BODY.to_owned());
+        }
+        if path_and_query.contains("test=model-metadata-max-context-length") {
+            return json_response("models", MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY.to_owned());
         }
         if path_and_query.contains("test=model-metadata") {
             return json_response("models", MODEL_METADATA_BODY.to_owned());
