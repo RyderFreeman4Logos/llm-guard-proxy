@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, HashSet},
+    convert::Infallible,
     fmt,
     path::{Path, PathBuf},
     pin::Pin,
@@ -18,16 +19,20 @@ use axum::{
     },
     routing::get,
 };
-use futures_util::Stream;
+use bytes::BytesMut;
+use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DownstreamMode, Health,
-    LICENSE, ObservabilityStore, RawPayloads, RequestId, RequestRecord, RequestStatus,
-    SERVICE_NAME, UpstreamMode, redact_upstream_base_url, validate_upstream_base_url,
+    LICENSE, MetadataConfig, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
+    RequestStatus, SERVICE_NAME, UpstreamMode, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+mod model_metadata;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
 const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 120;
@@ -286,13 +291,12 @@ async fn forward_openai_request(
     let upstream_status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
     let upstream_mode = upstream_mode_from_headers(&upstream_headers);
-    let observer = ForwardedBodyObserver {
+    let response_parts = ForwardedResponseParts {
         store: state.store.clone(),
         request_id: request_id.clone(),
         started_at_unix_ms,
         attempt_id,
         attempt_started_at_unix_ms,
-        downstream_mode: downstream_mode_from_headers(&upstream_headers),
         upstream_mode,
         model_id,
         upstream_status,
@@ -300,6 +304,17 @@ async fn forward_openai_request(
         request_metadata,
         attempt_request_metadata,
     };
+    if should_enrich_models_response(&method, &uri, &config) {
+        return forward_enriched_models_response(
+            response_parts,
+            upstream_response,
+            in_flight_permit,
+            &config.upstream.metadata,
+        )
+        .await;
+    }
+
+    let observer = response_parts.into_observer();
     let response_body =
         ObservedUpstreamBody::new(upstream_response.bytes_stream(), observer, in_flight_permit);
     let response = downstream_response(
@@ -315,6 +330,39 @@ async fn read_body_bytes(body: Body) -> Result<Bytes, ProxyError> {
     to_bytes(body, MAX_PROXY_BODY_BYTES)
         .await
         .map_err(|error| ProxyError::request_body(error.to_string()))
+}
+
+async fn read_upstream_body_bytes(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
+) -> Result<Bytes, ProxyError> {
+    let mut stream = Box::pin(stream);
+    let mut body = BytesMut::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            ProxyError::upstream_body(format!(
+                "upstream body stream failed: {}",
+                sanitized_reqwest_error(&error)
+            ))
+        })?;
+        let next_len = body
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| ProxyError::upstream_body(String::from("upstream body is too large")))?;
+        if next_len > MAX_PROXY_BODY_BYTES {
+            return Err(ProxyError::upstream_body(format!(
+                "upstream body exceeded proxy limit: max_bytes={MAX_PROXY_BODY_BYTES}"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+fn should_enrich_models_response(method: &Method, uri: &Uri, config: &AppConfig) -> bool {
+    method == Method::GET
+        && uri.path() == "/v1/models"
+        && config.upstream.metadata.discovery_enabled
+        && config.upstream.metadata.enrich_responses
 }
 
 fn upstream_method(method: &Method) -> Result<reqwest::Method, ProxyError> {
@@ -392,6 +440,77 @@ impl fmt::Display for ReqwestFailureKind {
 
 fn sanitized_reqwest_error(error: &reqwest::Error) -> String {
     ReqwestFailureKind::from_error(error).to_string()
+}
+
+struct ForwardedResponseParts {
+    store: ObservabilityStore,
+    request_id: RequestId,
+    started_at_unix_ms: u64,
+    attempt_id: AttemptId,
+    attempt_started_at_unix_ms: u64,
+    upstream_mode: UpstreamMode,
+    model_id: Option<String>,
+    upstream_status: reqwest::StatusCode,
+    upstream_headers: HeaderMap,
+    request_metadata: BTreeMap<String, String>,
+    attempt_request_metadata: BTreeMap<String, String>,
+}
+
+impl ForwardedResponseParts {
+    fn into_observer(self) -> ForwardedBodyObserver {
+        ForwardedBodyObserver {
+            downstream_mode: downstream_mode_from_headers(&self.upstream_headers),
+            store: self.store,
+            request_id: self.request_id,
+            started_at_unix_ms: self.started_at_unix_ms,
+            attempt_id: self.attempt_id,
+            attempt_started_at_unix_ms: self.attempt_started_at_unix_ms,
+            upstream_mode: self.upstream_mode,
+            model_id: self.model_id,
+            upstream_status: self.upstream_status,
+            upstream_headers: self.upstream_headers,
+            request_metadata: self.request_metadata,
+            attempt_request_metadata: self.attempt_request_metadata,
+        }
+    }
+
+    fn into_body_read_error(self, error: ProxyError) -> ProxyError {
+        let finished_at_unix_ms = unix_time_millis();
+        let error_reason = error.to_string();
+        let attempt_record = failed_attempt_record(
+            self.attempt_id,
+            self.request_id,
+            self.attempt_started_at_unix_ms,
+            finished_at_unix_ms,
+            error.error_type(),
+            &error_reason,
+            self.attempt_request_metadata,
+        );
+        error.with_observability(self.request_metadata, attempt_record)
+    }
+}
+
+async fn forward_enriched_models_response(
+    response_parts: ForwardedResponseParts,
+    upstream_response: reqwest::Response,
+    in_flight_permit: OwnedSemaphorePermit,
+    metadata_config: &MetadataConfig,
+) -> Result<Response<Body>, ProxyError> {
+    let upstream_status = response_parts.upstream_status;
+    let upstream_headers = response_parts.upstream_headers.clone();
+    let body = match read_upstream_body_bytes(upstream_response.bytes_stream()).await {
+        Ok(body) => body,
+        Err(error) => return Err(response_parts.into_body_read_error(error)),
+    };
+    let body = model_metadata::enrich_models_body(metadata_config, body);
+    let observer = response_parts.into_observer();
+    let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit);
+
+    Ok(downstream_response(
+        upstream_status,
+        &upstream_headers,
+        Body::from_stream(response_body),
+    ))
 }
 
 struct ForwardedBodyObserver {
@@ -548,6 +667,56 @@ impl Stream for ObservedUpstreamBody {
 }
 
 impl Drop for ObservedUpstreamBody {
+    fn drop(&mut self) {
+        self.record_once(&BodyCompletion::DownstreamDropped);
+    }
+}
+
+struct ObservedBufferedBody {
+    body: Option<Bytes>,
+    observer: Option<ForwardedBodyObserver>,
+    _in_flight_permit: OwnedSemaphorePermit,
+    bytes_seen: u64,
+}
+
+impl ObservedBufferedBody {
+    fn new(
+        body: Bytes,
+        observer: ForwardedBodyObserver,
+        in_flight_permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            body: (!body.is_empty()).then_some(body),
+            observer: Some(observer),
+            _in_flight_permit: in_flight_permit,
+            bytes_seen: 0,
+        }
+    }
+
+    fn record_once(&mut self, completion: &BodyCompletion) {
+        if let Some(observer) = self.observer.take() {
+            observer.record(self.bytes_seen, completion);
+        }
+    }
+}
+
+impl Stream for ObservedBufferedBody {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(body) = this.body.take() {
+            let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+            this.bytes_seen = this.bytes_seen.saturating_add(body_len);
+            return Poll::Ready(Some(Ok(body)));
+        }
+
+        this.record_once(&BodyCompletion::Succeeded);
+        Poll::Ready(None)
+    }
+}
+
+impl Drop for ObservedBufferedBody {
     fn drop(&mut self) {
         self.record_once(&BodyCompletion::DownstreamDropped);
     }
@@ -1059,6 +1228,11 @@ enum ProxyError {
         failure: ReqwestFailureKind,
         observability: Option<Box<FailedUpstreamObservability>>,
     },
+    #[error("failed to read upstream response body within proxy limit: {reason}")]
+    UpstreamBody {
+        reason: String,
+        observability: Option<Box<FailedUpstreamObservability>>,
+    },
 }
 
 impl ProxyError {
@@ -1091,6 +1265,13 @@ impl ProxyError {
         }
     }
 
+    fn upstream_body(reason: String) -> Self {
+        Self::UpstreamBody {
+            reason,
+            observability: None,
+        }
+    }
+
     const fn status(&self) -> StatusCode {
         match self {
             Self::RequestBody { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -1098,7 +1279,7 @@ impl ProxyError {
             | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidMethod { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRequestPath(error) => error.status(),
-            Self::UpstreamTransport { .. } => StatusCode::BAD_GATEWAY,
+            Self::UpstreamTransport { .. } | Self::UpstreamBody { .. } => StatusCode::BAD_GATEWAY,
         }
     }
 
@@ -1110,6 +1291,7 @@ impl ProxyError {
             Self::InvalidRequestPath(error) => error.error_type(),
             Self::InvalidMethod { .. } => "invalid_method",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
+            Self::UpstreamBody { .. } => "upstream_body_error",
         }
     }
 
@@ -1134,6 +1316,10 @@ impl ProxyError {
             Self::UpstreamTransport {
                 observability: Some(observability),
                 ..
+            }
+            | Self::UpstreamBody {
+                observability: Some(observability),
+                ..
             } => Some(&observability.request_metadata),
             Self::RequestBody {
                 request_metadata: None,
@@ -1155,6 +1341,10 @@ impl ProxyError {
             | Self::UpstreamTransport {
                 observability: None,
                 ..
+            }
+            | Self::UpstreamBody {
+                observability: None,
+                ..
             } => None,
         }
     }
@@ -1164,6 +1354,10 @@ impl ProxyError {
             Self::UpstreamTransport {
                 observability: Some(observability),
                 ..
+            }
+            | Self::UpstreamBody {
+                observability: Some(observability),
+                ..
             } => Some(&observability.attempt_record),
             Self::RequestBody { .. }
             | Self::ConfigSnapshot { .. }
@@ -1171,6 +1365,10 @@ impl ProxyError {
             | Self::InvalidRequestPath(_)
             | Self::InvalidMethod { .. }
             | Self::UpstreamTransport {
+                observability: None,
+                ..
+            }
+            | Self::UpstreamBody {
                 observability: None,
                 ..
             } => None,
@@ -1200,7 +1398,9 @@ impl ProxyError {
                 reason,
                 request_metadata: Some(request_metadata),
             },
-            error @ (Self::InvalidRequestPath(_) | Self::UpstreamTransport { .. }) => error,
+            error @ (Self::InvalidRequestPath(_)
+            | Self::UpstreamTransport { .. }
+            | Self::UpstreamBody { .. }) => error,
         }
     }
 
@@ -1212,6 +1412,13 @@ impl ProxyError {
         match self {
             Self::UpstreamTransport { failure, .. } => Self::UpstreamTransport {
                 failure,
+                observability: Some(Box::new(FailedUpstreamObservability {
+                    request_metadata,
+                    attempt_record,
+                })),
+            },
+            Self::UpstreamBody { reason, .. } => Self::UpstreamBody {
+                reason,
                 observability: Some(Box::new(FailedUpstreamObservability {
                     request_metadata,
                     attempt_record,

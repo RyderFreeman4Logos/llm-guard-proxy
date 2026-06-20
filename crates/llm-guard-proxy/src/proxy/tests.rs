@@ -36,6 +36,15 @@ const SSE_FIRST_CHUNK: &[u8] = b"data: first\n\n";
 const SSE_SECOND_CHUNK: &[u8] = b"data: second\n\n";
 const LONG_JSON_FIRST_CHUNK: &[u8] = br#"{"object":"list","data":["#;
 const LONG_JSON_SECOND_CHUNK: &[u8] = br"]}";
+const MODEL_METADATA_BODY: &str = r#"{"object":"list","data":[{"id":"aeon-ultimate","object":"model","max_model_len":256000,"owned_by":"vllm","extra":"keep"}]}"#;
+const MODEL_METADATA_CHUNKED_FIRST: &[u8] =
+    br#"{"object":"list","data":[{"id":"chunked-model","object":"model","#;
+const MODEL_METADATA_CHUNKED_SECOND: &[u8] =
+    br#""max_model_len":256000,"owned_by":"vllm","extra":"keep"}]}"#;
+const MODEL_METADATA_NO_CONTEXT_BODY: &str = r#"{"object":"list","data":[{"id":"fallback-model","object":"model","owned_by":"vllm","extra":"keep"}]}"#;
+const MODEL_METADATA_CONTEXT_LENGTH_BODY: &str = r#"{"object":"list","data":[{"id":"context-length-model","object":"model","context_length":256000,"owned_by":"vllm","extra":"keep"}]}"#;
+const MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY: &str = r#"{"object":"list","data":[{"id":"max-context-length-model","object":"model","max_context_length":256000,"owned_by":"vllm","extra":"keep"}]}"#;
+const LARGE_MODEL_METADATA_EXTRA_BYTES: usize = 1024 * 1024;
 static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
@@ -97,6 +106,547 @@ async fn get_models_forwards_method_path_query_and_headers() {
             .is_some_and(|value| value != "downstream.example"),
         "proxy must let the upstream client set Host instead of forwarding the downstream Host"
     );
+}
+
+#[tokio::test]
+async fn get_models_enriches_context_metadata_and_preserves_unknown_fields() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/v1/models?test=model-metadata", proxy.base_url))
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("body should be text");
+    let model = first_model(&body);
+    assert_eq!(model["id"], "aeon-ultimate");
+    assert_eq!(model["owned_by"], "vllm");
+    assert_eq!(model["extra"], "keep");
+    assert_eq!(model["max_model_len"].as_u64(), Some(256_000));
+    assert_eq!(model["context_length"].as_u64(), Some(256_000));
+    assert_eq!(model["max_context_length"].as_u64(), Some(256_000));
+
+    let observed = fake.recv().await;
+    assert_eq!(observed.method, Method::GET);
+    assert_eq!(observed.path_and_query, "/v1/models?test=model-metadata");
+}
+
+#[tokio::test]
+async fn get_models_enriches_chunked_context_metadata_without_content_length() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-chunked",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("body should be text");
+    let model = first_model(&body);
+    assert_eq!(model["id"], "chunked-model");
+    assert_eq!(model["owned_by"], "vllm");
+    assert_eq!(model["extra"], "keep");
+    assert_eq!(model["max_model_len"].as_u64(), Some(256_000));
+    assert_eq!(model["context_length"].as_u64(), Some(256_000));
+    assert_eq!(model["max_context_length"].as_u64(), Some(256_000));
+
+    let observed = fake.recv().await;
+    assert_eq!(observed.method, Method::GET);
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=model-metadata-chunked"
+    );
+}
+
+#[tokio::test]
+async fn upstream_context_length_overrides_stale_max_model_len_fallback() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_metadata_config(
+        &fake.base_url,
+        true,
+        r"
+[upstream.metadata]
+max_model_len_override = 8192
+",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-context-length",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("body should be text");
+    let model = first_model(&body);
+    assert_eq!(model["id"], "context-length-model");
+    assert_normalized_context_fields(&model, 256_000);
+
+    let observed = fake.recv().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=model-metadata-context-length"
+    );
+}
+
+#[tokio::test]
+async fn upstream_max_context_length_overrides_stale_max_model_len_fallback() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_metadata_config(
+        &fake.base_url,
+        true,
+        r"
+[upstream.metadata]
+max_model_len_override = 8192
+",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-max-context-length",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("body should be text");
+    let model = first_model(&body);
+    assert_eq!(model["id"], "max-context-length-model");
+    assert_normalized_context_fields(&model, 256_000);
+
+    let observed = fake.recv().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=model-metadata-max-context-length"
+    );
+}
+
+#[tokio::test]
+async fn enriched_models_response_holds_in_flight_permit_until_downstream_body_finishes() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 1).await;
+    let first_request = empty_get_request("/v1/models?test=model-metadata-large");
+
+    let first_response = proxy_handler(State(proxy.state.clone()), first_request).await;
+
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("first models request should reach upstream and hold the only permit");
+    assert_eq!(first_observed.method, Method::GET);
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/models?test=model-metadata-large"
+    );
+    assert_eq!(
+        proxy
+            .store
+            .retention_usage()
+            .expect("usage should be readable")
+            .record_count,
+        0,
+        "enriched model responses must not be recorded before downstream body completion"
+    );
+
+    let second_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata"),
+    )
+    .await;
+
+    assert_eq!(second_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let second_body = to_bytes(second_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("limit response body should read");
+    let second_body =
+        String::from_utf8(second_body.to_vec()).expect("limit response should be utf-8");
+    assert!(
+        second_body.contains("proxy_in_flight_limit_exceeded"),
+        "second request should be rejected while first model body is undrained: {second_body}"
+    );
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "permit rejection must happen before a second upstream request is sent"
+    );
+
+    let first_body = to_bytes(first_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("first enriched model body should read");
+    let first_body =
+        String::from_utf8(first_body.to_vec()).expect("first enriched model body should be utf-8");
+    let first_model_record = first_model(&first_body);
+    assert_eq!(first_model_record["context_length"].as_u64(), Some(256_000));
+    assert_eq!(
+        first_model_record["extra"]
+            .as_str()
+            .expect("large extra field should stay present")
+            .len(),
+        LARGE_MODEL_METADATA_EXTRA_BYTES
+    );
+
+    let third_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata"),
+    )
+    .await;
+
+    assert_eq!(third_response.status(), StatusCode::OK);
+    let third_body = to_bytes(third_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("third model body should read after capacity is released");
+    let third_body =
+        String::from_utf8(third_body.to_vec()).expect("third model body should be utf-8");
+    assert_eq!(
+        first_model(&third_body)["context_length"].as_u64(),
+        Some(256_000)
+    );
+    let third_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("third request should reach upstream after first body completion");
+    assert_eq!(
+        third_observed.path_and_query,
+        "/v1/models?test=model-metadata"
+    );
+}
+
+#[tokio::test]
+async fn enriched_models_observability_records_success_after_body_consumption() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("models request should reach upstream");
+    assert_eq!(
+        proxy
+            .store
+            .retention_usage()
+            .expect("usage should be readable")
+            .record_count,
+        0,
+        "success must wait until the enriched body reaches EOF"
+    );
+
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("enriched model body should read");
+    let expected_body_len = body.len().to_string();
+    let body = String::from_utf8(body.to_vec()).expect("enriched model body should be utf-8");
+    assert_eq!(first_model(&body)["context_length"].as_u64(), Some(256_000));
+
+    assert_eq!(
+        proxy
+            .store
+            .retention_usage()
+            .expect("usage should be readable")
+            .record_count,
+        2
+    );
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+
+    assert_eq!(request_row.status, "succeeded");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(request_row.abort_reason, None);
+    assert_eq!(
+        request_row.response_metadata["response_body_bytes"],
+        expected_body_len.as_str()
+    );
+    assert_eq!(request_row.response_metadata["http_status_success"], "true");
+    assert_eq!(attempt_row.status, "succeeded");
+    assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(attempt_row.abort_reason, None);
+    assert_eq!(
+        attempt_row.response_metadata["response_body_bytes"],
+        expected_body_len.as_str()
+    );
+}
+
+#[tokio::test]
+async fn enriched_models_observability_records_abort_when_body_is_dropped() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("models request should reach upstream");
+    assert_eq!(
+        proxy
+            .store
+            .retention_usage()
+            .expect("usage should be readable")
+            .record_count,
+        0,
+        "droppable response body should own the pending observability record"
+    );
+
+    drop(response);
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+
+    assert_eq!(request_row.status, "aborted");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(
+        request_row.abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+    assert_eq!(request_row.response_metadata["response_body_bytes"], "0");
+    assert_eq!(attempt_row.status, "aborted");
+    assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(
+        attempt_row.abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+    assert_eq!(attempt_row.response_metadata["response_body_bytes"], "0");
+}
+
+#[tokio::test]
+async fn get_models_reflects_upstream_metadata_changes_between_requests() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let first = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-changing",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("first proxy request should complete")
+        .text()
+        .await
+        .expect("first body should be text");
+    let _first_observed = fake.recv_next().await;
+    let second = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-changing",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("second proxy request should complete")
+        .text()
+        .await
+        .expect("second body should be text");
+    let _second_observed = fake.recv_next().await;
+
+    assert_eq!(
+        first_model(&first)["context_length"].as_u64(),
+        Some(128_000)
+    );
+    assert_eq!(
+        first_model(&second)["context_length"].as_u64(),
+        Some(256_000)
+    );
+}
+
+#[tokio::test]
+async fn disabled_model_metadata_discovery_or_enrichment_returns_upstream_body_unchanged() {
+    for metadata_config in [
+        r"
+[upstream.metadata]
+discovery_enabled = false
+enrich_responses = true
+",
+        r"
+[upstream.metadata]
+discovery_enabled = true
+enrich_responses = false
+",
+    ] {
+        let fake = FakeUpstream::spawn().await;
+        let proxy =
+            ProxyFixture::spawn_with_metadata_config(&fake.base_url, true, metadata_config).await;
+
+        let response = proxy
+            .client
+            .get(format!("{}/v1/models?test=model-metadata", proxy.base_url))
+            .send()
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("body should be text"),
+            MODEL_METADATA_BODY
+        );
+        let _observed = fake.recv().await;
+    }
+}
+
+#[tokio::test]
+async fn config_fallback_context_metadata_is_hot_reloadable() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_metadata_config(
+        &fake.base_url,
+        true,
+        r"
+[upstream.metadata]
+max_model_len_override = 4096
+",
+    )
+    .await;
+
+    let first = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-no-context",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("first proxy request should complete")
+        .text()
+        .await
+        .expect("first body should be text");
+    let _first_observed = fake.recv_next().await;
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[upstream.metadata]
+max_model_len_override = 8192
+",
+    );
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("metadata reload should succeed");
+
+    let second = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-no-context",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("second proxy request should complete")
+        .text()
+        .await
+        .expect("second body should be text");
+    let _second_observed = fake.recv_next().await;
+
+    assert!(outcome.applied);
+    assert_eq!(first_model(&first)["context_length"].as_u64(), Some(4_096));
+    assert_eq!(first_model(&first)["max_model_len"].as_u64(), Some(4_096));
+    assert_eq!(first_model(&second)["context_length"].as_u64(), Some(8_192));
+    assert_eq!(first_model(&second)["max_model_len"].as_u64(), Some(8_192));
+}
+
+#[tokio::test]
+async fn hot_reloaded_disabled_discovery_stops_model_metadata_enrichment() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let enriched = proxy
+        .client
+        .get(format!("{}/v1/models?test=model-metadata", proxy.base_url))
+        .send()
+        .await
+        .expect("first proxy request should complete")
+        .text()
+        .await
+        .expect("first body should be text");
+    let _first_observed = fake.recv_next().await;
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[upstream.metadata]
+discovery_enabled = false
+",
+    );
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("metadata reload should succeed");
+
+    let disabled = proxy
+        .client
+        .get(format!("{}/v1/models?test=model-metadata", proxy.base_url))
+        .send()
+        .await
+        .expect("second proxy request should complete")
+        .text()
+        .await
+        .expect("second body should be text");
+    let _second_observed = fake.recv_next().await;
+
+    assert!(outcome.applied);
+    assert_eq!(
+        first_model(&enriched)["context_length"].as_u64(),
+        Some(256_000)
+    );
+    assert_eq!(disabled, MODEL_METADATA_BODY);
+}
+
+#[tokio::test]
+async fn hermes_like_context_extraction_reads_enriched_model_length() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let body = proxy
+        .client
+        .get(format!("{}/v1/models?test=model-metadata", proxy.base_url))
+        .send()
+        .await
+        .expect("proxy request should complete")
+        .text()
+        .await
+        .expect("body should be text");
+
+    let model = first_model(&body);
+    assert_eq!(hermes_like_context_length(&model), Some(256_000));
+    let _observed = fake.recv().await;
 }
 
 #[tokio::test]
@@ -294,7 +844,7 @@ async fn long_json_response_streams_first_chunk_while_upstream_remains_open() {
         STREAM_HEADER_TIMEOUT,
         proxy
             .client
-            .get(format!("{}/v1/models?test=long-json", proxy.base_url))
+            .get(format!("{}/v1/embeddings?test=long-json", proxy.base_url))
             .send(),
     )
     .await
@@ -330,7 +880,7 @@ async fn long_json_response_streams_first_chunk_while_upstream_remains_open() {
 
     let observed = fake.recv().await;
     assert_eq!(observed.method, Method::GET);
-    assert_eq!(observed.path_and_query, "/v1/models?test=long-json");
+    assert_eq!(observed.path_and_query, "/v1/embeddings?test=long-json");
 }
 
 #[tokio::test]
@@ -629,7 +1179,7 @@ async fn in_flight_limit_rejects_before_body_buffering() {
     let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 1).await;
     let first_request = Request::builder()
         .method(Method::GET)
-        .uri("/v1/models?test=long-json")
+        .uri("/v1/embeddings?test=long-json")
         .body(Body::empty())
         .expect("first request should build");
 
@@ -641,7 +1191,10 @@ async fn in_flight_limit_rejects_before_body_buffering() {
         .await
         .expect("first request should reach upstream and hold the only permit");
     assert_eq!(first_observed.method, Method::GET);
-    assert_eq!(first_observed.path_and_query, "/v1/models?test=long-json");
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/embeddings?test=long-json"
+    );
 
     let body_polled = Arc::new(AtomicBool::new(false));
     let second_body = Body::from_stream(stream::once({
@@ -884,6 +1437,85 @@ where
         .unwrap_or_else(|error| panic!("{label} should not fail: {error}"))
 }
 
+fn first_model(body: &str) -> serde_json::Value {
+    let value = serde_json::from_str::<serde_json::Value>(body)
+        .unwrap_or_else(|error| panic!("model list should parse as JSON: {error}; body={body}"));
+    value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|models| models.first())
+        .cloned()
+        .unwrap_or_else(|| panic!("model list should contain at least one model: {body}"))
+}
+
+fn hermes_like_context_length(model: &serde_json::Value) -> Option<u64> {
+    ["context_length", "max_model_len", "max_context_length"]
+        .into_iter()
+        .find_map(|key| model.get(key).and_then(serde_json::Value::as_u64))
+}
+
+fn assert_normalized_context_fields(model: &serde_json::Value, expected: u64) {
+    assert_eq!(model["context_length"].as_u64(), Some(expected));
+    assert_eq!(model["max_context_length"].as_u64(), Some(expected));
+    assert_eq!(model["max_model_len"].as_u64(), Some(expected));
+}
+
+fn empty_get_request(uri: &'static str) -> Request<Body> {
+    Request::builder()
+        .method(Method::GET)
+        .uri(uri)
+        .body(Body::empty())
+        .expect("GET request should build")
+}
+
+#[derive(Debug)]
+struct ForwardedRecordRow {
+    status: String,
+    http_status: i64,
+    abort_reason: Option<String>,
+    response_metadata: serde_json::Value,
+}
+
+fn read_single_forwarded_request_row(sqlite_path: &Path) -> ForwardedRecordRow {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let row: (String, i64, Option<String>, String) = connection
+        .query_row(
+            "SELECT status, http_status, abort_reason, response_metadata_json FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("request row should exist");
+    let response_metadata =
+        serde_json::from_str(&row.3).expect("request response metadata should be json");
+
+    ForwardedRecordRow {
+        status: row.0,
+        http_status: row.1,
+        abort_reason: row.2,
+        response_metadata,
+    }
+}
+
+fn read_single_forwarded_attempt_row(sqlite_path: &Path) -> ForwardedRecordRow {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let row: (String, i64, Option<String>, String) = connection
+        .query_row(
+            "SELECT status, http_status, abort_reason, response_metadata_json FROM attempts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("attempt row should exist");
+    let response_metadata =
+        serde_json::from_str(&row.3).expect("attempt response metadata should be json");
+
+    ForwardedRecordRow {
+        status: row.0,
+        http_status: row.1,
+        abort_reason: row.2,
+        response_metadata,
+    }
+}
+
 #[derive(Debug)]
 struct ObservedRequest {
     method: Method,
@@ -897,12 +1529,21 @@ struct FakeUpstream {
     receiver: mpsc::Receiver<ObservedRequest>,
 }
 
+#[derive(Clone)]
+struct FakeUpstreamState {
+    sender: mpsc::Sender<ObservedRequest>,
+    changing_model_len: Arc<AtomicU64>,
+}
+
 impl FakeUpstream {
     async fn spawn() -> Self {
         let (sender, receiver) = mpsc::channel(10);
         let app = Router::new()
             .fallback(fake_upstream_handler)
-            .with_state(sender);
+            .with_state(FakeUpstreamState {
+                sender,
+                changing_model_len: Arc::new(AtomicU64::new(128_000)),
+            });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("fake upstream should bind");
@@ -922,6 +1563,10 @@ impl FakeUpstream {
     }
 
     async fn recv(mut self) -> ObservedRequest {
+        self.recv_next().await
+    }
+
+    async fn recv_next(&mut self) -> ObservedRequest {
         self.receiver
             .recv()
             .await
@@ -1059,10 +1704,11 @@ async fn capture_request_handler(
 }
 
 async fn fake_upstream_handler(
-    State(sender): State<mpsc::Sender<ObservedRequest>>,
+    State(state): State<FakeUpstreamState>,
     request: Request<Body>,
 ) -> Response<Body> {
     let observed = observe_request(request).await;
+    let path_and_query = observed.path_and_query.clone();
     let endpoint = observed
         .path_and_query
         .split('?')
@@ -1071,7 +1717,8 @@ async fn fake_upstream_handler(
         .to_owned();
     let is_sse_stream = observed.path_and_query.contains("test=sse");
     let is_long_json_stream = observed.path_and_query.contains("test=long-json");
-    sender
+    state
+        .sender
         .send(observed)
         .await
         .expect("fake upstream observation should send");
@@ -1093,7 +1740,7 @@ async fn fake_upstream_handler(
         );
     }
 
-    fake_upstream_endpoint_response(&endpoint)
+    fake_upstream_endpoint_response(&endpoint, &path_and_query, &state)
 }
 
 async fn observe_request(request: Request<Body>) -> ObservedRequest {
@@ -1113,7 +1760,42 @@ async fn observe_request(request: Request<Body>) -> ObservedRequest {
     }
 }
 
-fn fake_upstream_endpoint_response(endpoint: &str) -> Response<Body> {
+fn fake_upstream_endpoint_response(
+    endpoint: &str,
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+) -> Response<Body> {
+    if endpoint == "/v1/models" {
+        if path_and_query.contains("test=model-metadata-chunked") {
+            return chunked_json_response(
+                "models",
+                MODEL_METADATA_CHUNKED_FIRST,
+                MODEL_METADATA_CHUNKED_SECOND,
+            );
+        }
+        if path_and_query.contains("test=model-metadata-large") {
+            return json_response("models", large_model_metadata_body());
+        }
+        if path_and_query.contains("test=model-metadata-changing") {
+            let max_model_len = state
+                .changing_model_len
+                .fetch_add(128_000, Ordering::SeqCst);
+            return json_response("models", model_metadata_body(max_model_len));
+        }
+        if path_and_query.contains("test=model-metadata-no-context") {
+            return json_response("models", MODEL_METADATA_NO_CONTEXT_BODY.to_owned());
+        }
+        if path_and_query.contains("test=model-metadata-context-length") {
+            return json_response("models", MODEL_METADATA_CONTEXT_LENGTH_BODY.to_owned());
+        }
+        if path_and_query.contains("test=model-metadata-max-context-length") {
+            return json_response("models", MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY.to_owned());
+        }
+        if path_and_query.contains("test=model-metadata") {
+            return json_response("models", MODEL_METADATA_BODY.to_owned());
+        }
+    }
+
     let (label, body) = match endpoint {
         "/v1/models" => ("models", r#"{"object":"list","data":[]}"#),
         "/v1/chat/completions" => (
@@ -1135,14 +1817,59 @@ fn fake_upstream_endpoint_response(endpoint: &str) -> Response<Body> {
     } else {
         StatusCode::OK
     };
-    let mut response = Response::new(Body::from(body));
+    let mut response = json_response(label, body.to_owned());
     *response.status_mut() = status;
+    response
+}
+
+fn model_metadata_body(max_model_len: u64) -> String {
+    format!(
+        r#"{{"object":"list","data":[{{"id":"aeon-ultimate","object":"model","max_model_len":{max_model_len},"owned_by":"vllm","extra":"keep"}}]}}"#
+    )
+}
+
+fn large_model_metadata_body() -> String {
+    format!(
+        r#"{{"object":"list","data":[{{"id":"large-model","object":"model","max_model_len":256000,"owned_by":"vllm","extra":"{}"}}]}}"#,
+        "x".repeat(LARGE_MODEL_METADATA_EXTRA_BYTES)
+    )
+}
+
+fn json_response(label: &'static str, body: String) -> Response<Body> {
+    let content_length = body.len().to_string();
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length).expect("content length should be valid"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_str(label).expect("static label should be a valid header"),
+    );
+    response
+}
+
+fn chunked_json_response(
+    label: &'static str,
+    first: &'static [u8],
+    second: &'static [u8],
+) -> Response<Body> {
+    let body = Body::from_stream(stream::iter([
+        Ok::<_, std::convert::Infallible>(Bytes::from_static(first)),
+        Ok::<_, std::convert::Infallible>(Bytes::from_static(second)),
+    ]));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     response.headers_mut().insert(
         HeaderName::from_static("x-upstream-endpoint"),
-        HeaderValue::from_str(label).expect("static label should be a valid header"),
+        HeaderValue::from_static(label),
     );
     response
 }
@@ -1184,6 +1911,7 @@ fn delayed_stream_response(
 struct ProxyFixture {
     base_url: String,
     client: Client,
+    manager: ConfigManager,
     state: ProxyState,
     store: ObservabilityStore,
     sqlite_path: PathBuf,
@@ -1205,6 +1933,35 @@ impl ProxyFixture {
         observability_enabled: bool,
         max_in_flight_requests: usize,
     ) -> Self {
+        Self::spawn_with_options(
+            upstream_base_url,
+            observability_enabled,
+            max_in_flight_requests,
+            "",
+        )
+        .await
+    }
+
+    async fn spawn_with_metadata_config(
+        upstream_base_url: &str,
+        observability_enabled: bool,
+        metadata_config: &str,
+    ) -> Self {
+        Self::spawn_with_options(
+            upstream_base_url,
+            observability_enabled,
+            AppConfig::default().server.max_in_flight_requests,
+            metadata_config,
+        )
+        .await
+    }
+
+    async fn spawn_with_options(
+        upstream_base_url: &str,
+        observability_enabled: bool,
+        max_in_flight_requests: usize,
+        metadata_config: &str,
+    ) -> Self {
         let root = unique_test_dir("proxy");
         fs::create_dir_all(&root).expect("test root should be created");
         set_owner_only_dir(&root);
@@ -1216,6 +1973,7 @@ impl ProxyFixture {
             &sqlite_path,
             observability_enabled,
             max_in_flight_requests,
+            metadata_config,
         );
         let manager =
             ConfigManager::from_explicit_path(&config_path).expect("proxy config should load");
@@ -1247,6 +2005,7 @@ impl ProxyFixture {
         Self {
             base_url: format!("http://{addr}"),
             client: build_http_client().expect("client should build"),
+            manager,
             state,
             store,
             sqlite_path,
@@ -1267,6 +2026,7 @@ fn write_proxy_config(
     sqlite_path: &Path,
     observability_enabled: bool,
     max_in_flight_requests: usize,
+    metadata_config: &str,
 ) {
     fs::write(
         config_path,
@@ -1277,6 +2037,7 @@ max_in_flight_requests = {max_in_flight_requests}
 
 [upstream]
 base_url = "{upstream_base_url}"
+{metadata_config}
 
 [observability]
 enabled = {observability_enabled}
