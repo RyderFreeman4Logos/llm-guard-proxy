@@ -109,12 +109,8 @@ async fn health_handler(State(state): State<ProxyState>) -> Response<Body> {
 }
 
 async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
-    if !is_openai_path(request.uri().path()) {
-        return proxy_error_response(
-            StatusCode::NOT_FOUND,
-            "not_found",
-            "only /v1 OpenAI-compatible endpoints are proxied",
-        );
+    if let Err(error) = validate_openai_path(request.uri().path()) {
+        return proxy_error_response(error.status(), error.error_type(), &error.to_string());
     }
 
     let request_id = RequestId::generate();
@@ -383,6 +379,8 @@ impl Drop for ObservedUpstreamBody {
 }
 
 fn build_upstream_url(base_url: &str, uri: &Uri) -> Result<Url, ProxyError> {
+    validate_openai_path(uri.path())?;
+
     let mut base =
         Url::parse(base_url).map_err(|error| ProxyError::InvalidUpstreamUrl(error.to_string()))?;
     let path = upstream_path(base.path(), uri.path());
@@ -614,8 +612,61 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
 }
 
-fn is_openai_path(path: &str) -> bool {
-    path == "/v1" || path.starts_with("/v1/")
+fn validate_openai_path(path: &str) -> Result<(), OpenAiPathError> {
+    if path != "/v1" && !path.starts_with("/v1/") {
+        return Err(OpenAiPathError::OutsideOpenAiScope);
+    }
+
+    if path.split('/').any(path_segment_decodes_to_dot_segment) {
+        return Err(OpenAiPathError::DotSegment);
+    }
+
+    Ok(())
+}
+
+fn path_segment_decodes_to_dot_segment(segment: &str) -> bool {
+    let mut decoded = [0_u8; 2];
+    let mut decoded_len = 0_usize;
+    let bytes = segment.as_bytes();
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        let byte = if let Some((decoded_byte, next_index)) = percent_encoded_byte(bytes, index) {
+            index = next_index;
+            decoded_byte
+        } else {
+            let byte = bytes[index];
+            index += 1;
+            byte
+        };
+
+        if decoded_len == decoded.len() {
+            return false;
+        }
+        decoded[decoded_len] = byte;
+        decoded_len += 1;
+    }
+
+    matches!(&decoded[..decoded_len], b"." | b"..")
+}
+
+fn percent_encoded_byte(bytes: &[u8], index: usize) -> Option<(u8, usize)> {
+    if bytes.get(index).copied() != Some(b'%') {
+        return None;
+    }
+
+    let high = hex_value(*bytes.get(index + 1)?)?;
+    let low = hex_value(*bytes.get(index + 2)?)?;
+    Some(((high << 4) | low, index + 3))
+}
+
+const fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn record_failed_request(
@@ -709,6 +760,8 @@ enum ProxyError {
     ConfigSnapshot(String),
     #[error("invalid upstream base URL: {0}")]
     InvalidUpstreamUrl(String),
+    #[error("{0}")]
+    InvalidRequestPath(#[from] OpenAiPathError),
     #[error("invalid HTTP method: {0}")]
     InvalidMethod(String),
     #[error("upstream request failed: {0}")]
@@ -722,6 +775,7 @@ impl ProxyError {
             Self::ConfigSnapshot(_) | Self::InvalidUpstreamUrl(_) | Self::InvalidMethod(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR
             }
+            Self::InvalidRequestPath(error) => error.status(),
             Self::UpstreamTransport(_) => StatusCode::BAD_GATEWAY,
         }
     }
@@ -731,8 +785,33 @@ impl ProxyError {
             Self::RequestBody(_) => "request_body_error",
             Self::ConfigSnapshot(_) => "config_snapshot_failed",
             Self::InvalidUpstreamUrl(_) => "invalid_upstream_url",
+            Self::InvalidRequestPath(error) => error.error_type(),
             Self::InvalidMethod(_) => "invalid_method",
             Self::UpstreamTransport(_) => "upstream_transport_error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+enum OpenAiPathError {
+    #[error("only /v1 OpenAI-compatible endpoints are proxied")]
+    OutsideOpenAiScope,
+    #[error("OpenAI-compatible request path contains a raw or percent-encoded dot segment")]
+    DotSegment,
+}
+
+impl OpenAiPathError {
+    const fn status(self) -> StatusCode {
+        match self {
+            Self::OutsideOpenAiScope => StatusCode::NOT_FOUND,
+            Self::DotSegment => StatusCode::BAD_REQUEST,
+        }
+    }
+
+    const fn error_type(self) -> &'static str {
+        match self {
+            Self::OutsideOpenAiScope => "not_found",
+            Self::DotSegment => "invalid_request_path",
         }
     }
 }

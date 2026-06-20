@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -368,6 +369,22 @@ async fn observability_disabled_skips_new_forwarded_records() {
     );
 }
 
+#[tokio::test]
+async fn dot_segment_paths_are_rejected_without_forwarding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    for request_target in ["/v1/../admin", "/v1/%2e%2e/admin", "/v1/%2E/admin"] {
+        let response = send_raw_proxy_get(&proxy.base_url, request_target).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 400 Bad Request"),
+            "dot-segment target should be rejected: {response}"
+        );
+        assert_no_upstream_request(&mut fake).await;
+    }
+}
+
 #[test]
 fn upstream_url_uses_v1_base_without_duplicating_path() {
     let uri = Uri::from_static("/v1/models?limit=2");
@@ -385,6 +402,37 @@ fn upstream_url_preserves_encoded_path_and_query() {
         url.as_str(),
         "http://upstream.example/v1/files/a%2Fb?cursor=a%2Fb"
     );
+}
+
+#[test]
+fn upstream_url_rejects_raw_dot_segment_paths() {
+    let uri = Uri::from_static("/v1/../admin");
+    let error = build_upstream_url("http://upstream.example/v1", &uri)
+        .expect_err("path should be rejected");
+
+    assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error.error_type(), "invalid_request_path");
+}
+
+#[test]
+fn upstream_url_rejects_percent_encoded_dot_segment_paths() {
+    for path in [
+        "/v1/%2e/admin",
+        "/v1/%2E/admin",
+        "/v1/%2e%2e/admin",
+        "/v1/%2E%2E/admin",
+        "/v1/.%2e/admin",
+        "/v1/%2e./admin",
+    ] {
+        let uri = Uri::try_from(path).expect("test URI should be valid");
+        let error = match build_upstream_url("http://upstream.example/v1", &uri) {
+            Ok(url) => panic!("{path} should be rejected, got {url}"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(error.error_type(), "invalid_request_path");
+    }
 }
 
 async fn next_chunk<S>(body: &mut S, wait: Duration, label: &str) -> Bytes
@@ -440,6 +488,10 @@ impl FakeUpstream {
             .recv()
             .await
             .expect("fake upstream should capture a request")
+    }
+
+    async fn recv_within(&mut self, wait: Duration) -> Option<ObservedRequest> {
+        timeout(wait, self.receiver.recv()).await.ok().flatten()
     }
 }
 
@@ -664,4 +716,43 @@ fn remove_dir_all(path: &Path) {
     if let Err(error) = fs::remove_dir_all(path) {
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
+}
+
+async fn assert_no_upstream_request(fake: &mut FakeUpstream) {
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "invalid proxy path must not be forwarded upstream"
+    );
+}
+
+async fn send_raw_proxy_get(base_url: &str, request_target: &str) -> String {
+    let base_url = base_url.to_owned();
+    let request_target = request_target.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let url = Url::parse(&base_url).expect("proxy base URL should parse");
+        let host = url.host_str().expect("proxy base URL should have a host");
+        let port = url.port().expect("proxy base URL should have a port");
+        let addr = format!("{host}:{port}");
+        let mut stream = std::net::TcpStream::connect(&addr)
+            .unwrap_or_else(|error| panic!("proxy TCP connection should open: {error}"));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("read timeout should be set");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .expect("write timeout should be set");
+        write!(
+            stream,
+            "GET {request_target} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("raw proxy request should write");
+
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("raw proxy response should read");
+        response
+    })
+    .await
+    .expect("blocking raw proxy request should finish")
 }
