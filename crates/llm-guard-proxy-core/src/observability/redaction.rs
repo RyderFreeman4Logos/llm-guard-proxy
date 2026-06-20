@@ -3,6 +3,26 @@ use std::collections::BTreeMap;
 use super::{error::ObservabilityError, model::RawPayloads};
 
 const REDACTED: &str = "[REDACTED]";
+const SENSITIVE_KEY_MARKERS: &[&str] = &[
+    "authorization",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+];
+const SENSITIVE_ASSIGNMENT_KEYS: &[&str] = &[
+    "authorization",
+    "api-key",
+    "api_key",
+    "apikey",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+];
 
 pub(super) fn redacted_metadata_json(
     metadata: &BTreeMap<String, String>,
@@ -46,16 +66,10 @@ pub(super) fn sanitize_optional_text(value: Option<&String>) -> Option<String> {
 }
 
 fn is_sensitive_key(key: &str) -> bool {
-    let normalized = key
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect::<String>();
-    normalized.contains("authorization")
-        || normalized.contains("apikey")
-        || normalized.contains("token")
-        || normalized.contains("secret")
-        || normalized.contains("password")
+    let normalized = normalize_key(key);
+    SENSITIVE_KEY_MARKERS
+        .iter()
+        .any(|marker| normalized.contains(marker))
 }
 
 fn looks_sensitive(value: &str) -> bool {
@@ -66,6 +80,26 @@ fn looks_sensitive(value: &str) -> bool {
         || normalized.contains("x-api-key")
         || normalized.contains("authorization")
         || normalized.contains("sk-")
-        || normalized.contains("token=")
-        || normalized.contains("secret=")
+        || contains_sensitive_assignment(&normalized)
+}
+
+fn normalize_key(key: &str) -> String {
+    key.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn contains_sensitive_assignment(value: &str) -> bool {
+    let compact = value
+        .chars()
+        .filter(|character| {
+            !character.is_ascii_whitespace()
+                && !matches!(character, '"' | '\'' | '`' | '{' | '}' | '[' | ']')
+        })
+        .collect::<String>();
+
+    SENSITIVE_ASSIGNMENT_KEYS
+        .iter()
+        .any(|key| compact.contains(&format!("{key}:")) || compact.contains(&format!("{key}=")))
 }

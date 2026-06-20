@@ -122,6 +122,73 @@ fn writes_success_and_failure_request_and_attempt_rows() {
 }
 
 #[test]
+fn updating_request_preserves_existing_attempt_rows() {
+    let fixture = StoreFixture::new("request-update-preserves-attempts");
+    let store = fixture.open_store(true, false, 10_000, 8_000);
+    let initial_request = RequestRecord {
+        finished_at_unix_ms: None,
+        status: RequestStatus::Failed,
+        http_status: Some(500),
+        error_reason: Some(String::from("in flight")),
+        ..request_record("req-update", RequestStatus::Failed, 1_000)
+    };
+    let attempt = attempt_record(
+        "attempt-update",
+        &initial_request.request_id,
+        AttemptStatus::Succeeded,
+        1,
+        1_010,
+    );
+
+    store
+        .record_request(&initial_request)
+        .expect("initial request write");
+    store.record_attempt(&attempt).expect("attempt write");
+
+    let final_request = RequestRecord {
+        finished_at_unix_ms: Some(1_300),
+        status: RequestStatus::Succeeded,
+        http_status: Some(200),
+        error_reason: None,
+        response_metadata: BTreeMap::from([(String::from("server"), String::from("updated"))]),
+        ..initial_request
+    };
+    store
+        .record_request(&final_request)
+        .expect("final request update");
+
+    let connection = store.lock_connection().expect("connection lock");
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM attempts WHERE request_id = 'req-update' AND attempt_number = 1",
+        ),
+        1
+    );
+
+    let (status, finished_at_unix_ms, error_reason, response_metadata_json): (
+        String,
+        i64,
+        Option<String>,
+        String,
+    ) = connection
+        .query_row(
+            r"
+SELECT status, finished_at_unix_ms, error_reason, response_metadata_json
+FROM requests
+WHERE request_id = 'req-update'
+",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("updated request row should exist");
+    assert_eq!(status, "succeeded");
+    assert_eq!(finished_at_unix_ms, 1_300);
+    assert_eq!(error_reason, None);
+    assert!(response_metadata_json.contains("updated"));
+}
+
+#[test]
 fn redacts_authorization_and_api_key_like_values_before_persistence() {
     let fixture = StoreFixture::new("redaction");
     let store = fixture.open_store(true, true, 10_000, 8_000);
@@ -178,6 +245,49 @@ WHERE request_id = 'req-redaction'
         Some("model output without credentials")
     );
     assert_eq!(raw_reasoning.as_deref(), Some("[REDACTED]"));
+}
+
+#[test]
+fn redacts_common_raw_payload_secret_forms_before_persistence() {
+    let fixture = StoreFixture::new("raw-secret-forms");
+    let store = fixture.open_store(true, true, 10_000, 8_000);
+    let mut request = request_record("req-raw-secrets", RequestStatus::Succeeded, 1_000);
+    request.raw_payloads = RawPayloads {
+        input: Some(String::from(r#"{"password":"fixture-password"}"#)),
+        output: Some(String::from("credential = fixture-credential")),
+        reasoning: Some(String::from("secret: fixture-secret")),
+        tool_calls: Some(String::from(r#"{"arguments":{"passwd":"fixture-passwd"}}"#)),
+    };
+    let mut attempt = attempt_record(
+        "attempt-raw-secrets",
+        &request.request_id,
+        AttemptStatus::Succeeded,
+        1,
+        1_010,
+    );
+    attempt.raw_payloads = RawPayloads {
+        input: Some(String::from("authorization: Bearer fixture-bearer")),
+        output: Some(String::from("token=fixture-token")),
+        reasoning: Some(String::from(r#"{"api_key":"fixture-api-key"}"#)),
+        tool_calls: Some(String::from("credential: fixture-tool-credential")),
+    };
+
+    store
+        .record_request(&request)
+        .expect("redacted raw request write");
+    store
+        .record_attempt(&attempt)
+        .expect("redacted raw attempt write");
+
+    let connection = store.lock_connection().expect("connection lock");
+    assert_redacted_raw_payloads(
+        &connection,
+        "SELECT raw_input, raw_output, raw_reasoning, raw_tool_calls FROM requests WHERE request_id = 'req-raw-secrets'",
+    );
+    assert_redacted_raw_payloads(
+        &connection,
+        "SELECT raw_input, raw_output, raw_reasoning, raw_tool_calls FROM attempts WHERE attempt_id = 'attempt-raw-secrets'",
+    );
 }
 
 #[test]
@@ -382,6 +492,24 @@ fn count_rows(connection: &rusqlite::Connection, sql: &str) -> i64 {
     connection
         .query_row(sql, params![], |row| row.get(0))
         .expect("count query should succeed")
+}
+
+fn assert_redacted_raw_payloads(connection: &rusqlite::Connection, sql: &str) {
+    let raw_payloads: (
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = connection
+        .query_row(sql, [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })
+        .expect("raw payload row should exist");
+
+    assert_eq!(raw_payloads.0.as_deref(), Some("[REDACTED]"));
+    assert_eq!(raw_payloads.1.as_deref(), Some("[REDACTED]"));
+    assert_eq!(raw_payloads.2.as_deref(), Some("[REDACTED]"));
+    assert_eq!(raw_payloads.3.as_deref(), Some("[REDACTED]"));
 }
 
 fn unique_test_dir(name: &str) -> PathBuf {

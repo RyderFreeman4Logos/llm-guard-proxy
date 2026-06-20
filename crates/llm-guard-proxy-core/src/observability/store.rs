@@ -361,7 +361,7 @@ fn insert_request(
     transaction
         .execute(
             r"
-INSERT OR REPLACE INTO requests (
+INSERT INTO requests (
     request_id,
     started_at_unix_ms,
     finished_at_unix_ms,
@@ -384,7 +384,27 @@ INSERT OR REPLACE INTO requests (
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
-)",
+)
+ON CONFLICT(request_id) DO UPDATE SET
+    started_at_unix_ms = excluded.started_at_unix_ms,
+    finished_at_unix_ms = excluded.finished_at_unix_ms,
+    duration_ms = excluded.duration_ms,
+    downstream_mode = excluded.downstream_mode,
+    upstream_mode = excluded.upstream_mode,
+    model_id = excluded.model_id,
+    input_fingerprint = excluded.input_fingerprint,
+    status = excluded.status,
+    http_status = excluded.http_status,
+    error_reason = excluded.error_reason,
+    abort_reason = excluded.abort_reason,
+    request_metadata_json = excluded.request_metadata_json,
+    response_metadata_json = excluded.response_metadata_json,
+    raw_input = excluded.raw_input,
+    raw_output = excluded.raw_output,
+    raw_reasoning = excluded.raw_reasoning,
+    raw_tool_calls = excluded.raw_tool_calls,
+    estimated_bytes = excluded.estimated_bytes
+",
             params![
                 record.request_id,
                 record.started_at_unix_ms,
