@@ -122,19 +122,26 @@ fn rejects_upstream_base_url_with_userinfo() {
 }
 
 #[test]
-fn rejects_upstream_base_url_with_sensitive_query_key() {
-    let mut config = AppConfig::default();
-    config.upstream.base_url =
-        String::from("https://example.test/v1?access_token=secret-token&safe=ok");
+fn rejects_upstream_base_url_with_any_query_string() {
+    for base_url in [
+        "https://example.test/v1?safe=sk-test",
+        "https://example.test/v1?q=Bearer%20sk-test",
+        "https://example.test/v1?safe=ok",
+    ] {
+        let mut config = AppConfig::default();
+        config.upstream.base_url = base_url.to_owned();
 
-    let error = config
-        .validate()
-        .expect_err("sensitive upstream URL query key should be rejected");
+        let error = config
+            .validate()
+            .expect_err("upstream base URL query strings should be rejected");
 
-    assert_eq!(error.field(), "upstream.base_url");
-    assert!(error.message().contains("sensitive query parameters"));
-    assert!(!error.to_string().contains("secret-token"));
-    assert!(!error.to_string().contains("access_token"));
+        assert_eq!(error.field(), "upstream.base_url");
+        assert!(error.message().contains("query parameters"));
+        assert!(!error.to_string().contains("sk-test"));
+        assert!(!error.to_string().contains("Bearer"));
+        assert!(!error.to_string().contains("safe=sk-test"));
+        assert!(!error.to_string().contains("q=Bearer%20sk-test"));
+    }
 }
 
 #[test]
@@ -150,10 +157,10 @@ fn rejects_upstream_base_url_with_sensitive_query_key_variants() {
 
         let error = config
             .validate()
-            .expect_err("credential-bearing upstream URL query key should be rejected");
+            .expect_err("upstream base URL query strings should be rejected");
 
         assert_eq!(error.field(), "upstream.base_url");
-        assert!(error.message().contains("sensitive query parameters"));
+        assert!(error.message().contains("query parameters"));
         assert!(!error.to_string().contains("sk-test"));
     }
 }
@@ -188,12 +195,13 @@ fn redacts_upstream_base_url_for_display() {
 
     assert_eq!(
         redacted,
-        "https://redacted:redacted@example.test/v1?redacted=redacted&safe=ok"
+        "https://redacted:redacted@example.test/v1?redacted"
     );
     assert!(!redacted.contains("user"));
     assert!(!redacted.contains("secret"));
     assert!(!redacted.contains("sk-test"));
     assert!(!redacted.contains("api_key"));
+    assert!(!redacted.contains("safe=ok"));
 }
 
 #[test]
@@ -201,13 +209,20 @@ fn redacts_sensitive_upstream_query_variants_and_fragments_for_display() {
     for base_url in [
         "https://example.test/v1?x-api-key=sk-test&safe=ok",
         "https://example.test/v1?client_secret=sk-test&safe=ok",
+        "https://example.test/v1?safe=sk-test",
+        "https://example.test/v1?q=Bearer%20sk-test",
         "https://example.test/v1?safe=ok#token=sk-test",
     ] {
         let redacted = redact_upstream_base_url(base_url);
 
+        assert!(redacted.ends_with("/v1?redacted"));
         assert!(!redacted.contains("sk-test"));
+        assert!(!redacted.contains("Bearer"));
         assert!(!redacted.contains("client_secret=sk-test"));
         assert!(!redacted.contains("x-api-key=sk-test"));
+        assert!(!redacted.contains("safe=sk-test"));
+        assert!(!redacted.contains("q=Bearer%20sk-test"));
+        assert!(!redacted.contains("safe=ok"));
         assert!(!redacted.contains("token=sk-test"));
     }
 }

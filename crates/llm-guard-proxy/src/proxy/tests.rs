@@ -574,7 +574,7 @@ async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
     let metadata = request_metadata(&Method::GET, &uri, &headers, 0, true);
     let error = ProxyError::invalid_upstream_url(
         "https://user:secret@example.test/v1?x-api-key=sk-test#token=sk-test",
-        String::from("must not contain sensitive query parameters"),
+        String::from("must not contain query parameters"),
     )
     .with_request_metadata(metadata);
     let error_type = error.error_type();
@@ -618,7 +618,7 @@ async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
     assert!(
         request_row
             .2
-            .contains("https://redacted:redacted@example.test/v1?redacted=redacted")
+            .contains("https://redacted:redacted@example.test/v1?redacted")
     );
     assert!(!request_row.2.contains("user:secret"));
     assert!(!request_row.2.contains("secret"));
@@ -710,7 +710,7 @@ fn upstream_url_rejects_and_redacts_credential_bearing_base_url() {
     let error = error.to_string();
 
     assert!(error.contains("invalid upstream base URL"));
-    assert!(error.contains("https://redacted:redacted@example.test/v1?redacted=redacted"));
+    assert!(error.contains("https://redacted:redacted@example.test/v1?redacted"));
     assert!(!error.contains("user:secret"));
     assert!(!error.contains("secret"));
     assert!(!error.contains("sk-test"));
@@ -721,12 +721,12 @@ fn upstream_url_rejects_and_redacts_credential_bearing_base_url() {
 #[test]
 fn upstream_url_rejects_and_redacts_fragment_base_url() {
     let uri = Uri::from_static("/v1/models");
-    let error = build_upstream_url("https://example.test/v1?safe=ok#token=sk-test", &uri)
+    let error = build_upstream_url("https://example.test/v1#token=sk-test", &uri)
         .expect_err("fragment-bearing upstream URL should be rejected");
     let error = error.to_string();
 
     assert!(error.contains("invalid upstream base URL"));
-    assert!(error.contains("https://example.test/v1?safe=ok"));
+    assert!(error.contains("https://example.test/v1"));
     assert!(!error.contains("sk-test"));
     assert!(!error.contains("token=sk-test"));
 }

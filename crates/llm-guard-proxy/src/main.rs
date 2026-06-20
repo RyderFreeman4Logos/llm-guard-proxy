@@ -141,13 +141,15 @@ mod tests {
             "https://user:secret@example.test/v1?x-api-key=sk-test&safe=ok#token=sk-test",
         );
 
-        assert!(rendered.contains(
-            "upstream_base_url=https://redacted:redacted@example.test/v1?redacted=redacted&safe=ok"
-        ));
+        assert!(
+            rendered
+                .contains("upstream_base_url=https://redacted:redacted@example.test/v1?redacted")
+        );
         assert!(!rendered.contains("user"));
         assert!(!rendered.contains("secret"));
         assert!(!rendered.contains("sk-test"));
         assert!(!rendered.contains("x-api-key"));
+        assert!(!rendered.contains("safe=ok"));
         assert!(!rendered.contains("token=sk-test"));
     }
 }
