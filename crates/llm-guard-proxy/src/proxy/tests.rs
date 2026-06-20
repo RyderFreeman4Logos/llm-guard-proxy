@@ -1,22 +1,36 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use axum::http::header::{AUTHORIZATION, CONNECTION};
+use futures_util::{Stream, StreamExt, stream};
 use llm_guard_proxy_core::ConfigManager;
 use rusqlite::Connection;
-use tokio::{net::TcpListener, sync::mpsc};
+use tokio::{
+    net::TcpListener,
+    sync::mpsc,
+    time::{sleep, timeout},
+};
 
 use super::*;
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;
 const TEST_MAX_RECORDS: u64 = 100;
+const STREAM_DELAY: Duration = Duration::from_millis(800);
+const STREAM_HEADER_TIMEOUT: Duration = Duration::from_millis(500);
+const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_millis(250);
+const STREAM_SECOND_CHUNK_GUARD: Duration = Duration::from_millis(150);
+const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+const SSE_FIRST_CHUNK: &[u8] = b"data: first\n\n";
+const SSE_SECOND_CHUNK: &[u8] = b"data: second\n\n";
+const LONG_JSON_FIRST_CHUNK: &[u8] = br#"{"object":"list","data":["#;
+const LONG_JSON_SECOND_CHUNK: &[u8] = br"]}";
 
 #[tokio::test]
 async fn get_models_forwards_method_path_query_and_headers() {
@@ -166,6 +180,104 @@ async fn non_chat_embeddings_pass_through_without_policy_rewrite() {
 }
 
 #[tokio::test]
+async fn sse_response_streams_first_chunk_before_upstream_completion() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy
+            .client
+            .post(format!("{}/v1/chat/completions?test=sse", proxy.base_url))
+            .header(CONTENT_TYPE, "application/json")
+            .body(r#"{"model":"test-chat","messages":[],"stream":true}"#)
+            .send(),
+    )
+    .await
+    .expect("proxy should return SSE headers before delayed upstream completion")
+    .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("content type should be forwarded"),
+        "text/event-stream"
+    );
+
+    let mut body = response.bytes_stream();
+    let first = next_chunk(&mut body, STREAM_FIRST_CHUNK_TIMEOUT, "first SSE chunk").await;
+    assert_eq!(first, Bytes::from_static(SSE_FIRST_CHUNK));
+    assert!(
+        timeout(STREAM_SECOND_CHUNK_GUARD, body.next())
+            .await
+            .is_err(),
+        "second SSE chunk arrived before the upstream delay elapsed"
+    );
+    let second = next_chunk(&mut body, STREAM_COMPLETION_TIMEOUT, "second SSE chunk").await;
+    assert_eq!(second, Bytes::from_static(SSE_SECOND_CHUNK));
+    assert!(
+        timeout(STREAM_COMPLETION_TIMEOUT, body.next())
+            .await
+            .expect("SSE stream end should arrive after delayed chunk")
+            .is_none()
+    );
+
+    let observed = fake.recv().await;
+    assert_eq!(observed.method, Method::POST);
+    assert_eq!(observed.path_and_query, "/v1/chat/completions?test=sse");
+}
+
+#[tokio::test]
+async fn long_json_response_streams_first_chunk_while_upstream_remains_open() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy
+            .client
+            .get(format!("{}/v1/models?test=long-json", proxy.base_url))
+            .send(),
+    )
+    .await
+    .expect("proxy should return JSON headers before delayed upstream completion")
+    .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("content type should be forwarded"),
+        "application/json"
+    );
+
+    let mut body = response.bytes_stream();
+    let first = next_chunk(&mut body, STREAM_FIRST_CHUNK_TIMEOUT, "first JSON chunk").await;
+    assert_eq!(first, Bytes::from_static(LONG_JSON_FIRST_CHUNK));
+    assert!(
+        timeout(STREAM_SECOND_CHUNK_GUARD, body.next())
+            .await
+            .is_err(),
+        "second JSON chunk arrived before the upstream delay elapsed"
+    );
+    let second = next_chunk(&mut body, STREAM_COMPLETION_TIMEOUT, "second JSON chunk").await;
+    assert_eq!(second, Bytes::from_static(LONG_JSON_SECOND_CHUNK));
+    assert!(
+        timeout(STREAM_COMPLETION_TIMEOUT, body.next())
+            .await
+            .expect("JSON stream end should arrive after delayed chunk")
+            .is_none()
+    );
+
+    let observed = fake.recv().await;
+    assert_eq!(observed.method, Method::GET);
+    assert_eq!(observed.path_and_query, "/v1/models?test=long-json");
+}
+
+#[tokio::test]
 async fn forwarded_call_writes_observability_metadata() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -180,6 +292,10 @@ async fn forwarded_call_writes_observability_metadata() {
         .expect("proxy request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should be text"),
+        r#"{"id":"cmpl-test","object":"text_completion"}"#
+    );
     let _observed = fake.recv().await;
     assert_eq!(
         proxy
@@ -237,6 +353,10 @@ async fn observability_disabled_skips_new_forwarded_records() {
         .expect("proxy request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should be text"),
+        r#"{"object":"list","data":[]}"#
+    );
     let _observed = fake.recv().await;
     assert_eq!(
         proxy
@@ -265,6 +385,17 @@ fn upstream_url_preserves_encoded_path_and_query() {
         url.as_str(),
         "http://upstream.example/v1/files/a%2Fb?cursor=a%2Fb"
     );
+}
+
+async fn next_chunk<S>(body: &mut S, wait: Duration, label: &str) -> Bytes
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+{
+    timeout(wait, body.next())
+        .await
+        .unwrap_or_else(|_| panic!("{label} should arrive before timeout"))
+        .unwrap_or_else(|| panic!("{label} should not end the stream"))
+        .unwrap_or_else(|error| panic!("{label} should not fail: {error}"))
 }
 
 #[derive(Debug)]
@@ -336,10 +467,29 @@ async fn fake_upstream_handler(
         .next()
         .unwrap_or_default()
         .to_owned();
+    let is_sse_stream = observed.path_and_query.contains("test=sse");
+    let is_long_json_stream = observed.path_and_query.contains("test=long-json");
     sender
         .send(observed)
         .await
         .expect("fake upstream observation should send");
+
+    if is_sse_stream {
+        return delayed_stream_response(
+            "sse",
+            "text/event-stream",
+            SSE_FIRST_CHUNK,
+            SSE_SECOND_CHUNK,
+        );
+    }
+    if is_long_json_stream {
+        return delayed_stream_response(
+            "long-json",
+            "application/json",
+            LONG_JSON_FIRST_CHUNK,
+            LONG_JSON_SECOND_CHUNK,
+        );
+    }
 
     let (label, body) = match endpoint.as_str() {
         "/v1/models" => ("models", r#"{"object":"list","data":[]}"#),
@@ -370,6 +520,40 @@ async fn fake_upstream_handler(
     response.headers_mut().insert(
         HeaderName::from_static("x-upstream-endpoint"),
         HeaderValue::from_str(label).expect("static label should be a valid header"),
+    );
+    response
+}
+
+fn delayed_stream_response(
+    label: &'static str,
+    content_type: &'static str,
+    first: &'static [u8],
+    second: &'static [u8],
+) -> Response<Body> {
+    let body = Body::from_stream(stream::unfold(0_u8, move |state| async move {
+        match state {
+            0 => Some((
+                Ok::<_, std::convert::Infallible>(Bytes::from_static(first)),
+                1,
+            )),
+            1 => {
+                sleep(STREAM_DELAY).await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(Bytes::from_static(second)),
+                    2,
+                ))
+            }
+            _ => None,
+        }
+    }));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_static(label),
     );
     response
 }

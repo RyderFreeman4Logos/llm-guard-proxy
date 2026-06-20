@@ -1,6 +1,8 @@
 use std::{
     collections::{BTreeMap, HashSet},
     path::{Path, PathBuf},
+    pin::Pin,
+    task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,6 +16,7 @@ use axum::{
     },
     routing::get,
 };
+use futures_util::Stream;
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DownstreamMode, Health,
     LICENSE, ObservabilityStore, RawPayloads, RequestId, RequestRecord, RequestStatus,
@@ -167,13 +170,6 @@ async fn forward_openai_request(
     let upstream_status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
     let upstream_mode = upstream_mode_from_headers(&upstream_headers);
-    let response_body = upstream_response
-        .bytes()
-        .await
-        .map_err(ProxyError::UpstreamTransport)?;
-    let finished_at_unix_ms = unix_time_millis();
-
-    let response = downstream_response(upstream_status, &upstream_headers, response_body.clone());
     let request_metadata = request_metadata(
         &method,
         &uri,
@@ -181,47 +177,27 @@ async fn forward_openai_request(
         body.len(),
         config.shielding.enabled,
     );
-    let response_metadata = response_metadata(
-        upstream_status,
-        &upstream_headers,
-        response_body.len(),
-        finished_at_unix_ms.saturating_sub(started_at_unix_ms),
-    );
     let attempt_request_metadata = attempt_request_metadata(&method, &uri, &downstream_headers);
-    let attempt_response_metadata = response_metadata.clone();
-    let request_record = RequestRecord {
+    let observer = ForwardedBodyObserver {
+        store: state.store.clone(),
         request_id: request_id.clone(),
         started_at_unix_ms,
-        finished_at_unix_ms: Some(finished_at_unix_ms),
+        attempt_id,
+        attempt_started_at_unix_ms,
         downstream_mode: downstream_mode_from_headers(&upstream_headers),
         upstream_mode,
         model_id,
-        input_fingerprint: None,
-        status: RequestStatus::Succeeded,
-        http_status: Some(upstream_status.as_u16()),
-        error_reason: None,
-        abort_reason: None,
+        upstream_status,
+        upstream_headers: upstream_headers.clone(),
         request_metadata,
-        response_metadata,
-        raw_payloads: RawPayloads::default(),
+        attempt_request_metadata,
     };
-    let attempt_record = AttemptRecord {
-        attempt_id,
-        request_id: request_id.clone(),
-        attempt_number: 1,
-        started_at_unix_ms: attempt_started_at_unix_ms,
-        finished_at_unix_ms: Some(finished_at_unix_ms),
-        upstream_mode,
-        status: AttemptStatus::Succeeded,
-        http_status: Some(upstream_status.as_u16()),
-        error_reason: None,
-        retry_reason: None,
-        abort_reason: None,
-        request_metadata: attempt_request_metadata,
-        response_metadata: attempt_response_metadata,
-        raw_payloads: RawPayloads::default(),
-    };
-    record_observability(&state.store, &request_record, Some(&attempt_record));
+    let response_body = ObservedUpstreamBody::new(upstream_response.bytes_stream(), observer);
+    let response = downstream_response(
+        upstream_status,
+        &upstream_headers,
+        Body::from_stream(response_body),
+    );
 
     Ok(response)
 }
@@ -249,6 +225,161 @@ async fn send_upstream_request(
         .send()
         .await
         .map_err(ProxyError::UpstreamTransport)
+}
+
+struct ForwardedBodyObserver {
+    store: ObservabilityStore,
+    request_id: RequestId,
+    started_at_unix_ms: u64,
+    attempt_id: AttemptId,
+    attempt_started_at_unix_ms: u64,
+    downstream_mode: DownstreamMode,
+    upstream_mode: UpstreamMode,
+    model_id: Option<String>,
+    upstream_status: reqwest::StatusCode,
+    upstream_headers: HeaderMap,
+    request_metadata: BTreeMap<String, String>,
+    attempt_request_metadata: BTreeMap<String, String>,
+}
+
+impl ForwardedBodyObserver {
+    fn record(self, body_bytes: u64, completion: &BodyCompletion) {
+        let finished_at_unix_ms = unix_time_millis();
+        let response_metadata = response_metadata(
+            self.upstream_status,
+            &self.upstream_headers,
+            body_bytes,
+            finished_at_unix_ms.saturating_sub(self.started_at_unix_ms),
+        );
+        let attempt_response_metadata = response_metadata.clone();
+        let request_record = RequestRecord {
+            request_id: self.request_id.clone(),
+            started_at_unix_ms: self.started_at_unix_ms,
+            finished_at_unix_ms: Some(finished_at_unix_ms),
+            downstream_mode: self.downstream_mode,
+            upstream_mode: self.upstream_mode,
+            model_id: self.model_id,
+            input_fingerprint: None,
+            status: completion.request_status(),
+            http_status: Some(self.upstream_status.as_u16()),
+            error_reason: completion.error_reason(),
+            abort_reason: completion.abort_reason(),
+            request_metadata: self.request_metadata,
+            response_metadata,
+            raw_payloads: RawPayloads::default(),
+        };
+        let attempt_record = AttemptRecord {
+            attempt_id: self.attempt_id,
+            request_id: self.request_id,
+            attempt_number: 1,
+            started_at_unix_ms: self.attempt_started_at_unix_ms,
+            finished_at_unix_ms: Some(finished_at_unix_ms),
+            upstream_mode: self.upstream_mode,
+            status: completion.attempt_status(),
+            http_status: Some(self.upstream_status.as_u16()),
+            error_reason: completion.error_reason(),
+            retry_reason: None,
+            abort_reason: completion.abort_reason(),
+            request_metadata: self.attempt_request_metadata,
+            response_metadata: attempt_response_metadata,
+            raw_payloads: RawPayloads::default(),
+        };
+        record_observability(&self.store, &request_record, Some(&attempt_record));
+    }
+}
+
+enum BodyCompletion {
+    Succeeded,
+    UpstreamStreamError(String),
+    DownstreamDropped,
+}
+
+impl BodyCompletion {
+    const fn request_status(&self) -> RequestStatus {
+        match self {
+            Self::Succeeded => RequestStatus::Succeeded,
+            Self::UpstreamStreamError(_) => RequestStatus::Failed,
+            Self::DownstreamDropped => RequestStatus::Aborted,
+        }
+    }
+
+    const fn attempt_status(&self) -> AttemptStatus {
+        match self {
+            Self::Succeeded => AttemptStatus::Succeeded,
+            Self::UpstreamStreamError(_) => AttemptStatus::Failed,
+            Self::DownstreamDropped => AttemptStatus::Aborted,
+        }
+    }
+
+    fn error_reason(&self) -> Option<String> {
+        match self {
+            Self::UpstreamStreamError(error) => Some(format!("upstream_stream_error: {error}")),
+            Self::Succeeded | Self::DownstreamDropped => None,
+        }
+    }
+
+    fn abort_reason(&self) -> Option<String> {
+        match self {
+            Self::DownstreamDropped => Some(String::from("downstream_body_dropped_before_eof")),
+            Self::Succeeded | Self::UpstreamStreamError(_) => None,
+        }
+    }
+}
+
+struct ObservedUpstreamBody {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+    observer: Option<ForwardedBodyObserver>,
+    bytes_seen: u64,
+}
+
+impl ObservedUpstreamBody {
+    fn new(
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        observer: ForwardedBodyObserver,
+    ) -> Self {
+        Self {
+            inner: Box::pin(stream),
+            observer: Some(observer),
+            bytes_seen: 0,
+        }
+    }
+
+    fn record_once(&mut self, completion: &BodyCompletion) {
+        if let Some(observer) = self.observer.take() {
+            observer.record(self.bytes_seen, completion);
+        }
+    }
+}
+
+impl Stream for ObservedUpstreamBody {
+    type Item = Result<Bytes, reqwest::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => {
+                let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+                this.bytes_seen = this.bytes_seen.saturating_add(chunk_len);
+                Poll::Ready(Some(Ok(bytes)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                let completion = BodyCompletion::UpstreamStreamError(error.to_string());
+                this.record_once(&completion);
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                this.record_once(&BodyCompletion::Succeeded);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ObservedUpstreamBody {
+    fn drop(&mut self) {
+        self.record_once(&BodyCompletion::DownstreamDropped);
+    }
 }
 
 fn build_upstream_url(base_url: &str, uri: &Uri) -> Result<Url, ProxyError> {
@@ -290,10 +421,10 @@ fn upstream_path(base_path: &str, downstream_path: &str) -> String {
 fn downstream_response(
     status: reqwest::StatusCode,
     upstream_headers: &HeaderMap,
-    body: Bytes,
+    body: Body,
 ) -> Response<Body> {
     let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
-    let mut response = Response::new(Body::from(body));
+    let mut response = Response::new(body);
     *response.status_mut() = status;
     copy_response_headers(upstream_headers, response.headers_mut());
     response
@@ -405,7 +536,7 @@ fn attempt_request_metadata(
 fn response_metadata(
     status: reqwest::StatusCode,
     headers: &HeaderMap,
-    body_len: usize,
+    body_len: u64,
     latency_ms: u64,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::from([
