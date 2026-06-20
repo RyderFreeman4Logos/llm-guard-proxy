@@ -34,7 +34,6 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 mod model_metadata;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
-const MAX_PROXY_BODY_BYTES_U64: u64 = 64 * 1024 * 1024;
 const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 120;
 const HEADER_VALUE_NOT_UTF8: &str = "[non-utf8]";
 
@@ -304,7 +303,7 @@ async fn forward_openai_request(
         request_metadata,
         attempt_request_metadata,
     };
-    if should_enrich_models_response(&method, &uri, &upstream_headers, &config) {
+    if should_enrich_models_response(&method, &uri, &config) {
         return forward_enriched_models_response(
             response_parts,
             upstream_response,
@@ -358,25 +357,11 @@ async fn read_upstream_body_bytes(
     Ok(body.freeze())
 }
 
-fn should_enrich_models_response(
-    method: &Method,
-    uri: &Uri,
-    upstream_headers: &HeaderMap,
-    config: &AppConfig,
-) -> bool {
+fn should_enrich_models_response(method: &Method, uri: &Uri, config: &AppConfig) -> bool {
     method == Method::GET
         && uri.path() == "/v1/models"
         && config.upstream.metadata.discovery_enabled
         && config.upstream.metadata.enrich_responses
-        && response_body_fits_enrichment_limit(upstream_headers)
-}
-
-fn response_body_fits_enrichment_limit(headers: &HeaderMap) -> bool {
-    headers
-        .get(CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .is_some_and(|body_len| body_len <= MAX_PROXY_BODY_BYTES_U64)
 }
 
 fn upstream_method(method: &Method) -> Result<reqwest::Method, ProxyError> {

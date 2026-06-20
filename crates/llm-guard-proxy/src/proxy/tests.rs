@@ -37,6 +37,10 @@ const SSE_SECOND_CHUNK: &[u8] = b"data: second\n\n";
 const LONG_JSON_FIRST_CHUNK: &[u8] = br#"{"object":"list","data":["#;
 const LONG_JSON_SECOND_CHUNK: &[u8] = br"]}";
 const MODEL_METADATA_BODY: &str = r#"{"object":"list","data":[{"id":"aeon-ultimate","object":"model","max_model_len":256000,"owned_by":"vllm","extra":"keep"}]}"#;
+const MODEL_METADATA_CHUNKED_FIRST: &[u8] =
+    br#"{"object":"list","data":[{"id":"chunked-model","object":"model","#;
+const MODEL_METADATA_CHUNKED_SECOND: &[u8] =
+    br#""max_model_len":256000,"owned_by":"vllm","extra":"keep"}]}"#;
 const MODEL_METADATA_NO_CONTEXT_BODY: &str = r#"{"object":"list","data":[{"id":"fallback-model","object":"model","owned_by":"vllm","extra":"keep"}]}"#;
 static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -126,6 +130,39 @@ async fn get_models_enriches_context_metadata_and_preserves_unknown_fields() {
     let observed = fake.recv().await;
     assert_eq!(observed.method, Method::GET);
     assert_eq!(observed.path_and_query, "/v1/models?test=model-metadata");
+}
+
+#[tokio::test]
+async fn get_models_enriches_chunked_context_metadata_without_content_length() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-chunked",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("body should be text");
+    let model = first_model(&body);
+    assert_eq!(model["id"], "chunked-model");
+    assert_eq!(model["owned_by"], "vllm");
+    assert_eq!(model["extra"], "keep");
+    assert_eq!(model["max_model_len"].as_u64(), Some(256_000));
+    assert_eq!(model["context_length"].as_u64(), Some(256_000));
+    assert_eq!(model["max_context_length"].as_u64(), Some(256_000));
+
+    let observed = fake.recv().await;
+    assert_eq!(observed.method, Method::GET);
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=model-metadata-chunked"
+    );
 }
 
 #[tokio::test]
@@ -534,7 +571,7 @@ async fn long_json_response_streams_first_chunk_while_upstream_remains_open() {
         STREAM_HEADER_TIMEOUT,
         proxy
             .client
-            .get(format!("{}/v1/models?test=long-json", proxy.base_url))
+            .get(format!("{}/v1/embeddings?test=long-json", proxy.base_url))
             .send(),
     )
     .await
@@ -570,7 +607,7 @@ async fn long_json_response_streams_first_chunk_while_upstream_remains_open() {
 
     let observed = fake.recv().await;
     assert_eq!(observed.method, Method::GET);
-    assert_eq!(observed.path_and_query, "/v1/models?test=long-json");
+    assert_eq!(observed.path_and_query, "/v1/embeddings?test=long-json");
 }
 
 #[tokio::test]
@@ -869,7 +906,7 @@ async fn in_flight_limit_rejects_before_body_buffering() {
     let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 1).await;
     let first_request = Request::builder()
         .method(Method::GET)
-        .uri("/v1/models?test=long-json")
+        .uri("/v1/embeddings?test=long-json")
         .body(Body::empty())
         .expect("first request should build");
 
@@ -881,7 +918,10 @@ async fn in_flight_limit_rejects_before_body_buffering() {
         .await
         .expect("first request should reach upstream and hold the only permit");
     assert_eq!(first_observed.method, Method::GET);
-    assert_eq!(first_observed.path_and_query, "/v1/models?test=long-json");
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/embeddings?test=long-json"
+    );
 
     let body_polled = Arc::new(AtomicBool::new(false));
     let second_body = Body::from_stream(stream::once({
@@ -1391,6 +1431,13 @@ fn fake_upstream_endpoint_response(
     state: &FakeUpstreamState,
 ) -> Response<Body> {
     if endpoint == "/v1/models" {
+        if path_and_query.contains("test=model-metadata-chunked") {
+            return chunked_json_response(
+                "models",
+                MODEL_METADATA_CHUNKED_FIRST,
+                MODEL_METADATA_CHUNKED_SECOND,
+            );
+        }
         if path_and_query.contains("test=model-metadata-changing") {
             let max_model_len = state
                 .changing_model_len
@@ -1451,6 +1498,27 @@ fn json_response(label: &'static str, body: String) -> Response<Body> {
     response.headers_mut().insert(
         HeaderName::from_static("x-upstream-endpoint"),
         HeaderValue::from_str(label).expect("static label should be a valid header"),
+    );
+    response
+}
+
+fn chunked_json_response(
+    label: &'static str,
+    first: &'static [u8],
+    second: &'static [u8],
+) -> Response<Body> {
+    let body = Body::from_stream(stream::iter([
+        Ok::<_, std::convert::Infallible>(Bytes::from_static(first)),
+        Ok::<_, std::convert::Infallible>(Bytes::from_static(second)),
+    ]));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_static(label),
     );
     response
 }
