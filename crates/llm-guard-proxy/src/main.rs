@@ -138,7 +138,7 @@ mod tests {
     fn renders_listening_with_redacted_upstream_base_url() {
         let rendered = render_listening(
             "127.0.0.1:18009",
-            "https://user:secret@example.test/v1?api_key=sk-test&safe=ok",
+            "https://user:secret@example.test/v1?x-api-key=sk-test&safe=ok#token=sk-test",
         );
 
         assert!(rendered.contains(
@@ -147,6 +147,7 @@ mod tests {
         assert!(!rendered.contains("user"));
         assert!(!rendered.contains("secret"));
         assert!(!rendered.contains("sk-test"));
-        assert!(!rendered.contains("api_key"));
+        assert!(!rendered.contains("x-api-key"));
+        assert!(!rendered.contains("token=sk-test"));
     }
 }

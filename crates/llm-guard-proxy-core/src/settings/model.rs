@@ -5,14 +5,30 @@ use url::Url;
 
 const REDACTED_URL_PART: &str = "redacted";
 const INVALID_URL_DISPLAY: &str = "[invalid URL]";
-const SENSITIVE_UPSTREAM_QUERY_KEYS: &[&str] = &[
+const SENSITIVE_UPSTREAM_FIELD_NAME_SUBSTRINGS: &[&str] = &[
     "apikey",
     "accesstoken",
+    "accesskey",
+    "authkey",
+    "bearertoken",
+    "clientkey",
+    "clientsecret",
+    "privatekey",
+    "refreshtoken",
+    "secretkey",
     "token",
     "password",
+    "passwd",
     "secret",
-    "key",
     "authorization",
+];
+const SENSITIVE_UPSTREAM_FIELD_NAME_SEGMENTS: &[&str] = &[
+    "authorization",
+    "key",
+    "password",
+    "passwd",
+    "secret",
+    "token",
 ];
 
 /// Complete application configuration.
@@ -165,7 +181,8 @@ impl Default for UpstreamConfig {
 /// # Errors
 ///
 /// Returns a [`ValidationError`] when the URL is not absolute HTTP(S), includes
-/// userinfo, or contains query keys that commonly carry credentials.
+/// userinfo, contains query keys that commonly carry credentials, or includes a
+/// fragment.
 pub fn validate_upstream_base_url(base_url: &str) -> Result<(), ValidationError> {
     let url = Url::parse(base_url).map_err(|_error| {
         ValidationError::new(
@@ -189,6 +206,11 @@ pub fn validate_upstream_base_url(base_url: &str) -> Result<(), ValidationError>
             "must not contain sensitive query parameters",
         ));
     }
+    require(
+        url.fragment().is_none(),
+        "upstream.base_url",
+        "must not contain URL fragments",
+    )?;
     Ok(())
 }
 
@@ -212,7 +234,7 @@ pub fn redact_upstream_base_url(base_url: &str) -> String {
         let redacted_query = url
             .query_pairs()
             .map(|(key, value)| {
-                if is_sensitive_upstream_query_key(&key) {
+                if is_sensitive_upstream_field_name(&key) {
                     (REDACTED_URL_PART.to_owned(), REDACTED_URL_PART.to_owned())
                 } else {
                     (key.into_owned(), value.into_owned())
@@ -225,24 +247,37 @@ pub fn redact_upstream_base_url(base_url: &str) -> String {
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         );
     }
+    url.set_fragment(None);
 
     url.to_string()
 }
 
 fn has_sensitive_upstream_query_key(url: &Url) -> bool {
     url.query_pairs()
-        .any(|(key, _value)| is_sensitive_upstream_query_key(&key))
+        .any(|(key, _value)| is_sensitive_upstream_field_name(&key))
 }
 
-fn is_sensitive_upstream_query_key(key: &str) -> bool {
-    let normalized = normalize_upstream_query_key(key);
-    SENSITIVE_UPSTREAM_QUERY_KEYS
+fn is_sensitive_upstream_field_name(name: &str) -> bool {
+    let normalized = normalize_upstream_field_name(name);
+    if SENSITIVE_UPSTREAM_FIELD_NAME_SUBSTRINGS
         .iter()
-        .any(|sensitive| normalized == *sensitive)
+        .any(|sensitive| normalized.contains(sensitive))
+    {
+        return true;
+    }
+
+    name.split(|character: char| !character.is_ascii_alphanumeric())
+        .map(normalize_upstream_field_name)
+        .filter(|segment| !segment.is_empty())
+        .any(|segment| {
+            SENSITIVE_UPSTREAM_FIELD_NAME_SEGMENTS
+                .iter()
+                .any(|sensitive| segment == *sensitive)
+        })
 }
 
-fn normalize_upstream_query_key(key: &str) -> String {
-    key.chars()
+fn normalize_upstream_field_name(name: &str) -> String {
+    name.chars()
         .filter(char::is_ascii_alphanumeric)
         .flat_map(char::to_lowercase)
         .collect()

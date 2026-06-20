@@ -8,6 +8,7 @@ use std::{
 use super::{
     AppConfig, ConfigManager, ConfigParseError, HeartbeatMode, MissingConfigPolicy,
     RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ValidationError, parse::parse_config_text,
+    redact_upstream_base_url,
 };
 
 #[test]
@@ -137,6 +138,47 @@ fn rejects_upstream_base_url_with_sensitive_query_key() {
 }
 
 #[test]
+fn rejects_upstream_base_url_with_sensitive_query_key_variants() {
+    for base_url in [
+        "https://example.test/v1?x-api-key=sk-test",
+        "https://example.test/v1?client_secret=sk-test",
+        "https://example.test/v1?refresh_token=sk-test",
+        "https://example.test/v1?secret_key=sk-test",
+    ] {
+        let mut config = AppConfig::default();
+        config.upstream.base_url = base_url.to_owned();
+
+        let error = config
+            .validate()
+            .expect_err("credential-bearing upstream URL query key should be rejected");
+
+        assert_eq!(error.field(), "upstream.base_url");
+        assert!(error.message().contains("sensitive query parameters"));
+        assert!(!error.to_string().contains("sk-test"));
+    }
+}
+
+#[test]
+fn rejects_upstream_base_url_with_fragment() {
+    for base_url in [
+        "https://example.test/v1#token=sk-test",
+        "https://example.test/v1#section",
+    ] {
+        let mut config = AppConfig::default();
+        config.upstream.base_url = base_url.to_owned();
+
+        let error = config
+            .validate()
+            .expect_err("upstream URL fragments should be rejected");
+
+        assert_eq!(error.field(), "upstream.base_url");
+        assert!(error.message().contains("fragments"));
+        assert!(!error.to_string().contains("sk-test"));
+        assert!(!error.to_string().contains("token=sk-test"));
+    }
+}
+
+#[test]
 fn redacts_upstream_base_url_for_display() {
     let mut config = AppConfig::default();
     config.upstream.base_url =
@@ -152,6 +194,22 @@ fn redacts_upstream_base_url_for_display() {
     assert!(!redacted.contains("secret"));
     assert!(!redacted.contains("sk-test"));
     assert!(!redacted.contains("api_key"));
+}
+
+#[test]
+fn redacts_sensitive_upstream_query_variants_and_fragments_for_display() {
+    for base_url in [
+        "https://example.test/v1?x-api-key=sk-test&safe=ok",
+        "https://example.test/v1?client_secret=sk-test&safe=ok",
+        "https://example.test/v1?safe=ok#token=sk-test",
+    ] {
+        let redacted = redact_upstream_base_url(base_url);
+
+        assert!(!redacted.contains("sk-test"));
+        assert!(!redacted.contains("client_secret=sk-test"));
+        assert!(!redacted.contains("x-api-key=sk-test"));
+        assert!(!redacted.contains("token=sk-test"));
+    }
 }
 
 #[test]

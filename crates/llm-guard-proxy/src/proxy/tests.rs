@@ -573,7 +573,7 @@ async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
         RequestId::from_string("req-invalid-upstream").expect("request id should be valid");
     let metadata = request_metadata(&Method::GET, &uri, &headers, 0, true);
     let error = ProxyError::invalid_upstream_url(
-        "https://user:secret@example.test/v1?api_key=sk-test",
+        "https://user:secret@example.test/v1?x-api-key=sk-test#token=sk-test",
         String::from("must not contain sensitive query parameters"),
     )
     .with_request_metadata(metadata);
@@ -623,7 +623,8 @@ async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
     assert!(!request_row.2.contains("user:secret"));
     assert!(!request_row.2.contains("secret"));
     assert!(!request_row.2.contains("sk-test"));
-    assert!(!request_row.2.contains("api_key"));
+    assert!(!request_row.2.contains("x-api-key"));
+    assert!(!request_row.2.contains("token=sk-test"));
     assert_eq!(request_metadata["method"], "GET");
     assert_eq!(request_metadata["path"], "/v1/models");
     assert_eq!(request_metadata["query_present"], "true");
@@ -701,8 +702,11 @@ fn upstream_url_rejects_percent_encoded_dot_segment_paths() {
 #[test]
 fn upstream_url_rejects_and_redacts_credential_bearing_base_url() {
     let uri = Uri::from_static("/v1/models");
-    let error = build_upstream_url("https://user:secret@example.test/v1?api_key=sk-test", &uri)
-        .expect_err("credential-bearing upstream URL should be rejected");
+    let error = build_upstream_url(
+        "https://user:secret@example.test/v1?x-api-key=sk-test#token=sk-test",
+        &uri,
+    )
+    .expect_err("credential-bearing upstream URL should be rejected");
     let error = error.to_string();
 
     assert!(error.contains("invalid upstream base URL"));
@@ -710,7 +714,21 @@ fn upstream_url_rejects_and_redacts_credential_bearing_base_url() {
     assert!(!error.contains("user:secret"));
     assert!(!error.contains("secret"));
     assert!(!error.contains("sk-test"));
-    assert!(!error.contains("api_key"));
+    assert!(!error.contains("x-api-key"));
+    assert!(!error.contains("token=sk-test"));
+}
+
+#[test]
+fn upstream_url_rejects_and_redacts_fragment_base_url() {
+    let uri = Uri::from_static("/v1/models");
+    let error = build_upstream_url("https://example.test/v1?safe=ok#token=sk-test", &uri)
+        .expect_err("fragment-bearing upstream URL should be rejected");
+    let error = error.to_string();
+
+    assert!(error.contains("invalid upstream base URL"));
+    assert!(error.contains("https://example.test/v1?safe=ok"));
+    assert!(!error.contains("sk-test"));
+    assert!(!error.contains("token=sk-test"));
 }
 
 async fn next_chunk<S>(body: &mut S, wait: Duration, label: &str) -> Bytes
