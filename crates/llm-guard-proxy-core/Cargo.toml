@@ -1,0 +1,11 @@
+[package]
+name = "llm-guard-proxy-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core types for llm-guard-proxy."
+
+[lints]
+workspace = true

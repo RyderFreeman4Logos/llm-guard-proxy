@@ -1,0 +1,14 @@
+[package]
+name = "llm-guard-proxy"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OpenAI-compatible LLM guard proxy service."
+
+[dependencies]
+llm-guard-proxy-core = { path = "../llm-guard-proxy-core" }
+
+[lints]
+workspace = true
