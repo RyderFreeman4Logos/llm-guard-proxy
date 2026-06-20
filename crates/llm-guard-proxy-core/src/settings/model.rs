@@ -74,6 +74,12 @@ impl AppConfig {
         );
         push_change(
             &mut changes,
+            "server.max_in_flight_requests",
+            self.server.max_in_flight_requests.to_string(),
+            requested.server.max_in_flight_requests.to_string(),
+        );
+        push_change(
+            &mut changes,
             "upstream.base_url",
             self.upstream.base_url.clone(),
             requested.upstream.base_url.clone(),
@@ -95,6 +101,8 @@ pub struct ServerConfig {
     pub bind_host: String,
     /// TCP port for the proxy listener.
     pub port: u16,
+    /// Maximum proxied requests admitted into body buffering and upstream forwarding.
+    pub max_in_flight_requests: usize,
 }
 
 impl ServerConfig {
@@ -104,7 +112,12 @@ impl ServerConfig {
             "server.bind_host",
             "must not be empty",
         )?;
-        require(self.port > 0, "server.port", "must be between 1 and 65535")
+        require(self.port > 0, "server.port", "must be between 1 and 65535")?;
+        require(
+            self.max_in_flight_requests > 0,
+            "server.max_in_flight_requests",
+            "must be greater than zero",
+        )
     }
 }
 
@@ -113,6 +126,7 @@ impl Default for ServerConfig {
         Self {
             bind_host: String::from("127.0.0.1"),
             port: 18_009,
+            max_in_flight_requests: 16,
         }
     }
 }

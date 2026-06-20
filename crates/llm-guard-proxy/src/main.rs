@@ -57,6 +57,7 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         manager.path().to_path_buf(),
         store,
         proxy::build_http_client().map_err(|error| error.to_string())?,
+        config.server.max_in_flight_requests,
     );
     axum::serve(listener, proxy::router(state))
         .await

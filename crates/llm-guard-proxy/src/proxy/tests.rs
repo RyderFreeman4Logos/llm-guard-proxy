@@ -2,14 +2,17 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use axum::http::header::{AUTHORIZATION, CONNECTION};
+use axum::http::header::{AUTHORIZATION, CONNECTION, LOCATION};
 use futures_util::{Stream, StreamExt, stream};
 use llm_guard_proxy_core::ConfigManager;
 use rusqlite::Connection;
@@ -180,6 +183,56 @@ async fn non_chat_embeddings_pass_through_without_policy_rewrite() {
     assert_eq!(observed.method, Method::POST);
     assert_eq!(observed.path_and_query, "/v1/embeddings");
     assert_eq!(observed.body, body);
+}
+
+#[tokio::test]
+async fn upstream_redirects_are_forwarded_without_following() {
+    for redirect_status in [
+        StatusCode::TEMPORARY_REDIRECT,
+        StatusCode::PERMANENT_REDIRECT,
+    ] {
+        let mut target = RedirectTarget::spawn().await;
+        let upstream =
+            RedirectingUpstream::spawn(redirect_status, target.capture_url.clone()).await;
+        let proxy = ProxyFixture::spawn(&upstream.base_url, true).await;
+        let body = Bytes::from_static(
+            br#"{"model":"test-chat","messages":[{"role":"user","content":"secret prompt"}]}"#,
+        );
+
+        let response = proxy
+            .client
+            .post(format!("{}/v1/chat/completions", proxy.base_url))
+            .header(CONTENT_TYPE, "application/json")
+            .body(body.clone())
+            .send()
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(response.status(), redirect_status);
+        assert_eq!(
+            response
+                .headers()
+                .get(LOCATION)
+                .expect("redirect location should be forwarded"),
+            target.capture_url.as_str()
+        );
+        assert_eq!(
+            response.text().await.expect("body should be text"),
+            "redirected"
+        );
+
+        let observed = upstream.recv().await;
+        assert_eq!(observed.method, Method::POST);
+        assert_eq!(observed.path_and_query, "/v1/chat/completions");
+        assert_eq!(observed.body, body);
+        assert!(
+            target
+                .recv_within(Duration::from_millis(100))
+                .await
+                .is_none(),
+            "proxy must not follow upstream redirects or replay the prompt body"
+        );
+    }
 }
 
 #[tokio::test]
@@ -571,6 +624,89 @@ async fn oversized_body_failure_writes_failed_request_without_attempt() {
 }
 
 #[tokio::test]
+async fn in_flight_limit_rejects_before_body_buffering() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 1).await;
+    let first_request = Request::builder()
+        .method(Method::GET)
+        .uri("/v1/models?test=long-json")
+        .body(Body::empty())
+        .expect("first request should build");
+
+    let first_response = proxy_handler(State(proxy.state.clone()), first_request).await;
+
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("first request should reach upstream and hold the only permit");
+    assert_eq!(first_observed.method, Method::GET);
+    assert_eq!(first_observed.path_and_query, "/v1/models?test=long-json");
+
+    let body_polled = Arc::new(AtomicBool::new(false));
+    let second_body = Body::from_stream(stream::once({
+        let body_polled = Arc::clone(&body_polled);
+        async move {
+            body_polled.store(true, Ordering::SeqCst);
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(br#"{"prompt":"large"}"#))
+        }
+    }));
+    let second_request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/completions?blocked=true")
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_LENGTH, MAX_PROXY_BODY_BYTES.to_string())
+        .body(second_body)
+        .expect("second request should build");
+
+    let second_response = proxy_handler(State(proxy.state.clone()), second_request).await;
+
+    assert_eq!(second_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        !body_polled.load(Ordering::SeqCst),
+        "rejected requests must not be body-buffered before permit admission"
+    );
+    let response_body = to_bytes(second_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("limit response body should read");
+    let response_body =
+        String::from_utf8(response_body.to_vec()).expect("limit response should be utf-8");
+    assert!(
+        response_body.contains("proxy_in_flight_limit_exceeded"),
+        "limit response should identify capacity rejection: {response_body}"
+    );
+    assert_no_upstream_request(&mut fake).await;
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let request_row: (String, i64, String, String) = connection
+        .query_row(
+            "SELECT status, http_status, error_reason, request_metadata_json FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("limit rejection request row should exist");
+    let attempt_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .expect("attempt count should be readable");
+    let request_metadata: serde_json::Value =
+        serde_json::from_str(&request_row.3).expect("request metadata should be json");
+
+    assert_eq!(request_row.0, "failed");
+    assert_eq!(request_row.1, 503);
+    assert!(request_row.2.contains("proxy_in_flight_limit_exceeded"));
+    assert_eq!(request_metadata["method"], "POST");
+    assert_eq!(request_metadata["path"], "/v1/completions");
+    assert_eq!(request_metadata["query_present"], "true");
+    let max_body_bytes = MAX_PROXY_BODY_BYTES.to_string();
+    assert_eq!(
+        request_metadata["request_body_bytes"],
+        max_body_bytes.as_str()
+    );
+    assert_eq!(attempt_count, 0);
+    drop(first_response);
+}
+
+#[tokio::test]
 async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
     let proxy = ProxyFixture::spawn("http://127.0.0.1:1/v1", true).await;
     let uri = Uri::from_static("/v1/models?limit=2");
@@ -797,6 +933,88 @@ impl FakeUpstream {
     }
 }
 
+struct RedirectingUpstream {
+    base_url: String,
+    receiver: mpsc::Receiver<ObservedRequest>,
+}
+
+impl RedirectingUpstream {
+    async fn spawn(status: StatusCode, location: String) -> Self {
+        let (sender, receiver) = mpsc::channel(10);
+        let app = Router::new()
+            .fallback(redirecting_upstream_handler)
+            .with_state(RedirectingUpstreamState {
+                sender,
+                status,
+                location,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirecting upstream should bind");
+        let addr = listener
+            .local_addr()
+            .expect("redirecting upstream address should be available");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("redirecting upstream server failed: {error}");
+            }
+        });
+
+        Self {
+            base_url: format!("http://{addr}/v1"),
+            receiver,
+        }
+    }
+
+    async fn recv(mut self) -> ObservedRequest {
+        self.receiver
+            .recv()
+            .await
+            .expect("redirecting upstream should capture a request")
+    }
+}
+
+#[derive(Clone)]
+struct RedirectingUpstreamState {
+    sender: mpsc::Sender<ObservedRequest>,
+    status: StatusCode,
+    location: String,
+}
+
+struct RedirectTarget {
+    capture_url: String,
+    receiver: mpsc::Receiver<ObservedRequest>,
+}
+
+impl RedirectTarget {
+    async fn spawn() -> Self {
+        let (sender, receiver) = mpsc::channel(10);
+        let app = Router::new()
+            .fallback(capture_request_handler)
+            .with_state(sender);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("redirect target should bind");
+        let addr = listener
+            .local_addr()
+            .expect("redirect target address should be available");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("redirect target server failed: {error}");
+            }
+        });
+
+        Self {
+            capture_url: format!("http://{addr}/v1/redirect-target"),
+            receiver,
+        }
+    }
+
+    async fn recv_within(&mut self, wait: Duration) -> Option<ObservedRequest> {
+        timeout(wait, self.receiver.recv()).await.ok().flatten()
+    }
+}
+
 async fn closed_upstream_base_url() -> String {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -808,24 +1026,43 @@ async fn closed_upstream_base_url() -> String {
     format!("http://{addr}/v1")
 }
 
+async fn redirecting_upstream_handler(
+    State(state): State<RedirectingUpstreamState>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let observed = observe_request(request).await;
+    state
+        .sender
+        .send(observed)
+        .await
+        .expect("redirecting upstream observation should send");
+
+    let mut response = Response::new(Body::from("redirected"));
+    *response.status_mut() = state.status;
+    response.headers_mut().insert(
+        LOCATION,
+        HeaderValue::from_str(&state.location).expect("redirect location should be valid"),
+    );
+    response
+}
+
+async fn capture_request_handler(
+    State(sender): State<mpsc::Sender<ObservedRequest>>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let observed = observe_request(request).await;
+    sender
+        .send(observed)
+        .await
+        .expect("redirect target observation should send");
+    Response::new(Body::from("captured"))
+}
+
 async fn fake_upstream_handler(
     State(sender): State<mpsc::Sender<ObservedRequest>>,
     request: Request<Body>,
 ) -> Response<Body> {
-    let (parts, body) = request.into_parts();
-    let body = to_bytes(body, MAX_PROXY_BODY_BYTES)
-        .await
-        .expect("fake upstream body should be readable");
-    let path_and_query = parts.uri.path_and_query().map_or_else(
-        || parts.uri.path().to_owned(),
-        |value| value.as_str().to_owned(),
-    );
-    let observed = ObservedRequest {
-        method: parts.method,
-        path_and_query,
-        headers: parts.headers,
-        body,
-    };
+    let observed = observe_request(request).await;
     let endpoint = observed
         .path_and_query
         .split('?')
@@ -856,7 +1093,28 @@ async fn fake_upstream_handler(
         );
     }
 
-    let (label, body) = match endpoint.as_str() {
+    fake_upstream_endpoint_response(&endpoint)
+}
+
+async fn observe_request(request: Request<Body>) -> ObservedRequest {
+    let (parts, body) = request.into_parts();
+    let body = to_bytes(body, MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("fake upstream body should be readable");
+    let path_and_query = parts.uri.path_and_query().map_or_else(
+        || parts.uri.path().to_owned(),
+        |value| value.as_str().to_owned(),
+    );
+    ObservedRequest {
+        method: parts.method,
+        path_and_query,
+        headers: parts.headers,
+        body,
+    }
+}
+
+fn fake_upstream_endpoint_response(endpoint: &str) -> Response<Body> {
+    let (label, body) = match endpoint {
         "/v1/models" => ("models", r#"{"object":"list","data":[]}"#),
         "/v1/chat/completions" => (
             "chat-completions",
@@ -934,6 +1192,19 @@ struct ProxyFixture {
 
 impl ProxyFixture {
     async fn spawn(upstream_base_url: &str, observability_enabled: bool) -> Self {
+        Self::spawn_with_max_in_flight_requests(
+            upstream_base_url,
+            observability_enabled,
+            AppConfig::default().server.max_in_flight_requests,
+        )
+        .await
+    }
+
+    async fn spawn_with_max_in_flight_requests(
+        upstream_base_url: &str,
+        observability_enabled: bool,
+        max_in_flight_requests: usize,
+    ) -> Self {
         let root = unique_test_dir("proxy");
         fs::create_dir_all(&root).expect("test root should be created");
         set_owner_only_dir(&root);
@@ -944,15 +1215,21 @@ impl ProxyFixture {
             upstream_base_url,
             &sqlite_path,
             observability_enabled,
+            max_in_flight_requests,
         );
         let manager =
             ConfigManager::from_explicit_path(&config_path).expect("proxy config should load");
+        let config = manager
+            .handle()
+            .snapshot()
+            .expect("proxy config snapshot should load");
         let store = ObservabilityStore::open(manager.handle()).expect("store should open");
         let state = ProxyState::new(
             manager.handle(),
             manager.path().to_path_buf(),
             store.clone(),
             build_http_client().expect("client should build"),
+            config.server.max_in_flight_requests,
         );
         let app = router(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -989,11 +1266,15 @@ fn write_proxy_config(
     upstream_base_url: &str,
     sqlite_path: &Path,
     observability_enabled: bool,
+    max_in_flight_requests: usize,
 ) {
     fs::write(
         config_path,
         format!(
             r#"
+[server]
+max_in_flight_requests = {max_in_flight_requests}
+
 [upstream]
 base_url = "{upstream_base_url}"
 

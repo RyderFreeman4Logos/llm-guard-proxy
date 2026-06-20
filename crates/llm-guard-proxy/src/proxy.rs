@@ -3,6 +3,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -26,6 +27,7 @@ use llm_guard_proxy_core::{
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
 const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 120;
@@ -38,6 +40,8 @@ pub(crate) struct ProxyState {
     config_path: PathBuf,
     store: ObservabilityStore,
     client: Client,
+    in_flight_requests: Arc<Semaphore>,
+    max_in_flight_requests: usize,
 }
 
 impl ProxyState {
@@ -48,13 +52,25 @@ impl ProxyState {
         config_path: PathBuf,
         store: ObservabilityStore,
         client: Client,
+        max_in_flight_requests: usize,
     ) -> Self {
         Self {
             config,
             config_path,
             store,
             client,
+            in_flight_requests: Arc::new(Semaphore::new(max_in_flight_requests)),
+            max_in_flight_requests,
         }
+    }
+
+    fn try_acquire_in_flight_permit(&self) -> Result<OwnedSemaphorePermit, InFlightLimitExceeded> {
+        self.in_flight_requests
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_error| InFlightLimitExceeded {
+                max_in_flight_requests: self.max_in_flight_requests,
+            })
     }
 }
 
@@ -66,6 +82,7 @@ impl ProxyState {
 pub(crate) fn build_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
         .timeout(Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECS))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
 }
 
@@ -139,7 +156,38 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
         return response;
     }
 
-    match forward_openai_request(&state, &request_id, started_at_unix_ms, request).await {
+    let permit = match state.try_acquire_in_flight_permit() {
+        Ok(permit) => permit,
+        Err(error) => {
+            let finished_at_unix_ms = unix_time_millis();
+            let error_type = InFlightLimitExceeded::error_type();
+            let error_reason = error.to_string();
+            let response =
+                proxy_error_response(InFlightLimitExceeded::status(), error_type, &error_reason);
+            let request_metadata = pre_upstream_request_metadata(
+                request.method(),
+                request.uri(),
+                request.headers(),
+                config_shielding_enabled(&state.config),
+            );
+            record_failed_request(
+                &state.store,
+                FailedRequestRecord {
+                    request_id,
+                    started_at_unix_ms,
+                    finished_at_unix_ms,
+                    http_status: InFlightLimitExceeded::status().as_u16(),
+                    error_type,
+                    error_reason,
+                    request_metadata,
+                    attempt: None,
+                },
+            );
+            return response;
+        }
+    };
+
+    match forward_openai_request(&state, &request_id, started_at_unix_ms, request, permit).await {
         Ok(response) => response,
         Err(error) => {
             let finished_at_unix_ms = unix_time_millis();
@@ -172,6 +220,7 @@ async fn forward_openai_request(
     request_id: &RequestId,
     started_at_unix_ms: u64,
     request: Request<Body>,
+    in_flight_permit: OwnedSemaphorePermit,
 ) -> Result<Response<Body>, ProxyError> {
     let (parts, body) = request.into_parts();
     let method = parts.method;
@@ -251,7 +300,8 @@ async fn forward_openai_request(
         request_metadata,
         attempt_request_metadata,
     };
-    let response_body = ObservedUpstreamBody::new(upstream_response.bytes_stream(), observer);
+    let response_body =
+        ObservedUpstreamBody::new(upstream_response.bytes_stream(), observer, in_flight_permit);
     let response = downstream_response(
         upstream_status,
         &upstream_headers,
@@ -446,6 +496,7 @@ impl BodyCompletion {
 struct ObservedUpstreamBody {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     observer: Option<ForwardedBodyObserver>,
+    _in_flight_permit: OwnedSemaphorePermit,
     bytes_seen: u64,
 }
 
@@ -453,10 +504,12 @@ impl ObservedUpstreamBody {
     fn new(
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         observer: ForwardedBodyObserver,
+        in_flight_permit: OwnedSemaphorePermit,
     ) -> Self {
         Self {
             inner: Box::pin(stream),
             observer: Some(observer),
+            _in_flight_permit: in_flight_permit,
             bytes_seen: 0,
         }
     }
@@ -1177,6 +1230,22 @@ impl ProxyError {
 struct FailedUpstreamObservability {
     request_metadata: BTreeMap<String, String>,
     attempt_record: AttemptRecord,
+}
+
+#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
+#[error("proxy in-flight request limit exceeded: max_in_flight_requests={max_in_flight_requests}")]
+struct InFlightLimitExceeded {
+    max_in_flight_requests: usize,
+}
+
+impl InFlightLimitExceeded {
+    const fn status() -> StatusCode {
+        StatusCode::SERVICE_UNAVAILABLE
+    }
+
+    const fn error_type() -> &'static str {
+        "proxy_in_flight_limit_exceeded"
+    }
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]

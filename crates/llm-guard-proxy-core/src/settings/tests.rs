@@ -18,6 +18,7 @@ fn defaults_match_issue_contract() {
     config.validate().expect("default config should validate");
     assert_eq!(config.server.bind_host, "127.0.0.1");
     assert_eq!(config.server.port, 18_009);
+    assert_eq!(config.server.max_in_flight_requests, 16);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
     assert!(config.upstream.metadata.discovery_enabled);
     assert!(config.upstream.metadata.enrich_responses);
@@ -38,6 +39,7 @@ fn parses_toml_with_defaults_and_overrides() {
         r#"
 [server]
 port = 18100
+max_in_flight_requests = 2
 
 [upstream.metadata]
 context_length_override = 256000
@@ -55,6 +57,7 @@ enabled = false
 
     assert_eq!(config.server.bind_host, "127.0.0.1");
     assert_eq!(config.server.port, 18_100);
+    assert_eq!(config.server.max_in_flight_requests, 2);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
     assert_eq!(
         config.upstream.metadata.context_length_override,
@@ -93,6 +96,18 @@ fn validates_retention_hysteresis() {
         .validate()
         .expect_err("retention relation should fail");
     assert_eq!(error.field(), "observability.retention.prune_to_bytes");
+}
+
+#[test]
+fn validates_server_in_flight_limit() {
+    let mut config = AppConfig::default();
+    config.server.max_in_flight_requests = 0;
+
+    let error = config
+        .validate()
+        .expect_err("zero in-flight request limit should fail");
+
+    assert_eq!(error.field(), "server.max_in_flight_requests");
 }
 
 #[test]
@@ -351,6 +366,7 @@ interval_secs = 4
 fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"cloudflare.enabled"));
+    assert!(RESTART_REQUIRED_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"observability.sqlite_path"));
 }

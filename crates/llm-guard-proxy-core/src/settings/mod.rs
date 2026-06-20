@@ -56,6 +56,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
 pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "server.bind_host",
     "server.port",
+    "server.max_in_flight_requests",
     "upstream.base_url",
     "observability.sqlite_path",
 ];
