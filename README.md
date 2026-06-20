@@ -6,7 +6,7 @@ The proxy will sit between OpenAI-compatible clients and an upstream LLM service
 
 ## Non-Goals
 
-- This bootstrap does not implement request forwarding.
+- Generic `/v1/...` request forwarding is implemented; guarded chat behavior remains reserved for later issues.
 - Configuration is loaded and hot-reloadable. Observability metadata storage exists; retries, loop detection, metadata discovery, thinking policy, and heartbeat behavior are feature flags for later issues.
 - This bootstrap does not change upstream OpenAI-compatible semantics.
 
@@ -42,7 +42,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-Later issues will add the real proxy behavior behind these typed configuration fields.
+Later issues will add guarded proxy behavior behind these typed configuration fields.
 
 ## Configuration
 
