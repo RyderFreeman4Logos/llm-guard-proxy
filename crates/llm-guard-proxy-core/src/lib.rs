@@ -1,12 +1,17 @@
 #![forbid(unsafe_code)]
 //! Headless core types for the `llm-guard-proxy` service.
 //!
-//! Issue #1 intentionally keeps this crate small. Later issues will add proxy,
-//! configuration, observability, retry, and storage behavior behind core
-//! interfaces.
+//! Issue #1 intentionally kept this crate small. Later issues add proxy,
+//! retry, and request-shielding behavior behind core interfaces.
 
+mod observability;
 mod settings;
 
+pub use observability::{
+    AttemptId, AttemptRecord, AttemptStatus, DownstreamMode, ObservabilityError,
+    ObservabilityStore, RawPayloads, RequestId, RequestRecord, RequestStatus, RetentionUsage,
+    StoreWrite, UpstreamMode,
+};
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
     DEFAULT_CONFIG_RELATIVE_PATH, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, MetadataConfig,
