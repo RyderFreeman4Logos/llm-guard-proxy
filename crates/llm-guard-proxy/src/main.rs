@@ -6,7 +6,7 @@ use std::{
     process::ExitCode,
 };
 
-use llm_guard_proxy_core::{AppConfig, ConfigManager, Health, LICENSE, SERVICE_NAME};
+use llm_guard_proxy_core::{AppConfig, ConfigManager, Health, LICENSE, RequestId, SERVICE_NAME};
 
 fn main() -> ExitCode {
     match run(std::env::args_os()) {
@@ -32,7 +32,8 @@ fn run(args: impl IntoIterator<Item = OsString>) -> Result<String, String> {
         .handle()
         .snapshot()
         .map_err(|error| error.to_string())?;
-    Ok(render_health(&config, manager.path()))
+    let request_id = RequestId::generate();
+    Ok(render_health(&config, manager.path(), &request_id))
 }
 
 fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> Result<Option<PathBuf>, String> {
@@ -63,7 +64,7 @@ fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> Result<Option<
 }
 
 #[must_use]
-fn render_health(config: &AppConfig, path: &Path) -> String {
+fn render_health(config: &AppConfig, path: &Path, request_id: &RequestId) -> String {
     let health = Health::current();
     let name = SERVICE_NAME;
     let license = LICENSE;
@@ -74,7 +75,7 @@ fn render_health(config: &AppConfig, path: &Path) -> String {
     let observability_enabled = config.observability.enabled;
 
     format!(
-        "{name} readiness={readiness} license={license} config_path={config_path} heartbeat_mode={heartbeat_mode} heartbeat_interval_secs={heartbeat_interval_secs} observability_enabled={observability_enabled}"
+        "{name} request_id={request_id} readiness={readiness} license={license} config_path={config_path} heartbeat_mode={heartbeat_mode} heartbeat_interval_secs={heartbeat_interval_secs} observability_enabled={observability_enabled}"
     )
 }
 
@@ -82,7 +83,7 @@ fn render_health(config: &AppConfig, path: &Path) -> String {
 mod tests {
     use std::{ffi::OsString, path::Path};
 
-    use llm_guard_proxy_core::{AppConfig, HeartbeatMode};
+    use llm_guard_proxy_core::{AppConfig, HeartbeatMode, RequestId};
 
     use super::{parse_config_path, render_health};
 
@@ -93,9 +94,12 @@ mod tests {
         config.heartbeat.interval_secs = 7;
         config.observability.enabled = false;
 
+        let request_id =
+            RequestId::from_string("req-health").expect("test request id should be valid");
+
         assert_eq!(
-            render_health(&config, Path::new("/tmp/config.toml")),
-            "llm-guard-proxy readiness=ready license=Apache-2.0 config_path=/tmp/config.toml heartbeat_mode=json-whitespace heartbeat_interval_secs=7 observability_enabled=false"
+            render_health(&config, Path::new("/tmp/config.toml"), &request_id),
+            "llm-guard-proxy request_id=req-health readiness=ready license=Apache-2.0 config_path=/tmp/config.toml heartbeat_mode=json-whitespace heartbeat_interval_secs=7 observability_enabled=false"
         );
     }
 

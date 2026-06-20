@@ -7,7 +7,7 @@ The proxy will sit between OpenAI-compatible clients and an upstream LLM service
 ## Non-Goals
 
 - This bootstrap does not implement request forwarding.
-- Configuration is loaded and hot-reloadable, but observability, storage, retries, loop detection, metadata discovery, thinking policy, and heartbeat behavior are feature flags for later issues.
+- Configuration is loaded and hot-reloadable. Observability metadata storage exists; retries, loop detection, metadata discovery, thinking policy, and heartbeat behavior are feature flags for later issues.
 - This bootstrap does not change upstream OpenAI-compatible semantics.
 
 ## Workspace Layout
@@ -34,7 +34,7 @@ just pre-commit-fast
 just pre-commit
 ```
 
-The issue #2 completion gates are:
+The local completion gates are:
 
 ```bash
 cargo fmt --all -- --check
