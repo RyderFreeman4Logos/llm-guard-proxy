@@ -140,6 +140,7 @@ struct ChatAggregation {
     service_tier: Option<Value>,
     system_fingerprint: Option<String>,
     usage: Option<Value>,
+    extension_fields: Map<String, Value>,
     choices: BTreeMap<u64, ChoiceBuilder>,
     saw_done: bool,
     saw_finish_reason: bool,
@@ -175,6 +176,15 @@ impl ChatAggregation {
     }
 
     fn apply_chunk(&mut self, chunk: &Value) {
+        let Some(chunk_object) = chunk.as_object() else {
+            return;
+        };
+        copy_extension_fields(
+            chunk_object,
+            &mut self.extension_fields,
+            is_completion_owned_field,
+        );
+
         if let Some(id) = string_field(chunk, "id") {
             self.id.get_or_insert_with(|| id.to_owned());
         }
@@ -196,7 +206,7 @@ impl ChatAggregation {
             self.usage = Some(usage.clone());
         }
 
-        let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
+        let Some(choices) = chunk_object.get("choices").and_then(Value::as_array) else {
             return;
         };
 
@@ -206,6 +216,13 @@ impl ChatAggregation {
                 index,
                 ..ChoiceBuilder::default()
             });
+            if let Some(choice_object) = choice.as_object() {
+                copy_extension_fields(
+                    choice_object,
+                    &mut builder.extension_fields,
+                    is_choice_owned_field,
+                );
+            }
             if let Some(finish_reason) =
                 choice.get("finish_reason").filter(|value| !value.is_null())
             {
@@ -272,6 +289,7 @@ struct CompletionFields {
     service_tier: Option<Value>,
     system_fingerprint: Option<String>,
     usage: Option<Value>,
+    extension_fields: Map<String, Value>,
 }
 
 impl CompletionFields {
@@ -294,6 +312,7 @@ impl CompletionFields {
             service_tier: aggregation.service_tier.clone(),
             system_fingerprint: aggregation.system_fingerprint.clone(),
             usage: aggregation.usage.clone(),
+            extension_fields: aggregation.extension_fields.clone(),
         }
     }
 }
@@ -362,6 +381,7 @@ fn completion_body(fields: CompletionFields, choices: Vec<Value>) -> Result<Vec<
         (String::from("model"), Value::String(fields.model)),
         (String::from("choices"), Value::Array(choices)),
     ]);
+    insert_extension_fields(&mut response, fields.extension_fields);
     if let Some(service_tier) = fields.service_tier {
         response.insert(String::from("service_tier"), service_tier);
     }
@@ -377,6 +397,59 @@ fn completion_body(fields: CompletionFields, choices: Vec<Value>) -> Result<Vec<
 
     serde_json::to_vec(&Value::Object(response))
         .map_err(|error| format!("failed to serialize aggregated chat completion: {error}"))
+}
+
+fn copy_extension_fields(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+    is_owned_field: fn(&str) -> bool,
+) {
+    for (key, value) in source {
+        if is_owned_field(key) {
+            continue;
+        }
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+fn insert_extension_fields(target: &mut Map<String, Value>, extension_fields: Map<String, Value>) {
+    for (key, value) in extension_fields {
+        target.insert(key, value);
+    }
+}
+
+fn is_completion_owned_field(key: &str) -> bool {
+    matches!(
+        key,
+        "id" | "object"
+            | "created"
+            | "model"
+            | "choices"
+            | "service_tier"
+            | "system_fingerprint"
+            | "usage"
+    )
+}
+
+fn is_choice_owned_field(key: &str) -> bool {
+    matches!(
+        key,
+        "index" | "delta" | "message" | "finish_reason" | "logprobs"
+    )
+}
+
+fn is_message_owned_field(key: &str) -> bool {
+    matches!(
+        key,
+        "role"
+            | "content"
+            | "reasoning_content"
+            | "reasoning"
+            | "thinking"
+            | "tool_calls"
+            | "function_call"
+            | "refusal"
+    )
 }
 
 fn response_metadata(aggregation: &ChatAggregation) -> BTreeMap<String, String> {
@@ -447,6 +520,8 @@ struct ChoiceBuilder {
     reasoning: String,
     finish_reason: Option<Value>,
     logprobs: Option<Value>,
+    extension_fields: Map<String, Value>,
+    message_extension_fields: Map<String, Value>,
     function_call: Option<FunctionCallBuilder>,
     refusal: String,
     saw_refusal: bool,
@@ -469,6 +544,11 @@ impl ChoiceBuilder {
         first_token_latency_ms: &mut Option<u64>,
         attempt_started_at_unix_ms: u64,
     ) {
+        copy_extension_fields(
+            delta,
+            &mut self.message_extension_fields,
+            is_message_owned_field,
+        );
         if let Some(role) = delta.get("role").and_then(Value::as_str) {
             self.role.get_or_insert_with(|| role.to_owned());
         }
@@ -553,6 +633,7 @@ impl ChoiceBuilder {
             };
             message.insert(String::from("refusal"), refusal);
         }
+        insert_extension_fields(&mut message, self.message_extension_fields);
         if !self.tool_calls.is_empty() {
             message.insert(
                 String::from("tool_calls"),
@@ -579,6 +660,7 @@ impl ChoiceBuilder {
         if let Some(logprobs) = self.logprobs {
             choice.insert(String::from("logprobs"), logprobs);
         }
+        insert_extension_fields(&mut choice, self.extension_fields);
         Value::Object(choice)
     }
 }
