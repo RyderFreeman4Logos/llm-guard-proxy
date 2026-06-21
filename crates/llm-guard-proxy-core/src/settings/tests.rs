@@ -19,7 +19,9 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.server.bind_host, "127.0.0.1");
     assert_eq!(config.server.port, 18_009);
     assert_eq!(config.server.max_in_flight_requests, 16);
+    assert_eq!(config.server.max_request_body_bytes, 67_108_864);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
+    assert_eq!(config.upstream.request_timeout_ms, 120_000);
     assert!(config.upstream.metadata.discovery_enabled);
     assert!(config.upstream.metadata.enrich_responses);
     assert!(config.shielding.enabled);
@@ -65,10 +67,14 @@ fn parses_toml_with_defaults_and_overrides() {
 [server]
 port = 18100
 max_in_flight_requests = 2
+max_request_body_bytes = 1048576
 
 [upstream.metadata]
 context_length_override = 256000
 max_model_len_override = 256000
+
+[upstream]
+request_timeout_ms = 90000
 
 [observability]
 metrics_enabled = false
@@ -104,7 +110,9 @@ enabled = false
     assert_eq!(config.server.bind_host, "127.0.0.1");
     assert_eq!(config.server.port, 18_100);
     assert_eq!(config.server.max_in_flight_requests, 2);
+    assert_eq!(config.server.max_request_body_bytes, 1_048_576);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
+    assert_eq!(config.upstream.request_timeout_ms, 90_000);
     assert_eq!(
         config.upstream.metadata.context_length_override,
         Some(256_000)
@@ -226,6 +234,40 @@ fn validates_server_in_flight_limit() {
         .expect_err("zero in-flight request limit should fail");
 
     assert_eq!(error.field(), "server.max_in_flight_requests");
+}
+
+#[test]
+fn validates_request_body_limit_bounds() {
+    let mut config = AppConfig::default();
+    config.server.max_request_body_bytes = 0;
+
+    let error = config
+        .validate()
+        .expect_err("zero request body limit should fail");
+    assert_eq!(error.field(), "server.max_request_body_bytes");
+
+    config.server.max_request_body_bytes = 1_073_741_825;
+    let error = config
+        .validate()
+        .expect_err("excessive request body limit should fail");
+    assert_eq!(error.field(), "server.max_request_body_bytes");
+}
+
+#[test]
+fn validates_upstream_request_timeout_bounds() {
+    let mut config = AppConfig::default();
+    config.upstream.request_timeout_ms = 0;
+
+    let error = config
+        .validate()
+        .expect_err("zero upstream timeout should fail");
+    assert_eq!(error.field(), "upstream.request_timeout_ms");
+
+    config.upstream.request_timeout_ms = 600_001;
+    let error = config
+        .validate()
+        .expect_err("excessive upstream timeout should fail");
+    assert_eq!(error.field(), "upstream.request_timeout_ms");
 }
 
 #[test]
@@ -406,6 +448,8 @@ fn reload_applies_only_reloadable_fields() {
         r#"
 [server]
 port = 18009
+max_in_flight_requests = 4
+max_request_body_bytes = 1048576
 
 [heartbeat]
 mode = "sse"
@@ -422,6 +466,11 @@ output_repeated_line_threshold = 24
         r#"
 [server]
 port = 19000
+max_in_flight_requests = 2
+max_request_body_bytes = 512
+
+[upstream]
+request_timeout_ms = 90000
 
 [heartbeat]
 mode = "disabled"
@@ -441,6 +490,9 @@ output_repeated_line_threshold = 7
     assert_eq!(outcome.restart_required_changes.len(), 1);
     assert_eq!(outcome.restart_required_changes[0].field, "server.port");
     assert_eq!(snapshot.server.port, 18_009);
+    assert_eq!(snapshot.server.max_in_flight_requests, 2);
+    assert_eq!(snapshot.server.max_request_body_bytes, 512);
+    assert_eq!(snapshot.upstream.request_timeout_ms, 90_000);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 3);
     assert_eq!(snapshot.loop_guard.output_repeated_line_threshold, 7);
@@ -456,6 +508,8 @@ fn polling_watcher_applies_reloadable_file_changes() {
         r#"
 [server]
 port = 18009
+max_in_flight_requests = 4
+max_request_body_bytes = 1048576
 
 [heartbeat]
 mode = "sse"
@@ -473,6 +527,8 @@ interval_secs = 15
         r#"
 [server]
 port = 19000
+max_in_flight_requests = 2
+max_request_body_bytes = 512
 
 [heartbeat]
 mode = "disabled"
@@ -494,6 +550,8 @@ interval_secs = 4
 
     let snapshot = observed.expect("polling watcher should apply reload");
     assert_eq!(snapshot.server.port, 18_009);
+    assert_eq!(snapshot.server.max_in_flight_requests, 2);
+    assert_eq!(snapshot.server.max_request_body_bytes, 512);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 4);
 
@@ -504,6 +562,8 @@ interval_secs = 4
 #[test]
 fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"server.max_in_flight_requests"));
+    assert!(RELOADABLE_FIELDS.contains(&"server.max_request_body_bytes"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.output_repeated_line_threshold"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.input_overlap_threshold_multiplier"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.anti_loop_hint_enabled"));
@@ -511,7 +571,8 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_admin_token"));
     assert!(RELOADABLE_FIELDS.contains(&"cloudflare.enabled"));
-    assert!(RESTART_REQUIRED_FIELDS.contains(&"server.max_in_flight_requests"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.request_timeout_ms"));
+    assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"observability.sqlite_path"));
 }

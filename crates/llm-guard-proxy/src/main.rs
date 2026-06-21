@@ -2,7 +2,7 @@
 
 mod proxy;
 
-use std::{ffi::OsString, path::PathBuf, process::ExitCode, time::Duration};
+use std::{ffi::OsString, future::pending, path::PathBuf, process::ExitCode, time::Duration};
 
 use llm_guard_proxy_core::{
     ConfigManager, ObservabilityStore, RequestId, redact_upstream_base_url,
@@ -57,11 +57,39 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         manager.path().to_path_buf(),
         store,
         proxy::build_http_client().map_err(|error| error.to_string())?,
-        config.server.max_in_flight_requests,
     );
-    axum::serve(listener, proxy::router(state))
+    proxy::serve_until_shutdown(listener, state, shutdown_signal())
         .await
         .map_err(|error| format!("server failed: {error}"))
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            eprintln!("failed to install Ctrl-C handler: {error}");
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => {
+                eprintln!("failed to install SIGTERM handler: {error}");
+                pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = pending::<()>();
+
+    tokio::select! {
+        () = ctrl_c => {}
+        () = terminate => {}
+    }
 }
 
 fn render_listening(local_addr: impl std::fmt::Display, upstream_base_url: &str) -> String {

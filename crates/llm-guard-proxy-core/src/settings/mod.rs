@@ -28,6 +28,8 @@ pub const DEFAULT_CONFIG_RELATIVE_PATH: &str = ".config/llm-guard-proxy/config.t
 
 /// Fields that can be changed by reloading the config file.
 pub const RELOADABLE_FIELDS: &[&str] = &[
+    "server.max_in_flight_requests",
+    "server.max_request_body_bytes",
     "shielding.enabled",
     "observability.enabled",
     "observability.capture_raw_payloads",
@@ -59,6 +61,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "heartbeat.mode",
     "heartbeat.interval_secs",
     "cloudflare.enabled",
+    "upstream.request_timeout_ms",
     "upstream.metadata.discovery_enabled",
     "upstream.metadata.enrich_responses",
     "upstream.metadata.refresh_interval_secs",
@@ -70,7 +73,6 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
 pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "server.bind_host",
     "server.port",
-    "server.max_in_flight_requests",
     "upstream.base_url",
     "observability.sqlite_path",
 ];
