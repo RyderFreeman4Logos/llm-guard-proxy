@@ -1,13 +1,13 @@
 # llm-guard-proxy
 
-`llm-guard-proxy` is an Apache-2.0 Rust service intended to become an OpenAI-compatible guard proxy for local and GB10 vLLM deployments.
+`llm-guard-proxy` is an Apache-2.0 Rust OpenAI-compatible guard proxy for local and GB10 vLLM deployments.
 
-The proxy will sit between OpenAI-compatible clients and an upstream LLM service so later issues can add debuggability, retries, loop protection, heartbeat behavior, and observability without changing model quality.
+The proxy sits between OpenAI-compatible clients and an upstream LLM service so debuggability, retries, loop protection, heartbeat behavior, and observability can be added without changing model quality.
 
 ## Non-Goals
 
-- Generic `/v1/...` request forwarding is implemented; guarded chat behavior remains reserved for later issues.
-- Configuration is loaded and hot-reloadable. Observability metadata storage exists; retries, loop detection, metadata discovery, thinking policy, and heartbeat behavior are feature flags for later issues.
+- Generic `/v1/...` request forwarding is implemented. Non-streaming `/v1/chat/completions` requests use the shielded upstream streaming core by default.
+- Configuration is loaded and hot-reloadable. Observability metadata storage exists; retries, loop detection, thinking policy, and heartbeat behavior are feature flags for later issues.
 - This bootstrap does not change upstream OpenAI-compatible semantics.
 
 ## Workspace Layout
@@ -91,7 +91,13 @@ LLM_GUARD_PROXY_BIN=target/debug/llm-guard-proxy just smoke-gb10
 LLM_GUARD_PROXY_SMOKE_KEEP=1 just smoke-gb10
 ```
 
-Later issues will add guarded proxy behavior behind these typed configuration fields.
+The shielded chat core is enabled by default for non-streaming chat completions:
+
+- Downstream non-stream chat requests are sent upstream with `stream=true`.
+- The proxy buffers and parses upstream SSE deltas internally, then returns a normal OpenAI-compatible chat completion JSON response.
+- Attempt observability records include first-byte latency, first-token latency, finish reason, and parsed content/reasoning/tool-call delta counters.
+- Downstream `stream=true` chat requests currently stay on the generic streaming path to preserve first-chunk timing and backpressure behavior while later issues add release-after-inspection streaming.
+- Set `[shielding] enabled = false` and hot reload the config to fall back to generic forwarding for rollback or compatibility testing.
 
 ## Configuration
 

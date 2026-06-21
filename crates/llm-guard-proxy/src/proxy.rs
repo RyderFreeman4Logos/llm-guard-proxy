@@ -33,6 +33,7 @@ use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 mod model_metadata;
+mod shielded_chat;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
 const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 120;
@@ -248,7 +249,7 @@ async fn forward_openai_request(
         ProxyError::config_snapshot(error.to_string())
             .with_request_metadata(body_read_request_metadata)
     })?;
-    let request_metadata = request_metadata(
+    let mut request_metadata = request_metadata(
         &method,
         &uri,
         &downstream_headers,
@@ -260,34 +261,37 @@ async fn forward_openai_request(
     let reqwest_method = upstream_method(&method)
         .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     let model_id = extract_model_id(&body);
+    let shielded_chat_request = if should_intercept_non_stream_chat(&method, &uri, &config) {
+        shielded_chat::prepare_non_stream_request(&body)
+    } else {
+        None
+    };
+    let upstream_body = shielded_chat_request.as_ref().map_or_else(
+        || body.clone(),
+        shielded_chat::PreparedChatRequest::upstream_body,
+    );
+    if shielded_chat_request.is_some() {
+        add_shielded_chat_request_metadata(&mut request_metadata);
+    }
     let attempt_id = AttemptId::for_request(request_id, 1);
     let attempt_started_at_unix_ms = unix_time_millis();
-    let attempt_request_metadata = attempt_request_metadata(&method, &uri, &downstream_headers);
-    let upstream_response = match send_upstream_request(
-        &state.client,
-        reqwest_method,
+    let mut attempt_request_metadata = attempt_request_metadata(&method, &uri, &downstream_headers);
+    if shielded_chat_request.is_some() {
+        add_shielded_chat_request_metadata(&mut attempt_request_metadata);
+    }
+    let upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
+        client: &state.client,
+        method: reqwest_method,
         upstream_url,
-        &downstream_headers,
-        body.clone(),
-    )
-    .await
-    {
-        Ok(response) => response,
-        Err(error) => {
-            let finished_at_unix_ms = unix_time_millis();
-            let error_reason = error.to_string();
-            let attempt_record = failed_attempt_record(
-                attempt_id,
-                request_id.clone(),
-                attempt_started_at_unix_ms,
-                finished_at_unix_ms,
-                error.error_type(),
-                &error_reason,
-                attempt_request_metadata,
-            );
-            return Err(error.with_observability(request_metadata, attempt_record));
-        }
-    };
+        downstream_headers: &downstream_headers,
+        upstream_body,
+        attempt_id: attempt_id.clone(),
+        request_id,
+        attempt_started_at_unix_ms,
+        request_metadata: &request_metadata,
+        attempt_request_metadata: &attempt_request_metadata,
+    })
+    .await?;
     let upstream_status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
     let upstream_mode = upstream_mode_from_headers(&upstream_headers);
@@ -304,26 +308,108 @@ async fn forward_openai_request(
         request_metadata,
         attempt_request_metadata,
     };
-    if should_enrich_models_response(&method, &uri, &config) {
+    forward_upstream_response(
+        ResponseDispatch {
+            method: &method,
+            uri: &uri,
+            config: &config,
+            shielded_chat: shielded_chat_request.is_some(),
+        },
+        response_parts,
+        upstream_response,
+        in_flight_permit,
+    )
+    .await
+}
+
+struct UpstreamAttemptContext<'request> {
+    client: &'request Client,
+    method: reqwest::Method,
+    upstream_url: Url,
+    downstream_headers: &'request HeaderMap,
+    upstream_body: Bytes,
+    attempt_id: AttemptId,
+    request_id: &'request RequestId,
+    attempt_started_at_unix_ms: u64,
+    request_metadata: &'request BTreeMap<String, String>,
+    attempt_request_metadata: &'request BTreeMap<String, String>,
+}
+
+async fn send_first_upstream_attempt(
+    context: UpstreamAttemptContext<'_>,
+) -> Result<reqwest::Response, ProxyError> {
+    match send_upstream_request(
+        context.client,
+        context.method,
+        context.upstream_url,
+        context.downstream_headers,
+        context.upstream_body,
+    )
+    .await
+    {
+        Ok(response) => Ok(response),
+        Err(error) => {
+            let finished_at_unix_ms = unix_time_millis();
+            let error_reason = error.to_string();
+            let attempt_record = failed_attempt_record(
+                context.attempt_id,
+                context.request_id.clone(),
+                context.attempt_started_at_unix_ms,
+                finished_at_unix_ms,
+                error.error_type(),
+                &error_reason,
+                context.attempt_request_metadata.clone(),
+            );
+            Err(error.with_observability(context.request_metadata.clone(), attempt_record))
+        }
+    }
+}
+
+struct ResponseDispatch<'request> {
+    method: &'request Method,
+    uri: &'request Uri,
+    config: &'request AppConfig,
+    shielded_chat: bool,
+}
+
+async fn forward_upstream_response(
+    dispatch: ResponseDispatch<'_>,
+    response_parts: ForwardedResponseParts,
+    upstream_response: reqwest::Response,
+    in_flight_permit: OwnedSemaphorePermit,
+) -> Result<Response<Body>, ProxyError> {
+    let upstream_status = response_parts.upstream_status;
+    let upstream_headers = response_parts.upstream_headers.clone();
+    if should_enrich_models_response(dispatch.method, dispatch.uri, dispatch.config) {
         return forward_enriched_models_response(
             response_parts,
             upstream_response,
             in_flight_permit,
-            &config.upstream.metadata,
+            &dispatch.config.upstream.metadata,
         )
         .await;
+    }
+    if dispatch.shielded_chat && upstream_status.is_success() && is_event_stream(&upstream_headers)
+    {
+        return forward_shielded_chat_response(response_parts, upstream_response, in_flight_permit)
+            .await;
+    }
+    if dispatch.shielded_chat && upstream_status.is_success() {
+        return Err(
+            response_parts.into_body_read_error(ProxyError::upstream_body(String::from(
+                "shielded chat completion expected upstream text/event-stream response",
+            ))),
+        );
     }
 
     let observer = response_parts.into_observer();
     let response_body =
         ObservedUpstreamBody::new(upstream_response.bytes_stream(), observer, in_flight_permit);
-    let response = downstream_response(
+    Ok(downstream_response(
         upstream_status,
         &upstream_headers,
         Body::from_stream(response_body),
-    );
-
-    Ok(response)
+    ))
 }
 
 async fn read_body_bytes(body: Body) -> Result<Bytes, ProxyError> {
@@ -363,6 +449,10 @@ fn should_enrich_models_response(method: &Method, uri: &Uri, config: &AppConfig)
         && uri.path() == "/v1/models"
         && config.upstream.metadata.discovery_enabled
         && config.upstream.metadata.enrich_responses
+}
+
+fn should_intercept_non_stream_chat(method: &Method, uri: &Uri, config: &AppConfig) -> bool {
+    method == Method::POST && uri.path() == "/v1/chat/completions" && config.shielding.enabled
 }
 
 fn upstream_method(method: &Method) -> Result<reqwest::Method, ProxyError> {
@@ -458,8 +548,18 @@ struct ForwardedResponseParts {
 
 impl ForwardedResponseParts {
     fn into_observer(self) -> ForwardedBodyObserver {
+        let downstream_mode = downstream_mode_from_headers(&self.upstream_headers);
+        self.into_observer_with(downstream_mode, BTreeMap::new(), RawPayloads::default())
+    }
+
+    fn into_observer_with(
+        self,
+        downstream_mode: DownstreamMode,
+        extra_response_metadata: BTreeMap<String, String>,
+        raw_payloads: RawPayloads,
+    ) -> ForwardedBodyObserver {
         ForwardedBodyObserver {
-            downstream_mode: downstream_mode_from_headers(&self.upstream_headers),
+            downstream_mode,
             store: self.store,
             request_id: self.request_id,
             started_at_unix_ms: self.started_at_unix_ms,
@@ -471,6 +571,8 @@ impl ForwardedResponseParts {
             upstream_headers: self.upstream_headers,
             request_metadata: self.request_metadata,
             attempt_request_metadata: self.attempt_request_metadata,
+            extra_response_metadata,
+            raw_payloads,
         }
     }
 
@@ -513,6 +615,56 @@ async fn forward_enriched_models_response(
     ))
 }
 
+async fn forward_shielded_chat_response(
+    response_parts: ForwardedResponseParts,
+    upstream_response: reqwest::Response,
+    in_flight_permit: OwnedSemaphorePermit,
+) -> Result<Response<Body>, ProxyError> {
+    let request_id = response_parts.request_id.as_str().to_owned();
+    let request_model_id = response_parts.model_id.clone();
+    let upstream_content_type = response_parts
+        .upstream_headers
+        .get(CONTENT_TYPE)
+        .map(header_value);
+    let aggregated = match shielded_chat::aggregate_stream(
+        upstream_response.bytes_stream(),
+        response_parts.attempt_started_at_unix_ms,
+        &request_id,
+        request_model_id.as_deref(),
+    )
+    .await
+    {
+        Ok(aggregated) => aggregated,
+        Err(error) => {
+            return Err(response_parts.into_body_read_error(ProxyError::upstream_body(error)));
+        }
+    };
+
+    let body_len = aggregated.body.len();
+    let upstream_status = response_parts.upstream_status;
+    let response_headers =
+        shielded_chat_response_headers(&response_parts.upstream_headers, body_len);
+    let mut extra_metadata = aggregated.response_metadata;
+    if let Some(content_type) = upstream_content_type {
+        extra_metadata.insert(
+            String::from("upstream_response_header_content-type"),
+            content_type,
+        );
+    }
+    let observer = response_parts.into_observer_with(
+        DownstreamMode::NonStreamJson,
+        extra_metadata,
+        aggregated.raw_payloads,
+    );
+    let response_body = ObservedBufferedBody::new(aggregated.body, observer, in_flight_permit);
+
+    Ok(response_with_headers(
+        upstream_status,
+        response_headers,
+        Body::from_stream(response_body),
+    ))
+}
+
 struct ForwardedBodyObserver {
     store: ObservabilityStore,
     request_id: RequestId,
@@ -526,18 +678,22 @@ struct ForwardedBodyObserver {
     upstream_headers: HeaderMap,
     request_metadata: BTreeMap<String, String>,
     attempt_request_metadata: BTreeMap<String, String>,
+    extra_response_metadata: BTreeMap<String, String>,
+    raw_payloads: RawPayloads,
 }
 
 impl ForwardedBodyObserver {
     fn record(self, body_bytes: u64, completion: &BodyCompletion) {
         let finished_at_unix_ms = unix_time_millis();
-        let response_metadata = response_metadata(
+        let mut response_metadata = response_metadata(
             self.upstream_status,
             &self.upstream_headers,
             body_bytes,
             finished_at_unix_ms.saturating_sub(self.started_at_unix_ms),
         );
+        response_metadata.extend(self.extra_response_metadata);
         let attempt_response_metadata = response_metadata.clone();
+        let request_raw_payloads = self.raw_payloads.clone();
         let request_record = RequestRecord {
             request_id: self.request_id.clone(),
             started_at_unix_ms: self.started_at_unix_ms,
@@ -552,7 +708,7 @@ impl ForwardedBodyObserver {
             abort_reason: completion.abort_reason(),
             request_metadata: self.request_metadata,
             response_metadata,
-            raw_payloads: RawPayloads::default(),
+            raw_payloads: request_raw_payloads,
         };
         let attempt_record = AttemptRecord {
             attempt_id: self.attempt_id,
@@ -568,7 +724,7 @@ impl ForwardedBodyObserver {
             abort_reason: completion.abort_reason(),
             request_metadata: self.attempt_request_metadata,
             response_metadata: attempt_response_metadata,
-            raw_payloads: RawPayloads::default(),
+            raw_payloads: self.raw_payloads,
         };
         record_observability(&self.store, &request_record, Some(&attempt_record));
     }
@@ -767,11 +923,31 @@ fn downstream_response(
     upstream_headers: &HeaderMap,
     body: Body,
 ) -> Response<Body> {
+    let mut headers = HeaderMap::new();
+    copy_response_headers(upstream_headers, &mut headers);
+    response_with_headers(status, headers, body)
+}
+
+fn response_with_headers(
+    status: reqwest::StatusCode,
+    headers: HeaderMap,
+    body: Body,
+) -> Response<Body> {
     let status = StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut response = Response::new(body);
     *response.status_mut() = status;
-    copy_response_headers(upstream_headers, response.headers_mut());
+    *response.headers_mut() = headers;
     response
+}
+
+fn shielded_chat_response_headers(upstream_headers: &HeaderMap, body_len: usize) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    copy_response_headers(upstream_headers, &mut headers);
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Ok(content_length) = HeaderValue::from_str(&body_len.to_string()) {
+        headers.insert(CONTENT_LENGTH, content_length);
+    }
+    headers
 }
 
 fn forwarded_request_headers(headers: &HeaderMap) -> HeaderMap {
@@ -897,6 +1073,15 @@ fn request_body_bytes_hint(headers: &HeaderMap) -> String {
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .map_or_else(|| String::from("unknown"), |bytes| bytes.to_string())
+}
+
+fn add_shielded_chat_request_metadata(metadata: &mut BTreeMap<String, String>) {
+    metadata.insert(String::from("shielded_streaming"), String::from("true"));
+    metadata.insert(String::from("upstream_stream_forced"), String::from("true"));
+    metadata.insert(
+        String::from("policy_transform_applied"),
+        String::from("true"),
+    );
 }
 
 fn attempt_request_metadata(

@@ -67,9 +67,19 @@ pub(super) fn sanitize_optional_text(value: Option<&String>) -> Option<String> {
 
 fn is_sensitive_key(key: &str) -> bool {
     let normalized = normalize_key(key);
+    if is_non_secret_token_metric(&normalized) {
+        return false;
+    }
     SENSITIVE_KEY_MARKERS
         .iter()
         .any(|marker| normalized.contains(marker))
+}
+
+fn is_non_secret_token_metric(normalized_key: &str) -> bool {
+    matches!(
+        normalized_key,
+        "firsttokenlatencyms" | "prompttokens" | "completiontokens" | "totaltokens"
+    )
 }
 
 fn looks_sensitive(value: &str) -> bool {
