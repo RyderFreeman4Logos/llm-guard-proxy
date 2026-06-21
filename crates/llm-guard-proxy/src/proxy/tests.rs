@@ -1396,18 +1396,58 @@ max_repeated_inputs = 1
 
 #[test]
 fn normalized_chat_fingerprint_excludes_secrets_and_includes_output_parameters() {
-    let base = Bytes::from_static(
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"temperature":0.2,"api_key":"sk-one","metadata":{"authorization":"Bearer one"},"stream":false}"#,
-    );
-    let secret_changed = Bytes::from_static(
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"temperature":0.2,"api_key":"sk-two","metadata":{"authorization":"Bearer two"},"stream":true}"#,
-    );
+    let base_value = serde_json::json!({
+        "model": "test-chat",
+        "messages": [{"role": "user", "content": "ping"}],
+        "temperature": 0.2,
+        "max_tokens": 16,
+        "max_completion_tokens": 32,
+        "max_output_tokens": 48,
+        "api_key": "sk-one",
+        "access_token": "access-one",
+        "metadata": {
+            "authorization": "Bearer one",
+            "id_token": "id-one"
+        },
+        "stream": false
+    });
+    let secret_changed_value = serde_json::json!({
+        "model": "test-chat",
+        "messages": [{"role": "user", "content": "ping"}],
+        "temperature": 0.2,
+        "max_tokens": 16,
+        "max_completion_tokens": 32,
+        "max_output_tokens": 48,
+        "api_key": "sk-two",
+        "access_token": "access-two",
+        "metadata": {
+            "authorization": "Bearer two",
+            "id_token": "id-two"
+        },
+        "stream": true
+    });
+    let base = Bytes::from(base_value.to_string().into_bytes());
+    let secret_changed = Bytes::from(secret_changed_value.to_string().into_bytes());
     let temperature_changed = Bytes::from_static(
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"temperature":0.7,"api_key":"sk-one","metadata":{"authorization":"Bearer one"},"stream":false}"#,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"temperature":0.7,"max_tokens":16,"max_completion_tokens":32,"max_output_tokens":48,"api_key":"sk-one","access_token":"access-one","metadata":{"authorization":"Bearer one","id_token":"id-one"},"stream":false}"#,
     );
     let message_changed = Bytes::from_static(
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"pong"}],"temperature":0.2,"api_key":"sk-one","metadata":{"authorization":"Bearer one"},"stream":false}"#,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"pong"}],"temperature":0.2,"max_tokens":16,"max_completion_tokens":32,"max_output_tokens":48,"api_key":"sk-one","access_token":"access-one","metadata":{"authorization":"Bearer one","id_token":"id-one"},"stream":false}"#,
     );
+
+    let normalized =
+        normalize_chat_fingerprint_value(base_value).expect("base body should normalize");
+    assert_eq!(normalized["max_tokens"], 16);
+    assert_eq!(normalized["max_completion_tokens"], 32);
+    assert_eq!(normalized["max_output_tokens"], 48);
+    assert!(normalized.get("api_key").is_none());
+    assert!(normalized.get("access_token").is_none());
+    let metadata = normalized
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+        .expect("metadata should remain after secret fields are stripped");
+    assert!(!metadata.contains_key("authorization"));
+    assert!(!metadata.contains_key("id_token"));
 
     let base_fingerprint = chat_input_fingerprint(&base).expect("base fingerprint should compute");
     let secret_fingerprint =
@@ -1421,7 +1461,54 @@ fn normalized_chat_fingerprint_excludes_secrets_and_includes_output_parameters()
     assert_ne!(base_fingerprint, temperature_fingerprint);
     assert_ne!(base_fingerprint, message_fingerprint);
     assert!(!base_fingerprint.contains("sk-one"));
+    assert!(!base_fingerprint.contains("access-one"));
+    assert!(!base_fingerprint.contains("id-one"));
     assert!(!base_fingerprint.contains("Bearer"));
+}
+
+#[test]
+fn normalized_chat_fingerprint_distinguishes_max_tokens_for_repeat_detection() {
+    assert_token_budget_change_is_not_repeated("max_tokens");
+}
+
+#[test]
+fn normalized_chat_fingerprint_distinguishes_max_completion_tokens_for_repeat_detection() {
+    assert_token_budget_change_is_not_repeated("max_completion_tokens");
+}
+
+fn assert_token_budget_change_is_not_repeated(field_name: &str) {
+    let base_fingerprint = chat_input_fingerprint(&chat_body_with_token_budget(field_name, 16))
+        .expect("base fingerprint should compute");
+    let changed_fingerprint = chat_input_fingerprint(&chat_body_with_token_budget(field_name, 32))
+        .expect("changed fingerprint should compute");
+    assert_ne!(base_fingerprint, changed_fingerprint);
+
+    let repeat_inputs = RepeatInputCache::default();
+    let first_observation = repeat_inputs.observe(&base_fingerprint, 1_000, 120, 1);
+    let changed_observation = repeat_inputs.observe(&changed_fingerprint, 2_000, 120, 1);
+    let repeated_base_observation = repeat_inputs.observe(&base_fingerprint, 3_000, 120, 1);
+
+    assert_eq!(first_observation, RepeatInputObservation::default());
+    assert_eq!(changed_observation, RepeatInputObservation::default());
+    assert_eq!(
+        repeated_base_observation,
+        RepeatInputObservation {
+            repeated: true,
+            prior_count: 1
+        }
+    );
+}
+
+fn chat_body_with_token_budget(field_name: &str, value: u64) -> Bytes {
+    let mut body = serde_json::json!({
+        "model": "test-chat",
+        "messages": [{"role": "user", "content": "ping"}],
+        "temperature": 0.2
+    });
+    body.as_object_mut()
+        .expect("test body should be an object")
+        .insert(field_name.to_owned(), serde_json::Value::from(value));
+    Bytes::from(body.to_string().into_bytes())
 }
 
 #[tokio::test]

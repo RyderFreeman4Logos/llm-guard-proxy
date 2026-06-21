@@ -1536,19 +1536,32 @@ fn is_sensitive_fingerprint_key(key: &str) -> bool {
         .filter(char::is_ascii_alphanumeric)
         .map(|character| character.to_ascii_lowercase())
         .collect::<String>();
-    [
+
+    if is_output_budget_fingerprint_key(&normalized) {
+        return false;
+    }
+
+    let credential_keyword = [
         "authorization",
         "apikey",
         "accesskey",
         "privatekey",
         "secret",
-        "token",
         "password",
         "credential",
+        "credentials",
         "bearer",
     ]
     .iter()
-    .any(|sensitive| normalized.contains(sensitive))
+    .any(|sensitive| normalized.contains(sensitive));
+    credential_keyword || normalized.contains("token")
+}
+
+fn is_output_budget_fingerprint_key(normalized_key: &str) -> bool {
+    matches!(
+        normalized_key,
+        "maxtokens" | "maxcompletiontokens" | "maxoutputtokens"
+    )
 }
 
 fn request_body_bytes_hint(headers: &HeaderMap) -> String {
