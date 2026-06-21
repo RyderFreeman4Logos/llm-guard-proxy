@@ -41,6 +41,8 @@ fn defaults_match_issue_contract() {
     );
     assert_eq!(config.loop_guard.input_overlap_threshold_multiplier, 4);
     assert!(config.retry.enabled);
+    assert_eq!(config.retry.max_attempts, 5);
+    assert!(config.retry.anti_loop_hint_enabled);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
     assert!(config.cloudflare.enabled);
 }
@@ -69,6 +71,10 @@ output_suffix_cycle_threshold = 10
 output_low_progress_min_bytes = 2048
 output_low_progress_unique_ratio_percent = 25
 input_overlap_threshold_multiplier = 5
+
+[retry]
+max_attempts = 3
+anti_loop_hint_enabled = false
 
 [cloudflare]
 enabled = false
@@ -100,7 +106,21 @@ enabled = false
         25
     );
     assert_eq!(config.loop_guard.input_overlap_threshold_multiplier, 5);
+    assert_eq!(config.retry.max_attempts, 3);
+    assert!(!config.retry.anti_loop_hint_enabled);
     assert!(!config.cloudflare.enabled);
+}
+
+#[test]
+fn validates_retry_attempt_bounds() {
+    let mut config = AppConfig::default();
+    config.retry.max_attempts = 11;
+
+    let error = config
+        .validate()
+        .expect_err("retry attempts should be bounded");
+
+    assert_eq!(error.field(), "retry.max_attempts");
 }
 
 #[test]
@@ -419,6 +439,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.output_repeated_line_threshold"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.input_overlap_threshold_multiplier"));
+    assert!(RELOADABLE_FIELDS.contains(&"retry.anti_loop_hint_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"cloudflare.enabled"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));

@@ -167,7 +167,8 @@ input_overlap_threshold_multiplier = 4
 
 [retry]
 enabled = true
-max_attempts = 2
+max_attempts = 5
+anti_loop_hint_enabled = true
 
 [heartbeat]
 mode = "sse" # sse, json-whitespace, disabled
@@ -211,6 +212,7 @@ Reloadable fields:
 - `loop_guard.input_overlap_threshold_multiplier`
 - `retry.enabled`
 - `retry.max_attempts`
+- `retry.anti_loop_hint_enabled`
 - `heartbeat.mode`
 - `heartbeat.interval_secs`
 - `cloudflare.enabled`

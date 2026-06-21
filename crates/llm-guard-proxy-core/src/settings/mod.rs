@@ -49,6 +49,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "loop_guard.input_overlap_threshold_multiplier",
     "retry.enabled",
     "retry.max_attempts",
+    "retry.anti_loop_hint_enabled",
     "heartbeat.mode",
     "heartbeat.interval_secs",
     "cloudflare.enabled",

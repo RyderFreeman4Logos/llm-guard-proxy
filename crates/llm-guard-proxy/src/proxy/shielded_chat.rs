@@ -65,6 +65,34 @@ pub(super) fn prepare_non_stream_request(
     })
 }
 
+/// Returns a retry request body with a bounded anti-loop system hint.
+///
+/// The hint is deterministic and contains only proxy retry metadata; it never
+/// copies raw prompt, output, reasoning, or upstream error text.
+pub(super) fn body_with_anti_loop_retry_hint(
+    body: &Bytes,
+    attempt_number: u32,
+    max_attempts: u32,
+) -> Option<Bytes> {
+    let mut value = serde_json::from_slice::<Value>(body).ok()?;
+    let object = value.as_object_mut()?;
+    let messages = object.get_mut("messages")?.as_array_mut()?;
+    messages.insert(
+        0,
+        json!({
+            "role": "system",
+            "content": anti_loop_retry_hint(attempt_number, max_attempts),
+        }),
+    );
+    serde_json::to_vec(&value).ok().map(Bytes::from)
+}
+
+fn anti_loop_retry_hint(attempt_number: u32, max_attempts: u32) -> String {
+    format!(
+        "llm-guard-proxy retry hint: a prior shielded upstream attempt was aborted by loop protection. Avoid repeating the same output pattern and provide a concise fresh answer. retry_attempt={attempt_number}/{max_attempts}."
+    )
+}
+
 #[derive(Clone, Copy, Debug)]
 struct JsonPath {
     path: &'static [&'static str],

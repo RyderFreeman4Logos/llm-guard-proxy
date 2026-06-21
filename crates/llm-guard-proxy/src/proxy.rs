@@ -26,8 +26,8 @@ use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DownstreamMode, Health,
     HeartbeatMode, LICENSE, MetadataConfig, ObservabilityStore, RawPayloads, RequestId,
-    RequestRecord, RequestStatus, SERVICE_NAME, UpstreamMode, redact_upstream_base_url,
-    validate_upstream_base_url,
+    RequestRecord, RequestStatus, RetryConfig, SERVICE_NAME, UpstreamMode,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -357,58 +357,121 @@ async fn forward_openai_request(
         &shielded_chat_plan.liveness,
         &shielded_chat_plan.thinking_metadata,
     );
-    let attempt_id = AttemptId::for_request(request_id, 1);
+    let retry_policy = ShieldedRetryPolicy::from_config(&config.retry);
+    if shielded_chat_plan.intercepted {
+        add_retry_request_metadata(&mut request_metadata, retry_policy);
+        return forward_shielded_chat_with_retries(
+            ShieldedRetryRuntime {
+                client: state.client.clone(),
+                method: reqwest_method,
+                upstream_url,
+                downstream_method: method,
+                downstream_uri: uri,
+                downstream_headers,
+                upstream_body: shielded_chat_plan.upstream_body,
+                store: state.store.clone(),
+                request_id: request_id.clone(),
+                started_at_unix_ms,
+                model_id,
+                request_metadata,
+                liveness: shielded_chat_plan.liveness,
+                thinking_metadata: shielded_chat_plan.thinking_metadata,
+                loop_context: shielded_chat_plan.loop_context,
+                retry_policy,
+            },
+            in_flight_permit,
+        )
+        .await;
+    }
+    forward_generic_openai_request(GenericForwardContext {
+        state,
+        config: &config,
+        method,
+        uri,
+        downstream_headers,
+        reqwest_method,
+        upstream_url,
+        upstream_body: shielded_chat_plan.upstream_body,
+        liveness: shielded_chat_plan.liveness,
+        thinking_metadata: shielded_chat_plan.thinking_metadata,
+        request_id,
+        started_at_unix_ms,
+        model_id,
+        request_metadata,
+        in_flight_permit,
+    })
+    .await
+}
+
+struct GenericForwardContext<'request> {
+    state: &'request ProxyState,
+    config: &'request AppConfig,
+    method: Method,
+    uri: Uri,
+    downstream_headers: HeaderMap,
+    reqwest_method: reqwest::Method,
+    upstream_url: Url,
+    upstream_body: Bytes,
+    liveness: ShieldedLivenessSelection,
+    thinking_metadata: BTreeMap<String, String>,
+    request_id: &'request RequestId,
+    started_at_unix_ms: u64,
+    model_id: Option<String>,
+    request_metadata: BTreeMap<String, String>,
+    in_flight_permit: OwnedSemaphorePermit,
+}
+
+async fn forward_generic_openai_request(
+    context: GenericForwardContext<'_>,
+) -> Result<Response<Body>, ProxyError> {
+    let attempt_id = AttemptId::for_request(context.request_id, 1);
     let attempt_started_at_unix_ms = unix_time_millis();
-    let mut attempt_request_metadata = attempt_request_metadata(&method, &uri, &downstream_headers);
+    let mut attempt_request_metadata =
+        attempt_request_metadata(&context.method, &context.uri, &context.downstream_headers);
     add_shielded_request_metadata(
         &mut attempt_request_metadata,
-        shielded_chat_plan.intercepted,
-        &shielded_chat_plan.liveness,
-        &shielded_chat_plan.thinking_metadata,
+        false,
+        &context.liveness,
+        &context.thinking_metadata,
     );
-    let shielded_chat_intercepted = shielded_chat_plan.intercepted;
     let upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
-        client: &state.client,
-        method: reqwest_method,
-        upstream_url,
-        downstream_headers: &downstream_headers,
-        upstream_body: shielded_chat_plan.upstream_body,
+        client: &context.state.client,
+        method: context.reqwest_method,
+        upstream_url: context.upstream_url,
+        downstream_headers: &context.downstream_headers,
+        upstream_body: context.upstream_body,
         attempt_id: attempt_id.clone(),
-        request_id,
+        request_id: context.request_id,
         attempt_started_at_unix_ms,
-        request_metadata: &request_metadata,
+        request_metadata: &context.request_metadata,
         attempt_request_metadata: &attempt_request_metadata,
     })
     .await?;
     let upstream_status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
-    let upstream_mode = upstream_mode_from_headers(&upstream_headers);
     let response_parts = ForwardedResponseParts {
-        store: state.store.clone(),
-        request_id: request_id.clone(),
-        started_at_unix_ms,
+        store: context.state.store.clone(),
+        request_id: context.request_id.clone(),
+        started_at_unix_ms: context.started_at_unix_ms,
         attempt_id,
         attempt_started_at_unix_ms,
-        upstream_mode,
-        model_id,
-        input_fingerprint: shielded_chat_plan.liveness.input_fingerprint.clone(),
+        upstream_mode: upstream_mode_from_headers(&upstream_headers),
+        model_id: context.model_id,
+        input_fingerprint: context.liveness.input_fingerprint.clone(),
         upstream_status,
         upstream_headers: upstream_headers.clone(),
-        request_metadata,
+        request_metadata: context.request_metadata,
         attempt_request_metadata,
     };
     forward_upstream_response(
         ResponseDispatch {
-            method: &method,
-            uri: &uri,
-            config: &config,
-            shielded_chat: shielded_chat_intercepted,
-            liveness: shielded_chat_plan.liveness,
-            loop_context: shielded_chat_plan.loop_context,
+            method: &context.method,
+            uri: &context.uri,
+            config: context.config,
         },
         response_parts,
         upstream_response,
-        in_flight_permit,
+        context.in_flight_permit,
     )
     .await
 }
@@ -461,9 +524,6 @@ struct ResponseDispatch<'request> {
     method: &'request Method,
     uri: &'request Uri,
     config: &'request AppConfig,
-    shielded_chat: bool,
-    liveness: ShieldedLivenessSelection,
-    loop_context: shielded_chat::LoopInspectionContext,
 }
 
 struct ShieldedChatPlan {
@@ -544,6 +604,59 @@ impl ShieldedLivenessMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ShieldedRetryPolicy {
+    enabled: bool,
+    max_attempts: u32,
+    anti_loop_hint_enabled: bool,
+}
+
+impl ShieldedRetryPolicy {
+    fn from_config(config: &RetryConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            max_attempts: if config.enabled {
+                config.max_attempts
+            } else {
+                1
+            },
+            anti_loop_hint_enabled: config.anti_loop_hint_enabled,
+        }
+    }
+
+    fn allows_retry_after(self, attempt_number: u32) -> bool {
+        self.enabled && attempt_number < self.max_attempts
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShieldedRetryCause {
+    LoopDetected,
+    TransientUpstreamStatus,
+    TransientTransport,
+    TransientStream,
+}
+
+impl ShieldedRetryCause {
+    const fn retry_reason(self) -> &'static str {
+        match self {
+            Self::LoopDetected => "loop_detected",
+            Self::TransientUpstreamStatus => "transient_upstream_status",
+            Self::TransientTransport => "transient_upstream_transport",
+            Self::TransientStream => "transient_upstream_stream_failure",
+        }
+    }
+
+    const fn next_attempt_reason(self) -> &'static str {
+        match self {
+            Self::LoopDetected => "previous_loop_detected",
+            Self::TransientUpstreamStatus => "previous_transient_upstream_status",
+            Self::TransientTransport => "previous_transient_upstream_transport",
+            Self::TransientStream => "previous_transient_upstream_stream_failure",
+        }
+    }
+}
+
 async fn forward_upstream_response(
     dispatch: ResponseDispatch<'_>,
     response_parts: ForwardedResponseParts,
@@ -560,24 +673,6 @@ async fn forward_upstream_response(
             &dispatch.config.upstream.metadata,
         )
         .await;
-    }
-    if dispatch.shielded_chat && upstream_status.is_success() && is_event_stream(&upstream_headers)
-    {
-        return forward_shielded_chat_response(
-            response_parts,
-            upstream_response,
-            in_flight_permit,
-            &dispatch.liveness,
-            dispatch.loop_context,
-        )
-        .await;
-    }
-    if dispatch.shielded_chat && upstream_status.is_success() {
-        return Err(
-            response_parts.into_body_read_error(ProxyError::upstream_body(String::from(
-                "shielded chat completion expected upstream text/event-stream response",
-            ))),
-        );
     }
 
     let observer = response_parts.into_observer();
@@ -698,6 +793,13 @@ impl ReqwestFailureKind {
             Self::Other => "unknown_failure",
         }
     }
+
+    const fn is_transient(self) -> bool {
+        matches!(
+            self,
+            Self::Timeout | Self::Connect | Self::Body | Self::Other
+        )
+    }
 }
 
 impl fmt::Display for ReqwestFailureKind {
@@ -737,22 +839,35 @@ impl ForwardedResponseParts {
         extra_response_metadata: BTreeMap<String, String>,
         raw_payloads: RawPayloads,
     ) -> ForwardedBodyObserver {
+        let final_attempt = FinalAttemptContext {
+            attempt_id: self.attempt_id,
+            attempt_number: 1,
+            attempt_max_attempts: 1,
+            started_at_unix_ms: self.attempt_started_at_unix_ms,
+            upstream_mode: self.upstream_mode,
+            upstream_status: self.upstream_status,
+            upstream_headers: self.upstream_headers.clone(),
+            request_metadata: self.attempt_request_metadata,
+            extra_response_metadata: extra_response_metadata.clone(),
+            raw_payloads: raw_payloads.clone(),
+        };
         ForwardedBodyObserver {
             downstream_mode,
             store: self.store,
             request_id: self.request_id,
             started_at_unix_ms: self.started_at_unix_ms,
-            attempt_id: self.attempt_id,
-            attempt_started_at_unix_ms: self.attempt_started_at_unix_ms,
             upstream_mode: self.upstream_mode,
             model_id: self.model_id,
             input_fingerprint: self.input_fingerprint,
-            upstream_status: self.upstream_status,
-            upstream_headers: self.upstream_headers,
+            downstream_status: self.upstream_status,
+            downstream_headers: self.upstream_headers,
             request_metadata: self.request_metadata,
-            attempt_request_metadata: self.attempt_request_metadata,
             extra_response_metadata,
             raw_payloads,
+            completed_attempt_records: Vec::new(),
+            final_attempt: Some(final_attempt),
+            retry_observation: None,
+            attempt_progress: None,
         }
     }
 
@@ -804,81 +919,1034 @@ async fn forward_enriched_models_response(
     ))
 }
 
-async fn forward_shielded_chat_response(
-    response_parts: ForwardedResponseParts,
-    upstream_response: reqwest::Response,
-    in_flight_permit: OwnedSemaphorePermit,
-    liveness: &ShieldedLivenessSelection,
+#[derive(Clone)]
+struct ShieldedRetryRuntime {
+    client: Client,
+    method: reqwest::Method,
+    upstream_url: Url,
+    downstream_method: Method,
+    downstream_uri: Uri,
+    downstream_headers: HeaderMap,
+    upstream_body: Bytes,
+    store: ObservabilityStore,
+    request_id: RequestId,
+    started_at_unix_ms: u64,
+    model_id: Option<String>,
+    request_metadata: BTreeMap<String, String>,
+    liveness: ShieldedLivenessSelection,
+    thinking_metadata: BTreeMap<String, String>,
     loop_context: shielded_chat::LoopInspectionContext,
-) -> Result<Response<Body>, ProxyError> {
-    let request_id = response_parts.request_id.as_str().to_owned();
-    let request_model_id = response_parts.model_id.clone();
-    let upstream_content_type = response_parts
-        .upstream_headers
-        .get(CONTENT_TYPE)
-        .map(header_value);
-    if liveness.mode != ShieldedLivenessMode::Disabled {
-        let upstream_status = response_parts.upstream_status;
-        let response_headers =
-            shielded_chat_stream_response_headers(&response_parts.upstream_headers, liveness.mode);
-        let extra_metadata = shielded_liveness_response_metadata(liveness, upstream_content_type);
-        let loop_context = loop_context.clone();
-        let aggregate = Box::pin(async move {
-            shielded_chat::aggregate_stream(
-                upstream_response.bytes_stream(),
-                response_parts.attempt_started_at_unix_ms,
-                &request_id,
-                request_model_id.as_deref(),
-                loop_context,
-            )
-            .await
-        });
-        let observer = response_parts.into_observer_with(
-            liveness.mode.downstream_mode(),
-            extra_metadata,
-            RawPayloads::default(),
-        );
-        let response_body = ShieldedLivenessBody::new(
-            aggregate,
-            liveness.mode,
-            liveness.heartbeat_interval_secs,
-            observer,
-            in_flight_permit,
-        );
+    retry_policy: ShieldedRetryPolicy,
+}
 
-        return Ok(response_with_headers(
-            upstream_status,
-            response_headers,
-            Body::from_stream(response_body),
+#[derive(Clone, Debug)]
+struct ShieldedAttemptInfo {
+    attempt_id: AttemptId,
+    request_id: RequestId,
+    attempt_number: u32,
+    attempt_max_attempts: u32,
+    started_at_unix_ms: u64,
+    upstream_status: reqwest::StatusCode,
+    upstream_headers: HeaderMap,
+    upstream_mode: UpstreamMode,
+    request_metadata: BTreeMap<String, String>,
+}
+
+struct ShieldedStartedAttempt {
+    info: ShieldedAttemptInfo,
+    response: reqwest::Response,
+}
+
+struct ShieldedAcceptedOutcome {
+    body: Bytes,
+    raw_payloads: RawPayloads,
+    response_metadata: BTreeMap<String, String>,
+    prior_attempt_records: Vec<AttemptRecord>,
+    final_attempt: FinalAttemptContext,
+}
+
+struct ShieldedAggregatedAttempt {
+    body: Bytes,
+    raw_payloads: RawPayloads,
+    response_metadata: BTreeMap<String, String>,
+    final_attempt: FinalAttemptContext,
+}
+
+struct ShieldedFailureOutcome {
+    error_type: &'static str,
+    error_message: String,
+    response_metadata: BTreeMap<String, String>,
+    attempt_records: Vec<AttemptRecord>,
+    upstream_mode: UpstreamMode,
+    forwarded_response: Option<Box<ShieldedForwardedFailure>>,
+}
+
+struct ShieldedForwardedFailure {
+    started: ShieldedStartedAttempt,
+    final_attempt: FinalAttemptContext,
+}
+
+struct ShieldedTerminalForward {
+    started: ShieldedStartedAttempt,
+    prior_attempt_records: Vec<AttemptRecord>,
+}
+
+enum ShieldedRunOutcome {
+    Accepted(ShieldedAcceptedOutcome),
+    Failed(ShieldedFailureOutcome),
+    TerminalForward(ShieldedTerminalForward),
+}
+
+enum ShieldedBeginOutcome {
+    Aggregatable {
+        started: ShieldedStartedAttempt,
+        prior_attempt_records: Vec<AttemptRecord>,
+    },
+    Failed(ShieldedFailureOutcome),
+    TerminalForward(ShieldedTerminalForward),
+}
+
+struct ShieldedAttemptFailure {
+    attempt_id: AttemptId,
+    request_id: RequestId,
+    attempt_number: u32,
+    started_at_unix_ms: u64,
+    finished_at_unix_ms: u64,
+    upstream_mode: UpstreamMode,
+    http_status: Option<u16>,
+    error_type: &'static str,
+    error_message: String,
+    retry_cause: Option<ShieldedRetryCause>,
+    abort_reason: Option<String>,
+    request_metadata: BTreeMap<String, String>,
+    response_metadata: BTreeMap<String, String>,
+}
+
+async fn forward_shielded_chat_with_retries(
+    runtime: ShieldedRetryRuntime,
+    in_flight_permit: OwnedSemaphorePermit,
+) -> Result<Response<Body>, ProxyError> {
+    if runtime.liveness.mode == ShieldedLivenessMode::Disabled {
+        return Ok(
+            match run_shielded_attempts(runtime.clone(), None, Vec::new(), true, None).await {
+                ShieldedRunOutcome::Accepted(outcome) => {
+                    shielded_retry_success_response(&runtime, outcome, in_flight_permit)
+                }
+                ShieldedRunOutcome::Failed(failure) => {
+                    shielded_retry_error_response(&runtime, failure, in_flight_permit)
+                }
+                ShieldedRunOutcome::TerminalForward(terminal) => {
+                    shielded_retry_terminal_forward_response(&runtime, terminal, in_flight_permit)
+                }
+            },
+        );
+    }
+
+    match begin_shielded_retry(&runtime).await {
+        ShieldedBeginOutcome::Aggregatable {
+            started,
+            prior_attempt_records,
+        } => {
+            let upstream_status = started.info.upstream_status;
+            let upstream_content_type = started
+                .info
+                .upstream_headers
+                .get(CONTENT_TYPE)
+                .map(header_value);
+            let response_headers = shielded_chat_stream_response_headers(
+                &started.info.upstream_headers,
+                runtime.liveness.mode,
+            );
+            let extra_metadata =
+                shielded_liveness_response_metadata(&runtime.liveness, upstream_content_type);
+            let attempt_progress = Arc::new(Mutex::new(ShieldedAttemptProgress {
+                extra_response_metadata: extra_metadata.clone(),
+                completed_attempt_records: prior_attempt_records.clone(),
+                current_attempt: Some(
+                    started
+                        .info
+                        .clone()
+                        .into_final_context(extra_metadata.clone(), RawPayloads::default()),
+                ),
+            }));
+            let observer = shielded_retry_observer(
+                &runtime,
+                ShieldedRetryObserverInput {
+                    downstream_mode: runtime.liveness.mode.downstream_mode(),
+                    downstream_status: upstream_status,
+                    downstream_headers: response_headers.clone(),
+                    upstream_mode: UpstreamMode::Streaming,
+                    extra_response_metadata: extra_metadata,
+                    raw_payloads: RawPayloads::default(),
+                    completed_attempt_records: prior_attempt_records.clone(),
+                    final_attempt: None,
+                    attempt_progress: Some(attempt_progress.clone()),
+                },
+            );
+            let aggregate_runtime = runtime.clone();
+            let aggregate = Box::pin(async move {
+                match run_shielded_attempts(
+                    aggregate_runtime,
+                    Some(started),
+                    prior_attempt_records,
+                    false,
+                    Some(attempt_progress),
+                )
+                .await
+                {
+                    ShieldedRunOutcome::Accepted(outcome) => Ok(outcome),
+                    ShieldedRunOutcome::Failed(failure) => Err(failure),
+                    ShieldedRunOutcome::TerminalForward(terminal) => Err(terminal_forward_failure(
+                        terminal,
+                        "non-retryable upstream response after shielded retry",
+                    )),
+                }
+            });
+            let response_body = ShieldedLivenessBody::new(
+                aggregate,
+                runtime.liveness.mode,
+                runtime.liveness.heartbeat_interval_secs,
+                observer,
+                in_flight_permit,
+            );
+            Ok(response_with_headers(
+                upstream_status,
+                response_headers,
+                Body::from_stream(response_body),
+            ))
+        }
+        ShieldedBeginOutcome::Failed(failure) => Ok(shielded_retry_error_response(
+            &runtime,
+            failure,
+            in_flight_permit,
+        )),
+        ShieldedBeginOutcome::TerminalForward(terminal) => Ok(
+            shielded_retry_terminal_forward_response(&runtime, terminal, in_flight_permit),
+        ),
+    }
+}
+
+enum ShieldedAttemptStep {
+    Aggregatable(ShieldedStartedAttempt),
+    Retry {
+        attempt_number: u32,
+        retry_cause: Option<ShieldedRetryCause>,
+    },
+    Failed(ShieldedFailureOutcome),
+    TerminalForward(ShieldedTerminalForward),
+}
+
+enum ShieldedStartFailureStep {
+    Retry {
+        attempt_number: u32,
+        retry_cause: Option<ShieldedRetryCause>,
+    },
+    Failed(ShieldedFailureOutcome),
+}
+
+fn shielded_start_failure_step(
+    runtime: &ShieldedRetryRuntime,
+    failure: ShieldedAttemptFailure,
+    attempt_records: &mut Vec<AttemptRecord>,
+) -> ShieldedStartFailureStep {
+    let next_retry_cause = failure.retry_cause;
+    let can_retry = next_retry_cause.is_some_and(|_cause| {
+        runtime
+            .retry_policy
+            .allows_retry_after(failure.attempt_number)
+    });
+    attempt_records.push(attempt_failure_record(
+        &failure,
+        if can_retry {
+            AttemptStatus::Retried
+        } else {
+            AttemptStatus::Failed
+        },
+        if can_retry { next_retry_cause } else { None },
+        runtime.retry_policy,
+    ));
+    if can_retry {
+        return ShieldedStartFailureStep::Retry {
+            attempt_number: failure.attempt_number.saturating_add(1),
+            retry_cause: next_retry_cause,
+        };
+    }
+    ShieldedStartFailureStep::Failed(shielded_failure_outcome(
+        failure,
+        std::mem::take(attempt_records),
+        runtime.retry_policy,
+    ))
+}
+
+fn shielded_started_attempt_step(
+    runtime: &ShieldedRetryRuntime,
+    started: ShieldedStartedAttempt,
+    attempt_records: &mut Vec<AttemptRecord>,
+    allow_terminal_forward: bool,
+) -> ShieldedAttemptStep {
+    if started.info.upstream_status.is_success() && is_event_stream(&started.info.upstream_headers)
+    {
+        return ShieldedAttemptStep::Aggregatable(started);
+    }
+
+    if !started.info.upstream_status.is_success() {
+        if let Some(cause) = retry_cause_for_upstream_status(started.info.upstream_status) {
+            if runtime
+                .retry_policy
+                .allows_retry_after(started.info.attempt_number)
+            {
+                attempt_records.push(started_status_attempt_record(
+                    &started.info,
+                    AttemptStatus::Retried,
+                    Some(cause),
+                    runtime.retry_policy,
+                    "retryable upstream status before shielded stream",
+                ));
+                return ShieldedAttemptStep::Retry {
+                    attempt_number: started.info.attempt_number.saturating_add(1),
+                    retry_cause: Some(cause),
+                };
+            }
+            let failure = status_failure(
+                &started.info,
+                cause,
+                "retryable upstream status attempts exhausted before shielded stream",
+            );
+            return ShieldedAttemptStep::Failed(shielded_forwarded_status_failure_outcome(
+                failure,
+                std::mem::take(attempt_records),
+                runtime.retry_policy,
+                started,
+            ));
+        }
+        if allow_terminal_forward {
+            return ShieldedAttemptStep::TerminalForward(ShieldedTerminalForward {
+                started,
+                prior_attempt_records: std::mem::take(attempt_records),
+            });
+        }
+        let failure = status_failure_without_retry(
+            &started.info,
+            "non-retryable upstream response after shielded response started",
+        );
+        attempt_records.push(attempt_failure_record(
+            &failure,
+            AttemptStatus::Failed,
+            None,
+            runtime.retry_policy,
+        ));
+        return ShieldedAttemptStep::Failed(shielded_failure_outcome(
+            failure,
+            std::mem::take(attempt_records),
+            runtime.retry_policy,
         ));
     }
 
-    let aggregated = match shielded_chat::aggregate_stream(
-        upstream_response.bytes_stream(),
-        response_parts.attempt_started_at_unix_ms,
+    let failure = status_failure_without_retry(
+        &started.info,
+        "shielded chat completion expected upstream text/event-stream response",
+    );
+    attempt_records.push(attempt_failure_record(
+        &failure,
+        AttemptStatus::Failed,
+        None,
+        runtime.retry_policy,
+    ));
+    ShieldedAttemptStep::Failed(shielded_failure_outcome(
+        failure,
+        std::mem::take(attempt_records),
+        runtime.retry_policy,
+    ))
+}
+
+async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOutcome {
+    let mut attempt_number = 1;
+    let mut retry_cause = None;
+    let mut attempt_records = Vec::new();
+    loop {
+        let started = match start_shielded_attempt(runtime, attempt_number, retry_cause).await {
+            Ok(started) => started,
+            Err(failure) => {
+                match shielded_start_failure_step(runtime, failure, &mut attempt_records) {
+                    ShieldedStartFailureStep::Retry {
+                        attempt_number: next_attempt_number,
+                        retry_cause: next_retry_cause,
+                    } => {
+                        attempt_number = next_attempt_number;
+                        retry_cause = next_retry_cause;
+                        continue;
+                    }
+                    ShieldedStartFailureStep::Failed(outcome) => {
+                        return ShieldedBeginOutcome::Failed(outcome);
+                    }
+                }
+            }
+        };
+
+        match shielded_started_attempt_step(runtime, started, &mut attempt_records, true) {
+            ShieldedAttemptStep::Aggregatable(started) => {
+                return ShieldedBeginOutcome::Aggregatable {
+                    started,
+                    prior_attempt_records: attempt_records,
+                };
+            }
+            ShieldedAttemptStep::Retry {
+                attempt_number: next_attempt_number,
+                retry_cause: next_retry_cause,
+            } => {
+                attempt_number = next_attempt_number;
+                retry_cause = next_retry_cause;
+            }
+            ShieldedAttemptStep::Failed(outcome) => return ShieldedBeginOutcome::Failed(outcome),
+            ShieldedAttemptStep::TerminalForward(terminal) => {
+                return ShieldedBeginOutcome::TerminalForward(terminal);
+            }
+        }
+    }
+}
+
+async fn aggregate_shielded_attempt(
+    runtime: &ShieldedRetryRuntime,
+    started: ShieldedStartedAttempt,
+) -> Result<ShieldedAggregatedAttempt, ShieldedAttemptFailure> {
+    let request_id = runtime.request_id.as_str().to_owned();
+    let request_model_id = runtime.model_id.clone();
+    match shielded_chat::aggregate_stream(
+        started.response.bytes_stream(),
+        started.info.started_at_unix_ms,
         &request_id,
         request_model_id.as_deref(),
-        loop_context,
+        runtime.loop_context.clone(),
     )
     .await
     {
-        Ok(aggregated) => aggregated,
-        Err(error) => {
-            let response_metadata = error.response_metadata().clone();
-            return Err(response_parts.into_body_read_error_with_metadata(
-                ProxyError::upstream_body(error.to_string()),
-                response_metadata,
-            ));
-        }
-    };
+        Ok(aggregated) => Ok(ShieldedAggregatedAttempt {
+            final_attempt: started.info.into_final_context(
+                aggregated.response_metadata.clone(),
+                aggregated.raw_payloads.clone(),
+            ),
+            body: aggregated.body,
+            raw_payloads: aggregated.raw_payloads,
+            response_metadata: aggregated.response_metadata,
+        }),
+        Err(error) => Err(aggregation_failure(&started.info, &error)),
+    }
+}
 
-    let body_len = aggregated.body.len();
-    let upstream_status = response_parts.upstream_status;
-    let response_headers =
-        shielded_chat_response_headers(&response_parts.upstream_headers, body_len);
-    let mut extra_metadata = aggregated.response_metadata;
+async fn run_shielded_attempts(
+    runtime: ShieldedRetryRuntime,
+    initial_attempt: Option<ShieldedStartedAttempt>,
+    mut attempt_records: Vec<AttemptRecord>,
+    allow_terminal_forward: bool,
+    attempt_progress: Option<ShieldedAttemptProgressHandle>,
+) -> ShieldedRunOutcome {
+    let mut current_attempt = initial_attempt;
+    let mut attempt_number = current_attempt
+        .as_ref()
+        .map_or(1, |attempt| attempt.info.attempt_number);
+    let mut retry_cause = None;
+    loop {
+        let started = if let Some(started) = current_attempt.take() {
+            started
+        } else {
+            match start_shielded_attempt(&runtime, attempt_number, retry_cause).await {
+                Ok(started) => started,
+                Err(failure) => {
+                    match shielded_start_failure_step(&runtime, failure, &mut attempt_records) {
+                        ShieldedStartFailureStep::Retry {
+                            attempt_number: next_attempt_number,
+                            retry_cause: next_retry_cause,
+                        } => {
+                            attempt_number = next_attempt_number;
+                            retry_cause = next_retry_cause;
+                            continue;
+                        }
+                        ShieldedStartFailureStep::Failed(outcome) => {
+                            return ShieldedRunOutcome::Failed(outcome);
+                        }
+                    }
+                }
+            }
+        };
+
+        update_shielded_attempt_progress(
+            attempt_progress.as_ref(),
+            &attempt_records,
+            Some(&started.info),
+        );
+        let started = match shielded_started_attempt_step(
+            &runtime,
+            started,
+            &mut attempt_records,
+            allow_terminal_forward,
+        ) {
+            ShieldedAttemptStep::Aggregatable(started) => started,
+            ShieldedAttemptStep::Retry {
+                attempt_number: next_attempt_number,
+                retry_cause: next_retry_cause,
+            } => {
+                update_shielded_attempt_progress(attempt_progress.as_ref(), &attempt_records, None);
+                attempt_number = next_attempt_number;
+                retry_cause = next_retry_cause;
+                continue;
+            }
+            ShieldedAttemptStep::Failed(outcome) => return ShieldedRunOutcome::Failed(outcome),
+            ShieldedAttemptStep::TerminalForward(terminal) => {
+                return ShieldedRunOutcome::TerminalForward(terminal);
+            }
+        };
+
+        match aggregate_shielded_attempt(&runtime, started).await {
+            Ok(aggregated) => {
+                return ShieldedRunOutcome::Accepted(ShieldedAcceptedOutcome {
+                    body: aggregated.body,
+                    raw_payloads: aggregated.raw_payloads,
+                    response_metadata: aggregated.response_metadata,
+                    prior_attempt_records: attempt_records,
+                    final_attempt: aggregated.final_attempt,
+                });
+            }
+            Err(failure) => {
+                let next_retry_cause = failure.retry_cause;
+                let can_retry = next_retry_cause.is_some_and(|_cause| {
+                    runtime
+                        .retry_policy
+                        .allows_retry_after(failure.attempt_number)
+                });
+                attempt_records.push(attempt_failure_record(
+                    &failure,
+                    if can_retry {
+                        AttemptStatus::Retried
+                    } else {
+                        AttemptStatus::Failed
+                    },
+                    if can_retry { next_retry_cause } else { None },
+                    runtime.retry_policy,
+                ));
+                update_shielded_attempt_progress(attempt_progress.as_ref(), &attempt_records, None);
+                if can_retry {
+                    attempt_number = failure.attempt_number.saturating_add(1);
+                    retry_cause = next_retry_cause;
+                    continue;
+                }
+                return ShieldedRunOutcome::Failed(shielded_failure_outcome(
+                    failure,
+                    attempt_records,
+                    runtime.retry_policy,
+                ));
+            }
+        }
+    }
+}
+
+async fn start_shielded_attempt(
+    runtime: &ShieldedRetryRuntime,
+    attempt_number: u32,
+    retry_cause: Option<ShieldedRetryCause>,
+) -> Result<ShieldedStartedAttempt, ShieldedAttemptFailure> {
+    let attempt_id = AttemptId::for_request(&runtime.request_id, attempt_number);
+    let attempt_started_at_unix_ms = unix_time_millis();
+    let (upstream_body, anti_loop_hint_applied) =
+        shielded_attempt_body(runtime, attempt_number, retry_cause);
+    let request_metadata = shielded_attempt_request_metadata(
+        runtime,
+        attempt_number,
+        retry_cause,
+        anti_loop_hint_applied,
+    );
+    match send_upstream_request(
+        &runtime.client,
+        runtime.method.clone(),
+        runtime.upstream_url.clone(),
+        &runtime.downstream_headers,
+        upstream_body,
+    )
+    .await
+    {
+        Ok(response) => {
+            let upstream_status = response.status();
+            let upstream_headers = response.headers().clone();
+            let upstream_mode = upstream_mode_from_headers(&upstream_headers);
+            Ok(ShieldedStartedAttempt {
+                info: ShieldedAttemptInfo {
+                    attempt_id,
+                    request_id: runtime.request_id.clone(),
+                    attempt_number,
+                    attempt_max_attempts: runtime.retry_policy.max_attempts,
+                    started_at_unix_ms: attempt_started_at_unix_ms,
+                    upstream_status,
+                    upstream_headers,
+                    upstream_mode,
+                    request_metadata,
+                },
+                response,
+            })
+        }
+        Err(error) => {
+            let finished_at_unix_ms = unix_time_millis();
+            let retry_cause = transport_retry_cause(&error);
+            let mut response_metadata = failed_response_metadata(
+                attempt_started_at_unix_ms,
+                finished_at_unix_ms,
+                error.error_type(),
+            );
+            response_metadata.insert(
+                String::from("upstream_response_received"),
+                String::from("false"),
+            );
+            Err(ShieldedAttemptFailure {
+                attempt_id,
+                request_id: runtime.request_id.clone(),
+                attempt_number,
+                started_at_unix_ms: attempt_started_at_unix_ms,
+                finished_at_unix_ms,
+                upstream_mode: UpstreamMode::NotApplicable,
+                http_status: None,
+                error_type: error.error_type(),
+                error_message: error.to_string(),
+                retry_cause,
+                abort_reason: None,
+                request_metadata,
+                response_metadata,
+            })
+        }
+    }
+}
+
+impl ShieldedAttemptInfo {
+    fn into_final_context(
+        self,
+        extra_response_metadata: BTreeMap<String, String>,
+        raw_payloads: RawPayloads,
+    ) -> FinalAttemptContext {
+        FinalAttemptContext {
+            attempt_id: self.attempt_id,
+            attempt_number: self.attempt_number,
+            attempt_max_attempts: self.attempt_max_attempts,
+            started_at_unix_ms: self.started_at_unix_ms,
+            upstream_mode: self.upstream_mode,
+            upstream_status: self.upstream_status,
+            upstream_headers: self.upstream_headers,
+            request_metadata: self.request_metadata,
+            extra_response_metadata,
+            raw_payloads,
+        }
+    }
+}
+
+fn shielded_attempt_body(
+    runtime: &ShieldedRetryRuntime,
+    attempt_number: u32,
+    retry_cause: Option<ShieldedRetryCause>,
+) -> (Bytes, bool) {
+    if attempt_number > 1
+        && runtime.retry_policy.anti_loop_hint_enabled
+        && matches!(retry_cause, Some(ShieldedRetryCause::LoopDetected))
+    {
+        if let Some(body) = shielded_chat::body_with_anti_loop_retry_hint(
+            &runtime.upstream_body,
+            attempt_number,
+            runtime.retry_policy.max_attempts,
+        ) {
+            return (body, true);
+        }
+    }
+    (runtime.upstream_body.clone(), false)
+}
+
+fn shielded_attempt_request_metadata(
+    runtime: &ShieldedRetryRuntime,
+    attempt_number: u32,
+    retry_cause: Option<ShieldedRetryCause>,
+    anti_loop_hint_applied: bool,
+) -> BTreeMap<String, String> {
+    let mut metadata = attempt_request_metadata(
+        &runtime.downstream_method,
+        &runtime.downstream_uri,
+        &runtime.downstream_headers,
+    );
+    add_shielded_request_metadata(
+        &mut metadata,
+        true,
+        &runtime.liveness,
+        &runtime.thinking_metadata,
+    );
+    add_retry_attempt_metadata(
+        &mut metadata,
+        runtime.retry_policy,
+        attempt_number,
+        retry_cause,
+        anti_loop_hint_applied,
+    );
+    metadata
+}
+
+fn add_retry_attempt_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    policy: ShieldedRetryPolicy,
+    attempt_number: u32,
+    retry_cause: Option<ShieldedRetryCause>,
+    anti_loop_hint_applied: bool,
+) {
+    metadata.insert(String::from("attempt_number"), attempt_number.to_string());
+    metadata.insert(
+        String::from("retry_policy_enabled"),
+        policy.enabled.to_string(),
+    );
+    metadata.insert(
+        String::from("retry_max_attempts"),
+        policy.max_attempts.to_string(),
+    );
+    metadata.insert(
+        String::from("retry_anti_loop_hint_enabled"),
+        policy.anti_loop_hint_enabled.to_string(),
+    );
+    metadata.insert(
+        String::from("retry_previous_reason"),
+        retry_cause.map_or_else(
+            || String::from("none"),
+            |cause| cause.next_attempt_reason().to_owned(),
+        ),
+    );
+    metadata.insert(
+        String::from("retry_anti_loop_hint_applied"),
+        anti_loop_hint_applied.to_string(),
+    );
+}
+
+fn add_retry_request_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    policy: ShieldedRetryPolicy,
+) {
+    metadata.insert(
+        String::from("retry_policy_enabled"),
+        policy.enabled.to_string(),
+    );
+    metadata.insert(
+        String::from("retry_max_attempts"),
+        policy.max_attempts.to_string(),
+    );
+    metadata.insert(
+        String::from("retry_anti_loop_hint_enabled"),
+        policy.anti_loop_hint_enabled.to_string(),
+    );
+}
+
+fn retry_cause_for_upstream_status(status: reqwest::StatusCode) -> Option<ShieldedRetryCause> {
+    if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
+        Some(ShieldedRetryCause::TransientUpstreamStatus)
+    } else {
+        None
+    }
+}
+
+fn transport_retry_cause(error: &ProxyError) -> Option<ShieldedRetryCause> {
+    match error {
+        ProxyError::UpstreamTransport { failure, .. } if failure.is_transient() => {
+            Some(ShieldedRetryCause::TransientTransport)
+        }
+        _ => None,
+    }
+}
+
+fn aggregation_failure(
+    info: &ShieldedAttemptInfo,
+    error: &shielded_chat::AggregationError,
+) -> ShieldedAttemptFailure {
+    let finished_at_unix_ms = unix_time_millis();
+    let retry_cause = if error.is_loop_detected() {
+        Some(ShieldedRetryCause::LoopDetected)
+    } else {
+        error
+            .transient_stream_retry_reason()
+            .map(|_reason| ShieldedRetryCause::TransientStream)
+    };
+    let mut response_metadata = failed_response_metadata(
+        info.started_at_unix_ms,
+        finished_at_unix_ms,
+        "upstream_body_error",
+    );
+    response_metadata.insert(
+        String::from("upstream_response_received"),
+        String::from("true"),
+    );
+    response_metadata.insert(
+        String::from("http_status_success"),
+        info.upstream_status.is_success().to_string(),
+    );
+    response_metadata.extend(error.response_metadata().clone());
+    ShieldedAttemptFailure {
+        attempt_id: info.attempt_id.clone(),
+        request_id: info.request_id.clone(),
+        attempt_number: info.attempt_number,
+        started_at_unix_ms: info.started_at_unix_ms,
+        finished_at_unix_ms,
+        upstream_mode: info.upstream_mode,
+        http_status: Some(info.upstream_status.as_u16()),
+        error_type: "upstream_body_error",
+        error_message: error.to_string(),
+        retry_cause,
+        abort_reason: retry_cause
+            .filter(|cause| matches!(cause, ShieldedRetryCause::LoopDetected))
+            .map(|_cause| String::from("loop_guard")),
+        request_metadata: info.request_metadata.clone(),
+        response_metadata,
+    }
+}
+
+fn status_failure(
+    info: &ShieldedAttemptInfo,
+    cause: ShieldedRetryCause,
+    message: &str,
+) -> ShieldedAttemptFailure {
+    let finished_at_unix_ms = unix_time_millis();
+    let mut response_metadata = response_metadata(
+        info.upstream_status,
+        &info.upstream_headers,
+        0,
+        finished_at_unix_ms.saturating_sub(info.started_at_unix_ms),
+    );
+    response_metadata.insert(
+        String::from("status_code"),
+        info.upstream_status.as_u16().to_string(),
+    );
+    response_metadata.insert(
+        String::from("upstream_response_received"),
+        String::from("true"),
+    );
+    ShieldedAttemptFailure {
+        attempt_id: info.attempt_id.clone(),
+        request_id: info.request_id.clone(),
+        attempt_number: info.attempt_number,
+        started_at_unix_ms: info.started_at_unix_ms,
+        finished_at_unix_ms,
+        upstream_mode: info.upstream_mode,
+        http_status: Some(info.upstream_status.as_u16()),
+        error_type: "upstream_status_error",
+        error_message: format!("{message}: HTTP {}", info.upstream_status.as_u16()),
+        retry_cause: Some(cause),
+        abort_reason: None,
+        request_metadata: info.request_metadata.clone(),
+        response_metadata,
+    }
+}
+
+fn status_failure_without_retry(
+    info: &ShieldedAttemptInfo,
+    message: &str,
+) -> ShieldedAttemptFailure {
+    let finished_at_unix_ms = unix_time_millis();
+    let mut response_metadata = response_metadata(
+        info.upstream_status,
+        &info.upstream_headers,
+        0,
+        finished_at_unix_ms.saturating_sub(info.started_at_unix_ms),
+    );
+    response_metadata.insert(
+        String::from("upstream_response_received"),
+        String::from("true"),
+    );
+    ShieldedAttemptFailure {
+        attempt_id: info.attempt_id.clone(),
+        request_id: info.request_id.clone(),
+        attempt_number: info.attempt_number,
+        started_at_unix_ms: info.started_at_unix_ms,
+        finished_at_unix_ms,
+        upstream_mode: info.upstream_mode,
+        http_status: Some(info.upstream_status.as_u16()),
+        error_type: "upstream_body_error",
+        error_message: message.to_owned(),
+        retry_cause: None,
+        abort_reason: None,
+        request_metadata: info.request_metadata.clone(),
+        response_metadata,
+    }
+}
+
+fn attempt_failure_record(
+    failure: &ShieldedAttemptFailure,
+    status: AttemptStatus,
+    retry_cause: Option<ShieldedRetryCause>,
+    policy: ShieldedRetryPolicy,
+) -> AttemptRecord {
+    let mut response_metadata = failure.response_metadata.clone();
+    response_metadata.insert(
+        String::from("attempt_number"),
+        failure.attempt_number.to_string(),
+    );
+    response_metadata.insert(
+        String::from("attempt_max_attempts"),
+        policy.max_attempts.to_string(),
+    );
+    response_metadata.insert(String::from("attempt_outcome"), status.as_str().to_owned());
+    response_metadata.insert(
+        String::from("attempt_duration_ms"),
+        failure
+            .finished_at_unix_ms
+            .saturating_sub(failure.started_at_unix_ms)
+            .to_string(),
+    );
+    response_metadata.insert(
+        String::from("retry_policy_enabled"),
+        policy.enabled.to_string(),
+    );
+    if let Some(cause) = retry_cause {
+        response_metadata.insert(
+            String::from("retry_reason"),
+            cause.retry_reason().to_owned(),
+        );
+    } else if failure.retry_cause.is_some() {
+        response_metadata.insert(String::from("retry_exhausted"), String::from("true"));
+    }
+    if let Some(abort_reason) = &failure.abort_reason {
+        response_metadata.insert(String::from("abort_reason"), abort_reason.clone());
+    }
+    AttemptRecord {
+        attempt_id: failure.attempt_id.clone(),
+        request_id: failure.request_id.clone(),
+        attempt_number: failure.attempt_number,
+        started_at_unix_ms: failure.started_at_unix_ms,
+        finished_at_unix_ms: Some(failure.finished_at_unix_ms),
+        upstream_mode: failure.upstream_mode,
+        status,
+        http_status: failure.http_status,
+        error_reason: Some(format!("{}: {}", failure.error_type, failure.error_message)),
+        retry_reason: retry_cause.map(|cause| cause.retry_reason().to_owned()),
+        abort_reason: failure.abort_reason.clone(),
+        request_metadata: failure.request_metadata.clone(),
+        response_metadata,
+        raw_payloads: RawPayloads::default(),
+    }
+}
+
+fn started_status_attempt_record(
+    info: &ShieldedAttemptInfo,
+    status: AttemptStatus,
+    retry_cause: Option<ShieldedRetryCause>,
+    policy: ShieldedRetryPolicy,
+    message: &str,
+) -> AttemptRecord {
+    let failure = status_failure(
+        info,
+        retry_cause.unwrap_or(ShieldedRetryCause::TransientUpstreamStatus),
+        message,
+    );
+    attempt_failure_record(&failure, status, retry_cause, policy)
+}
+
+fn shielded_failure_outcome(
+    failure: ShieldedAttemptFailure,
+    attempt_records: Vec<AttemptRecord>,
+    policy: ShieldedRetryPolicy,
+) -> ShieldedFailureOutcome {
+    let mut response_metadata = failure.response_metadata.clone();
+    response_metadata.extend(retry_chain_metadata(
+        &attempt_records,
+        policy,
+        RequestStatus::Failed.as_str(),
+    ));
+    ShieldedFailureOutcome {
+        error_type: failure.error_type,
+        error_message: failure.error_message,
+        response_metadata,
+        attempt_records,
+        upstream_mode: failure.upstream_mode,
+        forwarded_response: None,
+    }
+}
+
+fn shielded_forwarded_status_failure_outcome(
+    failure: ShieldedAttemptFailure,
+    attempt_records: Vec<AttemptRecord>,
+    policy: ShieldedRetryPolicy,
+    started: ShieldedStartedAttempt,
+) -> ShieldedFailureOutcome {
+    let final_attempt = started.info.clone().into_final_context(
+        status_failure_final_attempt_metadata(&failure),
+        RawPayloads::default(),
+    );
+    let mut chain_attempts = attempt_records.clone();
+    chain_attempts.push(final_attempt_record(
+        final_attempt.clone(),
+        &failure.request_id,
+        failure.finished_at_unix_ms,
+        0,
+        &BodyCompletion::UpstreamStatusError(failure.error_message.clone()),
+    ));
+    let mut response_metadata = failure.response_metadata.clone();
+    response_metadata.extend(retry_chain_metadata(
+        &chain_attempts,
+        policy,
+        RequestStatus::Failed.as_str(),
+    ));
+    ShieldedFailureOutcome {
+        error_type: failure.error_type,
+        error_message: failure.error_message,
+        response_metadata,
+        attempt_records,
+        upstream_mode: failure.upstream_mode,
+        forwarded_response: Some(Box::new(ShieldedForwardedFailure {
+            started,
+            final_attempt,
+        })),
+    }
+}
+
+fn status_failure_final_attempt_metadata(
+    failure: &ShieldedAttemptFailure,
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    for key in ["status_code", "upstream_response_received"] {
+        if let Some(value) = failure.response_metadata.get(key) {
+            metadata.insert(key.to_owned(), value.clone());
+        }
+    }
+    if failure.retry_cause.is_some() {
+        metadata.insert(String::from("retry_exhausted"), String::from("true"));
+    }
+    metadata
+}
+
+fn terminal_forward_failure(
+    terminal: ShieldedTerminalForward,
+    message: &str,
+) -> ShieldedFailureOutcome {
+    let failure = status_failure_without_retry(&terminal.started.info, message);
+    let mut attempt_records = terminal.prior_attempt_records;
+    attempt_records.push(attempt_failure_record(
+        &failure,
+        AttemptStatus::Failed,
+        None,
+        ShieldedRetryPolicy {
+            enabled: false,
+            max_attempts: 1,
+            anti_loop_hint_enabled: false,
+        },
+    ));
+    shielded_failure_outcome(
+        failure,
+        attempt_records,
+        ShieldedRetryPolicy {
+            enabled: false,
+            max_attempts: 1,
+            anti_loop_hint_enabled: false,
+        },
+    )
+}
+
+fn shielded_retry_success_response(
+    runtime: &ShieldedRetryRuntime,
+    mut outcome: ShieldedAcceptedOutcome,
+    in_flight_permit: OwnedSemaphorePermit,
+) -> Response<Body> {
+    let body_len = outcome.body.len();
+    let upstream_headers = outcome.final_attempt.upstream_headers.clone();
+    let upstream_status = outcome.final_attempt.upstream_status;
+    let upstream_content_type = upstream_headers.get(CONTENT_TYPE).map(header_value);
+    let response_headers = shielded_chat_response_headers(&upstream_headers, body_len);
+    let mut extra_metadata = outcome.response_metadata.clone();
     extra_metadata.extend(shielded_liveness_response_metadata(
-        liveness,
+        &runtime.liveness,
         upstream_content_type.clone(),
     ));
     if let Some(content_type) = upstream_content_type {
@@ -887,89 +1955,428 @@ async fn forward_shielded_chat_response(
             content_type,
         );
     }
-    let observer = response_parts.into_observer_with(
-        DownstreamMode::NonStreamJson,
-        extra_metadata,
-        aggregated.raw_payloads,
+    outcome
+        .final_attempt
+        .extra_response_metadata
+        .extend(extra_metadata.clone());
+    outcome.final_attempt.raw_payloads = outcome.raw_payloads.clone();
+    let observer = shielded_retry_observer(
+        runtime,
+        ShieldedRetryObserverInput {
+            downstream_mode: DownstreamMode::NonStreamJson,
+            downstream_status: upstream_status,
+            downstream_headers: response_headers.clone(),
+            upstream_mode: outcome.final_attempt.upstream_mode,
+            extra_response_metadata: extra_metadata,
+            raw_payloads: outcome.raw_payloads,
+            completed_attempt_records: outcome.prior_attempt_records,
+            final_attempt: Some(outcome.final_attempt),
+            attempt_progress: None,
+        },
     );
-    let response_body = ObservedBufferedBody::new(aggregated.body, observer, in_flight_permit);
-
-    Ok(response_with_headers(
+    let response_body = ObservedBufferedBody::new(outcome.body, observer, in_flight_permit);
+    response_with_headers(
         upstream_status,
         response_headers,
         Body::from_stream(response_body),
-    ))
+    )
+}
+
+fn shielded_retry_error_response(
+    runtime: &ShieldedRetryRuntime,
+    failure: ShieldedFailureOutcome,
+    in_flight_permit: OwnedSemaphorePermit,
+) -> Response<Body> {
+    if failure.forwarded_response.is_some() {
+        return shielded_retry_forwarded_failure_response(runtime, failure, in_flight_permit);
+    }
+
+    let body = proxy_error_json_body(failure.error_type, &failure.error_message);
+    let response_headers = json_response_headers(body.len());
+    let observer = shielded_retry_observer(
+        runtime,
+        ShieldedRetryObserverInput {
+            downstream_mode: runtime.liveness.mode.downstream_mode(),
+            downstream_status: StatusCode::BAD_GATEWAY,
+            downstream_headers: response_headers.clone(),
+            upstream_mode: failure.upstream_mode,
+            extra_response_metadata: failure.response_metadata,
+            raw_payloads: RawPayloads::default(),
+            completed_attempt_records: failure.attempt_records,
+            final_attempt: None,
+            attempt_progress: None,
+        },
+    );
+    let completion = BodyCompletion::UpstreamStreamError(failure.error_message);
+    let response_body =
+        ObservedBufferedBody::new_with_completion(body, observer, in_flight_permit, completion);
+    response_with_headers(
+        StatusCode::BAD_GATEWAY,
+        response_headers,
+        Body::from_stream(response_body),
+    )
+}
+
+fn shielded_retry_forwarded_failure_response(
+    runtime: &ShieldedRetryRuntime,
+    mut failure: ShieldedFailureOutcome,
+    in_flight_permit: OwnedSemaphorePermit,
+) -> Response<Body> {
+    let forwarded = failure
+        .forwarded_response
+        .take()
+        .expect("forwarded failure response should be present");
+    let upstream_status = forwarded.started.info.upstream_status;
+    let upstream_headers = forwarded.started.info.upstream_headers.clone();
+    let mut response_headers = HeaderMap::new();
+    copy_response_headers(&upstream_headers, &mut response_headers);
+    let terminal_completion = BodyCompletion::UpstreamStatusError(failure.error_message);
+    let mut extra_response_metadata = failure.response_metadata;
+    extra_response_metadata.remove("response_body_bytes");
+    extra_response_metadata.remove("latency_ms");
+    let observer = shielded_retry_observer(
+        runtime,
+        ShieldedRetryObserverInput {
+            downstream_mode: downstream_mode_from_headers(&upstream_headers),
+            downstream_status: upstream_status,
+            downstream_headers: response_headers.clone(),
+            upstream_mode: forwarded.final_attempt.upstream_mode,
+            extra_response_metadata,
+            raw_payloads: RawPayloads::default(),
+            completed_attempt_records: failure.attempt_records,
+            final_attempt: Some(forwarded.final_attempt),
+            attempt_progress: None,
+        },
+    );
+    let response_body = ObservedUpstreamBody::new_with_completion(
+        forwarded.started.response.bytes_stream(),
+        observer,
+        in_flight_permit,
+        terminal_completion,
+    );
+    response_with_headers(
+        upstream_status,
+        response_headers,
+        Body::from_stream(response_body),
+    )
+}
+
+fn shielded_retry_terminal_forward_response(
+    runtime: &ShieldedRetryRuntime,
+    terminal: ShieldedTerminalForward,
+    in_flight_permit: OwnedSemaphorePermit,
+) -> Response<Body> {
+    let upstream_status = terminal.started.info.upstream_status;
+    let upstream_headers = terminal.started.info.upstream_headers.clone();
+    let final_attempt = terminal
+        .started
+        .info
+        .clone()
+        .into_final_context(BTreeMap::new(), RawPayloads::default());
+    let observer = shielded_retry_observer(
+        runtime,
+        ShieldedRetryObserverInput {
+            downstream_mode: downstream_mode_from_headers(&upstream_headers),
+            downstream_status: upstream_status,
+            downstream_headers: upstream_headers.clone(),
+            upstream_mode: final_attempt.upstream_mode,
+            extra_response_metadata: BTreeMap::new(),
+            raw_payloads: RawPayloads::default(),
+            completed_attempt_records: terminal.prior_attempt_records,
+            final_attempt: Some(final_attempt),
+            attempt_progress: None,
+        },
+    );
+    let response_body = ObservedUpstreamBody::new(
+        terminal.started.response.bytes_stream(),
+        observer,
+        in_flight_permit,
+    );
+    downstream_response(
+        upstream_status,
+        &upstream_headers,
+        Body::from_stream(response_body),
+    )
+}
+
+struct ShieldedRetryObserverInput {
+    downstream_mode: DownstreamMode,
+    downstream_status: reqwest::StatusCode,
+    downstream_headers: HeaderMap,
+    upstream_mode: UpstreamMode,
+    extra_response_metadata: BTreeMap<String, String>,
+    raw_payloads: RawPayloads,
+    completed_attempt_records: Vec<AttemptRecord>,
+    final_attempt: Option<FinalAttemptContext>,
+    attempt_progress: Option<ShieldedAttemptProgressHandle>,
+}
+
+fn shielded_retry_observer(
+    runtime: &ShieldedRetryRuntime,
+    input: ShieldedRetryObserverInput,
+) -> ForwardedBodyObserver {
+    ForwardedBodyObserver {
+        store: runtime.store.clone(),
+        request_id: runtime.request_id.clone(),
+        started_at_unix_ms: runtime.started_at_unix_ms,
+        downstream_mode: input.downstream_mode,
+        upstream_mode: input.upstream_mode,
+        model_id: runtime.model_id.clone(),
+        input_fingerprint: runtime.liveness.input_fingerprint.clone(),
+        downstream_status: input.downstream_status,
+        downstream_headers: input.downstream_headers,
+        request_metadata: runtime.request_metadata.clone(),
+        extra_response_metadata: input.extra_response_metadata,
+        raw_payloads: input.raw_payloads,
+        completed_attempt_records: input.completed_attempt_records,
+        final_attempt: input.final_attempt,
+        retry_observation: Some(RetryObservation {
+            policy: runtime.retry_policy,
+        }),
+        attempt_progress: input.attempt_progress,
+    }
+}
+
+fn json_response_headers(body_len: usize) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Ok(content_length) = HeaderValue::from_str(&body_len.to_string()) {
+        headers.insert(CONTENT_LENGTH, content_length);
+    }
+    headers
+}
+
+#[derive(Clone, Debug)]
+struct FinalAttemptContext {
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    attempt_max_attempts: u32,
+    started_at_unix_ms: u64,
+    upstream_mode: UpstreamMode,
+    upstream_status: reqwest::StatusCode,
+    upstream_headers: HeaderMap,
+    request_metadata: BTreeMap<String, String>,
+    extra_response_metadata: BTreeMap<String, String>,
+    raw_payloads: RawPayloads,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RetryObservation {
+    policy: ShieldedRetryPolicy,
+}
+
+type ShieldedAttemptProgressHandle = Arc<Mutex<ShieldedAttemptProgress>>;
+
+#[derive(Debug)]
+struct ShieldedAttemptProgress {
+    extra_response_metadata: BTreeMap<String, String>,
+    completed_attempt_records: Vec<AttemptRecord>,
+    current_attempt: Option<FinalAttemptContext>,
+}
+
+fn shielded_attempt_progress(
+    progress: &ShieldedAttemptProgressHandle,
+) -> MutexGuard<'_, ShieldedAttemptProgress> {
+    match progress.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn update_shielded_attempt_progress(
+    progress: Option<&ShieldedAttemptProgressHandle>,
+    completed_attempt_records: &[AttemptRecord],
+    current_attempt: Option<&ShieldedAttemptInfo>,
+) {
+    if let Some(progress) = progress {
+        let mut progress = shielded_attempt_progress(progress);
+        progress.completed_attempt_records = completed_attempt_records.to_vec();
+        let extra_response_metadata = progress.extra_response_metadata.clone();
+        progress.current_attempt = current_attempt.map(|info| {
+            info.clone()
+                .into_final_context(extra_response_metadata, RawPayloads::default())
+        });
+    }
 }
 
 struct ForwardedBodyObserver {
     store: ObservabilityStore,
     request_id: RequestId,
     started_at_unix_ms: u64,
-    attempt_id: AttemptId,
-    attempt_started_at_unix_ms: u64,
     downstream_mode: DownstreamMode,
     upstream_mode: UpstreamMode,
     model_id: Option<String>,
     input_fingerprint: Option<String>,
-    upstream_status: reqwest::StatusCode,
-    upstream_headers: HeaderMap,
+    downstream_status: reqwest::StatusCode,
+    downstream_headers: HeaderMap,
     request_metadata: BTreeMap<String, String>,
-    attempt_request_metadata: BTreeMap<String, String>,
     extra_response_metadata: BTreeMap<String, String>,
     raw_payloads: RawPayloads,
+    completed_attempt_records: Vec<AttemptRecord>,
+    final_attempt: Option<FinalAttemptContext>,
+    retry_observation: Option<RetryObservation>,
+    attempt_progress: Option<ShieldedAttemptProgressHandle>,
 }
 
 impl ForwardedBodyObserver {
     fn record(self, body_bytes: u64, completion: &BodyCompletion) {
         let finished_at_unix_ms = unix_time_millis();
+        let mut attempts = self.completed_attempt_records;
+        let mut final_attempt = self.final_attempt;
+        if matches!(completion, BodyCompletion::DownstreamDropped) {
+            if let Some(progress) = &self.attempt_progress {
+                let progress = shielded_attempt_progress(progress);
+                attempts = progress.completed_attempt_records.clone();
+                final_attempt.clone_from(&progress.current_attempt);
+            }
+        }
+        let upstream_mode = final_attempt
+            .as_ref()
+            .map_or(self.upstream_mode, |attempt| attempt.upstream_mode);
+        if let Some(final_attempt) = final_attempt {
+            attempts.push(final_attempt_record(
+                final_attempt,
+                &self.request_id,
+                finished_at_unix_ms,
+                body_bytes,
+                completion,
+            ));
+        }
+
         let mut response_metadata = response_metadata(
-            self.upstream_status,
-            &self.upstream_headers,
+            self.downstream_status,
+            &self.downstream_headers,
             body_bytes,
             finished_at_unix_ms.saturating_sub(self.started_at_unix_ms),
         );
         response_metadata.extend(self.extra_response_metadata);
-        let attempt_response_metadata = response_metadata.clone();
-        let request_raw_payloads = self.raw_payloads.clone();
+        if let Some(retry_observation) = self.retry_observation {
+            response_metadata.extend(retry_chain_metadata(
+                &attempts,
+                retry_observation.policy,
+                completion.request_status().as_str(),
+            ));
+        }
         let request_record = RequestRecord {
-            request_id: self.request_id.clone(),
+            request_id: self.request_id,
             started_at_unix_ms: self.started_at_unix_ms,
             finished_at_unix_ms: Some(finished_at_unix_ms),
             downstream_mode: self.downstream_mode,
-            upstream_mode: self.upstream_mode,
+            upstream_mode,
             model_id: self.model_id,
             input_fingerprint: self.input_fingerprint,
             status: completion.request_status(),
-            http_status: Some(self.upstream_status.as_u16()),
+            http_status: Some(self.downstream_status.as_u16()),
             error_reason: completion.error_reason(),
             abort_reason: completion.abort_reason(),
             request_metadata: self.request_metadata,
             response_metadata,
-            raw_payloads: request_raw_payloads,
-        };
-        let attempt_record = AttemptRecord {
-            attempt_id: self.attempt_id,
-            request_id: self.request_id,
-            attempt_number: 1,
-            started_at_unix_ms: self.attempt_started_at_unix_ms,
-            finished_at_unix_ms: Some(finished_at_unix_ms),
-            upstream_mode: self.upstream_mode,
-            status: completion.attempt_status(),
-            http_status: Some(self.upstream_status.as_u16()),
-            error_reason: completion.error_reason(),
-            retry_reason: None,
-            abort_reason: completion.abort_reason(),
-            request_metadata: self.attempt_request_metadata,
-            response_metadata: attempt_response_metadata,
             raw_payloads: self.raw_payloads,
         };
-        record_observability(&self.store, &request_record, Some(&attempt_record));
+        record_observability_many(&self.store, &request_record, &attempts);
     }
+}
+
+fn final_attempt_record(
+    attempt: FinalAttemptContext,
+    request_id: &RequestId,
+    finished_at_unix_ms: u64,
+    body_bytes: u64,
+    completion: &BodyCompletion,
+) -> AttemptRecord {
+    let mut response_metadata = response_metadata(
+        attempt.upstream_status,
+        &attempt.upstream_headers,
+        body_bytes,
+        finished_at_unix_ms.saturating_sub(attempt.started_at_unix_ms),
+    );
+    response_metadata.extend(attempt.extra_response_metadata);
+    response_metadata.insert(
+        String::from("attempt_number"),
+        attempt.attempt_number.to_string(),
+    );
+    response_metadata.insert(
+        String::from("attempt_max_attempts"),
+        attempt.attempt_max_attempts.to_string(),
+    );
+    response_metadata.insert(
+        String::from("attempt_outcome"),
+        completion.attempt_status().as_str().to_owned(),
+    );
+    AttemptRecord {
+        attempt_id: attempt.attempt_id,
+        request_id: request_id.clone(),
+        attempt_number: attempt.attempt_number,
+        started_at_unix_ms: attempt.started_at_unix_ms,
+        finished_at_unix_ms: Some(finished_at_unix_ms),
+        upstream_mode: attempt.upstream_mode,
+        status: completion.attempt_status(),
+        http_status: Some(attempt.upstream_status.as_u16()),
+        error_reason: completion.error_reason(),
+        retry_reason: None,
+        abort_reason: completion.abort_reason(),
+        request_metadata: attempt.request_metadata,
+        response_metadata,
+        raw_payloads: attempt.raw_payloads,
+    }
+}
+
+fn retry_chain_metadata(
+    attempts: &[AttemptRecord],
+    policy: ShieldedRetryPolicy,
+    final_outcome: &str,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            String::from("retry_policy_enabled"),
+            policy.enabled.to_string(),
+        ),
+        (
+            String::from("retry_max_attempts"),
+            policy.max_attempts.to_string(),
+        ),
+        (
+            String::from("retry_anti_loop_hint_enabled"),
+            policy.anti_loop_hint_enabled.to_string(),
+        ),
+        (
+            String::from("retry_attempt_count"),
+            attempts.len().to_string(),
+        ),
+        (
+            String::from("retry_final_outcome"),
+            final_outcome.to_owned(),
+        ),
+        (
+            String::from("retry_attempt_chain"),
+            attempt_chain_summary(attempts),
+        ),
+    ])
+}
+
+fn attempt_chain_summary(attempts: &[AttemptRecord]) -> String {
+    if attempts.is_empty() {
+        return String::from("none");
+    }
+    attempts
+        .iter()
+        .map(|attempt| {
+            format!(
+                "{}:{}:{}:{}",
+                attempt.attempt_number,
+                attempt.status.as_str(),
+                attempt.abort_reason.as_deref().unwrap_or("none"),
+                attempt.retry_reason.as_deref().unwrap_or("none")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 enum BodyCompletion {
     Succeeded,
     UpstreamStreamError(String),
+    UpstreamStatusError(String),
     DownstreamDropped,
 }
 
@@ -977,7 +2384,7 @@ impl BodyCompletion {
     const fn request_status(&self) -> RequestStatus {
         match self {
             Self::Succeeded => RequestStatus::Succeeded,
-            Self::UpstreamStreamError(_) => RequestStatus::Failed,
+            Self::UpstreamStreamError(_) | Self::UpstreamStatusError(_) => RequestStatus::Failed,
             Self::DownstreamDropped => RequestStatus::Aborted,
         }
     }
@@ -985,7 +2392,7 @@ impl BodyCompletion {
     const fn attempt_status(&self) -> AttemptStatus {
         match self {
             Self::Succeeded => AttemptStatus::Succeeded,
-            Self::UpstreamStreamError(_) => AttemptStatus::Failed,
+            Self::UpstreamStreamError(_) | Self::UpstreamStatusError(_) => AttemptStatus::Failed,
             Self::DownstreamDropped => AttemptStatus::Aborted,
         }
     }
@@ -993,6 +2400,7 @@ impl BodyCompletion {
     fn error_reason(&self) -> Option<String> {
         match self {
             Self::UpstreamStreamError(error) => Some(format!("upstream_stream_error: {error}")),
+            Self::UpstreamStatusError(error) => Some(format!("upstream_status_error: {error}")),
             Self::Succeeded | Self::DownstreamDropped => None,
         }
     }
@@ -1000,7 +2408,7 @@ impl BodyCompletion {
     fn abort_reason(&self) -> Option<String> {
         match self {
             Self::DownstreamDropped => Some(String::from("downstream_body_dropped_before_eof")),
-            Self::Succeeded | Self::UpstreamStreamError(_) => None,
+            Self::Succeeded | Self::UpstreamStreamError(_) | Self::UpstreamStatusError(_) => None,
         }
     }
 }
@@ -1010,6 +2418,7 @@ struct ObservedUpstreamBody {
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: OwnedSemaphorePermit,
     bytes_seen: u64,
+    terminal_completion: BodyCompletion,
 }
 
 impl ObservedUpstreamBody {
@@ -1018,11 +2427,26 @@ impl ObservedUpstreamBody {
         observer: ForwardedBodyObserver,
         in_flight_permit: OwnedSemaphorePermit,
     ) -> Self {
+        Self::new_with_completion(
+            stream,
+            observer,
+            in_flight_permit,
+            BodyCompletion::Succeeded,
+        )
+    }
+
+    fn new_with_completion(
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        observer: ForwardedBodyObserver,
+        in_flight_permit: OwnedSemaphorePermit,
+        terminal_completion: BodyCompletion,
+    ) -> Self {
         Self {
             inner: Box::pin(stream),
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
             bytes_seen: 0,
+            terminal_completion,
         }
     }
 
@@ -1051,7 +2475,9 @@ impl Stream for ObservedUpstreamBody {
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
-                this.record_once(&BodyCompletion::Succeeded);
+                let completion =
+                    std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded);
+                this.record_once(&completion);
                 Poll::Ready(None)
             }
             Poll::Pending => Poll::Pending,
@@ -1070,6 +2496,7 @@ struct ObservedBufferedBody {
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: OwnedSemaphorePermit,
     bytes_seen: u64,
+    terminal_completion: BodyCompletion,
 }
 
 impl ObservedBufferedBody {
@@ -1078,11 +2505,21 @@ impl ObservedBufferedBody {
         observer: ForwardedBodyObserver,
         in_flight_permit: OwnedSemaphorePermit,
     ) -> Self {
+        Self::new_with_completion(body, observer, in_flight_permit, BodyCompletion::Succeeded)
+    }
+
+    fn new_with_completion(
+        body: Bytes,
+        observer: ForwardedBodyObserver,
+        in_flight_permit: OwnedSemaphorePermit,
+        terminal_completion: BodyCompletion,
+    ) -> Self {
         Self {
             body: (!body.is_empty()).then_some(body),
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
             bytes_seen: 0,
+            terminal_completion,
         }
     }
 
@@ -1101,10 +2538,15 @@ impl Stream for ObservedBufferedBody {
         if let Some(body) = this.body.take() {
             let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
             this.bytes_seen = this.bytes_seen.saturating_add(body_len);
+            let completion =
+                std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded);
+            this.record_once(&completion);
             return Poll::Ready(Some(Ok(body)));
         }
 
-        this.record_once(&BodyCompletion::Succeeded);
+        let completion =
+            std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded);
+        this.record_once(&completion);
         Poll::Ready(None)
     }
 }
@@ -1115,16 +2557,8 @@ impl Drop for ObservedBufferedBody {
     }
 }
 
-type ShieldedAggregateFuture = Pin<
-    Box<
-        dyn Future<
-                Output = Result<
-                    shielded_chat::AggregatedChatCompletion,
-                    shielded_chat::AggregationError,
-                >,
-            > + Send,
-    >,
->;
+type ShieldedAggregateFuture =
+    Pin<Box<dyn Future<Output = Result<ShieldedAcceptedOutcome, ShieldedFailureOutcome>> + Send>>;
 
 struct ShieldedLivenessBody {
     aggregate: ShieldedAggregateFuture,
@@ -1179,8 +2613,8 @@ impl ShieldedLivenessBody {
         }
     }
 
-    fn error_chunk(&self, error: &str) -> Bytes {
-        let body = proxy_error_json_body("upstream_body_error", error);
+    fn error_chunk(&self, error_type: &str, error: &str) -> Bytes {
+        let body = proxy_error_json_body(error_type, error);
         match self.mode {
             ShieldedLivenessMode::Sse => sse_error_frame(&body),
             ShieldedLivenessMode::JsonWhitespace | ShieldedLivenessMode::Disabled => body,
@@ -1204,25 +2638,38 @@ impl Stream for ShieldedLivenessBody {
         }
 
         match this.aggregate.as_mut().poll(cx) {
-            Poll::Ready(Ok(aggregated)) => {
-                let chunk = this.accepted_chunk(&aggregated.body);
+            Poll::Ready(Ok(outcome)) => {
+                let chunk = this.accepted_chunk(&outcome.body);
                 if let Some(observer) = &mut this.observer {
+                    observer.completed_attempt_records = outcome.prior_attempt_records;
                     observer
                         .extra_response_metadata
-                        .extend(aggregated.response_metadata);
-                    observer.raw_payloads = aggregated.raw_payloads;
+                        .extend(outcome.response_metadata.clone());
+                    observer.raw_payloads = outcome.raw_payloads.clone();
+                    let mut final_attempt = outcome.final_attempt;
+                    final_attempt
+                        .extra_response_metadata
+                        .extend(observer.extra_response_metadata.clone());
+                    final_attempt.raw_payloads = outcome.raw_payloads;
+                    observer.final_attempt = Some(final_attempt);
                 }
                 this.terminal_completion = Some(BodyCompletion::Succeeded);
                 return this.count_and_emit(chunk);
             }
-            Poll::Ready(Err(error)) => {
+            Poll::Ready(Err(failure)) => {
+                let forwarded_final_attempt = failure
+                    .forwarded_response
+                    .map(|forwarded| forwarded.final_attempt);
                 if let Some(observer) = &mut this.observer {
+                    observer.completed_attempt_records = failure.attempt_records;
                     observer
                         .extra_response_metadata
-                        .extend(error.response_metadata().clone());
+                        .extend(failure.response_metadata);
+                    observer.final_attempt = forwarded_final_attempt;
                 }
-                let error_message = error.to_string();
-                let chunk = this.error_chunk(&error_message);
+                let error_type = failure.error_type;
+                let error_message = failure.error_message;
+                let chunk = this.error_chunk(error_type, &error_message);
                 this.terminal_completion = Some(BodyCompletion::UpstreamStreamError(error_message));
                 return this.count_and_emit(chunk);
             }
@@ -1982,11 +3429,20 @@ fn record_observability(
     request: &RequestRecord,
     attempt: Option<&AttemptRecord>,
 ) {
+    let attempts = attempt.into_iter().cloned().collect::<Vec<_>>();
+    record_observability_many(store, request, &attempts);
+}
+
+fn record_observability_many(
+    store: &ObservabilityStore,
+    request: &RequestRecord,
+    attempts: &[AttemptRecord],
+) {
     if let Err(error) = store.record_request(request) {
         eprintln!("failed to write request observability: {error}");
         return;
     }
-    if let Some(attempt) = attempt {
+    for attempt in attempts {
         if let Err(error) = store.record_attempt(attempt) {
             eprintln!("failed to write attempt observability: {error}");
         }

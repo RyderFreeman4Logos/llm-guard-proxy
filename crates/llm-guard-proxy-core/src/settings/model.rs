@@ -491,6 +491,8 @@ pub struct RetryConfig {
     pub enabled: bool,
     /// Total upstream attempts, including the first attempt.
     pub max_attempts: u32,
+    /// Adds a bounded deterministic anti-loop hint to retries after loop aborts.
+    pub anti_loop_hint_enabled: bool,
 }
 
 impl RetryConfig {
@@ -499,6 +501,11 @@ impl RetryConfig {
             self.max_attempts > 0,
             "retry.max_attempts",
             "must be greater than zero",
+        )?;
+        require(
+            self.max_attempts <= 10,
+            "retry.max_attempts",
+            "must be less than or equal to 10",
         )
     }
 }
@@ -507,7 +514,8 @@ impl Default for RetryConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            max_attempts: 2,
+            max_attempts: 5,
+            anti_loop_hint_enabled: true,
         }
     }
 }

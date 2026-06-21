@@ -361,6 +361,9 @@ fn assign_retry(
         "max_attempts" => {
             config.max_attempts = parse_u32(value, line_number, "retry.max_attempts")?;
         }
+        "anti_loop_hint_enabled" => {
+            config.anti_loop_hint_enabled = parse_bool(value, line_number)?;
+        }
         _ => return unknown_key("retry", key, line_number),
     }
     Ok(())
