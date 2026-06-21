@@ -289,19 +289,43 @@ PY
 }
 
 validate_chat_response() {
-    python3 - "$1" <<'PY'
+    python3 - "$1" "$2" <<'PY'
 import json
 import sys
+from pathlib import Path
 
-with open(sys.argv[1], "r", encoding="utf-8") as handle:
-    payload = json.load(handle)
+headers_path, body_path = sys.argv[1:]
+headers = Path(headers_path).read_text(encoding="utf-8", errors="replace").lower()
+body = Path(body_path).read_bytes()
+
+def final_payload_from_sse(raw_body):
+    text = raw_body.decode("utf-8")
+    for event in text.split("\n\n"):
+        event_name = ""
+        data_lines = []
+        for line in event.splitlines():
+            line = line.rstrip("\r")
+            if line.startswith("event:"):
+                event_name = line.removeprefix("event:").strip()
+            elif line.startswith("data:"):
+                data_lines.append(line.removeprefix("data:").lstrip())
+        if event_name == "final":
+            return json.loads("\n".join(data_lines))
+    raise SystemExit("/v1/chat/completions SSE response did not include a final event")
+
+if "text/event-stream" in headers:
+    payload = final_payload_from_sse(body)
+    downstream = "sse-final"
+else:
+    payload = json.loads(body.decode("utf-8"))
+    downstream = "json"
 
 if not isinstance(payload, dict):
     raise SystemExit("/v1/chat/completions response is not a JSON object")
 choices = payload.get("choices")
 if not isinstance(choices, list) or not choices:
     raise SystemExit("/v1/chat/completions response must include non-empty choices")
-print(f"choices={len(choices)}")
+print(f"downstream={downstream} choices={len(choices)}")
 PY
 }
 
@@ -522,7 +546,7 @@ chat_body="${run_dir}/chat.body.json"
 chat_headers="${run_dir}/chat.headers"
 chat_status="$(http_request POST "${base_url}/v1/chat/completions" "${chat_payload}" "${chat_body}" "${chat_headers}" "chat")"
 require_http_status "POST /v1/chat/completions" "${chat_status}" "200"
-chat_summary="$(validate_chat_response "${chat_body}")"
+chat_summary="$(validate_chat_response "${chat_headers}" "${chat_body}")"
 forwarded_calls=$((forwarded_calls + 1))
 printf 'smoke-gb10: endpoint=/v1/chat/completions mode=non_stream status=%s %s\n' \
     "${chat_status}" "${chat_summary}"

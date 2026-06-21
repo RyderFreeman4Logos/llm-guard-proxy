@@ -1,10 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher},
     convert::Infallible,
     fmt,
+    future::Future,
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -23,21 +25,24 @@ use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DownstreamMode, Health,
-    LICENSE, MetadataConfig, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
-    RequestStatus, SERVICE_NAME, UpstreamMode, redact_upstream_base_url,
+    HeartbeatMode, LICENSE, MetadataConfig, ObservabilityStore, RawPayloads, RequestId,
+    RequestRecord, RequestStatus, SERVICE_NAME, UpstreamMode, redact_upstream_base_url,
     validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::time::{Instant, Interval, MissedTickBehavior};
 
 mod model_metadata;
 mod shielded_chat;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REPEAT_FINGERPRINT_ENTRIES: usize = 1024;
 const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 120;
 const HEADER_VALUE_NOT_UTF8: &str = "[non-utf8]";
+const HEADER_VALUE_REDACTED: &str = "[redacted]";
 
 /// Shared HTTP proxy state.
 #[derive(Clone, Debug)]
@@ -47,6 +52,7 @@ pub(crate) struct ProxyState {
     store: ObservabilityStore,
     client: Client,
     in_flight_requests: Arc<Semaphore>,
+    repeat_inputs: Arc<RepeatInputCache>,
     max_in_flight_requests: usize,
 }
 
@@ -66,6 +72,7 @@ impl ProxyState {
             store,
             client,
             in_flight_requests: Arc::new(Semaphore::new(max_in_flight_requests)),
+            repeat_inputs: Arc::new(RepeatInputCache::default()),
             max_in_flight_requests,
         }
     }
@@ -77,6 +84,88 @@ impl ProxyState {
             .map_err(|_error| InFlightLimitExceeded {
                 max_in_flight_requests: self.max_in_flight_requests,
             })
+    }
+}
+
+#[derive(Debug, Default)]
+struct RepeatInputCache {
+    entries: Mutex<HashMap<String, RepeatInputEntry>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RepeatInputEntry {
+    count: u32,
+    last_seen_unix_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RepeatInputObservation {
+    repeated: bool,
+    prior_count: u32,
+}
+
+impl RepeatInputCache {
+    fn observe(
+        &self,
+        fingerprint: &str,
+        now_unix_ms: u64,
+        window_secs: u64,
+        max_repeated_inputs: u32,
+    ) -> RepeatInputObservation {
+        let window_ms = window_secs.saturating_mul(1_000);
+        let mut entries = repeat_input_entries(&self.entries);
+        entries.retain(|_fingerprint, entry| {
+            now_unix_ms.saturating_sub(entry.last_seen_unix_ms) <= window_ms
+        });
+
+        let observation = {
+            let entry = entries
+                .entry(fingerprint.to_owned())
+                .or_insert(RepeatInputEntry {
+                    count: 0,
+                    last_seen_unix_ms: now_unix_ms,
+                });
+            let prior_count = if now_unix_ms.saturating_sub(entry.last_seen_unix_ms) <= window_ms {
+                entry.count
+            } else {
+                0
+            };
+            entry.count = prior_count.saturating_add(1);
+            entry.last_seen_unix_ms = now_unix_ms;
+
+            RepeatInputObservation {
+                repeated: prior_count >= max_repeated_inputs,
+                prior_count,
+            }
+        };
+
+        prune_repeat_input_entries(&mut entries);
+        observation
+    }
+}
+
+fn repeat_input_entries(
+    entries: &Mutex<HashMap<String, RepeatInputEntry>>,
+) -> MutexGuard<'_, HashMap<String, RepeatInputEntry>> {
+    match entries.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn prune_repeat_input_entries(entries: &mut HashMap<String, RepeatInputEntry>) {
+    if entries.len() <= MAX_REPEAT_FINGERPRINT_ENTRIES {
+        return;
+    }
+
+    let remove_count = entries.len().saturating_sub(MAX_REPEAT_FINGERPRINT_ENTRIES);
+    let mut oldest_entries = entries
+        .iter()
+        .map(|(fingerprint, entry)| (fingerprint.clone(), entry.last_seen_unix_ms))
+        .collect::<Vec<_>>();
+    oldest_entries.sort_by_key(|(_fingerprint, last_seen_unix_ms)| *last_seen_unix_ms);
+    for (fingerprint, _last_seen_unix_ms) in oldest_entries.into_iter().take(remove_count) {
+        entries.remove(&fingerprint);
     }
 }
 
@@ -261,30 +350,27 @@ async fn forward_openai_request(
     let reqwest_method = upstream_method(&method)
         .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     let model_id = extract_model_id(&body);
-    let shielded_chat_request = if should_intercept_non_stream_chat(&method, &uri, &config) {
-        shielded_chat::prepare_non_stream_request(&body)
-    } else {
-        None
-    };
-    let upstream_body = shielded_chat_request.as_ref().map_or_else(
-        || body.clone(),
-        shielded_chat::PreparedChatRequest::upstream_body,
+    let shielded_chat_plan = plan_shielded_chat(state, &config, &method, &uri, &body);
+    add_shielded_request_metadata(
+        &mut request_metadata,
+        shielded_chat_plan.intercepted,
+        &shielded_chat_plan.liveness,
     );
-    if shielded_chat_request.is_some() {
-        add_shielded_chat_request_metadata(&mut request_metadata);
-    }
     let attempt_id = AttemptId::for_request(request_id, 1);
     let attempt_started_at_unix_ms = unix_time_millis();
     let mut attempt_request_metadata = attempt_request_metadata(&method, &uri, &downstream_headers);
-    if shielded_chat_request.is_some() {
-        add_shielded_chat_request_metadata(&mut attempt_request_metadata);
-    }
+    add_shielded_request_metadata(
+        &mut attempt_request_metadata,
+        shielded_chat_plan.intercepted,
+        &shielded_chat_plan.liveness,
+    );
+    let shielded_chat_intercepted = shielded_chat_plan.intercepted;
     let upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
         client: &state.client,
         method: reqwest_method,
         upstream_url,
         downstream_headers: &downstream_headers,
-        upstream_body,
+        upstream_body: shielded_chat_plan.upstream_body,
         attempt_id: attempt_id.clone(),
         request_id,
         attempt_started_at_unix_ms,
@@ -303,6 +389,7 @@ async fn forward_openai_request(
         attempt_started_at_unix_ms,
         upstream_mode,
         model_id,
+        input_fingerprint: shielded_chat_plan.liveness.input_fingerprint.clone(),
         upstream_status,
         upstream_headers: upstream_headers.clone(),
         request_metadata,
@@ -313,7 +400,8 @@ async fn forward_openai_request(
             method: &method,
             uri: &uri,
             config: &config,
-            shielded_chat: shielded_chat_request.is_some(),
+            shielded_chat: shielded_chat_intercepted,
+            liveness: shielded_chat_plan.liveness,
         },
         response_parts,
         upstream_response,
@@ -370,6 +458,73 @@ struct ResponseDispatch<'request> {
     uri: &'request Uri,
     config: &'request AppConfig,
     shielded_chat: bool,
+    liveness: ShieldedLivenessSelection,
+}
+
+struct ShieldedChatPlan {
+    upstream_body: Bytes,
+    intercepted: bool,
+    liveness: ShieldedLivenessSelection,
+}
+
+fn plan_shielded_chat(
+    state: &ProxyState,
+    config: &AppConfig,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+) -> ShieldedChatPlan {
+    let request = if should_intercept_non_stream_chat(method, uri, config) {
+        shielded_chat::prepare_non_stream_request(body)
+    } else {
+        None
+    };
+    let upstream_body = request.as_ref().map_or_else(
+        || body.clone(),
+        shielded_chat::PreparedChatRequest::upstream_body,
+    );
+    let intercepted = request.is_some();
+    let liveness = select_shielded_liveness(state, config, body, intercepted, unix_time_millis());
+
+    ShieldedChatPlan {
+        upstream_body,
+        intercepted,
+        liveness,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShieldedLivenessSelection {
+    mode: ShieldedLivenessMode,
+    heartbeat_interval_secs: u64,
+    input_fingerprint: Option<String>,
+    repeat_observation: RepeatInputObservation,
+    repeat_window_secs: u64,
+    repeat_max_inputs: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShieldedLivenessMode {
+    Sse,
+    JsonWhitespace,
+    Disabled,
+}
+
+impl ShieldedLivenessMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sse => "sse",
+            Self::JsonWhitespace => "json-whitespace",
+            Self::Disabled => "disabled",
+        }
+    }
+
+    const fn downstream_mode(self) -> DownstreamMode {
+        match self {
+            Self::Sse => DownstreamMode::Streaming,
+            Self::JsonWhitespace | Self::Disabled => DownstreamMode::NonStreamJson,
+        }
+    }
 }
 
 async fn forward_upstream_response(
@@ -391,8 +546,13 @@ async fn forward_upstream_response(
     }
     if dispatch.shielded_chat && upstream_status.is_success() && is_event_stream(&upstream_headers)
     {
-        return forward_shielded_chat_response(response_parts, upstream_response, in_flight_permit)
-            .await;
+        return forward_shielded_chat_response(
+            response_parts,
+            upstream_response,
+            in_flight_permit,
+            &dispatch.liveness,
+        )
+        .await;
     }
     if dispatch.shielded_chat && upstream_status.is_success() {
         return Err(
@@ -540,6 +700,7 @@ struct ForwardedResponseParts {
     attempt_started_at_unix_ms: u64,
     upstream_mode: UpstreamMode,
     model_id: Option<String>,
+    input_fingerprint: Option<String>,
     upstream_status: reqwest::StatusCode,
     upstream_headers: HeaderMap,
     request_metadata: BTreeMap<String, String>,
@@ -567,6 +728,7 @@ impl ForwardedResponseParts {
             attempt_started_at_unix_ms: self.attempt_started_at_unix_ms,
             upstream_mode: self.upstream_mode,
             model_id: self.model_id,
+            input_fingerprint: self.input_fingerprint,
             upstream_status: self.upstream_status,
             upstream_headers: self.upstream_headers,
             request_metadata: self.request_metadata,
@@ -619,6 +781,7 @@ async fn forward_shielded_chat_response(
     response_parts: ForwardedResponseParts,
     upstream_response: reqwest::Response,
     in_flight_permit: OwnedSemaphorePermit,
+    liveness: &ShieldedLivenessSelection,
 ) -> Result<Response<Body>, ProxyError> {
     let request_id = response_parts.request_id.as_str().to_owned();
     let request_model_id = response_parts.model_id.clone();
@@ -626,6 +789,40 @@ async fn forward_shielded_chat_response(
         .upstream_headers
         .get(CONTENT_TYPE)
         .map(header_value);
+    if liveness.mode != ShieldedLivenessMode::Disabled {
+        let upstream_status = response_parts.upstream_status;
+        let response_headers =
+            shielded_chat_stream_response_headers(&response_parts.upstream_headers, liveness.mode);
+        let extra_metadata = shielded_liveness_response_metadata(liveness, upstream_content_type);
+        let aggregate = Box::pin(async move {
+            shielded_chat::aggregate_stream(
+                upstream_response.bytes_stream(),
+                response_parts.attempt_started_at_unix_ms,
+                &request_id,
+                request_model_id.as_deref(),
+            )
+            .await
+        });
+        let observer = response_parts.into_observer_with(
+            liveness.mode.downstream_mode(),
+            extra_metadata,
+            RawPayloads::default(),
+        );
+        let response_body = ShieldedLivenessBody::new(
+            aggregate,
+            liveness.mode,
+            liveness.heartbeat_interval_secs,
+            observer,
+            in_flight_permit,
+        );
+
+        return Ok(response_with_headers(
+            upstream_status,
+            response_headers,
+            Body::from_stream(response_body),
+        ));
+    }
+
     let aggregated = match shielded_chat::aggregate_stream(
         upstream_response.bytes_stream(),
         response_parts.attempt_started_at_unix_ms,
@@ -645,6 +842,10 @@ async fn forward_shielded_chat_response(
     let response_headers =
         shielded_chat_response_headers(&response_parts.upstream_headers, body_len);
     let mut extra_metadata = aggregated.response_metadata;
+    extra_metadata.extend(shielded_liveness_response_metadata(
+        liveness,
+        upstream_content_type.clone(),
+    ));
     if let Some(content_type) = upstream_content_type {
         extra_metadata.insert(
             String::from("upstream_response_header_content-type"),
@@ -674,6 +875,7 @@ struct ForwardedBodyObserver {
     downstream_mode: DownstreamMode,
     upstream_mode: UpstreamMode,
     model_id: Option<String>,
+    input_fingerprint: Option<String>,
     upstream_status: reqwest::StatusCode,
     upstream_headers: HeaderMap,
     request_metadata: BTreeMap<String, String>,
@@ -701,7 +903,7 @@ impl ForwardedBodyObserver {
             downstream_mode: self.downstream_mode,
             upstream_mode: self.upstream_mode,
             model_id: self.model_id,
-            input_fingerprint: None,
+            input_fingerprint: self.input_fingerprint,
             status: completion.request_status(),
             http_status: Some(self.upstream_status.as_u16()),
             error_reason: completion.error_reason(),
@@ -878,6 +1080,123 @@ impl Drop for ObservedBufferedBody {
     }
 }
 
+type ShieldedAggregateFuture =
+    Pin<Box<dyn Future<Output = Result<shielded_chat::AggregatedChatCompletion, String>> + Send>>;
+
+struct ShieldedLivenessBody {
+    aggregate: ShieldedAggregateFuture,
+    interval: Interval,
+    mode: ShieldedLivenessMode,
+    observer: Option<ForwardedBodyObserver>,
+    _in_flight_permit: OwnedSemaphorePermit,
+    bytes_seen: u64,
+    terminal_completion: Option<BodyCompletion>,
+    json_prefix_pending: bool,
+}
+
+impl ShieldedLivenessBody {
+    fn new(
+        aggregate: ShieldedAggregateFuture,
+        mode: ShieldedLivenessMode,
+        interval_secs: u64,
+        observer: ForwardedBodyObserver,
+        in_flight_permit: OwnedSemaphorePermit,
+    ) -> Self {
+        let period = Duration::from_secs(interval_secs);
+        let mut interval = tokio::time::interval_at(Instant::now() + period, period);
+        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        Self {
+            aggregate,
+            interval,
+            mode,
+            observer: Some(observer),
+            _in_flight_permit: in_flight_permit,
+            bytes_seen: 0,
+            terminal_completion: None,
+            json_prefix_pending: mode == ShieldedLivenessMode::JsonWhitespace,
+        }
+    }
+
+    fn record_once(&mut self, completion: &BodyCompletion) {
+        if let Some(observer) = self.observer.take() {
+            observer.record(self.bytes_seen, completion);
+        }
+    }
+
+    fn count_and_emit(&mut self, bytes: Bytes) -> Poll<Option<Result<Bytes, Infallible>>> {
+        let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+        self.bytes_seen = self.bytes_seen.saturating_add(chunk_len);
+        Poll::Ready(Some(Ok(bytes)))
+    }
+
+    fn accepted_chunk(&self, body: &Bytes) -> Bytes {
+        match self.mode {
+            ShieldedLivenessMode::Sse => sse_final_frame(body),
+            ShieldedLivenessMode::JsonWhitespace | ShieldedLivenessMode::Disabled => body.clone(),
+        }
+    }
+
+    fn error_chunk(&self, error: &str) -> Bytes {
+        let body = proxy_error_json_body("upstream_body_error", error);
+        match self.mode {
+            ShieldedLivenessMode::Sse => sse_error_frame(&body),
+            ShieldedLivenessMode::JsonWhitespace | ShieldedLivenessMode::Disabled => body,
+        }
+    }
+}
+
+impl Stream for ShieldedLivenessBody {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let Some(completion) = this.terminal_completion.take() {
+            this.record_once(&completion);
+            return Poll::Ready(None);
+        }
+
+        if this.json_prefix_pending {
+            this.json_prefix_pending = false;
+            return this.count_and_emit(json_whitespace_heartbeat());
+        }
+
+        match this.aggregate.as_mut().poll(cx) {
+            Poll::Ready(Ok(aggregated)) => {
+                let chunk = this.accepted_chunk(&aggregated.body);
+                if let Some(observer) = &mut this.observer {
+                    observer
+                        .extra_response_metadata
+                        .extend(aggregated.response_metadata);
+                    observer.raw_payloads = aggregated.raw_payloads;
+                }
+                this.terminal_completion = Some(BodyCompletion::Succeeded);
+                return this.count_and_emit(chunk);
+            }
+            Poll::Ready(Err(error)) => {
+                let chunk = this.error_chunk(&error);
+                this.terminal_completion = Some(BodyCompletion::UpstreamStreamError(error));
+                return this.count_and_emit(chunk);
+            }
+            Poll::Pending => {}
+        }
+
+        match Pin::new(&mut this.interval).poll_tick(cx) {
+            Poll::Ready(_instant) => this.count_and_emit(heartbeat_chunk(this.mode)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for ShieldedLivenessBody {
+    fn drop(&mut self) {
+        if let Some(completion) = self.terminal_completion.take() {
+            self.record_once(&completion);
+        } else {
+            self.record_once(&BodyCompletion::DownstreamDropped);
+        }
+    }
+}
+
 fn build_upstream_url(base_url: &str, uri: &Uri) -> Result<Url, ProxyError> {
     validate_openai_path(uri.path())?;
     validate_upstream_base_url(base_url)
@@ -948,6 +1267,70 @@ fn shielded_chat_response_headers(upstream_headers: &HeaderMap, body_len: usize)
         headers.insert(CONTENT_LENGTH, content_length);
     }
     headers
+}
+
+fn shielded_chat_stream_response_headers(
+    upstream_headers: &HeaderMap,
+    mode: ShieldedLivenessMode,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    copy_response_headers(upstream_headers, &mut headers);
+    let content_type = match mode {
+        ShieldedLivenessMode::Sse => "text/event-stream",
+        ShieldedLivenessMode::JsonWhitespace | ShieldedLivenessMode::Disabled => "application/json",
+    };
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    headers.insert(
+        HeaderName::from_static("cache-control"),
+        HeaderValue::from_static("no-cache"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
+    );
+    headers
+}
+
+fn heartbeat_chunk(mode: ShieldedLivenessMode) -> Bytes {
+    match mode {
+        ShieldedLivenessMode::Sse => Bytes::from_static(b": llm-guard-proxy heartbeat\n\n"),
+        ShieldedLivenessMode::JsonWhitespace => json_whitespace_heartbeat(),
+        ShieldedLivenessMode::Disabled => Bytes::new(),
+    }
+}
+
+fn json_whitespace_heartbeat() -> Bytes {
+    Bytes::from_static(b" \n")
+}
+
+fn sse_final_frame(body: &Bytes) -> Bytes {
+    let mut frame = BytesMut::with_capacity(body.len().saturating_add(20));
+    frame.extend_from_slice(b"event: final\n");
+    frame.extend_from_slice(b"data: ");
+    frame.extend_from_slice(body);
+    frame.extend_from_slice(b"\n\n");
+    frame.freeze()
+}
+
+fn sse_error_frame(body: &Bytes) -> Bytes {
+    let mut frame = BytesMut::with_capacity(body.len().saturating_add(20));
+    frame.extend_from_slice(b"event: error\n");
+    frame.extend_from_slice(b"data: ");
+    frame.extend_from_slice(body);
+    frame.extend_from_slice(b"\n\n");
+    frame.freeze()
+}
+
+fn proxy_error_json_body(error_type: &str, message: &str) -> Bytes {
+    Bytes::from(
+        json!({
+            "error": {
+                "type": error_type,
+                "message": message,
+            }
+        })
+        .to_string(),
+    )
 }
 
 fn forwarded_request_headers(headers: &HeaderMap) -> HeaderMap {
@@ -1067,12 +1450,124 @@ fn base_request_metadata(
     metadata
 }
 
+fn select_shielded_liveness(
+    state: &ProxyState,
+    config: &AppConfig,
+    body: &Bytes,
+    shielded_chat: bool,
+    now_unix_ms: u64,
+) -> ShieldedLivenessSelection {
+    let input_fingerprint = shielded_chat
+        .then(|| chat_input_fingerprint(body))
+        .flatten();
+    let repeat_observation = input_fingerprint
+        .as_deref()
+        .filter(|_fingerprint| config.loop_guard.enabled)
+        .map_or_else(RepeatInputObservation::default, |fingerprint| {
+            state.repeat_inputs.observe(
+                fingerprint,
+                now_unix_ms,
+                config.loop_guard.normalized_input_window_secs,
+                config.loop_guard.max_repeated_inputs,
+            )
+        });
+    let mode = match config.heartbeat.mode {
+        HeartbeatMode::Disabled => ShieldedLivenessMode::Disabled,
+        HeartbeatMode::JsonWhitespace => ShieldedLivenessMode::JsonWhitespace,
+        HeartbeatMode::Sse if repeat_observation.repeated => ShieldedLivenessMode::JsonWhitespace,
+        HeartbeatMode::Sse => ShieldedLivenessMode::Sse,
+    };
+
+    ShieldedLivenessSelection {
+        mode,
+        heartbeat_interval_secs: config.heartbeat.interval_secs,
+        input_fingerprint,
+        repeat_observation,
+        repeat_window_secs: config.loop_guard.normalized_input_window_secs,
+        repeat_max_inputs: config.loop_guard.max_repeated_inputs,
+    }
+}
+
+fn chat_input_fingerprint(body: &Bytes) -> Option<String> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let normalized = normalize_chat_fingerprint_value(value)?;
+    let serialized = serde_json::to_vec(&normalized).ok()?;
+    let mut hasher = DefaultHasher::new();
+    serialized.hash(&mut hasher);
+    Some(format!("siphash64:{:016x}", hasher.finish()))
+}
+
+fn normalize_chat_fingerprint_value(value: serde_json::Value) -> Option<serde_json::Value> {
+    let serde_json::Value::Object(object) = value else {
+        return None;
+    };
+    let mut normalized = serde_json::Map::new();
+    for (key, value) in object {
+        if key == "stream" || is_sensitive_fingerprint_key(&key) {
+            continue;
+        }
+        normalized.insert(key, sanitize_fingerprint_value(value));
+    }
+    Some(serde_json::Value::Object(normalized))
+}
+
+fn sanitize_fingerprint_value(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(object) => {
+            let mut sanitized = serde_json::Map::new();
+            for (key, value) in object {
+                if is_sensitive_fingerprint_key(&key) {
+                    continue;
+                }
+                sanitized.insert(key, sanitize_fingerprint_value(value));
+            }
+            serde_json::Value::Object(sanitized)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(sanitize_fingerprint_value).collect())
+        }
+        value => value,
+    }
+}
+
+fn is_sensitive_fingerprint_key(key: &str) -> bool {
+    let normalized = key
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<String>();
+    [
+        "authorization",
+        "apikey",
+        "accesskey",
+        "privatekey",
+        "secret",
+        "token",
+        "password",
+        "credential",
+        "bearer",
+    ]
+    .iter()
+    .any(|sensitive| normalized.contains(sensitive))
+}
+
 fn request_body_bytes_hint(headers: &HeaderMap) -> String {
     headers
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<u64>().ok())
         .map_or_else(|| String::from("unknown"), |bytes| bytes.to_string())
+}
+
+fn add_shielded_request_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    shielded_chat: bool,
+    liveness: &ShieldedLivenessSelection,
+) {
+    if shielded_chat {
+        add_shielded_chat_request_metadata(metadata);
+        add_shielded_liveness_request_metadata(metadata, liveness);
+    }
 }
 
 fn add_shielded_chat_request_metadata(metadata: &mut BTreeMap<String, String>) {
@@ -1082,6 +1577,64 @@ fn add_shielded_chat_request_metadata(metadata: &mut BTreeMap<String, String>) {
         String::from("policy_transform_applied"),
         String::from("true"),
     );
+}
+
+fn add_shielded_liveness_request_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    liveness: &ShieldedLivenessSelection,
+) {
+    metadata.extend(shielded_liveness_metadata(liveness));
+}
+
+fn shielded_liveness_response_metadata(
+    liveness: &ShieldedLivenessSelection,
+    upstream_content_type: Option<String>,
+) -> BTreeMap<String, String> {
+    let mut metadata = shielded_liveness_metadata(liveness);
+    metadata.insert(
+        String::from("shielded_downstream_streaming"),
+        (liveness.mode == ShieldedLivenessMode::Sse).to_string(),
+    );
+    if let Some(content_type) = upstream_content_type {
+        metadata.insert(
+            String::from("upstream_response_header_content-type"),
+            content_type,
+        );
+    }
+    metadata
+}
+
+fn shielded_liveness_metadata(liveness: &ShieldedLivenessSelection) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            String::from("downstream_liveness_mode"),
+            liveness.mode.as_str().to_owned(),
+        ),
+        (
+            String::from("heartbeat_interval_secs"),
+            liveness.heartbeat_interval_secs.to_string(),
+        ),
+        (
+            String::from("repeat_input_window_secs"),
+            liveness.repeat_window_secs.to_string(),
+        ),
+        (
+            String::from("repeat_input_max_repeated_inputs"),
+            liveness.repeat_max_inputs.to_string(),
+        ),
+        (
+            String::from("input_fingerprint_present"),
+            liveness.input_fingerprint.is_some().to_string(),
+        ),
+        (
+            String::from("repeat_input_matched"),
+            liveness.repeat_observation.repeated.to_string(),
+        ),
+        (
+            String::from("repeat_input_prior_count"),
+            liveness.repeat_observation.prior_count.to_string(),
+        ),
+    ])
 }
 
 fn attempt_request_metadata(
@@ -1157,10 +1710,17 @@ fn copy_selected_header_metadata(
         if let Some(value) = headers.get(&header) {
             metadata.insert(
                 format!("{prefix}_header_{}", header.as_str()),
-                header_value(value),
+                selected_header_metadata_value(&header, value),
             );
         }
     }
+}
+
+fn selected_header_metadata_value(name: &HeaderName, value: &HeaderValue) -> String {
+    if name == AUTHORIZATION || name.as_str() == "x-api-key" {
+        return String::from(HEADER_VALUE_REDACTED);
+    }
+    header_value(value)
 }
 
 fn header_value(value: &HeaderValue) -> String {
