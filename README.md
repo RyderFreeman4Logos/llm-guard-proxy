@@ -96,8 +96,9 @@ The shielded chat core is enabled by default for non-streaming chat completions:
 - Downstream non-stream chat requests are sent upstream with `stream=true`.
 - The default downstream response is `text/event-stream`. While the shielded upstream attempt is pending, the proxy emits comment heartbeats shaped as `: llm-guard-proxy heartbeat`. After the attempt is accepted, it emits `event: final` with the accepted OpenAI-compatible chat completion JSON in the `data:` field.
 - If the same normalized input fingerprint repeats within the loop-guard window, the downstream response switches to `application/json` with leading whitespace heartbeat bytes before the final JSON body. Standard JSON parsers accept the leading whitespace.
+- The same `[loop_guard]` section also inspects shielded upstream SSE deltas for loops in hidden reasoning fields, visible content, and tool-call argument fragments. Detected output loops abort the shielded attempt through the existing upstream-body error path and record only bounded hashes/counters in observability metadata by default.
 - `heartbeat.mode = "disabled"` keeps the legacy buffered JSON response for shielded non-stream chat completions.
-- Attempt observability records include first-byte latency, first-token latency, finish reason, and parsed content/reasoning/tool-call delta counters.
+- Attempt observability records include first-byte latency, first-token latency, finish reason, parsed content/reasoning/tool-call delta counters, and `loop_*` diagnostics when loop guard aborts a shielded attempt.
 - Downstream `stream=true` chat requests currently stay on the generic streaming path to preserve first-chunk timing and backpressure behavior while later issues add release-after-inspection streaming.
 - Set `[shielding] enabled = false` and hot reload the config to fall back to generic forwarding for rollback or compatibility testing.
 
@@ -156,6 +157,13 @@ preserve_answer_budget = true
 enabled = true
 normalized_input_window_secs = 120
 max_repeated_inputs = 1
+output_repeated_line_threshold = 24
+output_token_window_size = 12
+output_repeated_token_window_threshold = 32
+output_suffix_cycle_threshold = 32
+output_low_progress_min_bytes = 4096
+output_low_progress_unique_ratio_percent = 15
+input_overlap_threshold_multiplier = 4
 
 [retry]
 enabled = true
@@ -194,6 +202,13 @@ Reloadable fields:
 - `loop_guard.enabled`
 - `loop_guard.normalized_input_window_secs`
 - `loop_guard.max_repeated_inputs`
+- `loop_guard.output_repeated_line_threshold`
+- `loop_guard.output_token_window_size`
+- `loop_guard.output_repeated_token_window_threshold`
+- `loop_guard.output_suffix_cycle_threshold`
+- `loop_guard.output_low_progress_min_bytes`
+- `loop_guard.output_low_progress_unique_ratio_percent`
+- `loop_guard.input_overlap_threshold_multiplier`
 - `retry.enabled`
 - `retry.max_attempts`
 - `heartbeat.mode`

@@ -28,6 +28,18 @@ fn defaults_match_issue_contract() {
     assert!(config.thinking.enabled);
     assert_eq!(config.thinking.budget_tokens, 32_768);
     assert!(config.loop_guard.enabled);
+    assert_eq!(config.loop_guard.normalized_input_window_secs, 120);
+    assert_eq!(config.loop_guard.max_repeated_inputs, 1);
+    assert_eq!(config.loop_guard.output_repeated_line_threshold, 24);
+    assert_eq!(config.loop_guard.output_token_window_size, 12);
+    assert_eq!(config.loop_guard.output_repeated_token_window_threshold, 32);
+    assert_eq!(config.loop_guard.output_suffix_cycle_threshold, 32);
+    assert_eq!(config.loop_guard.output_low_progress_min_bytes, 4_096);
+    assert_eq!(
+        config.loop_guard.output_low_progress_unique_ratio_percent,
+        15
+    );
+    assert_eq!(config.loop_guard.input_overlap_threshold_multiplier, 4);
     assert!(config.retry.enabled);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
     assert!(config.cloudflare.enabled);
@@ -49,6 +61,15 @@ max_model_len_override = 256000
 mode = "json-whitespace"
 interval_secs = 5
 
+[loop_guard]
+output_repeated_line_threshold = 40
+output_token_window_size = 8
+output_repeated_token_window_threshold = 9
+output_suffix_cycle_threshold = 10
+output_low_progress_min_bytes = 2048
+output_low_progress_unique_ratio_percent = 25
+input_overlap_threshold_multiplier = 5
+
 [cloudflare]
 enabled = false
 "#,
@@ -69,6 +90,16 @@ enabled = false
     );
     assert_eq!(config.heartbeat.mode, HeartbeatMode::JsonWhitespace);
     assert_eq!(config.heartbeat.interval_secs, 5);
+    assert_eq!(config.loop_guard.output_repeated_line_threshold, 40);
+    assert_eq!(config.loop_guard.output_token_window_size, 8);
+    assert_eq!(config.loop_guard.output_repeated_token_window_threshold, 9);
+    assert_eq!(config.loop_guard.output_suffix_cycle_threshold, 10);
+    assert_eq!(config.loop_guard.output_low_progress_min_bytes, 2_048);
+    assert_eq!(
+        config.loop_guard.output_low_progress_unique_ratio_percent,
+        25
+    );
+    assert_eq!(config.loop_guard.input_overlap_threshold_multiplier, 5);
     assert!(!config.cloudflare.enabled);
 }
 
@@ -108,6 +139,20 @@ fn validates_server_in_flight_limit() {
         .expect_err("zero in-flight request limit should fail");
 
     assert_eq!(error.field(), "server.max_in_flight_requests");
+}
+
+#[test]
+fn validates_loop_guard_ratio_limit() {
+    let mut config = AppConfig::default();
+    config.loop_guard.output_low_progress_unique_ratio_percent = 101;
+
+    let error = config
+        .validate()
+        .expect_err("low-progress ratio should be bounded");
+    assert_eq!(
+        error.field(),
+        "loop_guard.output_low_progress_unique_ratio_percent"
+    );
 }
 
 #[test]
@@ -278,6 +323,9 @@ port = 18009
 [heartbeat]
 mode = "sse"
 interval_secs = 15
+
+[loop_guard]
+output_repeated_line_threshold = 24
 "#,
     );
     let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
@@ -291,6 +339,9 @@ port = 19000
 [heartbeat]
 mode = "disabled"
 interval_secs = 3
+
+[loop_guard]
+output_repeated_line_threshold = 7
 "#,
     );
     let outcome = manager.reload().expect("reload should succeed");
@@ -305,6 +356,7 @@ interval_secs = 3
     assert_eq!(snapshot.server.port, 18_009);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 3);
+    assert_eq!(snapshot.loop_guard.output_repeated_line_threshold, 7);
 
     remove_file(&path);
 }
@@ -365,6 +417,8 @@ interval_secs = 4
 #[test]
 fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"loop_guard.output_repeated_line_threshold"));
+    assert!(RELOADABLE_FIELDS.contains(&"loop_guard.input_overlap_threshold_multiplier"));
     assert!(RELOADABLE_FIELDS.contains(&"cloudflare.enabled"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
