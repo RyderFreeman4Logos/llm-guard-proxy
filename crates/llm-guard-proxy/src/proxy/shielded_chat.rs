@@ -8,6 +8,10 @@ use serde_json::{Map, Number, Value, json};
 
 use super::{MAX_PROXY_BODY_BYTES, sanitized_reqwest_error, unix_time_millis};
 
+mod loop_guard;
+pub(super) use loop_guard::{AggregationError, LoopInspectionContext};
+use loop_guard::{LoopChannel, LoopDetector, observe_fragment};
+
 /// Prepared upstream request body for shielded non-stream chat completion handling.
 pub(super) struct PreparedChatRequest {
     upstream_body: Bytes,
@@ -863,18 +867,19 @@ pub(super) async fn aggregate_stream(
     attempt_started_at_unix_ms: u64,
     request_id: &str,
     request_model_id: Option<&str>,
-) -> Result<AggregatedChatCompletion, String> {
+    loop_context: LoopInspectionContext,
+) -> Result<AggregatedChatCompletion, AggregationError> {
     let mut stream = Box::pin(stream);
     let mut buffer = BytesMut::new();
     let mut bytes_seen = 0_usize;
-    let mut state = ChatAggregation::new(attempt_started_at_unix_ms);
+    let mut state = ChatAggregation::new(attempt_started_at_unix_ms, &loop_context);
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|error| {
-            format!(
+            AggregationError::plain(format!(
                 "upstream SSE stream failed: {}",
                 sanitized_reqwest_error(&error)
-            )
+            ))
         })?;
         if state.first_byte_latency_ms.is_none() {
             state.first_byte_latency_ms =
@@ -882,11 +887,11 @@ pub(super) async fn aggregate_stream(
         }
         bytes_seen = bytes_seen
             .checked_add(chunk.len())
-            .ok_or_else(|| String::from("upstream SSE body is too large"))?;
+            .ok_or_else(|| AggregationError::plain("upstream SSE body is too large"))?;
         if bytes_seen > MAX_PROXY_BODY_BYTES {
-            return Err(format!(
+            return Err(AggregationError::plain(format!(
                 "upstream SSE body exceeded proxy limit: max_bytes={MAX_PROXY_BODY_BYTES}"
-            ));
+            )));
         }
         buffer.extend_from_slice(&chunk);
 
@@ -896,7 +901,7 @@ pub(super) async fn aggregate_stream(
     }
 
     if buffer.iter().any(|byte| !byte.is_ascii_whitespace()) {
-        return Err(String::from(
+        return Err(AggregationError::plain(
             "upstream SSE ended with an unterminated event",
         ));
     }
@@ -933,6 +938,7 @@ fn next_sse_event(buffer: &mut BytesMut) -> Option<Vec<u8>> {
 #[derive(Default)]
 struct ChatAggregation {
     attempt_started_at_unix_ms: u64,
+    loop_detector: Option<LoopDetector>,
     id: Option<String>,
     created: Option<u64>,
     model: Option<String>,
@@ -949,16 +955,18 @@ struct ChatAggregation {
 }
 
 impl ChatAggregation {
-    fn new(attempt_started_at_unix_ms: u64) -> Self {
+    fn new(attempt_started_at_unix_ms: u64, loop_context: &LoopInspectionContext) -> Self {
         Self {
             attempt_started_at_unix_ms,
+            loop_detector: loop_context.detector(),
             ..Self::default()
         }
     }
 
-    fn apply_event(&mut self, event: &[u8]) -> Result<(), String> {
-        let event = std::str::from_utf8(event)
-            .map_err(|error| format!("upstream SSE event was not valid UTF-8: {error}"))?;
+    fn apply_event(&mut self, event: &[u8]) -> Result<(), AggregationError> {
+        let event = std::str::from_utf8(event).map_err(|error| {
+            AggregationError::plain(format!("upstream SSE event was not valid UTF-8: {error}"))
+        })?;
         let data = sse_data(event);
         if data.is_empty() {
             return Ok(());
@@ -968,15 +976,16 @@ impl ChatAggregation {
             return Ok(());
         }
 
-        let chunk = serde_json::from_str::<Value>(&data)
-            .map_err(|error| format!("upstream SSE data was not valid JSON: {error}"))?;
-        self.apply_chunk(&chunk);
+        let chunk = serde_json::from_str::<Value>(&data).map_err(|error| {
+            AggregationError::plain(format!("upstream SSE data was not valid JSON: {error}"))
+        })?;
+        self.apply_chunk(&chunk)?;
         Ok(())
     }
 
-    fn apply_chunk(&mut self, chunk: &Value) {
+    fn apply_chunk(&mut self, chunk: &Value) -> Result<(), AggregationError> {
         let Some(chunk_object) = chunk.as_object() else {
-            return;
+            return Ok(());
         };
         copy_extension_fields(
             chunk_object,
@@ -1006,7 +1015,7 @@ impl ChatAggregation {
         }
 
         let Some(choices) = chunk_object.get("choices").and_then(Value::as_array) else {
-            return;
+            return Ok(());
         };
 
         for choice in choices {
@@ -1041,23 +1050,26 @@ impl ChatAggregation {
                     &mut self.stats,
                     &mut self.first_token_latency_ms,
                     self.attempt_started_at_unix_ms,
-                );
+                    &mut self.loop_detector,
+                )?;
             }
         }
+        Ok(())
     }
 
     fn finish(
         self,
         request_id: &str,
         request_model_id: Option<&str>,
-    ) -> Result<AggregatedChatCompletion, String> {
+    ) -> Result<AggregatedChatCompletion, AggregationError> {
         self.ensure_usable()?;
         let response_metadata = response_metadata(&self);
         let completion_fields =
             CompletionFields::from_aggregation(&self, request_id, request_model_id);
         let finalized_choices = finalize_choices(self.choices);
         let raw_payloads = finalized_choices.raw_payloads();
-        let body = completion_body(completion_fields, finalized_choices.choices)?;
+        let body = completion_body(completion_fields, finalized_choices.choices)
+            .map_err(AggregationError::plain)?;
 
         Ok(AggregatedChatCompletion {
             body: Bytes::from(body),
@@ -1066,14 +1078,14 @@ impl ChatAggregation {
         })
     }
 
-    fn ensure_usable(&self) -> Result<(), String> {
+    fn ensure_usable(&self) -> Result<(), AggregationError> {
         if self.choices.is_empty() {
-            return Err(String::from(
+            return Err(AggregationError::plain(
                 "upstream SSE ended without chat completion choices",
             ));
         }
         if !self.saw_done && !self.saw_finish_reason {
-            return Err(String::from(
+            return Err(AggregationError::plain(
                 "upstream SSE ended before a final chat completion marker",
             ));
         }
@@ -1342,7 +1354,8 @@ impl ChoiceBuilder {
         stats: &mut DeltaStats,
         first_token_latency_ms: &mut Option<u64>,
         attempt_started_at_unix_ms: u64,
-    ) {
+        loop_detector: &mut Option<LoopDetector>,
+    ) -> Result<(), AggregationError> {
         copy_extension_fields(
             delta,
             &mut self.message_extension_fields,
@@ -1353,6 +1366,7 @@ impl ChoiceBuilder {
         }
         if let Some(content) = delta.get("content").and_then(Value::as_str) {
             if !content.is_empty() {
+                observe_fragment(loop_detector, LoopChannel::Content, content)?;
                 self.content.push_str(content);
                 stats.content_delta_count = stats.content_delta_count.saturating_add(1);
                 mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
@@ -1361,6 +1375,7 @@ impl ChoiceBuilder {
         for field in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(reasoning) = delta.get(field).and_then(Value::as_str) {
                 if !reasoning.is_empty() {
+                    observe_fragment(loop_detector, LoopChannel::Reasoning, reasoning)?;
                     self.reasoning.push_str(reasoning);
                     stats.reasoning_delta_count = stats.reasoning_delta_count.saturating_add(1);
                     mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
@@ -1370,7 +1385,7 @@ impl ChoiceBuilder {
         if let Some(function_call) = delta.get("function_call").and_then(Value::as_object) {
             self.function_call
                 .get_or_insert_with(FunctionCallBuilder::default)
-                .apply_delta(function_call);
+                .apply_delta(function_call, loop_detector)?;
             mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
         }
         if let Some(refusal) = delta.get("refusal") {
@@ -1395,12 +1410,13 @@ impl ChoiceBuilder {
                             index,
                             ..ToolCallBuilder::default()
                         })
-                        .apply_delta(tool_call);
+                        .apply_delta(tool_call, loop_detector)?;
                     stats.tool_call_delta_count = stats.tool_call_delta_count.saturating_add(1);
                     mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
                 }
             }
         }
+        Ok(())
     }
 
     fn into_value(self) -> Value {
@@ -1472,14 +1488,20 @@ struct FunctionCallBuilder {
 }
 
 impl FunctionCallBuilder {
-    fn apply_delta(&mut self, function_call: &Map<String, Value>) {
+    fn apply_delta(
+        &mut self,
+        function_call: &Map<String, Value>,
+        loop_detector: &mut Option<LoopDetector>,
+    ) -> Result<(), AggregationError> {
         if let Some(name) = function_call.get("name").and_then(Value::as_str) {
             self.name.get_or_insert_with(|| name.to_owned());
         }
         if let Some(arguments) = function_call.get("arguments").and_then(Value::as_str) {
+            observe_fragment(loop_detector, LoopChannel::ToolCallArguments, arguments)?;
             self.saw_arguments = true;
             self.arguments.push_str(arguments);
         }
+        Ok(())
     }
 
     fn into_value(self) -> Value {
@@ -1525,7 +1547,11 @@ struct ToolCallBuilder {
 }
 
 impl ToolCallBuilder {
-    fn apply_delta(&mut self, tool_call: &Map<String, Value>) {
+    fn apply_delta(
+        &mut self,
+        tool_call: &Map<String, Value>,
+        loop_detector: &mut Option<LoopDetector>,
+    ) -> Result<(), AggregationError> {
         if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
             self.id.get_or_insert_with(|| id.to_owned());
         }
@@ -1537,9 +1563,11 @@ impl ToolCallBuilder {
                 self.function_name.get_or_insert_with(|| name.to_owned());
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                observe_fragment(loop_detector, LoopChannel::ToolCallArguments, arguments)?;
                 self.function_arguments.push_str(arguments);
             }
         }
+        Ok(())
     }
 
     fn into_value(self) -> Value {

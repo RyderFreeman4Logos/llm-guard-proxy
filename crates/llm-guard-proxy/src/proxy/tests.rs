@@ -48,6 +48,7 @@ const MODEL_METADATA_CHUNKED_SECOND: &[u8] =
 const MODEL_METADATA_NO_CONTEXT_BODY: &str = r#"{"object":"list","data":[{"id":"fallback-model","object":"model","owned_by":"vllm","extra":"keep"}]}"#;
 const MODEL_METADATA_CONTEXT_LENGTH_BODY: &str = r#"{"object":"list","data":[{"id":"context-length-model","object":"model","context_length":256000,"owned_by":"vllm","extra":"keep"}]}"#;
 const MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY: &str = r#"{"object":"list","data":[{"id":"max-context-length-model","object":"model","max_context_length":256000,"owned_by":"vllm","extra":"keep"}]}"#;
+const REPEATED_INPUT_LOOP_LINE: &str = "legitimate repeated input line for issue ten";
 const LARGE_MODEL_METADATA_EXTRA_BYTES: usize = 1024 * 1024;
 static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -724,6 +725,246 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
     assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
     assert_eq!(observed_body["stream"], true);
     assert_eq!(observed_body["stream_options"]["include_usage"], true);
+}
+
+#[tokio::test]
+async fn shielded_loop_guard_catches_reasoning_line_repeated_hundreds_of_times() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-reasoning-hundreds",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("error body should be text");
+    assert!(body.contains("upstream_body_error"));
+    assert!(!body.contains("reasoning loop line"));
+
+    let request_row = read_last_observability_row(&proxy.sqlite_path, "requests");
+    let attempt_row = read_last_observability_row(&proxy.sqlite_path, "attempts");
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(attempt_row.status, "failed");
+    for metadata in [
+        &request_row.response_metadata,
+        &attempt_row.response_metadata,
+    ] {
+        assert_eq!(metadata["loop_detected"], "true");
+        assert_eq!(metadata["loop_signal"], "repeated_line");
+        assert_eq!(metadata["loop_channel"], "reasoning");
+        assert!(
+            metadata["loop_sample_hash"]
+                .as_str()
+                .expect("hash should be a string")
+                .starts_with("fnv64:")
+        );
+        assert!(!metadata.to_string().contains("reasoning loop line"));
+    }
+}
+
+#[tokio::test]
+async fn shielded_loop_guard_does_not_flag_repeated_input_without_output_loop() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+output_repeated_line_threshold = 4
+"#,
+    )
+    .await;
+    let repeated_input = format!("{REPEATED_INPUT_LOOP_LINE}\n{REPEATED_INPUT_LOOP_LINE}\n");
+    let body = serde_json::json!({
+        "model": "test-chat",
+        "messages": [{"role": "user", "content": repeated_input}],
+    });
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated: serde_json::Value =
+        serde_json::from_str(&response.text().await.expect("body should be text"))
+            .expect("body should be JSON");
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let request_row = read_last_observability_row(&proxy.sqlite_path, "requests");
+    assert!(request_row.response_metadata.get("loop_detected").is_none());
+}
+
+#[tokio::test]
+async fn shielded_loop_guard_raises_threshold_for_output_copying_repeated_input() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+output_repeated_line_threshold = 4
+output_token_window_size = 8
+output_repeated_token_window_threshold = 100
+output_suffix_cycle_threshold = 100
+output_low_progress_min_bytes = 1000000
+input_overlap_threshold_multiplier = 3
+"#,
+    )
+    .await;
+    let body = repeated_input_chat_body();
+
+    let under_threshold = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=copy-input-under-threshold",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("under-threshold request should complete");
+    assert_eq!(under_threshold.status(), StatusCode::OK);
+    let _under_body = under_threshold
+        .text()
+        .await
+        .expect("under-threshold body should be text");
+
+    let over_threshold = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=copy-input-over-threshold",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("over-threshold request should complete");
+    assert_eq!(over_threshold.status(), StatusCode::BAD_GATEWAY);
+
+    let attempt_row = read_last_observability_row(&proxy.sqlite_path, "attempts");
+    assert_eq!(attempt_row.status, "failed");
+    assert_eq!(attempt_row.response_metadata["loop_detected"], "true");
+    assert_eq!(
+        attempt_row.response_metadata["loop_signal"],
+        "repeated_line"
+    );
+    assert_eq!(attempt_row.response_metadata["loop_channel"], "content");
+    assert_eq!(attempt_row.response_metadata["loop_threshold"], "12");
+    assert_eq!(
+        attempt_row.response_metadata["loop_input_overlap_applied"],
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn hot_reloaded_loop_threshold_changes_subsequent_requests() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+output_repeated_line_threshold = 10
+output_repeated_token_window_threshold = 100
+output_suffix_cycle_threshold = 100
+output_low_progress_min_bytes = 1000000
+"#,
+    )
+    .await;
+    let body = r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#;
+
+    let before_reload = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-reasoning-six",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("first proxy request should complete");
+    assert_eq!(before_reload.status(), StatusCode::OK);
+    let _before_body = before_reload
+        .text()
+        .await
+        .expect("first body should be text");
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+output_repeated_line_threshold = 4
+output_repeated_token_window_threshold = 100
+output_suffix_cycle_threshold = 100
+output_low_progress_min_bytes = 1000000
+"#,
+    );
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("loop threshold reload should succeed");
+    assert!(outcome.applied);
+
+    let after_reload = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-reasoning-six",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("second proxy request should complete");
+    assert_eq!(after_reload.status(), StatusCode::BAD_GATEWAY);
+
+    let attempt_row = read_last_observability_row(&proxy.sqlite_path, "attempts");
+    assert_eq!(attempt_row.response_metadata["loop_detected"], "true");
+    assert_eq!(attempt_row.response_metadata["loop_threshold"], "4");
 }
 
 #[tokio::test]
@@ -2486,8 +2727,8 @@ async fn invalid_openai_path_writes_failed_request_without_attempt() {
 
 #[tokio::test]
 async fn upstream_transport_failure_writes_failed_request_and_attempt() {
-    let upstream_base_url = closed_upstream_base_url().await;
-    let proxy = ProxyFixture::spawn(&upstream_base_url, true).await;
+    let upstream = BrokenUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&upstream.base_url, true).await;
 
     let response = proxy
         .client
@@ -3061,6 +3302,36 @@ fn read_single_forwarded_attempt_row(sqlite_path: &Path) -> ForwardedRecordRow {
 }
 
 #[derive(Debug)]
+struct ObservabilityRow {
+    status: String,
+    response_metadata: serde_json::Value,
+}
+
+fn read_last_observability_row(sqlite_path: &Path, table: &str) -> ObservabilityRow {
+    assert!(matches!(table, "requests" | "attempts"));
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let sql =
+        format!("SELECT status, response_metadata_json FROM {table} ORDER BY rowid DESC LIMIT 1");
+    let row: (String, String) = connection
+        .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("observability row should exist");
+    let response_metadata = serde_json::from_str(&row.1).expect("response metadata should be json");
+    ObservabilityRow {
+        status: row.0,
+        response_metadata,
+    }
+}
+
+fn repeated_input_chat_body() -> String {
+    let repeated_input = format!("{REPEATED_INPUT_LOOP_LINE}\n{REPEATED_INPUT_LOOP_LINE}\n");
+    serde_json::json!({
+        "model": "test-chat",
+        "messages": [{"role": "user", "content": repeated_input}],
+    })
+    .to_string()
+}
+
+#[derive(Debug)]
 struct ObservedRequest {
     method: Method,
     path_and_query: String,
@@ -3204,15 +3475,34 @@ impl RedirectTarget {
     }
 }
 
-async fn closed_upstream_base_url() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("closed upstream listener should bind");
-    let addr = listener
-        .local_addr()
-        .expect("closed upstream address should be available");
-    drop(listener);
-    format!("http://{addr}/v1")
+struct BrokenUpstream {
+    base_url: String,
+}
+
+impl BrokenUpstream {
+    async fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("broken upstream listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("broken upstream address should be available");
+        tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok((_stream, _addr)) => {}
+                    Err(error) => {
+                        eprintln!("broken upstream listener failed: {error}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Self {
+            base_url: format!("http://{addr}/v1"),
+        }
+    }
 }
 
 async fn redirecting_upstream_handler(
@@ -3342,32 +3632,14 @@ fn fake_upstream_endpoint_response(
         }
     }
 
+    if endpoint == "/v1/chat/completions" {
+        if let Some(response) = fake_chat_completion_response(path_and_query, body) {
+            return response;
+        }
+    }
+
     let (label, body) = match endpoint {
         "/v1/models" => ("models", r#"{"object":"list","data":[]}"#),
-        "/v1/chat/completions"
-            if path_and_query.contains("test=compat-function-call")
-                && body_requests_stream(body) =>
-        {
-            return chat_completion_compat_function_call_sse_response(body);
-        }
-        "/v1/chat/completions"
-            if path_and_query.contains("test=compat-refusal") && body_requests_stream(body) =>
-        {
-            return chat_completion_compat_refusal_sse_response(body);
-        }
-        "/v1/chat/completions"
-            if path_and_query.contains("test=compat-extensions") && body_requests_stream(body) =>
-        {
-            return chat_completion_extension_fields_sse_response(body);
-        }
-        "/v1/chat/completions"
-            if path_and_query.contains("test=slow-shielded") && body_requests_stream(body) =>
-        {
-            return slow_chat_completion_sse_response(body);
-        }
-        "/v1/chat/completions" if body_requests_stream(body) => {
-            return chat_completion_sse_response(body);
-        }
         "/v1/chat/completions" => (
             "chat-completions",
             r#"{"id":"chatcmpl-test","object":"chat.completion"}"#,
@@ -3390,6 +3662,37 @@ fn fake_upstream_endpoint_response(
     let mut response = json_response(label, body.to_owned());
     *response.status_mut() = status;
     response
+}
+
+fn fake_chat_completion_response(path_and_query: &str, body: &Bytes) -> Option<Response<Body>> {
+    if !body_requests_stream(body) {
+        return None;
+    }
+    if path_and_query.contains("test=compat-function-call") {
+        return Some(chat_completion_compat_function_call_sse_response(body));
+    }
+    if path_and_query.contains("test=compat-refusal") {
+        return Some(chat_completion_compat_refusal_sse_response(body));
+    }
+    if path_and_query.contains("test=compat-extensions") {
+        return Some(chat_completion_extension_fields_sse_response(body));
+    }
+    if path_and_query.contains("test=slow-shielded") {
+        return Some(slow_chat_completion_sse_response(body));
+    }
+    if path_and_query.contains("test=loop-reasoning-hundreds") {
+        return Some(repeated_reasoning_line_sse_response(200));
+    }
+    if path_and_query.contains("test=loop-reasoning-six") {
+        return Some(repeated_reasoning_line_sse_response(6));
+    }
+    if path_and_query.contains("test=copy-input-under-threshold") {
+        return Some(repeated_input_copy_sse_response(11));
+    }
+    if path_and_query.contains("test=copy-input-over-threshold") {
+        return Some(repeated_input_copy_sse_response(12));
+    }
+    Some(chat_completion_sse_response(body))
 }
 
 fn model_metadata_body(max_model_len: u64) -> String {
@@ -3465,6 +3768,80 @@ fn slow_chat_completion_sse_response(body: &Bytes) -> Response<Body> {
     chat_completion_delayed_start_stream_response("chat-completions-slow-sse", chunks)
 }
 
+fn repeated_reasoning_line_sse_response(repetitions: usize) -> Response<Body> {
+    repeated_delta_sse_response(
+        "chat-completions-loop-reasoning-sse",
+        repetitions,
+        |line| {
+            serde_json::json!({
+                "reasoning_content": line,
+            })
+        },
+        "reasoning loop line\n",
+    )
+}
+
+fn repeated_input_copy_sse_response(repetitions: usize) -> Response<Body> {
+    repeated_delta_sse_response(
+        "chat-completions-copy-input-sse",
+        repetitions,
+        |line| {
+            serde_json::json!({
+                "content": line,
+            })
+        },
+        &format!("{REPEATED_INPUT_LOOP_LINE}\n"),
+    )
+}
+
+fn repeated_delta_sse_response(
+    label: &'static str,
+    repetitions: usize,
+    delta: impl Fn(&str) -> serde_json::Value,
+    line: &str,
+) -> Response<Body> {
+    let mut chunks = Vec::with_capacity(repetitions.saturating_add(3));
+    chunks.push(sse_json(&serde_json::json!({
+        "id": "chatcmpl-shielded",
+        "object": "chat.completion.chunk",
+        "created": 1_710_000_000_u64,
+        "model": "test-chat",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant"
+            },
+            "finish_reason": null
+        }]
+    })));
+    for _ in 0..repetitions {
+        chunks.push(sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": [{
+                "index": 0,
+                "delta": delta(line),
+                "finish_reason": null
+            }]
+        })));
+    }
+    chunks.push(sse_json(&serde_json::json!({
+        "id": "chatcmpl-shielded",
+        "object": "chat.completion.chunk",
+        "created": 1_710_000_000_u64,
+        "model": "test-chat",
+        "choices": [{
+            "index": 0,
+            "delta": {},
+            "finish_reason": "stop"
+        }]
+    })));
+    chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
+    chat_completion_vec_stream_response(label, chunks)
+}
+
 fn chat_completion_delayed_start_stream_response(
     label: &'static str,
     chunks: Vec<Bytes>,
@@ -3484,6 +3861,22 @@ fn chat_completion_delayed_start_stream_response(
                 (index + 1, chunks),
             ))
         },
+    ));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_str(label).expect("static label should be a valid header"),
+    );
+    response
+}
+
+fn chat_completion_vec_stream_response(label: &'static str, chunks: Vec<Bytes>) -> Response<Body> {
+    let body = Body::from_stream(stream::iter(
+        chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
     ));
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::OK;

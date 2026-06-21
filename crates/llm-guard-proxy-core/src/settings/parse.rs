@@ -299,6 +299,52 @@ fn assign_loop_guard(
             config.max_repeated_inputs =
                 parse_u32(value, line_number, "loop_guard.max_repeated_inputs")?;
         }
+        "output_repeated_line_threshold" => {
+            config.output_repeated_line_threshold = parse_u32(
+                value,
+                line_number,
+                "loop_guard.output_repeated_line_threshold",
+            )?;
+        }
+        "output_token_window_size" => {
+            config.output_token_window_size =
+                parse_u32(value, line_number, "loop_guard.output_token_window_size")?;
+        }
+        "output_repeated_token_window_threshold" => {
+            config.output_repeated_token_window_threshold = parse_u32(
+                value,
+                line_number,
+                "loop_guard.output_repeated_token_window_threshold",
+            )?;
+        }
+        "output_suffix_cycle_threshold" => {
+            config.output_suffix_cycle_threshold = parse_u32(
+                value,
+                line_number,
+                "loop_guard.output_suffix_cycle_threshold",
+            )?;
+        }
+        "output_low_progress_min_bytes" => {
+            config.output_low_progress_min_bytes = parse_u64(
+                value,
+                line_number,
+                "loop_guard.output_low_progress_min_bytes",
+            )?;
+        }
+        "output_low_progress_unique_ratio_percent" => {
+            config.output_low_progress_unique_ratio_percent = parse_u32(
+                value,
+                line_number,
+                "loop_guard.output_low_progress_unique_ratio_percent",
+            )?;
+        }
+        "input_overlap_threshold_multiplier" => {
+            config.input_overlap_threshold_multiplier = parse_u32(
+                value,
+                line_number,
+                "loop_guard.input_overlap_threshold_multiplier",
+            )?;
+        }
         _ => return unknown_key("loop_guard", key, line_number),
     }
     Ok(())

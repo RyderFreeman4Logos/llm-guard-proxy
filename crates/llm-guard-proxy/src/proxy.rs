@@ -404,6 +404,7 @@ async fn forward_openai_request(
             config: &config,
             shielded_chat: shielded_chat_intercepted,
             liveness: shielded_chat_plan.liveness,
+            loop_context: shielded_chat_plan.loop_context,
         },
         response_parts,
         upstream_response,
@@ -441,15 +442,16 @@ async fn send_first_upstream_attempt(
         Err(error) => {
             let finished_at_unix_ms = unix_time_millis();
             let error_reason = error.to_string();
-            let attempt_record = failed_attempt_record(
-                context.attempt_id,
-                context.request_id.clone(),
-                context.attempt_started_at_unix_ms,
+            let attempt_record = failed_attempt_record(FailedAttemptRecordInput {
+                attempt_id: context.attempt_id,
+                request_id: context.request_id.clone(),
+                started_at_unix_ms: context.attempt_started_at_unix_ms,
                 finished_at_unix_ms,
-                error.error_type(),
-                &error_reason,
-                context.attempt_request_metadata.clone(),
-            );
+                error_type: error.error_type(),
+                error_reason: &error_reason,
+                request_metadata: context.attempt_request_metadata.clone(),
+                extra_response_metadata: BTreeMap::new(),
+            });
             Err(error.with_observability(context.request_metadata.clone(), attempt_record))
         }
     }
@@ -461,6 +463,7 @@ struct ResponseDispatch<'request> {
     config: &'request AppConfig,
     shielded_chat: bool,
     liveness: ShieldedLivenessSelection,
+    loop_context: shielded_chat::LoopInspectionContext,
 }
 
 struct ShieldedChatPlan {
@@ -468,6 +471,7 @@ struct ShieldedChatPlan {
     intercepted: bool,
     liveness: ShieldedLivenessSelection,
     thinking_metadata: BTreeMap<String, String>,
+    loop_context: shielded_chat::LoopInspectionContext,
 }
 
 fn plan_shielded_chat(
@@ -491,12 +495,18 @@ fn plan_shielded_chat(
         .map_or_else(BTreeMap::new, |request| request.thinking_metadata().clone());
     let intercepted = request.is_some();
     let liveness = select_shielded_liveness(state, config, body, intercepted, unix_time_millis());
+    let loop_context = if intercepted {
+        shielded_chat::LoopInspectionContext::from_request_body(&config.loop_guard, body)
+    } else {
+        shielded_chat::LoopInspectionContext::empty(&config.loop_guard)
+    };
 
     ShieldedChatPlan {
         upstream_body,
         intercepted,
         liveness,
         thinking_metadata,
+        loop_context,
     }
 }
 
@@ -558,6 +568,7 @@ async fn forward_upstream_response(
             upstream_response,
             in_flight_permit,
             &dispatch.liveness,
+            dispatch.loop_context,
         )
         .await;
     }
@@ -746,17 +757,26 @@ impl ForwardedResponseParts {
     }
 
     fn into_body_read_error(self, error: ProxyError) -> ProxyError {
+        self.into_body_read_error_with_metadata(error, BTreeMap::new())
+    }
+
+    fn into_body_read_error_with_metadata(
+        self,
+        error: ProxyError,
+        extra_response_metadata: BTreeMap<String, String>,
+    ) -> ProxyError {
         let finished_at_unix_ms = unix_time_millis();
         let error_reason = error.to_string();
-        let attempt_record = failed_attempt_record(
-            self.attempt_id,
-            self.request_id,
-            self.attempt_started_at_unix_ms,
+        let attempt_record = failed_attempt_record(FailedAttemptRecordInput {
+            attempt_id: self.attempt_id,
+            request_id: self.request_id,
+            started_at_unix_ms: self.attempt_started_at_unix_ms,
             finished_at_unix_ms,
-            error.error_type(),
-            &error_reason,
-            self.attempt_request_metadata,
-        );
+            error_type: error.error_type(),
+            error_reason: &error_reason,
+            request_metadata: self.attempt_request_metadata,
+            extra_response_metadata,
+        });
         error.with_observability(self.request_metadata, attempt_record)
     }
 }
@@ -789,6 +809,7 @@ async fn forward_shielded_chat_response(
     upstream_response: reqwest::Response,
     in_flight_permit: OwnedSemaphorePermit,
     liveness: &ShieldedLivenessSelection,
+    loop_context: shielded_chat::LoopInspectionContext,
 ) -> Result<Response<Body>, ProxyError> {
     let request_id = response_parts.request_id.as_str().to_owned();
     let request_model_id = response_parts.model_id.clone();
@@ -801,12 +822,14 @@ async fn forward_shielded_chat_response(
         let response_headers =
             shielded_chat_stream_response_headers(&response_parts.upstream_headers, liveness.mode);
         let extra_metadata = shielded_liveness_response_metadata(liveness, upstream_content_type);
+        let loop_context = loop_context.clone();
         let aggregate = Box::pin(async move {
             shielded_chat::aggregate_stream(
                 upstream_response.bytes_stream(),
                 response_parts.attempt_started_at_unix_ms,
                 &request_id,
                 request_model_id.as_deref(),
+                loop_context,
             )
             .await
         });
@@ -835,12 +858,17 @@ async fn forward_shielded_chat_response(
         response_parts.attempt_started_at_unix_ms,
         &request_id,
         request_model_id.as_deref(),
+        loop_context,
     )
     .await
     {
         Ok(aggregated) => aggregated,
         Err(error) => {
-            return Err(response_parts.into_body_read_error(ProxyError::upstream_body(error)));
+            let response_metadata = error.response_metadata().clone();
+            return Err(response_parts.into_body_read_error_with_metadata(
+                ProxyError::upstream_body(error.to_string()),
+                response_metadata,
+            ));
         }
     };
 
@@ -1087,8 +1115,16 @@ impl Drop for ObservedBufferedBody {
     }
 }
 
-type ShieldedAggregateFuture =
-    Pin<Box<dyn Future<Output = Result<shielded_chat::AggregatedChatCompletion, String>> + Send>>;
+type ShieldedAggregateFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    shielded_chat::AggregatedChatCompletion,
+                    shielded_chat::AggregationError,
+                >,
+            > + Send,
+    >,
+>;
 
 struct ShieldedLivenessBody {
     aggregate: ShieldedAggregateFuture,
@@ -1180,8 +1216,14 @@ impl Stream for ShieldedLivenessBody {
                 return this.count_and_emit(chunk);
             }
             Poll::Ready(Err(error)) => {
-                let chunk = this.error_chunk(&error);
-                this.terminal_completion = Some(BodyCompletion::UpstreamStreamError(error));
+                if let Some(observer) = &mut this.observer {
+                    observer
+                        .extra_response_metadata
+                        .extend(error.response_metadata().clone());
+                }
+                let error_message = error.to_string();
+                let chunk = this.error_chunk(&error_message);
+                this.terminal_completion = Some(BodyCompletion::UpstreamStreamError(error_message));
                 return this.count_and_emit(chunk);
             }
             Poll::Pending => {}
@@ -1849,33 +1891,38 @@ fn config_shielding_enabled(config: &ConfigHandle) -> Option<bool> {
         .map(|snapshot| snapshot.shielding.enabled)
 }
 
-fn failed_attempt_record(
+struct FailedAttemptRecordInput<'error> {
     attempt_id: AttemptId,
     request_id: RequestId,
     started_at_unix_ms: u64,
     finished_at_unix_ms: u64,
-    error_type: &str,
-    error_reason: &str,
+    error_type: &'static str,
+    error_reason: &'error str,
     request_metadata: BTreeMap<String, String>,
-) -> AttemptRecord {
+    extra_response_metadata: BTreeMap<String, String>,
+}
+
+fn failed_attempt_record(input: FailedAttemptRecordInput<'_>) -> AttemptRecord {
+    let mut response_metadata = failed_response_metadata(
+        input.started_at_unix_ms,
+        input.finished_at_unix_ms,
+        input.error_type,
+    );
+    response_metadata.extend(input.extra_response_metadata);
     AttemptRecord {
-        attempt_id,
-        request_id,
+        attempt_id: input.attempt_id,
+        request_id: input.request_id,
         attempt_number: 1,
-        started_at_unix_ms,
-        finished_at_unix_ms: Some(finished_at_unix_ms),
+        started_at_unix_ms: input.started_at_unix_ms,
+        finished_at_unix_ms: Some(input.finished_at_unix_ms),
         upstream_mode: UpstreamMode::NotApplicable,
         status: AttemptStatus::Failed,
         http_status: None,
-        error_reason: Some(format!("{error_type}: {error_reason}")),
+        error_reason: Some(format!("{}: {}", input.error_type, input.error_reason)),
         retry_reason: None,
         abort_reason: None,
-        request_metadata,
-        response_metadata: failed_response_metadata(
-            started_at_unix_ms,
-            finished_at_unix_ms,
-            error_type,
-        ),
+        request_metadata: input.request_metadata,
+        response_metadata,
         raw_payloads: RawPayloads::default(),
     }
 }
@@ -1892,6 +1939,14 @@ struct FailedRequestRecord<'attempt> {
 }
 
 fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecord<'_>) {
+    let mut response_metadata = failed_response_metadata(
+        failure.started_at_unix_ms,
+        failure.finished_at_unix_ms,
+        failure.error_type,
+    );
+    if let Some(attempt) = failure.attempt {
+        copy_loop_response_metadata(&attempt.response_metadata, &mut response_metadata);
+    }
     let request_record = RequestRecord {
         request_id: failure.request_id,
         started_at_unix_ms: failure.started_at_unix_ms,
@@ -1905,14 +1960,21 @@ fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecor
         error_reason: Some(format!("{}: {}", failure.error_type, failure.error_reason)),
         abort_reason: None,
         request_metadata: failure.request_metadata,
-        response_metadata: failed_response_metadata(
-            failure.started_at_unix_ms,
-            failure.finished_at_unix_ms,
-            failure.error_type,
-        ),
+        response_metadata,
         raw_payloads: RawPayloads::default(),
     };
     record_observability(store, &request_record, failure.attempt);
+}
+
+fn copy_loop_response_metadata(
+    source: &BTreeMap<String, String>,
+    target: &mut BTreeMap<String, String>,
+) {
+    for (key, value) in source {
+        if key.starts_with("loop_") {
+            target.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 fn record_observability(

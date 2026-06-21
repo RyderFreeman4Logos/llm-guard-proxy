@@ -401,6 +401,20 @@ pub struct LoopGuardConfig {
     pub normalized_input_window_secs: u64,
     /// Repeat threshold that triggers loop-protection behavior.
     pub max_repeated_inputs: u32,
+    /// Repeated complete output lines required before aborting.
+    pub output_repeated_line_threshold: u32,
+    /// Normalized output token window size used for repetition detection.
+    pub output_token_window_size: u32,
+    /// Repeated normalized token windows required before aborting.
+    pub output_repeated_token_window_threshold: u32,
+    /// Suffix cycle repetitions required before aborting.
+    pub output_suffix_cycle_threshold: u32,
+    /// Minimum channel bytes before low-progress detection can abort.
+    pub output_low_progress_min_bytes: u64,
+    /// Maximum unique token-window ratio allowed for low-progress detection.
+    pub output_low_progress_unique_ratio_percent: u32,
+    /// Threshold multiplier applied when output repetition overlaps repeated input.
+    pub input_overlap_threshold_multiplier: u32,
 }
 
 impl LoopGuardConfig {
@@ -414,6 +428,41 @@ impl LoopGuardConfig {
             self.max_repeated_inputs > 0,
             "loop_guard.max_repeated_inputs",
             "must be greater than zero",
+        )?;
+        require(
+            self.output_repeated_line_threshold > 0,
+            "loop_guard.output_repeated_line_threshold",
+            "must be greater than zero",
+        )?;
+        require(
+            self.output_token_window_size > 0,
+            "loop_guard.output_token_window_size",
+            "must be greater than zero",
+        )?;
+        require(
+            self.output_repeated_token_window_threshold > 0,
+            "loop_guard.output_repeated_token_window_threshold",
+            "must be greater than zero",
+        )?;
+        require(
+            self.output_suffix_cycle_threshold > 0,
+            "loop_guard.output_suffix_cycle_threshold",
+            "must be greater than zero",
+        )?;
+        require(
+            self.output_low_progress_min_bytes > 0,
+            "loop_guard.output_low_progress_min_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.output_low_progress_unique_ratio_percent <= 100,
+            "loop_guard.output_low_progress_unique_ratio_percent",
+            "must be between 0 and 100",
+        )?;
+        require(
+            self.input_overlap_threshold_multiplier > 0,
+            "loop_guard.input_overlap_threshold_multiplier",
+            "must be greater than zero",
         )
     }
 }
@@ -424,6 +473,13 @@ impl Default for LoopGuardConfig {
             enabled: true,
             normalized_input_window_secs: 120,
             max_repeated_inputs: 1,
+            output_repeated_line_threshold: 24,
+            output_token_window_size: 12,
+            output_repeated_token_window_threshold: 32,
+            output_suffix_cycle_threshold: 32,
+            output_low_progress_min_bytes: 4_096,
+            output_low_progress_unique_ratio_percent: 15,
+            input_overlap_threshold_multiplier: 4,
         }
     }
 }
