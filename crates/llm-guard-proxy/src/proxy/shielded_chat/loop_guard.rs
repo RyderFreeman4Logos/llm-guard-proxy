@@ -13,6 +13,11 @@ const LOOP_MAX_RECENT_CHARS: usize = 4 * 1024;
 const LOOP_MAX_TOKEN_BYTES: usize = 128;
 const LOOP_SUFFIX_MIN_UNIT_CHARS: usize = 4;
 const LOOP_SUFFIX_MAX_UNIT_CHARS: usize = 64;
+const LOOP_INPUT_LINE_COUNT_CAP: usize = 4_096;
+const LOOP_INPUT_TOKEN_WINDOW_COUNT_CAP: usize = 8_192;
+const LOOP_OUTPUT_LINE_COUNT_CAP: usize = 4_096;
+const LOOP_OUTPUT_TOKEN_WINDOW_COUNT_CAP: usize = 8_192;
+const LOOP_OUTPUT_UNIQUE_TOKEN_WINDOW_CAP: usize = 8_192;
 const FNV64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -90,6 +95,7 @@ impl LoopInspectionContext {
 struct InputRepetitionProfile {
     repeated_line_hashes: BTreeSet<u64>,
     repeated_token_window_hashes: BTreeSet<u64>,
+    state_capping: LoopStateCapping,
 }
 
 impl InputRepetitionProfile {
@@ -97,28 +103,112 @@ impl InputRepetitionProfile {
         let Ok(value) = serde_json::from_slice::<Value>(request_body) else {
             return Self::default();
         };
-        let mut texts = Vec::new();
-        collect_input_text(&value, None, &mut texts);
-        Self::from_texts(&texts, token_window_size)
+        Self::from_value(&value, token_window_size)
     }
 
+    fn from_value(value: &Value, token_window_size: u32) -> Self {
+        let mut profile = Self::default();
+        let mut line_counts = BTreeMap::<u64, u32>::new();
+        let mut token_window_counts = BTreeMap::<u64, u32>::new();
+        profile.observe_value(
+            value,
+            None,
+            token_window_size,
+            &mut line_counts,
+            &mut token_window_counts,
+        );
+        profile
+    }
+
+    #[cfg(test)]
     fn from_texts(texts: &[String], token_window_size: u32) -> Self {
+        let mut profile = Self::default();
         let mut line_counts = BTreeMap::<u64, u32>::new();
         let mut token_window_counts = BTreeMap::<u64, u32>::new();
         for text in texts {
-            for line in text.lines() {
-                if let Some(hash) = normalized_line_hash(line) {
-                    increment_count(&mut line_counts, hash);
+            profile.observe_text(
+                text,
+                token_window_size,
+                &mut line_counts,
+                &mut token_window_counts,
+            );
+        }
+        profile
+    }
+
+    fn observe_value(
+        &mut self,
+        value: &Value,
+        key: Option<&str>,
+        token_window_size: u32,
+        line_counts: &mut BTreeMap<u64, u32>,
+        token_window_counts: &mut BTreeMap<u64, u32>,
+    ) {
+        match value {
+            Value::String(text) if !key.is_some_and(is_sensitive_input_key) => {
+                self.observe_text(text, token_window_size, line_counts, token_window_counts);
+            }
+            Value::Array(values) => {
+                for value in values {
+                    self.observe_value(
+                        value,
+                        key,
+                        token_window_size,
+                        line_counts,
+                        token_window_counts,
+                    );
                 }
             }
-            for window_hash in token_window_hashes(text, token_window_size) {
-                increment_count(&mut token_window_counts, window_hash);
+            Value::Object(object) => {
+                for (key, value) in object {
+                    if !is_sensitive_input_key(key) {
+                        self.observe_value(
+                            value,
+                            Some(key),
+                            token_window_size,
+                            line_counts,
+                            token_window_counts,
+                        );
+                    }
+                }
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+        }
+    }
+
+    fn observe_text(
+        &mut self,
+        text: &str,
+        token_window_size: u32,
+        line_counts: &mut BTreeMap<u64, u32>,
+        token_window_counts: &mut BTreeMap<u64, u32>,
+    ) {
+        for line in text.lines() {
+            if let Some(hash) = normalized_line_hash(line) {
+                if let Some(count) = increment_count_with_cap(
+                    line_counts,
+                    hash,
+                    LOOP_INPUT_LINE_COUNT_CAP,
+                    &mut self.state_capping.input_lines,
+                ) {
+                    if count > 1 {
+                        self.repeated_line_hashes.insert(hash);
+                    }
+                }
             }
         }
-        Self {
-            repeated_line_hashes: repeated_hashes(line_counts),
-            repeated_token_window_hashes: repeated_hashes(token_window_counts),
-        }
+        observe_token_window_hashes(text, token_window_size, |window_hash| {
+            if let Some(count) = increment_count_with_cap(
+                token_window_counts,
+                window_hash,
+                LOOP_INPUT_TOKEN_WINDOW_COUNT_CAP,
+                &mut self.state_capping.input_token_windows,
+            ) {
+                if count > 1 {
+                    self.repeated_token_window_hashes.insert(window_hash);
+                }
+            }
+        });
     }
 
     fn contains_line_hash(&self, hash: u64) -> bool {
@@ -127,27 +217,6 @@ impl InputRepetitionProfile {
 
     fn contains_token_window_hash(&self, hash: u64) -> bool {
         self.repeated_token_window_hashes.contains(&hash)
-    }
-}
-
-fn collect_input_text(value: &Value, key: Option<&str>, texts: &mut Vec<String>) {
-    match value {
-        Value::String(text) if !key.is_some_and(is_sensitive_input_key) => {
-            texts.push(text.clone());
-        }
-        Value::Array(values) => {
-            for value in values {
-                collect_input_text(value, key, texts);
-            }
-        }
-        Value::Object(object) => {
-            for (key, value) in object {
-                if !is_sensitive_input_key(key) {
-                    collect_input_text(value, Some(key), texts);
-                }
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
     }
 }
 
@@ -229,6 +298,7 @@ struct LoopDetection {
     unique_ratio_percent: Option<u64>,
     unique_window_count: Option<u64>,
     total_window_count: Option<u64>,
+    state_capping: LoopStateCapping,
 }
 
 impl LoopDetection {
@@ -297,7 +367,60 @@ impl LoopDetection {
                 total_window_count.to_string(),
             );
         }
+        self.state_capping.insert_metadata(&mut metadata);
         metadata
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LoopStateCapping {
+    input_lines: u64,
+    input_token_windows: u64,
+    output_lines: u64,
+    output_token_windows: u64,
+    output_unique_windows: u64,
+}
+
+impl LoopStateCapping {
+    const fn is_capped(self) -> bool {
+        self.input_lines > 0
+            || self.input_token_windows > 0
+            || self.output_lines > 0
+            || self.output_token_windows > 0
+            || self.output_unique_windows > 0
+    }
+
+    fn insert_metadata(self, metadata: &mut BTreeMap<String, String>) {
+        if !self.is_capped() {
+            return;
+        }
+        metadata.insert(
+            String::from("loop_guard_state_capped"),
+            String::from("true"),
+        );
+        insert_capped_metadata(metadata, "loop_input_line_count_capped", self.input_lines);
+        insert_capped_metadata(
+            metadata,
+            "loop_input_token_window_count_capped",
+            self.input_token_windows,
+        );
+        insert_capped_metadata(metadata, "loop_output_line_count_capped", self.output_lines);
+        insert_capped_metadata(
+            metadata,
+            "loop_output_token_window_count_capped",
+            self.output_token_windows,
+        );
+        insert_capped_metadata(
+            metadata,
+            "loop_output_unique_token_window_capped",
+            self.output_unique_windows,
+        );
+    }
+}
+
+fn insert_capped_metadata(metadata: &mut BTreeMap<String, String>, key: &str, value: u64) {
+    if value > 0 {
+        metadata.insert(key.to_owned(), value.to_string());
     }
 }
 
@@ -355,10 +478,13 @@ struct LoopChannelState {
     bytes_seen: u64,
     pending_line: String,
     line_counts: BTreeMap<u64, u32>,
+    line_count_capped: u64,
     current_token: String,
     recent_token_hashes: VecDeque<u64>,
     token_window_counts: BTreeMap<u64, u32>,
+    token_window_count_capped: u64,
     unique_token_windows: BTreeSet<u64>,
+    unique_token_window_capped: u64,
     token_window_total: u64,
     recent_chars: VecDeque<char>,
     input_overlap_seen: bool,
@@ -387,7 +513,7 @@ impl LoopChannelState {
         if let Some(detection) = self.observe_suffix_cycle(channel, config, input_profile) {
             return Some(detection);
         }
-        self.observe_low_progress(channel, config)
+        self.observe_low_progress(channel, config, input_profile)
     }
 
     fn observe_lines(
@@ -418,11 +544,16 @@ impl LoopChannelState {
         input_profile: &InputRepetitionProfile,
     ) -> Option<LoopDetection> {
         let hash = normalized_line_hash(&self.pending_line)?;
-        let count = increment_count(&mut self.line_counts, hash);
         let input_overlap = input_profile.contains_line_hash(hash);
         if input_overlap {
             self.input_overlap_seen = true;
         }
+        let count = increment_count_with_cap(
+            &mut self.line_counts,
+            hash,
+            LOOP_OUTPUT_LINE_COUNT_CAP,
+            &mut self.line_count_capped,
+        )?;
         let threshold = Self::adjusted_threshold(
             u64::from(config.output_repeated_line_threshold),
             input_overlap,
@@ -441,6 +572,7 @@ impl LoopChannelState {
             unique_ratio_percent: None,
             unique_window_count: None,
             total_window_count: None,
+            state_capping: self.state_capping(input_profile),
         })
     }
 
@@ -486,12 +618,22 @@ impl LoopChannelState {
         }
         let window_hash = stable_hash_u64s(self.recent_token_hashes.iter().copied());
         self.token_window_total = self.token_window_total.saturating_add(1);
-        self.unique_token_windows.insert(window_hash);
-        let count = increment_count(&mut self.token_window_counts, window_hash);
+        track_unique_hash_with_cap(
+            &mut self.unique_token_windows,
+            window_hash,
+            LOOP_OUTPUT_UNIQUE_TOKEN_WINDOW_CAP,
+            &mut self.unique_token_window_capped,
+        );
         let input_overlap = input_profile.contains_token_window_hash(window_hash);
         if input_overlap {
             self.input_overlap_seen = true;
         }
+        let count = increment_count_with_cap(
+            &mut self.token_window_counts,
+            window_hash,
+            LOOP_OUTPUT_TOKEN_WINDOW_COUNT_CAP,
+            &mut self.token_window_count_capped,
+        )?;
         let threshold = Self::adjusted_threshold(
             u64::from(config.output_repeated_token_window_threshold),
             input_overlap,
@@ -512,6 +654,7 @@ impl LoopChannelState {
                 u64::try_from(self.unique_token_windows.len()).unwrap_or(u64::MAX),
             ),
             total_window_count: Some(self.token_window_total),
+            state_capping: self.state_capping(input_profile),
         })
     }
 
@@ -555,6 +698,7 @@ impl LoopChannelState {
             unique_ratio_percent: None,
             unique_window_count: None,
             total_window_count: None,
+            state_capping: self.state_capping(input_profile),
         })
     }
 
@@ -562,6 +706,7 @@ impl LoopChannelState {
         &mut self,
         channel: LoopChannel,
         config: &LoopGuardConfig,
+        input_profile: &InputRepetitionProfile,
     ) -> Option<LoopDetection> {
         let min_bytes = if self.input_overlap_seen {
             config
@@ -571,6 +716,9 @@ impl LoopChannelState {
             config.output_low_progress_min_bytes
         };
         if self.bytes_seen < min_bytes || self.token_window_total == 0 {
+            return None;
+        }
+        if self.unique_token_window_capped > 0 {
             return None;
         }
         let unique_count = u64::try_from(self.unique_token_windows.len()).unwrap_or(u64::MAX);
@@ -591,6 +739,7 @@ impl LoopChannelState {
             unique_ratio_percent: Some(unique_ratio_percent),
             unique_window_count: Some(unique_count),
             total_window_count: Some(self.token_window_total),
+            state_capping: self.state_capping(input_profile),
         })
     }
 
@@ -600,6 +749,14 @@ impl LoopChannelState {
         } else {
             threshold
         }
+    }
+
+    fn state_capping(&self, input_profile: &InputRepetitionProfile) -> LoopStateCapping {
+        let mut capping = input_profile.state_capping;
+        capping.output_lines = self.line_count_capped;
+        capping.output_token_windows = self.token_window_count_capped;
+        capping.output_unique_windows = self.unique_token_window_capped;
+        capping
     }
 }
 
@@ -638,21 +795,24 @@ fn suffix_cycle(chars: &VecDeque<char>, minimum_repetitions: u32) -> Option<Suff
     None
 }
 
-fn token_window_hashes(text: &str, token_window_size: u32) -> Vec<u64> {
+fn observe_token_window_hashes(
+    text: &str,
+    token_window_size: u32,
+    mut observe_window_hash: impl FnMut(u64),
+) {
     let window_size = usize::try_from(token_window_size).unwrap_or(usize::MAX);
     if window_size == 0 {
-        return Vec::new();
+        return;
     }
     let mut current_token = String::new();
     let mut recent_token_hashes = VecDeque::new();
-    let mut window_hashes = Vec::new();
     for character in text.chars() {
         if character.is_whitespace() {
             push_token_window_hash(
                 &mut current_token,
                 &mut recent_token_hashes,
                 window_size,
-                &mut window_hashes,
+                &mut observe_window_hash,
             );
         } else if current_token.len() < LOOP_MAX_TOKEN_BYTES {
             for lower in character.to_lowercase() {
@@ -664,16 +824,15 @@ fn token_window_hashes(text: &str, token_window_size: u32) -> Vec<u64> {
         &mut current_token,
         &mut recent_token_hashes,
         window_size,
-        &mut window_hashes,
+        &mut observe_window_hash,
     );
-    window_hashes
 }
 
 fn push_token_window_hash(
     current_token: &mut String,
     recent_token_hashes: &mut VecDeque<u64>,
     window_size: usize,
-    window_hashes: &mut Vec<u64>,
+    observe_window_hash: &mut impl FnMut(u64),
 ) {
     if current_token.is_empty() {
         return;
@@ -684,7 +843,7 @@ fn push_token_window_hash(
         recent_token_hashes.pop_front();
     }
     if recent_token_hashes.len() == window_size {
-        window_hashes.push(stable_hash_u64s(recent_token_hashes.iter().copied()));
+        observe_window_hash(stable_hash_u64s(recent_token_hashes.iter().copied()));
     }
 }
 
@@ -694,17 +853,38 @@ fn normalized_line_hash(line: &str) -> Option<u64> {
         .then(|| stable_hash(normalized.to_lowercase().as_bytes()))
 }
 
-fn increment_count(counts: &mut BTreeMap<u64, u32>, hash: u64) -> u32 {
-    let count = counts.entry(hash).or_insert(0);
-    *count = count.saturating_add(1);
-    *count
+fn increment_count_with_cap(
+    counts: &mut BTreeMap<u64, u32>,
+    hash: u64,
+    cap: usize,
+    capped_count: &mut u64,
+) -> Option<u32> {
+    if let Some(count) = counts.get_mut(&hash) {
+        *count = count.saturating_add(1);
+        return Some(*count);
+    }
+    if counts.len() >= cap {
+        *capped_count = capped_count.saturating_add(1);
+        return None;
+    }
+    counts.insert(hash, 1);
+    Some(1)
 }
 
-fn repeated_hashes(counts: BTreeMap<u64, u32>) -> BTreeSet<u64> {
-    counts
-        .into_iter()
-        .filter_map(|(hash, count)| (count > 1).then_some(hash))
-        .collect()
+fn track_unique_hash_with_cap(
+    hashes: &mut BTreeSet<u64>,
+    hash: u64,
+    cap: usize,
+    capped_count: &mut u64,
+) {
+    if hashes.contains(&hash) {
+        return;
+    }
+    if hashes.len() >= cap {
+        *capped_count = capped_count.saturating_add(1);
+        return;
+    }
+    hashes.insert(hash);
 }
 
 fn stable_hash(bytes: &[u8]) -> u64 {
@@ -731,6 +911,8 @@ fn format_hash(hash: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use super::*;
 
     #[test]
@@ -831,6 +1013,107 @@ mod tests {
         assert_eq!(metadata["loop_channel"], "content");
         assert_eq!(metadata["loop_token_window_size"], "2");
         assert_eq!(metadata["loop_unique_ratio_percent"], "28");
+    }
+
+    #[test]
+    fn input_profile_caps_high_cardinality_lines_and_token_windows() {
+        let mut text = String::new();
+        text.push_str("tracked repeated input line\ntracked repeated input line\n");
+        for index in 0..LOOP_INPUT_TOKEN_WINDOW_COUNT_CAP.saturating_add(32) {
+            writeln!(
+                &mut text,
+                "unique input line {index} token-{index} value-{index}"
+            )
+            .expect("writing to String should not fail");
+        }
+
+        let profile = InputRepetitionProfile::from_texts(&[text], 2);
+
+        assert!(
+            profile
+                .contains_line_hash(normalized_line_hash("tracked repeated input line").unwrap())
+        );
+        assert!(profile.state_capping.is_capped());
+        assert!(profile.state_capping.input_lines > 0);
+        assert!(profile.state_capping.input_token_windows > 0);
+        assert!(profile.repeated_line_hashes.len() <= LOOP_INPUT_LINE_COUNT_CAP);
+        assert!(profile.repeated_token_window_hashes.len() <= LOOP_INPUT_TOKEN_WINDOW_COUNT_CAP);
+    }
+
+    #[test]
+    fn output_channel_state_caps_high_cardinality_lines_and_token_windows() {
+        let mut config = test_loop_config();
+        config.output_token_window_size = 2;
+        config.output_repeated_line_threshold = u32::MAX;
+        config.output_repeated_token_window_threshold = u32::MAX;
+        config.output_suffix_cycle_threshold = u32::MAX;
+        config.output_low_progress_min_bytes = u64::MAX;
+        let mut detector = LoopDetector::new(config, InputRepetitionProfile::default());
+
+        for index in 0..LOOP_OUTPUT_TOKEN_WINDOW_COUNT_CAP.saturating_add(32) {
+            detector
+                .observe(
+                    LoopChannel::Content,
+                    &format!("unique output line {index} token-{index} value-{index}\n"),
+                )
+                .expect("high-cardinality output should degrade without aborting");
+        }
+
+        assert_eq!(
+            detector.content.line_counts.len(),
+            LOOP_OUTPUT_LINE_COUNT_CAP
+        );
+        assert_eq!(
+            detector.content.token_window_counts.len(),
+            LOOP_OUTPUT_TOKEN_WINDOW_COUNT_CAP
+        );
+        assert_eq!(
+            detector.content.unique_token_windows.len(),
+            LOOP_OUTPUT_UNIQUE_TOKEN_WINDOW_CAP
+        );
+        assert!(detector.content.line_count_capped > 0);
+        assert!(detector.content.token_window_count_capped > 0);
+        assert!(detector.content.unique_token_window_capped > 0);
+        assert!(detector.content.token_window_total > LOOP_OUTPUT_TOKEN_WINDOW_COUNT_CAP as u64);
+    }
+
+    #[test]
+    fn tracked_repeated_line_still_detects_after_output_line_cap() {
+        let mut config = test_loop_config();
+        config.output_repeated_line_threshold = 3;
+        config.output_repeated_token_window_threshold = u32::MAX;
+        config.output_suffix_cycle_threshold = u32::MAX;
+        config.output_low_progress_min_bytes = u64::MAX;
+        let mut detector = LoopDetector::new(config, InputRepetitionProfile::default());
+
+        detector
+            .observe(LoopChannel::Reasoning, "tracked repeated output line\n")
+            .expect("first tracked line should pass");
+        detector
+            .observe(LoopChannel::Reasoning, "tracked repeated output line\n")
+            .expect("second tracked line should pass");
+        for index in 0..LOOP_OUTPUT_LINE_COUNT_CAP.saturating_add(16) {
+            detector
+                .observe(
+                    LoopChannel::Reasoning,
+                    &format!("unique capped output line {index}\n"),
+                )
+                .expect("new unique lines beyond the cap should be skipped");
+        }
+
+        let error = detector
+            .observe(LoopChannel::Reasoning, "tracked repeated output line\n")
+            .expect_err("existing tracked line should still count after cap");
+        let metadata = error.response_metadata();
+        assert_eq!(metadata["loop_signal"], "repeated_line");
+        assert_eq!(metadata["loop_channel"], "reasoning");
+        assert_eq!(metadata["loop_guard_state_capped"], "true");
+        assert!(
+            metadata["loop_output_line_count_capped"]
+                .parse::<u64>()
+                .expect("capped count should be numeric")
+                > 0
+        );
     }
 
     fn test_loop_config() -> LoopGuardConfig {
