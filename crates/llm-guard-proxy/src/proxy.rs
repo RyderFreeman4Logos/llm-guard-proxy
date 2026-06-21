@@ -24,10 +24,11 @@ use axum::{
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
-    AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DownstreamMode, Health,
-    HeartbeatMode, LICENSE, MetadataConfig, ObservabilityStore, RawPayloads, RequestId,
-    RequestRecord, RequestStatus, RetryConfig, SERVICE_NAME, UpstreamMode,
-    redact_upstream_base_url, validate_upstream_base_url,
+    AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
+    DownstreamMode, Health, HeartbeatMode, LICENSE, LatencyHistogram, MetadataConfig,
+    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
+    RequestStatus, RetryConfig, SERVICE_NAME, UpstreamMode, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -43,6 +44,7 @@ const MAX_REPEAT_FINGERPRINT_ENTRIES: usize = 1024;
 const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 120;
 const HEADER_VALUE_NOT_UTF8: &str = "[non-utf8]";
 const HEADER_VALUE_REDACTED: &str = "[redacted]";
+const DEBUG_SUMMARY_PATH: &str = "/debug/recent-requests";
 
 /// Shared HTTP proxy state.
 #[derive(Clone, Debug)]
@@ -185,9 +187,34 @@ pub(crate) fn build_http_client() -> Result<Client, reqwest::Error> {
 pub(crate) fn router(state: ProxyState) -> Router {
     Router::new()
         .route("/health", get(health_handler))
-        .route("/config-summary", get(health_handler))
+        .route("/metrics", get(metrics_handler))
+        .route("/config-summary", get(config_summary_handler))
         .fallback(proxy_handler)
         .with_state(state)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HealthUpstreamStatus {
+    Disabled,
+    Ready,
+    Unavailable,
+}
+
+impl HealthUpstreamStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "not_checked",
+            Self::Ready => "ready",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    const fn http_status(self) -> StatusCode {
+        match self {
+            Self::Disabled | Self::Ready => StatusCode::OK,
+            Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
 }
 
 /// Renders the compact health/config summary kept from the bootstrap binary.
@@ -207,7 +234,7 @@ pub(crate) fn render_health(config: &AppConfig, path: &Path, request_id: &Reques
     )
 }
 
-async fn health_handler(State(state): State<ProxyState>) -> Response<Body> {
+async fn config_summary_handler(State(state): State<ProxyState>) -> Response<Body> {
     match state.config.snapshot() {
         Ok(config) => text_response(
             StatusCode::OK,
@@ -221,7 +248,495 @@ async fn health_handler(State(state): State<ProxyState>) -> Response<Body> {
     }
 }
 
+async fn health_handler(State(state): State<ProxyState>) -> Response<Body> {
+    match state.config.snapshot() {
+        Ok(config) => {
+            let upstream = probe_upstream_readiness(&state, &config).await;
+            let status = upstream.http_status();
+            json_response(
+                status,
+                json!({
+                    "service": SERVICE_NAME,
+                    "process": "alive",
+                    "readiness": Health::current().readiness().as_str(),
+                    "upstream": upstream.as_str(),
+                    "upstream_probe_enabled": config
+                        .observability
+                        .health_upstream_probe_enabled
+                        .is_enabled(),
+                    "observability_enabled": config.observability.enabled,
+                    "request_id": RequestId::generate().as_str(),
+                })
+                .to_string(),
+            )
+        }
+        Err(error) => proxy_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_snapshot_failed",
+            &error.to_string(),
+        ),
+    }
+}
+
+async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
+    match state.config.snapshot() {
+        Ok(config) if config.observability.metrics_enabled.is_enabled() => {
+            match state.store.metrics_snapshot() {
+                Ok(snapshot) => text_response(StatusCode::OK, render_metrics(&snapshot)),
+                Err(error) => proxy_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "metrics_snapshot_failed",
+                    &error.to_string(),
+                ),
+            }
+        }
+        Ok(_config) => proxy_error_response(
+            StatusCode::NOT_FOUND,
+            "metrics_disabled",
+            "metrics endpoint is disabled",
+        ),
+        Err(error) => proxy_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_snapshot_failed",
+            &error.to_string(),
+        ),
+    }
+}
+
+async fn probe_upstream_readiness(state: &ProxyState, config: &AppConfig) -> HealthUpstreamStatus {
+    if !config
+        .observability
+        .health_upstream_probe_enabled
+        .is_enabled()
+    {
+        return HealthUpstreamStatus::Disabled;
+    }
+    let uri = Uri::from_static("/v1/models");
+    let Ok(url) = build_upstream_url(&config.upstream.base_url, &uri) else {
+        return HealthUpstreamStatus::Unavailable;
+    };
+    let timeout = Duration::from_millis(config.observability.health_upstream_probe_timeout_ms);
+    match tokio::time::timeout(timeout, state.client.get(url).send()).await {
+        Ok(Ok(response)) if response.status().is_success() => HealthUpstreamStatus::Ready,
+        Ok(Ok(response)) if response.status().as_u16() == StatusCode::UNAUTHORIZED.as_u16() => {
+            HealthUpstreamStatus::Ready
+        }
+        _ => HealthUpstreamStatus::Unavailable,
+    }
+}
+
+fn is_configured_debug_summary_request(state: &ProxyState, uri: &Uri) -> bool {
+    uri.path() == DEBUG_SUMMARY_PATH && state.config.snapshot().is_ok()
+}
+
+fn debug_summary_response(state: &ProxyState, request: &Request<Body>) -> Response<Body> {
+    let config = match state.config.snapshot() {
+        Ok(config) => config,
+        Err(error) => {
+            return proxy_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_snapshot_failed",
+                &error.to_string(),
+            );
+        }
+    };
+    if !config.observability.debug_summary_enabled.is_enabled() {
+        return proxy_error_response(
+            StatusCode::NOT_FOUND,
+            "debug_summary_disabled",
+            "debug summary endpoint is disabled",
+        );
+    }
+    if !debug_summary_authorized(
+        request.headers(),
+        config.observability.debug_summary_admin_token.as_deref(),
+    ) {
+        return proxy_error_response(
+            StatusCode::UNAUTHORIZED,
+            "debug_summary_unauthorized",
+            "debug summary authorization failed",
+        );
+    }
+    let limit = debug_summary_limit(
+        request.uri(),
+        config.observability.debug_summary_max_records,
+        config.observability.debug_summary_max_records,
+    );
+    match state.store.recent_request_summaries(limit) {
+        Ok(summaries) => json_response(
+            StatusCode::OK,
+            render_debug_summary_json(limit, &summaries).to_string(),
+        ),
+        Err(error) => proxy_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "debug_summary_failed",
+            &error.to_string(),
+        ),
+    }
+}
+
+fn debug_summary_authorized(headers: &HeaderMap, token: Option<&str>) -> bool {
+    let Some(token) = token.filter(|token| !token.is_empty()) else {
+        return true;
+    };
+    let bearer_matches = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|value| admin_token_matches(value, token));
+    let header_matches = headers
+        .get(HeaderName::from_static("x-admin-token"))
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| admin_token_matches(value, token));
+    bearer_matches || header_matches
+}
+
+fn admin_token_matches(candidate: &str, expected: &str) -> bool {
+    let candidate = candidate.as_bytes();
+    let expected = expected.as_bytes();
+    let mut diff = candidate.len() ^ expected.len();
+
+    for (index, expected_byte) in expected.iter().copied().enumerate() {
+        let candidate_byte = candidate.get(index).copied().unwrap_or(0);
+        diff |= usize::from(candidate_byte ^ expected_byte);
+    }
+
+    diff == 0
+}
+
+fn debug_summary_limit(uri: &Uri, default_limit: u32, max_limit: u32) -> u32 {
+    let bounded_default = default_limit.clamp(1, max_limit.max(1));
+    let Some(query) = uri.query() else {
+        return bounded_default;
+    };
+    query
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .find_map(|(key, value)| {
+            if key == "limit" {
+                value.parse::<u32>().ok()
+            } else {
+                None
+            }
+        })
+        .map_or(bounded_default, |limit| limit.clamp(1, max_limit.max(1)))
+}
+
+fn render_debug_summary_json(limit: u32, summaries: &[DebugRequestSummary]) -> serde_json::Value {
+    let requests = summaries
+        .iter()
+        .map(|summary| {
+            json!({
+                "request_id": summary.request_id.as_str(),
+                "started_at_unix_ms": summary.started_at_unix_ms,
+                "finished_at_unix_ms": summary.finished_at_unix_ms,
+                "duration_ms": summary.duration_ms,
+                "downstream_mode": summary.downstream_mode.as_str(),
+                "upstream_mode": summary.upstream_mode.as_str(),
+                "model_id": summary.model_id.as_deref(),
+                "status": summary.status.as_str(),
+                "http_status": summary.http_status,
+                "error_reason": summary.error_reason.as_deref(),
+                "abort_reason": summary.abort_reason.as_deref(),
+                "attempt_count": summary.attempt_count,
+                "retry_count": summary.retry_count,
+                "loop_detected": summary.loop_detected,
+                "request_metadata": &summary.request_metadata,
+                "response_metadata": &summary.response_metadata,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "limit": limit,
+        "request_count": summaries.len(),
+        "redaction": "raw prompts, raw outputs, and sensitive headers are omitted or redacted",
+        "requests": requests,
+    })
+}
+
+fn render_metrics(snapshot: &ObservabilityMetricsSnapshot) -> String {
+    let mut output = String::new();
+    push_request_metrics(&mut output, snapshot);
+    push_attempt_metrics(&mut output, snapshot);
+    push_retry_and_error_metrics(&mut output, snapshot);
+    push_latency_metrics(&mut output, snapshot);
+    push_heartbeat_metrics(&mut output, snapshot);
+    push_storage_metrics(&mut output, snapshot);
+    output
+}
+
+fn push_request_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_current_retained_requests",
+        "Currently retained proxy request rows by bounded lifecycle labels.",
+        "gauge",
+    );
+    for row in &snapshot.request_counts {
+        push_metric_line(
+            output,
+            "llm_guard_proxy_current_retained_requests",
+            &[
+                ("status", &row.status),
+                ("downstream_mode", &row.downstream_mode),
+                ("upstream_mode", &row.upstream_mode),
+                ("http_status_class", &row.http_status_class),
+            ],
+            row.count,
+        );
+    }
+}
+
+fn push_attempt_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_current_retained_attempts",
+        "Currently retained proxy upstream attempts by bounded lifecycle labels.",
+        "gauge",
+    );
+    for row in &snapshot.attempt_counts {
+        push_metric_line(
+            output,
+            "llm_guard_proxy_current_retained_attempts",
+            &[
+                ("status", &row.status),
+                ("upstream_mode", &row.upstream_mode),
+                ("http_status_class", &row.http_status_class),
+            ],
+            row.count,
+        );
+    }
+}
+
+fn push_retry_and_error_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_current_retained_retries",
+        "Currently retained attempts retried or marked with retry reasons.",
+        "gauge",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_current_retained_retries",
+        &[],
+        snapshot.retry_count,
+    );
+    push_metric_header(
+        output,
+        "llm_guard_proxy_current_retained_loop_aborts",
+        "Currently retained loop-guard abort observations.",
+        "gauge",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_current_retained_loop_aborts",
+        &[],
+        snapshot.loop_abort_count,
+    );
+    push_metric_header(
+        output,
+        "llm_guard_proxy_current_retained_upstream_errors",
+        "Currently retained upstream error observations by bounded error bucket.",
+        "gauge",
+    );
+    for row in &snapshot.upstream_error_counts {
+        push_metric_line(
+            output,
+            "llm_guard_proxy_current_retained_upstream_errors",
+            &[
+                ("kind", &row.kind),
+                ("http_status_class", &row.http_status_class),
+            ],
+            row.count,
+        );
+    }
+}
+
+fn push_latency_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
+    push_latency_distribution_gauges(
+        output,
+        "llm_guard_proxy_current_retained_first_token_latency_ms",
+        "first-token latency in milliseconds for shielded attempts",
+        &snapshot.first_token_latency_ms,
+    );
+    push_latency_distribution_gauges(
+        output,
+        "llm_guard_proxy_current_retained_total_latency_ms",
+        "end-to-end request latency in milliseconds",
+        &snapshot.total_latency_ms,
+    );
+}
+
+fn push_heartbeat_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_current_retained_heartbeat_modes",
+        "Currently retained downstream heartbeat/liveness mode counts.",
+        "gauge",
+    );
+    for row in &snapshot.heartbeat_mode_counts {
+        push_metric_line(
+            output,
+            "llm_guard_proxy_current_retained_heartbeat_modes",
+            &[("mode", &row.mode)],
+            row.count,
+        );
+    }
+}
+
+fn push_storage_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_observability_records",
+        "Currently retained observability records.",
+        "gauge",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_observability_records",
+        &[],
+        snapshot.retention_usage.record_count,
+    );
+    push_metric_header(
+        output,
+        "llm_guard_proxy_observability_storage_bytes",
+        "SQLite bytes used by the observability store.",
+        "gauge",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_observability_storage_bytes",
+        &[],
+        snapshot.retention_usage.observed_bytes,
+    );
+    push_metric_header(
+        output,
+        "llm_guard_proxy_storage_pruning_events_total",
+        "Retention pruning events that removed rows.",
+        "counter",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_storage_pruning_events_total",
+        &[],
+        snapshot.pruning.prune_events,
+    );
+    push_metric_header(
+        output,
+        "llm_guard_proxy_storage_pruned_requests_total",
+        "Request rows removed by retention pruning.",
+        "counter",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_storage_pruned_requests_total",
+        &[],
+        snapshot.pruning.pruned_requests,
+    );
+    push_metric_header(
+        output,
+        "llm_guard_proxy_storage_pruned_attempts_total",
+        "Attempt rows removed by retention pruning.",
+        "counter",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_storage_pruned_attempts_total",
+        &[],
+        snapshot.pruning.pruned_attempts,
+    );
+}
+
+fn push_latency_distribution_gauges(
+    output: &mut String,
+    name: &str,
+    help: &str,
+    histogram: &LatencyHistogram,
+) {
+    let le_metric = format!("{name}_le");
+    push_metric_header(
+        output,
+        &le_metric,
+        &format!("Currently retained {help} observations less than or equal to the bound."),
+        "gauge",
+    );
+    for bucket in &histogram.buckets {
+        let le = bucket.le_ms.to_string();
+        push_metric_line(output, &le_metric, &[("le", &le)], bucket.count);
+    }
+    push_metric_line(output, &le_metric, &[("le", "+Inf")], histogram.count);
+
+    let observations_metric = format!("{name}_observations");
+    push_metric_header(
+        output,
+        &observations_metric,
+        &format!("Currently retained {help} observation count."),
+        "gauge",
+    );
+    push_metric_line(output, &observations_metric, &[], histogram.count);
+
+    let sum_metric = format!("{name}_sum_ms");
+    push_metric_header(
+        output,
+        &sum_metric,
+        &format!("Currently retained {help} sum."),
+        "gauge",
+    );
+    push_metric_line(output, &sum_metric, &[], histogram.sum_ms);
+}
+
+fn push_metric_header(output: &mut String, name: &str, help: &str, metric_type: &str) {
+    output.push_str("# HELP ");
+    output.push_str(name);
+    output.push(' ');
+    output.push_str(help);
+    output.push('\n');
+    output.push_str("# TYPE ");
+    output.push_str(name);
+    output.push(' ');
+    output.push_str(metric_type);
+    output.push('\n');
+}
+
+fn push_metric_line(output: &mut String, name: &str, labels: &[(&str, &str)], value: u64) {
+    output.push_str(name);
+    if !labels.is_empty() {
+        output.push('{');
+        for (index, (key, value)) in labels.iter().enumerate() {
+            if index > 0 {
+                output.push(',');
+            }
+            output.push_str(key);
+            output.push_str("=\"");
+            output.push_str(&prometheus_escape_label(value));
+            output.push('"');
+        }
+        output.push('}');
+    }
+    output.push(' ');
+    output.push_str(&value.to_string());
+    output.push('\n');
+}
+
+fn prometheus_escape_label(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '"' => escaped.push_str("\\\""),
+            _ => escaped.push(character),
+        }
+    }
+    escaped
+}
+
 async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
+    if request.method() == Method::GET && is_configured_debug_summary_request(&state, request.uri())
+    {
+        return debug_summary_response(&state, &request);
+    }
+
     let request_id = RequestId::generate();
     let started_at_unix_ms = unix_time_millis();
     if let Err(error) = validate_openai_path(request.uri().path()) {
@@ -3447,6 +3962,15 @@ fn record_observability_many(
             eprintln!("failed to write attempt observability: {error}");
         }
     }
+}
+
+fn json_response(status: StatusCode, body: String) -> Response<Body> {
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
 }
 
 fn text_response(status: StatusCode, text: String) -> Response<Body> {

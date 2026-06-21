@@ -8,9 +8,11 @@ mod observability;
 mod settings;
 
 pub use observability::{
-    AttemptId, AttemptRecord, AttemptStatus, DownstreamMode, ObservabilityError,
-    ObservabilityStore, RawPayloads, RequestId, RequestRecord, RequestStatus, RetentionUsage,
-    StoreWrite, UpstreamMode,
+    AttemptId, AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary,
+    DownstreamMode, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram,
+    ObservabilityError, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId,
+    RequestMetricCount, RequestRecord, RequestStatus, RetentionPruningStats, RetentionUsage,
+    StoreWrite, UpstreamErrorMetricCount, UpstreamMode,
 };
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,

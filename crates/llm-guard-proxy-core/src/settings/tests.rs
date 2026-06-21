@@ -25,6 +25,17 @@ fn defaults_match_issue_contract() {
     assert!(config.shielding.enabled);
     assert!(config.observability.enabled);
     assert!(!config.observability.capture_raw_payloads);
+    assert!(config.observability.metrics_enabled.is_enabled());
+    assert!(
+        config
+            .observability
+            .health_upstream_probe_enabled
+            .is_enabled()
+    );
+    assert_eq!(config.observability.health_upstream_probe_timeout_ms, 500);
+    assert!(!config.observability.debug_summary_enabled.is_enabled());
+    assert_eq!(config.observability.debug_summary_admin_token, None);
+    assert_eq!(config.observability.debug_summary_max_records, 20);
     assert!(config.thinking.enabled);
     assert_eq!(config.thinking.budget_tokens, 32_768);
     assert!(config.loop_guard.enabled);
@@ -58,6 +69,14 @@ max_in_flight_requests = 2
 [upstream.metadata]
 context_length_override = 256000
 max_model_len_override = 256000
+
+[observability]
+metrics_enabled = false
+health_upstream_probe_enabled = false
+health_upstream_probe_timeout_ms = 250
+debug_summary_enabled = true
+debug_summary_admin_token = "test-admin-token"
+debug_summary_max_records = 7
 
 [heartbeat]
 mode = "json-whitespace"
@@ -94,6 +113,20 @@ enabled = false
         config.upstream.metadata.max_model_len_override,
         Some(256_000)
     );
+    assert!(!config.observability.metrics_enabled.is_enabled());
+    assert!(
+        !config
+            .observability
+            .health_upstream_probe_enabled
+            .is_enabled()
+    );
+    assert_eq!(config.observability.health_upstream_probe_timeout_ms, 250);
+    assert!(config.observability.debug_summary_enabled.is_enabled());
+    assert_eq!(
+        config.observability.debug_summary_admin_token.as_deref(),
+        Some("test-admin-token")
+    );
+    assert_eq!(config.observability.debug_summary_max_records, 7);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::JsonWhitespace);
     assert_eq!(config.heartbeat.interval_secs, 5);
     assert_eq!(config.loop_guard.output_repeated_line_threshold, 40);
@@ -147,6 +180,40 @@ fn validates_retention_hysteresis() {
         .validate()
         .expect_err("retention relation should fail");
     assert_eq!(error.field(), "observability.retention.prune_to_bytes");
+}
+
+#[test]
+fn validates_operational_endpoint_bounds() {
+    let mut config = AppConfig::default();
+    config.observability.debug_summary_max_records = 101;
+
+    let error = config
+        .validate()
+        .expect_err("debug summary limit should be bounded");
+    assert_eq!(error.field(), "observability.debug_summary_max_records");
+
+    config.observability.debug_summary_max_records = 20;
+    config.observability.health_upstream_probe_timeout_ms = 0;
+    let error = config
+        .validate()
+        .expect_err("health probe timeout should be nonzero");
+    assert_eq!(
+        error.field(),
+        "observability.health_upstream_probe_timeout_ms"
+    );
+}
+
+#[test]
+fn empty_debug_summary_admin_token_disables_token_requirement() {
+    let config = parse_config_text(
+        r#"
+[observability]
+debug_summary_admin_token = ""
+"#,
+    )
+    .expect("empty optional token config should parse");
+
+    assert_eq!(config.observability.debug_summary_admin_token, None);
 }
 
 #[test]
@@ -440,6 +507,9 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.output_repeated_line_threshold"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.input_overlap_threshold_multiplier"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.anti_loop_hint_enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"observability.metrics_enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_admin_token"));
     assert!(RELOADABLE_FIELDS.contains(&"cloudflare.enabled"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));

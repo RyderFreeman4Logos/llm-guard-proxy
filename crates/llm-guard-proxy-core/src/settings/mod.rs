@@ -13,9 +13,9 @@ mod tests;
 
 pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
-    AppConfig, CloudflareConfig, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, MetadataConfig,
-    ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig, ServerConfig,
-    ShieldingConfig, ThinkingConfig, UpstreamConfig, redact_upstream_base_url,
+    AppConfig, CloudflareConfig, ConfigToggle, HeartbeatConfig, HeartbeatMode, LoopGuardConfig,
+    MetadataConfig, ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig,
+    ServerConfig, ShieldingConfig, ThinkingConfig, UpstreamConfig, redact_upstream_base_url,
     validate_upstream_base_url,
 };
 pub use reload::{
@@ -31,6 +31,12 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "shielding.enabled",
     "observability.enabled",
     "observability.capture_raw_payloads",
+    "observability.metrics_enabled",
+    "observability.health_upstream_probe_enabled",
+    "observability.health_upstream_probe_timeout_ms",
+    "observability.debug_summary_enabled",
+    "observability.debug_summary_admin_token",
+    "observability.debug_summary_max_records",
     "observability.retention.max_bytes",
     "observability.retention.prune_to_bytes",
     "observability.retention.max_records",

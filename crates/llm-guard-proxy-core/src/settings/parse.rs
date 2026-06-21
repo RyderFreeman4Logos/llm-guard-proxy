@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
 use super::{
-    AppConfig, CloudflareConfig, ConfigParseError, HeartbeatConfig, HeartbeatMode, LoopGuardConfig,
-    MetadataConfig, ObservabilityConfig, RetentionConfig, RetryConfig, ServerConfig,
-    ShieldingConfig, ThinkingConfig, UpstreamConfig,
+    AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, HeartbeatConfig, HeartbeatMode,
+    LoopGuardConfig, MetadataConfig, ObservabilityConfig, RetentionConfig, RetryConfig,
+    ServerConfig, ShieldingConfig, ThinkingConfig, UpstreamConfig,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -235,6 +235,33 @@ fn assign_observability(
         "enabled" => config.enabled = parse_bool(value, line_number)?,
         "sqlite_path" => config.sqlite_path = PathBuf::from(parse_string(value, line_number)?),
         "capture_raw_payloads" => config.capture_raw_payloads = parse_bool(value, line_number)?,
+        "metrics_enabled" => {
+            config.metrics_enabled = ConfigToggle::from_bool(parse_bool(value, line_number)?);
+        }
+        "health_upstream_probe_enabled" => {
+            config.health_upstream_probe_enabled =
+                ConfigToggle::from_bool(parse_bool(value, line_number)?);
+        }
+        "health_upstream_probe_timeout_ms" => {
+            config.health_upstream_probe_timeout_ms = parse_u64(
+                value,
+                line_number,
+                "observability.health_upstream_probe_timeout_ms",
+            )?;
+        }
+        "debug_summary_enabled" => {
+            config.debug_summary_enabled = ConfigToggle::from_bool(parse_bool(value, line_number)?);
+        }
+        "debug_summary_admin_token" => {
+            config.debug_summary_admin_token = parse_optional_string(value, line_number)?;
+        }
+        "debug_summary_max_records" => {
+            config.debug_summary_max_records = parse_u32(
+                value,
+                line_number,
+                "observability.debug_summary_max_records",
+            )?;
+        }
         _ => return unknown_key("observability", key, line_number),
     }
     Ok(())
@@ -434,6 +461,14 @@ fn parse_string(value: &str, line_number: usize) -> Result<String, ConfigParseEr
         }
     }
     Ok(parsed)
+}
+
+fn parse_optional_string(
+    value: &str,
+    line_number: usize,
+) -> Result<Option<String>, ConfigParseError> {
+    let parsed = parse_string(value, line_number)?;
+    Ok((!parsed.is_empty()).then_some(parsed))
 }
 
 fn parse_bool(value: &str, line_number: usize) -> Result<bool, ConfigParseError> {
