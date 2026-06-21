@@ -69,13 +69,17 @@ struct JsonPath {
 
 #[derive(Clone, Copy, Debug)]
 struct BudgetObservation {
-    path: Option<JsonPath>,
+    path: JsonPath,
     state: BudgetState,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BudgetObservations {
+    entries: Vec<BudgetObservation>,
 }
 
 #[derive(Clone, Copy, Debug)]
 enum BudgetState {
-    Absent,
     Numeric(u64),
     Malformed,
 }
@@ -194,6 +198,10 @@ struct ThinkingPolicyOutcome {
     reason: &'static str,
     final_budget: String,
     answer_budget_delta: u64,
+    rewritten_paths: Vec<JsonPath>,
+    preserved_paths: Vec<JsonPath>,
+    malformed_paths: Vec<JsonPath>,
+    zero_paths: Vec<JsonPath>,
 }
 
 fn apply_thinking_policy(
@@ -201,14 +209,14 @@ fn apply_thinking_policy(
     thinking: &ThinkingConfig,
 ) -> BTreeMap<String, String> {
     let configured_budget = u64::from(thinking.budget_tokens);
-    let budget_observation = find_budget_observation(object);
+    let budget_observations = find_budget_observations(object);
     let disable_marker = find_disable_marker(object);
-    let mut metadata = initial_thinking_metadata(thinking, configured_budget, &budget_observation);
+    let mut metadata = initial_thinking_metadata(thinking, configured_budget, &budget_observations);
     let outcome = apply_thinking_budget_policy(
         object,
         thinking,
         configured_budget,
-        budget_observation,
+        &budget_observations,
         disable_marker,
         &mut metadata,
     );
@@ -225,7 +233,7 @@ fn apply_thinking_policy(
 fn initial_thinking_metadata(
     thinking: &ThinkingConfig,
     configured_budget: u64,
-    budget_observation: &BudgetObservation,
+    budget_observations: &BudgetObservations,
 ) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -242,23 +250,41 @@ fn initial_thinking_metadata(
         ),
         (
             String::from("thinking_budget_previous_state"),
-            previous_budget_state(budget_observation, configured_budget),
+            previous_budget_state(budget_observations, configured_budget),
         ),
         (
             String::from("thinking_budget_previous_tokens"),
-            previous_budget_tokens(budget_observation),
+            previous_budget_tokens(budget_observations),
         ),
         (
             String::from("thinking_schema_path"),
-            budget_observation
-                .path
-                .map_or_else(|| String::from("none"), JsonPath::display_path),
+            budget_observations.single_path().map_or_else(
+                || {
+                    if budget_observations.is_empty() {
+                        String::from("none")
+                    } else {
+                        String::from("multiple")
+                    }
+                },
+                JsonPath::display_path,
+            ),
         ),
         (
             String::from("thinking_schema_variant"),
-            budget_observation
-                .path
-                .map_or_else(|| String::from("none"), |path| path.variant.to_owned()),
+            budget_observations.single_path().map_or_else(
+                || {
+                    if budget_observations.is_empty() {
+                        String::from("none")
+                    } else {
+                        String::from("multiple")
+                    }
+                },
+                |path| path.variant.to_owned(),
+            ),
+        ),
+        (
+            String::from("thinking_budget_observed_paths"),
+            observed_budget_paths(budget_observations, configured_budget),
         ),
     ])
 }
@@ -267,65 +293,112 @@ fn apply_thinking_budget_policy(
     object: &mut Map<String, Value>,
     thinking: &ThinkingConfig,
     configured_budget: u64,
-    budget_observation: BudgetObservation,
+    budget_observations: &BudgetObservations,
     disable_marker: DisableMarker,
     metadata: &mut BTreeMap<String, String>,
 ) -> ThinkingPolicyOutcome {
     if !thinking.enabled {
-        return thinking_noop("policy_disabled", &budget_observation);
+        return thinking_noop("policy_disabled", budget_observations);
     }
     if configured_budget == 0 {
-        return thinking_noop("configured_budget_zero", &budget_observation);
+        return thinking_noop("configured_budget_zero", budget_observations);
     }
     match disable_marker {
         DisableMarker::Disabled(path) => {
             insert_disable_marker_metadata(metadata, path);
-            thinking_noop("caller_disabled_thinking", &budget_observation)
+            thinking_noop("caller_disabled_thinking", budget_observations)
         }
         DisableMarker::Malformed(path) => {
             insert_disable_marker_metadata(metadata, path);
-            thinking_noop("malformed_disable_marker", &budget_observation)
+            thinking_noop("malformed_disable_marker", budget_observations)
         }
         DisableMarker::None => {
-            apply_budget_observation(object, configured_budget, budget_observation, metadata)
+            apply_budget_observations(object, configured_budget, budget_observations, metadata)
         }
     }
 }
 
-fn apply_budget_observation(
+fn apply_budget_observations(
     object: &mut Map<String, Value>,
     configured_budget: u64,
-    budget_observation: BudgetObservation,
+    budget_observations: &BudgetObservations,
     metadata: &mut BTreeMap<String, String>,
 ) -> ThinkingPolicyOutcome {
-    match budget_observation.state {
-        BudgetState::Absent => inject_missing_budget(object, configured_budget, metadata),
-        BudgetState::Malformed => ThinkingPolicyOutcome {
-            rewrite_applied: false,
-            reason: "malformed_existing_budget",
-            final_budget: String::from("unknown"),
-            answer_budget_delta: 0,
-        },
-        BudgetState::Numeric(0) => ThinkingPolicyOutcome {
+    if budget_observations.is_empty() {
+        return inject_missing_budget(object, configured_budget, metadata);
+    }
+
+    let zero_paths = budget_observations.zero_paths();
+    if !zero_paths.is_empty() {
+        return ThinkingPolicyOutcome {
             rewrite_applied: false,
             reason: "existing_budget_zero",
-            final_budget: String::from("0"),
+            final_budget: final_budget_tokens(budget_observations, configured_budget),
             answer_budget_delta: 0,
-        },
-        BudgetState::Numeric(existing_budget) if existing_budget < configured_budget => {
-            raise_existing_budget(
-                object,
-                configured_budget,
-                existing_budget,
-                budget_observation.path,
-            )
+            rewritten_paths: Vec::new(),
+            preserved_paths: budget_observations.non_malformed_paths(),
+            malformed_paths: budget_observations.malformed_paths(),
+            zero_paths,
+        };
+    }
+
+    let mut rewritten_paths = Vec::new();
+    let mut preserved_paths = Vec::new();
+    let mut malformed_paths = Vec::new();
+    let mut answer_budget_delta = 0;
+    for observation in &budget_observations.entries {
+        match observation.state {
+            BudgetState::Malformed => malformed_paths.push(observation.path),
+            BudgetState::Numeric(existing_budget) if existing_budget < configured_budget => {
+                if !set_budget_at_path(object, observation.path, configured_budget) {
+                    return malformed_budget_container_outcome(
+                        budget_observations,
+                        configured_budget,
+                    );
+                }
+                rewritten_paths.push(observation.path);
+                answer_budget_delta =
+                    answer_budget_delta.max(configured_budget.saturating_sub(existing_budget));
+            }
+            BudgetState::Numeric(_existing_budget) => preserved_paths.push(observation.path),
         }
-        BudgetState::Numeric(existing_budget) => ThinkingPolicyOutcome {
+    }
+
+    if !rewritten_paths.is_empty() {
+        return ThinkingPolicyOutcome {
+            rewrite_applied: true,
+            reason: "raised_smaller_budget",
+            final_budget: final_budget_tokens(budget_observations, configured_budget),
+            answer_budget_delta,
+            rewritten_paths,
+            preserved_paths,
+            malformed_paths,
+            zero_paths: Vec::new(),
+        };
+    }
+
+    if !preserved_paths.is_empty() {
+        return ThinkingPolicyOutcome {
             rewrite_applied: false,
             reason: "preserved_equal_or_larger_budget",
-            final_budget: existing_budget.to_string(),
+            final_budget: final_budget_tokens(budget_observations, configured_budget),
             answer_budget_delta: 0,
-        },
+            rewritten_paths,
+            preserved_paths,
+            malformed_paths,
+            zero_paths: Vec::new(),
+        };
+    }
+
+    ThinkingPolicyOutcome {
+        rewrite_applied: false,
+        reason: "malformed_existing_budget",
+        final_budget: final_budget_tokens(budget_observations, configured_budget),
+        answer_budget_delta: 0,
+        rewritten_paths,
+        preserved_paths,
+        malformed_paths,
+        zero_paths: Vec::new(),
     }
 }
 
@@ -346,6 +419,10 @@ fn inject_missing_budget(
             reason: "injected_missing_budget",
             final_budget: configured_budget.to_string(),
             answer_budget_delta: configured_budget,
+            rewritten_paths: vec![path],
+            preserved_paths: Vec::new(),
+            malformed_paths: Vec::new(),
+            zero_paths: Vec::new(),
         };
     }
     ThinkingPolicyOutcome {
@@ -353,40 +430,42 @@ fn inject_missing_budget(
         reason: "malformed_budget_container",
         final_budget: String::from("unknown"),
         answer_budget_delta: 0,
+        rewritten_paths: Vec::new(),
+        preserved_paths: Vec::new(),
+        malformed_paths: Vec::new(),
+        zero_paths: Vec::new(),
     }
 }
 
-fn raise_existing_budget(
-    object: &mut Map<String, Value>,
+fn malformed_budget_container_outcome(
+    budget_observations: &BudgetObservations,
     configured_budget: u64,
-    existing_budget: u64,
-    path: Option<JsonPath>,
 ) -> ThinkingPolicyOutcome {
-    if path.is_some_and(|path| set_budget_at_path(object, path, configured_budget)) {
-        return ThinkingPolicyOutcome {
-            rewrite_applied: true,
-            reason: "raised_smaller_budget",
-            final_budget: configured_budget.to_string(),
-            answer_budget_delta: configured_budget.saturating_sub(existing_budget),
-        };
-    }
     ThinkingPolicyOutcome {
         rewrite_applied: false,
         reason: "malformed_budget_container",
-        final_budget: String::from("unknown"),
+        final_budget: final_budget_tokens(budget_observations, configured_budget),
         answer_budget_delta: 0,
+        rewritten_paths: Vec::new(),
+        preserved_paths: Vec::new(),
+        malformed_paths: budget_observations.malformed_paths(),
+        zero_paths: budget_observations.zero_paths(),
     }
 }
 
 fn thinking_noop(
     reason: &'static str,
-    budget_observation: &BudgetObservation,
+    budget_observations: &BudgetObservations,
 ) -> ThinkingPolicyOutcome {
     ThinkingPolicyOutcome {
         rewrite_applied: false,
         reason,
-        final_budget: final_budget_tokens(budget_observation),
+        final_budget: current_budget_tokens(budget_observations),
         answer_budget_delta: 0,
+        rewritten_paths: Vec::new(),
+        preserved_paths: budget_observations.non_malformed_paths(),
+        malformed_paths: budget_observations.malformed_paths(),
+        zero_paths: budget_observations.zero_paths(),
     }
 }
 
@@ -404,8 +483,8 @@ fn insert_disable_marker_metadata(metadata: &mut BTreeMap<String, String>, path:
 fn thinking_outcome_metadata(
     outcome: &ThinkingPolicyOutcome,
     answer_budget: &AnswerBudgetDecision,
-) -> [(String, String); 9] {
-    [
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
         (
             String::from("thinking_rewrite_applied"),
             outcome.rewrite_applied.to_string(),
@@ -442,32 +521,45 @@ fn thinking_outcome_metadata(
             String::from("thinking_answer_budget_overflow_fields"),
             join_fields(&answer_budget.overflow_fields),
         ),
-    ]
+        (
+            String::from("thinking_budget_rewritten_paths"),
+            join_paths(&outcome.rewritten_paths),
+        ),
+        (
+            String::from("thinking_budget_preserved_paths"),
+            join_paths(&outcome.preserved_paths),
+        ),
+        (
+            String::from("thinking_budget_malformed_paths"),
+            join_paths(&outcome.malformed_paths),
+        ),
+        (
+            String::from("thinking_budget_zero_paths"),
+            join_paths(&outcome.zero_paths),
+        ),
+    ])
 }
 
-fn find_budget_observation(object: &Map<String, Value>) -> BudgetObservation {
+fn find_budget_observations(object: &Map<String, Value>) -> BudgetObservations {
+    let mut entries = Vec::new();
     for path in BUDGET_PATHS {
         match value_at_path(object, path.path) {
             PathValue::Missing => {}
             PathValue::Malformed => {
-                return BudgetObservation {
-                    path: Some(*path),
+                entries.push(BudgetObservation {
+                    path: *path,
                     state: BudgetState::Malformed,
-                };
+                });
             }
             PathValue::Value(value) => {
-                return BudgetObservation {
-                    path: Some(*path),
+                entries.push(BudgetObservation {
+                    path: *path,
                     state: token_budget_value(value),
-                };
+                });
             }
         }
     }
-
-    BudgetObservation {
-        path: None,
-        state: BudgetState::Absent,
-    }
+    BudgetObservations { entries }
 }
 
 fn find_disable_marker(object: &Map<String, Value>) -> DisableMarker {
@@ -591,30 +683,82 @@ fn apply_answer_budget_preservation(
     decision
 }
 
-fn previous_budget_state(observation: &BudgetObservation, configured_budget: u64) -> String {
-    match observation.state {
-        BudgetState::Absent => String::from("absent"),
-        BudgetState::Malformed => String::from("malformed"),
-        BudgetState::Numeric(0) => String::from("zero"),
-        BudgetState::Numeric(existing) if existing < configured_budget => String::from("smaller"),
-        BudgetState::Numeric(existing) if existing == configured_budget => String::from("equal"),
-        BudgetState::Numeric(_existing) => String::from("larger"),
+fn previous_budget_state(observations: &BudgetObservations, configured_budget: u64) -> String {
+    if observations.is_empty() {
+        return String::from("absent");
+    }
+    let mut states = observations
+        .entries
+        .iter()
+        .map(|observation| budget_state_label(observation.state, configured_budget))
+        .collect::<Vec<_>>();
+    states.sort_unstable();
+    states.dedup();
+    if states.len() == 1 {
+        states[0].to_owned()
+    } else {
+        String::from("mixed")
     }
 }
 
-fn previous_budget_tokens(observation: &BudgetObservation) -> String {
-    match observation.state {
-        BudgetState::Absent => String::from("absent"),
+fn previous_budget_tokens(observations: &BudgetObservations) -> String {
+    if observations.is_empty() {
+        return String::from("absent");
+    }
+    if observations.entries.len() > 1 {
+        return String::from("multiple");
+    }
+    match observations.entries[0].state {
         BudgetState::Malformed => String::from("malformed"),
         BudgetState::Numeric(value) => value.to_string(),
     }
 }
 
-fn final_budget_tokens(observation: &BudgetObservation) -> String {
-    match observation.state {
-        BudgetState::Absent => String::from("absent"),
-        BudgetState::Malformed => String::from("unknown"),
-        BudgetState::Numeric(value) => value.to_string(),
+fn final_budget_tokens(observations: &BudgetObservations, configured_budget: u64) -> String {
+    budget_tokens_summary(observations, |value| {
+        if value > 0 && value < configured_budget {
+            configured_budget
+        } else {
+            value
+        }
+    })
+}
+
+fn current_budget_tokens(observations: &BudgetObservations) -> String {
+    budget_tokens_summary(observations, |value| value)
+}
+
+fn budget_tokens_summary(
+    observations: &BudgetObservations,
+    map_numeric: impl Fn(u64) -> u64,
+) -> String {
+    if observations.is_empty() {
+        return String::from("absent");
+    }
+    let mut values = observations
+        .entries
+        .iter()
+        .filter_map(|observation| match observation.state {
+            BudgetState::Malformed => None,
+            BudgetState::Numeric(value) => Some(map_numeric(value)),
+        })
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    match values.len() {
+        0 => String::from("unknown"),
+        1 => values[0].to_string(),
+        _ => String::from("multiple"),
+    }
+}
+
+fn budget_state_label(state: BudgetState, configured_budget: u64) -> &'static str {
+    match state {
+        BudgetState::Malformed => "malformed",
+        BudgetState::Numeric(0) => "zero",
+        BudgetState::Numeric(existing) if existing < configured_budget => "smaller",
+        BudgetState::Numeric(existing) if existing == configured_budget => "equal",
+        BudgetState::Numeric(_existing) => "larger",
     }
 }
 
@@ -626,9 +770,83 @@ fn join_fields(fields: &[&str]) -> String {
     }
 }
 
+fn join_paths(paths: &[JsonPath]) -> String {
+    if paths.is_empty() {
+        String::from("none")
+    } else {
+        paths
+            .iter()
+            .map(|path| path.display_path())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn observed_budget_paths(observations: &BudgetObservations, configured_budget: u64) -> String {
+    if observations.is_empty() {
+        return String::from("none");
+    }
+    observations
+        .entries
+        .iter()
+        .map(|observation| {
+            format!(
+                "{}={}",
+                observation.path.display_path(),
+                budget_state_label(observation.state, configured_budget)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 impl JsonPath {
     fn display_path(self) -> String {
         self.path.join(".")
+    }
+}
+
+impl BudgetObservations {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn single_path(&self) -> Option<JsonPath> {
+        if self.entries.len() == 1 {
+            Some(self.entries[0].path)
+        } else {
+            None
+        }
+    }
+
+    fn zero_paths(&self) -> Vec<JsonPath> {
+        self.entries
+            .iter()
+            .filter_map(|observation| match observation.state {
+                BudgetState::Numeric(0) => Some(observation.path),
+                BudgetState::Numeric(_) | BudgetState::Malformed => None,
+            })
+            .collect()
+    }
+
+    fn malformed_paths(&self) -> Vec<JsonPath> {
+        self.entries
+            .iter()
+            .filter_map(|observation| match observation.state {
+                BudgetState::Malformed => Some(observation.path),
+                BudgetState::Numeric(_) => None,
+            })
+            .collect()
+    }
+
+    fn non_malformed_paths(&self) -> Vec<JsonPath> {
+        self.entries
+            .iter()
+            .filter_map(|observation| match observation.state {
+                BudgetState::Numeric(_) => Some(observation.path),
+                BudgetState::Malformed => None,
+            })
+            .collect()
     }
 }
 
