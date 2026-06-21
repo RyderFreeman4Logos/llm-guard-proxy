@@ -721,6 +721,82 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
     assert_eq!(observed_body["messages"][0]["content"], "ping");
     assert_eq!(observed_body["thinking"]["budget_tokens"], 1);
     assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["stream_options"]["include_usage"], true);
+}
+
+#[tokio::test]
+async fn shielded_non_stream_chat_preserves_stream_options_while_forcing_usage() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream_options":{"include_usage":false,"include_obfuscation":true,"vendor_hint":{"mode":"keep"}}}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated_body = response.text().await.expect("body should be text");
+    let aggregated: serde_json::Value =
+        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    assert_eq!(aggregated["usage"]["total_tokens"], 5);
+
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["stream_options"]["include_usage"], true);
+    assert_eq!(observed_body["stream_options"]["include_obfuscation"], true);
+    assert_eq!(
+        observed_body["stream_options"]["vendor_hint"]["mode"],
+        "keep"
+    );
+}
+
+#[tokio::test]
+async fn shielded_non_stream_chat_preserves_choice_logprobs_from_sse_chunks() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"logprobs":true}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated_body = response.text().await.expect("body should be text");
+    let aggregated: serde_json::Value =
+        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    assert_eq!(
+        aggregated["choices"][0]["logprobs"]["content"][0]["token"],
+        "Hello"
+    );
+    assert_eq!(
+        aggregated["choices"][0]["logprobs"]["content"][1]["token"],
+        "!"
+    );
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(aggregated["usage"]["total_tokens"], 5);
+
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["stream_options"]["include_usage"], true);
+    assert_eq!(observed_body["logprobs"], true);
 }
 
 #[tokio::test]
@@ -1960,7 +2036,7 @@ fn fake_upstream_endpoint_response(
     let (label, body) = match endpoint {
         "/v1/models" => ("models", r#"{"object":"list","data":[]}"#),
         "/v1/chat/completions" if body_requests_stream(body) => {
-            return chat_completion_sse_response();
+            return chat_completion_sse_response(body);
         }
         "/v1/chat/completions" => (
             "chat-completions",
@@ -2017,68 +2093,16 @@ fn json_response(label: &'static str, body: String) -> Response<Body> {
     response
 }
 
-fn chat_completion_sse_response() -> Response<Body> {
+fn chat_completion_sse_response(body: &Bytes) -> Response<Body> {
+    let include_usage = body_requests_stream_usage(body);
+    let include_logprobs = body_requests_logprobs(body);
+    let first_chunk = chat_completion_first_chunk();
+    let second_chunk = chat_completion_second_chunk(include_logprobs);
+    let final_chunk = chat_completion_final_chunk(include_usage, include_logprobs);
     let chunks = [
-        sse_json(&serde_json::json!({
-            "id": "chatcmpl-shielded",
-            "object": "chat.completion.chunk",
-            "created": 1_710_000_000_u64,
-            "model": "test-chat",
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "role": "assistant",
-                    "content": "Hel"
-                },
-                "finish_reason": null
-            }]
-        })),
-        sse_json(&serde_json::json!({
-            "id": "chatcmpl-shielded",
-            "object": "chat.completion.chunk",
-            "created": 1_710_000_000_u64,
-            "model": "test-chat",
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "content": "lo",
-                    "reasoning_content": "think",
-                    "tool_calls": [{
-                        "index": 0,
-                        "id": "call_1",
-                        "type": "function",
-                        "function": {
-                            "name": "lookup",
-                            "arguments": "{\"q\""
-                        }
-                    }]
-                },
-                "finish_reason": null
-            }]
-        })),
-        sse_json(&serde_json::json!({
-            "id": "chatcmpl-shielded",
-            "object": "chat.completion.chunk",
-            "created": 1_710_000_000_u64,
-            "model": "test-chat",
-            "choices": [{
-                "index": 0,
-                "delta": {
-                    "tool_calls": [{
-                        "index": 0,
-                        "function": {
-                            "arguments": ":\"x\"}"
-                        }
-                    }]
-                },
-                "finish_reason": "stop"
-            }],
-            "usage": {
-                "prompt_tokens": 3,
-                "completion_tokens": 2,
-                "total_tokens": 5
-            }
-        })),
+        sse_json(&first_chunk),
+        sse_json(&second_chunk),
+        sse_json(&final_chunk),
         Bytes::from_static(b"data: [DONE]\n\n"),
     ];
     let body = Body::from_stream(stream::iter(
@@ -2096,14 +2120,151 @@ fn chat_completion_sse_response() -> Response<Body> {
     response
 }
 
+fn chat_completion_first_chunk() -> serde_json::Value {
+    serde_json::json!({
+        "id": "chatcmpl-shielded",
+        "object": "chat.completion.chunk",
+        "created": 1_710_000_000_u64,
+        "model": "test-chat",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "content": "Hel"
+            },
+            "finish_reason": null
+        }]
+    })
+}
+
+fn chat_completion_second_chunk(include_logprobs: bool) -> serde_json::Value {
+    let mut chunk = serde_json::json!({
+        "id": "chatcmpl-shielded",
+        "object": "chat.completion.chunk",
+        "created": 1_710_000_000_u64,
+        "model": "test-chat",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "content": "lo",
+                "reasoning_content": "think",
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": "{\"q\""
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    if include_logprobs {
+        insert_first_choice_field(
+            &mut chunk,
+            "logprobs",
+            serde_json::json!({
+                "content": [{
+                    "token": "Hello",
+                    "bytes": [72, 101, 108, 108, 111],
+                    "logprob": -0.01,
+                    "top_logprobs": []
+                }]
+            }),
+        );
+    }
+    chunk
+}
+
+fn chat_completion_final_chunk(include_usage: bool, include_logprobs: bool) -> serde_json::Value {
+    let mut chunk = serde_json::json!({
+        "id": "chatcmpl-shielded",
+        "object": "chat.completion.chunk",
+        "created": 1_710_000_000_u64,
+        "model": "test-chat",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "function": {
+                        "arguments": ":\"x\"}"
+                    }
+                }]
+            },
+            "finish_reason": "stop"
+        }]
+    });
+    if include_logprobs {
+        insert_first_choice_field(
+            &mut chunk,
+            "logprobs",
+            serde_json::json!({
+                "content": [{
+                    "token": "!",
+                    "bytes": [33],
+                    "logprob": -0.02,
+                    "top_logprobs": []
+                }]
+            }),
+        );
+    }
+    if include_usage {
+        chunk
+            .as_object_mut()
+            .expect("final chunk should be a JSON object")
+            .insert(
+                String::from("usage"),
+                serde_json::json!({
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5
+                }),
+            );
+    }
+    chunk
+}
+
 fn sse_json(value: &serde_json::Value) -> Bytes {
     Bytes::from(format!("data: {value}\n\n"))
+}
+
+fn insert_first_choice_field(chunk: &mut serde_json::Value, key: &str, field: serde_json::Value) {
+    if let Some(choice) = chunk
+        .get_mut("choices")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|choices| choices.first_mut())
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        choice.insert(key.to_owned(), field);
+    }
 }
 
 fn body_requests_stream(body: &Bytes) -> bool {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| value.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn body_requests_stream_usage(body: &Bytes) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("stream_options")
+                .and_then(|stream_options| stream_options.get("include_usage"))
+                .and_then(serde_json::Value::as_bool)
+        })
+        .unwrap_or(false)
+}
+
+fn body_requests_logprobs(body: &Bytes) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value.get("logprobs").and_then(serde_json::Value::as_bool))
         .unwrap_or(false)
 }
 

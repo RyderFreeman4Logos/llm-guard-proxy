@@ -19,7 +19,7 @@ impl PreparedChatRequest {
     }
 }
 
-/// Changes only `stream` to true for non-stream chat requests that can be parsed as JSON.
+/// Forces upstream streaming and usage frames for non-stream chat requests parsed as JSON.
 pub(super) fn prepare_non_stream_request(body: &Bytes) -> Option<PreparedChatRequest> {
     let mut value = serde_json::from_slice::<Value>(body).ok()?;
     if value
@@ -32,6 +32,14 @@ pub(super) fn prepare_non_stream_request(body: &Bytes) -> Option<PreparedChatReq
 
     let object = value.as_object_mut()?;
     object.insert(String::from("stream"), Value::Bool(true));
+    let stream_options = object
+        .entry(String::from("stream_options"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    if let Value::Object(stream_options) = stream_options {
+        stream_options.insert(String::from("include_usage"), Value::Bool(true));
+    } else {
+        *stream_options = json!({ "include_usage": true });
+    }
     let upstream_body = serde_json::to_vec(&value).ok()?;
 
     Some(PreparedChatRequest {
@@ -197,6 +205,9 @@ impl ChatAggregation {
                     self.stats.finish_reason = finish_reason.as_str().map(str::to_owned);
                 }
                 self.saw_finish_reason = true;
+            }
+            if let Some(logprobs) = choice.get("logprobs").filter(|value| !value.is_null()) {
+                builder.merge_logprobs(logprobs);
             }
             if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
                 self.stats.delta_count = self.stats.delta_count.saturating_add(1);
@@ -421,10 +432,19 @@ struct ChoiceBuilder {
     content: String,
     reasoning: String,
     finish_reason: Option<Value>,
+    logprobs: Option<Value>,
     tool_calls: BTreeMap<u64, ToolCallBuilder>,
 }
 
 impl ChoiceBuilder {
+    fn merge_logprobs(&mut self, next: &Value) {
+        let Some(existing) = self.logprobs.as_mut() else {
+            self.logprobs = Some(next.clone());
+            return;
+        };
+        merge_json_value(existing, next);
+    }
+
     fn apply_delta(
         &mut self,
         delta: &Map<String, Value>,
@@ -501,11 +521,42 @@ impl ChoiceBuilder {
             );
         }
 
-        json!({
-            "index": self.index,
-            "message": Value::Object(message),
-            "finish_reason": self.finish_reason.unwrap_or(Value::Null),
-        })
+        let mut choice = Map::from_iter([
+            (
+                String::from("index"),
+                Value::Number(Number::from(self.index)),
+            ),
+            (String::from("message"), Value::Object(message)),
+            (
+                String::from("finish_reason"),
+                self.finish_reason.unwrap_or(Value::Null),
+            ),
+        ]);
+        if let Some(logprobs) = self.logprobs {
+            choice.insert(String::from("logprobs"), logprobs);
+        }
+        Value::Object(choice)
+    }
+}
+
+fn merge_json_value(existing: &mut Value, next: &Value) {
+    match (existing, next) {
+        (Value::Object(existing), Value::Object(next)) => {
+            for (key, next_value) in next {
+                match existing.get_mut(key) {
+                    Some(existing_value) => merge_json_value(existing_value, next_value),
+                    None => {
+                        existing.insert(key.clone(), next_value.clone());
+                    }
+                }
+            }
+        }
+        (Value::Array(existing), Value::Array(next)) => {
+            existing.extend(next.iter().cloned());
+        }
+        (existing, next) => {
+            *existing = next.clone();
+        }
     }
 }
 
