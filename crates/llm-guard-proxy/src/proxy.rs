@@ -986,6 +986,7 @@ async fn forward_openai_request(
     add_shielded_request_metadata(
         &mut request_metadata,
         shielded_chat_plan.intercepted,
+        shielded_chat_plan.thinking_policy_applied,
         &shielded_chat_plan.liveness,
         &shielded_chat_plan.thinking_metadata,
     );
@@ -1027,6 +1028,7 @@ async fn forward_openai_request(
         upstream_body: shielded_chat_plan.upstream_body,
         upstream_timeout: Duration::from_millis(config.upstream.request_timeout_ms),
         liveness: shielded_chat_plan.liveness,
+        thinking_policy_applied: shielded_chat_plan.thinking_policy_applied,
         thinking_metadata: shielded_chat_plan.thinking_metadata,
         request_id,
         started_at_unix_ms,
@@ -1048,6 +1050,7 @@ struct GenericForwardContext<'request> {
     upstream_body: Bytes,
     upstream_timeout: Duration,
     liveness: ShieldedLivenessSelection,
+    thinking_policy_applied: bool,
     thinking_metadata: BTreeMap<String, String>,
     request_id: &'request RequestId,
     started_at_unix_ms: u64,
@@ -1066,6 +1069,7 @@ async fn forward_generic_openai_request(
     add_shielded_request_metadata(
         &mut attempt_request_metadata,
         false,
+        context.thinking_policy_applied,
         &context.liveness,
         &context.thinking_metadata,
     );
@@ -1167,6 +1171,7 @@ struct ResponseDispatch<'request> {
 struct ShieldedChatPlan {
     upstream_body: Bytes,
     intercepted: bool,
+    thinking_policy_applied: bool,
     liveness: ShieldedLivenessSelection,
     thinking_metadata: BTreeMap<String, String>,
     loop_context: shielded_chat::LoopInspectionContext,
@@ -1179,10 +1184,18 @@ fn plan_shielded_chat(
     uri: &Uri,
     body: &Bytes,
 ) -> ShieldedChatPlan {
-    let request = if should_intercept_non_stream_chat(method, uri, config) {
-        shielded_chat::prepare_non_stream_request(body, &config.thinking)
+    let (request, intercepted) = if should_intercept_non_stream_chat(method, uri, config) {
+        let non_stream_request = shielded_chat::prepare_non_stream_request(body, &config.thinking);
+        if non_stream_request.is_some() {
+            (non_stream_request, true)
+        } else {
+            (
+                shielded_chat::prepare_stream_request(body, &config.thinking),
+                false,
+            )
+        }
     } else {
-        None
+        (None, false)
     };
     let upstream_body = request.as_ref().map_or_else(
         || body.clone(),
@@ -1191,7 +1204,7 @@ fn plan_shielded_chat(
     let thinking_metadata = request
         .as_ref()
         .map_or_else(BTreeMap::new, |request| request.thinking_metadata().clone());
-    let intercepted = request.is_some();
+    let thinking_policy_applied = request.is_some();
     let liveness = select_shielded_liveness(state, config, body, intercepted, unix_time_millis());
     let loop_context = if intercepted {
         shielded_chat::LoopInspectionContext::from_request_body(&config.loop_guard, body)
@@ -1202,6 +1215,7 @@ fn plan_shielded_chat(
     ShieldedChatPlan {
         upstream_body,
         intercepted,
+        thinking_policy_applied,
         liveness,
         thinking_metadata,
         loop_context,
@@ -2209,6 +2223,7 @@ fn shielded_attempt_request_metadata(
     );
     add_shielded_request_metadata(
         &mut metadata,
+        true,
         true,
         &runtime.liveness,
         &runtime.thinking_metadata,
@@ -3714,12 +3729,19 @@ fn request_body_bytes_hint(headers: &HeaderMap) -> String {
 fn add_shielded_request_metadata(
     metadata: &mut BTreeMap<String, String>,
     shielded_chat: bool,
+    thinking_policy_applied: bool,
     liveness: &ShieldedLivenessSelection,
     thinking_metadata: &BTreeMap<String, String>,
 ) {
     if shielded_chat {
         add_shielded_chat_request_metadata(metadata);
         add_shielded_liveness_request_metadata(metadata, liveness);
+    }
+    if thinking_policy_applied {
+        metadata.insert(
+            String::from("policy_transform_applied"),
+            String::from("true"),
+        );
         metadata.extend(thinking_metadata.clone());
     }
 }

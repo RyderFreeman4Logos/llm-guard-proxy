@@ -42,17 +42,24 @@ the service changes are applied.
 
 ## Install wrapper binary
 
-Install from the checked-out reviewed revision:
+Install on gb10 through `mise`'s cargo backend so the binary is built on the
+arm64 host and managed as a reviewed GitHub cargo tool. Production updates
+should point at the reviewed `main` branch instead of copying a locally built
+binary from another architecture:
 
 ```bash
-reviewed_rev="$(git rev-parse --verify HEAD)"
-printf 'installing llm-guard-proxy from reviewed_rev=%s\n' "${reviewed_rev}"
-cargo install \
-  --path crates/llm-guard-proxy \
-  --root /home/obj/.local \
-  --locked \
-  --force
+mise use -g 'cargo:https://github.com/RyderFreeman4Logos/llm-guard-proxy@branch:main'
 ```
+
+The user unit expects a stable binary path. After `mise` installs or updates the
+tool, copy the resolved arm64 executable into the `ExecStart` path:
+
+```bash
+install -Dm755 "$(mise which llm-guard-proxy)" /home/obj/.local/bin/llm-guard-proxy
+```
+
+For a pre-merge live candidate, replace `@branch:main` with a reviewed feature
+branch. Reinstall from `@branch:main` after the PR merges.
 
 Verify the binary path used by the user unit:
 

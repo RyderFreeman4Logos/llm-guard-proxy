@@ -1701,6 +1701,73 @@ async fn shielded_thinking_policy_injects_missing_budget_and_preserves_answer_re
 }
 
 #[tokio::test]
+async fn streaming_chat_applies_thinking_policy_without_downstream_aggregation() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":64,"stream":true}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-endpoint")
+            .expect("streaming fake upstream SSE should be used"),
+        "chat-completions-sse"
+    );
+    let response_body = response.text().await.expect("stream body should be text");
+    assert!(response_body.contains("chat.completion.chunk"));
+    assert!(!response_body.contains("event: final"));
+
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.method, Method::POST);
+    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
+    assert_eq!(observed_body["max_tokens"], 32_832);
+    assert!(observed_body.get("stream_options").is_none());
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["policy_transform_applied"], "true");
+        assert_eq!(metadata["thinking_policy_enabled"], "true");
+        assert_eq!(metadata["thinking_policy_budget_tokens"], "32768");
+        assert_eq!(metadata["thinking_rewrite_applied"], "true");
+        assert_eq!(
+            metadata["thinking_rewrite_reason"],
+            "injected_missing_budget"
+        );
+        assert_eq!(metadata["thinking_budget_previous_state"], "absent");
+        assert_eq!(metadata["thinking_budget_final_tokens"], "32768");
+        assert_eq!(metadata["thinking_schema_path"], "thinking.budget_tokens");
+        assert_eq!(metadata["thinking_schema_variant"], "canonical");
+        assert_eq!(metadata["thinking_answer_budget_delta_tokens"], "32768");
+        assert_eq!(
+            metadata["thinking_answer_budget_preservation_applied"],
+            "true"
+        );
+        assert_eq!(
+            metadata["thinking_answer_budget_adjusted_fields"],
+            "max_tokens"
+        );
+        assert!(metadata.get("shielded_streaming").is_none());
+        assert!(metadata.get("upstream_stream_forced").is_none());
+    }
+}
+
+#[tokio::test]
 async fn shielded_thinking_policy_respects_explicit_disable_marker() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
