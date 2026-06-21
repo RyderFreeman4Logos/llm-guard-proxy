@@ -78,7 +78,14 @@ fn is_sensitive_key(key: &str) -> bool {
 fn is_non_secret_token_metric(normalized_key: &str) -> bool {
     matches!(
         normalized_key,
-        "firsttokenlatencyms" | "prompttokens" | "completiontokens" | "totaltokens"
+        "firsttokenlatencyms"
+            | "prompttokens"
+            | "completiontokens"
+            | "totaltokens"
+            | "thinkingpolicybudgettokens"
+            | "thinkingbudgetprevioustokens"
+            | "thinkingbudgetfinaltokens"
+            | "thinkinganswerbudgetdeltatokens"
     )
 }
 

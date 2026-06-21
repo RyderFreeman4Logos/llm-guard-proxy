@@ -173,6 +173,13 @@ Retention byte limits apply to actual SQLite page storage. SQLite has a
 schema/page-size minimum footprint, so limits below that floor prune retained
 rows but cannot shrink the database file below the empty-store minimum.
 
+For shielded non-stream chat requests, the thinking policy injects or raises
+known `thinking.budget_tokens` / chat-template budget fields unless the caller
+explicitly disables thinking or sets a zero budget. When
+`preserve_answer_budget` is enabled, numeric `max_tokens`,
+`max_completion_tokens`, and `max_output_tokens` fields are increased by the
+thinking-budget delta so the caller's answer-token reserve is preserved.
+
 Reloadable fields:
 
 - `shielding.enabled`
