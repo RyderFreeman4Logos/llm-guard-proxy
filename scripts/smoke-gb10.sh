@@ -12,6 +12,7 @@ REQUEST_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_REQUEST_TIMEOUT_SECS:-120}"
 CONNECT_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_CONNECT_TIMEOUT_SECS:-5}"
 READY_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_READY_TIMEOUT_SECS:-120}"
 KEEP_RUN_DIR="${LLM_GUARD_PROXY_SMOKE_KEEP:-0}"
+ADMIN_TOKEN="${LLM_GUARD_PROXY_SMOKE_ADMIN_TOKEN:-}"
 
 proxy_pid=""
 run_dir=""
@@ -170,6 +171,7 @@ http_request() {
     local label="$6"
     local path_as_is="${7:-false}"
     local accept_header="${8:-application/json}"
+    local extra_header="${9:-}"
     local stderr_path="${run_dir}/curl-${label//[^A-Za-z0-9_.-]/_}.stderr"
     local curl_exit
     local http_status
@@ -187,6 +189,9 @@ http_request() {
 
     if [[ "${path_as_is}" == "true" ]]; then
         curl_args+=(--path-as-is)
+    fi
+    if [[ -n "${extra_header}" ]]; then
+        curl_args+=(--header "${extra_header}")
     fi
     if [[ "${request_body_path}" != "-" ]]; then
         curl_args+=(--header "content-type: application/json" --data-binary "@${request_body_path}")
@@ -285,6 +290,84 @@ for model in models:
 
 context_summary = ",".join(context_summaries) if context_summaries else "absent"
 print(f"models_count={len(models)} context_metadata={context_summary}")
+PY
+}
+
+validate_config_summary() {
+    python3 - "$1" <<'PY'
+import sys
+
+text = open(sys.argv[1], "r", encoding="utf-8").read()
+for needle in ["llm-guard-proxy", "readiness=ready", "observability_enabled=true"]:
+    if needle not in text:
+        raise SystemExit(f"/config-summary missing {needle}")
+if "Bearer " in text or "x-admin-token" in text:
+    raise SystemExit("/config-summary leaked auth-looking text")
+print("summary=ok")
+PY
+}
+
+validate_health_response() {
+    python3 - "$1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+if payload.get("service") != "llm-guard-proxy":
+    raise SystemExit("/health service mismatch")
+if payload.get("process") != "alive":
+    raise SystemExit("/health process is not alive")
+if payload.get("upstream") != "ready":
+    raise SystemExit(f"/health upstream={payload.get('upstream')!r}; expected ready")
+if payload.get("upstream_probe_enabled") is not True:
+    raise SystemExit("/health upstream probe should be enabled")
+print("process=alive upstream=ready")
+PY
+}
+
+validate_metrics_response() {
+    python3 - "$1" <<'PY'
+import sys
+
+text = open(sys.argv[1], "r", encoding="utf-8").read()
+for needle in [
+    "llm_guard_proxy_current_retained_requests",
+    "llm_guard_proxy_current_retained_attempts",
+    "llm_guard_proxy_storage_pruning_events_total",
+]:
+    if needle not in text:
+        raise SystemExit(f"/metrics missing {needle}")
+for forbidden in ["Bearer ", "Authorization", "x-admin-token", "api_key"]:
+    if forbidden in text:
+        raise SystemExit(f"/metrics leaked {forbidden!r}")
+metric_lines = sum(1 for line in text.splitlines() if line and not line.startswith("#"))
+print(f"metric_lines={metric_lines}")
+PY
+}
+
+validate_debug_summary() {
+    python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+body_path, token = sys.argv[1:]
+raw = open(body_path, "r", encoding="utf-8").read()
+if token and token in raw:
+    raise SystemExit("/debug/recent-requests leaked the admin token")
+payload = json.loads(raw)
+if not isinstance(payload, dict):
+    raise SystemExit("/debug/recent-requests response is not a JSON object")
+if payload.get("limit") != 20:
+    raise SystemExit(f"/debug/recent-requests limit={payload.get('limit')!r}; expected 20")
+request_count = payload.get("request_count")
+if not isinstance(request_count, int) or request_count < 1:
+    raise SystemExit("/debug/recent-requests request_count must be a positive integer")
+if "redaction" not in payload:
+    raise SystemExit("/debug/recent-requests missing redaction statement")
+if not isinstance(payload.get("requests"), list):
+    raise SystemExit("/debug/recent-requests requests must be a list")
+print(f"request_count={request_count} redaction=present")
 PY
 }
 
@@ -449,6 +532,15 @@ if ! proxy_binary="$(resolve_proxy_binary)"; then
     exit 1
 fi
 
+if [[ -z "${ADMIN_TOKEN}" ]]; then
+    ADMIN_TOKEN="$(python3 - <<'PY'
+import secrets
+
+print(secrets.token_urlsafe(24))
+PY
+)"
+fi
+
 if [[ -z "${PORT}" ]]; then
     PORT="$(choose_port)"
 fi
@@ -483,6 +575,12 @@ enabled = true
 enabled = true
 sqlite_path = $(toml_quote "${sqlite_path}")
 capture_raw_payloads = false
+metrics_enabled = true
+health_upstream_probe_enabled = true
+health_upstream_probe_timeout_ms = 500
+debug_summary_enabled = true
+debug_summary_admin_token = $(toml_quote "${ADMIN_TOKEN}")
+debug_summary_max_records = 20
 
 [observability.retention]
 max_bytes = 1073741824
@@ -523,6 +621,22 @@ proxy_pid=$!
 
 wait_for_readiness "${base_url}"
 printf 'smoke-gb10: readiness=ready\n'
+
+config_summary_body="${run_dir}/config-summary.body.txt"
+config_summary_headers="${run_dir}/config-summary.headers"
+config_summary_status="$(http_request GET "${base_url}/config-summary" - "${config_summary_body}" "${config_summary_headers}" "config-summary")"
+require_http_status "GET /config-summary" "${config_summary_status}" "200"
+config_summary="$(validate_config_summary "${config_summary_body}")"
+printf 'smoke-gb10: endpoint=/config-summary status=%s %s\n' \
+    "${config_summary_status}" "${config_summary}"
+
+health_body="${run_dir}/health.body.json"
+health_headers="${run_dir}/health.headers"
+health_status="$(http_request GET "${base_url}/health" - "${health_body}" "${health_headers}" "health")"
+require_http_status "GET /health" "${health_status}" "200"
+health_summary="$(validate_health_response "${health_body}")"
+printf 'smoke-gb10: endpoint=/health status=%s %s\n' \
+    "${health_status}" "${health_summary}"
 
 chat_payload="${run_dir}/chat.json"
 stream_payload="${run_dir}/chat-stream.json"
@@ -587,6 +701,44 @@ dot_headers="${run_dir}/dot-segment.headers"
 dot_status="$(http_request GET "${base_url}/v1/../admin" - "${dot_body}" "${dot_headers}" "dot-segment" true)"
 require_http_status "GET /v1/../admin" "${dot_status}" "400"
 printf 'smoke-gb10: endpoint=/v1/../admin status=%s result=rejected_before_upstream\n' "${dot_status}"
+
+metrics_body="${run_dir}/metrics.body.txt"
+metrics_headers="${run_dir}/metrics.headers"
+metrics_status="$(http_request GET "${base_url}/metrics" - "${metrics_body}" "${metrics_headers}" "metrics" false "text/plain")"
+require_http_status "GET /metrics" "${metrics_status}" "200"
+metrics_summary="$(validate_metrics_response "${metrics_body}")"
+printf 'smoke-gb10: endpoint=/metrics status=%s %s\n' \
+    "${metrics_status}" "${metrics_summary}"
+
+debug_unauth_body="${run_dir}/debug-unauth.body.json"
+debug_unauth_headers="${run_dir}/debug-unauth.headers"
+debug_unauth_status="$(http_request GET "${base_url}/debug/recent-requests" - "${debug_unauth_body}" "${debug_unauth_headers}" "debug-unauth")"
+require_http_status "GET /debug/recent-requests unauthenticated" "${debug_unauth_status}" "401"
+printf 'smoke-gb10: endpoint=/debug/recent-requests auth=missing status=%s result=rejected\n' \
+    "${debug_unauth_status}"
+
+debug_wrong_body="${run_dir}/debug-wrong.body.json"
+debug_wrong_headers="${run_dir}/debug-wrong.headers"
+debug_wrong_status="$(http_request GET "${base_url}/debug/recent-requests" - "${debug_wrong_body}" "${debug_wrong_headers}" "debug-wrong" false "application/json" "authorization: Bearer wrong-admin-token")"
+require_http_status "GET /debug/recent-requests wrong token" "${debug_wrong_status}" "401"
+printf 'smoke-gb10: endpoint=/debug/recent-requests auth=wrong status=%s result=rejected\n' \
+    "${debug_wrong_status}"
+
+debug_bearer_body="${run_dir}/debug-bearer.body.json"
+debug_bearer_headers="${run_dir}/debug-bearer.headers"
+debug_bearer_status="$(http_request GET "${base_url}/debug/recent-requests?limit=50" - "${debug_bearer_body}" "${debug_bearer_headers}" "debug-bearer" false "application/json" "authorization: Bearer ${ADMIN_TOKEN}")"
+require_http_status "GET /debug/recent-requests bearer" "${debug_bearer_status}" "200"
+debug_bearer_summary="$(validate_debug_summary "${debug_bearer_body}" "${ADMIN_TOKEN}")"
+printf 'smoke-gb10: endpoint=/debug/recent-requests auth=bearer status=%s %s\n' \
+    "${debug_bearer_status}" "${debug_bearer_summary}"
+
+debug_header_body="${run_dir}/debug-header.body.json"
+debug_header_headers="${run_dir}/debug-header.headers"
+debug_header_status="$(http_request GET "${base_url}/debug/recent-requests" - "${debug_header_body}" "${debug_header_headers}" "debug-header" false "application/json" "x-admin-token: ${ADMIN_TOKEN}")"
+require_http_status "GET /debug/recent-requests x-admin-token" "${debug_header_status}" "200"
+debug_header_summary="$(validate_debug_summary "${debug_header_body}" "${ADMIN_TOKEN}")"
+printf 'smoke-gb10: endpoint=/debug/recent-requests auth=x-admin-token status=%s %s\n' \
+    "${debug_header_status}" "${debug_header_summary}"
 
 observability_summary="$(verify_observability "${sqlite_path}" "${forwarded_calls}")"
 printf 'smoke-gb10: observability %s\n' "${observability_summary}"
