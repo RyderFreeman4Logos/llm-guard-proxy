@@ -1,9 +1,10 @@
 use std::{
+    collections::HashMap,
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -965,6 +966,310 @@ output_low_progress_min_bytes = 1000000
     let attempt_row = read_last_observability_row(&proxy.sqlite_path, "attempts");
     assert_eq!(attempt_row.response_metadata["loop_detected"], "true");
     assert_eq!(attempt_row.response_metadata["loop_threshold"], "4");
+}
+
+#[tokio::test]
+async fn shielded_retry_loops_once_then_succeeds_without_emitting_loop() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[loop_guard]
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    assert!(!aggregated.to_string().contains("reasoning loop line"));
+
+    let first_attempt = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+    assert!(!body_contains_retry_hint(&first_attempt.body));
+    assert!(body_contains_retry_hint(&second_attempt.body));
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "successful retry should stop after the second upstream attempt"
+    );
+
+    let request_row = read_last_observability_row(&proxy.sqlite_path, "requests");
+    assert_eq!(request_row.status, "succeeded");
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "2");
+    assert_eq!(
+        request_row.response_metadata["retry_final_outcome"],
+        "succeeded"
+    );
+    assert_eq!(request_row.response_metadata["retry_max_attempts"], "5");
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].attempt_number, 1);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[0].abort_reason.as_deref(), Some("loop_guard"));
+    assert_eq!(attempts[0].response_metadata["loop_detected"], "true");
+    assert_eq!(attempts[0].response_metadata["attempt_max_attempts"], "5");
+    assert_eq!(attempts[1].attempt_number, 2);
+    assert_eq!(attempts[1].status, "succeeded");
+    assert_eq!(attempts[1].response_metadata["attempt_max_attempts"], "5");
+}
+
+#[tokio::test]
+async fn shielded_retry_all_loop_attempts_returns_error_and_records_chain() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 3
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-reasoning-hundreds",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("error body should be text");
+    assert!(body.contains("upstream_body_error"));
+    assert!(!body.contains("reasoning loop line"));
+    for _ in 0..3 {
+        let _ = fake.recv_next().await;
+    }
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let request_row = read_last_observability_row(&proxy.sqlite_path, "requests");
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "3");
+    assert_eq!(
+        request_row.response_metadata["retry_final_outcome"],
+        "failed"
+    );
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(attempts[1].status, "retried");
+    assert_eq!(attempts[2].status, "failed");
+    for attempt in &attempts {
+        assert_eq!(attempt.abort_reason.as_deref(), Some("loop_guard"));
+        assert_eq!(attempt.response_metadata["loop_detected"], "true");
+        assert_eq!(attempt.response_metadata["attempt_max_attempts"], "3");
+    }
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[1].retry_reason.as_deref(), Some("loop_detected"));
+    assert!(attempts[2].retry_reason.is_none());
+}
+
+#[tokio::test]
+async fn shielded_retry_policy_can_be_disabled_for_single_attempt_behavior() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+output_repeated_line_threshold = 4
+
+[retry]
+enabled = false
+max_attempts = 5
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let observed = fake.recv_next().await;
+    assert!(!body_contains_retry_hint(&observed.body));
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+}
+
+#[tokio::test]
+async fn shielded_retry_transient_upstream_status_then_success() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 3
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=transient-503-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated: serde_json::Value =
+        serde_json::from_str(&response.text().await.expect("body should be text"))
+            .expect("body should be JSON");
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    let _first = fake.recv_next().await;
+    let _second = fake.recv_next().await;
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(
+        attempts[0].retry_reason.as_deref(),
+        Some("transient_upstream_status")
+    );
+    assert_eq!(attempts[0].response_metadata["status_code"], "503");
+    assert_eq!(attempts[1].status, "succeeded");
+}
+
+#[tokio::test]
+async fn hot_reloaded_retry_max_attempts_reduces_subsequent_requests() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 4
+"#,
+    )
+    .await;
+    let body = r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#;
+
+    let first = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-reasoning-hundreds",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("first proxy request should complete");
+    assert_eq!(first.status(), StatusCode::BAD_GATEWAY);
+    let _ = first.text().await.expect("first body should be text");
+    for _ in 0..4 {
+        let _ = fake.recv_next().await;
+    }
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 2
+"#,
+    );
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("retry max attempts reload should succeed");
+    assert!(outcome.applied);
+
+    let second = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-reasoning-hundreds",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("second proxy request should complete");
+    assert_eq!(second.status(), StatusCode::BAD_GATEWAY);
+    let _ = second.text().await.expect("second body should be text");
+    for _ in 0..2 {
+        let _ = fake.recv_next().await;
+    }
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let request_row = read_last_observability_row(&proxy.sqlite_path, "requests");
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "2");
+    assert_eq!(request_row.response_metadata["retry_max_attempts"], "2");
 }
 
 #[tokio::test]
@@ -3307,6 +3612,46 @@ struct ObservabilityRow {
     response_metadata: serde_json::Value,
 }
 
+#[derive(Debug)]
+struct AttemptChainRow {
+    attempt_number: u32,
+    status: String,
+    retry_reason: Option<String>,
+    abort_reason: Option<String>,
+    response_metadata: serde_json::Value,
+}
+
+fn read_attempt_chain_rows(sqlite_path: &Path) -> Vec<AttemptChainRow> {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let mut statement = connection
+        .prepare(
+            "SELECT attempt_number, status, retry_reason, abort_reason, response_metadata_json \
+             FROM attempts ORDER BY rowid",
+        )
+        .expect("attempt chain query should prepare");
+    statement
+        .query_map([], |row| {
+            let metadata_json: String = row.get(4)?;
+            let response_metadata = serde_json::from_str(&metadata_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(AttemptChainRow {
+                attempt_number: row.get(0)?,
+                status: row.get(1)?,
+                retry_reason: row.get(2)?,
+                abort_reason: row.get(3)?,
+                response_metadata,
+            })
+        })
+        .expect("attempt chain query should execute")
+        .map(|row| row.expect("attempt chain row should decode"))
+        .collect()
+}
+
 fn read_last_observability_row(sqlite_path: &Path, table: &str) -> ObservabilityRow {
     assert!(matches!(table, "requests" | "attempts"));
     let connection = Connection::open(sqlite_path).expect("sqlite should open");
@@ -3348,6 +3693,7 @@ struct FakeUpstream {
 struct FakeUpstreamState {
     sender: mpsc::Sender<ObservedRequest>,
     changing_model_len: Arc<AtomicU64>,
+    attempt_counts: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl FakeUpstream {
@@ -3358,6 +3704,7 @@ impl FakeUpstream {
             .with_state(FakeUpstreamState {
                 sender,
                 changing_model_len: Arc::new(AtomicU64::new(128_000)),
+                attempt_counts: Arc::new(Mutex::new(HashMap::new())),
             });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -3633,7 +3980,7 @@ fn fake_upstream_endpoint_response(
     }
 
     if endpoint == "/v1/chat/completions" {
-        if let Some(response) = fake_chat_completion_response(path_and_query, body) {
+        if let Some(response) = fake_chat_completion_response(path_and_query, state, body) {
             return response;
         }
     }
@@ -3664,7 +4011,11 @@ fn fake_upstream_endpoint_response(
     response
 }
 
-fn fake_chat_completion_response(path_and_query: &str, body: &Bytes) -> Option<Response<Body>> {
+fn fake_chat_completion_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+    body: &Bytes,
+) -> Option<Response<Body>> {
     if !body_requests_stream(body) {
         return None;
     }
@@ -3680,6 +4031,20 @@ fn fake_chat_completion_response(path_and_query: &str, body: &Bytes) -> Option<R
     if path_and_query.contains("test=slow-shielded") {
         return Some(slow_chat_completion_sse_response(body));
     }
+    if path_and_query.contains("test=loop-once-then-success") {
+        if body_contains_retry_hint(body) {
+            return Some(chat_completion_sse_response(body));
+        }
+        return Some(repeated_reasoning_line_sse_response(200));
+    }
+    if path_and_query.contains("test=transient-503-then-success") {
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            return Some(upstream_status_json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+            ));
+        }
+        return Some(chat_completion_sse_response(body));
+    }
     if path_and_query.contains("test=loop-reasoning-hundreds") {
         return Some(repeated_reasoning_line_sse_response(200));
     }
@@ -3693,6 +4058,44 @@ fn fake_chat_completion_response(path_and_query: &str, body: &Bytes) -> Option<R
         return Some(repeated_input_copy_sse_response(12));
     }
     Some(chat_completion_sse_response(body))
+}
+
+fn next_fake_attempt_count(state: &FakeUpstreamState, key: &str) -> u64 {
+    let mut counts = state
+        .attempt_counts
+        .lock()
+        .expect("fake upstream attempt counts should not be poisoned");
+    let count = counts.entry(key.to_owned()).or_insert(0);
+    *count = count.saturating_add(1);
+    *count
+}
+
+fn body_contains_retry_hint(body: &Bytes) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("messages")
+                .and_then(serde_json::Value::as_array)
+                .cloned()
+        })
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|content| content.contains("llm-guard-proxy retry hint"))
+            })
+        })
+}
+
+fn upstream_status_json_response(status: StatusCode) -> Response<Body> {
+    let mut response = json_response(
+        "chat-completions-transient-error",
+        r#"{"error":{"type":"upstream_test_error","message":"try again"}}"#.to_owned(),
+    );
+    *response.status_mut() = status;
+    response
 }
 
 fn model_metadata_body(max_model_len: u64) -> String {

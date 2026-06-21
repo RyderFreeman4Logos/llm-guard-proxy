@@ -46,6 +46,32 @@ impl AggregationError {
     pub(in crate::proxy) fn response_metadata(&self) -> &BTreeMap<String, String> {
         &self.response_metadata
     }
+
+    pub(in crate::proxy) fn is_loop_detected(&self) -> bool {
+        self.response_metadata
+            .get("loop_detected")
+            .is_some_and(|value| value == "true")
+    }
+
+    pub(in crate::proxy) fn transient_stream_retry_reason(&self) -> Option<&'static str> {
+        if self
+            .message
+            .contains("upstream SSE stream failed: timeout_failure")
+            || self
+                .message
+                .contains("upstream SSE stream failed: connect_failure")
+            || self
+                .message
+                .contains("upstream SSE stream failed: body_failure")
+            || self
+                .message
+                .contains("upstream SSE stream failed: unknown_failure")
+        {
+            Some("transient_upstream_stream_failure")
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for AggregationError {
