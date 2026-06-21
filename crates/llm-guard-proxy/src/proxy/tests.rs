@@ -32,6 +32,10 @@ const STREAM_HEADER_TIMEOUT: Duration = Duration::from_millis(500);
 const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_millis(250);
 const STREAM_SECOND_CHUNK_GUARD: Duration = Duration::from_millis(150);
 const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
+const SHIELDED_SLOW_DELAY: Duration = Duration::from_millis(2_500);
+const SHIELDED_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(1_500);
+const SHIELDED_RELOAD_GUARD: Duration = Duration::from_millis(1_500);
+const SHIELDED_RELOAD_TIMEOUT: Duration = Duration::from_millis(2_500);
 const SSE_FIRST_CHUNK: &[u8] = b"data: first\n\n";
 const SSE_SECOND_CHUNK: &[u8] = b"data: second\n\n";
 const LONG_JSON_FIRST_CHUNK: &[u8] = br#"{"object":"list","data":["#;
@@ -671,8 +675,8 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
         response
             .headers()
             .get(CONTENT_TYPE)
-            .expect("content type should be rewritten for downstream JSON"),
-        "application/json"
+            .expect("content type should be rewritten for downstream SSE"),
+        "text/event-stream"
     );
     assert_eq!(
         response
@@ -681,9 +685,7 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
             .expect("shielded fake upstream SSE should be used"),
         "chat-completions-sse"
     );
-    let aggregated_body = response.text().await.expect("body should be text");
-    let aggregated: serde_json::Value =
-        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    let aggregated = shielded_final_json(response).await;
     assert_eq!(aggregated["id"], "chatcmpl-shielded");
     assert_eq!(aggregated["object"], "chat.completion");
     assert_eq!(aggregated["created"], 1_710_000_000);
@@ -742,9 +744,7 @@ async fn shielded_non_stream_chat_preserves_stream_options_while_forcing_usage()
         .expect("proxy request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
-    let aggregated_body = response.text().await.expect("body should be text");
-    let aggregated: serde_json::Value =
-        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    let aggregated = shielded_final_json(response).await;
     assert_eq!(aggregated["usage"]["total_tokens"], 5);
 
     let observed = fake.recv_next().await;
@@ -780,9 +780,7 @@ async fn shielded_non_stream_chat_preserves_compat_function_call_fields_from_sse
         .expect("proxy request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
-    let aggregated_body = response.text().await.expect("body should be text");
-    let aggregated: serde_json::Value =
-        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    let aggregated = shielded_final_json(response).await;
     assert_eq!(aggregated["service_tier"], "flex");
     assert_eq!(aggregated["choices"][0]["message"]["role"], "assistant");
     assert!(aggregated["choices"][0]["message"]["content"].is_null());
@@ -825,9 +823,7 @@ async fn shielded_non_stream_chat_preserves_compat_refusal_fields_from_sse() {
         .expect("proxy request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
-    let aggregated_body = response.text().await.expect("body should be text");
-    let aggregated: serde_json::Value =
-        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    let aggregated = shielded_final_json(response).await;
     assert_eq!(aggregated["service_tier"], "flex");
     assert_eq!(
         aggregated["choices"][0]["message"]["refusal"],
@@ -921,9 +917,7 @@ async fn shielded_non_stream_chat_preserves_choice_logprobs_from_sse_chunks() {
         .expect("proxy request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
-    let aggregated_body = response.text().await.expect("body should be text");
-    let aggregated: serde_json::Value =
-        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    let aggregated = shielded_final_json(response).await;
     assert_eq!(
         aggregated["choices"][0]["logprobs"]["content"][0]["token"],
         "Hello"
@@ -964,9 +958,7 @@ async fn shielded_non_stream_chat_preserves_extension_fields_from_sse_chunks() {
         .expect("proxy request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
-    let aggregated_body = response.text().await.expect("body should be text");
-    let aggregated: serde_json::Value =
-        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    let aggregated = shielded_final_json(response).await;
     assert_eq!(aggregated["object"], "chat.completion");
     assert_eq!(aggregated["provider_metadata"]["phase"], "final");
     assert_eq!(aggregated["x_provider_trace"], "trace-first");
@@ -1034,6 +1026,573 @@ async fn shielded_chat_attempt_metadata_records_stream_timings_and_delta_counts(
     assert_eq!(metadata["tool_call_delta_count"], "2");
     assert_metadata_latency(&metadata, "first_byte_latency_ms");
     assert_metadata_latency(&metadata, "first_token_latency_ms");
+}
+
+#[tokio::test]
+async fn default_sse_heartbeat_emits_progress_before_slow_shielded_content() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[heartbeat]
+interval_secs = 1
+",
+    )
+    .await;
+
+    let response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy
+            .client
+            .post(format!(
+                "{}/v1/chat/completions?test=slow-shielded",
+                proxy.base_url
+            ))
+            .header(CONTENT_TYPE, "application/json")
+            .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+            .send(),
+    )
+    .await
+    .expect("shielded SSE headers should arrive before upstream content")
+    .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("shielded default response should be SSE"),
+        "text/event-stream"
+    );
+
+    let mut body = response.bytes_stream();
+    let heartbeat = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "shielded heartbeat").await;
+    let heartbeat_text = std::str::from_utf8(&heartbeat).expect("heartbeat should be UTF-8");
+    assert!(heartbeat_text.starts_with(": llm-guard-proxy heartbeat"));
+    assert!(!heartbeat_text.contains("Hello"));
+    assert!(!heartbeat_text.contains("event: final"));
+
+    let final_body = timeout(Duration::from_secs(4), async {
+        let mut collected = BytesMut::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.expect("shielded SSE body should not fail");
+            collected.extend_from_slice(&chunk);
+            if std::str::from_utf8(&collected)
+                .expect("shielded SSE should remain UTF-8")
+                .contains("event: final")
+            {
+                return collected.freeze();
+            }
+        }
+        panic!("shielded SSE should emit a final event");
+    })
+    .await
+    .expect("shielded final event should arrive after heartbeat");
+    let final_json = final_json_from_sse_body(&final_body);
+    assert_eq!(final_json["choices"][0]["message"]["content"], "Hello");
+
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=slow-shielded"
+    );
+}
+
+#[tokio::test]
+async fn repeated_input_selects_json_whitespace_and_body_stays_parseable() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[heartbeat]
+interval_secs = 1
+",
+    )
+    .await;
+    let body =
+        r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"temperature":0.2}"#;
+
+    let first = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("first shielded request should complete");
+    assert_eq!(
+        first
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("first request should use default SSE"),
+        "text/event-stream"
+    );
+    let first_json = shielded_final_json(first).await;
+    assert_eq!(first_json["id"], "chatcmpl-shielded");
+    let _first_observed = fake.recv_next().await;
+
+    let second = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("second shielded request should complete");
+    assert_eq!(
+        second
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("repeated request should switch to JSON"),
+        "application/json"
+    );
+    let second_body = second.text().await.expect("second body should be text");
+    assert!(
+        second_body.chars().next().is_some_and(char::is_whitespace),
+        "JSON whitespace mode should prefix heartbeat whitespace: {second_body:?}"
+    );
+    let second_json: serde_json::Value =
+        serde_json::from_str(&second_body).expect("leading whitespace JSON should parse");
+    assert_eq!(second_json["id"], "chatcmpl-shielded");
+    let _second_observed = fake.recv_next().await;
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let rows = connection
+        .prepare(
+            "SELECT input_fingerprint, downstream_mode, request_metadata_json \
+             FROM requests ORDER BY started_at_unix_ms, request_id",
+        )
+        .expect("request query should prepare")
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("request query should run")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("request rows should decode");
+    assert_eq!(rows.len(), 2);
+    let first_fingerprint = rows[0]
+        .0
+        .as_ref()
+        .expect("first request fingerprint should be recorded");
+    let second_fingerprint = rows[1]
+        .0
+        .as_ref()
+        .expect("second request fingerprint should be recorded");
+    assert_eq!(first_fingerprint, second_fingerprint);
+    assert_eq!(rows[0].1, "streaming");
+    assert_eq!(rows[1].1, "non-stream-json");
+    let first_metadata: serde_json::Value =
+        serde_json::from_str(&rows[0].2).expect("first metadata should parse");
+    let second_metadata: serde_json::Value =
+        serde_json::from_str(&rows[1].2).expect("second metadata should parse");
+    assert_eq!(first_metadata["repeat_input_matched"], "false");
+    assert_eq!(second_metadata["repeat_input_matched"], "true");
+    assert_eq!(
+        second_metadata["downstream_liveness_mode"],
+        "json-whitespace"
+    );
+}
+
+#[tokio::test]
+async fn hot_reloaded_heartbeat_interval_changes_without_restart() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[heartbeat]
+interval_secs = 1
+
+[loop_guard]
+enabled = false
+",
+    )
+    .await;
+
+    let first = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=slow-shielded",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"first"}]}"#)
+        .send()
+        .await
+        .expect("first shielded request should complete");
+    let mut first_body = first.bytes_stream();
+    let first_heartbeat = next_chunk(
+        &mut first_body,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "first interval heartbeat",
+    )
+    .await;
+    assert!(
+        std::str::from_utf8(&first_heartbeat)
+            .expect("heartbeat should be UTF-8")
+            .starts_with(": llm-guard-proxy heartbeat")
+    );
+    drop(first_body);
+    let _first_observed = fake.recv_next().await;
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[heartbeat]
+interval_secs = 2
+
+[loop_guard]
+enabled = false
+",
+    );
+    proxy
+        .manager
+        .reload()
+        .expect("heartbeat interval reload should succeed");
+
+    let second = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=slow-shielded",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"second"}]}"#)
+        .send()
+        .await
+        .expect("second shielded request should complete");
+    let mut second_body = second.bytes_stream();
+    assert!(
+        timeout(SHIELDED_RELOAD_GUARD, second_body.next())
+            .await
+            .is_err(),
+        "reloaded two-second heartbeat should not arrive within the old interval"
+    );
+    let second_heartbeat = next_chunk(
+        &mut second_body,
+        SHIELDED_RELOAD_TIMEOUT,
+        "second interval heartbeat",
+    )
+    .await;
+    assert!(
+        std::str::from_utf8(&second_heartbeat)
+            .expect("heartbeat should be UTF-8")
+            .starts_with(": llm-guard-proxy heartbeat")
+    );
+    let _second_observed = fake.recv_next().await;
+}
+
+#[tokio::test]
+async fn hot_reloaded_repeat_window_changes_repeated_detection_without_restart() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[heartbeat]
+interval_secs = 1
+
+[loop_guard]
+normalized_input_window_secs = 1
+max_repeated_inputs = 1
+",
+    )
+    .await;
+    let body = r#"{"model":"test-chat","messages":[{"role":"user","content":"reload-window"}]}"#;
+
+    let first = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("first request should complete");
+    assert_eq!(
+        first
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("first request should use SSE"),
+        "text/event-stream"
+    );
+    let _first_json = shielded_final_json(first).await;
+    let _first_observed = fake.recv_next().await;
+
+    sleep(Duration::from_millis(1_200)).await;
+
+    let second = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("second request should complete");
+    assert_eq!(
+        second
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("expired repeat should stay SSE"),
+        "text/event-stream"
+    );
+    let _second_json = shielded_final_json(second).await;
+    let _second_observed = fake.recv_next().await;
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[heartbeat]
+interval_secs = 1
+
+[loop_guard]
+normalized_input_window_secs = 120
+max_repeated_inputs = 1
+",
+    );
+    proxy
+        .manager
+        .reload()
+        .expect("repeat window reload should succeed");
+
+    let third = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("third request should complete");
+    assert_eq!(
+        third
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("reloaded repeat window should switch to JSON"),
+        "application/json"
+    );
+    let third_body = third.text().await.expect("third body should be text");
+    let third_json: serde_json::Value =
+        serde_json::from_str(&third_body).expect("third JSON should parse");
+    assert_eq!(third_json["id"], "chatcmpl-shielded");
+    let _third_observed = fake.recv_next().await;
+}
+
+#[test]
+fn normalized_chat_fingerprint_excludes_secrets_and_includes_output_parameters() {
+    let base_value = chat_body_with_secret_values("one", false);
+    let secret_changed_value = chat_body_with_secret_values("two", true);
+    let base = Bytes::from(base_value.to_string().into_bytes());
+    let secret_changed = Bytes::from(secret_changed_value.to_string().into_bytes());
+    let temperature_changed = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"temperature":0.7,"max_tokens":16,"max_completion_tokens":32,"max_output_tokens":48,"api_key":"sk-one","access_token":"access-one","metadata":{"authorization":"Bearer one","id_token":"id-one"},"stream":false}"#,
+    );
+    let message_changed = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"pong"}],"temperature":0.2,"max_tokens":16,"max_completion_tokens":32,"max_output_tokens":48,"api_key":"sk-one","access_token":"access-one","metadata":{"authorization":"Bearer one","id_token":"id-one"},"stream":false}"#,
+    );
+
+    let normalized =
+        normalize_chat_fingerprint_value(base_value).expect("base body should normalize");
+    assert_eq!(normalized["max_tokens"], 16);
+    assert_eq!(normalized["max_completion_tokens"], 32);
+    assert_eq!(normalized["max_output_tokens"], 48);
+    assert_eq!(normalized["thinking"]["budget_tokens"], 24);
+    assert_normalized_excludes_secret_fields(&normalized);
+    assert_text_excludes_values(
+        &normalized.to_string(),
+        &[
+            "sk-one",
+            "access-one",
+            "refresh-one",
+            "api-token-one",
+            "auth-token-one",
+            "Bearer one",
+            "id-one",
+            "session-one",
+            "bearer-credential-one",
+            "password-one",
+            "secret-one",
+            "credentials-one",
+        ],
+    );
+
+    let base_fingerprint = chat_input_fingerprint(&base).expect("base fingerprint should compute");
+    let secret_fingerprint =
+        chat_input_fingerprint(&secret_changed).expect("secret fingerprint should compute");
+    let temperature_fingerprint = chat_input_fingerprint(&temperature_changed)
+        .expect("temperature fingerprint should compute");
+    let message_fingerprint =
+        chat_input_fingerprint(&message_changed).expect("message fingerprint should compute");
+
+    assert_eq!(base_fingerprint, secret_fingerprint);
+    assert_ne!(base_fingerprint, temperature_fingerprint);
+    assert_ne!(base_fingerprint, message_fingerprint);
+    assert_text_excludes_values(
+        &base_fingerprint,
+        &[
+            "sk-one",
+            "access-one",
+            "id-one",
+            "Bearer",
+            "refresh-one",
+            "api-token-one",
+            "auth-token-one",
+        ],
+    );
+}
+
+fn chat_body_with_secret_values(suffix: &str, stream: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model": "test-chat",
+        "messages": [{"role": "user", "content": "ping"}],
+        "temperature": 0.2,
+        "max_tokens": 16,
+        "max_completion_tokens": 32,
+        "max_output_tokens": 48,
+        "thinking": {
+            "budget_tokens": 24
+        },
+        "api_key": format!("sk-{suffix}"),
+        "access_token": format!("access-{suffix}"),
+        "refresh_token": format!("refresh-{suffix}"),
+        "api_token": format!("api-token-{suffix}"),
+        "auth_token": format!("auth-token-{suffix}"),
+        "metadata": {
+            "authorization": format!("Bearer {suffix}"),
+            "id_token": format!("id-{suffix}"),
+            "session_token": format!("session-{suffix}"),
+            "bearer_credentials": format!("bearer-credential-{suffix}"),
+            "password": format!("password-{suffix}"),
+            "secret": format!("secret-{suffix}"),
+            "credentials": format!("credentials-{suffix}")
+        },
+        "stream": stream
+    })
+}
+
+fn assert_normalized_excludes_secret_fields(normalized: &serde_json::Value) {
+    assert!(normalized.get("api_key").is_none());
+    assert!(normalized.get("access_token").is_none());
+    assert!(normalized.get("refresh_token").is_none());
+    assert!(normalized.get("api_token").is_none());
+    assert!(normalized.get("auth_token").is_none());
+    let metadata = normalized
+        .get("metadata")
+        .and_then(serde_json::Value::as_object)
+        .expect("metadata should remain after secret fields are stripped");
+    for secret_key in [
+        "authorization",
+        "id_token",
+        "session_token",
+        "bearer_credentials",
+        "password",
+        "secret",
+        "credentials",
+    ] {
+        assert!(!metadata.contains_key(secret_key));
+    }
+}
+
+fn assert_text_excludes_values(text: &str, values: &[&str]) {
+    for value in values {
+        assert!(!text.contains(value));
+    }
+}
+
+#[test]
+fn normalized_chat_fingerprint_distinguishes_max_tokens_for_repeat_detection() {
+    assert_token_budget_change_is_not_repeated("max_tokens");
+}
+
+#[test]
+fn normalized_chat_fingerprint_distinguishes_max_completion_tokens_for_repeat_detection() {
+    assert_token_budget_change_is_not_repeated("max_completion_tokens");
+}
+
+#[test]
+fn normalized_chat_fingerprint_distinguishes_max_output_tokens_for_repeat_detection() {
+    assert_token_budget_change_is_not_repeated("max_output_tokens");
+}
+
+#[test]
+fn normalized_chat_fingerprint_distinguishes_thinking_budget_tokens_for_repeat_detection() {
+    let base_body = chat_body_with_thinking_budget(16);
+    let changed_body = chat_body_with_thinking_budget(32);
+    assert_budget_change_is_not_repeated(&base_body, &changed_body);
+}
+
+fn assert_token_budget_change_is_not_repeated(field_name: &str) {
+    let base_body = chat_body_with_token_budget(field_name, 16);
+    let changed_body = chat_body_with_token_budget(field_name, 32);
+    assert_budget_change_is_not_repeated(&base_body, &changed_body);
+}
+
+fn assert_budget_change_is_not_repeated(base_body: &Bytes, changed_body: &Bytes) {
+    let base_fingerprint =
+        chat_input_fingerprint(base_body).expect("base fingerprint should compute");
+    let changed_fingerprint =
+        chat_input_fingerprint(changed_body).expect("changed fingerprint should compute");
+    assert_ne!(base_fingerprint, changed_fingerprint);
+
+    let repeat_inputs = RepeatInputCache::default();
+    let first_observation = repeat_inputs.observe(&base_fingerprint, 1_000, 120, 1);
+    let changed_observation = repeat_inputs.observe(&changed_fingerprint, 2_000, 120, 1);
+    let repeated_base_observation = repeat_inputs.observe(&base_fingerprint, 3_000, 120, 1);
+
+    assert_eq!(first_observation, RepeatInputObservation::default());
+    assert_eq!(changed_observation, RepeatInputObservation::default());
+    assert_eq!(
+        repeated_base_observation,
+        RepeatInputObservation {
+            repeated: true,
+            prior_count: 1
+        }
+    );
+}
+
+fn chat_body_with_token_budget(field_name: &str, value: u64) -> Bytes {
+    let mut body = serde_json::json!({
+        "model": "test-chat",
+        "messages": [{"role": "user", "content": "ping"}],
+        "temperature": 0.2,
+        "stream": false
+    });
+    body.as_object_mut()
+        .expect("test body should be an object")
+        .insert(field_name.to_owned(), serde_json::Value::from(value));
+    Bytes::from(body.to_string().into_bytes())
+}
+
+fn chat_body_with_thinking_budget(value: u64) -> Bytes {
+    Bytes::from(
+        serde_json::json!({
+            "model": "test-chat",
+            "messages": [{"role": "user", "content": "ping"}],
+            "temperature": 0.2,
+            "thinking": {
+                "budget_tokens": value
+            },
+            "stream": false
+        })
+        .to_string()
+        .into_bytes(),
+    )
 }
 
 #[tokio::test]
@@ -1857,6 +2416,51 @@ where
         .unwrap_or_else(|error| panic!("{label} should not fail: {error}"))
 }
 
+async fn shielded_final_json(response: reqwest::Response) -> serde_json::Value {
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    let body = response.bytes().await.expect("body should be readable");
+    if content_type.contains("text/event-stream") {
+        final_json_from_sse_body(&body)
+    } else {
+        serde_json::from_slice(&body).unwrap_or_else(|error| {
+            panic!("shielded JSON body should parse: {error}; body={body:?}")
+        })
+    }
+}
+
+fn final_json_from_sse_body(body: &[u8]) -> serde_json::Value {
+    let text = std::str::from_utf8(body)
+        .unwrap_or_else(|error| panic!("SSE body should be UTF-8: {error}; body={body:?}"));
+    for event in text.split("\n\n") {
+        let mut event_name = "";
+        let mut data = String::new();
+        for line in event.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(value) = line.strip_prefix("event:") {
+                event_name = value.trim();
+                continue;
+            }
+            if let Some(value) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(value.trim_start());
+            }
+        }
+        if event_name == "final" {
+            return serde_json::from_str(&data).unwrap_or_else(|error| {
+                panic!("final SSE data should parse as JSON: {error}; data={data}")
+            });
+        }
+    }
+    panic!("SSE body should include a final event: {text}");
+}
+
 fn first_model(body: &str) -> serde_json::Value {
     let value = serde_json::from_str::<serde_json::Value>(body)
         .unwrap_or_else(|error| panic!("model list should parse as JSON: {error}; body={body}"));
@@ -2246,6 +2850,11 @@ fn fake_upstream_endpoint_response(
         {
             return chat_completion_extension_fields_sse_response(body);
         }
+        "/v1/chat/completions"
+            if path_and_query.contains("test=slow-shielded") && body_requests_stream(body) =>
+        {
+            return slow_chat_completion_sse_response(body);
+        }
         "/v1/chat/completions" if body_requests_stream(body) => {
             return chat_completion_sse_response(body);
         }
@@ -2327,6 +2936,53 @@ fn chat_completion_sse_response(body: &Bytes) -> Response<Body> {
     response.headers_mut().insert(
         HeaderName::from_static("x-upstream-endpoint"),
         HeaderValue::from_static("chat-completions-sse"),
+    );
+    response
+}
+
+fn slow_chat_completion_sse_response(body: &Bytes) -> Response<Body> {
+    let include_usage = body_requests_stream_usage(body);
+    let include_logprobs = body_requests_logprobs(body);
+    let chunks = vec![
+        sse_json(&chat_completion_first_chunk()),
+        sse_json(&chat_completion_second_chunk(include_logprobs)),
+        sse_json(&chat_completion_final_chunk(
+            include_usage,
+            include_logprobs,
+        )),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    chat_completion_delayed_start_stream_response("chat-completions-slow-sse", chunks)
+}
+
+fn chat_completion_delayed_start_stream_response(
+    label: &'static str,
+    chunks: Vec<Bytes>,
+) -> Response<Body> {
+    let body = Body::from_stream(stream::unfold(
+        (0_usize, chunks),
+        |(index, chunks)| async move {
+            if index >= chunks.len() {
+                return None;
+            }
+            if index == 0 {
+                sleep(SHIELDED_SLOW_DELAY).await;
+            }
+            let chunk = chunks[index].clone();
+            Some((
+                Ok::<_, std::convert::Infallible>(chunk),
+                (index + 1, chunks),
+            ))
+        },
+    ));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_str(label).expect("static label should be a valid header"),
     );
     response
 }

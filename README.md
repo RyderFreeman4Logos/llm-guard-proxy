@@ -7,7 +7,7 @@ The proxy sits between OpenAI-compatible clients and an upstream LLM service so 
 ## Non-Goals
 
 - Generic `/v1/...` request forwarding is implemented. Non-streaming `/v1/chat/completions` requests use the shielded upstream streaming core by default.
-- Configuration is loaded and hot-reloadable. Observability metadata storage exists; retries, loop detection, thinking policy, and heartbeat behavior are feature flags for later issues.
+- Configuration is loaded and hot-reloadable. Observability metadata storage exists for retries, loop detection, thinking policy, heartbeat behavior, and upstream metadata discovery.
 - This bootstrap does not change upstream OpenAI-compatible semantics.
 
 ## Workspace Layout
@@ -94,7 +94,9 @@ LLM_GUARD_PROXY_SMOKE_KEEP=1 just smoke-gb10
 The shielded chat core is enabled by default for non-streaming chat completions:
 
 - Downstream non-stream chat requests are sent upstream with `stream=true`.
-- The proxy buffers and parses upstream SSE deltas internally, then returns a normal OpenAI-compatible chat completion JSON response.
+- The default downstream response is `text/event-stream`. While the shielded upstream attempt is pending, the proxy emits comment heartbeats shaped as `: llm-guard-proxy heartbeat`. After the attempt is accepted, it emits `event: final` with the accepted OpenAI-compatible chat completion JSON in the `data:` field.
+- If the same normalized input fingerprint repeats within the loop-guard window, the downstream response switches to `application/json` with leading whitespace heartbeat bytes before the final JSON body. Standard JSON parsers accept the leading whitespace.
+- `heartbeat.mode = "disabled"` keeps the legacy buffered JSON response for shielded non-stream chat completions.
 - Attempt observability records include first-byte latency, first-token latency, finish reason, and parsed content/reasoning/tool-call delta counters.
 - Downstream `stream=true` chat requests currently stay on the generic streaming path to preserve first-chunk timing and backpressure behavior while later issues add release-after-inspection streaming.
 - Set `[shielding] enabled = false` and hot reload the config to fall back to generic forwarding for rollback or compatibility testing.
