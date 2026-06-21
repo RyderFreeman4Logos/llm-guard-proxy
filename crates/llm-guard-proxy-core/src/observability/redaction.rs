@@ -28,7 +28,15 @@ pub(super) fn redacted_metadata_json(
     metadata: &BTreeMap<String, String>,
     field: &'static str,
 ) -> Result<String, ObservabilityError> {
-    let redacted = metadata
+    let redacted = redacted_metadata_map(metadata);
+    serde_json::to_string(&redacted)
+        .map_err(|source| ObservabilityError::SerializeMetadata { field, source })
+}
+
+pub(super) fn redacted_metadata_map(
+    metadata: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    metadata
         .iter()
         .map(|(key, value)| {
             let value = if is_sensitive_key(key) || looks_sensitive(value) {
@@ -38,9 +46,24 @@ pub(super) fn redacted_metadata_json(
             };
             (key.clone(), value)
         })
-        .collect::<BTreeMap<_, _>>();
-    serde_json::to_string(&redacted)
-        .map_err(|source| ObservabilityError::SerializeMetadata { field, source })
+        .collect()
+}
+
+pub(super) fn debug_safe_metadata_map(
+    metadata: &BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    metadata
+        .iter()
+        .filter(|(key, _value)| !is_sensitive_key(key))
+        .map(|(key, value)| {
+            let value = if looks_sensitive(value) {
+                REDACTED.to_owned()
+            } else {
+                value.clone()
+            };
+            (key.clone(), value)
+        })
+        .collect()
 }
 
 pub(super) fn sanitize_raw_payloads(raw: &RawPayloads, capture_raw_payloads: bool) -> RawPayloads {

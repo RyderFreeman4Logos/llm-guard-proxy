@@ -102,6 +102,12 @@ The shielded chat core is enabled by default for non-streaming chat completions:
 - Downstream `stream=true` chat requests currently stay on the generic streaming path to preserve first-chunk timing and backpressure behavior while later issues add release-after-inspection streaming.
 - Set `[shielding] enabled = false` and hot reload the config to fall back to generic forwarding for rollback or compatibility testing.
 
+## Operational Endpoints
+
+- `GET /health` returns a small JSON status object with `process = "alive"` and upstream readiness. By default it performs a bounded `GET /v1/models` readiness probe against the configured upstream and returns `503` when the proxy process is alive but upstream is unavailable. Set `observability.health_upstream_probe_enabled = false` to skip the upstream probe and report `upstream = "not_checked"`.
+- `GET /metrics` returns Prometheus-style text metrics when `observability.metrics_enabled = true` (the default). Metrics are aggregated from the bounded SQLite observability store and use low-cardinality labels only: request/attempt status, upstream/downstream mode, HTTP status class, heartbeat mode, upstream error kind, retry/loop observations, current-retained latency distribution gauges, and monotonic storage pruning counters. Metrics derived from retained rows are named `llm_guard_proxy_current_retained_*` and emitted as gauges because retention pruning can remove old rows; only cumulative storage pruning metrics use `*_total` counters. Metrics never include raw prompts, raw bodies, request headers, query strings, model IDs, or request IDs.
+- `GET /debug/recent-requests?limit=N` is disabled by default. Set `observability.debug_summary_enabled = true` to expose bounded recent request summaries; optionally set `observability.debug_summary_admin_token` and pass the same admin value in the `Authorization: Bearer ...` header or the `x-admin-token` header. Output is clamped by `observability.debug_summary_max_records`, omits raw prompt/output payloads, omits sensitive metadata keys, and redacts sensitive-looking values.
+
 ## Configuration
 
 The default config path is:
@@ -142,6 +148,12 @@ enabled = true
 enabled = true
 sqlite_path = "~/.local/state/llm-guard-proxy/observability.sqlite3"
 capture_raw_payloads = false
+metrics_enabled = true
+health_upstream_probe_enabled = true
+health_upstream_probe_timeout_ms = 500
+debug_summary_enabled = false
+# debug_summary_admin_token = "change-me-for-admin-debug"
+debug_summary_max_records = 25
 
 [observability.retention]
 max_bytes = 1073741824
@@ -194,6 +206,12 @@ Reloadable fields:
 - `shielding.enabled`
 - `observability.enabled`
 - `observability.capture_raw_payloads`
+- `observability.metrics_enabled`
+- `observability.health_upstream_probe_enabled`
+- `observability.health_upstream_probe_timeout_ms`
+- `observability.debug_summary_enabled`
+- `observability.debug_summary_admin_token`
+- `observability.debug_summary_max_records`
 - `observability.retention.max_bytes`
 - `observability.retention.prune_to_bytes`
 - `observability.retention.max_records`

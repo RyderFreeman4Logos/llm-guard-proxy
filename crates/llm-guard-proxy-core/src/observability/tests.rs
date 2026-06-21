@@ -25,7 +25,7 @@ fn creates_sqlite_schema_in_test_temp_directory() {
     let fixture = StoreFixture::new("schema");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
 
-    assert_eq!(store.schema_version().expect("schema version"), 1);
+    assert_eq!(store.schema_version().expect("schema version"), 2);
     assert!(fixture.sqlite_path.exists());
 
     let connection = store.lock_connection().expect("connection lock");

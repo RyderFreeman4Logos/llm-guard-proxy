@@ -54,6 +54,267 @@ const LARGE_MODEL_METADATA_EXTRA_BYTES: usize = 1024 * 1024;
 static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[tokio::test]
+async fn health_reports_process_and_upstream_readiness() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_observability_config(
+        &fake.base_url,
+        true,
+        "health_upstream_probe_timeout_ms = 100\n",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/health", proxy.base_url))
+        .send()
+        .await
+        .expect("health request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response.text().await.expect("health body should be text");
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("health should be JSON");
+    assert_eq!(body["process"], "alive");
+    assert_eq!(body["upstream"], "ready");
+
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.method, Method::GET);
+    assert_eq!(observed.path_and_query, "/v1/models");
+
+    let broken = BrokenUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_observability_config(
+        &broken.base_url,
+        true,
+        "health_upstream_probe_timeout_ms = 20\n",
+    )
+    .await;
+    let response = proxy
+        .client
+        .get(format!("{}/health", proxy.base_url))
+        .send()
+        .await
+        .expect("health request should complete");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body_text = response.text().await.expect("health body should be text");
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("health should be JSON");
+    assert_eq!(body["process"], "alive");
+    assert_eq!(body["upstream"], "unavailable");
+}
+
+#[tokio::test]
+async fn metrics_expose_retained_gauges_without_secrets() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?api_key=sk-live-secret&safe=ok",
+            proxy.base_url
+        ))
+        .header(AUTHORIZATION, "Bearer downstream-secret")
+        .header("x-api-key", "sk-header-secret")
+        .send()
+        .await
+        .expect("proxy request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response.text().await.expect("body should be consumed");
+    let _observed = fake.recv_next().await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/metrics", proxy.base_url))
+        .send()
+        .await
+        .expect("metrics request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("metrics should be text");
+    assert_metric_type(&body, "llm_guard_proxy_current_retained_requests", "gauge");
+    assert_metric_type(&body, "llm_guard_proxy_current_retained_attempts", "gauge");
+    assert_metric_type(&body, "llm_guard_proxy_current_retained_retries", "gauge");
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_current_retained_first_token_latency_ms_le",
+        "gauge",
+    );
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_current_retained_total_latency_ms_le",
+        "gauge",
+    );
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_storage_pruning_events_total",
+        "counter",
+    );
+    assert_legacy_retained_counter_metrics_absent(&body);
+    assert_safe_operational_text("metrics", &body);
+}
+
+#[tokio::test]
+async fn retained_metrics_stay_prometheus_safe_after_pruning() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    for index in 0..50 {
+        send_metrics_chat_request(&proxy, &mut fake, index).await;
+    }
+    let before = fetch_metrics(&proxy).await;
+    assert_metric_type(
+        &before,
+        "llm_guard_proxy_current_retained_requests",
+        "gauge",
+    );
+    assert_metric_type(
+        &before,
+        "llm_guard_proxy_current_retained_first_token_latency_ms_le",
+        "gauge",
+    );
+    assert_legacy_retained_counter_metrics_absent(&before);
+    assert!(
+        metric_value(
+            &before,
+            "llm_guard_proxy_current_retained_first_token_latency_ms_observations"
+        ) > 0
+    );
+    assert!(
+        metric_value(
+            &before,
+            "llm_guard_proxy_current_retained_total_latency_ms_observations"
+        ) > 0
+    );
+
+    let before_prune_events = metric_value(&before, "llm_guard_proxy_storage_pruning_events_total");
+    let before_pruned_requests =
+        metric_value(&before, "llm_guard_proxy_storage_pruned_requests_total");
+    let before_pruned_attempts =
+        metric_value(&before, "llm_guard_proxy_storage_pruned_attempts_total");
+
+    for index in 50..52 {
+        send_metrics_chat_request(&proxy, &mut fake, index).await;
+    }
+    let after = fetch_metrics(&proxy).await;
+    assert_metric_type(&after, "llm_guard_proxy_current_retained_requests", "gauge");
+    assert_metric_type(
+        &after,
+        "llm_guard_proxy_current_retained_total_latency_ms_le",
+        "gauge",
+    );
+    assert_legacy_retained_counter_metrics_absent(&after);
+
+    assert!(
+        metric_value(&after, "llm_guard_proxy_storage_pruning_events_total") >= before_prune_events
+    );
+    assert!(
+        metric_value(&after, "llm_guard_proxy_storage_pruned_requests_total")
+            > before_pruned_requests
+    );
+    assert!(
+        metric_value(&after, "llm_guard_proxy_storage_pruned_attempts_total")
+            > before_pruned_attempts
+    );
+}
+
+#[tokio::test]
+async fn debug_summary_is_disabled_by_default() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/recent-requests", proxy.base_url))
+        .send()
+        .await
+        .expect("debug request should complete");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[test]
+fn admin_token_matcher_accepts_only_exact_values() {
+    assert!(admin_token_matches("admin-token", "admin-token"));
+    assert!(!admin_token_matches("admin-tokeo", "admin-token"));
+    assert!(!admin_token_matches("admin-token-extra", "admin-token"));
+    assert!(!admin_token_matches("admin-toke", "admin-token"));
+    assert!(!admin_token_matches("", "admin-token"));
+}
+
+#[tokio::test]
+async fn debug_summary_is_gated_bounded_and_redacted() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_observability_config(
+        &fake.base_url,
+        true,
+        r#"debug_summary_enabled = true
+debug_summary_admin_token = "admin-token"
+debug_summary_max_records = 2
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?api_key=sk-live-secret",
+            proxy.base_url
+        ))
+        .header(AUTHORIZATION, "Bearer downstream-secret")
+        .header("x-api-key", "sk-header-secret")
+        .send()
+        .await
+        .expect("proxy request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response.text().await.expect("body should be consumed");
+    let _observed = fake.recv_next().await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/recent-requests", proxy.base_url))
+        .send()
+        .await
+        .expect("unauthorized debug request should complete");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/recent-requests", proxy.base_url))
+        .header(AUTHORIZATION, "Bearer admin-tokeo")
+        .send()
+        .await
+        .expect("bearer near-miss debug request should complete");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/recent-requests", proxy.base_url))
+        .header("x-admin-token", "admin-token-extra")
+        .send()
+        .await
+        .expect("admin-token near-miss debug request should complete");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/recent-requests?limit=50", proxy.base_url))
+        .header(AUTHORIZATION, "Bearer admin-token")
+        .send()
+        .await
+        .expect("authorized debug request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("debug body should be text");
+    assert!(body.contains("\"limit\":2"));
+    assert!(body.contains("\"request_count\":1"));
+    assert!(body.contains("\"status\":"));
+    assert_safe_operational_text("debug summary", &body);
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/recent-requests", proxy.base_url))
+        .header("x-admin-token", "admin-token")
+        .send()
+        .await
+        .expect("x-admin-token debug request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn get_models_forwards_method_path_query_and_headers() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -4973,18 +5234,51 @@ impl ProxyFixture {
         max_in_flight_requests: usize,
         metadata_config: &str,
     ) -> Self {
+        Self::spawn_with_full_options(
+            upstream_base_url,
+            observability_enabled,
+            max_in_flight_requests,
+            metadata_config,
+            "",
+        )
+        .await
+    }
+
+    async fn spawn_with_observability_config(
+        upstream_base_url: &str,
+        observability_enabled: bool,
+        observability_config: &str,
+    ) -> Self {
+        Self::spawn_with_full_options(
+            upstream_base_url,
+            observability_enabled,
+            AppConfig::default().server.max_in_flight_requests,
+            "",
+            observability_config,
+        )
+        .await
+    }
+
+    async fn spawn_with_full_options(
+        upstream_base_url: &str,
+        observability_enabled: bool,
+        max_in_flight_requests: usize,
+        metadata_config: &str,
+        observability_config: &str,
+    ) -> Self {
         let root = unique_test_dir("proxy");
         fs::create_dir_all(&root).expect("test root should be created");
         set_owner_only_dir(&root);
         let config_path = root.join("config.toml");
         let sqlite_path = root.join("storage").join("observability.sqlite3");
-        write_proxy_config(
+        write_proxy_config_with_observability(
             &config_path,
             upstream_base_url,
             &sqlite_path,
             observability_enabled,
             max_in_flight_requests,
             metadata_config,
+            observability_config,
         );
         let manager =
             ConfigManager::from_explicit_path(&config_path).expect("proxy config should load");
@@ -5039,6 +5333,26 @@ fn write_proxy_config(
     max_in_flight_requests: usize,
     metadata_config: &str,
 ) {
+    write_proxy_config_with_observability(
+        config_path,
+        upstream_base_url,
+        sqlite_path,
+        observability_enabled,
+        max_in_flight_requests,
+        metadata_config,
+        "",
+    );
+}
+
+fn write_proxy_config_with_observability(
+    config_path: &Path,
+    upstream_base_url: &str,
+    sqlite_path: &Path,
+    observability_enabled: bool,
+    max_in_flight_requests: usize,
+    metadata_config: &str,
+    observability_config: &str,
+) {
     fs::write(
         config_path,
         format!(
@@ -5054,6 +5368,7 @@ base_url = "{upstream_base_url}"
 enabled = {observability_enabled}
 sqlite_path = "{sqlite_path}"
 capture_raw_payloads = false
+{observability_config}
 
 [observability.retention]
 max_bytes = {TEST_MAX_BYTES}
@@ -5110,6 +5425,101 @@ fn assert_sensitive_query_absent(label: &str, text: &str) {
             "{label} leaked sensitive query fragment {sensitive:?}: {text}"
         );
     }
+}
+
+fn assert_safe_operational_text(label: &str, text: &str) {
+    for sensitive in [
+        "sk-live-secret",
+        "sk-header-secret",
+        "downstream-secret",
+        "Bearer downstream-secret",
+    ] {
+        assert!(
+            !text.contains(sensitive),
+            "{label} leaked sensitive value {sensitive:?}: {text}"
+        );
+    }
+    let lowercase = text.to_ascii_lowercase();
+    for sensitive_key in ["authorization", "x-api-key"] {
+        assert!(
+            !lowercase.contains(sensitive_key),
+            "{label} leaked sensitive key {sensitive_key:?}: {text}"
+        );
+    }
+}
+
+async fn send_metrics_chat_request(proxy: &ProxyFixture, fake: &mut FakeUpstream, index: usize) {
+    let body = serde_json::json!({
+        "model": "test-chat",
+        "messages": [{"role": "user", "content": format!("metrics pruning {index}")}],
+    })
+    .to_string();
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=metrics-pruning-{index}",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("metrics chat request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response
+        .text()
+        .await
+        .expect("metrics chat body should be consumed");
+    let _observed = fake.recv_next().await;
+}
+
+async fn fetch_metrics(proxy: &ProxyFixture) -> String {
+    let response = proxy
+        .client
+        .get(format!("{}/metrics", proxy.base_url))
+        .send()
+        .await
+        .expect("metrics request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.text().await.expect("metrics should be text")
+}
+
+fn assert_metric_type(body: &str, metric_name: &str, metric_type: &str) {
+    let expected = format!("# TYPE {metric_name} {metric_type}");
+    assert!(
+        body.contains(&expected),
+        "metrics body missing expected type line {expected:?}: {body}"
+    );
+}
+
+fn assert_legacy_retained_counter_metrics_absent(body: &str) {
+    for metric_name in [
+        "llm_guard_proxy_requests_total",
+        "llm_guard_proxy_attempts_total",
+        "llm_guard_proxy_retries_total",
+        "llm_guard_proxy_loop_aborts_total",
+        "llm_guard_proxy_upstream_errors_total",
+        "llm_guard_proxy_heartbeat_mode_total",
+        "llm_guard_proxy_first_token_latency_ms_bucket",
+        "llm_guard_proxy_first_token_latency_ms_count",
+        "llm_guard_proxy_first_token_latency_ms_sum",
+        "llm_guard_proxy_total_latency_ms_bucket",
+        "llm_guard_proxy_total_latency_ms_count",
+        "llm_guard_proxy_total_latency_ms_sum",
+    ] {
+        assert!(
+            !body.contains(metric_name),
+            "metrics body still exposes legacy retained metric {metric_name:?}: {body}"
+        );
+    }
+}
+
+fn metric_value(body: &str, metric_name: &str) -> u64 {
+    let prefix = format!("{metric_name} ");
+    body.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or_else(|| panic!("metrics body missing numeric metric {metric_name:?}: {body}"))
 }
 
 async fn send_raw_proxy_get(base_url: &str, request_target: &str) -> String {

@@ -17,7 +17,9 @@ mod tests;
 pub use error::ObservabilityError;
 pub use ids::{AttemptId, RequestId};
 pub use model::{
-    AttemptRecord, AttemptStatus, DownstreamMode, RawPayloads, RequestRecord, RequestStatus,
-    RetentionUsage, StoreWrite, UpstreamMode,
+    AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
+    HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram, ObservabilityMetricsSnapshot,
+    RawPayloads, RequestMetricCount, RequestRecord, RequestStatus, RetentionPruningStats,
+    RetentionUsage, StoreWrite, UpstreamErrorMetricCount, UpstreamMode,
 };
 pub use store::ObservabilityStore;

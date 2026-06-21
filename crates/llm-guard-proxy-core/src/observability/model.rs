@@ -201,3 +201,146 @@ pub struct RetentionUsage {
     /// schema and page size.
     pub observed_bytes: u64,
 }
+
+/// Retention pruning counters persisted by the observability store.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RetentionPruningStats {
+    /// Number of retention-pruning passes that deleted at least one request.
+    pub prune_events: u64,
+    /// Number of request rows deleted by retention pruning.
+    pub pruned_requests: u64,
+    /// Number of attempt rows deleted by retention pruning.
+    pub pruned_attempts: u64,
+    /// Last pruning time in Unix milliseconds, if pruning has happened.
+    pub last_pruned_at_unix_ms: Option<u64>,
+}
+
+/// Low-cardinality request-count metric row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestMetricCount {
+    /// Final request status label.
+    pub status: String,
+    /// Downstream response mode label.
+    pub downstream_mode: String,
+    /// Upstream response mode label.
+    pub upstream_mode: String,
+    /// Downstream HTTP status class label.
+    pub http_status_class: String,
+    /// Row count.
+    pub count: u64,
+}
+
+/// Low-cardinality attempt-count metric row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AttemptMetricCount {
+    /// Final attempt status label.
+    pub status: String,
+    /// Upstream response mode label.
+    pub upstream_mode: String,
+    /// Upstream HTTP status class label.
+    pub http_status_class: String,
+    /// Row count.
+    pub count: u64,
+}
+
+/// Low-cardinality upstream-error metric row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpstreamErrorMetricCount {
+    /// Error kind bucket.
+    pub kind: String,
+    /// Upstream HTTP status class label.
+    pub http_status_class: String,
+    /// Row count.
+    pub count: u64,
+}
+
+/// Low-cardinality heartbeat-mode metric row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HeartbeatModeMetricCount {
+    /// Observed heartbeat/liveness mode.
+    pub mode: String,
+    /// Row count.
+    pub count: u64,
+}
+
+/// One cumulative histogram bucket.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HistogramBucket {
+    /// Inclusive upper bound in milliseconds.
+    pub le_ms: u64,
+    /// Cumulative value count up to and including `le_ms`.
+    pub count: u64,
+}
+
+/// Histogram snapshot over millisecond latency values.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LatencyHistogram {
+    /// Cumulative finite buckets.
+    pub buckets: Vec<HistogramBucket>,
+    /// Total number of observed values.
+    pub count: u64,
+    /// Sum of observed values in milliseconds.
+    pub sum_ms: u64,
+}
+
+/// Prometheus-oriented aggregate metrics derived from retained observations.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObservabilityMetricsSnapshot {
+    /// Request rows grouped by low-cardinality lifecycle labels.
+    pub request_counts: Vec<RequestMetricCount>,
+    /// Attempt rows grouped by low-cardinality lifecycle labels.
+    pub attempt_counts: Vec<AttemptMetricCount>,
+    /// Attempts that were retried or recorded a retry reason.
+    pub retry_count: u64,
+    /// Attempts or requests aborted by loop protection.
+    pub loop_abort_count: u64,
+    /// Upstream errors grouped into bounded buckets.
+    pub upstream_error_counts: Vec<UpstreamErrorMetricCount>,
+    /// First-token latency histogram from shielded attempts when present.
+    pub first_token_latency_ms: LatencyHistogram,
+    /// End-to-end request latency histogram.
+    pub total_latency_ms: LatencyHistogram,
+    /// Observed heartbeat/liveness modes.
+    pub heartbeat_mode_counts: Vec<HeartbeatModeMetricCount>,
+    /// Current retention usage.
+    pub retention_usage: RetentionUsage,
+    /// Persisted pruning counters.
+    pub pruning: RetentionPruningStats,
+}
+
+/// Safe bounded request summary for gated debug endpoints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DebugRequestSummary {
+    /// Stable request id.
+    pub request_id: String,
+    /// Request start time in Unix milliseconds.
+    pub started_at_unix_ms: u64,
+    /// Request finish time in Unix milliseconds.
+    pub finished_at_unix_ms: Option<u64>,
+    /// Request duration in milliseconds.
+    pub duration_ms: Option<u64>,
+    /// Downstream response mode.
+    pub downstream_mode: String,
+    /// Upstream response mode.
+    pub upstream_mode: String,
+    /// Sanitized model id, if known.
+    pub model_id: Option<String>,
+    /// Final request status.
+    pub status: String,
+    /// Downstream HTTP status, if one was produced.
+    pub http_status: Option<u16>,
+    /// Sanitized failure reason, if any.
+    pub error_reason: Option<String>,
+    /// Sanitized abort reason, if any.
+    pub abort_reason: Option<String>,
+    /// Number of attempts associated with the request.
+    pub attempt_count: u64,
+    /// Number of retried attempts associated with the request.
+    pub retry_count: u64,
+    /// Whether loop protection was observed for this request.
+    pub loop_detected: bool,
+    /// Redacted and filtered request metadata.
+    pub request_metadata: BTreeMap<String, String>,
+    /// Redacted and filtered response metadata.
+    pub response_metadata: BTreeMap<String, String>,
+}

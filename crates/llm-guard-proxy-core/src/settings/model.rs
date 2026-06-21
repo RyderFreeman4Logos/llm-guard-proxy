@@ -49,6 +49,17 @@ impl AppConfig {
         self.shielding = requested.shielding.clone();
         self.observability.enabled = requested.observability.enabled;
         self.observability.capture_raw_payloads = requested.observability.capture_raw_payloads;
+        self.observability.metrics_enabled = requested.observability.metrics_enabled;
+        self.observability.health_upstream_probe_enabled =
+            requested.observability.health_upstream_probe_enabled;
+        self.observability.health_upstream_probe_timeout_ms =
+            requested.observability.health_upstream_probe_timeout_ms;
+        self.observability.debug_summary_enabled = requested.observability.debug_summary_enabled;
+        self.observability
+            .debug_summary_admin_token
+            .clone_from(&requested.observability.debug_summary_admin_token);
+        self.observability.debug_summary_max_records =
+            requested.observability.debug_summary_max_records;
         self.observability.retention = requested.observability.retention.clone();
         self.thinking = requested.thinking.clone();
         self.loop_guard = requested.loop_guard.clone();
@@ -284,7 +295,30 @@ impl Default for ShieldingConfig {
     }
 }
 
-/// Observability policy and storage settings.
+/// Two-state config toggle used to keep endpoint switches explicit in the model.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConfigToggle {
+    Disabled,
+    Enabled,
+}
+
+impl ConfigToggle {
+    #[must_use]
+    pub const fn from_bool(enabled: bool) -> Self {
+        if enabled {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+
+    #[must_use]
+    pub const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+/// Metadata capture and retention settings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ObservabilityConfig {
     /// Enables indexed observability metadata.
@@ -293,6 +327,18 @@ pub struct ObservabilityConfig {
     pub sqlite_path: PathBuf,
     /// Enables raw prompt/output sidecars for explicitly configured debugging.
     pub capture_raw_payloads: bool,
+    /// Enables the Prometheus-compatible `/metrics` endpoint.
+    pub metrics_enabled: ConfigToggle,
+    /// Enables bounded upstream probing from `/health`.
+    pub health_upstream_probe_enabled: ConfigToggle,
+    /// Maximum time spent probing upstream readiness from `/health`.
+    pub health_upstream_probe_timeout_ms: u64,
+    /// Enables the gated recent-request debug summary endpoint.
+    pub debug_summary_enabled: ConfigToggle,
+    /// Optional bearer/admin token required for the debug summary endpoint.
+    pub debug_summary_admin_token: Option<String>,
+    /// Maximum recent request summaries returned by one debug response.
+    pub debug_summary_max_records: u32,
     /// Retention limits for metadata and artifacts.
     pub retention: RetentionConfig,
 }
@@ -304,6 +350,33 @@ impl ObservabilityConfig {
             "observability.sqlite_path",
             "must not be empty",
         )?;
+        require(
+            self.health_upstream_probe_timeout_ms > 0,
+            "observability.health_upstream_probe_timeout_ms",
+            "must be greater than zero",
+        )?;
+        require(
+            self.health_upstream_probe_timeout_ms <= 30_000,
+            "observability.health_upstream_probe_timeout_ms",
+            "must be less than or equal to 30000",
+        )?;
+        require(
+            self.debug_summary_max_records > 0,
+            "observability.debug_summary_max_records",
+            "must be greater than zero",
+        )?;
+        require(
+            self.debug_summary_max_records <= 100,
+            "observability.debug_summary_max_records",
+            "must be less than or equal to 100",
+        )?;
+        if let Some(token) = &self.debug_summary_admin_token {
+            require(
+                !token.trim().is_empty(),
+                "observability.debug_summary_admin_token",
+                "must not be empty when set",
+            )?;
+        }
         self.retention.validate()
     }
 }
@@ -314,6 +387,12 @@ impl Default for ObservabilityConfig {
             enabled: true,
             sqlite_path: PathBuf::from("~/.local/state/llm-guard-proxy/observability.sqlite3"),
             capture_raw_payloads: false,
+            metrics_enabled: ConfigToggle::Enabled,
+            health_upstream_probe_enabled: ConfigToggle::Enabled,
+            health_upstream_probe_timeout_ms: 500,
+            debug_summary_enabled: ConfigToggle::Disabled,
+            debug_summary_admin_token: None,
+            debug_summary_max_records: 20,
             retention: RetentionConfig::default(),
         }
     }
