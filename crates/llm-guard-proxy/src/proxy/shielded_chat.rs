@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use axum::body::Bytes;
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
-use llm_guard_proxy_core::RawPayloads;
+use llm_guard_proxy_core::{RawPayloads, ThinkingConfig};
 use serde_json::{Map, Number, Value, json};
 
 use super::{MAX_PROXY_BODY_BYTES, sanitized_reqwest_error, unix_time_millis};
@@ -11,16 +11,24 @@ use super::{MAX_PROXY_BODY_BYTES, sanitized_reqwest_error, unix_time_millis};
 /// Prepared upstream request body for shielded non-stream chat completion handling.
 pub(super) struct PreparedChatRequest {
     upstream_body: Bytes,
+    thinking_metadata: BTreeMap<String, String>,
 }
 
 impl PreparedChatRequest {
     pub(super) fn upstream_body(&self) -> Bytes {
         self.upstream_body.clone()
     }
+
+    pub(super) fn thinking_metadata(&self) -> &BTreeMap<String, String> {
+        &self.thinking_metadata
+    }
 }
 
 /// Forces upstream streaming and usage frames for non-stream chat requests parsed as JSON.
-pub(super) fn prepare_non_stream_request(body: &Bytes) -> Option<PreparedChatRequest> {
+pub(super) fn prepare_non_stream_request(
+    body: &Bytes,
+    thinking: &ThinkingConfig,
+) -> Option<PreparedChatRequest> {
     let mut value = serde_json::from_slice::<Value>(body).ok()?;
     let object = value.as_object_mut()?;
     if let Some(stream) = object.get("stream") {
@@ -35,6 +43,7 @@ pub(super) fn prepare_non_stream_request(body: &Bytes) -> Option<PreparedChatReq
         return None;
     }
 
+    let thinking_metadata = apply_thinking_policy(object, thinking);
     object.insert(String::from("stream"), Value::Bool(true));
     let stream_options = object
         .entry(String::from("stream_options"))
@@ -48,7 +57,797 @@ pub(super) fn prepare_non_stream_request(body: &Bytes) -> Option<PreparedChatReq
 
     Some(PreparedChatRequest {
         upstream_body: Bytes::from(upstream_body),
+        thinking_metadata,
     })
+}
+
+#[derive(Clone, Copy, Debug)]
+struct JsonPath {
+    path: &'static [&'static str],
+    variant: &'static str,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BudgetObservation {
+    path: JsonPath,
+    state: BudgetState,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BudgetObservations {
+    entries: Vec<BudgetObservation>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BudgetState {
+    Numeric(u64),
+    Malformed,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DisableMarker {
+    None,
+    Disabled(JsonPath),
+    Malformed(JsonPath),
+}
+
+#[derive(Clone, Debug, Default)]
+struct AnswerBudgetDecision {
+    applied: bool,
+    adjusted_fields: Vec<&'static str>,
+    preserved_fields: Vec<&'static str>,
+    malformed_fields: Vec<&'static str>,
+    overflow_fields: Vec<&'static str>,
+}
+
+const CANONICAL_THINKING_BUDGET: JsonPath = JsonPath {
+    path: &["thinking", "budget_tokens"],
+    variant: "canonical",
+};
+
+const ROOT_THINKING_BUDGET: JsonPath = JsonPath {
+    path: &["thinking_budget"],
+    variant: "root-thinking-budget",
+};
+
+const ROOT_CHAT_TEMPLATE_THINKING_BUDGET: JsonPath = JsonPath {
+    path: &["chat_template_kwargs", "thinking_budget"],
+    variant: "chat-template-kwargs",
+};
+
+const EXTRA_BODY_THINKING_BUDGET: JsonPath = JsonPath {
+    path: &["extra_body", "thinking_budget"],
+    variant: "extra-body-thinking-budget",
+};
+
+const EXTRA_BODY_CANONICAL_THINKING_BUDGET: JsonPath = JsonPath {
+    path: &["extra_body", "thinking", "budget_tokens"],
+    variant: "extra-body-canonical",
+};
+
+const EXTRA_BODY_CHAT_TEMPLATE_THINKING_BUDGET: JsonPath = JsonPath {
+    path: &["extra_body", "chat_template_kwargs", "thinking_budget"],
+    variant: "extra-body-chat-template-kwargs",
+};
+
+const BUDGET_PATHS: &[JsonPath] = &[
+    CANONICAL_THINKING_BUDGET,
+    ROOT_THINKING_BUDGET,
+    ROOT_CHAT_TEMPLATE_THINKING_BUDGET,
+    EXTRA_BODY_THINKING_BUDGET,
+    EXTRA_BODY_CANONICAL_THINKING_BUDGET,
+    EXTRA_BODY_CHAT_TEMPLATE_THINKING_BUDGET,
+];
+
+const ROOT_ENABLE_THINKING: JsonPath = JsonPath {
+    path: &["enable_thinking"],
+    variant: "root-enable-thinking",
+};
+
+const THINKING_ENABLE_THINKING: JsonPath = JsonPath {
+    path: &["thinking", "enable_thinking"],
+    variant: "canonical-enable-thinking",
+};
+
+const THINKING_ENABLED: JsonPath = JsonPath {
+    path: &["thinking", "enabled"],
+    variant: "canonical-thinking-enabled",
+};
+
+const ROOT_CHAT_TEMPLATE_ENABLE_THINKING: JsonPath = JsonPath {
+    path: &["chat_template_kwargs", "enable_thinking"],
+    variant: "chat-template-kwargs-enable-thinking",
+};
+
+const EXTRA_BODY_ENABLE_THINKING: JsonPath = JsonPath {
+    path: &["extra_body", "enable_thinking"],
+    variant: "extra-body-enable-thinking",
+};
+
+const EXTRA_BODY_THINKING_ENABLE_THINKING: JsonPath = JsonPath {
+    path: &["extra_body", "thinking", "enable_thinking"],
+    variant: "extra-body-canonical-enable-thinking",
+};
+
+const EXTRA_BODY_THINKING_ENABLED: JsonPath = JsonPath {
+    path: &["extra_body", "thinking", "enabled"],
+    variant: "extra-body-canonical-thinking-enabled",
+};
+
+const EXTRA_BODY_CHAT_TEMPLATE_ENABLE_THINKING: JsonPath = JsonPath {
+    path: &["extra_body", "chat_template_kwargs", "enable_thinking"],
+    variant: "extra-body-chat-template-kwargs-enable-thinking",
+};
+
+const DISABLE_MARKER_PATHS: &[JsonPath] = &[
+    ROOT_ENABLE_THINKING,
+    THINKING_ENABLE_THINKING,
+    THINKING_ENABLED,
+    ROOT_CHAT_TEMPLATE_ENABLE_THINKING,
+    EXTRA_BODY_ENABLE_THINKING,
+    EXTRA_BODY_THINKING_ENABLE_THINKING,
+    EXTRA_BODY_THINKING_ENABLED,
+    EXTRA_BODY_CHAT_TEMPLATE_ENABLE_THINKING,
+];
+
+const ANSWER_BUDGET_FIELDS: &[&str] = &["max_tokens", "max_completion_tokens", "max_output_tokens"];
+
+#[derive(Debug)]
+struct ThinkingPolicyOutcome {
+    rewrite_applied: bool,
+    reason: &'static str,
+    final_budget: String,
+    answer_budget_delta: u64,
+    rewritten_paths: Vec<JsonPath>,
+    preserved_paths: Vec<JsonPath>,
+    malformed_paths: Vec<JsonPath>,
+    zero_paths: Vec<JsonPath>,
+}
+
+fn apply_thinking_policy(
+    object: &mut Map<String, Value>,
+    thinking: &ThinkingConfig,
+) -> BTreeMap<String, String> {
+    let configured_budget = u64::from(thinking.budget_tokens);
+    let budget_observations = find_budget_observations(object);
+    let disable_marker = find_disable_marker(object);
+    let mut metadata = initial_thinking_metadata(thinking, configured_budget, &budget_observations);
+    let outcome = apply_thinking_budget_policy(
+        object,
+        thinking,
+        configured_budget,
+        &budget_observations,
+        disable_marker,
+        &mut metadata,
+    );
+    let answer_budget = apply_answer_budget_preservation(
+        object,
+        thinking.preserve_answer_budget,
+        outcome.answer_budget_delta,
+    );
+
+    metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
+    metadata
+}
+
+fn initial_thinking_metadata(
+    thinking: &ThinkingConfig,
+    configured_budget: u64,
+    budget_observations: &BudgetObservations,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            String::from("thinking_policy_enabled"),
+            thinking.enabled.to_string(),
+        ),
+        (
+            String::from("thinking_policy_budget_tokens"),
+            configured_budget.to_string(),
+        ),
+        (
+            String::from("thinking_preserve_answer_budget_enabled"),
+            thinking.preserve_answer_budget.to_string(),
+        ),
+        (
+            String::from("thinking_budget_previous_state"),
+            previous_budget_state(budget_observations, configured_budget),
+        ),
+        (
+            String::from("thinking_budget_previous_tokens"),
+            previous_budget_tokens(budget_observations),
+        ),
+        (
+            String::from("thinking_schema_path"),
+            budget_observations.single_path().map_or_else(
+                || {
+                    if budget_observations.is_empty() {
+                        String::from("none")
+                    } else {
+                        String::from("multiple")
+                    }
+                },
+                JsonPath::display_path,
+            ),
+        ),
+        (
+            String::from("thinking_schema_variant"),
+            budget_observations.single_path().map_or_else(
+                || {
+                    if budget_observations.is_empty() {
+                        String::from("none")
+                    } else {
+                        String::from("multiple")
+                    }
+                },
+                |path| path.variant.to_owned(),
+            ),
+        ),
+        (
+            String::from("thinking_budget_observed_paths"),
+            observed_budget_paths(budget_observations, configured_budget),
+        ),
+    ])
+}
+
+fn apply_thinking_budget_policy(
+    object: &mut Map<String, Value>,
+    thinking: &ThinkingConfig,
+    configured_budget: u64,
+    budget_observations: &BudgetObservations,
+    disable_marker: DisableMarker,
+    metadata: &mut BTreeMap<String, String>,
+) -> ThinkingPolicyOutcome {
+    if !thinking.enabled {
+        return thinking_noop("policy_disabled", budget_observations);
+    }
+    if configured_budget == 0 {
+        return thinking_noop("configured_budget_zero", budget_observations);
+    }
+    match disable_marker {
+        DisableMarker::Disabled(path) => {
+            insert_disable_marker_metadata(metadata, path);
+            thinking_noop("caller_disabled_thinking", budget_observations)
+        }
+        DisableMarker::Malformed(path) => {
+            insert_disable_marker_metadata(metadata, path);
+            thinking_noop("malformed_disable_marker", budget_observations)
+        }
+        DisableMarker::None => {
+            apply_budget_observations(object, configured_budget, budget_observations, metadata)
+        }
+    }
+}
+
+fn apply_budget_observations(
+    object: &mut Map<String, Value>,
+    configured_budget: u64,
+    budget_observations: &BudgetObservations,
+    metadata: &mut BTreeMap<String, String>,
+) -> ThinkingPolicyOutcome {
+    if budget_observations.is_empty() {
+        return inject_missing_budget(object, configured_budget, metadata);
+    }
+
+    let zero_paths = budget_observations.zero_paths();
+    if !zero_paths.is_empty() {
+        return ThinkingPolicyOutcome {
+            rewrite_applied: false,
+            reason: "existing_budget_zero",
+            final_budget: final_budget_tokens(budget_observations, configured_budget),
+            answer_budget_delta: 0,
+            rewritten_paths: Vec::new(),
+            preserved_paths: budget_observations.non_malformed_paths(),
+            malformed_paths: budget_observations.malformed_paths(),
+            zero_paths,
+        };
+    }
+
+    let mut rewritten_paths = Vec::new();
+    let mut preserved_paths = Vec::new();
+    let mut malformed_paths = Vec::new();
+    let mut answer_budget_delta = 0;
+    for observation in &budget_observations.entries {
+        match observation.state {
+            BudgetState::Malformed => malformed_paths.push(observation.path),
+            BudgetState::Numeric(existing_budget) if existing_budget < configured_budget => {
+                if !set_budget_at_path(object, observation.path, configured_budget) {
+                    return malformed_budget_container_outcome(
+                        budget_observations,
+                        configured_budget,
+                    );
+                }
+                rewritten_paths.push(observation.path);
+                answer_budget_delta =
+                    answer_budget_delta.max(configured_budget.saturating_sub(existing_budget));
+            }
+            BudgetState::Numeric(_existing_budget) => preserved_paths.push(observation.path),
+        }
+    }
+
+    if !rewritten_paths.is_empty() {
+        return ThinkingPolicyOutcome {
+            rewrite_applied: true,
+            reason: "raised_smaller_budget",
+            final_budget: final_budget_tokens(budget_observations, configured_budget),
+            answer_budget_delta,
+            rewritten_paths,
+            preserved_paths,
+            malformed_paths,
+            zero_paths: Vec::new(),
+        };
+    }
+
+    if !preserved_paths.is_empty() {
+        return ThinkingPolicyOutcome {
+            rewrite_applied: false,
+            reason: "preserved_equal_or_larger_budget",
+            final_budget: final_budget_tokens(budget_observations, configured_budget),
+            answer_budget_delta: 0,
+            rewritten_paths,
+            preserved_paths,
+            malformed_paths,
+            zero_paths: Vec::new(),
+        };
+    }
+
+    ThinkingPolicyOutcome {
+        rewrite_applied: false,
+        reason: "malformed_existing_budget",
+        final_budget: final_budget_tokens(budget_observations, configured_budget),
+        answer_budget_delta: 0,
+        rewritten_paths,
+        preserved_paths,
+        malformed_paths,
+        zero_paths: Vec::new(),
+    }
+}
+
+fn inject_missing_budget(
+    object: &mut Map<String, Value>,
+    configured_budget: u64,
+    metadata: &mut BTreeMap<String, String>,
+) -> ThinkingPolicyOutcome {
+    let path = injection_path(object);
+    metadata.insert(String::from("thinking_schema_path"), path.display_path());
+    metadata.insert(
+        String::from("thinking_schema_variant"),
+        path.variant.to_owned(),
+    );
+    if set_budget_at_path(object, path, configured_budget) {
+        return ThinkingPolicyOutcome {
+            rewrite_applied: true,
+            reason: "injected_missing_budget",
+            final_budget: configured_budget.to_string(),
+            answer_budget_delta: configured_budget,
+            rewritten_paths: vec![path],
+            preserved_paths: Vec::new(),
+            malformed_paths: Vec::new(),
+            zero_paths: Vec::new(),
+        };
+    }
+    ThinkingPolicyOutcome {
+        rewrite_applied: false,
+        reason: "malformed_budget_container",
+        final_budget: String::from("unknown"),
+        answer_budget_delta: 0,
+        rewritten_paths: Vec::new(),
+        preserved_paths: Vec::new(),
+        malformed_paths: Vec::new(),
+        zero_paths: Vec::new(),
+    }
+}
+
+fn malformed_budget_container_outcome(
+    budget_observations: &BudgetObservations,
+    configured_budget: u64,
+) -> ThinkingPolicyOutcome {
+    ThinkingPolicyOutcome {
+        rewrite_applied: false,
+        reason: "malformed_budget_container",
+        final_budget: final_budget_tokens(budget_observations, configured_budget),
+        answer_budget_delta: 0,
+        rewritten_paths: Vec::new(),
+        preserved_paths: Vec::new(),
+        malformed_paths: budget_observations.malformed_paths(),
+        zero_paths: budget_observations.zero_paths(),
+    }
+}
+
+fn thinking_noop(
+    reason: &'static str,
+    budget_observations: &BudgetObservations,
+) -> ThinkingPolicyOutcome {
+    ThinkingPolicyOutcome {
+        rewrite_applied: false,
+        reason,
+        final_budget: current_budget_tokens(budget_observations),
+        answer_budget_delta: 0,
+        rewritten_paths: Vec::new(),
+        preserved_paths: budget_observations.non_malformed_paths(),
+        malformed_paths: budget_observations.malformed_paths(),
+        zero_paths: budget_observations.zero_paths(),
+    }
+}
+
+fn insert_disable_marker_metadata(metadata: &mut BTreeMap<String, String>, path: JsonPath) {
+    metadata.insert(
+        String::from("thinking_disable_marker_path"),
+        path.display_path(),
+    );
+    metadata.insert(
+        String::from("thinking_disable_marker_variant"),
+        path.variant.to_owned(),
+    );
+}
+
+fn thinking_outcome_metadata(
+    outcome: &ThinkingPolicyOutcome,
+    answer_budget: &AnswerBudgetDecision,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            String::from("thinking_rewrite_applied"),
+            outcome.rewrite_applied.to_string(),
+        ),
+        (
+            String::from("thinking_rewrite_reason"),
+            outcome.reason.to_owned(),
+        ),
+        (
+            String::from("thinking_budget_final_tokens"),
+            outcome.final_budget.clone(),
+        ),
+        (
+            String::from("thinking_answer_budget_delta_tokens"),
+            outcome.answer_budget_delta.to_string(),
+        ),
+        (
+            String::from("thinking_answer_budget_preservation_applied"),
+            answer_budget.applied.to_string(),
+        ),
+        (
+            String::from("thinking_answer_budget_adjusted_fields"),
+            join_fields(&answer_budget.adjusted_fields),
+        ),
+        (
+            String::from("thinking_answer_budget_preserved_fields"),
+            join_fields(&answer_budget.preserved_fields),
+        ),
+        (
+            String::from("thinking_answer_budget_malformed_fields"),
+            join_fields(&answer_budget.malformed_fields),
+        ),
+        (
+            String::from("thinking_answer_budget_overflow_fields"),
+            join_fields(&answer_budget.overflow_fields),
+        ),
+        (
+            String::from("thinking_budget_rewritten_paths"),
+            join_paths(&outcome.rewritten_paths),
+        ),
+        (
+            String::from("thinking_budget_preserved_paths"),
+            join_paths(&outcome.preserved_paths),
+        ),
+        (
+            String::from("thinking_budget_malformed_paths"),
+            join_paths(&outcome.malformed_paths),
+        ),
+        (
+            String::from("thinking_budget_zero_paths"),
+            join_paths(&outcome.zero_paths),
+        ),
+    ])
+}
+
+fn find_budget_observations(object: &Map<String, Value>) -> BudgetObservations {
+    let mut entries = Vec::new();
+    for path in BUDGET_PATHS {
+        match value_at_path(object, path.path) {
+            PathValue::Missing => {}
+            PathValue::Malformed => {
+                entries.push(BudgetObservation {
+                    path: *path,
+                    state: BudgetState::Malformed,
+                });
+            }
+            PathValue::Value(value) => {
+                entries.push(BudgetObservation {
+                    path: *path,
+                    state: token_budget_value(value),
+                });
+            }
+        }
+    }
+    BudgetObservations { entries }
+}
+
+fn find_disable_marker(object: &Map<String, Value>) -> DisableMarker {
+    let mut malformed = None;
+    for path in DISABLE_MARKER_PATHS {
+        match value_at_path(object, path.path) {
+            PathValue::Malformed => {
+                malformed.get_or_insert(*path);
+            }
+            PathValue::Value(Value::Bool(false)) => return DisableMarker::Disabled(*path),
+            PathValue::Missing | PathValue::Value(Value::Bool(true)) => {}
+            PathValue::Value(_value) => {
+                malformed.get_or_insert(*path);
+            }
+        }
+    }
+
+    malformed.map_or(DisableMarker::None, DisableMarker::Malformed)
+}
+
+enum PathValue<'a> {
+    Missing,
+    Malformed,
+    Value(&'a Value),
+}
+
+fn value_at_path<'a>(object: &'a Map<String, Value>, path: &[&str]) -> PathValue<'a> {
+    let Some((&last, parents)) = path.split_last() else {
+        return PathValue::Missing;
+    };
+    let mut current = object;
+    for key in parents {
+        match current.get(*key) {
+            Some(Value::Object(next)) => current = next,
+            Some(_value) => return PathValue::Malformed,
+            None => return PathValue::Missing,
+        }
+    }
+    current
+        .get(last)
+        .map_or(PathValue::Missing, PathValue::Value)
+}
+
+fn token_budget_value(value: &Value) -> BudgetState {
+    match value {
+        Value::Number(number) => number
+            .as_u64()
+            .map_or(BudgetState::Malformed, BudgetState::Numeric),
+        _ => BudgetState::Malformed,
+    }
+}
+
+fn injection_path(object: &Map<String, Value>) -> JsonPath {
+    if object_at_path(object, &["chat_template_kwargs"]) {
+        return ROOT_CHAT_TEMPLATE_THINKING_BUDGET;
+    }
+    if object_at_path(object, &["extra_body", "chat_template_kwargs"]) {
+        return EXTRA_BODY_CHAT_TEMPLATE_THINKING_BUDGET;
+    }
+    if object_at_path(object, &["extra_body", "thinking"]) {
+        return EXTRA_BODY_CANONICAL_THINKING_BUDGET;
+    }
+    CANONICAL_THINKING_BUDGET
+}
+
+fn object_at_path(object: &Map<String, Value>, path: &[&str]) -> bool {
+    let mut current = object;
+    for key in path {
+        match current.get(*key) {
+            Some(Value::Object(next)) => current = next,
+            Some(_) | None => return false,
+        }
+    }
+    true
+}
+
+fn set_budget_at_path(object: &mut Map<String, Value>, path: JsonPath, budget: u64) -> bool {
+    let Some((&last, parents)) = path.path.split_last() else {
+        return false;
+    };
+    let mut current = object;
+    for key in parents {
+        let entry = current
+            .entry((*key).to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Value::Object(next) = entry else {
+            return false;
+        };
+        current = next;
+    }
+    current.insert(last.to_owned(), Value::Number(Number::from(budget)));
+    true
+}
+
+fn apply_answer_budget_preservation(
+    object: &mut Map<String, Value>,
+    preserve_answer_budget: bool,
+    delta: u64,
+) -> AnswerBudgetDecision {
+    let mut decision = AnswerBudgetDecision::default();
+    for field in ANSWER_BUDGET_FIELDS {
+        let Some(value) = object.get_mut(*field) else {
+            continue;
+        };
+        if delta == 0 || !preserve_answer_budget {
+            decision.preserved_fields.push(field);
+            continue;
+        }
+        let Some(existing) = value.as_u64() else {
+            decision.malformed_fields.push(field);
+            continue;
+        };
+        let Some(adjusted) = existing.checked_add(delta) else {
+            decision.overflow_fields.push(field);
+            continue;
+        };
+        *value = Value::Number(Number::from(adjusted));
+        decision.adjusted_fields.push(field);
+        decision.applied = true;
+    }
+    decision
+}
+
+fn previous_budget_state(observations: &BudgetObservations, configured_budget: u64) -> String {
+    if observations.is_empty() {
+        return String::from("absent");
+    }
+    let mut states = observations
+        .entries
+        .iter()
+        .map(|observation| budget_state_label(observation.state, configured_budget))
+        .collect::<Vec<_>>();
+    states.sort_unstable();
+    states.dedup();
+    if states.len() == 1 {
+        states[0].to_owned()
+    } else {
+        String::from("mixed")
+    }
+}
+
+fn previous_budget_tokens(observations: &BudgetObservations) -> String {
+    if observations.is_empty() {
+        return String::from("absent");
+    }
+    if observations.entries.len() > 1 {
+        return String::from("multiple");
+    }
+    match observations.entries[0].state {
+        BudgetState::Malformed => String::from("malformed"),
+        BudgetState::Numeric(value) => value.to_string(),
+    }
+}
+
+fn final_budget_tokens(observations: &BudgetObservations, configured_budget: u64) -> String {
+    budget_tokens_summary(observations, |value| {
+        if value > 0 && value < configured_budget {
+            configured_budget
+        } else {
+            value
+        }
+    })
+}
+
+fn current_budget_tokens(observations: &BudgetObservations) -> String {
+    budget_tokens_summary(observations, |value| value)
+}
+
+fn budget_tokens_summary(
+    observations: &BudgetObservations,
+    map_numeric: impl Fn(u64) -> u64,
+) -> String {
+    if observations.is_empty() {
+        return String::from("absent");
+    }
+    let mut values = observations
+        .entries
+        .iter()
+        .filter_map(|observation| match observation.state {
+            BudgetState::Malformed => None,
+            BudgetState::Numeric(value) => Some(map_numeric(value)),
+        })
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values.dedup();
+    match values.len() {
+        0 => String::from("unknown"),
+        1 => values[0].to_string(),
+        _ => String::from("multiple"),
+    }
+}
+
+fn budget_state_label(state: BudgetState, configured_budget: u64) -> &'static str {
+    match state {
+        BudgetState::Malformed => "malformed",
+        BudgetState::Numeric(0) => "zero",
+        BudgetState::Numeric(existing) if existing < configured_budget => "smaller",
+        BudgetState::Numeric(existing) if existing == configured_budget => "equal",
+        BudgetState::Numeric(_existing) => "larger",
+    }
+}
+
+fn join_fields(fields: &[&str]) -> String {
+    if fields.is_empty() {
+        String::from("none")
+    } else {
+        fields.join(",")
+    }
+}
+
+fn join_paths(paths: &[JsonPath]) -> String {
+    if paths.is_empty() {
+        String::from("none")
+    } else {
+        paths
+            .iter()
+            .map(|path| path.display_path())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+fn observed_budget_paths(observations: &BudgetObservations, configured_budget: u64) -> String {
+    if observations.is_empty() {
+        return String::from("none");
+    }
+    observations
+        .entries
+        .iter()
+        .map(|observation| {
+            format!(
+                "{}={}",
+                observation.path.display_path(),
+                budget_state_label(observation.state, configured_budget)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+impl JsonPath {
+    fn display_path(self) -> String {
+        self.path.join(".")
+    }
+}
+
+impl BudgetObservations {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn single_path(&self) -> Option<JsonPath> {
+        if self.entries.len() == 1 {
+            Some(self.entries[0].path)
+        } else {
+            None
+        }
+    }
+
+    fn zero_paths(&self) -> Vec<JsonPath> {
+        self.entries
+            .iter()
+            .filter_map(|observation| match observation.state {
+                BudgetState::Numeric(0) => Some(observation.path),
+                BudgetState::Numeric(_) | BudgetState::Malformed => None,
+            })
+            .collect()
+    }
+
+    fn malformed_paths(&self) -> Vec<JsonPath> {
+        self.entries
+            .iter()
+            .filter_map(|observation| match observation.state {
+                BudgetState::Malformed => Some(observation.path),
+                BudgetState::Numeric(_) => None,
+            })
+            .collect()
+    }
+
+    fn non_malformed_paths(&self) -> Vec<JsonPath> {
+        self.entries
+            .iter()
+            .filter_map(|observation| match observation.state {
+                BudgetState::Numeric(_) => Some(observation.path),
+                BudgetState::Malformed => None,
+            })
+            .collect()
+    }
 }
 
 /// Accepted, aggregated OpenAI-compatible chat completion response.

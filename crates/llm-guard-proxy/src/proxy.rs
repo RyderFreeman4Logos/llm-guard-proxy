@@ -355,6 +355,7 @@ async fn forward_openai_request(
         &mut request_metadata,
         shielded_chat_plan.intercepted,
         &shielded_chat_plan.liveness,
+        &shielded_chat_plan.thinking_metadata,
     );
     let attempt_id = AttemptId::for_request(request_id, 1);
     let attempt_started_at_unix_ms = unix_time_millis();
@@ -363,6 +364,7 @@ async fn forward_openai_request(
         &mut attempt_request_metadata,
         shielded_chat_plan.intercepted,
         &shielded_chat_plan.liveness,
+        &shielded_chat_plan.thinking_metadata,
     );
     let shielded_chat_intercepted = shielded_chat_plan.intercepted;
     let upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
@@ -465,6 +467,7 @@ struct ShieldedChatPlan {
     upstream_body: Bytes,
     intercepted: bool,
     liveness: ShieldedLivenessSelection,
+    thinking_metadata: BTreeMap<String, String>,
 }
 
 fn plan_shielded_chat(
@@ -475,7 +478,7 @@ fn plan_shielded_chat(
     body: &Bytes,
 ) -> ShieldedChatPlan {
     let request = if should_intercept_non_stream_chat(method, uri, config) {
-        shielded_chat::prepare_non_stream_request(body)
+        shielded_chat::prepare_non_stream_request(body, &config.thinking)
     } else {
         None
     };
@@ -483,6 +486,9 @@ fn plan_shielded_chat(
         || body.clone(),
         shielded_chat::PreparedChatRequest::upstream_body,
     );
+    let thinking_metadata = request
+        .as_ref()
+        .map_or_else(BTreeMap::new, |request| request.thinking_metadata().clone());
     let intercepted = request.is_some();
     let liveness = select_shielded_liveness(state, config, body, intercepted, unix_time_millis());
 
@@ -490,6 +496,7 @@ fn plan_shielded_chat(
         upstream_body,
         intercepted,
         liveness,
+        thinking_metadata,
     }
 }
 
@@ -1576,10 +1583,12 @@ fn add_shielded_request_metadata(
     metadata: &mut BTreeMap<String, String>,
     shielded_chat: bool,
     liveness: &ShieldedLivenessSelection,
+    thinking_metadata: &BTreeMap<String, String>,
 ) {
     if shielded_chat {
         add_shielded_chat_request_metadata(metadata);
         add_shielded_liveness_request_metadata(metadata, liveness);
+        metadata.extend(thinking_metadata.clone());
     }
 }
 

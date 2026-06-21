@@ -721,7 +721,7 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
         serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
     assert_eq!(observed_body["model"], "test-chat");
     assert_eq!(observed_body["messages"][0]["content"], "ping");
-    assert_eq!(observed_body["thinking"]["budget_tokens"], 1);
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
     assert_eq!(observed_body["stream"], true);
     assert_eq!(observed_body["stream_options"]["include_usage"], true);
 }
@@ -757,6 +757,495 @@ async fn shielded_non_stream_chat_preserves_stream_options_while_forcing_usage()
         observed_body["stream_options"]["vendor_hint"]["mode"],
         "keep"
     );
+}
+
+#[tokio::test]
+async fn shielded_thinking_policy_injects_missing_budget_and_preserves_answer_reserve() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":64}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
+    assert_eq!(observed_body["max_tokens"], 32_832);
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["stream_options"]["include_usage"], true);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["thinking_policy_enabled"], "true");
+        assert_eq!(metadata["thinking_policy_budget_tokens"], "32768");
+        assert_eq!(metadata["thinking_rewrite_applied"], "true");
+        assert_eq!(
+            metadata["thinking_rewrite_reason"],
+            "injected_missing_budget"
+        );
+        assert_eq!(metadata["thinking_budget_previous_state"], "absent");
+        assert_eq!(metadata["thinking_budget_final_tokens"], "32768");
+        assert_eq!(metadata["thinking_schema_path"], "thinking.budget_tokens");
+        assert_eq!(metadata["thinking_schema_variant"], "canonical");
+        assert_eq!(metadata["thinking_answer_budget_delta_tokens"], "32768");
+        assert_eq!(
+            metadata["thinking_answer_budget_preservation_applied"],
+            "true"
+        );
+        assert_eq!(
+            metadata["thinking_answer_budget_adjusted_fields"],
+            "max_tokens"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shielded_thinking_policy_respects_explicit_disable_marker() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":64,"api_key":"sk-secret"}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert!(observed_body.get("thinking").is_none());
+    assert!(observed_body.get("thinking_budget").is_none());
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+    assert_eq!(observed_body["max_tokens"], 64);
+    assert_eq!(observed_body["stream"], true);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["thinking_rewrite_applied"], "false");
+        assert_eq!(
+            metadata["thinking_rewrite_reason"],
+            "caller_disabled_thinking"
+        );
+        assert_eq!(
+            metadata["thinking_disable_marker_path"],
+            "chat_template_kwargs.enable_thinking"
+        );
+        assert_eq!(
+            metadata["thinking_answer_budget_preserved_fields"],
+            "max_tokens"
+        );
+        assert_text_excludes_values(&metadata.to_string(), &["sk-secret", "api_key"]);
+    }
+}
+
+#[tokio::test]
+async fn shielded_thinking_policy_preserves_zero_existing_budget() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"thinking":{"budget_tokens":0},"max_tokens":64}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 0);
+    assert_eq!(observed_body["max_tokens"], 64);
+    assert_eq!(observed_body["stream"], true);
+
+    let (request_metadata, _attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    assert_eq!(request_metadata["thinking_rewrite_applied"], "false");
+    assert_eq!(
+        request_metadata["thinking_rewrite_reason"],
+        "existing_budget_zero"
+    );
+    assert_eq!(request_metadata["thinking_budget_previous_state"], "zero");
+    assert_eq!(request_metadata["thinking_budget_final_tokens"], "0");
+}
+
+#[tokio::test]
+async fn shielded_thinking_policy_raises_smaller_budget_and_adjusts_answer_fields() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"thinking":{"budget_tokens":1},"max_tokens":64,"max_completion_tokens":32,"max_output_tokens":16}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
+    assert_eq!(observed_body["max_tokens"], 32_831);
+    assert_eq!(observed_body["max_completion_tokens"], 32_799);
+    assert_eq!(observed_body["max_output_tokens"], 32_783);
+    assert_eq!(
+        observed_body["max_tokens"].as_u64().expect("max_tokens")
+            - observed_body["thinking"]["budget_tokens"]
+                .as_u64()
+                .expect("thinking budget"),
+        63
+    );
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["thinking_rewrite_applied"], "true");
+        assert_eq!(metadata["thinking_rewrite_reason"], "raised_smaller_budget");
+        assert_eq!(metadata["thinking_budget_previous_state"], "smaller");
+        assert_eq!(metadata["thinking_budget_previous_tokens"], "1");
+        assert_eq!(metadata["thinking_budget_final_tokens"], "32768");
+        assert_eq!(metadata["thinking_answer_budget_delta_tokens"], "32767");
+        assert_eq!(
+            metadata["thinking_answer_budget_preservation_applied"],
+            "true"
+        );
+        assert_eq!(
+            metadata["thinking_answer_budget_adjusted_fields"],
+            "max_tokens,max_completion_tokens,max_output_tokens"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shielded_thinking_policy_raises_all_known_non_zero_budget_paths_once() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"thinking":{"budget_tokens":32768},"extra_body":{"chat_template_kwargs":{"thinking_budget":8}},"max_tokens":64}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
+    assert_eq!(
+        observed_body["extra_body"]["chat_template_kwargs"]["thinking_budget"],
+        32_768
+    );
+    assert_eq!(observed_body["max_tokens"], 32_824);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["thinking_rewrite_applied"], "true");
+        assert_eq!(metadata["thinking_rewrite_reason"], "raised_smaller_budget");
+        assert_eq!(metadata["thinking_budget_previous_state"], "mixed");
+        assert_eq!(metadata["thinking_budget_previous_tokens"], "multiple");
+        assert_eq!(metadata["thinking_schema_path"], "multiple");
+        assert_eq!(metadata["thinking_schema_variant"], "multiple");
+        assert_eq!(metadata["thinking_budget_final_tokens"], "32768");
+        assert_eq!(metadata["thinking_answer_budget_delta_tokens"], "32760");
+        assert_eq!(
+            metadata["thinking_budget_observed_paths"],
+            "thinking.budget_tokens=equal,extra_body.chat_template_kwargs.thinking_budget=smaller"
+        );
+        assert_eq!(
+            metadata["thinking_budget_rewritten_paths"],
+            "extra_body.chat_template_kwargs.thinking_budget"
+        );
+        assert_eq!(
+            metadata["thinking_budget_preserved_paths"],
+            "thinking.budget_tokens"
+        );
+        assert_eq!(metadata["thinking_budget_zero_paths"], "none");
+    }
+}
+
+#[tokio::test]
+async fn shielded_thinking_policy_zero_budget_in_any_known_path_opts_out() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"thinking":{"budget_tokens":32768},"extra_body":{"chat_template_kwargs":{"thinking_budget":0}},"max_tokens":64}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
+    assert_eq!(
+        observed_body["extra_body"]["chat_template_kwargs"]["thinking_budget"],
+        0
+    );
+    assert_eq!(observed_body["max_tokens"], 64);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["thinking_rewrite_applied"], "false");
+        assert_eq!(metadata["thinking_rewrite_reason"], "existing_budget_zero");
+        assert_eq!(metadata["thinking_budget_previous_state"], "mixed");
+        assert_eq!(metadata["thinking_budget_previous_tokens"], "multiple");
+        assert_eq!(metadata["thinking_budget_final_tokens"], "multiple");
+        assert_eq!(metadata["thinking_answer_budget_delta_tokens"], "0");
+        assert_eq!(
+            metadata["thinking_budget_observed_paths"],
+            "thinking.budget_tokens=equal,extra_body.chat_template_kwargs.thinking_budget=zero"
+        );
+        assert_eq!(metadata["thinking_budget_rewritten_paths"], "none");
+        assert_eq!(
+            metadata["thinking_budget_zero_paths"],
+            "extra_body.chat_template_kwargs.thinking_budget"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shielded_thinking_policy_updates_extra_body_chat_template_budget() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"extra_body":{"chat_template_kwargs":{"enable_thinking":true,"thinking_budget":8}},"max_completion_tokens":20}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(
+        observed_body["extra_body"]["chat_template_kwargs"]["thinking_budget"],
+        32_768
+    );
+    assert!(observed_body.get("thinking").is_none());
+    assert_eq!(observed_body["max_completion_tokens"], 32_780);
+
+    let (request_metadata, _attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    assert_eq!(
+        request_metadata["thinking_schema_path"],
+        "extra_body.chat_template_kwargs.thinking_budget"
+    );
+    assert_eq!(
+        request_metadata["thinking_schema_variant"],
+        "extra-body-chat-template-kwargs"
+    );
+}
+
+#[tokio::test]
+async fn shielded_thinking_policy_disabled_leaves_budget_unchanged_except_streaming() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[thinking]
+enabled = false
+",
+    )
+    .await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":64}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert!(observed_body.get("thinking").is_none());
+    assert_eq!(observed_body["max_tokens"], 64);
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["stream_options"]["include_usage"], true);
+
+    let (request_metadata, _attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    assert_eq!(request_metadata["thinking_policy_enabled"], "false");
+    assert_eq!(request_metadata["thinking_rewrite_applied"], "false");
+    assert_eq!(
+        request_metadata["thinking_rewrite_reason"],
+        "policy_disabled"
+    );
+}
+
+#[tokio::test]
+async fn hot_reloaded_thinking_policy_changes_subsequent_rewrites() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[thinking]
+budget_tokens = 1024
+
+[loop_guard]
+enabled = false
+",
+    )
+    .await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"reload"}]}"#,
+    );
+
+    let first = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("first proxy request should complete");
+    assert_eq!(first.status(), StatusCode::OK);
+    let _first_json = shielded_final_json(first).await;
+    let first_observed = fake.recv_next().await;
+    let first_body: serde_json::Value =
+        serde_json::from_slice(&first_observed.body).expect("first body should be JSON");
+    assert_eq!(first_body["thinking"]["budget_tokens"], 1024);
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[thinking]
+enabled = false
+budget_tokens = 1024
+
+[loop_guard]
+enabled = false
+",
+    );
+    let disabled_outcome = proxy
+        .manager
+        .reload()
+        .expect("disabled thinking reload should succeed");
+
+    let second = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("second proxy request should complete");
+    assert_eq!(second.status(), StatusCode::OK);
+    let _second_json = shielded_final_json(second).await;
+    let second_observed = fake.recv_next().await;
+    let second_body: serde_json::Value =
+        serde_json::from_slice(&second_observed.body).expect("second body should be JSON");
+    assert!(second_body.get("thinking").is_none());
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[thinking]
+enabled = true
+budget_tokens = 2048
+
+[loop_guard]
+enabled = false
+",
+    );
+    let enabled_outcome = proxy
+        .manager
+        .reload()
+        .expect("enabled thinking reload should succeed");
+
+    let third = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("third proxy request should complete");
+    assert_eq!(third.status(), StatusCode::OK);
+    let _third_json = shielded_final_json(third).await;
+    let third_observed = fake.recv_next().await;
+    let third_body: serde_json::Value =
+        serde_json::from_slice(&third_observed.body).expect("third body should be JSON");
+    assert_eq!(third_body["thinking"]["budget_tokens"], 2048);
+
+    assert!(disabled_outcome.applied);
+    assert!(enabled_outcome.applied);
 }
 
 #[tokio::test]
@@ -2492,6 +2981,27 @@ fn assert_metadata_latency(metadata: &serde_json::Value, key: &str) {
     value
         .parse::<u64>()
         .unwrap_or_else(|error| panic!("{key} should be a u64 latency: {error}; value={value}"));
+}
+
+fn read_single_request_and_attempt_metadata(
+    proxy: &ProxyFixture,
+) -> (serde_json::Value, serde_json::Value) {
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let request_metadata_json: String = connection
+        .query_row("SELECT request_metadata_json FROM requests", [], |row| {
+            row.get(0)
+        })
+        .expect("request row should exist");
+    let attempt_metadata_json: String = connection
+        .query_row("SELECT request_metadata_json FROM attempts", [], |row| {
+            row.get(0)
+        })
+        .expect("attempt row should exist");
+    let request_metadata =
+        serde_json::from_str(&request_metadata_json).expect("request metadata should parse");
+    let attempt_metadata =
+        serde_json::from_str(&attempt_metadata_json).expect("attempt metadata should parse");
+    (request_metadata, attempt_metadata)
 }
 
 fn empty_get_request(uri: &'static str) -> Request<Body> {
