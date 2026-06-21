@@ -1188,6 +1188,83 @@ max_attempts = 3
 }
 
 #[tokio::test]
+async fn shielded_retry_exhausted_upstream_status_preserves_final_response_semantics() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=always-429",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"rate-limit"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("7")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = response.text().await.expect("body should be text");
+    assert_eq!(
+        body,
+        r#"{"error":{"type":"upstream_test_error","message":"try again"}}"#
+    );
+
+    let _first = fake.recv_next().await;
+    let _second = fake.recv_next().await;
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(request_row.http_status, 429);
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "2");
+    assert_eq!(
+        request_row.response_metadata["retry_attempt_chain"],
+        "1:retried:none:transient_upstream_status,2:failed:none:none"
+    );
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].attempt_number, 1);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(
+        attempts[0].retry_reason.as_deref(),
+        Some("transient_upstream_status")
+    );
+    assert_eq!(attempts[0].response_metadata["status_code"], "429");
+    assert_eq!(attempts[1].attempt_number, 2);
+    assert_eq!(attempts[1].status, "failed");
+    assert_eq!(attempts[1].response_metadata["status_code"], "429");
+    assert_eq!(attempts[1].response_metadata["retry_exhausted"], "true");
+}
+
+#[tokio::test]
 async fn hot_reloaded_retry_max_attempts_reduces_subsequent_requests() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -2132,6 +2209,124 @@ interval_secs = 1
     assert_eq!(
         observed.path_and_query,
         "/v1/chat/completions?test=slow-shielded"
+    );
+}
+
+#[tokio::test]
+async fn shielded_liveness_drop_records_current_attempt_abort() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[heartbeat]
+interval_secs = 1
+",
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=slow-shielded",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"drop-current"}]}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let heartbeat = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "shielded heartbeat").await;
+    let heartbeat_text = std::str::from_utf8(&heartbeat).expect("heartbeat should be UTF-8");
+    assert!(heartbeat_text.starts_with(": llm-guard-proxy heartbeat"));
+    drop(body);
+
+    let _observed = fake.recv_next().await;
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+
+    assert_eq!(request_row.status, "aborted");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(
+        request_row.abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "1");
+    assert_eq!(
+        request_row.response_metadata["retry_attempt_chain"],
+        "1:aborted:downstream_body_dropped_before_eof:none"
+    );
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].attempt_number, 1);
+    assert_eq!(attempts[0].status, "aborted");
+    assert_eq!(
+        attempts[0].abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+}
+
+#[tokio::test]
+async fn shielded_liveness_drop_after_prior_retry_records_current_chain() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[heartbeat]
+interval_secs = 1
+
+[loop_guard]
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 3
+anti_loop_hint_enabled = true
+",
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=loop-once-then-slow-success",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"drop-after-retry"}]}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let heartbeat = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "retry heartbeat").await;
+    let heartbeat_text = std::str::from_utf8(&heartbeat).expect("heartbeat should be UTF-8");
+    assert!(heartbeat_text.starts_with(": llm-guard-proxy heartbeat"));
+    drop(body);
+
+    let first_attempt = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+    assert!(!body_contains_retry_hint(&first_attempt.body));
+    assert!(body_contains_retry_hint(&second_attempt.body));
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+
+    assert_eq!(request_row.status, "aborted");
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "2");
+    assert_eq!(
+        request_row.response_metadata["retry_attempt_chain"],
+        "1:retried:loop_guard:loop_detected,2:aborted:downstream_body_dropped_before_eof:none"
+    );
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].attempt_number, 1);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[0].abort_reason.as_deref(), Some("loop_guard"));
+    assert_eq!(attempts[1].attempt_number, 2);
+    assert_eq!(attempts[1].status, "aborted");
+    assert_eq!(
+        attempts[1].abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
     );
 }
 
@@ -3440,9 +3635,10 @@ fn upstream_url_rejects_and_redacts_fragment_base_url() {
     assert!(!error.contains("token=sk-test"));
 }
 
-async fn next_chunk<S>(body: &mut S, wait: Duration, label: &str) -> Bytes
+async fn next_chunk<S, E>(body: &mut S, wait: Duration, label: &str) -> Bytes
 where
-    S: Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
 {
     timeout(wait, body.next())
         .await
@@ -3556,6 +3752,15 @@ fn empty_get_request(uri: &'static str) -> Request<Body> {
         .uri(uri)
         .body(Body::empty())
         .expect("GET request should build")
+}
+
+fn shielded_chat_request(uri: &'static str, body: &'static str) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("shielded chat request should build")
 }
 
 #[derive(Debug)]
@@ -4031,11 +4236,25 @@ fn fake_chat_completion_response(
     if path_and_query.contains("test=slow-shielded") {
         return Some(slow_chat_completion_sse_response(body));
     }
+    if path_and_query.contains("test=loop-once-then-slow-success") {
+        return Some(if body_contains_retry_hint(body) {
+            slow_chat_completion_sse_response(body)
+        } else {
+            repeated_reasoning_line_sse_response(200)
+        });
+    }
     if path_and_query.contains("test=loop-once-then-success") {
-        if body_contains_retry_hint(body) {
-            return Some(chat_completion_sse_response(body));
-        }
-        return Some(repeated_reasoning_line_sse_response(200));
+        return Some(if body_contains_retry_hint(body) {
+            chat_completion_sse_response(body)
+        } else {
+            repeated_reasoning_line_sse_response(200)
+        });
+    }
+    if path_and_query.contains("test=always-429") {
+        return Some(upstream_status_json_response(StatusCode::TOO_MANY_REQUESTS));
+    }
+    if path_and_query.contains("test=bad-request") {
+        return Some(upstream_status_json_response(StatusCode::BAD_REQUEST));
     }
     if path_and_query.contains("test=transient-503-then-success") {
         if next_fake_attempt_count(state, path_and_query) == 1 {
@@ -4095,6 +4314,11 @@ fn upstream_status_json_response(status: StatusCode) -> Response<Body> {
         r#"{"error":{"type":"upstream_test_error","message":"try again"}}"#.to_owned(),
     );
     *response.status_mut() = status;
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        response
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from_static("7"));
+    }
     response
 }
 
