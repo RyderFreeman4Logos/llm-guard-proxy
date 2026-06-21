@@ -65,6 +65,30 @@ pub(super) fn prepare_non_stream_request(
     })
 }
 
+/// Applies thinking-budget shielding to downstream streaming chat requests.
+///
+/// Streaming requests keep their streaming response contract; unlike
+/// [`prepare_non_stream_request`], this does not force upstream usage frames or
+/// route the response through non-stream aggregation.
+pub(super) fn prepare_stream_request(
+    body: &Bytes,
+    thinking: &ThinkingConfig,
+) -> Option<PreparedChatRequest> {
+    let mut value = serde_json::from_slice::<Value>(body).ok()?;
+    let object = value.as_object_mut()?;
+    if !matches!(object.get("stream"), Some(Value::Bool(true))) {
+        return None;
+    }
+
+    let thinking_metadata = apply_thinking_policy(object, thinking);
+    let upstream_body = serde_json::to_vec(&value).ok()?;
+
+    Some(PreparedChatRequest {
+        upstream_body: Bytes::from(upstream_body),
+        thinking_metadata,
+    })
+}
+
 /// Returns a retry request body with a bounded anti-loop system hint.
 ///
 /// The hint is deterministic and contains only proxy retry metadata; it never
