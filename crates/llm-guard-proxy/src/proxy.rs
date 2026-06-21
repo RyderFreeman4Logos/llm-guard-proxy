@@ -1537,7 +1537,7 @@ fn is_sensitive_fingerprint_key(key: &str) -> bool {
         .map(|character| character.to_ascii_lowercase())
         .collect::<String>();
 
-    if is_output_budget_fingerprint_key(&normalized) {
+    if is_known_non_secret_token_fingerprint_key(&normalized) {
         return false;
     }
 
@@ -1557,10 +1557,10 @@ fn is_sensitive_fingerprint_key(key: &str) -> bool {
     credential_keyword || normalized.contains("token")
 }
 
-fn is_output_budget_fingerprint_key(normalized_key: &str) -> bool {
+fn is_known_non_secret_token_fingerprint_key(normalized_key: &str) -> bool {
     matches!(
         normalized_key,
-        "maxtokens" | "maxcompletiontokens" | "maxoutputtokens"
+        "maxtokens" | "maxcompletiontokens" | "maxoutputtokens" | "budgettokens"
     )
 }
 
