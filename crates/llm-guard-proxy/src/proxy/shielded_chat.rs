@@ -22,15 +22,19 @@ impl PreparedChatRequest {
 /// Forces upstream streaming and usage frames for non-stream chat requests parsed as JSON.
 pub(super) fn prepare_non_stream_request(body: &Bytes) -> Option<PreparedChatRequest> {
     let mut value = serde_json::from_slice::<Value>(body).ok()?;
-    if value
-        .get("stream")
-        .and_then(Value::as_bool)
-        .is_some_and(|stream| stream)
+    let object = value.as_object_mut()?;
+    if let Some(stream) = object.get("stream") {
+        if !matches!(stream, Value::Bool(false)) {
+            return None;
+        }
+    }
+    if object
+        .get("stream_options")
+        .is_some_and(|stream_options| !stream_options.is_object())
     {
         return None;
     }
 
-    let object = value.as_object_mut()?;
     object.insert(String::from("stream"), Value::Bool(true));
     let stream_options = object
         .entry(String::from("stream_options"))
@@ -133,6 +137,7 @@ struct ChatAggregation {
     id: Option<String>,
     created: Option<u64>,
     model: Option<String>,
+    service_tier: Option<Value>,
     system_fingerprint: Option<String>,
     usage: Option<Value>,
     choices: BTreeMap<u64, ChoiceBuilder>,
@@ -178,6 +183,10 @@ impl ChatAggregation {
         }
         if let Some(model) = string_field(chunk, "model") {
             self.model.get_or_insert_with(|| model.to_owned());
+        }
+        if let Some(service_tier) = chunk.get("service_tier") {
+            self.service_tier
+                .get_or_insert_with(|| service_tier.clone());
         }
         if let Some(system_fingerprint) = string_field(chunk, "system_fingerprint") {
             self.system_fingerprint
@@ -260,6 +269,7 @@ struct CompletionFields {
     id: String,
     created: u64,
     model: String,
+    service_tier: Option<Value>,
     system_fingerprint: Option<String>,
     usage: Option<Value>,
 }
@@ -281,6 +291,7 @@ impl CompletionFields {
                 .clone()
                 .or_else(|| request_model_id.map(str::to_owned))
                 .unwrap_or_else(|| String::from("unknown")),
+            service_tier: aggregation.service_tier.clone(),
             system_fingerprint: aggregation.system_fingerprint.clone(),
             usage: aggregation.usage.clone(),
         }
@@ -351,6 +362,9 @@ fn completion_body(fields: CompletionFields, choices: Vec<Value>) -> Result<Vec<
         (String::from("model"), Value::String(fields.model)),
         (String::from("choices"), Value::Array(choices)),
     ]);
+    if let Some(service_tier) = fields.service_tier {
+        response.insert(String::from("service_tier"), service_tier);
+    }
     if let Some(system_fingerprint) = fields.system_fingerprint {
         response.insert(
             String::from("system_fingerprint"),
@@ -433,6 +447,9 @@ struct ChoiceBuilder {
     reasoning: String,
     finish_reason: Option<Value>,
     logprobs: Option<Value>,
+    function_call: Option<FunctionCallBuilder>,
+    refusal: String,
+    saw_refusal: bool,
     tool_calls: BTreeMap<u64, ToolCallBuilder>,
 }
 
@@ -471,6 +488,21 @@ impl ChoiceBuilder {
                 }
             }
         }
+        if let Some(function_call) = delta.get("function_call").and_then(Value::as_object) {
+            self.function_call
+                .get_or_insert_with(FunctionCallBuilder::default)
+                .apply_delta(function_call);
+            mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
+        }
+        if let Some(refusal) = delta.get("refusal") {
+            self.saw_refusal = true;
+            if let Some(refusal) = refusal.as_str() {
+                if !refusal.is_empty() {
+                    self.refusal.push_str(refusal);
+                    mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
+                }
+            }
+        }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
             for tool_call in tool_calls {
                 if let Some(tool_call) = tool_call.as_object() {
@@ -498,7 +530,8 @@ impl ChoiceBuilder {
             String::from("role"),
             Value::String(self.role.unwrap_or_else(|| String::from("assistant"))),
         );
-        if self.content.is_empty() && !self.tool_calls.is_empty() {
+        if self.content.is_empty() && (!self.tool_calls.is_empty() || self.function_call.is_some())
+        {
             message.insert(String::from("content"), Value::Null);
         } else {
             message.insert(String::from("content"), Value::String(self.content));
@@ -508,6 +541,17 @@ impl ChoiceBuilder {
                 String::from("reasoning_content"),
                 Value::String(self.reasoning),
             );
+        }
+        if let Some(function_call) = self.function_call {
+            message.insert(String::from("function_call"), function_call.into_value());
+        }
+        if self.saw_refusal {
+            let refusal = if self.refusal.is_empty() {
+                Value::Null
+            } else {
+                Value::String(self.refusal)
+            };
+            message.insert(String::from("refusal"), refusal);
         }
         if !self.tool_calls.is_empty() {
             message.insert(
@@ -536,6 +580,36 @@ impl ChoiceBuilder {
             choice.insert(String::from("logprobs"), logprobs);
         }
         Value::Object(choice)
+    }
+}
+
+#[derive(Default)]
+struct FunctionCallBuilder {
+    name: Option<String>,
+    arguments: String,
+    saw_arguments: bool,
+}
+
+impl FunctionCallBuilder {
+    fn apply_delta(&mut self, function_call: &Map<String, Value>) {
+        if let Some(name) = function_call.get("name").and_then(Value::as_str) {
+            self.name.get_or_insert_with(|| name.to_owned());
+        }
+        if let Some(arguments) = function_call.get("arguments").and_then(Value::as_str) {
+            self.saw_arguments = true;
+            self.arguments.push_str(arguments);
+        }
+    }
+
+    fn into_value(self) -> Value {
+        let mut function_call = Map::new();
+        if let Some(name) = self.name {
+            function_call.insert(String::from("name"), Value::String(name));
+        }
+        if self.saw_arguments {
+            function_call.insert(String::from("arguments"), Value::String(self.arguments));
+        }
+        Value::Object(function_call)
     }
 }
 

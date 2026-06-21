@@ -760,6 +760,150 @@ async fn shielded_non_stream_chat_preserves_stream_options_while_forcing_usage()
 }
 
 #[tokio::test]
+async fn shielded_non_stream_chat_preserves_compat_function_call_fields_from_sse() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream":false}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=compat-function-call",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated_body = response.text().await.expect("body should be text");
+    let aggregated: serde_json::Value =
+        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    assert_eq!(aggregated["service_tier"], "flex");
+    assert_eq!(aggregated["choices"][0]["message"]["role"], "assistant");
+    assert!(aggregated["choices"][0]["message"]["content"].is_null());
+    assert_eq!(
+        aggregated["choices"][0]["message"]["function_call"]["name"],
+        "legacy_lookup"
+    );
+    assert_eq!(
+        aggregated["choices"][0]["message"]["function_call"]["arguments"],
+        r#"{"q":"x"}"#
+    );
+    assert_eq!(aggregated["choices"][0]["finish_reason"], "function_call");
+    assert_eq!(aggregated["usage"]["total_tokens"], 5);
+
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["stream_options"]["include_usage"], true);
+}
+
+#[tokio::test]
+async fn shielded_non_stream_chat_preserves_compat_refusal_fields_from_sse() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=compat-refusal",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated_body = response.text().await.expect("body should be text");
+    let aggregated: serde_json::Value =
+        serde_json::from_str(&aggregated_body).expect("aggregated body should be valid JSON");
+    assert_eq!(aggregated["service_tier"], "flex");
+    assert_eq!(
+        aggregated["choices"][0]["message"]["refusal"],
+        "I cannot help with that"
+    );
+    assert_eq!(aggregated["choices"][0]["finish_reason"], "stop");
+    assert_eq!(aggregated["usage"]["total_tokens"], 5);
+
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["stream_options"]["include_usage"], true);
+}
+
+#[tokio::test]
+async fn shielded_chat_preserves_malformed_stream_for_upstream_validation() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream":"false"}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should be text"),
+        r#"{"id":"chatcmpl-test","object":"chat.completion"}"#
+    );
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.body, body);
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], "false");
+    assert!(observed_body.get("stream_options").is_none());
+}
+
+#[tokio::test]
+async fn shielded_chat_preserves_malformed_stream_options_for_upstream_validation() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream_options":"bad"}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should be text"),
+        r#"{"id":"chatcmpl-test","object":"chat.completion"}"#
+    );
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.body, body);
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert!(observed_body.get("stream").is_none());
+    assert_eq!(observed_body["stream_options"], "bad");
+}
+
+#[tokio::test]
 async fn shielded_non_stream_chat_preserves_choice_logprobs_from_sse_chunks() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -2035,6 +2179,17 @@ fn fake_upstream_endpoint_response(
 
     let (label, body) = match endpoint {
         "/v1/models" => ("models", r#"{"object":"list","data":[]}"#),
+        "/v1/chat/completions"
+            if path_and_query.contains("test=compat-function-call")
+                && body_requests_stream(body) =>
+        {
+            return chat_completion_compat_function_call_sse_response(body);
+        }
+        "/v1/chat/completions"
+            if path_and_query.contains("test=compat-refusal") && body_requests_stream(body) =>
+        {
+            return chat_completion_compat_refusal_sse_response(body);
+        }
         "/v1/chat/completions" if body_requests_stream(body) => {
             return chat_completion_sse_response(body);
         }
@@ -2116,6 +2271,134 @@ fn chat_completion_sse_response(body: &Bytes) -> Response<Body> {
     response.headers_mut().insert(
         HeaderName::from_static("x-upstream-endpoint"),
         HeaderValue::from_static("chat-completions-sse"),
+    );
+    response
+}
+
+fn chat_completion_compat_function_call_sse_response(body: &Bytes) -> Response<Body> {
+    let include_usage = body_requests_stream_usage(body);
+    let first_chunk = serde_json::json!({
+        "id": "chatcmpl-shielded",
+        "object": "chat.completion.chunk",
+        "created": 1_710_000_000_u64,
+        "model": "test-chat",
+        "service_tier": "flex",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "function_call": {
+                    "name": "legacy_lookup",
+                    "arguments": "{\"q\""
+                }
+            },
+            "finish_reason": null
+        }]
+    });
+    let mut final_chunk = serde_json::json!({
+        "id": "chatcmpl-shielded",
+        "object": "chat.completion.chunk",
+        "created": 1_710_000_000_u64,
+        "model": "test-chat",
+        "service_tier": "flex",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "function_call": {
+                    "arguments": ":\"x\"}"
+                }
+            },
+            "finish_reason": "function_call"
+        }]
+    });
+    if include_usage {
+        final_chunk
+            .as_object_mut()
+            .expect("final chunk should be a JSON object")
+            .insert(
+                String::from("usage"),
+                serde_json::json!({
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5
+                }),
+            );
+    }
+    let chunks = [
+        sse_json(&first_chunk),
+        sse_json(&final_chunk),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    chat_completion_stream_response("chat-completions-compat-function-call-sse", chunks)
+}
+
+fn chat_completion_compat_refusal_sse_response(body: &Bytes) -> Response<Body> {
+    let include_usage = body_requests_stream_usage(body);
+    let first_chunk = serde_json::json!({
+        "id": "chatcmpl-shielded",
+        "object": "chat.completion.chunk",
+        "created": 1_710_000_000_u64,
+        "model": "test-chat",
+        "service_tier": "flex",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "role": "assistant",
+                "refusal": "I cannot"
+            },
+            "finish_reason": null
+        }]
+    });
+    let mut final_chunk = serde_json::json!({
+        "id": "chatcmpl-shielded",
+        "object": "chat.completion.chunk",
+        "created": 1_710_000_000_u64,
+        "model": "test-chat",
+        "service_tier": "flex",
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "refusal": " help with that"
+            },
+            "finish_reason": "stop"
+        }]
+    });
+    if include_usage {
+        final_chunk
+            .as_object_mut()
+            .expect("final chunk should be a JSON object")
+            .insert(
+                String::from("usage"),
+                serde_json::json!({
+                    "prompt_tokens": 3,
+                    "completion_tokens": 2,
+                    "total_tokens": 5
+                }),
+            );
+    }
+    let chunks = [
+        sse_json(&first_chunk),
+        sse_json(&final_chunk),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    chat_completion_stream_response("chat-completions-compat-refusal-sse", chunks)
+}
+
+fn chat_completion_stream_response<const N: usize>(
+    label: &'static str,
+    chunks: [Bytes; N],
+) -> Response<Body> {
+    let body = Body::from_stream(stream::iter(
+        chunks.into_iter().map(Ok::<_, std::convert::Infallible>),
+    ));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_static(label),
     );
     response
 }
