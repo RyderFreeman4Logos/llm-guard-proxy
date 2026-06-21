@@ -46,6 +46,8 @@ impl AppConfig {
     }
 
     pub(crate) fn apply_reloadable_from(&mut self, requested: &Self) {
+        self.server.max_in_flight_requests = requested.server.max_in_flight_requests;
+        self.server.max_request_body_bytes = requested.server.max_request_body_bytes;
         self.shielding = requested.shielding.clone();
         self.observability.enabled = requested.observability.enabled;
         self.observability.capture_raw_payloads = requested.observability.capture_raw_payloads;
@@ -66,6 +68,7 @@ impl AppConfig {
         self.retry = requested.retry.clone();
         self.heartbeat = requested.heartbeat.clone();
         self.cloudflare = requested.cloudflare.clone();
+        self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
         self.upstream.metadata = requested.upstream.metadata.clone();
     }
 
@@ -82,12 +85,6 @@ impl AppConfig {
             "server.port",
             self.server.port.to_string(),
             requested.server.port.to_string(),
-        );
-        push_change(
-            &mut changes,
-            "server.max_in_flight_requests",
-            self.server.max_in_flight_requests.to_string(),
-            requested.server.max_in_flight_requests.to_string(),
         );
         push_change(
             &mut changes,
@@ -114,6 +111,8 @@ pub struct ServerConfig {
     pub port: u16,
     /// Maximum proxied requests admitted into body buffering and upstream forwarding.
     pub max_in_flight_requests: usize,
+    /// Maximum downstream request body bytes buffered before forwarding.
+    pub max_request_body_bytes: usize,
 }
 
 impl ServerConfig {
@@ -128,6 +127,16 @@ impl ServerConfig {
             self.max_in_flight_requests > 0,
             "server.max_in_flight_requests",
             "must be greater than zero",
+        )?;
+        require(
+            self.max_request_body_bytes > 0,
+            "server.max_request_body_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.max_request_body_bytes <= 1_073_741_824,
+            "server.max_request_body_bytes",
+            "must be less than or equal to 1073741824",
         )
     }
 }
@@ -138,6 +147,7 @@ impl Default for ServerConfig {
             bind_host: String::from("127.0.0.1"),
             port: 18_009,
             max_in_flight_requests: 16,
+            max_request_body_bytes: 67_108_864,
         }
     }
 }
@@ -147,6 +157,8 @@ impl Default for ServerConfig {
 pub struct UpstreamConfig {
     /// Base URL for OpenAI-compatible requests.
     pub base_url: String,
+    /// Total upstream request timeout, including streamed response body reads.
+    pub request_timeout_ms: u64,
     /// Metadata discovery and model context enrichment policy.
     pub metadata: MetadataConfig,
 }
@@ -154,6 +166,16 @@ pub struct UpstreamConfig {
 impl UpstreamConfig {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_upstream_base_url(&self.base_url)?;
+        require(
+            self.request_timeout_ms > 0,
+            "upstream.request_timeout_ms",
+            "must be greater than zero",
+        )?;
+        require(
+            self.request_timeout_ms <= 600_000,
+            "upstream.request_timeout_ms",
+            "must be less than or equal to 600000",
+        )?;
         self.metadata.validate()
     }
 
@@ -171,6 +193,7 @@ impl Default for UpstreamConfig {
     fn default() -> Self {
         Self {
             base_url: String::from("http://gb10:18009/v1"),
+            request_timeout_ms: 120_000,
             metadata: MetadataConfig::default(),
         }
     }

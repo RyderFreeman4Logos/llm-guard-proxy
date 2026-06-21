@@ -108,6 +108,18 @@ The shielded chat core is enabled by default for non-streaming chat completions:
 - `GET /metrics` returns Prometheus-style text metrics when `observability.metrics_enabled = true` (the default). Metrics are aggregated from the bounded SQLite observability store and use low-cardinality labels only: request/attempt status, upstream/downstream mode, HTTP status class, heartbeat mode, upstream error kind, retry/loop observations, current-retained latency distribution gauges, and monotonic storage pruning counters. Metrics derived from retained rows are named `llm_guard_proxy_current_retained_*` and emitted as gauges because retention pruning can remove old rows; only cumulative storage pruning metrics use `*_total` counters. Metrics never include raw prompts, raw bodies, request headers, query strings, model IDs, or request IDs.
 - `GET /debug/recent-requests?limit=N` is disabled by default. Set `observability.debug_summary_enabled = true` to expose bounded recent request summaries; optionally set `observability.debug_summary_admin_token` and pass the same admin value in the `Authorization: Bearer ...` header or the `x-admin-token` header. Output is clamped by `observability.debug_summary_max_records`, omits raw prompt/output payloads, omits sensitive metadata keys, and redacts sensitive-looking values.
 
+## Deployment Hardening
+
+The built-in defaults are intended for local, LAN, Tailscale, or Cloudflare-fronted testing where an upstream OpenAI-compatible service already enforces its own model and account policy. They do not replace network ACLs, TLS termination, upstream authentication, or host firewall rules.
+
+- Request body buffering is capped by `server.max_request_body_bytes` before upstream work starts. Rejections return an OpenAI-shaped `413` error and do not create upstream attempts.
+- Proxied request admission is capped by `server.max_in_flight_requests`. The proxy returns `503 proxy_in_flight_limit_exceeded` before reading the body when capacity is exhausted. Permits are held until the downstream response body completes or is dropped.
+- Upstream requests use `upstream.request_timeout_ms` as a per-attempt total timeout, including streamed response body reads. Timeout errors are recorded with bounded error kinds such as `timeout_failure`, not raw URLs or headers.
+- Ctrl-C and SIGTERM start graceful shutdown: the listener stops accepting new connections and in-flight response bodies are allowed to finish or be canceled by downstream drop.
+- Request forwarding strips hop-by-hop headers, `Host`, `Content-Length`, and the admin-only `x-admin-token` header. OpenAI-compatible `Authorization` and `x-api-key` headers are forwarded to the upstream for normal `/v1/...` calls, but are redacted from logs, metrics, debug summaries, and observability metadata.
+- Raw prompts, raw outputs, reasoning text, and tool arguments are not persisted by default. Keep `observability.capture_raw_payloads = false` for shared LAN or Cloudflare exposure unless you have a separate data-handling reason to enable it.
+- `heartbeat.mode = "sse"` is the default downstream liveness mode for shielded non-stream chat and is suitable for Cloudflare-style idle timeout protection. Repeated normalized inputs switch to JSON whitespace heartbeat to preserve parseable non-stream JSON.
+
 ## Configuration
 
 The default config path is:
@@ -130,9 +142,12 @@ Sample config:
 [server]
 bind_host = "127.0.0.1"
 port = 18009
+max_in_flight_requests = 16
+max_request_body_bytes = 67108864
 
 [upstream]
 base_url = "http://gb10:18009/v1"
+request_timeout_ms = 120000
 
 [upstream.metadata]
 discovery_enabled = true
@@ -203,6 +218,8 @@ thinking-budget delta so the caller's answer-token reserve is preserved.
 
 Reloadable fields:
 
+- `server.max_in_flight_requests`
+- `server.max_request_body_bytes`
 - `shielding.enabled`
 - `observability.enabled`
 - `observability.capture_raw_payloads`
@@ -234,6 +251,7 @@ Reloadable fields:
 - `heartbeat.mode`
 - `heartbeat.interval_secs`
 - `cloudflare.enabled`
+- `upstream.request_timeout_ms`
 - `upstream.metadata.discovery_enabled`
 - `upstream.metadata.enrich_responses`
 - `upstream.metadata.refresh_interval_secs`

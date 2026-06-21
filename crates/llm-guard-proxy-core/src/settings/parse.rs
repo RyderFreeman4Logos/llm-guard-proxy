@@ -159,6 +159,10 @@ fn assign_server(
             config.max_in_flight_requests =
                 parse_usize(value, line_number, "server.max_in_flight_requests")?;
         }
+        "max_request_body_bytes" => {
+            config.max_request_body_bytes =
+                parse_usize(value, line_number, "server.max_request_body_bytes")?;
+        }
         _ => return unknown_key("server", key, line_number),
     }
     Ok(())
@@ -172,6 +176,10 @@ fn assign_upstream(
 ) -> Result<(), ConfigParseError> {
     match key {
         "base_url" => config.base_url = parse_string(value, line_number)?,
+        "request_timeout_ms" => {
+            config.request_timeout_ms =
+                parse_u64(value, line_number, "upstream.request_timeout_ms")?;
+        }
         _ => return unknown_key("upstream", key, line_number),
     }
     Ok(())

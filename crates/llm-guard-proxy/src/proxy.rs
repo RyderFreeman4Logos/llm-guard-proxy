@@ -33,15 +33,16 @@ use llm_guard_proxy_core::{
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::time::{Instant, Interval, MissedTickBehavior};
+use tokio::{
+    net::TcpListener,
+    time::{Instant, Interval, MissedTickBehavior},
+};
 
 mod model_metadata;
 mod shielded_chat;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_REPEAT_FINGERPRINT_ENTRIES: usize = 1024;
-const UPSTREAM_REQUEST_TIMEOUT_SECS: u64 = 120;
 const HEADER_VALUE_NOT_UTF8: &str = "[non-utf8]";
 const HEADER_VALUE_REDACTED: &str = "[redacted]";
 const DEBUG_SUMMARY_PATH: &str = "/debug/recent-requests";
@@ -53,9 +54,8 @@ pub(crate) struct ProxyState {
     config_path: PathBuf,
     store: ObservabilityStore,
     client: Client,
-    in_flight_requests: Arc<Semaphore>,
+    in_flight_requests: Arc<InFlightLimiter>,
     repeat_inputs: Arc<RepeatInputCache>,
-    max_in_flight_requests: usize,
 }
 
 impl ProxyState {
@@ -66,26 +66,83 @@ impl ProxyState {
         config_path: PathBuf,
         store: ObservabilityStore,
         client: Client,
-        max_in_flight_requests: usize,
     ) -> Self {
         Self {
             config,
             config_path,
             store,
             client,
-            in_flight_requests: Arc::new(Semaphore::new(max_in_flight_requests)),
+            in_flight_requests: Arc::new(InFlightLimiter::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
-            max_in_flight_requests,
         }
     }
 
-    fn try_acquire_in_flight_permit(&self) -> Result<OwnedSemaphorePermit, InFlightLimitExceeded> {
-        self.in_flight_requests
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_error| InFlightLimitExceeded {
-                max_in_flight_requests: self.max_in_flight_requests,
-            })
+    fn try_acquire_in_flight_permit(
+        &self,
+        max_in_flight_requests: usize,
+    ) -> Result<InFlightPermit, InFlightLimitExceeded> {
+        self.in_flight_requests.try_acquire(max_in_flight_requests)
+    }
+}
+
+/// Serves the proxy until the supplied shutdown future resolves.
+///
+/// Axum stops accepting new connections after shutdown starts and waits for
+/// in-flight response bodies to finish or be dropped.
+pub(crate) async fn serve_until_shutdown(
+    listener: TcpListener,
+    state: ProxyState,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    axum::serve(listener, router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
+#[derive(Debug, Default)]
+struct InFlightLimiter {
+    current: Mutex<usize>,
+}
+
+impl InFlightLimiter {
+    fn try_acquire(
+        self: &Arc<Self>,
+        max_in_flight_requests: usize,
+    ) -> Result<InFlightPermit, InFlightLimitExceeded> {
+        let mut current = in_flight_count(&self.current);
+        if *current >= max_in_flight_requests {
+            return Err(InFlightLimitExceeded {
+                max_in_flight_requests,
+            });
+        }
+
+        *current = current.saturating_add(1);
+        Ok(InFlightPermit {
+            limiter: Arc::clone(self),
+        })
+    }
+
+    fn release(&self) {
+        let mut current = in_flight_count(&self.current);
+        *current = current.saturating_sub(1);
+    }
+}
+
+fn in_flight_count(current: &Mutex<usize>) -> MutexGuard<'_, usize> {
+    match current.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+#[derive(Debug)]
+struct InFlightPermit {
+    limiter: Arc<InFlightLimiter>,
+}
+
+impl Drop for InFlightPermit {
+    fn drop(&mut self) {
+        self.limiter.release();
     }
 }
 
@@ -178,7 +235,6 @@ fn prune_repeat_input_entries(entries: &mut HashMap<String, RepeatInputEntry>) {
 /// Returns a reqwest error if the HTTP client cannot be built.
 pub(crate) fn build_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
-        .timeout(Duration::from_secs(UPSTREAM_REQUEST_TIMEOUT_SECS))
         .redirect(reqwest::redirect::Policy::none())
         .build()
 }
@@ -766,38 +822,21 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
         return response;
     }
 
-    let permit = match state.try_acquire_in_flight_permit() {
-        Ok(permit) => permit,
-        Err(error) => {
-            let finished_at_unix_ms = unix_time_millis();
-            let error_type = InFlightLimitExceeded::error_type();
-            let error_reason = error.to_string();
-            let response =
-                proxy_error_response(InFlightLimitExceeded::status(), error_type, &error_reason);
-            let request_metadata = pre_upstream_request_metadata(
-                request.method(),
-                request.uri(),
-                request.headers(),
-                config_shielding_enabled(&state.config),
-            );
-            record_failed_request(
-                &state.store,
-                FailedRequestRecord {
-                    request_id,
-                    started_at_unix_ms,
-                    finished_at_unix_ms,
-                    http_status: InFlightLimitExceeded::status().as_u16(),
-                    error_type,
-                    error_reason,
-                    request_metadata,
-                    attempt: None,
-                },
-            );
-            return response;
-        }
+    let admission = match admit_request(&state, &request_id, started_at_unix_ms, &request) {
+        AdmissionOutcome::Accepted(admission) => admission,
+        AdmissionOutcome::Rejected(response) => return response,
     };
 
-    match forward_openai_request(&state, &request_id, started_at_unix_ms, request, permit).await {
+    match forward_openai_request(
+        &state,
+        &request_id,
+        started_at_unix_ms,
+        request,
+        admission.permit,
+        admission.config.server.max_request_body_bytes,
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => {
             let finished_at_unix_ms = unix_time_millis();
@@ -825,12 +864,90 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
     }
 }
 
+struct RequestAdmission {
+    config: AppConfig,
+    permit: InFlightPermit,
+}
+
+enum AdmissionOutcome {
+    Accepted(RequestAdmission),
+    Rejected(Response<Body>),
+}
+
+fn admit_request(
+    state: &ProxyState,
+    request_id: &RequestId,
+    started_at_unix_ms: u64,
+    request: &Request<Body>,
+) -> AdmissionOutcome {
+    let config = match state.config.snapshot() {
+        Ok(config) => config,
+        Err(error) => {
+            let error_type = "config_snapshot_failed";
+            let error_reason = error.to_string();
+            let response =
+                proxy_error_response(StatusCode::INTERNAL_SERVER_ERROR, error_type, &error_reason);
+            record_failed_request(
+                &state.store,
+                FailedRequestRecord {
+                    request_id: request_id.clone(),
+                    started_at_unix_ms,
+                    finished_at_unix_ms: unix_time_millis(),
+                    http_status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    error_type,
+                    error_reason,
+                    request_metadata: pre_upstream_request_metadata(
+                        request.method(),
+                        request.uri(),
+                        request.headers(),
+                        None,
+                    ),
+                    attempt: None,
+                },
+            );
+            return AdmissionOutcome::Rejected(response);
+        }
+    };
+
+    let permit = match state.try_acquire_in_flight_permit(config.server.max_in_flight_requests) {
+        Ok(permit) => permit,
+        Err(error) => {
+            let error_type = InFlightLimitExceeded::error_type();
+            let error_reason = error.to_string();
+            let response =
+                proxy_error_response(InFlightLimitExceeded::status(), error_type, &error_reason);
+            record_failed_request(
+                &state.store,
+                FailedRequestRecord {
+                    request_id: request_id.clone(),
+                    started_at_unix_ms,
+                    finished_at_unix_ms: unix_time_millis(),
+                    http_status: InFlightLimitExceeded::status().as_u16(),
+                    error_type,
+                    error_reason,
+                    request_metadata: pre_upstream_request_metadata(
+                        request.method(),
+                        request.uri(),
+                        request.headers(),
+                        Some(config.shielding.enabled),
+                    ),
+                    attempt: None,
+                },
+            );
+            return AdmissionOutcome::Rejected(response);
+        }
+    };
+
+    AdmissionOutcome::Accepted(RequestAdmission { config, permit })
+}
+
 async fn forward_openai_request(
     state: &ProxyState,
     request_id: &RequestId,
     started_at_unix_ms: u64,
     request: Request<Body>,
-    in_flight_permit: OwnedSemaphorePermit,
+    in_flight_permit: InFlightPermit,
+    max_request_body_bytes: usize,
 ) -> Result<Response<Body>, ProxyError> {
     let (parts, body) = request.into_parts();
     let method = parts.method;
@@ -839,7 +956,7 @@ async fn forward_openai_request(
     let shielding_enabled_hint = config_shielding_enabled(&state.config);
     let pre_body_request_metadata =
         pre_upstream_request_metadata(&method, &uri, &downstream_headers, shielding_enabled_hint);
-    let body = read_body_bytes(body)
+    let body = read_body_bytes(body, max_request_body_bytes)
         .await
         .map_err(|error| error.with_request_metadata(pre_body_request_metadata))?;
     let body_read_request_metadata = base_request_metadata(
@@ -884,6 +1001,7 @@ async fn forward_openai_request(
                 downstream_uri: uri,
                 downstream_headers,
                 upstream_body: shielded_chat_plan.upstream_body,
+                upstream_timeout: Duration::from_millis(config.upstream.request_timeout_ms),
                 store: state.store.clone(),
                 request_id: request_id.clone(),
                 started_at_unix_ms,
@@ -907,6 +1025,7 @@ async fn forward_openai_request(
         reqwest_method,
         upstream_url,
         upstream_body: shielded_chat_plan.upstream_body,
+        upstream_timeout: Duration::from_millis(config.upstream.request_timeout_ms),
         liveness: shielded_chat_plan.liveness,
         thinking_metadata: shielded_chat_plan.thinking_metadata,
         request_id,
@@ -927,13 +1046,14 @@ struct GenericForwardContext<'request> {
     reqwest_method: reqwest::Method,
     upstream_url: Url,
     upstream_body: Bytes,
+    upstream_timeout: Duration,
     liveness: ShieldedLivenessSelection,
     thinking_metadata: BTreeMap<String, String>,
     request_id: &'request RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
     request_metadata: BTreeMap<String, String>,
-    in_flight_permit: OwnedSemaphorePermit,
+    in_flight_permit: InFlightPermit,
 }
 
 async fn forward_generic_openai_request(
@@ -955,6 +1075,7 @@ async fn forward_generic_openai_request(
         upstream_url: context.upstream_url,
         downstream_headers: &context.downstream_headers,
         upstream_body: context.upstream_body,
+        upstream_timeout: context.upstream_timeout,
         attempt_id: attempt_id.clone(),
         request_id: context.request_id,
         attempt_started_at_unix_ms,
@@ -997,6 +1118,7 @@ struct UpstreamAttemptContext<'request> {
     upstream_url: Url,
     downstream_headers: &'request HeaderMap,
     upstream_body: Bytes,
+    upstream_timeout: Duration,
     attempt_id: AttemptId,
     request_id: &'request RequestId,
     attempt_started_at_unix_ms: u64,
@@ -1013,6 +1135,7 @@ async fn send_first_upstream_attempt(
         context.upstream_url,
         context.downstream_headers,
         context.upstream_body,
+        context.upstream_timeout,
     )
     .await
     {
@@ -1176,7 +1299,7 @@ async fn forward_upstream_response(
     dispatch: ResponseDispatch<'_>,
     response_parts: ForwardedResponseParts,
     upstream_response: reqwest::Response,
-    in_flight_permit: OwnedSemaphorePermit,
+    in_flight_permit: InFlightPermit,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
     let upstream_headers = response_parts.upstream_headers.clone();
@@ -1200,8 +1323,8 @@ async fn forward_upstream_response(
     ))
 }
 
-async fn read_body_bytes(body: Body) -> Result<Bytes, ProxyError> {
-    to_bytes(body, MAX_PROXY_BODY_BYTES)
+async fn read_body_bytes(body: Body, max_request_body_bytes: usize) -> Result<Bytes, ProxyError> {
+    to_bytes(body, max_request_body_bytes)
         .await
         .map_err(|error| ProxyError::request_body(error.to_string()))
 }
@@ -1254,12 +1377,14 @@ async fn send_upstream_request(
     upstream_url: Url,
     downstream_headers: &HeaderMap,
     body: Bytes,
+    timeout: Duration,
 ) -> Result<reqwest::Response, ProxyError> {
     let headers = forwarded_request_headers(downstream_headers);
     client
         .request(method, upstream_url)
         .headers(headers)
         .body(body)
+        .timeout(timeout)
         .send()
         .await
         .map_err(|source| {
@@ -1414,7 +1539,7 @@ impl ForwardedResponseParts {
 async fn forward_enriched_models_response(
     response_parts: ForwardedResponseParts,
     upstream_response: reqwest::Response,
-    in_flight_permit: OwnedSemaphorePermit,
+    in_flight_permit: InFlightPermit,
     metadata_config: &MetadataConfig,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
@@ -1443,6 +1568,7 @@ struct ShieldedRetryRuntime {
     downstream_uri: Uri,
     downstream_headers: HeaderMap,
     upstream_body: Bytes,
+    upstream_timeout: Duration,
     store: ObservabilityStore,
     request_id: RequestId,
     started_at_unix_ms: u64,
@@ -1539,7 +1665,7 @@ struct ShieldedAttemptFailure {
 
 async fn forward_shielded_chat_with_retries(
     runtime: ShieldedRetryRuntime,
-    in_flight_permit: OwnedSemaphorePermit,
+    in_flight_permit: InFlightPermit,
 ) -> Result<Response<Body>, ProxyError> {
     if runtime.liveness.mode == ShieldedLivenessMode::Disabled {
         return Ok(
@@ -1975,6 +2101,7 @@ async fn start_shielded_attempt(
         runtime.upstream_url.clone(),
         &runtime.downstream_headers,
         upstream_body,
+        runtime.upstream_timeout,
     )
     .await
     {
@@ -2452,7 +2579,7 @@ fn terminal_forward_failure(
 fn shielded_retry_success_response(
     runtime: &ShieldedRetryRuntime,
     mut outcome: ShieldedAcceptedOutcome,
-    in_flight_permit: OwnedSemaphorePermit,
+    in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     let body_len = outcome.body.len();
     let upstream_headers = outcome.final_attempt.upstream_headers.clone();
@@ -2500,7 +2627,7 @@ fn shielded_retry_success_response(
 fn shielded_retry_error_response(
     runtime: &ShieldedRetryRuntime,
     failure: ShieldedFailureOutcome,
-    in_flight_permit: OwnedSemaphorePermit,
+    in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     if failure.forwarded_response.is_some() {
         return shielded_retry_forwarded_failure_response(runtime, failure, in_flight_permit);
@@ -2535,7 +2662,7 @@ fn shielded_retry_error_response(
 fn shielded_retry_forwarded_failure_response(
     runtime: &ShieldedRetryRuntime,
     mut failure: ShieldedFailureOutcome,
-    in_flight_permit: OwnedSemaphorePermit,
+    in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     let forwarded = failure
         .forwarded_response
@@ -2579,7 +2706,7 @@ fn shielded_retry_forwarded_failure_response(
 fn shielded_retry_terminal_forward_response(
     runtime: &ShieldedRetryRuntime,
     terminal: ShieldedTerminalForward,
-    in_flight_permit: OwnedSemaphorePermit,
+    in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     let upstream_status = terminal.started.info.upstream_status;
     let upstream_headers = terminal.started.info.upstream_headers.clone();
@@ -2931,7 +3058,7 @@ impl BodyCompletion {
 struct ObservedUpstreamBody {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     observer: Option<ForwardedBodyObserver>,
-    _in_flight_permit: OwnedSemaphorePermit,
+    _in_flight_permit: InFlightPermit,
     bytes_seen: u64,
     terminal_completion: BodyCompletion,
 }
@@ -2940,7 +3067,7 @@ impl ObservedUpstreamBody {
     fn new(
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         observer: ForwardedBodyObserver,
-        in_flight_permit: OwnedSemaphorePermit,
+        in_flight_permit: InFlightPermit,
     ) -> Self {
         Self::new_with_completion(
             stream,
@@ -2953,7 +3080,7 @@ impl ObservedUpstreamBody {
     fn new_with_completion(
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         observer: ForwardedBodyObserver,
-        in_flight_permit: OwnedSemaphorePermit,
+        in_flight_permit: InFlightPermit,
         terminal_completion: BodyCompletion,
     ) -> Self {
         Self {
@@ -3009,24 +3136,20 @@ impl Drop for ObservedUpstreamBody {
 struct ObservedBufferedBody {
     body: Option<Bytes>,
     observer: Option<ForwardedBodyObserver>,
-    _in_flight_permit: OwnedSemaphorePermit,
+    _in_flight_permit: InFlightPermit,
     bytes_seen: u64,
     terminal_completion: BodyCompletion,
 }
 
 impl ObservedBufferedBody {
-    fn new(
-        body: Bytes,
-        observer: ForwardedBodyObserver,
-        in_flight_permit: OwnedSemaphorePermit,
-    ) -> Self {
+    fn new(body: Bytes, observer: ForwardedBodyObserver, in_flight_permit: InFlightPermit) -> Self {
         Self::new_with_completion(body, observer, in_flight_permit, BodyCompletion::Succeeded)
     }
 
     fn new_with_completion(
         body: Bytes,
         observer: ForwardedBodyObserver,
-        in_flight_permit: OwnedSemaphorePermit,
+        in_flight_permit: InFlightPermit,
         terminal_completion: BodyCompletion,
     ) -> Self {
         Self {
@@ -3080,7 +3203,7 @@ struct ShieldedLivenessBody {
     interval: Interval,
     mode: ShieldedLivenessMode,
     observer: Option<ForwardedBodyObserver>,
-    _in_flight_permit: OwnedSemaphorePermit,
+    _in_flight_permit: InFlightPermit,
     bytes_seen: u64,
     terminal_completion: Option<BodyCompletion>,
     json_prefix_pending: bool,
@@ -3092,7 +3215,7 @@ impl ShieldedLivenessBody {
         mode: ShieldedLivenessMode,
         interval_secs: u64,
         observer: ForwardedBodyObserver,
-        in_flight_permit: OwnedSemaphorePermit,
+        in_flight_permit: InFlightPermit,
     ) -> Self {
         let period = Duration::from_secs(interval_secs);
         let mut interval = tokio::time::interval_at(Instant::now() + period, period);
@@ -3369,6 +3492,7 @@ fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
 fn should_skip_request_header(name: &HeaderName, connection_tokens: &HashSet<HeaderName>) -> bool {
     name == HOST
         || name == CONTENT_LENGTH
+        || is_admin_only_request_header(name)
         || is_hop_by_hop_header(name)
         || connection_tokens.contains(name)
 }
@@ -3389,6 +3513,10 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+fn is_admin_only_request_header(name: &HeaderName) -> bool {
+    matches!(name.as_str(), "x-admin-token")
 }
 
 fn connection_header_tokens(headers: &HeaderMap) -> HashSet<HeaderName> {

@@ -19,7 +19,7 @@ use llm_guard_proxy_core::ConfigManager;
 use rusqlite::Connection;
 use tokio::{
     net::TcpListener,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     time::{sleep, timeout},
 };
 
@@ -325,6 +325,7 @@ async fn get_models_forwards_method_path_query_and_headers() {
         .header(AUTHORIZATION, "Bearer test-token")
         .header(HOST, "downstream.example")
         .header("x-custom-proxy-test", "keep-me")
+        .header("x-admin-token", "admin-secret")
         .header(CONNECTION, "x-drop-me")
         .header("x-drop-me", "drop-me")
         .send()
@@ -365,6 +366,10 @@ async fn get_models_forwards_method_path_query_and_headers() {
     assert!(
         observed.headers.get("x-drop-me").is_none(),
         "Connection-nominated hop-by-hop header must not be forwarded"
+    );
+    assert!(
+        observed.headers.get("x-admin-token").is_none(),
+        "debug/admin token headers must not be forwarded upstream"
     );
     assert!(
         observed
@@ -3354,6 +3359,125 @@ async fn long_json_response_streams_first_chunk_while_upstream_remains_open() {
 }
 
 #[tokio::test]
+async fn generic_stream_timeout_records_failed_request_and_attempt() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        "request_timeout_ms = 100\n",
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.path_and_query, "/v1/embeddings?test=long-json");
+
+    let mut body = response.into_body().into_data_stream();
+    let first = next_chunk(&mut body, STREAM_FIRST_CHUNK_TIMEOUT, "first JSON chunk").await;
+    assert_eq!(first, Bytes::from_static(LONG_JSON_FIRST_CHUNK));
+    let timeout_item = timeout(Duration::from_secs(1), body.next())
+        .await
+        .expect("upstream timeout should surface before the delayed second chunk")
+        .expect("body stream should yield an upstream timeout item");
+    assert!(
+        timeout_item.is_err(),
+        "delayed upstream body should fail under the configured timeout"
+    );
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(attempt_row.status, "failed");
+    assert!(
+        request_row
+            .error_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("timeout_failure")),
+        "request error should use bounded timeout kind: {:?}",
+        request_row.error_reason
+    );
+    assert!(
+        attempt_row
+            .error_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("timeout_failure")),
+        "attempt error should use bounded timeout kind: {:?}",
+        attempt_row.error_reason
+    );
+}
+
+#[tokio::test]
+async fn shielded_upstream_timeout_returns_bounded_gateway_error() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+request_timeout_ms = 100
+
+[heartbeat]
+mode = "disabled"
+
+[retry]
+enabled = false
+"#,
+    )
+    .await;
+
+    let response = timeout(
+        Duration::from_secs(2),
+        proxy_handler(
+            State(proxy.state.clone()),
+            shielded_chat_request(
+                "/v1/chat/completions?test=slow-shielded",
+                r#"{"model":"test-chat","messages":[{"role":"user","content":"timeout"}]}"#,
+            ),
+        ),
+    )
+    .await
+    .expect("shielded timeout response should be bounded");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("timeout error body should read");
+    let body = String::from_utf8(body.to_vec()).expect("timeout error body should be UTF-8");
+    assert!(body.contains("upstream_body_error"));
+    assert!(body.contains("timeout_failure"));
+    assert_safe_operational_text("shielded timeout body", &body);
+
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=slow-shielded"
+    );
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(attempt_row.status, "failed");
+    assert!(
+        request_row
+            .error_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("timeout_failure"))
+    );
+    assert!(
+        attempt_row
+            .error_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("timeout_failure"))
+    );
+}
+
+#[tokio::test]
 async fn forwarded_call_writes_observability_metadata() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -3730,6 +3854,143 @@ async fn in_flight_limit_rejects_before_body_buffering() {
 }
 
 #[tokio::test]
+async fn in_flight_limit_hot_reload_updates_admission_capacity() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 2).await;
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        1,
+        "",
+    );
+    let outcome = proxy.manager.reload().expect("limit reload should succeed");
+    assert!(outcome.applied);
+    assert!(
+        outcome.restart_required_changes.is_empty(),
+        "in-flight limit should be safe to hot reload"
+    );
+
+    let first_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=one"),
+    )
+    .await;
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("first request should reach upstream");
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=one"
+    );
+
+    let rejected_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata&slot=rejected"),
+    )
+    .await;
+    assert_eq!(rejected_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_no_upstream_request(&mut fake).await;
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        2,
+        "",
+    );
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("limit increase should reload");
+    assert!(outcome.applied);
+    assert!(
+        outcome.restart_required_changes.is_empty(),
+        "limit increase should not require process restart"
+    );
+
+    let second_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata&slot=two"),
+    )
+    .await;
+    assert_eq!(second_response.status(), StatusCode::OK);
+    let second_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("second request should reach upstream after limit increase");
+    assert_eq!(
+        second_observed.path_and_query,
+        "/v1/models?test=model-metadata&slot=two"
+    );
+
+    let third_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata&slot=three"),
+    )
+    .await;
+    assert_eq!(third_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_no_upstream_request(&mut fake).await;
+
+    drop(first_response);
+    drop(second_response);
+}
+
+#[tokio::test]
+async fn graceful_shutdown_waits_for_in_flight_response_body() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 1).await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("shutdown test listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("shutdown test address should be readable");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let state = proxy.state.clone();
+    let server = tokio::spawn(async move {
+        serve_until_shutdown(listener, state, async {
+            let _received = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = proxy
+        .client
+        .get(format!("http://{addr}/v1/embeddings?test=long-json"))
+        .send()
+        .await
+        .expect("long response request should get headers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("long response should reach upstream before shutdown");
+    assert_eq!(observed.path_and_query, "/v1/embeddings?test=long-json");
+
+    shutdown_tx
+        .send(())
+        .expect("shutdown signal should be delivered");
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !server.is_finished(),
+        "graceful shutdown should wait for the in-flight response body"
+    );
+
+    drop(response);
+    timeout(Duration::from_secs(2), server)
+        .await
+        .expect("server should exit after response is dropped")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+}
+
+#[tokio::test]
 async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
     let proxy = ProxyFixture::spawn("http://127.0.0.1:1/v1", true).await;
     let uri = Uri::from_static("/v1/models?limit=2");
@@ -4028,46 +4289,65 @@ fn shielded_chat_request(uri: &'static str, body: &'static str) -> Request<Body>
 struct ForwardedRecordRow {
     status: String,
     http_status: i64,
+    error_reason: Option<String>,
     abort_reason: Option<String>,
     response_metadata: serde_json::Value,
 }
 
 fn read_single_forwarded_request_row(sqlite_path: &Path) -> ForwardedRecordRow {
     let connection = Connection::open(sqlite_path).expect("sqlite should open");
-    let row: (String, i64, Option<String>, String) = connection
+    let row: (String, i64, Option<String>, Option<String>, String) = connection
         .query_row(
-            "SELECT status, http_status, abort_reason, response_metadata_json FROM requests",
+            "SELECT status, http_status, error_reason, abort_reason, response_metadata_json FROM requests",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .expect("request row should exist");
     let response_metadata =
-        serde_json::from_str(&row.3).expect("request response metadata should be json");
+        serde_json::from_str(&row.4).expect("request response metadata should be json");
 
     ForwardedRecordRow {
         status: row.0,
         http_status: row.1,
-        abort_reason: row.2,
+        error_reason: row.2,
+        abort_reason: row.3,
         response_metadata,
     }
 }
 
 fn read_single_forwarded_attempt_row(sqlite_path: &Path) -> ForwardedRecordRow {
     let connection = Connection::open(sqlite_path).expect("sqlite should open");
-    let row: (String, i64, Option<String>, String) = connection
+    let row: (String, i64, Option<String>, Option<String>, String) = connection
         .query_row(
-            "SELECT status, http_status, abort_reason, response_metadata_json FROM attempts",
+            "SELECT status, http_status, error_reason, abort_reason, response_metadata_json FROM attempts",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
         )
         .expect("attempt row should exist");
     let response_metadata =
-        serde_json::from_str(&row.3).expect("attempt response metadata should be json");
+        serde_json::from_str(&row.4).expect("attempt response metadata should be json");
 
     ForwardedRecordRow {
         status: row.0,
         http_status: row.1,
-        abort_reason: row.2,
+        error_reason: row.2,
+        abort_reason: row.3,
         response_metadata,
     }
 }
@@ -5282,17 +5562,12 @@ impl ProxyFixture {
         );
         let manager =
             ConfigManager::from_explicit_path(&config_path).expect("proxy config should load");
-        let config = manager
-            .handle()
-            .snapshot()
-            .expect("proxy config snapshot should load");
         let store = ObservabilityStore::open(manager.handle()).expect("store should open");
         let state = ProxyState::new(
             manager.handle(),
             manager.path().to_path_buf(),
             store.clone(),
             build_http_client().expect("client should build"),
-            config.server.max_in_flight_requests,
         );
         let app = router(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
