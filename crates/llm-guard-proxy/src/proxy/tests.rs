@@ -1772,6 +1772,137 @@ async fn streaming_chat_applies_thinking_policy_without_downstream_aggregation()
 }
 
 #[tokio::test]
+async fn streaming_chat_downstream_drop_cancels_upstream_relay() {
+    let mut upstream = CancellableUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&upstream.base_url, true).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream":true}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("streaming chat request should receive response headers");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-endpoint")
+            .expect("cancellable SSE upstream should be used"),
+        "cancellable-chat-sse"
+    );
+    let observed = upstream.recv_request().await;
+    assert_eq!(observed.method, Method::POST);
+    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+
+    let mut downstream = response.bytes_stream();
+    let first = next_chunk(
+        &mut downstream,
+        STREAM_FIRST_CHUNK_TIMEOUT,
+        "first cancellable SSE chunk",
+    )
+    .await;
+    assert!(first.starts_with(b"data: "));
+    drop(downstream);
+
+    let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+    assert_eq!(drop_event.label, "cancellable-chat-sse");
+    assert_forwarded_abort_recorded(&proxy);
+}
+
+#[tokio::test]
+async fn non_stream_chat_downstream_drop_cancels_upstream_body() {
+    let mut upstream = CancellableUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_full_options(
+        &upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        "",
+        r"
+[shielding]
+enabled = false
+",
+        "",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("non-stream chat request should receive response headers");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-endpoint")
+            .expect("cancellable JSON upstream should be used"),
+        "cancellable-chat-json"
+    );
+    let observed = upstream.recv_request().await;
+    assert_eq!(observed.method, Method::POST);
+    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_ne!(observed_body["stream"], true);
+
+    drop(response);
+
+    let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+    assert_eq!(drop_event.label, "cancellable-chat-json");
+    assert_forwarded_abort_recorded(&proxy);
+}
+
+#[tokio::test]
+async fn shielded_non_stream_chat_downstream_drop_cancels_upstream_aggregation() {
+    let mut upstream = CancellableUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&upstream.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("shielded chat request should receive response headers");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .expect("shielded response should advertise downstream SSE"),
+        "text/event-stream"
+    );
+    let observed = upstream.recv_request().await;
+    assert_eq!(observed.method, Method::POST);
+    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["stream_options"]["include_usage"], true);
+
+    drop(response);
+
+    let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+    assert_eq!(drop_event.label, "cancellable-chat-sse");
+    assert_forwarded_abort_recorded(&proxy);
+}
+
+#[tokio::test]
 async fn shielded_thinking_policy_respects_explicit_disable_marker() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -4733,6 +4864,24 @@ fn read_single_forwarded_attempt_row(sqlite_path: &Path) -> ForwardedRecordRow {
     }
 }
 
+fn assert_forwarded_abort_recorded(proxy: &ProxyFixture) {
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+
+    assert_eq!(request_row.status, "aborted");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(
+        request_row.abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+    assert_eq!(attempt_row.status, "aborted");
+    assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(
+        attempt_row.abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+}
+
 #[derive(Debug)]
 struct ObservabilityRow {
     status: String,
@@ -4814,6 +4963,67 @@ struct ObservedRequest {
 struct FakeUpstream {
     base_url: String,
     receiver: mpsc::Receiver<ObservedRequest>,
+}
+
+#[derive(Debug)]
+struct UpstreamDropEvent {
+    label: &'static str,
+}
+
+struct CancellableUpstream {
+    base_url: String,
+    receiver: mpsc::Receiver<ObservedRequest>,
+    drop_receiver: mpsc::Receiver<UpstreamDropEvent>,
+}
+
+#[derive(Clone)]
+struct CancellableUpstreamState {
+    request_sender: mpsc::Sender<ObservedRequest>,
+    drop_sender: mpsc::Sender<UpstreamDropEvent>,
+}
+
+impl CancellableUpstream {
+    async fn spawn() -> Self {
+        let (request_sender, receiver) = mpsc::channel(10);
+        let (drop_sender, drop_receiver) = mpsc::channel(10);
+        let app = Router::new()
+            .fallback(cancellable_upstream_handler)
+            .with_state(CancellableUpstreamState {
+                request_sender,
+                drop_sender,
+            });
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("cancellable upstream should bind");
+        let addr = listener
+            .local_addr()
+            .expect("cancellable upstream address should be available");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("cancellable upstream server failed: {error}");
+            }
+        });
+
+        Self {
+            base_url: format!("http://{addr}/v1"),
+            receiver,
+            drop_receiver,
+        }
+    }
+
+    async fn recv_request(&mut self) -> ObservedRequest {
+        self.receiver
+            .recv()
+            .await
+            .expect("cancellable upstream should capture a request")
+    }
+
+    async fn recv_drop_within(&mut self, wait: Duration) -> UpstreamDropEvent {
+        timeout(wait, self.drop_receiver.recv())
+            .await
+            .expect("upstream response body should be dropped before timeout")
+            .expect("upstream drop channel should stay open")
+    }
 }
 
 #[derive(Clone)]
@@ -5009,6 +5219,25 @@ async fn capture_request_handler(
         .await
         .expect("redirect target observation should send");
     Response::new(Body::from("captured"))
+}
+
+async fn cancellable_upstream_handler(
+    State(state): State<CancellableUpstreamState>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let observed = observe_request(request).await;
+    let body = observed.body.clone();
+    state
+        .request_sender
+        .send(observed)
+        .await
+        .expect("cancellable upstream observation should send");
+
+    if body_requests_stream(&body) {
+        cancellable_chat_sse_response(state.drop_sender)
+    } else {
+        cancellable_chat_json_response(state.drop_sender)
+    }
 }
 
 async fn fake_upstream_handler(
@@ -5273,6 +5502,122 @@ fn json_response(label: &'static str, body: String) -> Response<Body> {
         HeaderValue::from_str(label).expect("static label should be a valid header"),
     );
     response
+}
+
+fn cancellable_chat_sse_response(drop_sender: mpsc::Sender<UpstreamDropEvent>) -> Response<Body> {
+    let chunks = vec![
+        sse_json(&chat_completion_first_chunk()),
+        sse_json(&chat_completion_second_chunk(false)),
+        sse_json(&chat_completion_final_chunk(true, false)),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    cancellable_stream_response(
+        "cancellable-chat-sse",
+        "text/event-stream",
+        chunks,
+        drop_sender,
+    )
+}
+
+fn cancellable_chat_json_response(drop_sender: mpsc::Sender<UpstreamDropEvent>) -> Response<Body> {
+    let chunks = vec![
+        Bytes::from_static(br#"{"id":"chatcmpl-cancellable","#),
+        Bytes::from_static(br#""object":"chat.completion"}"#),
+    ];
+    cancellable_stream_response(
+        "cancellable-chat-json",
+        "application/json",
+        chunks,
+        drop_sender,
+    )
+}
+
+fn cancellable_stream_response(
+    label: &'static str,
+    content_type: &'static str,
+    chunks: Vec<Bytes>,
+    drop_sender: mpsc::Sender<UpstreamDropEvent>,
+) -> Response<Body> {
+    let body = Body::from_stream(CancellableResponseStream::new(
+        label,
+        chunks,
+        drop_sender,
+        STREAM_DELAY,
+    ));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_static(label),
+    );
+    response
+}
+
+struct CancellableResponseStream {
+    label: &'static str,
+    chunks: Vec<Bytes>,
+    next_index: usize,
+    delay_after_first: Option<Pin<Box<tokio::time::Sleep>>>,
+    drop_sender: mpsc::Sender<UpstreamDropEvent>,
+    completed: bool,
+}
+
+impl CancellableResponseStream {
+    fn new(
+        label: &'static str,
+        chunks: Vec<Bytes>,
+        drop_sender: mpsc::Sender<UpstreamDropEvent>,
+        delay_after_first: Duration,
+    ) -> Self {
+        Self {
+            label,
+            chunks,
+            next_index: 0,
+            delay_after_first: Some(Box::pin(sleep(delay_after_first))),
+            drop_sender,
+            completed: false,
+        }
+    }
+}
+
+impl Stream for CancellableResponseStream {
+    type Item = Result<Bytes, std::convert::Infallible>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.next_index >= this.chunks.len() {
+            this.completed = true;
+            return Poll::Ready(None);
+        }
+
+        if this.next_index > 0 {
+            if let Some(delay) = &mut this.delay_after_first {
+                match delay.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        this.delay_after_first = None;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+        }
+
+        let chunk = this.chunks[this.next_index].clone();
+        this.next_index = this.next_index.saturating_add(1);
+        Poll::Ready(Some(Ok(chunk)))
+    }
+}
+
+impl Drop for CancellableResponseStream {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _send_result = self
+                .drop_sender
+                .try_send(UpstreamDropEvent { label: self.label });
+        }
+    }
 }
 
 fn chat_completion_sse_response(body: &Bytes) -> Response<Body> {
