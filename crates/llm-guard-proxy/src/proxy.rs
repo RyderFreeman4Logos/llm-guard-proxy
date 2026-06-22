@@ -994,7 +994,7 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
     let admission_request = AdmissionRequestMetadata::from_request(&request);
     let admission =
         match admit_request(&state, &request_id, started_at_unix_ms, admission_request).await {
-            AdmissionOutcome::Accepted(admission) => admission,
+            AdmissionOutcome::Accepted(admission) => *admission,
             AdmissionOutcome::Rejected(response) => return response,
         };
 
@@ -1061,7 +1061,7 @@ impl AdmissionRequestMetadata {
 }
 
 enum AdmissionOutcome {
-    Accepted(RequestAdmission),
+    Accepted(Box<RequestAdmission>),
     Rejected(Response<Body>),
 }
 
@@ -1111,7 +1111,7 @@ async fn admit_request(
                 );
             }
         };
-        return AdmissionOutcome::Accepted(RequestAdmission { config, permit });
+        return AdmissionOutcome::Accepted(Box::new(RequestAdmission { config, permit }));
     }
 
     let (config, permit) = match state.acquire_generation_permit().await {
@@ -1128,7 +1128,7 @@ async fn admit_request(
         }
     };
 
-    AdmissionOutcome::Accepted(RequestAdmission { config, permit })
+    AdmissionOutcome::Accepted(Box::new(RequestAdmission { config, permit }))
 }
 
 fn reject_admission(

@@ -586,6 +586,7 @@ debug_summary_max_records = 20
 max_bytes = 1073741824
 prune_to_bytes = 805306368
 max_records = 100000
+prune_to_records = 80000
 
 [thinking]
 enabled = true

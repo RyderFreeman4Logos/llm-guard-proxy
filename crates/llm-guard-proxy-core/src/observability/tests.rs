@@ -615,6 +615,125 @@ fn retention_max_records_counts_requests_and_attempts() {
 }
 
 #[test]
+fn retention_max_records_prunes_to_configured_record_hysteresis() {
+    let fixture = StoreFixture::new("retention-record-hysteresis-configured");
+    let manager = fixture.manager_with_record_hysteresis(
+        true,
+        false,
+        TEST_MAX_BYTES,
+        TEST_PRUNE_TO_BYTES,
+        10,
+        6,
+    );
+    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+
+    for index in 0_u64..=10 {
+        let request = request_record(
+            &format!("req-record-hysteresis-configured-{index}"),
+            RequestStatus::Succeeded,
+            1_000 + index,
+        );
+        store
+            .record_request(&request)
+            .expect("request should be written");
+    }
+
+    let usage = store.retention_usage().expect("retention usage after");
+    assert_eq!(usage.request_count, 6);
+    assert_eq!(usage.attempt_count, 0);
+    assert_eq!(usage.record_count, 6);
+
+    let snapshot = store.metrics_snapshot().expect("metrics snapshot");
+    assert_eq!(snapshot.pruning.prune_events, 1);
+    assert_eq!(snapshot.pruning.pruned_requests, 5);
+    assert_eq!(snapshot.pruning.pruned_attempts, 0);
+
+    let connection = store.lock_connection().expect("connection lock");
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM requests WHERE request_id = 'req-record-hysteresis-configured-0'",
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM requests WHERE request_id = 'req-record-hysteresis-configured-4'",
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM requests WHERE request_id = 'req-record-hysteresis-configured-5'",
+        ),
+        1
+    );
+}
+
+#[test]
+fn retention_default_record_hysteresis_skips_pruning_during_headroom_writes() {
+    let fixture = StoreFixture::new("retention-record-hysteresis-default");
+    let manager =
+        fixture.manager_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 10);
+    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+
+    for index in 0_u64..=10 {
+        let request = request_record(
+            &format!("req-record-hysteresis-default-{index}"),
+            RequestStatus::Succeeded,
+            1_000 + index,
+        );
+        store
+            .record_request(&request)
+            .expect("request should be written");
+    }
+
+    let usage = store.retention_usage().expect("retention usage after");
+    assert_eq!(usage.record_count, 8);
+    let snapshot = store.metrics_snapshot().expect("metrics snapshot");
+    assert_eq!(snapshot.pruning.prune_events, 1);
+    assert_eq!(snapshot.pruning.pruned_requests, 3);
+
+    for index in 11_u64..=12 {
+        let request = request_record(
+            &format!("req-record-hysteresis-default-{index}"),
+            RequestStatus::Succeeded,
+            1_000 + index,
+        );
+        store
+            .record_request(&request)
+            .expect("headroom request should be written");
+    }
+
+    let usage = store
+        .retention_usage()
+        .expect("retention usage during headroom");
+    assert_eq!(usage.record_count, 10);
+    let snapshot = store.metrics_snapshot().expect("metrics snapshot");
+    assert_eq!(snapshot.pruning.prune_events, 1);
+    assert_eq!(snapshot.pruning.pruned_requests, 3);
+
+    let request = request_record(
+        "req-record-hysteresis-default-13",
+        RequestStatus::Succeeded,
+        1_013,
+    );
+    store
+        .record_request(&request)
+        .expect("next over-cap request should be written");
+
+    let usage = store
+        .retention_usage()
+        .expect("retention usage after retrigger");
+    assert_eq!(usage.record_count, 8);
+    let snapshot = store.metrics_snapshot().expect("metrics snapshot");
+    assert_eq!(snapshot.pruning.prune_events, 2);
+    assert_eq!(snapshot.pruning.pruned_requests, 6);
+}
+
+#[test]
 fn hot_reload_disabled_setting_stops_new_writes() {
     let fixture = StoreFixture::new("hot-reload-disable");
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
@@ -712,6 +831,30 @@ impl StoreFixture {
             max_bytes,
             prune_to_bytes,
             max_records,
+        );
+        ConfigManager::from_explicit_path(&self.config_path).expect("config should load")
+    }
+
+    fn manager_with_record_hysteresis(
+        &self,
+        enabled: bool,
+        capture_raw_payloads: bool,
+        max_bytes: u64,
+        prune_to_bytes: u64,
+        max_records: u64,
+        prune_to_records: u64,
+    ) -> ConfigManager {
+        write_config_file_with_retention(
+            &self.config_path,
+            &self.sqlite_path,
+            enabled,
+            capture_raw_payloads,
+            TestRetentionLimits {
+                max_bytes,
+                prune_to_bytes,
+                max_records,
+                prune_to_records: Some(prune_to_records),
+            },
         );
         ConfigManager::from_explicit_path(&self.config_path).expect("config should load")
     }
@@ -842,7 +985,43 @@ fn write_config_file_with_max_records(
     prune_to_bytes: u64,
     max_records: u64,
 ) {
+    write_config_file_with_retention(
+        config_path,
+        sqlite_path,
+        enabled,
+        capture_raw_payloads,
+        TestRetentionLimits {
+            max_bytes,
+            prune_to_bytes,
+            max_records,
+            prune_to_records: None,
+        },
+    );
+}
+
+#[derive(Clone, Copy)]
+struct TestRetentionLimits {
+    max_bytes: u64,
+    prune_to_bytes: u64,
+    max_records: u64,
+    prune_to_records: Option<u64>,
+}
+
+fn write_config_file_with_retention(
+    config_path: &Path,
+    sqlite_path: &Path,
+    enabled: bool,
+    capture_raw_payloads: bool,
+    retention: TestRetentionLimits,
+) {
     let sqlite_path = sqlite_path.display();
+    let prune_to_records_entry = retention
+        .prune_to_records
+        .map(|value| format!("prune_to_records = {value}\n"))
+        .unwrap_or_default();
+    let max_bytes = retention.max_bytes;
+    let prune_to_bytes = retention.prune_to_bytes;
+    let max_records = retention.max_records;
     fs::write(
         config_path,
         format!(
@@ -856,6 +1035,7 @@ capture_raw_payloads = {capture_raw_payloads}
 max_bytes = {max_bytes}
 prune_to_bytes = {prune_to_bytes}
 max_records = {max_records}
+{prune_to_records_entry}
 "#
         ),
     )

@@ -41,6 +41,12 @@ fn defaults_match_issue_contract() {
     assert!(!config.observability.debug_summary_enabled.is_enabled());
     assert_eq!(config.observability.debug_summary_admin_token, None);
     assert_eq!(config.observability.debug_summary_max_records, 20);
+    assert_eq!(config.observability.retention.max_records, 100_000);
+    assert_eq!(config.observability.retention.prune_to_records, None);
+    assert_eq!(
+        config.observability.retention.effective_prune_to_records(),
+        80_000
+    );
     assert!(config.thinking.enabled);
     assert_eq!(config.thinking.budget_tokens, 32_768);
     assert!(config.loop_guard.enabled);
@@ -89,6 +95,10 @@ health_upstream_probe_timeout_ms = 250
 debug_summary_enabled = true
 debug_summary_admin_token = "test-admin-token"
 debug_summary_max_records = 7
+
+[observability.retention]
+max_records = 50
+prune_to_records = 40
 
 [heartbeat]
 mode = "json-whitespace"
@@ -144,6 +154,12 @@ enabled = false
         Some("test-admin-token")
     );
     assert_eq!(config.observability.debug_summary_max_records, 7);
+    assert_eq!(config.observability.retention.max_records, 50);
+    assert_eq!(config.observability.retention.prune_to_records, Some(40));
+    assert_eq!(
+        config.observability.retention.effective_prune_to_records(),
+        40
+    );
     assert_eq!(config.heartbeat.mode, HeartbeatMode::JsonWhitespace);
     assert_eq!(config.heartbeat.interval_secs, 5);
     assert_eq!(config.loop_guard.output_repeated_line_threshold, 40);
@@ -159,6 +175,24 @@ enabled = false
     assert_eq!(config.retry.max_attempts, 3);
     assert!(!config.retry.anti_loop_hint_enabled);
     assert!(!config.cloudflare.enabled);
+}
+
+#[test]
+fn derives_retention_record_hysteresis_from_overridden_max_records() {
+    let config = parse_config_text(
+        r"
+[observability.retention]
+max_records = 10
+",
+    )
+    .expect("config should parse");
+
+    assert_eq!(config.observability.retention.max_records, 10);
+    assert_eq!(config.observability.retention.prune_to_records, None);
+    assert_eq!(
+        config.observability.retention.effective_prune_to_records(),
+        8
+    );
 }
 
 #[test]
@@ -197,6 +231,14 @@ fn validates_retention_hysteresis() {
         .validate()
         .expect_err("retention relation should fail");
     assert_eq!(error.field(), "observability.retention.prune_to_bytes");
+
+    config.observability.retention.prune_to_bytes = 10;
+    config.observability.retention.max_records = 10;
+    config.observability.retention.prune_to_records = Some(11);
+    let error = config
+        .validate()
+        .expect_err("record retention relation should fail");
+    assert_eq!(error.field(), "observability.retention.prune_to_records");
 }
 
 #[test]
@@ -649,6 +691,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"observability.metrics_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_admin_token"));
+    assert!(RELOADABLE_FIELDS.contains(&"observability.retention.prune_to_records"));
     assert!(RELOADABLE_FIELDS.contains(&"cloudflare.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.request_timeout_ms"));
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.max_in_flight_requests"));
