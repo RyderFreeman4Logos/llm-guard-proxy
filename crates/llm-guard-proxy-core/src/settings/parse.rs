@@ -308,6 +308,13 @@ fn assign_retention(
             config.max_records =
                 parse_u64(value, line_number, "observability.retention.max_records")?;
         }
+        "prune_to_records" => {
+            config.prune_to_records = Some(parse_u64(
+                value,
+                line_number,
+                "observability.retention.prune_to_records",
+            )?);
+        }
         _ => return unknown_key("observability.retention", key, line_number),
     }
     Ok(())

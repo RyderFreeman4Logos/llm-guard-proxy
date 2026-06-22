@@ -176,6 +176,7 @@ debug_summary_max_records = 25
 max_bytes = 1073741824
 prune_to_bytes = 805306368
 max_records = 100000
+prune_to_records = 80000
 
 [thinking]
 enabled = true
@@ -210,6 +211,8 @@ enabled = true
 Retention byte limits apply to actual SQLite page storage. SQLite has a
 schema/page-size minimum footprint, so limits below that floor prune retained
 rows but cannot shrink the database file below the empty-store minimum.
+Record-count retention prunes from `max_records` down to `prune_to_records`;
+when omitted, `prune_to_records` defaults to 80% of `max_records`.
 
 For shielded non-stream chat requests, the thinking policy injects or raises
 known `thinking.budget_tokens` / chat-template budget fields unless the caller
@@ -234,6 +237,7 @@ Reloadable fields:
 - `observability.retention.max_bytes`
 - `observability.retention.prune_to_bytes`
 - `observability.retention.max_records`
+- `observability.retention.prune_to_records`
 - `thinking.enabled`
 - `thinking.budget_tokens`
 - `thinking.preserve_answer_budget`

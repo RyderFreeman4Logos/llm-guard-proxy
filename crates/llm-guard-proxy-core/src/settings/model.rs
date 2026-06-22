@@ -475,9 +475,23 @@ pub struct RetentionConfig {
     pub prune_to_bytes: u64,
     /// Maximum indexed record count.
     pub max_records: u64,
+    /// Hysteresis target after record-count pruning.
+    ///
+    /// When omitted, the effective target is derived from `max_records`.
+    pub prune_to_records: Option<u64>,
 }
 
 impl RetentionConfig {
+    /// Effective record-count pruning target.
+    ///
+    /// Omitted config defaults to 80% of `max_records`, with a minimum target
+    /// of one retained record for very small test configurations.
+    #[must_use]
+    pub fn effective_prune_to_records(&self) -> u64 {
+        self.prune_to_records
+            .unwrap_or_else(|| default_prune_to_records(self.max_records))
+    }
+
     fn validate(&self) -> Result<(), ValidationError> {
         require(
             self.max_bytes > 0,
@@ -498,7 +512,20 @@ impl RetentionConfig {
             self.max_records > 0,
             "observability.retention.max_records",
             "must be greater than zero",
-        )
+        )?;
+        if let Some(prune_to_records) = self.prune_to_records {
+            require(
+                prune_to_records > 0,
+                "observability.retention.prune_to_records",
+                "must be greater than zero",
+            )?;
+            require(
+                prune_to_records <= self.max_records,
+                "observability.retention.prune_to_records",
+                "must be less than or equal to max_records",
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -508,8 +535,16 @@ impl Default for RetentionConfig {
             max_bytes: 1_073_741_824,
             prune_to_bytes: 805_306_368,
             max_records: 100_000,
+            prune_to_records: None,
         }
     }
+}
+
+const fn default_prune_to_records(max_records: u64) -> u64 {
+    let gap = max_records / 5;
+    let gap = if gap == 0 { 1 } else { gap };
+    let target = max_records.saturating_sub(gap);
+    if target == 0 { 1 } else { target }
 }
 
 /// Thinking budget policy for later request rewriting.

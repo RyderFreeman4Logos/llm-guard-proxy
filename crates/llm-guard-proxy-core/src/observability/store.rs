@@ -622,10 +622,15 @@ fn enforce_retention(
     } else {
         max_bytes
     };
+    let target_records = if usage.record_count > retention.max_records {
+        retention.effective_prune_to_records()
+    } else {
+        retention.max_records
+    };
     let mut outcome = RetentionPruneOutcome::default();
 
-    while usage.observed_bytes > target_bytes || usage.record_count > retention.max_records {
-        let batch = prune_retained_rows(connection, retention.max_records, target_bytes)?;
+    while usage.observed_bytes > target_bytes || usage.record_count > target_records {
+        let batch = prune_retained_rows(connection, target_records, target_bytes)?;
         if !batch.deleted_any() {
             break;
         }
