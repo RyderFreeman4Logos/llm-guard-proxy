@@ -159,6 +159,21 @@ fn assign_server(
             config.max_in_flight_requests =
                 parse_usize(value, line_number, "server.max_in_flight_requests")?;
         }
+        "max_queued_generation_requests" => {
+            config.max_queued_generation_requests =
+                parse_usize(value, line_number, "server.max_queued_generation_requests")?;
+        }
+        "generation_queue_timeout_ms" => {
+            config.generation_queue_timeout_ms =
+                parse_u64(value, line_number, "server.generation_queue_timeout_ms")?;
+        }
+        "max_control_plane_in_flight_requests" => {
+            config.max_control_plane_in_flight_requests = parse_usize(
+                value,
+                line_number,
+                "server.max_control_plane_in_flight_requests",
+            )?;
+        }
         "max_request_body_bytes" => {
             config.max_request_body_bytes =
                 parse_usize(value, line_number, "server.max_request_body_bytes")?;

@@ -29,6 +29,9 @@ pub const DEFAULT_CONFIG_RELATIVE_PATH: &str = ".config/llm-guard-proxy/config.t
 /// Fields that can be changed by reloading the config file.
 pub const RELOADABLE_FIELDS: &[&str] = &[
     "server.max_in_flight_requests",
+    "server.max_queued_generation_requests",
+    "server.generation_queue_timeout_ms",
+    "server.max_control_plane_in_flight_requests",
     "server.max_request_body_bytes",
     "shielding.enabled",
     "observability.enabled",

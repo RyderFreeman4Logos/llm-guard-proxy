@@ -3969,6 +3969,259 @@ async fn saturated_generation_requests_wait_for_in_flight_capacity() {
 }
 
 #[tokio::test]
+async fn generation_queue_full_fails_without_body_buffering_or_upstream_forward() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_queued_generation_requests = 1\ngeneration_queue_timeout_ms = 1000\n",
+    )
+    .await;
+    let first_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=active"),
+    )
+    .await;
+
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("first request should hold generation capacity");
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=active"
+    );
+
+    let (queued_request, queued_body_polled) =
+        tracked_json_request("/v1/completions?slot=queued", br#"{"prompt":"queued"}"#);
+    let queued = tokio::spawn(proxy_handler(State(proxy.state.clone()), queued_request));
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !queued_body_polled.load(Ordering::SeqCst),
+        "queued request must not read its body before capacity is available"
+    );
+    assert!(
+        !queued.is_finished(),
+        "first queued request should occupy the bounded queue"
+    );
+
+    let (overflow_request, overflow_body_polled) =
+        tracked_json_request("/v1/completions?slot=overflow", br#"{"prompt":"overflow"}"#);
+    let overflow_response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy_handler(State(proxy.state.clone()), overflow_request),
+    )
+    .await
+    .expect("queue-full response should be bounded");
+
+    assert_eq!(overflow_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        overflow_response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let overflow_body = to_bytes(overflow_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("queue-full body should read");
+    let overflow_body =
+        String::from_utf8(overflow_body.to_vec()).expect("queue-full body should be utf-8");
+    assert!(
+        overflow_body.contains("proxy_generation_queue_full"),
+        "queue-full error should identify admission failure: {overflow_body}"
+    );
+    assert!(
+        !overflow_body_polled.load(Ordering::SeqCst),
+        "queue-full rejection must not read the request body"
+    );
+    assert_no_upstream_request(&mut fake).await;
+
+    queued.abort();
+    match queued.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(response) => panic!(
+            "queued request should still be waiting before active response drops, got {}",
+            response.status()
+        ),
+    }
+    assert!(
+        !queued_body_polled.load(Ordering::SeqCst),
+        "aborted queued request must not read its body"
+    );
+    drop(first_response);
+}
+
+fn tracked_json_request(uri: &str, body: &'static [u8]) -> (Request<Body>, Arc<AtomicBool>) {
+    let polled = Arc::new(AtomicBool::new(false));
+    let request_body = Body::from_stream(stream::once({
+        let polled = Arc::clone(&polled);
+        async move {
+            polled.store(true, Ordering::SeqCst);
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(body))
+        }
+    }));
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(CONTENT_TYPE, "application/json")
+        .body(request_body)
+        .expect("tracked json request should build");
+    (request, polled)
+}
+
+#[tokio::test]
+async fn generation_queue_timeout_fails_without_body_buffering_or_upstream_forward() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_queued_generation_requests = 1\ngeneration_queue_timeout_ms = 20\n",
+    )
+    .await;
+    let first_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=active"),
+    )
+    .await;
+
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("first request should hold generation capacity");
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=active"
+    );
+
+    let body_polled = Arc::new(AtomicBool::new(false));
+    let queued_body = Body::from_stream(stream::once({
+        let body_polled = Arc::clone(&body_polled);
+        async move {
+            body_polled.store(true, Ordering::SeqCst);
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(br#"{"prompt":"timeout"}"#))
+        }
+    }));
+    let queued_request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/completions?slot=timeout")
+        .header(CONTENT_TYPE, "application/json")
+        .body(queued_body)
+        .expect("queued request should build");
+    let queued_response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy_handler(State(proxy.state.clone()), queued_request),
+    )
+    .await
+    .expect("queue-timeout response should be bounded");
+
+    assert_eq!(queued_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        queued_response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let queued_body = to_bytes(queued_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("queue-timeout body should read");
+    let queued_body =
+        String::from_utf8(queued_body.to_vec()).expect("queue-timeout body should be utf-8");
+    assert!(
+        queued_body.contains("proxy_generation_queue_timeout"),
+        "queue-timeout error should identify admission failure: {queued_body}"
+    );
+    assert!(
+        !body_polled.load(Ordering::SeqCst),
+        "queue-timeout rejection must not read the request body"
+    );
+    assert_no_upstream_request(&mut fake).await;
+    drop(first_response);
+}
+
+#[tokio::test]
+async fn models_bypass_generation_saturation_but_keep_control_plane_bound() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_control_plane_in_flight_requests = 1\n",
+    )
+    .await;
+    let generation_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=active"),
+    )
+    .await;
+
+    assert_eq!(generation_response.status(), StatusCode::OK);
+    let generation_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("generation request should hold generation capacity");
+    assert_eq!(
+        generation_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=active"
+    );
+
+    let first_model_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/models?test=model-metadata-large&slot=one"),
+    )
+    .await;
+    assert_eq!(first_model_response.status(), StatusCode::OK);
+    let first_model_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("models request should bypass generation capacity");
+    assert_eq!(
+        first_model_observed.path_and_query,
+        "/v1/models?test=model-metadata-large&slot=one"
+    );
+
+    let second_model_response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy_handler(
+            State(proxy.state.clone()),
+            empty_get_request("/v1/models?test=model-metadata&slot=two"),
+        ),
+    )
+    .await
+    .expect("control-plane limit response should be bounded");
+    assert_eq!(
+        second_model_response.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        second_model_response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let second_model_body = to_bytes(second_model_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("control-plane limit body should read");
+    let second_model_body = String::from_utf8(second_model_body.to_vec())
+        .expect("control-plane limit body should be utf-8");
+    assert!(
+        second_model_body.contains("proxy_control_plane_in_flight_limit_exceeded"),
+        "control-plane error should identify admission failure: {second_model_body}"
+    );
+    assert_no_upstream_request(&mut fake).await;
+
+    drop(first_model_response);
+    drop(generation_response);
+}
+
+#[tokio::test]
 async fn in_flight_limit_hot_reload_updates_admission_capacity() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 2).await;
@@ -5622,6 +5875,23 @@ impl ProxyFixture {
         .await
     }
 
+    async fn spawn_with_admission_config(
+        upstream_base_url: &str,
+        observability_enabled: bool,
+        max_in_flight_requests: usize,
+        server_config: &str,
+    ) -> Self {
+        Self::spawn_with_full_options(
+            upstream_base_url,
+            observability_enabled,
+            max_in_flight_requests,
+            server_config,
+            "",
+            "",
+        )
+        .await
+    }
+
     async fn spawn_with_metadata_config(
         upstream_base_url: &str,
         observability_enabled: bool,
@@ -5646,6 +5916,7 @@ impl ProxyFixture {
             upstream_base_url,
             observability_enabled,
             max_in_flight_requests,
+            "",
             metadata_config,
             "",
         )
@@ -5662,6 +5933,7 @@ impl ProxyFixture {
             observability_enabled,
             AppConfig::default().server.max_in_flight_requests,
             "",
+            "",
             observability_config,
         )
         .await
@@ -5671,6 +5943,7 @@ impl ProxyFixture {
         upstream_base_url: &str,
         observability_enabled: bool,
         max_in_flight_requests: usize,
+        server_config: &str,
         metadata_config: &str,
         observability_config: &str,
     ) -> Self {
@@ -5679,15 +5952,16 @@ impl ProxyFixture {
         set_owner_only_dir(&root);
         let config_path = root.join("config.toml");
         let sqlite_path = root.join("storage").join("observability.sqlite3");
-        write_proxy_config_with_observability(
-            &config_path,
+        write_proxy_config_with_observability(ProxyConfigWriteOptions {
+            config_path: &config_path,
             upstream_base_url,
-            &sqlite_path,
+            sqlite_path: &sqlite_path,
             observability_enabled,
             max_in_flight_requests,
+            server_config,
             metadata_config,
             observability_config,
-        );
+        });
         let manager =
             ConfigManager::from_explicit_path(&config_path).expect("proxy config should load");
         let store = ObservabilityStore::open(manager.handle()).expect("store should open");
@@ -5736,32 +6010,38 @@ fn write_proxy_config(
     max_in_flight_requests: usize,
     metadata_config: &str,
 ) {
-    write_proxy_config_with_observability(
+    write_proxy_config_with_observability(ProxyConfigWriteOptions {
         config_path,
         upstream_base_url,
         sqlite_path,
         observability_enabled,
         max_in_flight_requests,
+        server_config: "",
         metadata_config,
-        "",
-    );
+        observability_config: "",
+    });
 }
 
-fn write_proxy_config_with_observability(
-    config_path: &Path,
-    upstream_base_url: &str,
-    sqlite_path: &Path,
+#[derive(Clone, Copy)]
+struct ProxyConfigWriteOptions<'a> {
+    config_path: &'a Path,
+    upstream_base_url: &'a str,
+    sqlite_path: &'a Path,
     observability_enabled: bool,
     max_in_flight_requests: usize,
-    metadata_config: &str,
-    observability_config: &str,
-) {
+    server_config: &'a str,
+    metadata_config: &'a str,
+    observability_config: &'a str,
+}
+
+fn write_proxy_config_with_observability(options: ProxyConfigWriteOptions<'_>) {
     fs::write(
-        config_path,
+        options.config_path,
         format!(
             r#"
 [server]
 max_in_flight_requests = {max_in_flight_requests}
+{server_config}
 
 [upstream]
 base_url = "{upstream_base_url}"
@@ -5778,7 +6058,13 @@ max_bytes = {TEST_MAX_BYTES}
 prune_to_bytes = {TEST_PRUNE_TO_BYTES}
 max_records = {TEST_MAX_RECORDS}
 "#,
-            sqlite_path = sqlite_path.display(),
+            max_in_flight_requests = options.max_in_flight_requests,
+            server_config = options.server_config,
+            upstream_base_url = options.upstream_base_url,
+            metadata_config = options.metadata_config,
+            observability_enabled = options.observability_enabled,
+            sqlite_path = options.sqlite_path.display(),
+            observability_config = options.observability_config,
         ),
     )
     .expect("test config should be written");
