@@ -17,7 +17,9 @@ use axum::{
     extract::State,
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
-        header::{ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST},
+        header::{
+            ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, RETRY_AFTER,
+        },
     },
     routing::get,
 };
@@ -35,6 +37,7 @@ use serde_json::json;
 use thiserror::Error;
 use tokio::{
     net::TcpListener,
+    sync::Notify,
     time::{Instant, Interval, MissedTickBehavior},
 };
 
@@ -46,6 +49,8 @@ const MAX_REPEAT_FINGERPRINT_ENTRIES: usize = 1024;
 const HEADER_VALUE_NOT_UTF8: &str = "[non-utf8]";
 const HEADER_VALUE_REDACTED: &str = "[redacted]";
 const DEBUG_SUMMARY_PATH: &str = "/debug/recent-requests";
+const IN_FLIGHT_CAPACITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
+const ADMISSION_RETRY_AFTER_SECS: &str = "1";
 
 /// Shared HTTP proxy state.
 #[derive(Clone, Debug)]
@@ -54,7 +59,8 @@ pub(crate) struct ProxyState {
     config_path: PathBuf,
     store: ObservabilityStore,
     client: Client,
-    in_flight_requests: Arc<InFlightLimiter>,
+    generation_requests: Arc<InFlightLimiter>,
+    control_plane_requests: Arc<InFlightLimiter>,
     repeat_inputs: Arc<RepeatInputCache>,
 }
 
@@ -72,16 +78,79 @@ impl ProxyState {
             config_path,
             store,
             client,
-            in_flight_requests: Arc::new(InFlightLimiter::default()),
+            generation_requests: Arc::new(InFlightLimiter::default()),
+            control_plane_requests: Arc::new(InFlightLimiter::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
         }
     }
 
-    fn try_acquire_in_flight_permit(
+    async fn acquire_generation_permit(
         &self,
-        max_in_flight_requests: usize,
-    ) -> Result<InFlightPermit, InFlightLimitExceeded> {
-        self.in_flight_requests.try_acquire(max_in_flight_requests)
+    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
+        let config = self
+            .config
+            .snapshot()
+            .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+        if let Some(permit) = self
+            .generation_requests
+            .try_acquire(config.server.max_in_flight_requests)
+        {
+            return Ok((config, permit));
+        }
+
+        let Some(queue_permit) = self
+            .generation_requests
+            .try_enqueue(config.server.max_queued_generation_requests)
+        else {
+            return Err(AdmissionFailure::GenerationQueueFull {
+                max_queued_generation_requests: config.server.max_queued_generation_requests,
+            });
+        };
+
+        self.wait_for_generation_capacity(queue_permit, config.server.generation_queue_timeout_ms)
+            .await
+    }
+
+    async fn wait_for_generation_capacity(
+        &self,
+        _queue_permit: QueuedAdmissionPermit,
+        timeout_ms: u64,
+    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let config = self
+                .config
+                .snapshot()
+                .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+            if let Some(permit) = self
+                .generation_requests
+                .try_acquire(config.server.max_in_flight_requests)
+            {
+                return Ok((config, permit));
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(AdmissionFailure::GenerationQueueTimeout {
+                    generation_queue_timeout_ms: timeout_ms,
+                });
+            }
+
+            self.generation_requests
+                .wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL))
+                .await;
+        }
+    }
+
+    fn try_acquire_control_plane_permit(
+        &self,
+        max_control_plane_in_flight_requests: usize,
+    ) -> Result<InFlightPermit, AdmissionFailure> {
+        self.control_plane_requests
+            .try_acquire(max_control_plane_in_flight_requests)
+            .ok_or(AdmissionFailure::ControlPlaneLimitExceeded {
+                max_control_plane_in_flight_requests,
+            })
     }
 }
 
@@ -101,34 +170,60 @@ pub(crate) async fn serve_until_shutdown(
 
 #[derive(Debug, Default)]
 struct InFlightLimiter {
-    current: Mutex<usize>,
+    counts: Mutex<AdmissionCounts>,
+    notify: Notify,
 }
 
 impl InFlightLimiter {
-    fn try_acquire(
-        self: &Arc<Self>,
-        max_in_flight_requests: usize,
-    ) -> Result<InFlightPermit, InFlightLimitExceeded> {
-        let mut current = in_flight_count(&self.current);
-        if *current >= max_in_flight_requests {
-            return Err(InFlightLimitExceeded {
-                max_in_flight_requests,
-            });
+    fn try_acquire(self: &Arc<Self>, max_in_flight_requests: usize) -> Option<InFlightPermit> {
+        let mut counts = admission_counts(&self.counts);
+        if counts.active >= max_in_flight_requests {
+            return None;
         }
 
-        *current = current.saturating_add(1);
-        Ok(InFlightPermit {
+        counts.active = counts.active.saturating_add(1);
+        Some(InFlightPermit::limited(Arc::clone(self)))
+    }
+
+    fn try_enqueue(self: &Arc<Self>, max_queued_requests: usize) -> Option<QueuedAdmissionPermit> {
+        let mut counts = admission_counts(&self.counts);
+        if counts.queued >= max_queued_requests {
+            return None;
+        }
+
+        counts.queued = counts.queued.saturating_add(1);
+        Some(QueuedAdmissionPermit {
             limiter: Arc::clone(self),
         })
     }
 
+    async fn wait_for_capacity(&self, max_wait: Duration) {
+        tokio::select! {
+            () = self.notify.notified() => {}
+            () = tokio::time::sleep(max_wait) => {}
+        }
+    }
+
     fn release(&self) {
-        let mut current = in_flight_count(&self.current);
-        *current = current.saturating_sub(1);
+        let mut counts = admission_counts(&self.counts);
+        counts.active = counts.active.saturating_sub(1);
+        self.notify.notify_waiters();
+    }
+
+    fn leave_queue(&self) {
+        let mut counts = admission_counts(&self.counts);
+        counts.queued = counts.queued.saturating_sub(1);
+        self.notify.notify_waiters();
     }
 }
 
-fn in_flight_count(current: &Mutex<usize>) -> MutexGuard<'_, usize> {
+#[derive(Debug, Default)]
+struct AdmissionCounts {
+    active: usize,
+    queued: usize,
+}
+
+fn admission_counts(current: &Mutex<AdmissionCounts>) -> MutexGuard<'_, AdmissionCounts> {
     match current.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -137,12 +232,86 @@ fn in_flight_count(current: &Mutex<usize>) -> MutexGuard<'_, usize> {
 
 #[derive(Debug)]
 struct InFlightPermit {
-    limiter: Arc<InFlightLimiter>,
+    limiter: Option<Arc<InFlightLimiter>>,
+}
+
+impl InFlightPermit {
+    fn limited(limiter: Arc<InFlightLimiter>) -> Self {
+        Self {
+            limiter: Some(limiter),
+        }
+    }
 }
 
 impl Drop for InFlightPermit {
     fn drop(&mut self) {
-        self.limiter.release();
+        if let Some(limiter) = &self.limiter {
+            limiter.release();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueuedAdmissionPermit {
+    limiter: Arc<InFlightLimiter>,
+}
+
+impl Drop for QueuedAdmissionPermit {
+    fn drop(&mut self) {
+        self.limiter.leave_queue();
+    }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+enum AdmissionFailure {
+    #[error("failed to read proxy config snapshot: {0}")]
+    ConfigSnapshot(String),
+    #[error(
+        "proxy generation request queue is full: max_queued_generation_requests={max_queued_generation_requests}"
+    )]
+    GenerationQueueFull {
+        max_queued_generation_requests: usize,
+    },
+    #[error(
+        "proxy generation request queue wait timed out: generation_queue_timeout_ms={generation_queue_timeout_ms}"
+    )]
+    GenerationQueueTimeout { generation_queue_timeout_ms: u64 },
+    #[error(
+        "proxy control-plane request limit exceeded: max_control_plane_in_flight_requests={max_control_plane_in_flight_requests}"
+    )]
+    ControlPlaneLimitExceeded {
+        max_control_plane_in_flight_requests: usize,
+    },
+}
+
+impl AdmissionFailure {
+    const fn status(&self) -> StatusCode {
+        match self {
+            Self::ConfigSnapshot(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::GenerationQueueFull { .. }
+            | Self::GenerationQueueTimeout { .. }
+            | Self::ControlPlaneLimitExceeded { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        }
+    }
+
+    const fn error_type(&self) -> &'static str {
+        match self {
+            Self::ConfigSnapshot(_) => "config_snapshot_failed",
+            Self::GenerationQueueFull { .. } => "proxy_generation_queue_full",
+            Self::GenerationQueueTimeout { .. } => "proxy_generation_queue_timeout",
+            Self::ControlPlaneLimitExceeded { .. } => {
+                "proxy_control_plane_in_flight_limit_exceeded"
+            }
+        }
+    }
+
+    const fn retry_after(&self) -> Option<&'static str> {
+        match self {
+            Self::ConfigSnapshot(_) => None,
+            Self::GenerationQueueFull { .. }
+            | Self::GenerationQueueTimeout { .. }
+            | Self::ControlPlaneLimitExceeded { .. } => Some(ADMISSION_RETRY_AFTER_SECS),
+        }
     }
 }
 
@@ -822,10 +991,12 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
         return response;
     }
 
-    let admission = match admit_request(&state, &request_id, started_at_unix_ms, &request) {
-        AdmissionOutcome::Accepted(admission) => admission,
-        AdmissionOutcome::Rejected(response) => return response,
-    };
+    let admission_request = AdmissionRequestMetadata::from_request(&request);
+    let admission =
+        match admit_request(&state, &request_id, started_at_unix_ms, admission_request).await {
+            AdmissionOutcome::Accepted(admission) => admission,
+            AdmissionOutcome::Rejected(response) => return response,
+        };
 
     match forward_openai_request(
         &state,
@@ -869,16 +1040,36 @@ struct RequestAdmission {
     permit: InFlightPermit,
 }
 
+struct AdmissionRequestMetadata {
+    method: Method,
+    uri: Uri,
+    headers: HeaderMap,
+}
+
+impl AdmissionRequestMetadata {
+    fn from_request(request: &Request<Body>) -> Self {
+        Self {
+            method: request.method().clone(),
+            uri: request.uri().clone(),
+            headers: request.headers().clone(),
+        }
+    }
+
+    fn pre_upstream_metadata(&self, shielding_enabled: Option<bool>) -> BTreeMap<String, String> {
+        pre_upstream_request_metadata(&self.method, &self.uri, &self.headers, shielding_enabled)
+    }
+}
+
 enum AdmissionOutcome {
     Accepted(RequestAdmission),
     Rejected(Response<Body>),
 }
 
-fn admit_request(
+async fn admit_request(
     state: &ProxyState,
     request_id: &RequestId,
     started_at_unix_ms: u64,
-    request: &Request<Body>,
+    request: AdmissionRequestMetadata,
 ) -> AdmissionOutcome {
     let config = match state.config.snapshot() {
         Ok(config) => config,
@@ -896,12 +1087,7 @@ fn admit_request(
                     http_status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                     error_type,
                     error_reason,
-                    request_metadata: pre_upstream_request_metadata(
-                        request.method(),
-                        request.uri(),
-                        request.headers(),
-                        None,
-                    ),
+                    request_metadata: request.pre_upstream_metadata(None),
                     attempt: None,
                 },
             );
@@ -909,36 +1095,76 @@ fn admit_request(
         }
     };
 
-    let permit = match state.try_acquire_in_flight_permit(config.server.max_in_flight_requests) {
-        Ok(permit) => permit,
-        Err(error) => {
-            let error_type = InFlightLimitExceeded::error_type();
-            let error_reason = error.to_string();
-            let response =
-                proxy_error_response(InFlightLimitExceeded::status(), error_type, &error_reason);
-            record_failed_request(
-                &state.store,
-                FailedRequestRecord {
-                    request_id: request_id.clone(),
+    if is_control_plane_models_request(&request.method, &request.uri) {
+        let permit = match state
+            .try_acquire_control_plane_permit(config.server.max_control_plane_in_flight_requests)
+        {
+            Ok(permit) => permit,
+            Err(error) => {
+                return reject_admission(
+                    state,
+                    request_id,
                     started_at_unix_ms,
-                    finished_at_unix_ms: unix_time_millis(),
-                    http_status: InFlightLimitExceeded::status().as_u16(),
-                    error_type,
-                    error_reason,
-                    request_metadata: pre_upstream_request_metadata(
-                        request.method(),
-                        request.uri(),
-                        request.headers(),
-                        Some(config.shielding.enabled),
-                    ),
-                    attempt: None,
-                },
+                    &request,
+                    Some(config.shielding.enabled),
+                    &error,
+                );
+            }
+        };
+        return AdmissionOutcome::Accepted(RequestAdmission { config, permit });
+    }
+
+    let (config, permit) = match state.acquire_generation_permit().await {
+        Ok(admission) => admission,
+        Err(error) => {
+            return reject_admission(
+                state,
+                request_id,
+                started_at_unix_ms,
+                &request,
+                Some(config.shielding.enabled),
+                &error,
             );
-            return AdmissionOutcome::Rejected(response);
         }
     };
 
     AdmissionOutcome::Accepted(RequestAdmission { config, permit })
+}
+
+fn reject_admission(
+    state: &ProxyState,
+    request_id: &RequestId,
+    started_at_unix_ms: u64,
+    request: &AdmissionRequestMetadata,
+    shielding_enabled: Option<bool>,
+    error: &AdmissionFailure,
+) -> AdmissionOutcome {
+    let error_type = error.error_type();
+    let error_reason = error.to_string();
+    let response = admission_error_response(
+        error.status(),
+        error_type,
+        &error_reason,
+        error.retry_after(),
+    );
+    record_failed_request(
+        &state.store,
+        FailedRequestRecord {
+            request_id: request_id.clone(),
+            started_at_unix_ms,
+            finished_at_unix_ms: unix_time_millis(),
+            http_status: error.status().as_u16(),
+            error_type,
+            error_reason,
+            request_metadata: request.pre_upstream_metadata(shielding_enabled),
+            attempt: None,
+        },
+    );
+    AdmissionOutcome::Rejected(response)
+}
+
+fn is_control_plane_models_request(method: &Method, uri: &Uri) -> bool {
+    method == Method::GET && uri.path() == "/v1/models"
 }
 
 async fn forward_openai_request(
@@ -4150,6 +4376,21 @@ fn proxy_error_response(status: StatusCode, error_type: &str, message: &str) -> 
     response
 }
 
+fn admission_error_response(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+    retry_after: Option<&'static str>,
+) -> Response<Body> {
+    let mut response = proxy_error_response(status, error_type, message);
+    if let Some(retry_after) = retry_after {
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static(retry_after));
+    }
+    response
+}
+
 fn unix_time_millis() -> u64 {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -4396,22 +4637,6 @@ impl ProxyError {
 struct FailedUpstreamObservability {
     request_metadata: BTreeMap<String, String>,
     attempt_record: AttemptRecord,
-}
-
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-#[error("proxy in-flight request limit exceeded: max_in_flight_requests={max_in_flight_requests}")]
-struct InFlightLimitExceeded {
-    max_in_flight_requests: usize,
-}
-
-impl InFlightLimitExceeded {
-    const fn status() -> StatusCode {
-        StatusCode::SERVICE_UNAVAILABLE
-    }
-
-    const fn error_type() -> &'static str {
-        "proxy_in_flight_limit_exceeded"
-    }
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]

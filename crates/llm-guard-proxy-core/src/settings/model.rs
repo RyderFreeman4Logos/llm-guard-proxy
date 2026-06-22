@@ -47,6 +47,11 @@ impl AppConfig {
 
     pub(crate) fn apply_reloadable_from(&mut self, requested: &Self) {
         self.server.max_in_flight_requests = requested.server.max_in_flight_requests;
+        self.server.max_queued_generation_requests =
+            requested.server.max_queued_generation_requests;
+        self.server.generation_queue_timeout_ms = requested.server.generation_queue_timeout_ms;
+        self.server.max_control_plane_in_flight_requests =
+            requested.server.max_control_plane_in_flight_requests;
         self.server.max_request_body_bytes = requested.server.max_request_body_bytes;
         self.shielding = requested.shielding.clone();
         self.observability.enabled = requested.observability.enabled;
@@ -111,6 +116,12 @@ pub struct ServerConfig {
     pub port: u16,
     /// Maximum proxied requests admitted into body buffering and upstream forwarding.
     pub max_in_flight_requests: usize,
+    /// Maximum generation requests allowed to wait for an in-flight slot.
+    pub max_queued_generation_requests: usize,
+    /// Maximum milliseconds a queued generation request may wait for capacity.
+    pub generation_queue_timeout_ms: u64,
+    /// Maximum `/v1/models` requests admitted into upstream forwarding.
+    pub max_control_plane_in_flight_requests: usize,
     /// Maximum downstream request body bytes buffered before forwarding.
     pub max_request_body_bytes: usize,
 }
@@ -127,6 +138,31 @@ impl ServerConfig {
             self.max_in_flight_requests > 0,
             "server.max_in_flight_requests",
             "must be greater than zero",
+        )?;
+        require(
+            self.max_queued_generation_requests <= 10_000,
+            "server.max_queued_generation_requests",
+            "must be less than or equal to 10000",
+        )?;
+        require(
+            self.generation_queue_timeout_ms > 0,
+            "server.generation_queue_timeout_ms",
+            "must be greater than zero",
+        )?;
+        require(
+            self.generation_queue_timeout_ms <= 600_000,
+            "server.generation_queue_timeout_ms",
+            "must be less than or equal to 600000",
+        )?;
+        require(
+            self.max_control_plane_in_flight_requests > 0,
+            "server.max_control_plane_in_flight_requests",
+            "must be greater than zero",
+        )?;
+        require(
+            self.max_control_plane_in_flight_requests <= 1_024,
+            "server.max_control_plane_in_flight_requests",
+            "must be less than or equal to 1024",
         )?;
         require(
             self.max_request_body_bytes > 0,
@@ -147,6 +183,9 @@ impl Default for ServerConfig {
             bind_host: String::from("127.0.0.1"),
             port: 18_009,
             max_in_flight_requests: 16,
+            max_queued_generation_requests: 64,
+            generation_queue_timeout_ms: 30_000,
+            max_control_plane_in_flight_requests: 4,
             max_request_body_bytes: 67_108_864,
         }
     }
