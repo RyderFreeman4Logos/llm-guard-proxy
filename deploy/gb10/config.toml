@@ -2,6 +2,7 @@
 bind_host = "100.105.4.92"
 port = 18009
 max_in_flight_requests = 16
+max_control_plane_in_flight_requests = 128
 max_request_body_bytes = 67108864
 
 [upstream]

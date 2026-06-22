@@ -114,6 +114,7 @@ The built-in defaults are intended for local, LAN, Tailscale, or Cloudflare-fron
 
 - Request body buffering is capped by `server.max_request_body_bytes` before upstream work starts. Rejections return an OpenAI-shaped `413` error and do not create upstream attempts.
 - Proxied request admission is capped by `server.max_in_flight_requests`. The proxy returns `503 proxy_in_flight_limit_exceeded` before reading the body when capacity is exhausted. Permits are held until the downstream response body completes or is dropped.
+- Control-plane `GET /v1/models` forwarding uses the independent `server.max_control_plane_in_flight_requests` cap, defaulting to `128` so operator and monitoring bursts fit under the bound. It does not consume generation request slots; excess control-plane requests fail fast with `503 proxy_control_plane_in_flight_limit_exceeded`.
 - Upstream requests use `upstream.request_timeout_ms` as a per-attempt total timeout, including streamed response body reads. Timeout errors are recorded with bounded error kinds such as `timeout_failure`, not raw URLs or headers.
 - Ctrl-C and SIGTERM start graceful shutdown: the listener stops accepting new connections and in-flight response bodies are allowed to finish or be canceled by downstream drop.
 - Request forwarding strips hop-by-hop headers, `Host`, `Content-Length`, and the admin-only `x-admin-token` header. OpenAI-compatible `Authorization` and `x-api-key` headers are forwarded to the upstream for normal `/v1/...` calls, but are redacted from logs, metrics, debug summaries, and observability metadata.
@@ -143,6 +144,7 @@ Sample config:
 bind_host = "127.0.0.1"
 port = 18009
 max_in_flight_requests = 16
+max_control_plane_in_flight_requests = 128
 max_request_body_bytes = 67108864
 
 [upstream]

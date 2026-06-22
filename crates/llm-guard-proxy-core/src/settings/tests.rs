@@ -21,7 +21,7 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.server.max_in_flight_requests, 16);
     assert_eq!(config.server.max_queued_generation_requests, 64);
     assert_eq!(config.server.generation_queue_timeout_ms, 30_000);
-    assert_eq!(config.server.max_control_plane_in_flight_requests, 4);
+    assert_eq!(config.server.max_control_plane_in_flight_requests, 128);
     assert_eq!(config.server.max_request_body_bytes, 67_108_864);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
     assert_eq!(config.upstream.request_timeout_ms, 120_000);
