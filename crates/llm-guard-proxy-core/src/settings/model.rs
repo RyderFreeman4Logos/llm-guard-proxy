@@ -185,7 +185,7 @@ impl Default for ServerConfig {
             max_in_flight_requests: 16,
             max_queued_generation_requests: 64,
             generation_queue_timeout_ms: 30_000,
-            max_control_plane_in_flight_requests: 4,
+            max_control_plane_in_flight_requests: 128,
             max_request_body_bytes: 67_108_864,
         }
     }

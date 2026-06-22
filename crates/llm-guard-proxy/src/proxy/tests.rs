@@ -607,6 +607,64 @@ async fn enriched_models_response_bypasses_generation_in_flight_capacity() {
 }
 
 #[tokio::test]
+async fn models_burst_above_old_control_plane_cap_succeeds_and_health_stays_responsive() {
+    const BURST_SIZE_ABOVE_OLD_CAP: usize = 8;
+
+    let default_control_plane_cap = AppConfig::default()
+        .server
+        .max_control_plane_in_flight_requests;
+    assert!(default_control_plane_cap >= BURST_SIZE_ABOVE_OLD_CAP);
+
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let mut active_model_responses = Vec::with_capacity(BURST_SIZE_ABOVE_OLD_CAP);
+
+    for _ in 0..BURST_SIZE_ABOVE_OLD_CAP {
+        let response = proxy_handler(
+            State(proxy.state.clone()),
+            empty_get_request("/v1/models?test=model-metadata"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        active_model_responses.push(response);
+        let observed = fake
+            .recv_within(STREAM_HEADER_TIMEOUT)
+            .await
+            .expect("model burst request should reach upstream");
+        assert_eq!(observed.path_and_query, "/v1/models?test=model-metadata");
+    }
+
+    let health_response = timeout(
+        STREAM_COMPLETION_TIMEOUT,
+        proxy
+            .client
+            .get(format!("{}/health", proxy.base_url))
+            .send(),
+    )
+    .await
+    .expect("health should stay responsive during model burst")
+    .expect("health request should complete");
+    assert_eq!(health_response.status(), StatusCode::OK);
+    let health_body = health_response
+        .text()
+        .await
+        .expect("health body should be text");
+    let health: serde_json::Value =
+        serde_json::from_str(&health_body).expect("health should be JSON");
+    assert_eq!(health["process"], "alive");
+    assert_eq!(health["upstream"], "ready");
+
+    let health_probe = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("health probe should reach upstream during model burst");
+    assert_eq!(health_probe.path_and_query, "/v1/models");
+
+    drop(active_model_responses);
+}
+
+#[tokio::test]
 async fn enriched_models_observability_records_success_after_body_consumption() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
