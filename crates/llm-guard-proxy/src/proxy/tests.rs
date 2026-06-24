@@ -1005,8 +1005,8 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
         response
             .headers()
             .get(CONTENT_TYPE)
-            .expect("content type should be rewritten for downstream SSE"),
-        "text/event-stream"
+            .expect("content type should be JSON for non-stream downstream clients"),
+        "application/json"
     );
     assert_eq!(
         response
@@ -1015,7 +1015,17 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
             .expect("shielded fake upstream SSE should be used"),
         "chat-completions-sse"
     );
-    let aggregated = shielded_final_json(response).await;
+    let response_body = response.text().await.expect("response body should be text");
+    assert!(
+        !response_body.starts_with(": llm-guard-proxy heartbeat"),
+        "non-stream response must not start with SSE heartbeat: {response_body:?}"
+    );
+    assert!(
+        !response_body.contains("event: final"),
+        "non-stream response must not contain SSE final framing: {response_body:?}"
+    );
+    let aggregated: serde_json::Value =
+        serde_json::from_str(&response_body).expect("non-stream response should be JSON");
     assert_eq!(aggregated["id"], "chatcmpl-shielded");
     assert_eq!(aggregated["object"], "chat.completion");
     assert_eq!(aggregated["created"], 1_710_000_000);
@@ -1926,7 +1936,16 @@ enabled = false
 #[tokio::test]
 async fn shielded_non_stream_chat_downstream_drop_cancels_upstream_aggregation() {
     let mut upstream = CancellableUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn(&upstream.base_url, true).await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "json-whitespace"
+"#,
+    )
+    .await;
 
     let response = proxy
         .client
@@ -1942,8 +1961,8 @@ async fn shielded_non_stream_chat_downstream_drop_cancels_upstream_aggregation()
         response
             .headers()
             .get(CONTENT_TYPE)
-            .expect("shielded response should advertise downstream SSE"),
-        "text/event-stream"
+            .expect("shielded non-stream response should advertise JSON"),
+        "application/json"
     );
     let observed = upstream.recv_request().await;
     assert_eq!(observed.method, Method::POST);
@@ -2667,7 +2686,7 @@ async fn shielded_chat_attempt_metadata_records_stream_timings_and_delta_counts(
 }
 
 #[tokio::test]
-async fn default_sse_heartbeat_emits_progress_before_slow_shielded_content() {
+async fn default_sse_mode_buffers_non_stream_json_without_sse_framing() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -2681,7 +2700,7 @@ interval_secs = 1
     .await;
 
     let response = timeout(
-        STREAM_HEADER_TIMEOUT,
+        Duration::from_secs(4),
         proxy
             .client
             .post(format!(
@@ -2693,7 +2712,7 @@ interval_secs = 1
             .send(),
     )
     .await
-    .expect("shielded SSE headers should arrive before upstream content")
+    .expect("shielded JSON response should arrive after upstream aggregation")
     .expect("proxy request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
@@ -2701,35 +2720,22 @@ interval_secs = 1
         response
             .headers()
             .get(CONTENT_TYPE)
-            .expect("shielded default response should be SSE"),
-        "text/event-stream"
+            .expect("shielded default non-stream response should be JSON"),
+        "application/json"
     );
 
-    let mut body = response.bytes_stream();
-    let heartbeat = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "shielded heartbeat").await;
-    let heartbeat_text = std::str::from_utf8(&heartbeat).expect("heartbeat should be UTF-8");
-    assert!(heartbeat_text.starts_with(": llm-guard-proxy heartbeat"));
-    assert!(!heartbeat_text.contains("Hello"));
-    assert!(!heartbeat_text.contains("event: final"));
-
-    let final_body = timeout(Duration::from_secs(4), async {
-        let mut collected = BytesMut::new();
-        while let Some(chunk) = body.next().await {
-            let chunk = chunk.expect("shielded SSE body should not fail");
-            collected.extend_from_slice(&chunk);
-            if std::str::from_utf8(&collected)
-                .expect("shielded SSE should remain UTF-8")
-                .contains("event: final")
-            {
-                return collected.freeze();
-            }
-        }
-        panic!("shielded SSE should emit a final event");
-    })
-    .await
-    .expect("shielded final event should arrive after heartbeat");
-    let final_json = final_json_from_sse_body(&final_body);
-    assert_eq!(final_json["choices"][0]["message"]["content"], "Hello");
+    let body = response.text().await.expect("response body should be text");
+    assert!(
+        !body.starts_with(": llm-guard-proxy heartbeat"),
+        "non-stream body must not start with SSE heartbeat: {body:?}"
+    );
+    assert!(
+        !body.contains("event: final"),
+        "non-stream body must not contain SSE final event: {body:?}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(&body).expect("non-stream body should parse as JSON");
+    assert_eq!(json["choices"][0]["message"]["content"], "Hello");
 
     let observed = fake.recv_next().await;
     assert_eq!(
@@ -2745,10 +2751,11 @@ async fn shielded_liveness_drop_records_current_attempt_abort() {
         &fake.base_url,
         true,
         AppConfig::default().server.max_in_flight_requests,
-        r"
+        r#"
 [heartbeat]
+mode = "json-whitespace"
 interval_secs = 1
-",
+"#,
     )
     .await;
 
@@ -2764,8 +2771,7 @@ interval_secs = 1
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
     let heartbeat = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "shielded heartbeat").await;
-    let heartbeat_text = std::str::from_utf8(&heartbeat).expect("heartbeat should be UTF-8");
-    assert!(heartbeat_text.starts_with(": llm-guard-proxy heartbeat"));
+    assert_eq!(heartbeat, Bytes::from_static(b" \n"));
     drop(body);
 
     let _observed = fake.recv_next().await;
@@ -2799,8 +2805,9 @@ async fn shielded_liveness_drop_after_prior_retry_records_current_chain() {
         &fake.base_url,
         true,
         AppConfig::default().server.max_in_flight_requests,
-        r"
+        r#"
 [heartbeat]
+mode = "json-whitespace"
 interval_secs = 1
 
 [loop_guard]
@@ -2809,7 +2816,7 @@ output_repeated_line_threshold = 4
 [retry]
 max_attempts = 3
 anti_loop_hint_enabled = true
-",
+"#,
     )
     .await;
 
@@ -2824,9 +2831,10 @@ anti_loop_hint_enabled = true
 
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
+    let prefix = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "retry JSON prefix").await;
+    assert_eq!(prefix, Bytes::from_static(b" \n"));
     let heartbeat = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "retry heartbeat").await;
-    let heartbeat_text = std::str::from_utf8(&heartbeat).expect("heartbeat should be UTF-8");
-    assert!(heartbeat_text.starts_with(": llm-guard-proxy heartbeat"));
+    assert_eq!(heartbeat, Bytes::from_static(b" \n"));
     drop(body);
 
     let first_attempt = fake.recv_next().await;
@@ -2884,8 +2892,8 @@ interval_secs = 1
         first
             .headers()
             .get(CONTENT_TYPE)
-            .expect("first request should use default SSE"),
-        "text/event-stream"
+            .expect("first request should use JSON"),
+        "application/json"
     );
     let first_json = shielded_final_json(first).await;
     assert_eq!(first_json["id"], "chatcmpl-shielded");
@@ -2943,13 +2951,14 @@ interval_secs = 1
         .as_ref()
         .expect("second request fingerprint should be recorded");
     assert_eq!(first_fingerprint, second_fingerprint);
-    assert_eq!(rows[0].1, "streaming");
+    assert_eq!(rows[0].1, "non-stream-json");
     assert_eq!(rows[1].1, "non-stream-json");
     let first_metadata: serde_json::Value =
         serde_json::from_str(&rows[0].2).expect("first metadata should parse");
     let second_metadata: serde_json::Value =
         serde_json::from_str(&rows[1].2).expect("second metadata should parse");
     assert_eq!(first_metadata["repeat_input_matched"], "false");
+    assert_eq!(first_metadata["downstream_liveness_mode"], "disabled");
     assert_eq!(second_metadata["repeat_input_matched"], "true");
     assert_eq!(
         second_metadata["downstream_liveness_mode"],
@@ -2964,13 +2973,14 @@ async fn hot_reloaded_heartbeat_interval_changes_without_restart() {
         &fake.base_url,
         true,
         AppConfig::default().server.max_in_flight_requests,
-        r"
+        r#"
 [heartbeat]
+mode = "json-whitespace"
 interval_secs = 1
 
 [loop_guard]
 enabled = false
-",
+"#,
     )
     .await;
 
@@ -2986,6 +2996,13 @@ enabled = false
         .await
         .expect("first shielded request should complete");
     let mut first_body = first.bytes_stream();
+    let first_prefix = next_chunk(
+        &mut first_body,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "first JSON prefix",
+    )
+    .await;
+    assert_eq!(first_prefix, Bytes::from_static(b" \n"));
     let first_heartbeat = next_chunk(
         &mut first_body,
         SHIELDED_HEARTBEAT_TIMEOUT,
@@ -2993,9 +3010,8 @@ enabled = false
     )
     .await;
     assert!(
-        std::str::from_utf8(&first_heartbeat)
-            .expect("heartbeat should be UTF-8")
-            .starts_with(": llm-guard-proxy heartbeat")
+        first_heartbeat == Bytes::from_static(b" \n"),
+        "first JSON whitespace heartbeat should be a JSON-safe whitespace chunk"
     );
     drop(first_body);
     let _first_observed = fake.recv_next().await;
@@ -3006,13 +3022,14 @@ enabled = false
         &proxy.sqlite_path,
         true,
         AppConfig::default().server.max_in_flight_requests,
-        r"
+        r#"
 [heartbeat]
+mode = "json-whitespace"
 interval_secs = 2
 
 [loop_guard]
 enabled = false
-",
+"#,
     );
     proxy
         .manager
@@ -3031,6 +3048,13 @@ enabled = false
         .await
         .expect("second shielded request should complete");
     let mut second_body = second.bytes_stream();
+    let second_prefix = next_chunk(
+        &mut second_body,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "second JSON prefix",
+    )
+    .await;
+    assert_eq!(second_prefix, Bytes::from_static(b" \n"));
     assert!(
         timeout(SHIELDED_RELOAD_GUARD, second_body.next())
             .await
@@ -3044,9 +3068,8 @@ enabled = false
     )
     .await;
     assert!(
-        std::str::from_utf8(&second_heartbeat)
-            .expect("heartbeat should be UTF-8")
-            .starts_with(": llm-guard-proxy heartbeat")
+        second_heartbeat == Bytes::from_static(b" \n"),
+        "second JSON whitespace heartbeat should be a JSON-safe whitespace chunk"
     );
     let _second_observed = fake.recv_next().await;
 }
@@ -3082,8 +3105,8 @@ max_repeated_inputs = 1
         first
             .headers()
             .get(CONTENT_TYPE)
-            .expect("first request should use SSE"),
-        "text/event-stream"
+            .expect("first request should use JSON"),
+        "application/json"
     );
     let _first_json = shielded_final_json(first).await;
     let _first_observed = fake.recv_next().await;
@@ -3102,8 +3125,8 @@ max_repeated_inputs = 1
         second
             .headers()
             .get(CONTENT_TYPE)
-            .expect("expired repeat should stay SSE"),
-        "text/event-stream"
+            .expect("expired repeat should stay JSON"),
+        "application/json"
     );
     let _second_json = shielded_final_json(second).await;
     let _second_observed = fake.recv_next().await;

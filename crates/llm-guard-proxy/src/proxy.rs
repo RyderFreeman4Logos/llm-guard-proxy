@@ -3851,11 +3851,12 @@ fn select_shielded_liveness(
                 config.loop_guard.max_repeated_inputs,
             )
         });
+    // Non-stream OpenAI-compatible clients require JSON framing even when the
+    // proxy internally forces upstream SSE for inspection and retry.
     let mode = match config.heartbeat.mode {
-        HeartbeatMode::Disabled => ShieldedLivenessMode::Disabled,
         HeartbeatMode::JsonWhitespace => ShieldedLivenessMode::JsonWhitespace,
         HeartbeatMode::Sse if repeat_observation.repeated => ShieldedLivenessMode::JsonWhitespace,
-        HeartbeatMode::Sse => ShieldedLivenessMode::Sse,
+        HeartbeatMode::Disabled | HeartbeatMode::Sse => ShieldedLivenessMode::Disabled,
     };
 
     ShieldedLivenessSelection {
