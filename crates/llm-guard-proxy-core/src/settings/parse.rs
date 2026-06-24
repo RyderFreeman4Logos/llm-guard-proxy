@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, HeartbeatConfig, HeartbeatMode,
     LoopGuardConfig, MetadataConfig, ObservabilityConfig, RetentionConfig, RetryConfig,
-    ServerConfig, ShieldingConfig, ThinkingConfig, UpstreamConfig,
+    ServerConfig, ShieldingConfig, ThinkingConfig, UpstreamConfig, UpstreamStallConfig,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -18,6 +18,7 @@ enum Section {
     Thinking,
     LoopGuard,
     Retry,
+    UpstreamStall,
     Heartbeat,
     Cloudflare,
 }
@@ -84,6 +85,7 @@ fn parse_section(line: &str, line_number: usize) -> Result<Section, ConfigParseE
         "thinking" => Ok(Section::Thinking),
         "loop_guard" => Ok(Section::LoopGuard),
         "retry" => Ok(Section::Retry),
+        "upstream.stall" => Ok(Section::UpstreamStall),
         "heartbeat" => Ok(Section::Heartbeat),
         "cloudflare" => Ok(Section::Cloudflare),
         _ => Err(ConfigParseError::new(
@@ -141,6 +143,9 @@ fn assign_value(
         Section::Thinking => assign_thinking(&mut config.thinking, key, value, line_number),
         Section::LoopGuard => assign_loop_guard(&mut config.loop_guard, key, value, line_number),
         Section::Retry => assign_retry(&mut config.retry, key, value, line_number),
+        Section::UpstreamStall => {
+            assign_upstream_stall(&mut config.upstream_stall, key, value, line_number)
+        }
         Section::Heartbeat => assign_heartbeat(&mut config.heartbeat, key, value, line_number),
         Section::Cloudflare => assign_cloudflare(&mut config.cloudflare, key, value, line_number),
     }
@@ -426,6 +431,45 @@ fn assign_retry(
     Ok(())
 }
 
+fn assign_upstream_stall(
+    config: &mut UpstreamStallConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "idle_timeout_ms" => {
+            config.idle_timeout_ms =
+                parse_u64(value, line_number, "upstream.stall.idle_timeout_ms")?;
+        }
+        "recovery_command" => {
+            config.recovery_command = parse_string_array(value, line_number)?;
+        }
+        "recovery_timeout_ms" => {
+            config.recovery_timeout_ms =
+                parse_u64(value, line_number, "upstream.stall.recovery_timeout_ms")?;
+        }
+        "recovery_cooldown_ms" => {
+            config.recovery_cooldown_ms =
+                parse_u64(value, line_number, "upstream.stall.recovery_cooldown_ms")?;
+        }
+        "recovery_budget_window_ms" => {
+            config.recovery_budget_window_ms = parse_u64(
+                value,
+                line_number,
+                "upstream.stall.recovery_budget_window_ms",
+            )?;
+        }
+        "recovery_max_per_window" => {
+            config.recovery_max_per_window =
+                parse_u32(value, line_number, "upstream.stall.recovery_max_per_window")?;
+        }
+        _ => return unknown_key("upstream.stall", key, line_number),
+    }
+    Ok(())
+}
+
 fn assign_heartbeat(
     config: &mut HeartbeatConfig,
     key: &str,
@@ -499,6 +543,62 @@ fn parse_optional_string(
 ) -> Result<Option<String>, ConfigParseError> {
     let parsed = parse_string(value, line_number)?;
     Ok((!parsed.is_empty()).then_some(parsed))
+}
+
+fn parse_string_array(value: &str, line_number: usize) -> Result<Vec<String>, ConfigParseError> {
+    if !value.starts_with('[') || !value.ends_with(']') {
+        return Err(ConfigParseError::new(
+            line_number,
+            "expected an array of quoted string values",
+        ));
+    }
+    let inner = &value[1..value.len() - 1];
+    let mut parsed = Vec::new();
+    let mut cursor = 0;
+    while cursor < inner.len() {
+        let remaining = &inner[cursor..];
+        let trimmed = remaining.trim_start();
+        cursor += remaining.len() - trimmed.len();
+        if cursor >= inner.len() {
+            break;
+        }
+        if !inner[cursor..].starts_with('"') {
+            return Err(ConfigParseError::new(
+                line_number,
+                "array entries must be quoted strings",
+            ));
+        }
+        let mut escaped = false;
+        let mut end = None;
+        for (relative_index, character) in inner[cursor + 1..].char_indices() {
+            if character == '"' && !escaped {
+                end = Some(cursor + 1 + relative_index);
+                break;
+            }
+            escaped = character == '\\' && !escaped;
+            if character != '\\' {
+                escaped = false;
+            }
+        }
+        let Some(end_index) = end else {
+            return Err(ConfigParseError::new(line_number, "unterminated string"));
+        };
+        parsed.push(parse_string(&inner[cursor..=end_index], line_number)?);
+        cursor = end_index + 1;
+        let remaining = inner[cursor..].trim_start();
+        cursor = inner.len() - remaining.len();
+        if cursor >= inner.len() {
+            break;
+        }
+        if !inner[cursor..].starts_with(',') {
+            return Err(ConfigParseError::new(
+                line_number,
+                "array entries must be separated by commas",
+            ));
+        }
+        cursor += 1;
+    }
+    Ok(parsed)
 }
 
 fn parse_bool(value: &str, line_number: usize) -> Result<bool, ConfigParseError> {

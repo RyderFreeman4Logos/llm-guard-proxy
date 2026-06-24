@@ -36,6 +36,22 @@ impl AggregationError {
         }
     }
 
+    pub(super) fn upstream_stall(idle_timeout_ms: u64) -> Self {
+        Self {
+            message: format!("upstream SSE stream stalled: no chunk for {idle_timeout_ms}ms"),
+            response_metadata: BTreeMap::from([
+                (
+                    String::from("upstream_stall_detected"),
+                    String::from("true"),
+                ),
+                (
+                    String::from("upstream_stall_idle_timeout_ms"),
+                    idle_timeout_ms.to_string(),
+                ),
+            ]),
+        }
+    }
+
     fn loop_detected(detection: &LoopDetection) -> Self {
         Self {
             message: detection.message(),
@@ -53,8 +69,16 @@ impl AggregationError {
             .is_some_and(|value| value == "true")
     }
 
+    pub(in crate::proxy) fn is_upstream_stall(&self) -> bool {
+        self.response_metadata
+            .get("upstream_stall_detected")
+            .is_some_and(|value| value == "true")
+    }
+
     pub(in crate::proxy) fn transient_stream_retry_reason(&self) -> Option<&'static str> {
-        if self
+        if self.is_upstream_stall() {
+            Some("upstream_stall")
+        } else if self
             .message
             .contains("upstream SSE stream failed: timeout_failure")
             || self

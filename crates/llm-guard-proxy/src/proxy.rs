@@ -6,6 +6,7 @@ use std::{
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     pin::Pin,
+    process::Stdio,
     sync::{Arc, Mutex, MutexGuard},
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -29,16 +30,17 @@ use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
     DownstreamMode, Health, HeartbeatMode, LICENSE, LatencyHistogram, MetadataConfig,
     ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
-    RequestStatus, RetryConfig, SERVICE_NAME, UpstreamMode, redact_upstream_base_url,
-    validate_upstream_base_url,
+    RequestStatus, RetryConfig, SERVICE_NAME, UpstreamMode, UpstreamStallConfig,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;
 use tokio::{
     net::TcpListener,
-    sync::Notify,
-    time::{Instant, Interval, MissedTickBehavior},
+    process::Command,
+    sync::{Mutex as AsyncMutex, Notify},
+    time::{Instant, Interval, MissedTickBehavior, timeout},
 };
 
 mod model_metadata;
@@ -51,6 +53,8 @@ const HEADER_VALUE_REDACTED: &str = "[redacted]";
 const DEBUG_SUMMARY_PATH: &str = "/debug/recent-requests";
 const IN_FLIGHT_CAPACITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 const ADMISSION_RETRY_AFTER_SECS: &str = "1";
+const RECOVERY_PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(100);
+const RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE: Duration = Duration::from_millis(500);
 
 /// Shared HTTP proxy state.
 #[derive(Clone, Debug)]
@@ -61,6 +65,7 @@ pub(crate) struct ProxyState {
     client: Client,
     generation_requests: Arc<InFlightLimiter>,
     control_plane_requests: Arc<InFlightLimiter>,
+    upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
 }
 
@@ -80,6 +85,7 @@ impl ProxyState {
             client,
             generation_requests: Arc::new(InFlightLimiter::default()),
             control_plane_requests: Arc::new(InFlightLimiter::default()),
+            upstream_stall_recovery: Arc::new(UpstreamStallRecoveryCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
         }
     }
@@ -1217,6 +1223,7 @@ async fn forward_openai_request(
         &shielded_chat_plan.thinking_metadata,
     );
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry);
+    let upstream_stall_policy = UpstreamStallPolicy::from_config(&config.upstream_stall);
     if shielded_chat_plan.intercepted {
         add_retry_request_metadata(&mut request_metadata, retry_policy);
         return forward_shielded_chat_with_retries(
@@ -1238,6 +1245,8 @@ async fn forward_openai_request(
                 thinking_metadata: shielded_chat_plan.thinking_metadata,
                 loop_context: shielded_chat_plan.loop_context,
                 retry_policy,
+                upstream_stall_policy,
+                upstream_stall_recovery: state.upstream_stall_recovery.clone(),
             },
             in_flight_permit,
         )
@@ -1507,12 +1516,61 @@ impl ShieldedRetryPolicy {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UpstreamStallPolicy {
+    enabled: bool,
+    idle_timeout: Duration,
+    recovery_command: Vec<String>,
+    recovery_timeout: Duration,
+    recovery_cooldown: Duration,
+    recovery_budget_window: Duration,
+    recovery_max_per_window: u32,
+}
+
+impl UpstreamStallPolicy {
+    fn from_config(config: &UpstreamStallConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            idle_timeout: Duration::from_millis(config.idle_timeout_ms),
+            recovery_command: config.recovery_command.clone(),
+            recovery_timeout: Duration::from_millis(config.recovery_timeout_ms),
+            recovery_cooldown: Duration::from_millis(config.recovery_cooldown_ms),
+            recovery_budget_window: Duration::from_millis(config.recovery_budget_window_ms),
+            recovery_max_per_window: config.recovery_max_per_window,
+        }
+    }
+
+    const fn idle_timeout(&self) -> Option<Duration> {
+        if self.enabled {
+            Some(self.idle_timeout)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct UpstreamStallRecoveryCoordinator {
+    state: AsyncMutex<UpstreamStallRecoveryState>,
+    notify: Notify,
+}
+
+#[derive(Debug, Default)]
+struct UpstreamStallRecoveryState {
+    running: bool,
+    last_finished: Option<Instant>,
+    window_started: Option<Instant>,
+    runs_in_window: u32,
+    last_result: Option<BTreeMap<String, String>>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShieldedRetryCause {
     LoopDetected,
     TransientUpstreamStatus,
     TransientTransport,
     TransientStream,
+    UpstreamStall,
 }
 
 impl ShieldedRetryCause {
@@ -1522,6 +1580,7 @@ impl ShieldedRetryCause {
             Self::TransientUpstreamStatus => "transient_upstream_status",
             Self::TransientTransport => "transient_upstream_transport",
             Self::TransientStream => "transient_upstream_stream_failure",
+            Self::UpstreamStall => "upstream_stall",
         }
     }
 
@@ -1531,6 +1590,7 @@ impl ShieldedRetryCause {
             Self::TransientUpstreamStatus => "previous_transient_upstream_status",
             Self::TransientTransport => "previous_transient_upstream_transport",
             Self::TransientStream => "previous_transient_upstream_stream_failure",
+            Self::UpstreamStall => "previous_upstream_stall",
         }
     }
 }
@@ -1818,6 +1878,8 @@ struct ShieldedRetryRuntime {
     thinking_metadata: BTreeMap<String, String>,
     loop_context: shielded_chat::LoopInspectionContext,
     retry_policy: ShieldedRetryPolicy,
+    upstream_stall_policy: UpstreamStallPolicy,
+    upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
 }
 
 #[derive(Clone, Debug)]
@@ -2198,6 +2260,7 @@ async fn aggregate_shielded_attempt(
         &request_id,
         request_model_id.as_deref(),
         runtime.loop_context.clone(),
+        runtime.upstream_stall_policy.idle_timeout(),
     )
     .await
     {
@@ -2287,21 +2350,21 @@ async fn run_shielded_attempts(
                     final_attempt: aggregated.final_attempt,
                 });
             }
-            Err(failure) => {
+            Err(mut failure) => {
                 let next_retry_cause = failure.retry_cause;
-                let can_retry = next_retry_cause.is_some_and(|_cause| {
-                    runtime
-                        .retry_policy
-                        .allows_retry_after(failure.attempt_number)
-                });
+                let mut can_retry = should_retry_after_shielded_failure(&runtime, &failure);
+                let recovery_gate = recovery_gate_for_retryable_upstream_stall(
+                    &runtime,
+                    can_retry,
+                    next_retry_cause,
+                )
+                .await;
+                can_retry = can_retry && recovery_gate.permits_retry;
+                failure.response_metadata.extend(recovery_gate.metadata);
                 attempt_records.push(attempt_failure_record(
                     &failure,
-                    if can_retry {
-                        AttemptStatus::Retried
-                    } else {
-                        AttemptStatus::Failed
-                    },
-                    if can_retry { next_retry_cause } else { None },
+                    retry_attempt_status(can_retry),
+                    retry_cause_for_attempt_record(can_retry, next_retry_cause),
                     runtime.retry_policy,
                 ));
                 update_shielded_attempt_progress(attempt_progress.as_ref(), &attempt_records, None);
@@ -2318,6 +2381,422 @@ async fn run_shielded_attempts(
             }
         }
     }
+}
+
+const fn retry_attempt_status(can_retry: bool) -> AttemptStatus {
+    if can_retry {
+        AttemptStatus::Retried
+    } else {
+        AttemptStatus::Failed
+    }
+}
+
+const fn retry_cause_for_attempt_record(
+    can_retry: bool,
+    retry_cause: Option<ShieldedRetryCause>,
+) -> Option<ShieldedRetryCause> {
+    if can_retry { retry_cause } else { None }
+}
+
+fn should_retry_after_shielded_failure(
+    runtime: &ShieldedRetryRuntime,
+    failure: &ShieldedAttemptFailure,
+) -> bool {
+    failure.retry_cause.is_some()
+        && runtime
+            .retry_policy
+            .allows_retry_after(failure.attempt_number)
+}
+
+struct UpstreamStallRecoveryGate {
+    metadata: BTreeMap<String, String>,
+    permits_retry: bool,
+}
+
+async fn recovery_gate_for_retryable_upstream_stall(
+    runtime: &ShieldedRetryRuntime,
+    can_retry: bool,
+    retry_cause: Option<ShieldedRetryCause>,
+) -> UpstreamStallRecoveryGate {
+    if !can_retry || !matches!(retry_cause, Some(ShieldedRetryCause::UpstreamStall)) {
+        return UpstreamStallRecoveryGate {
+            metadata: BTreeMap::new(),
+            permits_retry: true,
+        };
+    }
+    let mut metadata = run_upstream_stall_recovery(
+        &runtime.upstream_stall_policy,
+        &runtime.upstream_stall_recovery,
+    )
+    .await;
+    let permits_retry = upstream_stall_recovery_permits_retry(&metadata);
+    metadata.insert(
+        String::from("upstream_stall_recovery_permits_retry"),
+        permits_retry.to_string(),
+    );
+    UpstreamStallRecoveryGate {
+        metadata,
+        permits_retry,
+    }
+}
+
+fn upstream_stall_recovery_permits_retry(metadata: &BTreeMap<String, String>) -> bool {
+    match metadata
+        .get("upstream_stall_recovery_status")
+        .map(String::as_str)
+    {
+        Some("skipped_no_command" | "succeeded") => true,
+        Some("joined_inflight") => metadata
+            .get("upstream_stall_recovery_joined_status")
+            .is_some_and(|status| status == "succeeded"),
+        _ => false,
+    }
+}
+
+async fn run_upstream_stall_recovery(
+    policy: &UpstreamStallPolicy,
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+) -> BTreeMap<String, String> {
+    let mut metadata = upstream_stall_recovery_metadata(!policy.recovery_command.is_empty());
+    if policy.recovery_command.is_empty() {
+        metadata.insert(
+            String::from("upstream_stall_recovery_status"),
+            String::from("skipped_no_command"),
+        );
+        return metadata;
+    }
+
+    let mut state = coordinator.state.lock().await;
+    if state.running {
+        drop(state);
+        return wait_for_upstream_stall_recovery_result(policy, coordinator, true).await;
+    }
+
+    let now = Instant::now();
+    if let Some(last_finished) = state.last_finished {
+        let elapsed = now.saturating_duration_since(last_finished);
+        if elapsed < policy.recovery_cooldown {
+            metadata.insert(
+                String::from("upstream_stall_recovery_status"),
+                String::from("skipped_cooldown"),
+            );
+            metadata.insert(
+                String::from("upstream_stall_recovery_cooldown_remaining_ms"),
+                policy
+                    .recovery_cooldown
+                    .saturating_sub(elapsed)
+                    .as_millis()
+                    .to_string(),
+            );
+            return metadata;
+        }
+    }
+
+    let window_started = state.window_started.unwrap_or(now);
+    if now.saturating_duration_since(window_started) >= policy.recovery_budget_window {
+        state.window_started = Some(now);
+        state.runs_in_window = 0;
+    } else if state.runs_in_window >= policy.recovery_max_per_window {
+        metadata.insert(
+            String::from("upstream_stall_recovery_status"),
+            String::from("skipped_budget_exhausted"),
+        );
+        metadata.insert(
+            String::from("upstream_stall_recovery_budget_runs"),
+            state.runs_in_window.to_string(),
+        );
+        metadata.insert(
+            String::from("upstream_stall_recovery_budget_max_per_window"),
+            policy.recovery_max_per_window.to_string(),
+        );
+        return metadata;
+    } else if state.window_started.is_none() {
+        state.window_started = Some(now);
+    }
+
+    state.running = true;
+    state.runs_in_window = state.runs_in_window.saturating_add(1);
+    drop(state);
+
+    let task_policy = policy.clone();
+    let task_coordinator = Arc::clone(coordinator);
+    tokio::spawn(async move {
+        let mut metadata = upstream_stall_recovery_metadata(true);
+        metadata.extend(run_upstream_stall_recovery_command(&task_policy).await);
+        finish_upstream_stall_recovery(&task_coordinator, metadata).await;
+    });
+
+    wait_for_upstream_stall_recovery_result(policy, coordinator, false).await
+}
+
+async fn wait_for_upstream_stall_recovery_result(
+    policy: &UpstreamStallPolicy,
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+    joined_inflight: bool,
+) -> BTreeMap<String, String> {
+    let mut metadata = upstream_stall_recovery_metadata(true);
+    let deadline = Instant::now() + recovery_join_timeout(policy);
+    loop {
+        let notified = coordinator.notify.notified();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+
+        let state = coordinator.state.lock().await;
+        if !state.running {
+            return completed_upstream_stall_recovery_metadata(&metadata, &state, joined_inflight);
+        }
+        drop(state);
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || timeout(remaining, notified).await.is_err() {
+            let state = coordinator.state.lock().await;
+            if !state.running {
+                return completed_upstream_stall_recovery_metadata(
+                    &metadata,
+                    &state,
+                    joined_inflight,
+                );
+            }
+            drop(state);
+
+            metadata.insert(
+                String::from("upstream_stall_recovery_status"),
+                if joined_inflight {
+                    String::from("join_timeout")
+                } else {
+                    String::from("completion_timeout")
+                },
+            );
+            return metadata;
+        }
+    }
+}
+
+fn completed_upstream_stall_recovery_metadata(
+    metadata: &BTreeMap<String, String>,
+    state: &UpstreamStallRecoveryState,
+    joined_inflight: bool,
+) -> BTreeMap<String, String> {
+    let Some(last_result) = &state.last_result else {
+        let mut missing = metadata.clone();
+        missing.insert(
+            String::from("upstream_stall_recovery_status"),
+            String::from("missing_result"),
+        );
+        return missing;
+    };
+    if !joined_inflight {
+        return last_result.clone();
+    }
+    let mut joined = metadata.clone();
+    joined.insert(
+        String::from("upstream_stall_recovery_status"),
+        String::from("joined_inflight"),
+    );
+    if let Some(status) = last_result.get("upstream_stall_recovery_status") {
+        joined.insert(
+            String::from("upstream_stall_recovery_joined_status"),
+            status.clone(),
+        );
+    }
+    joined
+}
+
+const fn recovery_join_timeout(policy: &UpstreamStallPolicy) -> Duration {
+    policy
+        .recovery_timeout
+        .saturating_add(Duration::from_secs(1))
+}
+
+async fn finish_upstream_stall_recovery(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    metadata: BTreeMap<String, String>,
+) {
+    let mut state = coordinator.state.lock().await;
+    state.running = false;
+    state.last_finished = Some(Instant::now());
+    state.last_result = Some(metadata);
+    drop(state);
+    coordinator.notify.notify_waiters();
+}
+
+fn upstream_stall_recovery_metadata(configured: bool) -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        String::from("upstream_stall_recovery_configured"),
+        configured.to_string(),
+    )])
+}
+
+async fn run_upstream_stall_recovery_command(
+    policy: &UpstreamStallPolicy,
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::from([(
+        String::from("upstream_stall_recovery_ran"),
+        String::from("true"),
+    )]);
+    let program = &policy.recovery_command[0];
+    let args = &policy.recovery_command[1..];
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_recovery_command(&mut command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            metadata.insert(
+                String::from("upstream_stall_recovery_status"),
+                String::from("spawn_failed"),
+            );
+            metadata.insert(
+                String::from("upstream_stall_recovery_error"),
+                error.kind().to_string(),
+            );
+            return metadata;
+        }
+    };
+    match timeout(policy.recovery_timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            metadata.insert(
+                String::from("upstream_stall_recovery_status"),
+                if status.success() {
+                    String::from("succeeded")
+                } else {
+                    String::from("exit_failure")
+                },
+            );
+            if let Some(code) = status.code() {
+                metadata.insert(
+                    String::from("upstream_stall_recovery_exit_code"),
+                    code.to_string(),
+                );
+            }
+        }
+        Ok(Err(error)) => {
+            metadata.insert(
+                String::from("upstream_stall_recovery_status"),
+                String::from("wait_failed"),
+            );
+            metadata.insert(
+                String::from("upstream_stall_recovery_error"),
+                error.kind().to_string(),
+            );
+        }
+        Err(_elapsed) => {
+            metadata.insert(
+                String::from("upstream_stall_recovery_status"),
+                String::from("timeout_killed"),
+            );
+            metadata.extend(terminate_timed_out_recovery_child(&mut child).await);
+        }
+    }
+    metadata
+}
+
+#[cfg(unix)]
+fn configure_recovery_command(command: &mut Command) {
+    command.process_group(0);
+}
+
+#[cfg(not(unix))]
+fn configure_recovery_command(_command: &mut Command) {}
+
+#[cfg(unix)]
+async fn terminate_timed_out_recovery_child(
+    child: &mut tokio::process::Child,
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::from([(
+        String::from("upstream_stall_recovery_timeout_cleanup_scope"),
+        String::from("process_group"),
+    )]);
+    let Some(pid) = child.id() else {
+        metadata.insert(
+            String::from("upstream_stall_recovery_timeout_cleanup_status"),
+            String::from("missing_child_pid"),
+        );
+        let _kill_result = child.kill().await;
+        return metadata;
+    };
+
+    metadata.insert(
+        String::from("upstream_stall_recovery_timeout_term_sent"),
+        send_recovery_process_group_signal(pid, "TERM")
+            .await
+            .to_string(),
+    );
+    tokio::time::sleep(RECOVERY_PROCESS_GROUP_TERM_GRACE).await;
+    let child_reaped_after_term;
+    let term_child_wait_status = match child.try_wait() {
+        Ok(Some(_status)) => {
+            child_reaped_after_term = true;
+            "child_reaped_after_term"
+        }
+        Ok(None) => {
+            child_reaped_after_term = false;
+            "child_still_running_after_term"
+        }
+        Err(_error) => {
+            child_reaped_after_term = false;
+            "child_wait_failed_after_term"
+        }
+    };
+    metadata.insert(
+        String::from("upstream_stall_recovery_timeout_term_child_wait_status"),
+        String::from(term_child_wait_status),
+    );
+
+    metadata.insert(
+        String::from("upstream_stall_recovery_timeout_kill_sent"),
+        send_recovery_process_group_signal(pid, "KILL")
+            .await
+            .to_string(),
+    );
+    let cleanup_status = if child_reaped_after_term {
+        "group_killed_after_child_reaped"
+    } else {
+        match timeout(RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE, child.wait()).await {
+            Ok(Ok(_status)) => "terminated_after_kill",
+            Ok(Err(_error)) => "wait_failed_after_kill",
+            Err(_elapsed) => "wait_timeout_after_kill",
+        }
+    };
+    metadata.insert(
+        String::from("upstream_stall_recovery_timeout_cleanup_status"),
+        String::from(cleanup_status),
+    );
+    metadata
+}
+
+#[cfg(not(unix))]
+async fn terminate_timed_out_recovery_child(
+    child: &mut tokio::process::Child,
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::from([(
+        String::from("upstream_stall_recovery_timeout_cleanup_scope"),
+        String::from("child"),
+    )]);
+    metadata.insert(
+        String::from("upstream_stall_recovery_timeout_cleanup_status"),
+        child.kill().await.is_ok().to_string(),
+    );
+    metadata
+}
+
+#[cfg(unix)]
+async fn send_recovery_process_group_signal(pid: u32, signal: &str) -> bool {
+    Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pid}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|status| status.success())
 }
 
 async fn start_shielded_attempt(
@@ -2539,6 +3018,8 @@ fn aggregation_failure(
     let finished_at_unix_ms = unix_time_millis();
     let retry_cause = if error.is_loop_detected() {
         Some(ShieldedRetryCause::LoopDetected)
+    } else if error.is_upstream_stall() {
+        Some(ShieldedRetryCause::UpstreamStall)
     } else {
         error
             .transient_stream_retry_reason()
@@ -2569,9 +3050,11 @@ fn aggregation_failure(
         error_type: "upstream_body_error",
         error_message: error.to_string(),
         retry_cause,
-        abort_reason: retry_cause
-            .filter(|cause| matches!(cause, ShieldedRetryCause::LoopDetected))
-            .map(|_cause| String::from("loop_guard")),
+        abort_reason: match retry_cause {
+            Some(ShieldedRetryCause::LoopDetected) => Some(String::from("loop_guard")),
+            Some(ShieldedRetryCause::UpstreamStall) => Some(String::from("upstream_stall")),
+            _ => None,
+        },
         request_metadata: info.request_metadata.clone(),
         response_metadata,
     }
