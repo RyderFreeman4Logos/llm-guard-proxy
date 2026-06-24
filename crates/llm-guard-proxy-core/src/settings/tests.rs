@@ -65,8 +65,33 @@ fn defaults_match_issue_contract() {
     assert!(config.retry.enabled);
     assert_eq!(config.retry.max_attempts, 5);
     assert!(config.retry.anti_loop_hint_enabled);
+    assert!(!config.upstream_stall.enabled);
+    assert_eq!(config.upstream_stall.idle_timeout_ms, 30_000);
+    assert!(config.upstream_stall.recovery_command.is_empty());
+    assert_eq!(config.upstream_stall.recovery_timeout_ms, 300_000);
+    assert_eq!(config.upstream_stall.recovery_cooldown_ms, 300_000);
+    assert_eq!(config.upstream_stall.recovery_budget_window_ms, 900_000);
+    assert_eq!(config.upstream_stall.recovery_max_per_window, 2);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
     assert!(config.cloudflare.enabled);
+}
+
+#[test]
+fn validates_enabled_upstream_stall_idle_timeout_precedes_request_timeout() {
+    let mut config = AppConfig::default();
+    config.upstream_stall.enabled = true;
+    config.upstream_stall.idle_timeout_ms = config.upstream.request_timeout_ms;
+
+    let error = config
+        .validate()
+        .expect_err("stall idle timeout should beat total upstream request timeout");
+
+    assert_eq!(error.field(), "upstream.stall.idle_timeout_ms");
+    assert!(
+        error
+            .message()
+            .contains("less than upstream.request_timeout_ms")
+    );
 }
 
 #[test]
@@ -117,6 +142,15 @@ input_overlap_threshold_multiplier = 5
 max_attempts = 3
 anti_loop_hint_enabled = false
 
+[upstream.stall]
+enabled = true
+idle_timeout_ms = 5000
+recovery_command = ["/usr/bin/systemctl", "--user", "restart", "vllm-aeon-27b-dflash-n12.service"]
+recovery_timeout_ms = 60000
+recovery_cooldown_ms = 45000
+recovery_budget_window_ms = 180000
+recovery_max_per_window = 1
+
 [cloudflare]
 enabled = false
 "#,
@@ -140,6 +174,44 @@ enabled = false
         config.upstream.metadata.max_model_len_override,
         Some(256_000)
     );
+    assert_parsed_observability_overrides(&config);
+    assert_eq!(config.heartbeat.mode, HeartbeatMode::JsonWhitespace);
+    assert_eq!(config.heartbeat.interval_secs, 5);
+    assert_eq!(config.loop_guard.output_repeated_line_threshold, 40);
+    assert_eq!(config.loop_guard.output_token_window_size, 8);
+    assert_eq!(config.loop_guard.output_repeated_token_window_threshold, 9);
+    assert_eq!(config.loop_guard.output_suffix_cycle_threshold, 10);
+    assert_eq!(config.loop_guard.output_low_progress_min_bytes, 2_048);
+    assert_eq!(
+        config.loop_guard.output_low_progress_unique_ratio_percent,
+        25
+    );
+    assert_eq!(config.loop_guard.input_overlap_threshold_multiplier, 5);
+    assert_eq!(config.retry.max_attempts, 3);
+    assert!(!config.retry.anti_loop_hint_enabled);
+    assert_parsed_upstream_stall_overrides(&config);
+    assert!(!config.cloudflare.enabled);
+}
+
+fn assert_parsed_upstream_stall_overrides(config: &AppConfig) {
+    assert!(config.upstream_stall.enabled);
+    assert_eq!(config.upstream_stall.idle_timeout_ms, 5_000);
+    assert_eq!(
+        config.upstream_stall.recovery_command,
+        vec![
+            String::from("/usr/bin/systemctl"),
+            String::from("--user"),
+            String::from("restart"),
+            String::from("vllm-aeon-27b-dflash-n12.service"),
+        ]
+    );
+    assert_eq!(config.upstream_stall.recovery_timeout_ms, 60_000);
+    assert_eq!(config.upstream_stall.recovery_cooldown_ms, 45_000);
+    assert_eq!(config.upstream_stall.recovery_budget_window_ms, 180_000);
+    assert_eq!(config.upstream_stall.recovery_max_per_window, 1);
+}
+
+fn assert_parsed_observability_overrides(config: &AppConfig) {
     assert!(!config.observability.metrics_enabled.is_enabled());
     assert!(
         !config
@@ -160,21 +232,6 @@ enabled = false
         config.observability.retention.effective_prune_to_records(),
         40
     );
-    assert_eq!(config.heartbeat.mode, HeartbeatMode::JsonWhitespace);
-    assert_eq!(config.heartbeat.interval_secs, 5);
-    assert_eq!(config.loop_guard.output_repeated_line_threshold, 40);
-    assert_eq!(config.loop_guard.output_token_window_size, 8);
-    assert_eq!(config.loop_guard.output_repeated_token_window_threshold, 9);
-    assert_eq!(config.loop_guard.output_suffix_cycle_threshold, 10);
-    assert_eq!(config.loop_guard.output_low_progress_min_bytes, 2_048);
-    assert_eq!(
-        config.loop_guard.output_low_progress_unique_ratio_percent,
-        25
-    );
-    assert_eq!(config.loop_guard.input_overlap_threshold_multiplier, 5);
-    assert_eq!(config.retry.max_attempts, 3);
-    assert!(!config.retry.anti_loop_hint_enabled);
-    assert!(!config.cloudflare.enabled);
 }
 
 #[test]
@@ -692,6 +749,12 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_admin_token"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.retention.prune_to_records"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_command"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_timeout_ms"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_cooldown_ms"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_budget_window_ms"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_max_per_window"));
     assert!(RELOADABLE_FIELDS.contains(&"cloudflare.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.request_timeout_ms"));
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.max_in_flight_requests"));

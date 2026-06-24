@@ -15,8 +15,8 @@ pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, HeartbeatConfig, HeartbeatMode, LoopGuardConfig,
     MetadataConfig, ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig,
-    ServerConfig, ShieldingConfig, ThinkingConfig, UpstreamConfig, redact_upstream_base_url,
-    validate_upstream_base_url,
+    ServerConfig, ShieldingConfig, ThinkingConfig, UpstreamConfig, UpstreamStallConfig,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 pub use reload::{
     ConfigHandle, ConfigManager, MissingConfigPolicy, ReloadOutcome, ReloadWatcher,
@@ -62,6 +62,13 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "retry.enabled",
     "retry.max_attempts",
     "retry.anti_loop_hint_enabled",
+    "upstream.stall.enabled",
+    "upstream.stall.idle_timeout_ms",
+    "upstream.stall.recovery_command",
+    "upstream.stall.recovery_timeout_ms",
+    "upstream.stall.recovery_cooldown_ms",
+    "upstream.stall.recovery_budget_window_ms",
+    "upstream.stall.recovery_max_per_window",
     "heartbeat.mode",
     "heartbeat.interval_secs",
     "cloudflare.enabled",

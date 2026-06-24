@@ -23,6 +23,8 @@ pub struct AppConfig {
     pub loop_guard: LoopGuardConfig,
     /// Retry policy for shielded upstream attempts.
     pub retry: RetryConfig,
+    /// Upstream no-progress detection and recovery policy.
+    pub upstream_stall: UpstreamStallConfig,
     /// Downstream liveness policy.
     pub heartbeat: HeartbeatConfig,
     /// Cloudflare compatibility policy for later timeout shielding.
@@ -42,7 +44,20 @@ impl AppConfig {
         self.observability.validate()?;
         self.loop_guard.validate()?;
         self.retry.validate()?;
+        self.upstream_stall.validate()?;
+        self.validate_upstream_stall_timeout_order()?;
         self.heartbeat.validate()
+    }
+
+    fn validate_upstream_stall_timeout_order(&self) -> Result<(), ValidationError> {
+        if self.upstream_stall.enabled {
+            require(
+                self.upstream_stall.idle_timeout_ms < self.upstream.request_timeout_ms,
+                "upstream.stall.idle_timeout_ms",
+                "must be less than upstream.request_timeout_ms when upstream stall recovery is enabled",
+            )?;
+        }
+        Ok(())
     }
 
     pub(crate) fn apply_reloadable_from(&mut self, requested: &Self) {
@@ -71,6 +86,7 @@ impl AppConfig {
         self.thinking = requested.thinking.clone();
         self.loop_guard = requested.loop_guard.clone();
         self.retry = requested.retry.clone();
+        self.upstream_stall = requested.upstream_stall.clone();
         self.heartbeat = requested.heartbeat.clone();
         self.cloudflare = requested.cloudflare.clone();
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
@@ -692,6 +708,107 @@ impl Default for RetryConfig {
             enabled: true,
             max_attempts: 5,
             anti_loop_hint_enabled: true,
+        }
+    }
+}
+
+/// Upstream no-progress detection and optional recovery hook.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpstreamStallConfig {
+    /// Enables shielded chat aggregation idle-timeout detection.
+    pub enabled: bool,
+    /// Maximum milliseconds to wait for the next upstream SSE chunk.
+    pub idle_timeout_ms: u64,
+    /// Optional argv command run after a stall before retrying.
+    ///
+    /// Empty means recovery is disabled. Each element is passed as a single
+    /// argv item; the proxy never invokes a shell. A configured command must
+    /// perform the complete recovery procedure, including any restart and
+    /// post-restart readiness or smoke checks, because retries are allowed
+    /// only after this command exits successfully.
+    pub recovery_command: Vec<String>,
+    /// Maximum milliseconds to wait for the recovery command.
+    pub recovery_timeout_ms: u64,
+    /// Minimum milliseconds between completed recovery command executions.
+    pub recovery_cooldown_ms: u64,
+    /// Rolling window used by the recovery execution budget.
+    pub recovery_budget_window_ms: u64,
+    /// Maximum recovery command executions inside one budget window.
+    pub recovery_max_per_window: u32,
+}
+
+impl UpstreamStallConfig {
+    fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            self.idle_timeout_ms > 0,
+            "upstream.stall.idle_timeout_ms",
+            "must be greater than zero",
+        )?;
+        require(
+            self.idle_timeout_ms <= 600_000,
+            "upstream.stall.idle_timeout_ms",
+            "must be less than or equal to 600000",
+        )?;
+        require(
+            self.recovery_timeout_ms > 0,
+            "upstream.stall.recovery_timeout_ms",
+            "must be greater than zero",
+        )?;
+        require(
+            self.recovery_timeout_ms <= 600_000,
+            "upstream.stall.recovery_timeout_ms",
+            "must be less than or equal to 600000",
+        )?;
+        require(
+            self.recovery_command
+                .iter()
+                .all(|argument| !argument.trim().is_empty()),
+            "upstream.stall.recovery_command",
+            "must not contain empty argv entries",
+        )?;
+        require(
+            self.recovery_cooldown_ms > 0,
+            "upstream.stall.recovery_cooldown_ms",
+            "must be greater than zero",
+        )?;
+        require(
+            self.recovery_cooldown_ms <= 3_600_000,
+            "upstream.stall.recovery_cooldown_ms",
+            "must be less than or equal to 3600000",
+        )?;
+        require(
+            self.recovery_budget_window_ms > 0,
+            "upstream.stall.recovery_budget_window_ms",
+            "must be greater than zero",
+        )?;
+        require(
+            self.recovery_budget_window_ms <= 86_400_000,
+            "upstream.stall.recovery_budget_window_ms",
+            "must be less than or equal to 86400000",
+        )?;
+        require(
+            self.recovery_max_per_window > 0,
+            "upstream.stall.recovery_max_per_window",
+            "must be greater than zero",
+        )?;
+        require(
+            self.recovery_max_per_window <= 100,
+            "upstream.stall.recovery_max_per_window",
+            "must be less than or equal to 100",
+        )
+    }
+}
+
+impl Default for UpstreamStallConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            idle_timeout_ms: 30_000,
+            recovery_command: Vec::new(),
+            recovery_timeout_ms: 300_000,
+            recovery_cooldown_ms: 300_000,
+            recovery_budget_window_ms: 900_000,
+            recovery_max_per_window: 2,
         }
     }
 }

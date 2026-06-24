@@ -1,10 +1,11 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, pin::Pin, time::Duration};
 
 use axum::body::Bytes;
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{RawPayloads, ThinkingConfig};
 use serde_json::{Map, Number, Value, json};
+use tokio::time::timeout;
 
 use super::{MAX_PROXY_BODY_BYTES, sanitized_reqwest_error, unix_time_millis};
 
@@ -920,13 +921,14 @@ pub(super) async fn aggregate_stream(
     request_id: &str,
     request_model_id: Option<&str>,
     loop_context: LoopInspectionContext,
+    upstream_idle_timeout: Option<Duration>,
 ) -> Result<AggregatedChatCompletion, AggregationError> {
     let mut stream = Box::pin(stream);
     let mut buffer = BytesMut::new();
     let mut bytes_seen = 0_usize;
     let mut state = ChatAggregation::new(attempt_started_at_unix_ms, &loop_context);
 
-    while let Some(chunk) = stream.next().await {
+    while let Some(chunk) = next_stream_chunk(&mut stream, upstream_idle_timeout).await? {
         let chunk = chunk.map_err(|error| {
             AggregationError::plain(format!(
                 "upstream SSE stream failed: {}",
@@ -959,6 +961,24 @@ pub(super) async fn aggregate_stream(
     }
 
     state.finish(request_id, request_model_id)
+}
+
+async fn next_stream_chunk(
+    stream: &mut Pin<Box<impl Stream<Item = Result<Bytes, reqwest::Error>>>>,
+    upstream_idle_timeout: Option<Duration>,
+) -> Result<Option<Result<Bytes, reqwest::Error>>, AggregationError> {
+    let Some(upstream_idle_timeout) = upstream_idle_timeout else {
+        return Ok(stream.next().await);
+    };
+    match timeout(upstream_idle_timeout, stream.next()).await {
+        Ok(next_chunk) => Ok(next_chunk),
+        Err(_elapsed) => Err(AggregationError::upstream_stall(
+            upstream_idle_timeout
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        )),
+    }
 }
 
 fn next_sse_event(buffer: &mut BytesMut) -> Option<Vec<u8>> {

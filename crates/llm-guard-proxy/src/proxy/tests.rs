@@ -1372,6 +1372,399 @@ anti_loop_hint_enabled = true
 }
 
 #[tokio::test]
+async fn shielded_retry_runs_recovery_command_after_upstream_stall_then_succeeds() {
+    let mut fake = FakeUpstream::spawn().await;
+    let recovery_root = unique_test_dir("stall-recovery");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let recovery_marker = recovery_root.join("recovered");
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+
+[upstream.stall]
+enabled = true
+idle_timeout_ms = 50
+recovery_command = ["/usr/bin/touch", "{recovery_marker}"]
+recovery_timeout_ms = 1000
+recovery_cooldown_ms = 1000
+recovery_budget_window_ms = 10000
+recovery_max_per_window = 1
+"#,
+            recovery_marker = recovery_marker.display()
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=stall-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    assert!(recovery_marker.exists());
+
+    let _first_attempt = fake.recv_next().await;
+    let _second_attempt = fake.recv_next().await;
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].attempt_number, 1);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("upstream_stall"));
+    assert_eq!(attempts[0].abort_reason.as_deref(), Some("upstream_stall"));
+    assert_eq!(
+        attempts[0].response_metadata["upstream_stall_detected"],
+        "true"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["upstream_stall_recovery_status"],
+        "succeeded"
+    );
+    assert_eq!(attempts[1].attempt_number, 2);
+    assert_eq!(attempts[1].status, "succeeded");
+
+    remove_dir_all(&recovery_root);
+}
+
+#[tokio::test]
+async fn shielded_retry_does_not_replay_when_recovery_command_fails() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+
+[upstream.stall]
+enabled = true
+idle_timeout_ms = 50
+recovery_command = ["/bin/false"]
+recovery_timeout_ms = 1000
+recovery_cooldown_ms = 1000
+recovery_budget_window_ms = 10000
+recovery_max_per_window = 1
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=stall-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _body = response
+        .text()
+        .await
+        .expect("error body should be consumed");
+    let _first_attempt = fake.recv_next().await;
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].attempt_number, 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(attempts[0].retry_reason, None);
+    assert_eq!(attempts[0].abort_reason.as_deref(), Some("upstream_stall"));
+    assert_eq!(
+        attempts[0].response_metadata["upstream_stall_recovery_status"],
+        "exit_failure"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["upstream_stall_recovery_permits_retry"],
+        "false"
+    );
+}
+
+#[tokio::test]
+async fn upstream_stall_recovery_is_single_flight_and_budget_limited() {
+    let policy = UpstreamStallPolicy {
+        enabled: true,
+        idle_timeout: Duration::from_millis(50),
+        recovery_command: vec![String::from("/bin/sleep"), String::from("0.2")],
+        recovery_timeout: Duration::from_secs(2),
+        recovery_cooldown: Duration::from_millis(1),
+        recovery_budget_window: Duration::from_secs(60),
+        recovery_max_per_window: 1,
+    };
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+
+    let first_recovery = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        let policy = policy.clone();
+        async move { run_upstream_stall_recovery(&policy, &coordinator).await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let joined = run_upstream_stall_recovery(&policy, &coordinator).await;
+    let first = first_recovery
+        .await
+        .expect("first recovery task should join");
+
+    assert_eq!(first["upstream_stall_recovery_status"], "succeeded");
+    assert_eq!(joined["upstream_stall_recovery_status"], "joined_inflight");
+    assert_eq!(joined["upstream_stall_recovery_joined_status"], "succeeded");
+
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let budget_limited = run_upstream_stall_recovery(&policy, &coordinator).await;
+    assert_eq!(
+        budget_limited["upstream_stall_recovery_status"],
+        "skipped_budget_exhausted"
+    );
+    assert_eq!(budget_limited["upstream_stall_recovery_budget_runs"], "1");
+}
+
+#[tokio::test]
+async fn upstream_stall_recovery_joiners_do_not_hang_after_leader_cancellation() {
+    let policy = UpstreamStallPolicy {
+        enabled: true,
+        idle_timeout: Duration::from_millis(50),
+        recovery_command: vec![String::from("/bin/sleep"), String::from("0.2")],
+        recovery_timeout: Duration::from_secs(2),
+        recovery_cooldown: Duration::from_millis(1),
+        recovery_budget_window: Duration::from_secs(60),
+        recovery_max_per_window: 2,
+    };
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+
+    let leader = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        let policy = policy.clone();
+        async move { run_upstream_stall_recovery(&policy, &coordinator).await }
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    leader.abort();
+    assert!(
+        leader
+            .await
+            .expect_err("leader should be cancelled")
+            .is_cancelled()
+    );
+
+    let joined = timeout(
+        Duration::from_millis(500),
+        run_upstream_stall_recovery(&policy, &coordinator),
+    )
+    .await
+    .expect("later stall recovery should not wait forever after leader cancellation");
+
+    assert_eq!(joined["upstream_stall_recovery_status"], "joined_inflight");
+    assert_eq!(joined["upstream_stall_recovery_joined_status"], "succeeded");
+}
+
+#[tokio::test]
+async fn upstream_stall_recovery_joiner_uses_completed_state_after_lost_notification() {
+    let policy = UpstreamStallPolicy {
+        enabled: true,
+        idle_timeout: Duration::from_millis(50),
+        recovery_command: vec![String::from("/bin/true")],
+        recovery_timeout: Duration::from_millis(1),
+        recovery_cooldown: Duration::from_millis(1),
+        recovery_budget_window: Duration::from_secs(60),
+        recovery_max_per_window: 2,
+    };
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+
+    {
+        let mut state = coordinator.state.lock().await;
+        state.running = true;
+    }
+    let joined = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        let policy = policy.clone();
+        async move { wait_for_upstream_stall_recovery_result(&policy, &coordinator, true).await }
+    });
+    sleep(Duration::from_millis(50)).await;
+    {
+        let mut state = coordinator.state.lock().await;
+        state.running = false;
+        state.last_finished = Some(Instant::now());
+        state.last_result = Some(BTreeMap::from([
+            (
+                String::from("upstream_stall_recovery_configured"),
+                String::from("true"),
+            ),
+            (
+                String::from("upstream_stall_recovery_status"),
+                String::from("succeeded"),
+            ),
+        ]));
+    }
+
+    let joined = timeout(Duration::from_millis(1_500), joined)
+        .await
+        .expect("lost notification simulation should not hang until the test timeout")
+        .expect("joiner task should complete");
+
+    assert_eq!(joined["upstream_stall_recovery_status"], "joined_inflight");
+    assert_eq!(joined["upstream_stall_recovery_joined_status"], "succeeded");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
+    let test_dir = unique_test_dir("recovery-process-group");
+    remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let child_pid_path = test_dir.join("child.pid");
+    let script_path = test_dir.join("spawn-descendant.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nsleep 30 &\necho \"$!\" > {}\nsleep 30\n",
+            child_pid_path.display()
+        ),
+    )
+    .expect("test recovery script should be written");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+        .expect("test recovery script should be executable");
+
+    let policy = UpstreamStallPolicy {
+        enabled: true,
+        idle_timeout: Duration::from_millis(50),
+        recovery_command: vec![script_path.display().to_string()],
+        recovery_timeout: Duration::from_millis(100),
+        recovery_cooldown: Duration::from_millis(1),
+        recovery_budget_window: Duration::from_secs(60),
+        recovery_max_per_window: 1,
+    };
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+
+    let metadata = run_upstream_stall_recovery(&policy, &coordinator).await;
+    let child_pid = read_pid_file(&child_pid_path).await;
+
+    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_cleanup_scope"],
+        "process_group"
+    );
+    assert_process_not_running(child_pid).await;
+    remove_dir_all(&test_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process_group() {
+    let test_dir = unique_test_dir("recovery-term-resistant-process-group");
+    remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let child_pid_path = test_dir.join("child.pid");
+    let script_path = test_dir.join("spawn-term-resistant-descendant.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nsh -c 'trap \"\" TERM; echo \"$$\" > {}; while :; do sleep 1; done' &\nsleep 30\n",
+            child_pid_path.display()
+        ),
+    )
+    .expect("test recovery script should be written");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+        .expect("test recovery script should be executable");
+
+    let policy = UpstreamStallPolicy {
+        enabled: true,
+        idle_timeout: Duration::from_millis(50),
+        recovery_command: vec![script_path.display().to_string()],
+        recovery_timeout: Duration::from_millis(100),
+        recovery_cooldown: Duration::from_millis(1),
+        recovery_budget_window: Duration::from_secs(60),
+        recovery_max_per_window: 1,
+    };
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+
+    let metadata = run_upstream_stall_recovery(&policy, &coordinator).await;
+    let child_pid = read_pid_file(&child_pid_path).await;
+
+    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_cleanup_scope"],
+        "process_group"
+    );
+    assert_process_not_running(child_pid).await;
+    remove_dir_all(&test_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_before_join_timeout() {
+    let test_dir = unique_test_dir("recovery-term-resistant-group-leader");
+    remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let child_pid_path = test_dir.join("child.pid");
+    let script_path = test_dir.join("term-resistant-leader.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\ntrap '' TERM\necho \"$$\" > {}\nwhile :; do sleep 1; done\n",
+            child_pid_path.display()
+        ),
+    )
+    .expect("test recovery script should be written");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+        .expect("test recovery script should be executable");
+
+    let policy = UpstreamStallPolicy {
+        enabled: true,
+        idle_timeout: Duration::from_millis(50),
+        recovery_command: vec![script_path.display().to_string()],
+        recovery_timeout: Duration::from_millis(100),
+        recovery_cooldown: Duration::from_millis(1),
+        recovery_budget_window: Duration::from_secs(60),
+        recovery_max_per_window: 1,
+    };
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+
+    let metadata = run_upstream_stall_recovery(&policy, &coordinator).await;
+    let child_pid = read_pid_file(&child_pid_path).await;
+
+    if metadata
+        .get("upstream_stall_recovery_status")
+        .map(String::as_str)
+        != Some("timeout_killed")
+    {
+        kill_process_if_running(child_pid).await;
+    }
+    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_kill_sent"],
+        "true"
+    );
+    assert_process_not_running(child_pid).await;
+    remove_dir_all(&test_dir);
+}
+
+#[tokio::test]
 async fn shielded_retry_all_loop_attempts_returns_error_and_records_chain() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -5496,6 +5889,12 @@ fn fake_chat_completion_response(
         }
         return Some(chat_completion_sse_response(body));
     }
+    if path_and_query.contains("test=stall-once-then-success") {
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            return Some(stalled_chat_completion_sse_response());
+        }
+        return Some(chat_completion_sse_response(body));
+    }
     if path_and_query.contains("test=loop-reasoning-hundreds") {
         return Some(repeated_reasoning_line_sse_response(200));
     }
@@ -5741,6 +6140,20 @@ fn slow_chat_completion_sse_response(body: &Bytes) -> Response<Body> {
         Bytes::from_static(b"data: [DONE]\n\n"),
     ];
     chat_completion_delayed_start_stream_response("chat-completions-slow-sse", chunks)
+}
+
+fn stalled_chat_completion_sse_response() -> Response<Body> {
+    let body = Body::from_stream(stream::pending::<Result<Bytes, std::convert::Infallible>>());
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_static("chat-completions-stalled-sse"),
+    );
+    response
 }
 
 fn repeated_reasoning_line_sse_response(repetitions: usize) -> Response<Body> {
@@ -6518,6 +6931,61 @@ fn remove_dir_all(path: &Path) {
     if let Err(error) = fs::remove_dir_all(path) {
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
+}
+
+#[cfg(unix)]
+async fn read_pid_file(path: &Path) -> u32 {
+    for _ in 0..20 {
+        if let Ok(text) = fs::read_to_string(path) {
+            return text
+                .trim()
+                .parse::<u32>()
+                .expect("pid file should contain a child pid");
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("pid file was not written: {}", path.display());
+}
+
+#[cfg(unix)]
+async fn assert_process_not_running(pid: u32) {
+    for _ in 0..20 {
+        match linux_process_state(pid) {
+            None | Some('Z') => return,
+            Some(_) => sleep(Duration::from_millis(50)).await,
+        }
+    }
+    let _ = tokio::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    panic!("process {pid} still appears to be running");
+}
+
+#[cfg(unix)]
+async fn kill_process_if_running(pid: u32) {
+    if matches!(linux_process_state(pid), None | Some('Z')) {
+        return;
+    }
+    let _ = tokio::process::Command::new("kill")
+        .arg("-KILL")
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+}
+
+#[cfg(unix)]
+fn linux_process_state(pid: u32) -> Option<char> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_prefix, suffix) = stat.rsplit_once(") ")?;
+    suffix.chars().next()
 }
 
 async fn assert_no_upstream_request(fake: &mut FakeUpstream) {

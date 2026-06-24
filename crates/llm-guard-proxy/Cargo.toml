@@ -15,7 +15,7 @@ llm-guard-proxy-core = { path = "../llm-guard-proxy-core" }
 reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "stream"] }
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
 [dev-dependencies]
 rusqlite = { version = "0.32", features = ["bundled"] }
