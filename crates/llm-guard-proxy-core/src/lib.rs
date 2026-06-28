@@ -19,8 +19,9 @@ pub use settings::{
     DEFAULT_CONFIG_RELATIVE_PATH, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, MetadataConfig,
     MissingConfigPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
     ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig, RetryConfig,
-    ServerConfig, ShieldingConfig, ThinkingConfig, UpstreamConfig, UpstreamStallConfig,
-    ValidationError, default_config_path, redact_upstream_base_url, validate_upstream_base_url,
+    ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamStallConfig, ValidationError, default_config_path, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 
 /// Public service name used by the binary and documentation.

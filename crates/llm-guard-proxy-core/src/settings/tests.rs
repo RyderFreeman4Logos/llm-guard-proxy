@@ -7,8 +7,8 @@ use std::{
 
 use super::{
     AppConfig, ConfigManager, ConfigParseError, HeartbeatMode, MissingConfigPolicy,
-    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ValidationError, parse::parse_config_text,
-    redact_upstream_base_url,
+    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ToolRequestThinkingPolicy, ValidationError,
+    parse::parse_config_text, redact_upstream_base_url,
 };
 
 #[test]
@@ -49,6 +49,10 @@ fn defaults_match_issue_contract() {
     );
     assert!(config.thinking.enabled);
     assert_eq!(config.thinking.budget_tokens, 32_768);
+    assert_eq!(
+        config.thinking.tool_request_policy,
+        ToolRequestThinkingPolicy::Apply
+    );
     assert!(config.loop_guard.enabled);
     assert_eq!(config.loop_guard.normalized_input_window_secs, 120);
     assert_eq!(config.loop_guard.max_repeated_inputs, 1);
@@ -125,6 +129,9 @@ debug_summary_max_records = 7
 max_records = 50
 prune_to_records = 40
 
+[thinking]
+tool_request_policy = "passthrough"
+
 [heartbeat]
 mode = "json-whitespace"
 interval_secs = 5
@@ -166,6 +173,10 @@ enabled = false
     assert_eq!(config.server.max_request_body_bytes, 1_048_576);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
     assert_eq!(config.upstream.request_timeout_ms, 90_000);
+    assert_eq!(
+        config.thinking.tool_request_policy,
+        ToolRequestThinkingPolicy::Passthrough
+    );
     assert_eq!(
         config.upstream.metadata.context_length_override,
         Some(256_000)
@@ -737,6 +748,7 @@ interval_secs = 4
 #[test]
 fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"thinking.tool_request_policy"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_queued_generation_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.generation_queue_timeout_ms"));

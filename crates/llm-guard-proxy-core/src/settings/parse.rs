@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, HeartbeatConfig, HeartbeatMode,
     LoopGuardConfig, MetadataConfig, ObservabilityConfig, RetentionConfig, RetryConfig,
-    ServerConfig, ShieldingConfig, ThinkingConfig, UpstreamConfig, UpstreamStallConfig,
+    ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamStallConfig,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -337,9 +338,28 @@ fn assign_thinking(
             config.budget_tokens = parse_u32(value, line_number, "thinking.budget_tokens")?;
         }
         "preserve_answer_budget" => config.preserve_answer_budget = parse_bool(value, line_number)?,
+        "tool_request_policy" => {
+            config.tool_request_policy = parse_tool_request_thinking_policy(value, line_number)?;
+        }
         _ => return unknown_key("thinking", key, line_number),
     }
     Ok(())
+}
+
+fn parse_tool_request_thinking_policy(
+    value: &str,
+    line_number: usize,
+) -> Result<ToolRequestThinkingPolicy, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "apply" => Ok(ToolRequestThinkingPolicy::Apply),
+        "passthrough" => Ok(ToolRequestThinkingPolicy::Passthrough),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid thinking.tool_request_policy {other:?}; expected \"apply\" or \"passthrough\""
+            ),
+        )),
+    }
 }
 
 fn assign_loop_guard(
