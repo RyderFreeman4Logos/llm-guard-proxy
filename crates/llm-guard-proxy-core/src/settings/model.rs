@@ -563,6 +563,26 @@ const fn default_prune_to_records(max_records: u64) -> u64 {
     if target == 0 { 1 } else { target }
 }
 
+/// Thinking-budget behavior for requests that carry tool/function-calling hints.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToolRequestThinkingPolicy {
+    /// Apply the regular thinking policy to every chat request, including tool-use.
+    #[default]
+    Apply,
+    /// Leave caller-provided thinking fields untouched for tool-use requests.
+    Passthrough,
+}
+
+impl ToolRequestThinkingPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Apply => "apply",
+            Self::Passthrough => "passthrough",
+        }
+    }
+}
+
 /// Thinking budget policy for later request rewriting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThinkingConfig {
@@ -572,6 +592,8 @@ pub struct ThinkingConfig {
     pub budget_tokens: u32,
     /// Adjusts `max_tokens` so callers keep their apparent answer budget.
     pub preserve_answer_budget: bool,
+    /// Request-class policy for tool/function-calling requests.
+    pub tool_request_policy: ToolRequestThinkingPolicy,
 }
 
 impl Default for ThinkingConfig {
@@ -580,6 +602,7 @@ impl Default for ThinkingConfig {
             enabled: true,
             budget_tokens: 32_768,
             preserve_answer_budget: true,
+            tool_request_policy: ToolRequestThinkingPolicy::Apply,
         }
     }
 }

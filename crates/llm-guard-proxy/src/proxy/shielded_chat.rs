@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, pin::Pin, time::Duration};
 use axum::body::Bytes;
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
-use llm_guard_proxy_core::{RawPayloads, ThinkingConfig};
+use llm_guard_proxy_core::{RawPayloads, ThinkingConfig, ToolRequestThinkingPolicy};
 use serde_json::{Map, Number, Value, json};
 use tokio::time::timeout;
 
@@ -268,7 +268,25 @@ fn apply_thinking_policy(
     let configured_budget = u64::from(thinking.budget_tokens);
     let budget_observations = find_budget_observations(object);
     let disable_marker = find_disable_marker(object);
+    let is_tool_request = is_tool_use_request(object);
     let mut metadata = initial_thinking_metadata(thinking, configured_budget, &budget_observations);
+    metadata.insert(
+        String::from("thinking_tool_request_detected"),
+        is_tool_request.to_string(),
+    );
+    if is_tool_request
+        && matches!(
+            thinking.tool_request_policy,
+            ToolRequestThinkingPolicy::Passthrough
+        )
+    {
+        let outcome = thinking_noop("tool_request_passthrough", &budget_observations);
+        metadata.extend(thinking_outcome_metadata(
+            &outcome,
+            &AnswerBudgetDecision::default(),
+        ));
+        return metadata;
+    }
     let outcome = apply_thinking_budget_policy(
         object,
         thinking,
@@ -285,6 +303,25 @@ fn apply_thinking_policy(
 
     metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
     metadata
+}
+
+fn is_tool_use_request(object: &Map<String, Value>) -> bool {
+    non_empty_array(object.get("tools"))
+        || non_empty_array(object.get("functions"))
+        || present_tool_selector(object.get("tool_choice"))
+        || present_tool_selector(object.get("function_call"))
+}
+
+fn non_empty_array(value: Option<&Value>) -> bool {
+    matches!(value, Some(Value::Array(values)) if !values.is_empty())
+}
+
+fn present_tool_selector(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(selector)) => !selector.trim().eq_ignore_ascii_case("none"),
+        Some(Value::Null | Value::Bool(false)) | None => false,
+        Some(_) => true,
+    }
 }
 
 fn initial_thinking_metadata(
@@ -304,6 +341,10 @@ fn initial_thinking_metadata(
         (
             String::from("thinking_preserve_answer_budget_enabled"),
             thinking.preserve_answer_budget.to_string(),
+        ),
+        (
+            String::from("thinking_tool_request_policy"),
+            thinking.tool_request_policy.as_str().to_owned(),
         ),
         (
             String::from("thinking_budget_previous_state"),

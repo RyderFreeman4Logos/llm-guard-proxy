@@ -2166,6 +2166,112 @@ async fn shielded_thinking_policy_injects_missing_budget_and_preserves_answer_re
 }
 
 #[tokio::test]
+async fn tool_request_passthrough_leaves_thinking_and_answer_budget_untouched() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+tool_request_policy = "passthrough"
+"#,
+    )
+    .await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object","properties":{}}}}],"thinking":{"budget_tokens":1},"chat_template_kwargs":{"enable_thinking":false},"max_tokens":64}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 1);
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+    assert_eq!(observed_body["max_tokens"], 64);
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["stream_options"]["include_usage"], true);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["thinking_policy_enabled"], "true");
+        assert_eq!(metadata["thinking_tool_request_policy"], "passthrough");
+        assert_eq!(metadata["thinking_tool_request_detected"], "true");
+        assert_eq!(metadata["thinking_rewrite_applied"], "false");
+        assert_eq!(
+            metadata["thinking_rewrite_reason"],
+            "tool_request_passthrough"
+        );
+        assert_eq!(metadata["thinking_budget_previous_state"], "smaller");
+        assert_eq!(metadata["thinking_budget_final_tokens"], "1");
+        assert_eq!(metadata["thinking_answer_budget_delta_tokens"], "0");
+        assert_eq!(
+            metadata["thinking_answer_budget_preservation_applied"],
+            "false"
+        );
+    }
+}
+
+#[tokio::test]
+async fn tool_request_passthrough_policy_still_injects_non_tool_requests() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+tool_request_policy = "passthrough"
+"#,
+    )
+    .await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":64}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
+    assert_eq!(observed_body["max_tokens"], 32_832);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["thinking_tool_request_policy"], "passthrough");
+        assert_eq!(metadata["thinking_tool_request_detected"], "false");
+        assert_eq!(metadata["thinking_rewrite_applied"], "true");
+        assert_eq!(
+            metadata["thinking_rewrite_reason"],
+            "injected_missing_budget"
+        );
+    }
+}
+
+#[tokio::test]
 async fn streaming_chat_applies_thinking_policy_without_downstream_aggregation() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;

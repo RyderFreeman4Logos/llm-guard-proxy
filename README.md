@@ -182,6 +182,10 @@ prune_to_records = 80000
 enabled = true
 budget_tokens = 32768
 preserve_answer_budget = true
+# "apply" keeps the regular thinking rewrite for every chat request.
+# "passthrough" leaves caller-provided thinking fields untouched when a
+# request carries tool/function-calling hints.
+tool_request_policy = "apply"
 
 [loop_guard]
 enabled = true
@@ -220,6 +224,11 @@ explicitly disables thinking or sets a zero budget. When
 `preserve_answer_budget` is enabled, numeric `max_tokens`,
 `max_completion_tokens`, and `max_output_tokens` fields are increased by the
 thinking-budget delta so the caller's answer-token reserve is preserved.
+Set `thinking.tool_request_policy = "passthrough"` to make requests with
+`tools`, legacy `functions`, `tool_choice`, or `function_call` bypass the
+thinking rewrite entirely; the proxy then forwards any caller-provided thinking
+parameters as-is while still applying the regular thinking policy to non-tool
+chat requests.
 
 Reloadable fields:
 
@@ -241,6 +250,7 @@ Reloadable fields:
 - `thinking.enabled`
 - `thinking.budget_tokens`
 - `thinking.preserve_answer_budget`
+- `thinking.tool_request_policy`
 - `loop_guard.enabled`
 - `loop_guard.normalized_input_window_secs`
 - `loop_guard.max_repeated_inputs`
