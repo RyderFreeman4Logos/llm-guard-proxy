@@ -374,15 +374,6 @@ fn validates_server_admission_queue_bounds() {
         .expect_err("zero generation queue timeout should fail");
 
     assert_eq!(error.field(), "server.generation_queue_timeout_ms");
-
-    config = AppConfig::default();
-    config.server.generation_queue_timeout_ms = 600_001;
-
-    let error = config
-        .validate()
-        .expect_err("excessive generation queue timeout should fail");
-
-    assert_eq!(error.field(), "server.generation_queue_timeout_ms");
 }
 
 #[test]
@@ -429,12 +420,6 @@ fn validates_upstream_request_timeout_bounds() {
     let error = config
         .validate()
         .expect_err("zero upstream timeout should fail");
-    assert_eq!(error.field(), "upstream.request_timeout_ms");
-
-    config.upstream.request_timeout_ms = 600_001;
-    let error = config
-        .validate()
-        .expect_err("excessive upstream timeout should fail");
     assert_eq!(error.field(), "upstream.request_timeout_ms");
 }
 

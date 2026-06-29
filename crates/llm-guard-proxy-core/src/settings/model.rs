@@ -166,11 +166,6 @@ impl ServerConfig {
             "must be greater than zero",
         )?;
         require(
-            self.generation_queue_timeout_ms <= 600_000,
-            "server.generation_queue_timeout_ms",
-            "must be less than or equal to 600000",
-        )?;
-        require(
             self.max_control_plane_in_flight_requests > 0,
             "server.max_control_plane_in_flight_requests",
             "must be greater than zero",
@@ -225,11 +220,6 @@ impl UpstreamConfig {
             self.request_timeout_ms > 0,
             "upstream.request_timeout_ms",
             "must be greater than zero",
-        )?;
-        require(
-            self.request_timeout_ms <= 600_000,
-            "upstream.request_timeout_ms",
-            "must be less than or equal to 600000",
         )?;
         self.metadata.validate()
     }
@@ -768,19 +758,9 @@ impl UpstreamStallConfig {
             "must be greater than zero",
         )?;
         require(
-            self.idle_timeout_ms <= 600_000,
-            "upstream.stall.idle_timeout_ms",
-            "must be less than or equal to 600000",
-        )?;
-        require(
             self.recovery_timeout_ms > 0,
             "upstream.stall.recovery_timeout_ms",
             "must be greater than zero",
-        )?;
-        require(
-            self.recovery_timeout_ms <= 600_000,
-            "upstream.stall.recovery_timeout_ms",
-            "must be less than or equal to 600000",
         )?;
         require(
             self.recovery_command
@@ -793,11 +773,6 @@ impl UpstreamStallConfig {
             self.recovery_cooldown_ms > 0,
             "upstream.stall.recovery_cooldown_ms",
             "must be greater than zero",
-        )?;
-        require(
-            self.recovery_cooldown_ms <= 3_600_000,
-            "upstream.stall.recovery_cooldown_ms",
-            "must be less than or equal to 3600000",
         )?;
         require(
             self.recovery_budget_window_ms > 0,
