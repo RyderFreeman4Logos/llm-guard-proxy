@@ -580,6 +580,8 @@ impl ToolRequestThinkingPolicy {
 pub struct ThinkingConfig {
     /// Enables default thinking budget injection.
     pub enabled: bool,
+    /// Forces all recognized upstream thinking budgets to zero.
+    pub force_disable: bool,
     /// Thinking token budget. A zero budget disables injection.
     pub budget_tokens: u32,
     /// Adjusts `max_tokens` so callers keep their apparent answer budget.
@@ -592,6 +594,7 @@ impl Default for ThinkingConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            force_disable: false,
             budget_tokens: 32_768,
             preserve_answer_budget: true,
             tool_request_policy: ToolRequestThinkingPolicy::Apply,

@@ -35,6 +35,7 @@ prune_to_records = 80000
 
 [thinking]
 enabled = true
+force_disable = false
 budget_tokens = 32768
 preserve_answer_budget = true
 tool_request_policy = "passthrough"

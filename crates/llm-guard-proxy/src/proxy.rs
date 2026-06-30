@@ -4424,7 +4424,11 @@ fn is_sensitive_fingerprint_key(key: &str) -> bool {
 fn is_known_non_secret_token_fingerprint_key(normalized_key: &str) -> bool {
     matches!(
         normalized_key,
-        "maxtokens" | "maxcompletiontokens" | "maxoutputtokens" | "budgettokens"
+        "maxtokens"
+            | "maxcompletiontokens"
+            | "maxoutputtokens"
+            | "budgettokens"
+            | "thinkingtokenbudget"
     )
 }
 

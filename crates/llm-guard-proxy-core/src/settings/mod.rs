@@ -47,6 +47,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "observability.retention.max_records",
     "observability.retention.prune_to_records",
     "thinking.enabled",
+    "thinking.force_disable",
     "thinking.budget_tokens",
     "thinking.preserve_answer_budget",
     "thinking.tool_request_policy",

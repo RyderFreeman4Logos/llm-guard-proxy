@@ -109,6 +109,11 @@ group/other-writable ancestor unless that ancestor is sticky. The `chmod` above
 keeps the XDG state path usable while preserving private `0700` permissions on
 the actual state directory.
 
+The deployed `[thinking] force_disable = false` default preserves existing
+thinking behavior. Set it to `true` if the active model starts dead-looping in
+hidden thinking or a client harness cannot control thinking budgets; the field is
+hot-reloadable and takes precedence over tool-request passthrough.
+
 Update the active AEON text unit only. Replace this Docker publish line:
 
 ```text
