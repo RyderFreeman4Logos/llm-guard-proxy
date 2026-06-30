@@ -11,6 +11,7 @@ const LOOP_MIN_LINE_CHARS: usize = 8;
 const LOOP_MAX_PENDING_LINE_BYTES: usize = 8 * 1024;
 const LOOP_MAX_RECENT_CHARS: usize = 4 * 1024;
 const LOOP_MAX_TOKEN_BYTES: usize = 128;
+const LOOP_MAX_SEMANTIC_TOKEN_BYTES: usize = 64;
 const LOOP_SUFFIX_MIN_UNIT_CHARS: usize = 4;
 const LOOP_SUFFIX_MAX_UNIT_CHARS: usize = 64;
 const LOOP_INPUT_LINE_COUNT_CAP: usize = 4_096;
@@ -321,6 +322,7 @@ enum LoopSignal {
     RepeatedTokenWindow,
     SuffixCycle,
     LowProgressGrowth,
+    SemanticJaccard,
 }
 
 impl LoopSignal {
@@ -330,6 +332,7 @@ impl LoopSignal {
             Self::RepeatedTokenWindow => "repeated_token_window",
             Self::SuffixCycle => "suffix_cycle",
             Self::LowProgressGrowth => "low_progress_growth",
+            Self::SemanticJaccard => "semantic_jaccard",
         }
     }
 }
@@ -348,6 +351,9 @@ struct LoopDetection {
     unique_ratio_percent: Option<u64>,
     unique_window_count: Option<u64>,
     total_window_count: Option<u64>,
+    semantic_similarity_percent: Option<u64>,
+    semantic_feature_count: Option<u64>,
+    semantic_history_window_count: Option<u64>,
     state_capping: LoopStateCapping,
 }
 
@@ -417,6 +423,24 @@ impl LoopDetection {
                 total_window_count.to_string(),
             );
         }
+        if let Some(semantic_similarity_percent) = self.semantic_similarity_percent {
+            metadata.insert(
+                String::from("loop_semantic_similarity_percent"),
+                semantic_similarity_percent.to_string(),
+            );
+        }
+        if let Some(semantic_feature_count) = self.semantic_feature_count {
+            metadata.insert(
+                String::from("loop_semantic_feature_count"),
+                semantic_feature_count.to_string(),
+            );
+        }
+        if let Some(semantic_history_window_count) = self.semantic_history_window_count {
+            metadata.insert(
+                String::from("loop_semantic_history_window_count"),
+                semantic_history_window_count.to_string(),
+            );
+        }
         self.state_capping.insert_metadata(&mut metadata);
         metadata
     }
@@ -429,6 +453,7 @@ struct LoopStateCapping {
     output_lines: u64,
     output_token_windows: u64,
     output_unique_windows: u64,
+    output_semantic_windows: u64,
 }
 
 impl LoopStateCapping {
@@ -438,6 +463,7 @@ impl LoopStateCapping {
             || self.output_lines > 0
             || self.output_token_windows > 0
             || self.output_unique_windows > 0
+            || self.output_semantic_windows > 0
     }
 
     fn insert_metadata(self, metadata: &mut BTreeMap<String, String>) {
@@ -464,6 +490,11 @@ impl LoopStateCapping {
             metadata,
             "loop_output_unique_token_window_capped",
             self.output_unique_windows,
+        );
+        insert_capped_metadata(
+            metadata,
+            "loop_output_semantic_window_count_capped",
+            self.output_semantic_windows,
         );
     }
 }
@@ -538,6 +569,10 @@ struct LoopChannelState {
     token_window_total: u64,
     recent_chars: VecDeque<char>,
     input_overlap_seen: bool,
+    semantic_current_token: String,
+    semantic_window_tokens: Vec<u64>,
+    semantic_windows: VecDeque<SemanticWindow>,
+    semantic_history_window_capped: u64,
 }
 
 impl LoopChannelState {
@@ -561,6 +596,9 @@ impl LoopChannelState {
         }
         self.observe_recent_chars(fragment);
         if let Some(detection) = self.observe_suffix_cycle(channel, config, input_profile) {
+            return Some(detection);
+        }
+        if let Some(detection) = self.observe_semantic(channel, fragment, config, input_profile) {
             return Some(detection);
         }
         self.observe_low_progress(channel, config, input_profile)
@@ -622,6 +660,9 @@ impl LoopChannelState {
             unique_ratio_percent: None,
             unique_window_count: None,
             total_window_count: None,
+            semantic_similarity_percent: None,
+            semantic_feature_count: None,
+            semantic_history_window_count: None,
             state_capping: self.state_capping(input_profile),
         })
     }
@@ -704,6 +745,9 @@ impl LoopChannelState {
                 u64::try_from(self.unique_token_windows.len()).unwrap_or(u64::MAX),
             ),
             total_window_count: Some(self.token_window_total),
+            semantic_similarity_percent: None,
+            semantic_feature_count: None,
+            semantic_history_window_count: None,
             state_capping: self.state_capping(input_profile),
         })
     }
@@ -748,8 +792,126 @@ impl LoopChannelState {
             unique_ratio_percent: None,
             unique_window_count: None,
             total_window_count: None,
+            semantic_similarity_percent: None,
+            semantic_feature_count: None,
+            semantic_history_window_count: None,
             state_capping: self.state_capping(input_profile),
         })
+    }
+
+    fn observe_semantic(
+        &mut self,
+        channel: LoopChannel,
+        fragment: &str,
+        config: &LoopGuardConfig,
+        input_profile: &InputRepetitionProfile,
+    ) -> Option<LoopDetection> {
+        if channel != LoopChannel::Reasoning || !config.reasoning_semantic_detection_enabled {
+            return None;
+        }
+
+        for character in fragment.chars() {
+            if character.is_ascii_alphanumeric() {
+                if self.semantic_current_token.len() < LOOP_MAX_SEMANTIC_TOKEN_BYTES {
+                    self.semantic_current_token
+                        .push(character.to_ascii_lowercase());
+                }
+                continue;
+            }
+
+            if let Some(detection) = self.finish_semantic_token(channel, config, input_profile) {
+                return Some(detection);
+            }
+            if character == '\n' {
+                if self.semantic_window_tokens.len()
+                    >= usize::try_from(config.reasoning_semantic_minimum_token_count)
+                        .unwrap_or(usize::MAX)
+                {
+                    return self.finish_semantic_window(channel, config, input_profile);
+                }
+                self.semantic_window_tokens.clear();
+            }
+        }
+        None
+    }
+
+    fn finish_semantic_token(
+        &mut self,
+        channel: LoopChannel,
+        config: &LoopGuardConfig,
+        input_profile: &InputRepetitionProfile,
+    ) -> Option<LoopDetection> {
+        if self.semantic_current_token.is_empty() {
+            return None;
+        }
+        if let Some(token_hash) = semantic_token_hash(&self.semantic_current_token) {
+            self.semantic_window_tokens.push(token_hash);
+        }
+        self.semantic_current_token.clear();
+
+        if self.semantic_window_tokens.len()
+            >= usize::try_from(config.reasoning_semantic_window_token_count).unwrap_or(usize::MAX)
+        {
+            return self.finish_semantic_window(channel, config, input_profile);
+        }
+        None
+    }
+
+    fn finish_semantic_window(
+        &mut self,
+        channel: LoopChannel,
+        config: &LoopGuardConfig,
+        input_profile: &InputRepetitionProfile,
+    ) -> Option<LoopDetection> {
+        let minimum_tokens =
+            usize::try_from(config.reasoning_semantic_minimum_token_count).unwrap_or(usize::MAX);
+        if self.semantic_window_tokens.len() < minimum_tokens {
+            return None;
+        }
+
+        let window = SemanticWindow::from_tokens(&self.semantic_window_tokens);
+        let threshold = u64::from(config.reasoning_semantic_similarity_threshold_percent);
+        let similarity = self
+            .semantic_windows
+            .iter()
+            .map(|previous| window.similarity_percent(previous))
+            .max()
+            .unwrap_or(0);
+        if similarity >= threshold {
+            return Some(LoopDetection {
+                signal: LoopSignal::SemanticJaccard,
+                channel,
+                observed_count: similarity,
+                threshold,
+                observed_bytes: self.bytes_seen,
+                fragment_count: self.fragment_count,
+                sample_hash: window.sample_hash,
+                input_overlap_applied: false,
+                token_window_size: Some(config.reasoning_semantic_window_token_count),
+                unique_ratio_percent: None,
+                unique_window_count: None,
+                total_window_count: None,
+                semantic_similarity_percent: Some(similarity),
+                semantic_feature_count: Some(
+                    u64::try_from(window.feature_count()).unwrap_or(u64::MAX),
+                ),
+                semantic_history_window_count: Some(
+                    u64::try_from(self.semantic_windows.len()).unwrap_or(u64::MAX),
+                ),
+                state_capping: self.state_capping(input_profile),
+            });
+        }
+
+        let history_cap =
+            usize::try_from(config.reasoning_semantic_history_window_count).unwrap_or(usize::MAX);
+        if self.semantic_windows.len() >= history_cap {
+            self.semantic_windows.pop_front();
+            self.semantic_history_window_capped =
+                self.semantic_history_window_capped.saturating_add(1);
+        }
+        self.semantic_windows.push_back(window);
+        self.semantic_window_tokens.clear();
+        None
     }
 
     fn observe_low_progress(
@@ -789,6 +951,9 @@ impl LoopChannelState {
             unique_ratio_percent: Some(unique_ratio_percent),
             unique_window_count: Some(unique_count),
             total_window_count: Some(self.token_window_total),
+            semantic_similarity_percent: None,
+            semantic_feature_count: None,
+            semantic_history_window_count: None,
             state_capping: self.state_capping(input_profile),
         })
     }
@@ -806,6 +971,7 @@ impl LoopChannelState {
         capping.output_lines = self.line_count_capped;
         capping.output_token_windows = self.token_window_count_capped;
         capping.output_unique_windows = self.unique_token_window_capped;
+        capping.output_semantic_windows = self.semantic_history_window_capped;
         capping
     }
 }
@@ -814,6 +980,59 @@ impl LoopChannelState {
 struct SuffixCycle {
     unit_hash: u64,
     repetitions: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SemanticWindow {
+    token_features: BTreeSet<u64>,
+    ngram_features: BTreeSet<u64>,
+    sample_hash: u64,
+}
+
+impl SemanticWindow {
+    fn from_tokens(tokens: &[u64]) -> Self {
+        let mut token_features = BTreeSet::new();
+        let mut ngram_features = BTreeSet::new();
+        for token in tokens {
+            token_features.insert(stable_hash_u64s([0, *token]));
+        }
+        for pair in tokens.windows(2) {
+            ngram_features.insert(stable_hash_u64s([1, pair[0], pair[1]]));
+        }
+        let sample_hash =
+            stable_hash_u64s(token_features.iter().chain(ngram_features.iter()).copied());
+        Self {
+            token_features,
+            ngram_features,
+            sample_hash,
+        }
+    }
+
+    fn feature_count(&self) -> usize {
+        self.token_features
+            .len()
+            .saturating_add(self.ngram_features.len())
+    }
+
+    fn similarity_percent(&self, other: &Self) -> u64 {
+        jaccard_percent(&self.token_features, &other.token_features)
+            .max(jaccard_percent(&self.ngram_features, &other.ngram_features))
+    }
+}
+
+fn jaccard_percent(left: &BTreeSet<u64>, right: &BTreeSet<u64>) -> u64 {
+    if left.is_empty() || right.is_empty() {
+        return 0;
+    }
+    let intersection = left.intersection(right).count();
+    let union = left
+        .len()
+        .saturating_add(right.len())
+        .saturating_sub(intersection);
+    if union == 0 {
+        return 0;
+    }
+    u64::try_from(intersection.saturating_mul(100) / union).unwrap_or(u64::MAX)
 }
 
 fn suffix_cycle(chars: &VecDeque<char>, minimum_repetitions: u32) -> Option<SuffixCycle> {
@@ -843,6 +1062,85 @@ fn suffix_cycle(chars: &VecDeque<char>, minimum_repetitions: u32) -> Option<Suff
         }
     }
     None
+}
+
+fn semantic_token_hash(token: &str) -> Option<u64> {
+    let normalized = normalize_semantic_token(token)?;
+    Some(stable_hash(normalized.as_bytes()))
+}
+
+fn normalize_semantic_token(token: &str) -> Option<String> {
+    if token.len() < 3 || is_semantic_stop_word(token) {
+        return None;
+    }
+    let normalized = match token {
+        "tmp" | "temp" | "tmpdir" | "temporary" => String::from("temporary"),
+        "dir" | "dirs" | "directory" | "directories" => String::from("directory"),
+        "extracting" | "extracted" | "extracts" | "extraction" => String::from("extract"),
+        "archives" | "archived" => String::from("archive"),
+        "zips" | "zipped" => String::from("zip"),
+        _ => strip_semantic_suffix(token),
+    };
+    (normalized.len() >= 3 && !is_semantic_stop_word(&normalized)).then_some(normalized)
+}
+
+fn strip_semantic_suffix(token: &str) -> String {
+    for suffix in ["ing", "ed", "es", "s"] {
+        if token.len() > suffix.len().saturating_add(3) && token.ends_with(suffix) {
+            return token[..token.len() - suffix.len()].to_owned();
+        }
+    }
+    token.to_owned()
+}
+
+fn is_semantic_stop_word(token: &str) -> bool {
+    matches!(
+        token,
+        "the"
+            | "and"
+            | "but"
+            | "for"
+            | "with"
+            | "that"
+            | "this"
+            | "then"
+            | "than"
+            | "from"
+            | "into"
+            | "onto"
+            | "over"
+            | "under"
+            | "again"
+            | "actually"
+            | "maybe"
+            | "could"
+            | "would"
+            | "should"
+            | "need"
+            | "needs"
+            | "using"
+            | "use"
+            | "try"
+            | "first"
+            | "next"
+            | "back"
+            | "approach"
+            | "plan"
+            | "step"
+            | "option"
+            | "think"
+            | "about"
+            | "without"
+            | "before"
+            | "after"
+            | "because"
+            | "there"
+            | "where"
+            | "when"
+            | "what"
+            | "which"
+            | "while"
+    )
 }
 
 fn observe_token_window_hashes(
@@ -1166,6 +1464,133 @@ mod tests {
         );
     }
 
+    #[test]
+    fn semantic_reasoning_loop_with_varied_wording_is_detected() {
+        let mut config = semantic_loop_config();
+        config.reasoning_semantic_similarity_threshold_percent = 45;
+        let mut detector = LoopDetector::new(config, InputRepetitionProfile::default());
+
+        detector
+            .observe(
+                LoopChannel::Reasoning,
+                "Use bsdtar to extract the archive into /dev/shm, then check unzip in a temporary directory and inspect members with python zipfile.\n",
+            )
+            .expect("first semantic reasoning window should pass");
+        let error = detector
+            .observe(
+                LoopChannel::Reasoning,
+                "Try unzip into a tmpdir, but keep bsdtar available for archive extraction and use Python's zipfile module to inspect entries.\n",
+            )
+            .expect_err("semantic reasoning repetition with varied wording should trip");
+
+        let metadata = error.response_metadata();
+        assert_eq!(metadata["loop_signal"], "semantic_jaccard");
+        assert_eq!(metadata["loop_channel"], "reasoning");
+        assert_eq!(metadata["loop_detected"], "true");
+        assert!(
+            metadata["loop_semantic_similarity_percent"]
+                .parse::<u64>()
+                .expect("semantic similarity should be numeric")
+                >= 45
+        );
+    }
+
+    #[test]
+    fn semantic_reasoning_detection_can_be_disabled() {
+        let mut config = semantic_loop_config();
+        config.reasoning_semantic_detection_enabled = false;
+        let mut detector = LoopDetector::new(config, InputRepetitionProfile::default());
+
+        for fragment in semantic_reasoning_repetition_fragments() {
+            detector
+                .observe(LoopChannel::Reasoning, fragment)
+                .expect("disabled semantic detector should not trip");
+        }
+    }
+
+    #[test]
+    fn semantic_reasoning_detector_ignores_content_channel() {
+        let mut detector =
+            LoopDetector::new(semantic_loop_config(), InputRepetitionProfile::default());
+
+        for fragment in semantic_reasoning_repetition_fragments() {
+            detector
+                .observe(LoopChannel::Content, fragment)
+                .expect("semantic detector is reasoning-only");
+        }
+    }
+
+    #[test]
+    fn semantic_reasoning_detector_avoids_short_stopword_and_stepwise_false_positives() {
+        let mut detector =
+            LoopDetector::new(semantic_loop_config(), InputRepetitionProfile::default());
+
+        for fragment in [
+            "and then but maybe because while there\n",
+            "First validate headers and parse the request body into JSON.\n",
+            "Next call the upstream model and collect status metadata.\n",
+            "Finally write observability counters and return the response.\n",
+        ] {
+            detector
+                .observe(LoopChannel::Reasoning, fragment)
+                .expect("normal short or stepwise reasoning should not trip");
+        }
+    }
+
+    #[test]
+    fn semantic_reasoning_history_and_window_are_bounded() {
+        let mut config = semantic_loop_config();
+        config.reasoning_semantic_similarity_threshold_percent = 100;
+        config.reasoning_semantic_window_token_count = 4;
+        config.reasoning_semantic_minimum_token_count = 4;
+        config.reasoning_semantic_history_window_count = 2;
+        let mut detector = LoopDetector::new(config, InputRepetitionProfile::default());
+
+        for index in 0..8 {
+            detector
+                .observe(
+                    LoopChannel::Reasoning,
+                    &format!("unique topic{index} alpha{index} beta{index} gamma{index}\n"),
+                )
+                .expect("unique semantic windows should not trip");
+        }
+
+        assert_eq!(detector.reasoning.semantic_windows.len(), 2);
+        assert!(detector.reasoning.semantic_window_tokens.len() <= 4);
+        assert!(detector.reasoning.semantic_history_window_capped > 0);
+    }
+
+    #[test]
+    fn semantic_reasoning_threshold_controls_sensitivity() {
+        let mut strict_config = semantic_loop_config();
+        strict_config.reasoning_semantic_similarity_threshold_percent = 95;
+        let mut strict_detector =
+            LoopDetector::new(strict_config, InputRepetitionProfile::default());
+        for fragment in semantic_reasoning_repetition_fragments() {
+            strict_detector
+                .observe(LoopChannel::Reasoning, fragment)
+                .expect("strict semantic threshold should not trip varied wording");
+        }
+
+        let mut loose_config = semantic_loop_config();
+        loose_config.reasoning_semantic_similarity_threshold_percent = 45;
+        let mut loose_detector = LoopDetector::new(loose_config, InputRepetitionProfile::default());
+        let mut detected = false;
+        for fragment in semantic_reasoning_repetition_fragments() {
+            if loose_detector
+                .observe(LoopChannel::Reasoning, fragment)
+                .is_err()
+            {
+                detected = true;
+                break;
+            }
+        }
+        assert!(
+            detected,
+            "looser semantic threshold should catch varied wording"
+        );
+    }
+
     fn test_loop_config() -> LoopGuardConfig {
         LoopGuardConfig {
             enabled: true,
@@ -1178,6 +1603,30 @@ mod tests {
             output_low_progress_min_bytes: 1_000_000,
             output_low_progress_unique_ratio_percent: 0,
             input_overlap_threshold_multiplier: 3,
+            reasoning_semantic_detection_enabled: true,
+            reasoning_semantic_similarity_threshold_percent: 55,
+            reasoning_semantic_window_token_count: 24,
+            reasoning_semantic_minimum_token_count: 8,
+            reasoning_semantic_history_window_count: 16,
         }
+    }
+
+    fn semantic_loop_config() -> LoopGuardConfig {
+        let mut config = test_loop_config();
+        config.output_repeated_line_threshold = u32::MAX;
+        config.output_repeated_token_window_threshold = u32::MAX;
+        config.output_suffix_cycle_threshold = u32::MAX;
+        config.output_low_progress_min_bytes = u64::MAX;
+        config.reasoning_semantic_history_window_count = 4;
+        config
+    }
+
+    fn semantic_reasoning_repetition_fragments() -> [&'static str; 4] {
+        [
+            "Use bsdtar to extract the archive into /dev/shm, then try unzip in a temporary directory and inspect with python zipfile.\n",
+            "Try unzip into a tmpdir, keep bsdtar for archive extraction, and use the Python zipfile module to inspect the entries.\n",
+            "Python zipfile can list the archive; if needed, extract with bsdtar or unzip into a temporary directory.\n",
+            "Return to the unzip tmpdir plan, with bsdtar as the extractor fallback and python zipfile for inspection.\n",
+        ]
     }
 }

@@ -66,6 +66,19 @@ fn defaults_match_issue_contract() {
         15
     );
     assert_eq!(config.loop_guard.input_overlap_threshold_multiplier, 4);
+    assert!(config.loop_guard.reasoning_semantic_detection_enabled);
+    assert_eq!(
+        config
+            .loop_guard
+            .reasoning_semantic_similarity_threshold_percent,
+        55
+    );
+    assert_eq!(config.loop_guard.reasoning_semantic_window_token_count, 24);
+    assert_eq!(config.loop_guard.reasoning_semantic_minimum_token_count, 8);
+    assert_eq!(
+        config.loop_guard.reasoning_semantic_history_window_count,
+        16
+    );
     assert!(config.retry.enabled);
     assert_eq!(config.retry.max_attempts, 5);
     assert!(config.retry.anti_loop_hint_enabled);
@@ -202,6 +215,35 @@ enabled = false
     assert!(!config.retry.anti_loop_hint_enabled);
     assert_parsed_upstream_stall_overrides(&config);
     assert!(!config.cloudflare.enabled);
+}
+
+#[test]
+fn parses_loop_guard_semantic_overrides() {
+    let config = parse_config_text(
+        r"
+[loop_guard]
+reasoning_semantic_detection_enabled = false
+reasoning_semantic_similarity_threshold_percent = 70
+reasoning_semantic_window_token_count = 32
+reasoning_semantic_minimum_token_count = 16
+reasoning_semantic_history_window_count = 20
+",
+    )
+    .expect("semantic loop guard config should parse");
+
+    assert!(!config.loop_guard.reasoning_semantic_detection_enabled);
+    assert_eq!(
+        config
+            .loop_guard
+            .reasoning_semantic_similarity_threshold_percent,
+        70
+    );
+    assert_eq!(config.loop_guard.reasoning_semantic_window_token_count, 32);
+    assert_eq!(config.loop_guard.reasoning_semantic_minimum_token_count, 16);
+    assert_eq!(
+        config.loop_guard.reasoning_semantic_history_window_count,
+        20
+    );
 }
 
 fn assert_parsed_upstream_stall_overrides(config: &AppConfig) {
@@ -438,6 +480,53 @@ fn validates_loop_guard_ratio_limit() {
 }
 
 #[test]
+fn validates_loop_guard_semantic_bounds() {
+    let mut config = AppConfig::default();
+    config
+        .loop_guard
+        .reasoning_semantic_similarity_threshold_percent = 0;
+
+    let error = config
+        .validate()
+        .expect_err("zero semantic similarity threshold should fail");
+    assert_eq!(
+        error.field(),
+        "loop_guard.reasoning_semantic_similarity_threshold_percent"
+    );
+
+    config = AppConfig::default();
+    config.loop_guard.reasoning_semantic_window_token_count = 257;
+    let error = config
+        .validate()
+        .expect_err("semantic window token count should be capped");
+    assert_eq!(
+        error.field(),
+        "loop_guard.reasoning_semantic_window_token_count"
+    );
+
+    config = AppConfig::default();
+    config.loop_guard.reasoning_semantic_minimum_token_count = 25;
+    config.loop_guard.reasoning_semantic_window_token_count = 24;
+    let error = config
+        .validate()
+        .expect_err("semantic minimum token count should fit in window");
+    assert_eq!(
+        error.field(),
+        "loop_guard.reasoning_semantic_minimum_token_count"
+    );
+
+    config = AppConfig::default();
+    config.loop_guard.reasoning_semantic_history_window_count = 257;
+    let error = config
+        .validate()
+        .expect_err("semantic history window count should be capped");
+    assert_eq!(
+        error.field(),
+        "loop_guard.reasoning_semantic_history_window_count"
+    );
+}
+
+#[test]
 fn validates_normal_upstream_base_urls() {
     for base_url in ["http://gb10:18009/v1", "https://host.example/v1"] {
         let mut config = AppConfig::default();
@@ -613,6 +702,11 @@ interval_secs = 15
 
 [loop_guard]
 output_repeated_line_threshold = 24
+reasoning_semantic_detection_enabled = true
+reasoning_semantic_similarity_threshold_percent = 55
+reasoning_semantic_window_token_count = 24
+reasoning_semantic_minimum_token_count = 12
+reasoning_semantic_history_window_count = 16
 "#,
     );
     let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
@@ -637,6 +731,11 @@ interval_secs = 3
 
 [loop_guard]
 output_repeated_line_threshold = 7
+reasoning_semantic_detection_enabled = false
+reasoning_semantic_similarity_threshold_percent = 70
+reasoning_semantic_window_token_count = 32
+reasoning_semantic_minimum_token_count = 16
+reasoning_semantic_history_window_count = 20
 "#,
     );
     let outcome = manager.reload().expect("reload should succeed");
@@ -658,6 +757,25 @@ output_repeated_line_threshold = 7
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 3);
     assert_eq!(snapshot.loop_guard.output_repeated_line_threshold, 7);
+    assert!(!snapshot.loop_guard.reasoning_semantic_detection_enabled);
+    assert_eq!(
+        snapshot
+            .loop_guard
+            .reasoning_semantic_similarity_threshold_percent,
+        70
+    );
+    assert_eq!(
+        snapshot.loop_guard.reasoning_semantic_window_token_count,
+        32
+    );
+    assert_eq!(
+        snapshot.loop_guard.reasoning_semantic_minimum_token_count,
+        16
+    );
+    assert_eq!(
+        snapshot.loop_guard.reasoning_semantic_history_window_count,
+        20
+    );
 
     remove_file(&path);
 }
@@ -741,6 +859,13 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"server.max_request_body_bytes"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.output_repeated_line_threshold"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.input_overlap_threshold_multiplier"));
+    assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_detection_enabled"));
+    assert!(
+        RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_similarity_threshold_percent")
+    );
+    assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_window_token_count"));
+    assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_minimum_token_count"));
+    assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_history_window_count"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.anti_loop_hint_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.metrics_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));

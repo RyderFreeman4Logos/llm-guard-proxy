@@ -427,6 +427,37 @@ fn assign_loop_guard(
                 "loop_guard.input_overlap_threshold_multiplier",
             )?;
         }
+        "reasoning_semantic_detection_enabled" => {
+            config.reasoning_semantic_detection_enabled = parse_bool(value, line_number)?;
+        }
+        "reasoning_semantic_similarity_threshold_percent" => {
+            config.reasoning_semantic_similarity_threshold_percent = parse_u32(
+                value,
+                line_number,
+                "loop_guard.reasoning_semantic_similarity_threshold_percent",
+            )?;
+        }
+        "reasoning_semantic_window_token_count" => {
+            config.reasoning_semantic_window_token_count = parse_u32(
+                value,
+                line_number,
+                "loop_guard.reasoning_semantic_window_token_count",
+            )?;
+        }
+        "reasoning_semantic_minimum_token_count" => {
+            config.reasoning_semantic_minimum_token_count = parse_u32(
+                value,
+                line_number,
+                "loop_guard.reasoning_semantic_minimum_token_count",
+            )?;
+        }
+        "reasoning_semantic_history_window_count" => {
+            config.reasoning_semantic_history_window_count = parse_u32(
+                value,
+                line_number,
+                "loop_guard.reasoning_semantic_history_window_count",
+            )?;
+        }
         _ => return unknown_key("loop_guard", key, line_number),
     }
     Ok(())

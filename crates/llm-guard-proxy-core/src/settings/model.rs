@@ -5,6 +5,8 @@ use url::Url;
 
 const REDACTED_URL_PART: &str = "redacted";
 const INVALID_URL_DISPLAY: &str = "[invalid URL]";
+const LOOP_GUARD_MAX_SEMANTIC_WINDOW_TOKENS: u32 = 256;
+const LOOP_GUARD_MAX_SEMANTIC_HISTORY_WINDOWS: u32 = 256;
 
 /// Complete application configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -620,6 +622,16 @@ pub struct LoopGuardConfig {
     pub output_low_progress_unique_ratio_percent: u32,
     /// Threshold multiplier applied when output repetition overlaps repeated input.
     pub input_overlap_threshold_multiplier: u32,
+    /// Enables semantic Jaccard detection for reasoning/thinking streams.
+    pub reasoning_semantic_detection_enabled: bool,
+    /// Minimum Jaccard similarity required to flag a semantic reasoning loop.
+    pub reasoning_semantic_similarity_threshold_percent: u32,
+    /// Significant reasoning tokens kept in each semantic comparison window.
+    pub reasoning_semantic_window_token_count: u32,
+    /// Significant tokens required before a partial semantic window can be compared.
+    pub reasoning_semantic_minimum_token_count: u32,
+    /// Maximum completed semantic windows kept for bounded history comparison.
+    pub reasoning_semantic_history_window_count: u32,
 }
 
 impl LoopGuardConfig {
@@ -668,6 +680,36 @@ impl LoopGuardConfig {
             self.input_overlap_threshold_multiplier > 0,
             "loop_guard.input_overlap_threshold_multiplier",
             "must be greater than zero",
+        )?;
+        require(
+            (1..=100).contains(&self.reasoning_semantic_similarity_threshold_percent),
+            "loop_guard.reasoning_semantic_similarity_threshold_percent",
+            "must be between 1 and 100",
+        )?;
+        require(
+            self.reasoning_semantic_window_token_count > 0
+                && self.reasoning_semantic_window_token_count
+                    <= LOOP_GUARD_MAX_SEMANTIC_WINDOW_TOKENS,
+            "loop_guard.reasoning_semantic_window_token_count",
+            "must be between 1 and 256",
+        )?;
+        require(
+            self.reasoning_semantic_minimum_token_count > 0,
+            "loop_guard.reasoning_semantic_minimum_token_count",
+            "must be greater than zero",
+        )?;
+        require(
+            self.reasoning_semantic_minimum_token_count
+                <= self.reasoning_semantic_window_token_count,
+            "loop_guard.reasoning_semantic_minimum_token_count",
+            "must be less than or equal to loop_guard.reasoning_semantic_window_token_count",
+        )?;
+        require(
+            self.reasoning_semantic_history_window_count > 0
+                && self.reasoning_semantic_history_window_count
+                    <= LOOP_GUARD_MAX_SEMANTIC_HISTORY_WINDOWS,
+            "loop_guard.reasoning_semantic_history_window_count",
+            "must be between 1 and 256",
         )
     }
 }
@@ -685,6 +727,11 @@ impl Default for LoopGuardConfig {
             output_low_progress_min_bytes: 4_096,
             output_low_progress_unique_ratio_percent: 15,
             input_overlap_threshold_multiplier: 4,
+            reasoning_semantic_detection_enabled: true,
+            reasoning_semantic_similarity_threshold_percent: 55,
+            reasoning_semantic_window_token_count: 24,
+            reasoning_semantic_minimum_token_count: 8,
+            reasoning_semantic_history_window_count: 16,
         }
     }
 }

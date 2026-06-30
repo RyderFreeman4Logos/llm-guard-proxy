@@ -1119,6 +1119,74 @@ mode = "disabled"
 }
 
 #[tokio::test]
+async fn shielded_loop_guard_catches_semantic_reasoning_repetition_with_varied_wording() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+output_repeated_line_threshold = 100
+output_repeated_token_window_threshold = 100
+output_suffix_cycle_threshold = 100
+output_low_progress_min_bytes = 1000000
+reasoning_semantic_similarity_threshold_percent = 45
+reasoning_semantic_window_token_count = 24
+reasoning_semantic_minimum_token_count = 8
+reasoning_semantic_history_window_count = 4
+
+[retry]
+enabled = false
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=semantic-reasoning-varied",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("error body should be text");
+    assert!(body.contains("upstream_body_error"));
+    assert!(!body.contains("bsdtar"));
+    assert!(!body.contains("zipfile"));
+
+    let request_row = read_last_observability_row(&proxy.sqlite_path, "requests");
+    let attempt_row = read_last_observability_row(&proxy.sqlite_path, "attempts");
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(attempt_row.status, "failed");
+    for metadata in [
+        &request_row.response_metadata,
+        &attempt_row.response_metadata,
+    ] {
+        assert_eq!(metadata["loop_detected"], "true");
+        assert_eq!(metadata["loop_signal"], "semantic_jaccard");
+        assert_eq!(metadata["loop_channel"], "reasoning");
+        assert!(
+            metadata["loop_semantic_similarity_percent"]
+                .as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .expect("semantic similarity should be numeric")
+                >= 45
+        );
+        assert!(!metadata.to_string().contains("bsdtar"));
+        assert!(!metadata.to_string().contains("zipfile"));
+    }
+}
+
+#[tokio::test]
 async fn shielded_loop_guard_does_not_flag_repeated_input_without_output_loop() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -6179,6 +6247,9 @@ fn fake_chat_completion_response(
     if path_and_query.contains("test=loop-reasoning-six") {
         return Some(repeated_reasoning_line_sse_response(6));
     }
+    if path_and_query.contains("test=semantic-reasoning-varied") {
+        return Some(semantic_reasoning_repetition_sse_response());
+    }
     if path_and_query.contains("test=copy-input-under-threshold") {
         return Some(repeated_input_copy_sse_response(11));
     }
@@ -6447,6 +6518,26 @@ fn repeated_reasoning_line_sse_response(repetitions: usize) -> Response<Body> {
     )
 }
 
+fn semantic_reasoning_repetition_sse_response() -> Response<Body> {
+    delta_fragments_sse_response(
+        "chat-completions-semantic-reasoning-sse",
+        [
+            serde_json::json!({
+                "reasoning_content": "Use bsdtar to extract the archive into /dev/shm, then check unzip in a temporary directory and inspect members with python zipfile.\n",
+            }),
+            serde_json::json!({
+                "reasoning_content": "Try unzip into a tmpdir, but keep bsdtar available for archive extraction and use Python's zipfile module to inspect entries.\n",
+            }),
+            serde_json::json!({
+                "reasoning_content": "Python zipfile can read the archive listing; if that stalls, extract with bsdtar or unzip into a temporary directory.\n",
+            }),
+            serde_json::json!({
+                "reasoning_content": "Return to the unzip tmpdir plan, with bsdtar as the extractor fallback and python zipfile for inspection.\n",
+            }),
+        ],
+    )
+}
+
 fn repeated_input_copy_sse_response(repetitions: usize) -> Response<Body> {
     repeated_delta_sse_response(
         "chat-completions-copy-input-sse",
@@ -6460,13 +6551,15 @@ fn repeated_input_copy_sse_response(repetitions: usize) -> Response<Body> {
     )
 }
 
-fn repeated_delta_sse_response(
+fn delta_fragments_sse_response<const N: usize>(
     label: &'static str,
-    repetitions: usize,
-    delta: impl Fn(&str) -> serde_json::Value,
-    line: &str,
+    deltas: [serde_json::Value; N],
 ) -> Response<Body> {
-    let mut chunks = Vec::with_capacity(repetitions.saturating_add(3));
+    delta_vec_sse_response(label, Vec::from(deltas))
+}
+
+fn delta_vec_sse_response(label: &'static str, deltas: Vec<serde_json::Value>) -> Response<Body> {
+    let mut chunks = Vec::with_capacity(deltas.len().saturating_add(3));
     chunks.push(sse_json(&serde_json::json!({
         "id": "chatcmpl-shielded",
         "object": "chat.completion.chunk",
@@ -6480,7 +6573,7 @@ fn repeated_delta_sse_response(
             "finish_reason": null
         }]
     })));
-    for _ in 0..repetitions {
+    for delta in deltas {
         chunks.push(sse_json(&serde_json::json!({
             "id": "chatcmpl-shielded",
             "object": "chat.completion.chunk",
@@ -6488,7 +6581,7 @@ fn repeated_delta_sse_response(
             "model": "test-chat",
             "choices": [{
                 "index": 0,
-                "delta": delta(line),
+                "delta": delta,
                 "finish_reason": null
             }]
         })));
@@ -6506,6 +6599,19 @@ fn repeated_delta_sse_response(
     })));
     chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
     chat_completion_vec_stream_response(label, chunks)
+}
+
+fn repeated_delta_sse_response(
+    label: &'static str,
+    repetitions: usize,
+    delta: impl Fn(&str) -> serde_json::Value,
+    line: &str,
+) -> Response<Body> {
+    let mut deltas = Vec::with_capacity(repetitions);
+    for _ in 0..repetitions {
+        deltas.push(delta(line));
+    }
+    delta_vec_sse_response(label, deltas)
 }
 
 fn chat_completion_delayed_start_stream_response(

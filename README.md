@@ -198,6 +198,17 @@ output_suffix_cycle_threshold = 32
 output_low_progress_min_bytes = 4096
 output_low_progress_unique_ratio_percent = 15
 input_overlap_threshold_multiplier = 4
+reasoning_semantic_detection_enabled = true
+reasoning_semantic_similarity_threshold_percent = 55
+reasoning_semantic_window_token_count = 24
+reasoning_semantic_minimum_token_count = 8
+reasoning_semantic_history_window_count = 16
+
+# Semantic loop detection is reasoning-only and compares bounded normalized
+# token/ngram windows with Jaccard similarity. The default is enabled with a
+# conservative majority-overlap threshold; raise the threshold to reduce false
+# positives, lower it to catch looser paraphrases, or disable it to keep only
+# the hash, suffix-cycle, and low-progress detectors.
 
 [retry]
 enabled = true
@@ -261,6 +272,11 @@ Reloadable fields:
 - `loop_guard.output_low_progress_min_bytes`
 - `loop_guard.output_low_progress_unique_ratio_percent`
 - `loop_guard.input_overlap_threshold_multiplier`
+- `loop_guard.reasoning_semantic_detection_enabled`
+- `loop_guard.reasoning_semantic_similarity_threshold_percent`
+- `loop_guard.reasoning_semantic_window_token_count`
+- `loop_guard.reasoning_semantic_minimum_token_count`
+- `loop_guard.reasoning_semantic_history_window_count`
 - `retry.enabled`
 - `retry.max_attempts`
 - `retry.anti_loop_hint_enabled`
