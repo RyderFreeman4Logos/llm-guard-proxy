@@ -50,6 +50,11 @@ output_suffix_cycle_threshold = 32
 output_low_progress_min_bytes = 4096
 output_low_progress_unique_ratio_percent = 15
 input_overlap_threshold_multiplier = 4
+reasoning_semantic_detection_enabled = true
+reasoning_semantic_similarity_threshold_percent = 55
+reasoning_semantic_window_token_count = 24
+reasoning_semantic_minimum_token_count = 8
+reasoning_semantic_history_window_count = 16
 
 [retry]
 enabled = true
