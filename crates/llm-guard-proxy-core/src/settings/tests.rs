@@ -48,6 +48,7 @@ fn defaults_match_issue_contract() {
         80_000
     );
     assert!(config.thinking.enabled);
+    assert!(!config.thinking.force_disable);
     assert_eq!(config.thinking.budget_tokens, 32_768);
     assert_eq!(
         config.thinking.tool_request_policy,
@@ -143,6 +144,7 @@ max_records = 50
 prune_to_records = 40
 
 [thinking]
+force_disable = true
 tool_request_policy = "passthrough"
 
 [heartbeat]
@@ -186,6 +188,7 @@ enabled = false
     assert_eq!(config.server.max_request_body_bytes, 1_048_576);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
     assert_eq!(config.upstream.request_timeout_ms, 90_000);
+    assert!(config.thinking.force_disable);
     assert_eq!(
         config.thinking.tool_request_policy,
         ToolRequestThinkingPolicy::Passthrough
@@ -722,6 +725,9 @@ generation_queue_timeout_ms = 1000
 max_control_plane_in_flight_requests = 2
 max_request_body_bytes = 512
 
+[thinking]
+force_disable = true
+
 [upstream]
 request_timeout_ms = 90000
 
@@ -753,6 +759,7 @@ reasoning_semantic_history_window_count = 20
     assert_eq!(snapshot.server.generation_queue_timeout_ms, 1_000);
     assert_eq!(snapshot.server.max_control_plane_in_flight_requests, 2);
     assert_eq!(snapshot.server.max_request_body_bytes, 512);
+    assert!(snapshot.thinking.force_disable);
     assert_eq!(snapshot.upstream.request_timeout_ms, 90_000);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 3);
@@ -851,6 +858,7 @@ interval_secs = 4
 #[test]
 fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"thinking.force_disable"));
     assert!(RELOADABLE_FIELDS.contains(&"thinking.tool_request_policy"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_queued_generation_requests"));

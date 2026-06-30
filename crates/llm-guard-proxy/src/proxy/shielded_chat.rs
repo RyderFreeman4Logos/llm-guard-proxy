@@ -162,6 +162,11 @@ const CANONICAL_THINKING_BUDGET: JsonPath = JsonPath {
     variant: "canonical",
 };
 
+const ROOT_THINKING_TOKEN_BUDGET: JsonPath = JsonPath {
+    path: &["thinking_token_budget"],
+    variant: "root-thinking-token-budget",
+};
+
 const ROOT_THINKING_BUDGET: JsonPath = JsonPath {
     path: &["thinking_budget"],
     variant: "root-thinking-budget",
@@ -177,6 +182,11 @@ const EXTRA_BODY_THINKING_BUDGET: JsonPath = JsonPath {
     variant: "extra-body-thinking-budget",
 };
 
+const EXTRA_BODY_THINKING_TOKEN_BUDGET: JsonPath = JsonPath {
+    path: &["extra_body", "thinking_token_budget"],
+    variant: "extra-body-thinking-token-budget",
+};
+
 const EXTRA_BODY_CANONICAL_THINKING_BUDGET: JsonPath = JsonPath {
     path: &["extra_body", "thinking", "budget_tokens"],
     variant: "extra-body-canonical",
@@ -189,8 +199,10 @@ const EXTRA_BODY_CHAT_TEMPLATE_THINKING_BUDGET: JsonPath = JsonPath {
 
 const BUDGET_PATHS: &[JsonPath] = &[
     CANONICAL_THINKING_BUDGET,
+    ROOT_THINKING_TOKEN_BUDGET,
     ROOT_THINKING_BUDGET,
     ROOT_CHAT_TEMPLATE_THINKING_BUDGET,
+    EXTRA_BODY_THINKING_TOKEN_BUDGET,
     EXTRA_BODY_THINKING_BUDGET,
     EXTRA_BODY_CANONICAL_THINKING_BUDGET,
     EXTRA_BODY_CHAT_TEMPLATE_THINKING_BUDGET,
@@ -274,6 +286,13 @@ fn apply_thinking_policy(
         String::from("thinking_tool_request_detected"),
         is_tool_request.to_string(),
     );
+    if thinking.force_disable {
+        let outcome = apply_force_disable_thinking(object, &budget_observations, &mut metadata);
+        let answer_budget =
+            apply_answer_budget_preservation(object, false, outcome.answer_budget_delta);
+        metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
+        return metadata;
+    }
     if is_tool_request
         && matches!(
             thinking.tool_request_policy,
@@ -333,6 +352,10 @@ fn initial_thinking_metadata(
         (
             String::from("thinking_policy_enabled"),
             thinking.enabled.to_string(),
+        ),
+        (
+            String::from("thinking_force_disable_enabled"),
+            thinking.force_disable.to_string(),
         ),
         (
             String::from("thinking_policy_budget_tokens"),
@@ -413,6 +436,85 @@ fn apply_thinking_budget_policy(
         DisableMarker::None => {
             apply_budget_observations(object, configured_budget, budget_observations, metadata)
         }
+    }
+}
+
+fn apply_force_disable_thinking(
+    object: &mut Map<String, Value>,
+    budget_observations: &BudgetObservations,
+    metadata: &mut BTreeMap<String, String>,
+) -> ThinkingPolicyOutcome {
+    let disable_marker_paths = normalize_force_disable_markers(object, metadata);
+    metadata.insert(
+        String::from("thinking_disable_marker_rewritten_paths"),
+        join_paths(&disable_marker_paths),
+    );
+
+    if budget_observations.is_empty() {
+        let path = injection_path(object);
+        metadata.insert(String::from("thinking_schema_path"), path.display_path());
+        metadata.insert(
+            String::from("thinking_schema_variant"),
+            path.variant.to_owned(),
+        );
+        if set_budget_at_path(object, path, 0) {
+            return ThinkingPolicyOutcome {
+                rewrite_applied: true,
+                reason: "force_disabled_thinking",
+                final_budget: String::from("0"),
+                answer_budget_delta: 0,
+                rewritten_paths: vec![path],
+                preserved_paths: Vec::new(),
+                malformed_paths: Vec::new(),
+                zero_paths: Vec::new(),
+            };
+        }
+        return ThinkingPolicyOutcome {
+            rewrite_applied: false,
+            reason: "malformed_budget_container",
+            final_budget: String::from("unknown"),
+            answer_budget_delta: 0,
+            rewritten_paths: Vec::new(),
+            preserved_paths: Vec::new(),
+            malformed_paths: Vec::new(),
+            zero_paths: Vec::new(),
+        };
+    }
+
+    let mut rewritten_paths = Vec::new();
+    let mut preserved_paths = Vec::new();
+    let mut malformed_paths = Vec::new();
+    let mut zero_paths = Vec::new();
+    for observation in &budget_observations.entries {
+        match observation.state {
+            BudgetState::Numeric(0) => {
+                preserved_paths.push(observation.path);
+                zero_paths.push(observation.path);
+            }
+            BudgetState::Numeric(_) | BudgetState::Malformed => {
+                if set_budget_at_path(object, observation.path, 0) {
+                    rewritten_paths.push(observation.path);
+                } else {
+                    malformed_paths.push(observation.path);
+                }
+            }
+        }
+    }
+
+    let final_budget = if rewritten_paths.is_empty() && preserved_paths.is_empty() {
+        String::from("unknown")
+    } else {
+        String::from("0")
+    };
+    ThinkingPolicyOutcome {
+        rewrite_applied: !rewritten_paths.is_empty() || !disable_marker_paths.is_empty(),
+        reason: "force_disabled_thinking",
+        final_budget,
+        answer_budget_delta: 0,
+        rewritten_paths,
+        preserved_paths,
+        malformed_paths,
+        zero_paths,
     }
 }
 
@@ -578,6 +680,17 @@ fn insert_disable_marker_metadata(metadata: &mut BTreeMap<String, String>, path:
     );
 }
 
+fn insert_multiple_disable_marker_metadata(metadata: &mut BTreeMap<String, String>) {
+    metadata.insert(
+        String::from("thinking_disable_marker_path"),
+        String::from("multiple"),
+    );
+    metadata.insert(
+        String::from("thinking_disable_marker_variant"),
+        String::from("multiple"),
+    );
+}
+
 fn thinking_outcome_metadata(
     outcome: &ThinkingPolicyOutcome,
     answer_budget: &AnswerBudgetDecision,
@@ -723,6 +836,25 @@ fn injection_path(object: &Map<String, Value>) -> JsonPath {
     CANONICAL_THINKING_BUDGET
 }
 
+fn force_disable_marker_path(object: &Map<String, Value>) -> JsonPath {
+    if object_at_path(object, &["chat_template_kwargs"]) {
+        return ROOT_CHAT_TEMPLATE_ENABLE_THINKING;
+    }
+    if object_at_path(object, &["extra_body", "chat_template_kwargs"]) {
+        return EXTRA_BODY_CHAT_TEMPLATE_ENABLE_THINKING;
+    }
+    if object_at_path(object, &["extra_body", "thinking"]) {
+        return EXTRA_BODY_THINKING_ENABLED;
+    }
+    if object_at_path(object, &["thinking"]) {
+        return THINKING_ENABLED;
+    }
+    if object_at_path(object, &["extra_body"]) {
+        return EXTRA_BODY_ENABLE_THINKING;
+    }
+    THINKING_ENABLED
+}
+
 fn object_at_path(object: &Map<String, Value>, path: &[&str]) -> bool {
     let mut current = object;
     for key in path {
@@ -732,6 +864,40 @@ fn object_at_path(object: &Map<String, Value>, path: &[&str]) -> bool {
         }
     }
     true
+}
+
+fn normalize_force_disable_markers(
+    object: &mut Map<String, Value>,
+    metadata: &mut BTreeMap<String, String>,
+) -> Vec<JsonPath> {
+    let mut rewritten_paths = Vec::new();
+    let mut disabled_marker_present = false;
+    for path in DISABLE_MARKER_PATHS {
+        match value_at_path(object, path.path) {
+            PathValue::Value(Value::Bool(false)) => disabled_marker_present = true,
+            PathValue::Value(Value::Bool(true)) => {
+                if set_bool_at_path(object, *path, false) {
+                    rewritten_paths.push(*path);
+                }
+            }
+            PathValue::Missing | PathValue::Malformed | PathValue::Value(_) => {}
+        }
+    }
+
+    if rewritten_paths.is_empty() && !disabled_marker_present {
+        let path = force_disable_marker_path(object);
+        if set_bool_at_path(object, path, false) {
+            rewritten_paths.push(path);
+        }
+    }
+
+    match rewritten_paths.as_slice() {
+        [] => {}
+        [path] => insert_disable_marker_metadata(metadata, *path),
+        [_first, ..] => insert_multiple_disable_marker_metadata(metadata),
+    }
+
+    rewritten_paths
 }
 
 fn set_budget_at_path(object: &mut Map<String, Value>, path: JsonPath, budget: u64) -> bool {
@@ -749,6 +915,24 @@ fn set_budget_at_path(object: &mut Map<String, Value>, path: JsonPath, budget: u
         current = next;
     }
     current.insert(last.to_owned(), Value::Number(Number::from(budget)));
+    true
+}
+
+fn set_bool_at_path(object: &mut Map<String, Value>, path: JsonPath, value: bool) -> bool {
+    let Some((&last, parents)) = path.path.split_last() else {
+        return false;
+    };
+    let mut current = object;
+    for key in parents {
+        let entry = current
+            .entry((*key).to_owned())
+            .or_insert_with(|| Value::Object(Map::new()));
+        let Value::Object(next) = entry else {
+            return false;
+        };
+        current = next;
+    }
+    current.insert(last.to_owned(), Value::Bool(value));
     true
 }
 

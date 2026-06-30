@@ -180,6 +180,7 @@ prune_to_records = 80000
 
 [thinking]
 enabled = true
+force_disable = false
 budget_tokens = 32768
 preserve_answer_budget = true
 # "apply" keeps the regular thinking rewrite for every chat request.
@@ -229,9 +230,9 @@ rows but cannot shrink the database file below the empty-store minimum.
 Record-count retention prunes from `max_records` down to `prune_to_records`;
 when omitted, `prune_to_records` defaults to 80% of `max_records`.
 
-For shielded non-stream chat requests, the thinking policy injects or raises
-known `thinking.budget_tokens` / chat-template budget fields unless the caller
-explicitly disables thinking or sets a zero budget. When
+For shielded chat requests, the thinking policy injects or raises known
+`thinking.budget_tokens`, `thinking_token_budget`, and chat-template budget
+fields unless the caller explicitly disables thinking or sets a zero budget. When
 `preserve_answer_budget` is enabled, numeric `max_tokens`,
 `max_completion_tokens`, and `max_output_tokens` fields are increased by the
 thinking-budget delta so the caller's answer-token reserve is preserved.
@@ -239,7 +240,12 @@ Set `thinking.tool_request_policy = "passthrough"` to make requests with
 `tools`, legacy `functions`, `tool_choice`, or `function_call` bypass the
 thinking rewrite entirely; the proxy then forwards any caller-provided thinking
 parameters as-is while still applying the regular thinking policy to non-tool
-chat requests.
+chat requests. Set hot-reloadable `thinking.force_disable = true` to override
+all caller and proxy thinking budgets with zero, normalize known
+`enable_thinking`/`enabled` markers to `false`, and leave answer-token fields
+unchanged. Force-disable takes precedence over `thinking.enabled`,
+`thinking.budget_tokens`, zero-budget opt-outs, caller disable markers, and
+`thinking.tool_request_policy = "passthrough"`.
 
 Reloadable fields:
 
@@ -259,6 +265,7 @@ Reloadable fields:
 - `observability.retention.max_records`
 - `observability.retention.prune_to_records`
 - `thinking.enabled`
+- `thinking.force_disable`
 - `thinking.budget_tokens`
 - `thinking.preserve_answer_budget`
 - `thinking.tool_request_policy`

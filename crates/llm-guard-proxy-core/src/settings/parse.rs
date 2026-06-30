@@ -334,6 +334,7 @@ fn assign_thinking(
 ) -> Result<(), ConfigParseError> {
     match key {
         "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "force_disable" => config.force_disable = parse_bool(value, line_number)?,
         "budget_tokens" => {
             config.budget_tokens = parse_u32(value, line_number, "thinking.budget_tokens")?;
         }
