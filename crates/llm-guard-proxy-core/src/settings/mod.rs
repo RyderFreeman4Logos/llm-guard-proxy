@@ -111,6 +111,8 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstream.metadata.max_model_len_override",
     "upstream.metadata.input_token_safety_margin",
     "upstreams.request_timeout_ms",
+    "upstreams.max_in_flight_requests",
+    "upstreams.max_queued_generation_requests",
     "upstreams.metadata.discovery_enabled",
     "upstreams.metadata.enrich_responses",
     "upstreams.metadata.refresh_interval_secs",

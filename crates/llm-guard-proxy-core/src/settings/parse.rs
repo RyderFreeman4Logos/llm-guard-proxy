@@ -241,6 +241,20 @@ fn assign_upstream_profile(
             config.request_timeout_ms =
                 parse_u64(value, line_number, "upstreams.request_timeout_ms")?;
         }
+        "max_in_flight_requests" => {
+            config.max_in_flight_requests = Some(parse_usize(
+                value,
+                line_number,
+                "upstreams.max_in_flight_requests",
+            )?);
+        }
+        "max_queued_generation_requests" => {
+            config.max_queued_generation_requests = Some(parse_usize(
+                value,
+                line_number,
+                "upstreams.max_queued_generation_requests",
+            )?);
+        }
         _ => return unknown_key("upstreams", key, line_number),
     }
     Ok(())

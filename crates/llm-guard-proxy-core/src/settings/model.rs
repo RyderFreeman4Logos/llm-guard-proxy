@@ -152,9 +152,19 @@ impl AppConfig {
             match_models: Vec::new(),
             base_url: self.upstream.base_url.clone(),
             request_timeout_ms: self.upstream.request_timeout_ms,
+            max_in_flight_requests: None,
+            max_queued_generation_requests: None,
             metadata: self.upstream.metadata.clone(),
             thinking: self.thinking.clone(),
         }
+    }
+
+    /// Returns true when any named upstream declares independent generation admission limits.
+    #[must_use]
+    pub fn has_upstream_profile_generation_limits(&self) -> bool {
+        self.upstream_profiles
+            .iter()
+            .any(UpstreamProfileConfig::has_generation_limits)
     }
 
     pub(crate) fn apply_reloadable_from(&mut self, requested: &Self) {
@@ -266,6 +276,8 @@ impl AppConfig {
             .zip(requested.upstream_profiles.iter())
         {
             active.request_timeout_ms = requested.request_timeout_ms;
+            active.max_in_flight_requests = requested.max_in_flight_requests;
+            active.max_queued_generation_requests = requested.max_queued_generation_requests;
             active.metadata = requested.metadata.clone();
             active.thinking = requested.thinking.clone();
         }
@@ -421,6 +433,10 @@ pub struct UpstreamProfileConfig {
     pub base_url: String,
     /// Total upstream request timeout, including streamed response body reads.
     pub request_timeout_ms: u64,
+    /// Optional per-profile in-flight generation request limit.
+    pub max_in_flight_requests: Option<usize>,
+    /// Optional per-profile queue length for generation requests waiting on this profile.
+    pub max_queued_generation_requests: Option<usize>,
     /// Metadata discovery and model context enrichment policy.
     pub metadata: MetadataConfig,
     /// Thinking budget policy for this profile.
@@ -467,8 +483,42 @@ impl UpstreamProfileConfig {
             "upstreams.request_timeout_ms",
             "must be greater than zero",
         )?;
+        if let Some(max_in_flight_requests) = self.max_in_flight_requests {
+            require(
+                max_in_flight_requests > 0,
+                "upstreams.max_in_flight_requests",
+                "must be greater than zero",
+            )?;
+        }
+        if let Some(max_queued_generation_requests) = self.max_queued_generation_requests {
+            require(
+                max_queued_generation_requests <= 10_000,
+                "upstreams.max_queued_generation_requests",
+                "must be less than or equal to 10000",
+            )?;
+        }
         self.metadata.validate()?;
         self.thinking.validate("upstreams.thinking.max_tokens")
+    }
+
+    /// Returns true when this profile uses an independent generation admission limiter.
+    #[must_use]
+    pub const fn has_generation_limits(&self) -> bool {
+        self.max_in_flight_requests.is_some() || self.max_queued_generation_requests.is_some()
+    }
+
+    /// Effective in-flight limit for this profile, inheriting the server default when omitted.
+    #[must_use]
+    pub fn effective_max_in_flight_requests(&self, server: &ServerConfig) -> usize {
+        self.max_in_flight_requests
+            .unwrap_or(server.max_in_flight_requests)
+    }
+
+    /// Effective queue limit for this profile, inheriting the server default when omitted.
+    #[must_use]
+    pub fn effective_max_queued_generation_requests(&self, server: &ServerConfig) -> usize {
+        self.max_queued_generation_requests
+            .unwrap_or(server.max_queued_generation_requests)
     }
 
     /// Returns true when the request model selects this profile.
@@ -492,6 +542,8 @@ impl Default for UpstreamProfileConfig {
             match_models: Vec::new(),
             base_url: upstream.base_url,
             request_timeout_ms: upstream.request_timeout_ms,
+            max_in_flight_requests: None,
+            max_queued_generation_requests: None,
             metadata: upstream.metadata,
             thinking: ThinkingConfig::default(),
         }

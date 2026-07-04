@@ -68,6 +68,8 @@ pub(crate) struct ProxyState {
     evidence_store: EvidenceStore,
     client: Client,
     generation_requests: Arc<InFlightLimiter>,
+    generation_body_routing_requests: Arc<InFlightLimiter>,
+    generation_profile_requests: Arc<Mutex<HashMap<String, Arc<InFlightLimiter>>>>,
     control_plane_requests: Arc<InFlightLimiter>,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
@@ -91,6 +93,8 @@ impl ProxyState {
             evidence_store,
             client,
             generation_requests: Arc::new(InFlightLimiter::default()),
+            generation_body_routing_requests: Arc::new(InFlightLimiter::default()),
+            generation_profile_requests: Arc::new(Mutex::new(HashMap::new())),
             control_plane_requests: Arc::new(InFlightLimiter::default()),
             upstream_stall_recovery: Arc::new(UpstreamStallRecoveryCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
@@ -101,32 +105,49 @@ impl ProxyState {
     async fn acquire_generation_permit(
         &self,
     ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
+        self.acquire_generation_permit_with_limiter(Arc::clone(&self.generation_requests))
+            .await
+    }
+
+    async fn acquire_generation_body_routing_permit(
+        &self,
+    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
+        self.acquire_generation_permit_with_limiter(Arc::clone(
+            &self.generation_body_routing_requests,
+        ))
+        .await
+    }
+
+    async fn acquire_generation_permit_with_limiter(
+        &self,
+        limiter: Arc<InFlightLimiter>,
+    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
         let config = self
             .config
             .snapshot()
             .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
-        if let Some(permit) = self
-            .generation_requests
-            .try_acquire(config.server.max_in_flight_requests)
-        {
+        if let Some(permit) = limiter.try_acquire(config.server.max_in_flight_requests) {
             return Ok((config, permit));
         }
 
-        let Some(queue_permit) = self
-            .generation_requests
-            .try_enqueue(config.server.max_queued_generation_requests)
+        let Some(queue_permit) = limiter.try_enqueue(config.server.max_queued_generation_requests)
         else {
             return Err(AdmissionFailure::GenerationQueueFull {
                 max_queued_generation_requests: config.server.max_queued_generation_requests,
             });
         };
 
-        self.wait_for_generation_capacity(queue_permit, config.server.generation_queue_timeout_ms)
-            .await
+        self.wait_for_generation_capacity(
+            limiter,
+            queue_permit,
+            config.server.generation_queue_timeout_ms,
+        )
+        .await
     }
 
     async fn wait_for_generation_capacity(
         &self,
+        limiter: Arc<InFlightLimiter>,
         _queue_permit: QueuedAdmissionPermit,
         timeout_ms: u64,
     ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
@@ -136,10 +157,7 @@ impl ProxyState {
                 .config
                 .snapshot()
                 .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
-            if let Some(permit) = self
-                .generation_requests
-                .try_acquire(config.server.max_in_flight_requests)
-            {
+            if let Some(permit) = limiter.try_acquire(config.server.max_in_flight_requests) {
                 return Ok((config, permit));
             }
 
@@ -150,10 +168,101 @@ impl ProxyState {
                 });
             }
 
-            self.generation_requests
+            limiter
                 .wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL))
                 .await;
         }
+    }
+
+    async fn acquire_generation_permit_for_model(
+        &self,
+        model_id: Option<&str>,
+        body_routing_permit: InFlightPermit,
+    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
+        let config = self
+            .config
+            .snapshot()
+            .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+        let selected_profile = config.select_upstream_profile(model_id);
+        let limiter = self.generation_limiter_for_profile(&selected_profile.profile);
+        if let Some(permit) = limiter.try_acquire(
+            selected_profile
+                .profile
+                .effective_max_in_flight_requests(&config.server),
+        ) {
+            drop(body_routing_permit);
+            return Ok((config, permit));
+        }
+
+        let max_queued_generation_requests = selected_profile
+            .profile
+            .effective_max_queued_generation_requests(&config.server);
+        let Some(queue_permit) = limiter.try_enqueue(max_queued_generation_requests) else {
+            drop(body_routing_permit);
+            return Err(AdmissionFailure::GenerationQueueFull {
+                max_queued_generation_requests,
+            });
+        };
+
+        drop(body_routing_permit);
+
+        self.wait_for_profile_generation_capacity(
+            queue_permit,
+            model_id.map(str::to_owned),
+            config.server.generation_queue_timeout_ms,
+        )
+        .await
+    }
+
+    async fn wait_for_profile_generation_capacity(
+        &self,
+        _queue_permit: QueuedAdmissionPermit,
+        model_id: Option<String>,
+        timeout_ms: u64,
+    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        loop {
+            let config = self
+                .config
+                .snapshot()
+                .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+            let selected_profile = config.select_upstream_profile(model_id.as_deref());
+            let limiter = self.generation_limiter_for_profile(&selected_profile.profile);
+            if let Some(permit) = limiter.try_acquire(
+                selected_profile
+                    .profile
+                    .effective_max_in_flight_requests(&config.server),
+            ) {
+                return Ok((config, permit));
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(AdmissionFailure::GenerationQueueTimeout {
+                    generation_queue_timeout_ms: timeout_ms,
+                });
+            }
+
+            limiter
+                .wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL))
+                .await;
+        }
+    }
+
+    fn generation_limiter_for_profile(
+        &self,
+        profile: &UpstreamProfileConfig,
+    ) -> Arc<InFlightLimiter> {
+        if !profile.has_generation_limits() {
+            return Arc::clone(&self.generation_requests);
+        }
+
+        let mut limiters = generation_profile_limiters(&self.generation_profile_requests);
+        Arc::clone(
+            limiters
+                .entry(profile.name.clone())
+                .or_insert_with(|| Arc::new(InFlightLimiter::default())),
+        )
     }
 
     fn try_acquire_control_plane_permit(
@@ -238,6 +347,15 @@ struct AdmissionCounts {
 }
 
 fn admission_counts(current: &Mutex<AdmissionCounts>) -> MutexGuard<'_, AdmissionCounts> {
+    match current.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn generation_profile_limiters(
+    current: &Mutex<HashMap<String, Arc<InFlightLimiter>>>,
+) -> MutexGuard<'_, HashMap<String, Arc<InFlightLimiter>>> {
     match current.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -1018,6 +1136,7 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
         started_at_unix_ms,
         request,
         admission.permit,
+        admission.permit_kind,
         admission.config.server.max_request_body_bytes,
     )
     .await
@@ -1052,6 +1171,14 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
 struct RequestAdmission {
     config: AppConfig,
     permit: InFlightPermit,
+    permit_kind: AdmissionPermitKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AdmissionPermitKind {
+    ControlPlane,
+    Generation,
+    BodyRouting,
 }
 
 struct AdmissionRequestMetadata {
@@ -1125,7 +1252,32 @@ async fn admit_request(
                 );
             }
         };
-        return AdmissionOutcome::Accepted(Box::new(RequestAdmission { config, permit }));
+        return AdmissionOutcome::Accepted(Box::new(RequestAdmission {
+            config,
+            permit,
+            permit_kind: AdmissionPermitKind::ControlPlane,
+        }));
+    }
+
+    if config.has_upstream_profile_generation_limits() {
+        let (config, permit) = match state.acquire_generation_body_routing_permit().await {
+            Ok(admission) => admission,
+            Err(error) => {
+                return reject_admission(
+                    state,
+                    request_id,
+                    started_at_unix_ms,
+                    &request,
+                    Some(config.shielding.enabled),
+                    &error,
+                );
+            }
+        };
+        return AdmissionOutcome::Accepted(Box::new(RequestAdmission {
+            config,
+            permit,
+            permit_kind: AdmissionPermitKind::BodyRouting,
+        }));
     }
 
     let (config, permit) = match state.acquire_generation_permit().await {
@@ -1142,7 +1294,11 @@ async fn admit_request(
         }
     };
 
-    AdmissionOutcome::Accepted(Box::new(RequestAdmission { config, permit }))
+    AdmissionOutcome::Accepted(Box::new(RequestAdmission {
+        config,
+        permit,
+        permit_kind: AdmissionPermitKind::Generation,
+    }))
 }
 
 fn reject_admission(
@@ -1187,6 +1343,7 @@ async fn forward_openai_request(
     started_at_unix_ms: u64,
     request: Request<Body>,
     in_flight_permit: InFlightPermit,
+    admission_permit_kind: AdmissionPermitKind,
     max_request_body_bytes: usize,
 ) -> Result<Response<Body>, ProxyError> {
     let (parts, body) = request.into_parts();
@@ -1194,22 +1351,25 @@ async fn forward_openai_request(
     let uri = parts.uri;
     let downstream_headers = parts.headers;
     let shielding_enabled_hint = config_shielding_enabled(&state.config);
-    let pre_body_request_metadata =
-        pre_upstream_request_metadata(&method, &uri, &downstream_headers, shielding_enabled_hint);
-    let body = read_body_bytes(body, max_request_body_bytes)
-        .await
-        .map_err(|error| error.with_request_metadata(pre_body_request_metadata))?;
-    let body_read_request_metadata = base_request_metadata(
-        &method,
-        &uri,
-        &downstream_headers,
-        body.len().to_string(),
-        shielding_enabled_hint,
-    );
-    let config = state.config.snapshot().map_err(|error| {
-        ProxyError::config_snapshot(error.to_string())
-            .with_request_metadata(body_read_request_metadata)
-    })?;
+    let body_admission = read_body_and_admit_generation(
+        state,
+        body,
+        in_flight_permit,
+        admission_permit_kind,
+        max_request_body_bytes,
+        BodyAdmissionContext {
+            method: &method,
+            uri: &uri,
+            downstream_headers: &downstream_headers,
+            shielding_enabled_hint,
+        },
+    )
+    .await?;
+    let OpenAiBodyAdmission {
+        config,
+        body,
+        in_flight_permit,
+    } = body_admission;
     let mut request_metadata = request_metadata(
         &method,
         &uri,
@@ -1284,6 +1444,86 @@ async fn forward_openai_request(
         in_flight_permit,
     })
     .await
+}
+
+struct OpenAiBodyAdmission {
+    config: AppConfig,
+    body: Bytes,
+    in_flight_permit: InFlightPermit,
+}
+
+struct BodyAdmissionContext<'request> {
+    method: &'request Method,
+    uri: &'request Uri,
+    downstream_headers: &'request HeaderMap,
+    shielding_enabled_hint: Option<bool>,
+}
+
+async fn read_body_and_admit_generation(
+    state: &ProxyState,
+    body: Body,
+    in_flight_permit: InFlightPermit,
+    admission_permit_kind: AdmissionPermitKind,
+    max_request_body_bytes: usize,
+    request: BodyAdmissionContext<'_>,
+) -> Result<OpenAiBodyAdmission, ProxyError> {
+    let pre_body_request_metadata = pre_upstream_request_metadata(
+        request.method,
+        request.uri,
+        request.downstream_headers,
+        request.shielding_enabled_hint,
+    );
+    let body = read_body_bytes(body, max_request_body_bytes)
+        .await
+        .map_err(|error| error.with_request_metadata(pre_body_request_metadata))?;
+    let body_read_request_metadata = base_request_metadata(
+        request.method,
+        request.uri,
+        request.downstream_headers,
+        body.len().to_string(),
+        request.shielding_enabled_hint,
+    );
+    let config = state.config.snapshot().map_err(|error| {
+        ProxyError::config_snapshot(error.to_string())
+            .with_request_metadata(body_read_request_metadata.clone())
+    })?;
+    if is_control_plane_models_request(request.method, request.uri) {
+        return Ok(OpenAiBodyAdmission {
+            config,
+            body,
+            in_flight_permit,
+        });
+    }
+
+    if admission_permit_kind != AdmissionPermitKind::BodyRouting
+        && !config.has_upstream_profile_generation_limits()
+    {
+        return Ok(OpenAiBodyAdmission {
+            config,
+            body,
+            in_flight_permit,
+        });
+    }
+
+    let model_id_for_admission = extract_model_id(&body);
+    if admission_permit_kind == AdmissionPermitKind::Generation {
+        return Ok(OpenAiBodyAdmission {
+            config,
+            body,
+            in_flight_permit,
+        });
+    }
+    let (config, in_flight_permit) = state
+        .acquire_generation_permit_for_model(model_id_for_admission.as_deref(), in_flight_permit)
+        .await
+        .map_err(|error| {
+            ProxyError::admission(error).with_request_metadata(body_read_request_metadata)
+        })?;
+    Ok(OpenAiBodyAdmission {
+        config,
+        body,
+        in_flight_permit,
+    })
 }
 
 struct PreparedOpenAiRequest {
@@ -6082,6 +6322,12 @@ fn proxy_error_response_with_code(
 
 fn proxy_error_response_from_error(error: &ProxyError) -> Response<Body> {
     match error {
+        ProxyError::Admission { failure, .. } => admission_error_response(
+            failure.status(),
+            failure.error_type(),
+            &failure.to_string(),
+            failure.retry_after(),
+        ),
         ProxyError::ContextBudgetExceeded {
             message,
             param,
@@ -6145,6 +6391,11 @@ enum ProxyError {
         reason: String,
         request_metadata: Option<BTreeMap<String, String>>,
     },
+    #[error("{failure}")]
+    Admission {
+        failure: AdmissionFailure,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
     #[error("upstream request failed: {failure}")]
     UpstreamTransport {
         failure: ReqwestFailureKind,
@@ -6194,6 +6445,13 @@ impl ProxyError {
         }
     }
 
+    fn admission(failure: AdmissionFailure) -> Self {
+        Self::Admission {
+            failure,
+            request_metadata: None,
+        }
+    }
+
     fn upstream_body(reason: String) -> Self {
         Self::UpstreamBody {
             reason,
@@ -6217,6 +6475,7 @@ impl ProxyError {
             | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidMethod { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRequestPath(error) => error.status(),
+            Self::Admission { failure, .. } => failure.status(),
             Self::ContextBudgetExceeded { .. } => StatusCode::BAD_REQUEST,
             Self::UpstreamTransport { .. } | Self::UpstreamBody { .. } => StatusCode::BAD_GATEWAY,
         }
@@ -6229,6 +6488,7 @@ impl ProxyError {
             Self::InvalidUpstreamUrl { .. } => "invalid_upstream_url",
             Self::InvalidRequestPath(error) => error.error_type(),
             Self::InvalidMethod { .. } => "invalid_method",
+            Self::Admission { failure, .. } => failure.error_type(),
             Self::ContextBudgetExceeded { .. } => "invalid_request_error",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
             Self::UpstreamBody { .. } => "upstream_body_error",
@@ -6250,6 +6510,10 @@ impl ProxyError {
                 ..
             }
             | Self::InvalidMethod {
+                request_metadata: Some(request_metadata),
+                ..
+            }
+            | Self::Admission {
                 request_metadata: Some(request_metadata),
                 ..
             }
@@ -6279,6 +6543,10 @@ impl ProxyError {
             }
             | Self::InvalidRequestPath(_)
             | Self::InvalidMethod {
+                request_metadata: None,
+                ..
+            }
+            | Self::Admission {
                 request_metadata: None,
                 ..
             }
@@ -6312,6 +6580,7 @@ impl ProxyError {
             | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidRequestPath(_)
             | Self::InvalidMethod { .. }
+            | Self::Admission { .. }
             | Self::ContextBudgetExceeded { .. }
             | Self::UpstreamTransport {
                 observability: None,
@@ -6345,6 +6614,10 @@ impl ProxyError {
             },
             Self::InvalidMethod { reason, .. } => Self::InvalidMethod {
                 reason,
+                request_metadata: Some(request_metadata),
+            },
+            Self::Admission { failure, .. } => Self::Admission {
+                failure,
                 request_metadata: Some(request_metadata),
             },
             Self::ContextBudgetExceeded {
@@ -6393,6 +6666,7 @@ impl ProxyError {
             | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidRequestPath(_)
             | Self::InvalidMethod { .. }
+            | Self::Admission { .. }
             | Self::ContextBudgetExceeded { .. }) => error,
         }
     }

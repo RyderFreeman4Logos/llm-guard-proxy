@@ -339,6 +339,8 @@ name = "aeon-chat"
 base_url = "http://aeon.example/v1"
 match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon"]
 request_timeout_ms = 7200000
+max_in_flight_requests = 8
+max_queued_generation_requests = 16
 
 [upstreams.metadata]
 discovery_enabled = true
@@ -383,6 +385,8 @@ mode = "force_disable"
         ]
     );
     assert_eq!(aeon.request_timeout_ms, 7_200_000);
+    assert_eq!(aeon.max_in_flight_requests, Some(8));
+    assert_eq!(aeon.max_queued_generation_requests, Some(16));
     assert_eq!(aeon.metadata.context_length_override, Some(262_144));
     assert_eq!(aeon.metadata.input_token_safety_margin, 2_048);
     assert_eq!(aeon.thinking.mode, ThinkingMode::ForceThinking);
@@ -489,6 +493,26 @@ match_models = ["one"]
 request_timeout_ms = 0
 "#,
             "upstreams.request_timeout_ms",
+        ),
+        (
+            r#"
+[[upstreams]]
+name = "bad-in-flight"
+base_url = "http://one.example/v1"
+match_models = ["one"]
+max_in_flight_requests = 0
+"#,
+            "upstreams.max_in_flight_requests",
+        ),
+        (
+            r#"
+[[upstreams]]
+name = "bad-queue"
+base_url = "http://one.example/v1"
+match_models = ["one"]
+max_queued_generation_requests = 10001
+"#,
+            "upstreams.max_queued_generation_requests",
         ),
         (
             r#"
@@ -1321,6 +1345,8 @@ name = "aeon-chat"
 base_url = "http://aeon.example/v1"
 match_models = ["aeon-ultimate"]
 request_timeout_ms = 120000
+max_in_flight_requests = 4
+max_queued_generation_requests = 4
 
 [upstreams.metadata]
 context_length_override = 4096
@@ -1341,6 +1367,8 @@ name = "aeon-chat"
 base_url = "http://aeon.example/v1"
 match_models = ["aeon-ultimate"]
 request_timeout_ms = 90000
+max_in_flight_requests = 8
+max_queued_generation_requests = 16
 
 [upstreams.metadata]
 context_length_override = 8192
@@ -1361,6 +1389,8 @@ thinking_token_budget = 2048
     assert!(outcome.applied);
     assert!(outcome.restart_required_changes.is_empty());
     assert_eq!(profile.profile.request_timeout_ms, 90_000);
+    assert_eq!(profile.profile.max_in_flight_requests, Some(8));
+    assert_eq!(profile.profile.max_queued_generation_requests, Some(16));
     assert_eq!(
         profile.profile.metadata.context_length_override,
         Some(8_192)

@@ -7253,6 +7253,597 @@ async fn saturated_generation_requests_wait_for_in_flight_capacity() {
 }
 
 #[tokio::test]
+async fn matched_upstream_profile_has_independent_generation_capacity() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        &format!(
+            r#"max_queued_generation_requests = 0
+generation_queue_timeout_ms = 50
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+max_in_flight_requests = 2
+max_queued_generation_requests = 0
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+
+    let default_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=default"),
+    )
+    .await;
+    assert_eq!(default_response.status(), StatusCode::OK);
+    let default_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("default request should hold the default generation capacity");
+    assert_eq!(
+        default_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=default"
+    );
+
+    let first_embedding = proxy_handler(
+        State(proxy.state.clone()),
+        embedding_request("/v1/embeddings?test=long-json&slot=embedding-one"),
+    )
+    .await;
+    let second_embedding = proxy_handler(
+        State(proxy.state.clone()),
+        embedding_request("/v1/embeddings?test=long-json&slot=embedding-two"),
+    )
+    .await;
+
+    assert_eq!(first_embedding.status(), StatusCode::OK);
+    assert_eq!(second_embedding.status(), StatusCode::OK);
+    let first_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("first matched-profile request should reach upstream despite default saturation");
+    let second_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("second matched-profile request should use profile capacity");
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=embedding-one"
+    );
+    assert_eq!(
+        second_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=embedding-two"
+    );
+
+    drop(first_embedding);
+    drop(second_embedding);
+    drop(default_response);
+}
+
+#[tokio::test]
+async fn profile_limit_mode_bounds_body_routing_before_buffering() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        &format!(
+            r#"max_queued_generation_requests = 1
+generation_queue_timeout_ms = 1000
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+max_in_flight_requests = 2
+max_queued_generation_requests = 0
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+
+    let (active_request, active_body_polled) =
+        tracked_pending_json_request("/v1/completions?slot=active");
+    let active = tokio::spawn(proxy_handler(State(proxy.state.clone()), active_request));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        active_body_polled.load(Ordering::SeqCst),
+        "active routing request should hold the body-routing permit while reading its body"
+    );
+
+    let (queued_request, queued_body_polled) =
+        tracked_pending_json_request("/v1/completions?slot=queued");
+    let queued = tokio::spawn(proxy_handler(State(proxy.state.clone()), queued_request));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !queued_body_polled.load(Ordering::SeqCst),
+        "queued routing request must not read its body before routing capacity is available"
+    );
+    assert!(
+        !queued.is_finished(),
+        "queued routing request should occupy the bounded routing queue"
+    );
+
+    let (overflow_request, overflow_body_polled) =
+        tracked_json_request("/v1/completions?slot=overflow", br#"{"prompt":"overflow"}"#);
+    let overflow_response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy_handler(State(proxy.state.clone()), overflow_request),
+    )
+    .await
+    .expect("routing queue-full response should be bounded");
+
+    assert_eq!(overflow_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        overflow_response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let overflow_body = to_bytes(overflow_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("routing queue-full body should read");
+    let overflow_body =
+        String::from_utf8(overflow_body.to_vec()).expect("routing queue-full body should be utf-8");
+    assert!(
+        overflow_body.contains("proxy_generation_queue_full"),
+        "routing queue-full error should identify admission failure: {overflow_body}"
+    );
+    assert!(
+        !overflow_body_polled.load(Ordering::SeqCst),
+        "routing queue-full rejection must not read the overflow body"
+    );
+    assert_no_upstream_request(&mut fake).await;
+
+    queued.abort();
+    active.abort();
+    assert!(
+        queued
+            .await
+            .expect_err("queued request should be aborted")
+            .is_cancelled()
+    );
+    assert!(
+        active
+            .await
+            .expect_err("active request should be aborted")
+            .is_cancelled()
+    );
+    assert!(
+        !queued_body_polled.load(Ordering::SeqCst),
+        "aborted queued routing request must not read its body"
+    );
+}
+
+#[tokio::test]
+async fn profile_limit_models_bypass_generation_saturation() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        &format!(
+            r#"max_control_plane_in_flight_requests = 2
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+max_in_flight_requests = 2
+max_queued_generation_requests = 0
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+
+    let generation_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=active"),
+    )
+    .await;
+    assert_eq!(generation_response.status(), StatusCode::OK);
+    let generation_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("generation request should hold default generation capacity");
+    assert_eq!(
+        generation_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=active"
+    );
+
+    let model_response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy_handler(
+            State(proxy.state.clone()),
+            empty_get_request("/v1/models?test=model-metadata&slot=profile-limits"),
+        ),
+    )
+    .await
+    .expect("models request should bypass generation saturation in profile-limit mode");
+    assert_eq!(model_response.status(), StatusCode::OK);
+    let model_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("models request should reach upstream in profile-limit mode");
+    assert_eq!(
+        model_observed.path_and_query,
+        "/v1/models?test=model-metadata&slot=profile-limits"
+    );
+
+    drop(model_response);
+    drop(generation_response);
+}
+
+#[tokio::test]
+async fn profile_wait_releases_body_routing_capacity_for_other_profiles() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        &format!(
+            r#"max_queued_generation_requests = 1
+generation_queue_timeout_ms = 1000
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+max_in_flight_requests = 1
+max_queued_generation_requests = 0
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+
+    let default_active = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=default-active"),
+    )
+    .await;
+    assert_eq!(default_active.status(), StatusCode::OK);
+    let default_active_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("default request should hold default generation capacity");
+    assert_eq!(
+        default_active_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=default-active"
+    );
+
+    let (default_queued_request, default_queued_body_polled) = tracked_json_request(
+        "/v1/completions?slot=default-queued",
+        br#"{"prompt":"queued default"}"#,
+    );
+    let default_queued = tokio::spawn(proxy_handler(
+        State(proxy.state.clone()),
+        default_queued_request,
+    ));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        default_queued_body_polled.load(Ordering::SeqCst),
+        "default queued request should read its body before occupying the default profile queue"
+    );
+    assert!(
+        !default_queued.is_finished(),
+        "default queued request should wait on default generation capacity"
+    );
+
+    let embedding_response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy_handler(
+            State(proxy.state.clone()),
+            embedding_request("/v1/embeddings?test=long-json&slot=embedding"),
+        ),
+    )
+    .await
+    .expect("matched profile request must not be blocked by default profile admission wait");
+    assert_eq!(embedding_response.status(), StatusCode::OK);
+    let embedding_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("embedding request should reach upstream while default profile waits");
+    assert_eq!(
+        embedding_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=embedding"
+    );
+
+    default_queued.abort();
+    assert!(
+        default_queued
+            .await
+            .expect_err("default queued request should be aborted")
+            .is_cancelled()
+    );
+    drop(embedding_response);
+    drop(default_active);
+}
+
+#[tokio::test]
+async fn profile_limit_reload_off_exchanges_body_routing_for_global_generation_permit() {
+    let mut fake = FakeUpstream::spawn().await;
+    let initial_upstream_config = format!(
+        r#"max_queued_generation_requests = 0
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+max_in_flight_requests = 1
+max_queued_generation_requests = 0
+"#,
+        fake.base_url
+    );
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        &initial_upstream_config,
+    )
+    .await;
+
+    let (first_request, release_first_body, first_body_polled) = controlled_json_request(
+        "/v1/embeddings?test=long-json&slot=reload-first",
+        br#"{"model":"embedding-model","input":"first"}"#,
+    );
+    let first = tokio::spawn(proxy_handler(State(proxy.state.clone()), first_request));
+    wait_for_flag(
+        &first_body_polled,
+        "first request body should start reading",
+    )
+    .await;
+
+    write_proxy_config_with_observability(ProxyConfigWriteOptions {
+        config_path: proxy.manager.path(),
+        upstream_base_url: &fake.base_url,
+        sqlite_path: &proxy.sqlite_path,
+        evidence_sqlite_path: &proxy.evidence_sqlite_path,
+        observability_enabled: true,
+        max_in_flight_requests: 1,
+        server_config: &format!(
+            r#"max_queued_generation_requests = 0
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+"#,
+            fake.base_url
+        ),
+        metadata_config: "",
+        observability_config: "",
+        evidence_config: "",
+    });
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("profile limit removal reload should succeed");
+    assert!(outcome.applied);
+
+    release_first_body
+        .send(())
+        .expect("first body release should be delivered");
+    let first_response = timeout(STREAM_HEADER_TIMEOUT, first)
+        .await
+        .expect("first request should finish admission after reload")
+        .expect("first request task should not panic");
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("first request should reach upstream after reload");
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=reload-first"
+    );
+
+    let (overflow_request, overflow_body_polled) = tracked_json_request(
+        "/v1/embeddings?slot=reload-overflow",
+        br#"{"model":"embedding-model","input":"overflow"}"#,
+    );
+    let overflow_response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy_handler(State(proxy.state.clone()), overflow_request),
+    )
+    .await
+    .expect("overflow response should be bounded");
+    assert_eq!(overflow_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        !overflow_body_polled.load(Ordering::SeqCst),
+        "overflow request should be rejected by global generation admission before body read"
+    );
+    assert_no_upstream_request(&mut fake).await;
+
+    drop(overflow_response);
+    drop(first_response);
+}
+
+#[tokio::test]
+async fn profile_limit_reload_on_keeps_global_generation_permit_for_default_profile() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        &format!(
+            r#"max_queued_generation_requests = 0
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+
+    let (first_request, release_first_body, first_body_polled) = controlled_json_request(
+        "/v1/completions?test=long-json&slot=reload-on-default",
+        br#"{"prompt":"first"}"#,
+    );
+    let first = tokio::spawn(proxy_handler(State(proxy.state.clone()), first_request));
+    wait_for_flag(
+        &first_body_polled,
+        "default request body should start reading before reload",
+    )
+    .await;
+
+    write_proxy_config_with_observability(ProxyConfigWriteOptions {
+        config_path: proxy.manager.path(),
+        upstream_base_url: &fake.base_url,
+        sqlite_path: &proxy.sqlite_path,
+        evidence_sqlite_path: &proxy.evidence_sqlite_path,
+        observability_enabled: true,
+        max_in_flight_requests: 1,
+        server_config: &format!(
+            r#"max_queued_generation_requests = 0
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+max_in_flight_requests = 1
+max_queued_generation_requests = 0
+"#,
+            fake.base_url
+        ),
+        metadata_config: "",
+        observability_config: "",
+        evidence_config: "",
+    });
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("profile limit addition reload should succeed");
+    assert!(outcome.applied);
+
+    release_first_body
+        .send(())
+        .expect("first body release should be delivered");
+    let first_response = timeout(STREAM_HEADER_TIMEOUT, first)
+        .await
+        .expect("first request should finish admission after reload")
+        .expect("first request task should not panic");
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("default request should keep its global permit and reach upstream");
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/completions?test=long-json&slot=reload-on-default"
+    );
+
+    drop(first_response);
+}
+
+#[tokio::test]
+async fn profile_limit_reload_on_keeps_global_generation_permit_for_newly_limited_profile() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        2,
+        &format!(
+            r#"max_queued_generation_requests = 0
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+
+    let (first_request, release_first_body, first_body_polled) = controlled_json_request(
+        "/v1/embeddings?test=long-json&slot=reload-on-matched-first",
+        br#"{"model":"embedding-model","input":"first"}"#,
+    );
+    let first = tokio::spawn(proxy_handler(State(proxy.state.clone()), first_request));
+    wait_for_flag(
+        &first_body_polled,
+        "matched profile request body should start reading before reload",
+    )
+    .await;
+
+    write_proxy_config_with_observability(ProxyConfigWriteOptions {
+        config_path: proxy.manager.path(),
+        upstream_base_url: &fake.base_url,
+        sqlite_path: &proxy.sqlite_path,
+        evidence_sqlite_path: &proxy.evidence_sqlite_path,
+        observability_enabled: true,
+        max_in_flight_requests: 2,
+        server_config: &format!(
+            r#"max_queued_generation_requests = 0
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+max_in_flight_requests = 1
+max_queued_generation_requests = 0
+"#,
+            fake.base_url
+        ),
+        metadata_config: "",
+        observability_config: "",
+        evidence_config: "",
+    });
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("profile limit addition reload should succeed");
+    assert!(outcome.applied);
+
+    let active_profile_response = proxy_handler(
+        State(proxy.state.clone()),
+        embedding_request("/v1/embeddings?test=long-json&slot=profile-active"),
+    )
+    .await;
+    assert_eq!(active_profile_response.status(), StatusCode::OK);
+    let active_profile_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("new profile-limited request should hold profile capacity");
+    assert_eq!(
+        active_profile_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=profile-active"
+    );
+
+    release_first_body
+        .send(())
+        .expect("first body release should be delivered");
+    let first_response = timeout(STREAM_HEADER_TIMEOUT, first)
+        .await
+        .expect("pre-reload request should not be re-admitted into the new profile limiter")
+        .expect("first request task should not panic");
+    assert_eq!(first_response.status(), StatusCode::OK);
+    let first_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("pre-reload matched request should keep its global permit and reach upstream");
+    assert_eq!(
+        first_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=reload-on-matched-first"
+    );
+
+    drop(active_profile_response);
+    drop(first_response);
+}
+
+#[tokio::test]
 async fn generation_queue_full_fails_without_body_buffering_or_upstream_forward() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_admission_config(
@@ -7355,6 +7946,57 @@ fn tracked_json_request(uri: &str, body: &'static [u8]) -> (Request<Body>, Arc<A
         .body(request_body)
         .expect("tracked json request should build");
     (request, polled)
+}
+
+fn tracked_pending_json_request(uri: &str) -> (Request<Body>, Arc<AtomicBool>) {
+    let polled = Arc::new(AtomicBool::new(false));
+    let request_body = Body::from_stream(stream::once({
+        let polled = Arc::clone(&polled);
+        async move {
+            polled.store(true, Ordering::SeqCst);
+            std::future::pending::<Result<Bytes, std::convert::Infallible>>().await
+        }
+    }));
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(CONTENT_TYPE, "application/json")
+        .body(request_body)
+        .expect("tracked pending json request should build");
+    (request, polled)
+}
+
+fn controlled_json_request(
+    uri: &str,
+    body: &'static [u8],
+) -> (Request<Body>, oneshot::Sender<()>, Arc<AtomicBool>) {
+    let (release, released) = oneshot::channel();
+    let polled = Arc::new(AtomicBool::new(false));
+    let request_body = Body::from_stream(stream::once({
+        let polled = Arc::clone(&polled);
+        async move {
+            polled.store(true, Ordering::SeqCst);
+            let _ = released.await;
+            Ok::<_, std::convert::Infallible>(Bytes::from_static(body))
+        }
+    }));
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(CONTENT_TYPE, "application/json")
+        .body(request_body)
+        .expect("controlled json request should build");
+    (request, release, polled)
+}
+
+async fn wait_for_flag(flag: &AtomicBool, label: &str) {
+    timeout(Duration::from_secs(1), async {
+        while !flag.load(Ordering::SeqCst) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {label}"));
 }
 
 #[tokio::test]
@@ -7962,6 +8604,17 @@ fn empty_get_request(uri: &'static str) -> Request<Body> {
         .uri(uri)
         .body(Body::empty())
         .expect("GET request should build")
+}
+
+fn embedding_request(uri: &'static str) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"embedding-model","input":"capacity test"}"#,
+        ))
+        .expect("embedding request should build")
 }
 
 fn shielded_chat_request(uri: &'static str, body: &'static str) -> Request<Body> {
