@@ -109,7 +109,9 @@ fn is_non_secret_token_metric(normalized_key: &str) -> bool {
             | "thinkingbudgetprevioustokens"
             | "thinkingbudgetfinaltokens"
             | "thinkinganswerbudgetdeltatokens"
-    )
+    ) || normalized_key.contains("tokenwindowsize")
+        || normalized_key.contains("tokenwindowcount")
+        || normalized_key.contains("uniquetokenwindow")
 }
 
 fn looks_sensitive(value: &str) -> bool {

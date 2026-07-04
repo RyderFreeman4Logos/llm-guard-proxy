@@ -602,11 +602,43 @@ impl Default for ThinkingConfig {
     }
 }
 
+/// Loop detector decision mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LoopGuardMode {
+    /// Skip detector construction and feature calculation.
+    Disabled,
+    /// Record bounded detector signals but never abort or retry.
+    #[default]
+    Monitor,
+    /// Abort on high-confidence abort candidates.
+    Enforce,
+}
+
+impl LoopGuardMode {
+    /// Returns the TOML-compatible mode label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Monitor => "monitor",
+            Self::Enforce => "enforce",
+        }
+    }
+
+    /// Returns true when detector work should be skipped.
+    #[must_use]
+    pub const fn is_disabled(self) -> bool {
+        matches!(self, Self::Disabled)
+    }
+}
+
 /// Loop detection policy for repeated normalized inputs.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoopGuardConfig {
-    /// Enables normalized repeated-input detection.
+    /// Enables loop-guard behavior. `false` is equivalent to mode `disabled`.
     pub enabled: bool,
+    /// Channelized detector decision mode.
+    pub mode: LoopGuardMode,
     /// Time window used to compare normalized inputs.
     pub normalized_input_window_secs: u64,
     /// Repeat threshold that triggers loop-protection behavior.
@@ -638,6 +670,16 @@ pub struct LoopGuardConfig {
 }
 
 impl LoopGuardConfig {
+    /// Returns the detector mode after applying the legacy `enabled` switch.
+    #[must_use]
+    pub const fn effective_mode(&self) -> LoopGuardMode {
+        if self.enabled {
+            self.mode
+        } else {
+            LoopGuardMode::Disabled
+        }
+    }
+
     fn validate(&self) -> Result<(), ValidationError> {
         require(
             self.normalized_input_window_secs > 0,
@@ -721,6 +763,7 @@ impl Default for LoopGuardConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: LoopGuardMode::Monitor,
             normalized_input_window_secs: 120,
             max_repeated_inputs: 1,
             output_repeated_line_threshold: 24,

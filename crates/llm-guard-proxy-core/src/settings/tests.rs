@@ -6,7 +6,7 @@ use std::{
 };
 
 use super::{
-    AppConfig, ConfigManager, ConfigParseError, HeartbeatMode, MissingConfigPolicy,
+    AppConfig, ConfigManager, ConfigParseError, HeartbeatMode, LoopGuardMode, MissingConfigPolicy,
     RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ToolRequestThinkingPolicy, ValidationError,
     parse::parse_config_text, redact_upstream_base_url,
 };
@@ -55,6 +55,8 @@ fn defaults_match_issue_contract() {
         ToolRequestThinkingPolicy::Apply
     );
     assert!(config.loop_guard.enabled);
+    assert_eq!(config.loop_guard.mode, LoopGuardMode::Monitor);
+    assert_eq!(config.loop_guard.effective_mode(), LoopGuardMode::Monitor);
     assert_eq!(config.loop_guard.normalized_input_window_secs, 120);
     assert_eq!(config.loop_guard.max_repeated_inputs, 1);
     assert_eq!(config.loop_guard.output_repeated_line_threshold, 24);
@@ -152,6 +154,7 @@ mode = "json-whitespace"
 interval_secs = 5
 
 [loop_guard]
+mode = "monitor"
 output_repeated_line_threshold = 40
 output_token_window_size = 8
 output_repeated_token_window_threshold = 9
@@ -204,6 +207,7 @@ enabled = false
     assert_parsed_observability_overrides(&config);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::JsonWhitespace);
     assert_eq!(config.heartbeat.interval_secs, 5);
+    assert_eq!(config.loop_guard.mode, LoopGuardMode::Monitor);
     assert_eq!(config.loop_guard.output_repeated_line_threshold, 40);
     assert_eq!(config.loop_guard.output_token_window_size, 8);
     assert_eq!(config.loop_guard.output_repeated_token_window_threshold, 9);
@@ -247,6 +251,55 @@ reasoning_semantic_history_window_count = 20
         config.loop_guard.reasoning_semantic_history_window_count,
         20
     );
+}
+
+#[test]
+fn parses_loop_guard_modes_and_legacy_enabled_switch() {
+    for (mode, expected) in [
+        ("disabled", LoopGuardMode::Disabled),
+        ("monitor", LoopGuardMode::Monitor),
+        ("enforce", LoopGuardMode::Enforce),
+    ] {
+        let config = parse_config_text(&format!(
+            r#"
+[loop_guard]
+mode = "{mode}"
+"#
+        ))
+        .expect("loop guard mode should parse");
+
+        assert_eq!(config.loop_guard.mode, expected);
+        assert_eq!(config.loop_guard.effective_mode(), expected);
+    }
+
+    let config = parse_config_text(
+        r#"
+[loop_guard]
+enabled = false
+mode = "enforce"
+"#,
+    )
+    .expect("legacy loop guard switch should parse");
+
+    assert_eq!(config.loop_guard.mode, LoopGuardMode::Enforce);
+    assert_eq!(config.loop_guard.effective_mode(), LoopGuardMode::Disabled);
+}
+
+#[test]
+fn rejects_invalid_loop_guard_mode() {
+    let error = parse_config_text(
+        r#"
+[loop_guard]
+mode = "observe-everything"
+"#,
+    )
+    .expect_err("invalid detector mode should fail");
+
+    assert_eq!(error.line(), 3);
+    assert!(error.message().contains("invalid loop_guard.mode"));
+    assert!(error.message().contains("disabled"));
+    assert!(error.message().contains("monitor"));
+    assert!(error.message().contains("enforce"));
 }
 
 fn assert_parsed_upstream_stall_overrides(config: &AppConfig) {
@@ -703,8 +756,9 @@ max_request_body_bytes = 1048576
 mode = "sse"
 interval_secs = 15
 
-[loop_guard]
-output_repeated_line_threshold = 24
+	[loop_guard]
+	mode = "enforce"
+	output_repeated_line_threshold = 24
 reasoning_semantic_detection_enabled = true
 reasoning_semantic_similarity_threshold_percent = 55
 reasoning_semantic_window_token_count = 24
@@ -735,8 +789,9 @@ request_timeout_ms = 90000
 mode = "disabled"
 interval_secs = 3
 
-[loop_guard]
-output_repeated_line_threshold = 7
+	[loop_guard]
+	mode = "monitor"
+	output_repeated_line_threshold = 7
 reasoning_semantic_detection_enabled = false
 reasoning_semantic_similarity_threshold_percent = 70
 reasoning_semantic_window_token_count = 32
@@ -763,6 +818,7 @@ reasoning_semantic_history_window_count = 20
     assert_eq!(snapshot.upstream.request_timeout_ms, 90_000);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 3);
+    assert_eq!(snapshot.loop_guard.mode, LoopGuardMode::Monitor);
     assert_eq!(snapshot.loop_guard.output_repeated_line_threshold, 7);
     assert!(!snapshot.loop_guard.reasoning_semantic_detection_enabled);
     assert_eq!(
@@ -865,6 +921,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"server.generation_queue_timeout_ms"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_control_plane_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_request_body_bytes"));
+    assert!(RELOADABLE_FIELDS.contains(&"loop_guard.mode"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.output_repeated_line_threshold"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.input_overlap_threshold_multiplier"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_detection_enabled"));

@@ -1076,6 +1076,9 @@ async fn shielded_loop_guard_catches_reasoning_line_repeated_hundreds_of_times()
         r#"
 [heartbeat]
 mode = "disabled"
+
+[loop_guard]
+mode = "enforce"
 "#,
     )
     .await;
@@ -1130,6 +1133,7 @@ async fn shielded_loop_guard_catches_semantic_reasoning_repetition_with_varied_w
 mode = "disabled"
 
 [loop_guard]
+mode = "enforce"
 output_repeated_line_threshold = 100
 output_repeated_token_window_threshold = 100
 output_suffix_cycle_threshold = 100
@@ -1187,6 +1191,241 @@ enabled = false
 }
 
 #[tokio::test]
+async fn shielded_loop_guard_monitor_records_reasoning_signal_without_abort() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+mode = "monitor"
+output_repeated_line_threshold = 4
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-reasoning-hundreds",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response.text().await.expect("body should be text");
+
+    let attempt_row = read_last_observability_row(&proxy.sqlite_path, "attempts");
+    assert_eq!(attempt_row.status, "succeeded");
+    let metadata = &attempt_row.response_metadata;
+    assert_eq!(metadata["loop_detector_mode"], "monitor");
+    assert_eq!(metadata["loop_signal_0_channel"], "reasoning");
+    assert_eq!(metadata["loop_signal_0_reason_code"], "repeated_line");
+    assert_eq!(metadata["loop_signal_0_severity"], "abort_candidate");
+    assert!(metadata.get("loop_detected").is_none());
+    assert!(!metadata.to_string().contains("reasoning loop line"));
+}
+
+#[tokio::test]
+async fn shielded_loop_guard_disabled_skips_detector_metadata() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+mode = "disabled"
+output_repeated_line_threshold = 4
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-reasoning-hundreds",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response.text().await.expect("body should be text");
+
+    let attempt_row = read_last_observability_row(&proxy.sqlite_path, "attempts");
+    assert_eq!(attempt_row.status, "succeeded");
+    assert!(
+        attempt_row
+            .response_metadata
+            .get("loop_detector_mode")
+            .is_none()
+    );
+    assert!(
+        attempt_row
+            .response_metadata
+            .get("loop_signal_count")
+            .is_none()
+    );
+    assert!(attempt_row.response_metadata.get("loop_detected").is_none());
+}
+
+#[tokio::test]
+async fn shielded_loop_guard_monitor_records_tool_argument_and_fingerprint_signals() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+mode = "monitor"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=repeated-tool-fingerprint",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response.text().await.expect("body should be text");
+
+    let attempt_row = read_last_observability_row(&proxy.sqlite_path, "attempts");
+    let metadata = &attempt_row.response_metadata;
+    let metadata_text = metadata.to_string();
+    assert_eq!(metadata["loop_detector_mode"], "monitor");
+    assert!(metadata_text.contains("tool_arguments"));
+    assert!(metadata_text.contains("tool_arguments_json_completed"));
+    assert!(metadata_text.contains("tool_fingerprint"));
+    assert!(metadata_text.contains("tool_fingerprint_repeated"));
+    assert!(metadata_text.contains("fingerprint_hash"));
+    assert!(!metadata_text.contains(r#""q":"#));
+    assert!(!metadata_text.contains("limit"));
+}
+
+#[tokio::test]
+async fn debug_summary_exposes_bounded_loop_detector_metadata_without_raw_payloads() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_full_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        "",
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+mode = "monitor"
+"#,
+        r#"debug_summary_enabled = true
+debug_summary_admin_token = "admin-token"
+debug_summary_max_records = 5
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=repeated-tool-fingerprint",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"debug-summary-prompt-secret"}]}"#,
+        )
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response.text().await.expect("body should be text");
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/recent-requests?limit=5", proxy.base_url))
+        .header(AUTHORIZATION, "Bearer admin-token")
+        .send()
+        .await
+        .expect("debug summary request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("debug summary should be text");
+    let summary: serde_json::Value =
+        serde_json::from_str(&body).expect("debug summary should be JSON");
+    let request = summary["requests"]
+        .as_array()
+        .and_then(|requests| {
+            requests.iter().find(|request| {
+                request["response_metadata"]["loop_detector_mode"].as_str() == Some("monitor")
+            })
+        })
+        .expect("debug summary should include the loop request");
+    let metadata = request["response_metadata"]
+        .as_object()
+        .expect("debug summary response metadata should be an object");
+    let metadata_text = request["response_metadata"].to_string();
+
+    assert_eq!(
+        metadata
+            .get("loop_detector_mode")
+            .and_then(serde_json::Value::as_str),
+        Some("monitor")
+    );
+    assert!(
+        metadata_text.contains("tool_arguments_json_completed"),
+        "debug summary should include bounded completed-JSON detector signal: {metadata_text}"
+    );
+    assert!(
+        metadata_text.contains("tool_fingerprint_repeated"),
+        "debug summary should include bounded fingerprint detector signal: {metadata_text}"
+    );
+    assert!(metadata_text.contains("fingerprint_hash"));
+    assert!(metadata.len() < 200);
+    assert!(!body.contains("debug-summary-prompt-secret"));
+    assert!(!metadata_text.contains(r#""q":"#));
+    assert!(!metadata_text.contains(r#""limit":1"#));
+    assert!(!metadata_text.contains("lookup"));
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_metric_type(
+        &metrics,
+        "llm_guard_proxy_current_retained_requests",
+        "gauge",
+    );
+    assert!(!metrics.contains("debug-summary-prompt-secret"));
+    assert!(!metrics.contains(r#""q":"#));
+    assert!(!metrics.contains(r#""limit":1"#));
+    assert!(!metrics.contains("lookup"));
+}
+
+#[tokio::test]
 async fn shielded_loop_guard_does_not_flag_repeated_input_without_output_loop() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -1228,7 +1467,7 @@ output_repeated_line_threshold = 4
 }
 
 #[tokio::test]
-async fn shielded_loop_guard_raises_threshold_for_output_copying_repeated_input() {
+async fn shielded_loop_guard_records_suspect_for_output_copying_repeated_input() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -1278,21 +1517,35 @@ input_overlap_threshold_multiplier = 3
         .send()
         .await
         .expect("over-threshold request should complete");
-    assert_eq!(over_threshold.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(over_threshold.status(), StatusCode::OK);
+    let _over_body = over_threshold
+        .text()
+        .await
+        .expect("over-threshold body should be text");
 
     let attempt_row = read_last_observability_row(&proxy.sqlite_path, "attempts");
-    assert_eq!(attempt_row.status, "failed");
-    assert_eq!(attempt_row.response_metadata["loop_detected"], "true");
+    assert_eq!(attempt_row.status, "succeeded");
     assert_eq!(
-        attempt_row.response_metadata["loop_signal"],
+        attempt_row.response_metadata["loop_signal_0_reason_code"],
         "repeated_line"
     );
-    assert_eq!(attempt_row.response_metadata["loop_channel"], "content");
-    assert_eq!(attempt_row.response_metadata["loop_threshold"], "12");
     assert_eq!(
-        attempt_row.response_metadata["loop_input_overlap_applied"],
+        attempt_row.response_metadata["loop_signal_0_channel"],
+        "content"
+    );
+    assert_eq!(
+        attempt_row.response_metadata["loop_signal_0_severity"],
+        "suspect"
+    );
+    assert_eq!(
+        attempt_row.response_metadata["loop_signal_0_feature_threshold"],
+        "12"
+    );
+    assert_eq!(
+        attempt_row.response_metadata["loop_signal_0_feature_input_overlap_applied"],
         "true"
     );
+    assert!(attempt_row.response_metadata.get("loop_detected").is_none());
 }
 
 #[tokio::test]
@@ -1307,6 +1560,7 @@ async fn hot_reloaded_loop_threshold_changes_subsequent_requests() {
 mode = "disabled"
 
 [loop_guard]
+mode = "enforce"
 output_repeated_line_threshold = 10
 output_repeated_token_window_threshold = 100
 output_suffix_cycle_threshold = 100
@@ -1344,6 +1598,7 @@ output_low_progress_min_bytes = 1000000
 mode = "disabled"
 
 [loop_guard]
+mode = "enforce"
 output_repeated_line_threshold = 4
 output_repeated_token_window_threshold = 100
 output_suffix_cycle_threshold = 100
@@ -1381,14 +1636,15 @@ async fn shielded_retry_loops_once_then_succeeds_without_emitting_loop() {
         &fake.base_url,
         true,
         AppConfig::default().server.max_in_flight_requests,
-        r"
+        r#"
 [loop_guard]
+mode = "enforce"
 output_repeated_line_threshold = 4
 
 [retry]
 max_attempts = 5
 anti_loop_hint_enabled = true
-",
+"#,
     )
     .await;
 
@@ -1844,6 +2100,7 @@ async fn shielded_retry_all_loop_attempts_returns_error_and_records_chain() {
 mode = "disabled"
 
 [loop_guard]
+mode = "enforce"
 output_repeated_line_threshold = 4
 
 [retry]
@@ -1907,6 +2164,7 @@ async fn shielded_retry_policy_can_be_disabled_for_single_attempt_behavior() {
 mode = "disabled"
 
 [loop_guard]
+mode = "enforce"
 output_repeated_line_threshold = 4
 
 [retry]
@@ -2075,6 +2333,7 @@ async fn hot_reloaded_retry_max_attempts_reduces_subsequent_requests() {
 mode = "disabled"
 
 [loop_guard]
+mode = "enforce"
 output_repeated_line_threshold = 4
 
 [retry]
@@ -2113,6 +2372,7 @@ max_attempts = 4
 mode = "disabled"
 
 [loop_guard]
+mode = "enforce"
 output_repeated_line_threshold = 4
 
 [retry]
@@ -3752,6 +4012,7 @@ mode = "json-whitespace"
 interval_secs = 1
 
 [loop_guard]
+mode = "enforce"
 output_repeated_line_threshold = 4
 
 [retry]
@@ -6481,6 +6742,9 @@ fn fake_chat_completion_response(
     if path_and_query.contains("test=semantic-reasoning-varied") {
         return Some(semantic_reasoning_repetition_sse_response());
     }
+    if path_and_query.contains("test=repeated-tool-fingerprint") {
+        return Some(repeated_tool_fingerprint_sse_response());
+    }
     if path_and_query.contains("test=copy-input-under-threshold") {
         return Some(repeated_input_copy_sse_response(11));
     }
@@ -6764,6 +7028,36 @@ fn semantic_reasoning_repetition_sse_response() -> Response<Body> {
             }),
             serde_json::json!({
                 "reasoning_content": "Return to the unzip tmpdir plan, with bsdtar as the extractor fallback and python zipfile for inspection.\n",
+            }),
+        ],
+    )
+}
+
+fn repeated_tool_fingerprint_sse_response() -> Response<Body> {
+    delta_fragments_sse_response(
+        "chat-completions-repeated-tool-fingerprint-sse",
+        [
+            serde_json::json!({
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": "{\"q\":\"x\",\"limit\":1}"
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "tool_calls": [{
+                    "index": 1,
+                    "id": "call_2",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "arguments": "{\"limit\":1,\"q\":\"x\"}"
+                    }
+                }]
             }),
         ],
     )

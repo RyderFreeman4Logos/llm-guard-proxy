@@ -4,9 +4,15 @@
 //! Issue #1 intentionally kept this crate small. Later issues add proxy,
 //! retry, and request-shielding behavior behind core interfaces.
 
+mod loop_detector;
 mod observability;
 mod settings;
 
+pub use loop_detector::{
+    BoundedFeatureSummary, ChannelizedLoopDetector, DetectorEventKind, DetectorSummary,
+    LoopDetector, LoopDetectorInput, LoopInputProfile, LoopReasonCode, LoopSeverity, LoopSignal,
+    StreamChannel, ToolCallFingerprintInput,
+};
 pub use observability::{
     AttemptId, AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary,
     DownstreamMode, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram,
@@ -16,12 +22,12 @@ pub use observability::{
 };
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
-    DEFAULT_CONFIG_RELATIVE_PATH, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, MetadataConfig,
-    MissingConfigPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
-    ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig, RetryConfig,
-    ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy, UpstreamConfig,
-    UpstreamStallConfig, ValidationError, default_config_path, redact_upstream_base_url,
-    validate_upstream_base_url,
+    DEFAULT_CONFIG_RELATIVE_PATH, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, LoopGuardMode,
+    MetadataConfig, MissingConfigPolicy, ObservabilityConfig, RELOADABLE_FIELDS,
+    RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig,
+    RetryConfig, ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy,
+    UpstreamConfig, UpstreamStallConfig, ValidationError, default_config_path,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 
 /// Public service name used by the binary and documentation.

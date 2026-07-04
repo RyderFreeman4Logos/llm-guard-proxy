@@ -14,9 +14,9 @@ mod tests;
 pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, HeartbeatConfig, HeartbeatMode, LoopGuardConfig,
-    MetadataConfig, ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig,
-    ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy, UpstreamConfig,
-    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    LoopGuardMode, MetadataConfig, ObservabilityConfig, RestartRequiredChange, RetentionConfig,
+    RetryConfig, ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy,
+    UpstreamConfig, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 pub use reload::{
     ConfigHandle, ConfigManager, MissingConfigPolicy, ReloadOutcome, ReloadWatcher,
@@ -52,6 +52,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "thinking.preserve_answer_budget",
     "thinking.tool_request_policy",
     "loop_guard.enabled",
+    "loop_guard.mode",
     "loop_guard.normalized_input_window_secs",
     "loop_guard.max_repeated_inputs",
     "loop_guard.output_repeated_line_threshold",
