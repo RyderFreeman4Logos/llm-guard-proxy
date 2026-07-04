@@ -28,11 +28,13 @@ use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
-    DownstreamDropPolicy, DownstreamMode, Health, HeartbeatMode, LICENSE, LatencyHistogram,
-    MetadataConfig, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId,
-    RequestRecord, RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME, ThinkingConfig,
-    UpstreamMode, UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig,
-    redact_upstream_base_url, validate_upstream_base_url,
+    DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
+    EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore, EvidenceStoreWrite, Health,
+    HeartbeatMode, LICENSE, LatencyHistogram, MetadataConfig, ObservabilityMetricsSnapshot,
+    ObservabilityStore, RawPayloads, RequestId, RequestRecord, RequestStatus, RetryConfig,
+    RetryLadderConfig, SERVICE_NAME, ShadowSkipReason, ThinkingConfig, UpstreamMode,
+    UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -63,11 +65,13 @@ pub(crate) struct ProxyState {
     config: ConfigHandle,
     config_path: PathBuf,
     store: ObservabilityStore,
+    evidence_store: EvidenceStore,
     client: Client,
     generation_requests: Arc<InFlightLimiter>,
     control_plane_requests: Arc<InFlightLimiter>,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
+    shadow_attempts: Arc<InFlightLimiter>,
 }
 
 impl ProxyState {
@@ -77,17 +81,20 @@ impl ProxyState {
         config: ConfigHandle,
         config_path: PathBuf,
         store: ObservabilityStore,
+        evidence_store: EvidenceStore,
         client: Client,
     ) -> Self {
         Self {
             config,
             config_path,
             store,
+            evidence_store,
             client,
             generation_requests: Arc::new(InFlightLimiter::default()),
             control_plane_requests: Arc::new(InFlightLimiter::default()),
             upstream_stall_recovery: Arc::new(UpstreamStallRecoveryCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
+            shadow_attempts: Arc::new(InFlightLimiter::default()),
         }
     }
 
@@ -1231,7 +1238,9 @@ async fn forward_openai_request(
                 upstream_timeout: Duration::from_millis(
                     prepared_request.upstream_profile.request_timeout_ms,
                 ),
+                config: state.config.clone(),
                 store: state.store.clone(),
+                evidence_store: state.evidence_store.clone(),
                 request_id: request_id.clone(),
                 started_at_unix_ms,
                 model_id: prepared_request.model_id,
@@ -1244,6 +1253,8 @@ async fn forward_openai_request(
                 retry_policy,
                 upstream_stall_policy,
                 upstream_stall_recovery: state.upstream_stall_recovery.clone(),
+                shadow_attempts: state.shadow_attempts.clone(),
+                shadow_evidence: ShadowEvidenceState::default(),
             },
             in_flight_permit,
         )
@@ -1384,7 +1395,9 @@ async fn forward_generic_openai_request(
     let upstream_status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
     let response_parts = ForwardedResponseParts {
+        config: context.state.config.clone(),
         store: context.state.store.clone(),
+        evidence_store: context.state.evidence_store.clone(),
         request_id: context.request_id.clone(),
         started_at_unix_ms: context.started_at_unix_ms,
         attempt_id,
@@ -2110,7 +2123,9 @@ fn sanitized_reqwest_error(error: &reqwest::Error) -> String {
 }
 
 struct ForwardedResponseParts {
+    config: ConfigHandle,
     store: ObservabilityStore,
+    evidence_store: EvidenceStore,
     request_id: RequestId,
     started_at_unix_ms: u64,
     attempt_id: AttemptId,
@@ -2149,8 +2164,11 @@ impl ForwardedResponseParts {
             raw_payloads: raw_payloads.clone(),
         };
         ForwardedBodyObserver {
+            config: self.config,
             downstream_mode,
             store: self.store,
+            evidence_store: self.evidence_store,
+            shadow_evidence: ShadowEvidenceState::default(),
             request_id: self.request_id,
             started_at_unix_ms: self.started_at_unix_ms,
             upstream_mode: self.upstream_mode,
@@ -2229,7 +2247,9 @@ struct ShieldedRetryRuntime {
     downstream_body: Bytes,
     chat_kind: ShieldedChatKind,
     upstream_timeout: Duration,
+    config: ConfigHandle,
     store: ObservabilityStore,
+    evidence_store: EvidenceStore,
     request_id: RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
@@ -2242,6 +2262,8 @@ struct ShieldedRetryRuntime {
     retry_policy: ShieldedRetryPolicy,
     upstream_stall_policy: UpstreamStallPolicy,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
+    shadow_attempts: Arc<InFlightLimiter>,
+    shadow_evidence: ShadowEvidenceState,
 }
 
 #[derive(Clone, Debug)]
@@ -2255,6 +2277,47 @@ struct ShieldedAttemptInfo {
     upstream_headers: HeaderMap,
     upstream_mode: UpstreamMode,
     request_metadata: BTreeMap<String, String>,
+    raw_request_body: Option<String>,
+    upstream_body: Bytes,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ShadowEvidenceState {
+    inner: Arc<Mutex<ShadowEvidenceInner>>,
+}
+
+#[derive(Debug, Default)]
+struct ShadowEvidenceInner {
+    reserved_attempts: u32,
+    records: Vec<EvidenceAttemptRecord>,
+}
+
+impl ShadowEvidenceState {
+    fn try_reserve_attempt(&self, max_attempts: u32) -> Option<u32> {
+        let mut inner = shadow_evidence_inner(&self.inner);
+        if inner.reserved_attempts >= max_attempts {
+            return None;
+        }
+        inner.reserved_attempts = inner.reserved_attempts.saturating_add(1);
+        Some(inner.reserved_attempts)
+    }
+
+    fn push_record(&self, record: EvidenceAttemptRecord) {
+        shadow_evidence_inner(&self.inner).records.push(record);
+    }
+
+    fn snapshot(&self) -> Vec<EvidenceAttemptRecord> {
+        shadow_evidence_inner(&self.inner).records.clone()
+    }
+}
+
+fn shadow_evidence_inner(
+    current: &Mutex<ShadowEvidenceInner>,
+) -> MutexGuard<'_, ShadowEvidenceInner> {
+    match current.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 struct ShieldedStartedAttempt {
@@ -2265,7 +2328,6 @@ struct ShieldedStartedAttempt {
 struct ShieldedAcceptedOutcome {
     body: Bytes,
     sse_body: Bytes,
-    raw_payloads: RawPayloads,
     response_metadata: BTreeMap<String, String>,
     prior_attempt_records: Vec<AttemptRecord>,
     final_attempt: FinalAttemptContext,
@@ -2274,7 +2336,6 @@ struct ShieldedAcceptedOutcome {
 struct ShieldedAggregatedAttempt {
     body: Bytes,
     sse_body: Bytes,
-    raw_payloads: RawPayloads,
     response_metadata: BTreeMap<String, String>,
     final_attempt: FinalAttemptContext,
 }
@@ -2321,6 +2382,8 @@ struct ShieldedAttemptFailure {
     abort_reason: Option<String>,
     request_metadata: BTreeMap<String, String>,
     response_metadata: BTreeMap<String, String>,
+    raw_payloads: RawPayloads,
+    upstream_body: Bytes,
 }
 
 async fn forward_shielded_chat_with_retries(
@@ -2676,7 +2739,6 @@ async fn aggregate_shielded_attempt(
             ),
             body: aggregated.body,
             sse_body: aggregated.sse_body,
-            raw_payloads: aggregated.raw_payloads,
             response_metadata: aggregated.response_metadata,
         }),
         Err(error) => Err(aggregation_failure(&started.info, &error)),
@@ -2751,7 +2813,6 @@ async fn run_shielded_attempts(
                 return ShieldedRunOutcome::Accepted(ShieldedAcceptedOutcome {
                     body: aggregated.body,
                     sse_body: aggregated.sse_body,
-                    raw_payloads: aggregated.raw_payloads,
                     response_metadata: aggregated.response_metadata,
                     prior_attempt_records: attempt_records,
                     final_attempt: aggregated.final_attempt,
@@ -2768,12 +2829,14 @@ async fn run_shielded_attempts(
                 .await;
                 can_retry = can_retry && recovery_gate.permits_retry;
                 failure.response_metadata.extend(recovery_gate.metadata);
-                attempt_records.push(attempt_failure_record(
+                let attempt_record = attempt_failure_record(
                     &failure,
                     retry_attempt_status(can_retry),
                     retry_cause_for_attempt_record(can_retry, next_retry_cause),
                     &runtime.retry_policy,
-                ));
+                );
+                maybe_schedule_shadow_continuation(&runtime, &failure, &attempt_record);
+                attempt_records.push(attempt_record);
                 update_shielded_attempt_progress(attempt_progress.as_ref(), &attempt_records, None);
                 if can_retry {
                     attempt_number = failure.attempt_number.saturating_add(1);
@@ -3218,6 +3281,8 @@ async fn start_shielded_attempt(
         .attempt_plan(attempt_number, &runtime.upstream_profile.thinking);
     let (upstream_body, anti_loop_hint_applied) =
         shielded_attempt_body(runtime, attempt_number, retry_cause, &attempt_plan);
+    let raw_request_body = raw_payload_text(&upstream_body);
+    let evidence_upstream_body = upstream_body.clone();
     let request_metadata = shielded_attempt_request_metadata(
         runtime,
         attempt_number,
@@ -3250,6 +3315,8 @@ async fn start_shielded_attempt(
                     upstream_headers,
                     upstream_mode,
                     request_metadata,
+                    raw_request_body,
+                    upstream_body: evidence_upstream_body,
                 },
                 response,
             })
@@ -3280,9 +3347,21 @@ async fn start_shielded_attempt(
                 abort_reason: None,
                 request_metadata,
                 response_metadata,
+                raw_payloads: RawPayloads {
+                    input: raw_request_body,
+                    ..RawPayloads::default()
+                },
+                upstream_body: evidence_upstream_body,
             })
         }
     }
+}
+
+fn raw_payload_text(bytes: &Bytes) -> Option<String> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
 }
 
 impl ShieldedAttemptInfo {
@@ -3291,6 +3370,10 @@ impl ShieldedAttemptInfo {
         extra_response_metadata: BTreeMap<String, String>,
         raw_payloads: RawPayloads,
     ) -> FinalAttemptContext {
+        let mut raw_payloads = raw_payloads;
+        if raw_payloads.input.is_none() {
+            raw_payloads.input = self.raw_request_body;
+        }
         FinalAttemptContext {
             attempt_id: self.attempt_id,
             attempt_number: self.attempt_number,
@@ -3511,6 +3594,10 @@ fn aggregation_failure(
         info.upstream_status.is_success().to_string(),
     );
     response_metadata.extend(error.response_metadata().clone());
+    let mut raw_payloads = error.raw_payloads().clone();
+    if raw_payloads.input.is_none() {
+        raw_payloads.input.clone_from(&info.raw_request_body);
+    }
     ShieldedAttemptFailure {
         attempt_id: info.attempt_id.clone(),
         request_id: info.request_id.clone(),
@@ -3529,6 +3616,8 @@ fn aggregation_failure(
         },
         request_metadata: info.request_metadata.clone(),
         response_metadata,
+        raw_payloads,
+        upstream_body: info.upstream_body.clone(),
     }
 }
 
@@ -3566,6 +3655,11 @@ fn status_failure(
         abort_reason: None,
         request_metadata: info.request_metadata.clone(),
         response_metadata,
+        raw_payloads: RawPayloads {
+            input: info.raw_request_body.clone(),
+            ..RawPayloads::default()
+        },
+        upstream_body: info.upstream_body.clone(),
     }
 }
 
@@ -3598,6 +3692,11 @@ fn status_failure_without_retry(
         abort_reason: None,
         request_metadata: info.request_metadata.clone(),
         response_metadata,
+        raw_payloads: RawPayloads {
+            input: info.raw_request_body.clone(),
+            ..RawPayloads::default()
+        },
+        upstream_body: info.upstream_body.clone(),
     }
 }
 
@@ -3654,7 +3753,7 @@ fn attempt_failure_record(
         abort_reason: failure.abort_reason.clone(),
         request_metadata: failure.request_metadata.clone(),
         response_metadata,
-        raw_payloads: RawPayloads::default(),
+        raw_payloads: failure.raw_payloads.clone(),
     }
 }
 
@@ -3780,7 +3879,7 @@ fn shielded_retry_success_response(
         .final_attempt
         .extra_response_metadata
         .extend(extra_metadata.clone());
-    outcome.final_attempt.raw_payloads = outcome.raw_payloads.clone();
+    let raw_payloads = outcome.final_attempt.raw_payloads.clone();
     let observer = shielded_retry_observer(
         runtime,
         ShieldedRetryObserverInput {
@@ -3789,7 +3888,7 @@ fn shielded_retry_success_response(
             downstream_headers: response_headers.clone(),
             upstream_mode: outcome.final_attempt.upstream_mode,
             extra_response_metadata: extra_metadata,
-            raw_payloads: outcome.raw_payloads,
+            raw_payloads,
             completed_attempt_records: outcome.prior_attempt_records,
             final_attempt: Some(outcome.final_attempt),
             attempt_progress: None,
@@ -3889,7 +3988,10 @@ fn shielded_retry_observer(
     input: ShieldedRetryObserverInput,
 ) -> ForwardedBodyObserver {
     ForwardedBodyObserver {
+        config: runtime.config.clone(),
         store: runtime.store.clone(),
+        evidence_store: runtime.evidence_store.clone(),
+        shadow_evidence: runtime.shadow_evidence.clone(),
         request_id: runtime.request_id.clone(),
         started_at_unix_ms: runtime.started_at_unix_ms,
         downstream_mode: input.downstream_mode,
@@ -3973,7 +4075,10 @@ fn update_shielded_attempt_progress(
 }
 
 struct ForwardedBodyObserver {
+    config: ConfigHandle,
     store: ObservabilityStore,
+    evidence_store: EvidenceStore,
+    shadow_evidence: ShadowEvidenceState,
     request_id: RequestId,
     started_at_unix_ms: u64,
     downstream_mode: DownstreamMode,
@@ -4047,6 +4152,15 @@ impl ForwardedBodyObserver {
             raw_payloads: self.raw_payloads,
         };
         record_observability_many(&self.store, &request_record, &attempts);
+        record_evidence_many(
+            EvidenceRecordContext {
+                config: &self.config,
+                store: &self.evidence_store,
+                shadow_evidence: &self.shadow_evidence,
+            },
+            &request_record,
+            &attempts,
+        );
     }
 }
 
@@ -4436,12 +4550,11 @@ impl Stream for ShieldedLivenessBody {
                     observer
                         .extra_response_metadata
                         .extend(outcome.response_metadata.clone());
-                    observer.raw_payloads = outcome.raw_payloads.clone();
                     let mut final_attempt = outcome.final_attempt;
                     final_attempt
                         .extra_response_metadata
                         .extend(observer.extra_response_metadata.clone());
-                    final_attempt.raw_payloads = outcome.raw_payloads;
+                    observer.raw_payloads = final_attempt.raw_payloads.clone();
                     observer.final_attempt = Some(final_attempt);
                 }
                 this.terminal_completion = Some(BodyCompletion::Succeeded);
@@ -5289,6 +5402,628 @@ fn record_observability_many(
             eprintln!("failed to write attempt observability: {error}");
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct EvidenceRecordContext<'record> {
+    config: &'record ConfigHandle,
+    store: &'record EvidenceStore,
+    shadow_evidence: &'record ShadowEvidenceState,
+}
+
+fn record_evidence_many(
+    context: EvidenceRecordContext<'_>,
+    request: &RequestRecord,
+    attempts: &[AttemptRecord],
+) {
+    let settings = match context.config.snapshot() {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("failed to read evidence settings: {error}");
+            return;
+        }
+    };
+    if !settings.evidence.enabled {
+        return;
+    }
+
+    let group_id = request.request_id.as_str().to_owned();
+    let group = EvidenceGroupRecord {
+        group_id: group_id.clone(),
+        request_id: request.request_id.clone(),
+        started_at_unix_ms: request.started_at_unix_ms,
+        finished_at_unix_ms: request.finished_at_unix_ms,
+        model_id: request.model_id.clone(),
+        status: request.status.as_str().to_owned(),
+        request_metadata: request.request_metadata.clone(),
+        response_metadata: request.response_metadata.clone(),
+    };
+    let mut evidence_attempts = attempts
+        .iter()
+        .map(|attempt| evidence_attempt_from_observability(&group_id, request, attempt))
+        .collect::<Vec<_>>();
+    evidence_attempts.extend(context.shadow_evidence.snapshot());
+
+    match context.store.record_group(&group, &evidence_attempts) {
+        Ok(EvidenceStoreWrite::Written) => {
+            for shadow in context.shadow_evidence.snapshot() {
+                match context.store.record_shadow_attempt(&shadow) {
+                    Ok(EvidenceStoreWrite::Written | EvidenceStoreWrite::Disabled) | Err(_) => {}
+                }
+            }
+        }
+        Ok(EvidenceStoreWrite::Disabled) => {}
+        Err(error) => eprintln!("failed to write evidence ledger: {error}"),
+    }
+}
+
+fn evidence_attempt_from_observability(
+    group_id: &str,
+    request: &RequestRecord,
+    attempt: &AttemptRecord,
+) -> EvidenceAttemptRecord {
+    let role = evidence_attempt_role(attempt);
+    let shown_to_downstream = attempt_shown_to_downstream(request, attempt);
+    EvidenceAttemptRecord {
+        attempt_id: attempt.attempt_id.clone(),
+        group_id: group_id.to_owned(),
+        request_id: request.request_id.clone(),
+        attempt_number: attempt.attempt_number,
+        role,
+        shown_to_downstream,
+        started_at_unix_ms: attempt.started_at_unix_ms,
+        finished_at_unix_ms: attempt.finished_at_unix_ms,
+        upstream_profile: metadata_value(&attempt.request_metadata, "upstream_profile")
+            .or_else(|| metadata_value(&attempt.response_metadata, "upstream_profile")),
+        model_id: request.model_id.clone(),
+        thinking_mode: metadata_value(&attempt.request_metadata, "attempt_thinking_mode")
+            .or_else(|| metadata_value(&attempt.response_metadata, "attempt_thinking_mode")),
+        thinking_budget_tokens: metadata_u32(
+            &attempt.request_metadata,
+            "attempt_thinking_budget_tokens",
+        )
+        .or_else(|| metadata_u32(&attempt.response_metadata, "attempt_thinking_budget_tokens")),
+        thinking_max_tokens: metadata_u32(&attempt.request_metadata, "attempt_thinking_max_tokens")
+            .or_else(|| metadata_u32(&attempt.response_metadata, "attempt_thinking_max_tokens")),
+        detector_features: evidence_detector_features(&attempt.response_metadata),
+        status: evidence_attempt_status(attempt, shown_to_downstream),
+        http_status: attempt.http_status,
+        error_reason: attempt.error_reason.clone(),
+        retry_reason: attempt.retry_reason.clone(),
+        abort_reason: attempt.abort_reason.clone(),
+        shadow_skip_reason: None,
+        request_metadata: attempt.request_metadata.clone(),
+        response_metadata: attempt.response_metadata.clone(),
+        raw_payloads: attempt.raw_payloads.clone(),
+    }
+}
+
+fn evidence_attempt_role(attempt: &AttemptRecord) -> EvidenceAttemptRole {
+    if attempt.attempt_number <= 1 {
+        EvidenceAttemptRole::Primary
+    } else {
+        EvidenceAttemptRole::Fallback
+    }
+}
+
+fn attempt_shown_to_downstream(request: &RequestRecord, attempt: &AttemptRecord) -> bool {
+    request.status == RequestStatus::Succeeded
+        && attempt.status == AttemptStatus::Succeeded
+        && attempt.retry_reason.is_none()
+        && attempt.abort_reason.is_none()
+}
+
+fn evidence_attempt_status(
+    attempt: &AttemptRecord,
+    shown_to_downstream: bool,
+) -> EvidenceAttemptStatus {
+    match attempt.status {
+        AttemptStatus::Succeeded if shown_to_downstream => EvidenceAttemptStatus::Accepted,
+        AttemptStatus::Succeeded => EvidenceAttemptStatus::Accepted,
+        AttemptStatus::Retried => EvidenceAttemptStatus::Rejected,
+        AttemptStatus::Failed => EvidenceAttemptStatus::Failed,
+        AttemptStatus::Aborted => EvidenceAttemptStatus::Aborted,
+    }
+}
+
+fn evidence_detector_features(metadata: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    metadata
+        .iter()
+        .filter(|(key, _value)| {
+            key.starts_with("loop_")
+                || matches!(
+                    key.as_str(),
+                    "response_body_bytes"
+                        | "delta_count"
+                        | "content_delta_count"
+                        | "reasoning_delta_count"
+                        | "tool_call_delta_count"
+                        | "finish_reason"
+                )
+        })
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn maybe_schedule_shadow_continuation(
+    runtime: &ShieldedRetryRuntime,
+    failure: &ShieldedAttemptFailure,
+    source: &AttemptRecord,
+) {
+    if failure.retry_cause != Some(ShieldedRetryCause::LoopDetected) {
+        return;
+    }
+    let settings = match runtime.config.snapshot() {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("failed to read shadow evidence settings: {error}");
+            return;
+        }
+    };
+    let shadow = &settings.evidence.shadow;
+    if !settings.evidence.enabled || !shadow.enabled || !shadow.keep_looping_attempt_running {
+        return;
+    }
+
+    if shadow.max_shadow_attempts_per_request == 0 {
+        push_shadow_skipped_record(
+            &runtime.shadow_evidence,
+            runtime,
+            source,
+            &settings,
+            ShadowSkipReason::PerRequestLimit,
+        );
+        return;
+    }
+    if shadow.max_global_shadow_in_flight == 0 {
+        push_shadow_skipped_record(
+            &runtime.shadow_evidence,
+            runtime,
+            source,
+            &settings,
+            ShadowSkipReason::GlobalLimit,
+        );
+        return;
+    }
+    let Some(permit) = runtime
+        .shadow_attempts
+        .try_acquire(shadow.max_global_shadow_in_flight)
+    else {
+        push_shadow_skipped_record(
+            &runtime.shadow_evidence,
+            runtime,
+            source,
+            &settings,
+            ShadowSkipReason::GlobalLimit,
+        );
+        return;
+    };
+    let Some(sequence) = runtime
+        .shadow_evidence
+        .try_reserve_attempt(shadow.max_shadow_attempts_per_request)
+    else {
+        drop(permit);
+        push_shadow_skipped_record(
+            &runtime.shadow_evidence,
+            runtime,
+            source,
+            &settings,
+            ShadowSkipReason::PerRequestLimit,
+        );
+        return;
+    };
+
+    let Some(attempt_id) = shadow_attempt_id(&runtime.request_id, source.attempt_number, sequence)
+    else {
+        drop(permit);
+        push_shadow_skipped_record(
+            &runtime.shadow_evidence,
+            runtime,
+            source,
+            &settings,
+            ShadowSkipReason::ContinuationUnavailable,
+        );
+        return;
+    };
+    let task = ShadowContinuationTask {
+        client: runtime.client.clone(),
+        method: runtime.method.clone(),
+        upstream_url: runtime.upstream_url.clone(),
+        downstream_headers: runtime.downstream_headers.clone(),
+        upstream_body: failure.upstream_body.clone(),
+        upstream_timeout: runtime.upstream_timeout,
+        evidence_store: runtime.evidence_store.clone(),
+        shadow_evidence: runtime.shadow_evidence.clone(),
+        request_id: runtime.request_id.clone(),
+        group_id: runtime.request_id.as_str().to_owned(),
+        attempt_id,
+        source: source.clone(),
+        model_id: runtime.model_id.clone(),
+        loop_context: runtime.loop_context.clone(),
+        shadow_attempt_timeout_ms: shadow.shadow_attempt_timeout_ms,
+        parallel_downgrade_attempts: shadow.parallel_downgrade_attempts,
+        _permit: permit,
+    };
+    tokio::spawn(async move {
+        let record = run_shadow_continuation(task).await;
+        record.shadow_evidence.push_record(record.attempt.clone());
+        match record.evidence_store.record_shadow_attempt(&record.attempt) {
+            Ok(EvidenceStoreWrite::Written | EvidenceStoreWrite::Disabled) | Err(_) => {}
+        }
+    });
+}
+
+struct ShadowContinuationTask {
+    client: Client,
+    method: reqwest::Method,
+    upstream_url: Url,
+    downstream_headers: HeaderMap,
+    upstream_body: Bytes,
+    upstream_timeout: Duration,
+    evidence_store: EvidenceStore,
+    shadow_evidence: ShadowEvidenceState,
+    request_id: RequestId,
+    group_id: String,
+    attempt_id: AttemptId,
+    source: AttemptRecord,
+    model_id: Option<String>,
+    loop_context: shielded_chat::LoopInspectionContext,
+    shadow_attempt_timeout_ms: u64,
+    parallel_downgrade_attempts: bool,
+    _permit: InFlightPermit,
+}
+
+struct ShadowContinuationRecord {
+    evidence_store: EvidenceStore,
+    shadow_evidence: ShadowEvidenceState,
+    attempt: EvidenceAttemptRecord,
+}
+
+async fn run_shadow_continuation(task: ShadowContinuationTask) -> ShadowContinuationRecord {
+    let evidence_store = task.evidence_store.clone();
+    let shadow_evidence = task.shadow_evidence.clone();
+    let started_at_unix_ms = unix_time_millis();
+    let timeout_ms = task.shadow_attempt_timeout_ms;
+    let outcome = timeout(
+        Duration::from_millis(timeout_ms),
+        run_shadow_continuation_request(&task, started_at_unix_ms),
+    )
+    .await;
+    let attempt = match outcome {
+        Ok(attempt) => attempt,
+        Err(_elapsed) => build_shadow_terminal_record(
+            &task,
+            ShadowTerminalInput {
+                started_at_unix_ms,
+                finished_at_unix_ms: unix_time_millis(),
+                status: EvidenceAttemptStatus::ShadowTimeout,
+                http_status: None,
+                response_headers: HeaderMap::new(),
+                response_metadata: BTreeMap::new(),
+                raw_payloads: RawPayloads::default(),
+                response_body_bytes: 0,
+                error_reason: Some(String::from("shadow continuation timed out")),
+                abort_reason: Some(String::from("shadow_timeout")),
+            },
+        ),
+    };
+    ShadowContinuationRecord {
+        evidence_store,
+        shadow_evidence,
+        attempt,
+    }
+}
+
+async fn run_shadow_continuation_request(
+    task: &ShadowContinuationTask,
+    started_at_unix_ms: u64,
+) -> EvidenceAttemptRecord {
+    let mut response_headers = HeaderMap::new();
+    let mut http_status = None;
+    let mut response_metadata = BTreeMap::new();
+    let mut raw_payloads = RawPayloads::default();
+    let mut response_body_bytes = 0_u64;
+    let mut error_reason = None;
+
+    let response = send_upstream_request(
+        &task.client,
+        task.method.clone(),
+        task.upstream_url.clone(),
+        &task.downstream_headers,
+        task.upstream_body.clone(),
+        task.upstream_timeout,
+    )
+    .await;
+    let status = match response {
+        Ok(response) => {
+            let status = response.status();
+            http_status = Some(status.as_u16());
+            response_headers = response.headers().clone();
+            if status.is_success() && is_event_stream(&response_headers) {
+                match shielded_chat::aggregate_stream(
+                    response.bytes_stream(),
+                    started_at_unix_ms,
+                    task.request_id.as_str(),
+                    task.model_id.as_deref(),
+                    task.loop_context.clone(),
+                    None,
+                )
+                .await
+                {
+                    Ok(aggregated) => {
+                        response_body_bytes =
+                            aggregated.sse_body.len().try_into().unwrap_or(u64::MAX);
+                        response_metadata = aggregated.response_metadata;
+                        raw_payloads = aggregated.raw_payloads;
+                        EvidenceAttemptStatus::Accepted
+                    }
+                    Err(error) => {
+                        response_metadata = error.response_metadata().clone();
+                        raw_payloads = error.raw_payloads().clone();
+                        error_reason = Some(format!(
+                            "shadow continuation SSE aggregation failed: {error}"
+                        ));
+                        EvidenceAttemptStatus::Failed
+                    }
+                }
+            } else {
+                match read_shadow_response_body(response).await {
+                    Ok(body) => {
+                        response_body_bytes = body.len().try_into().unwrap_or(u64::MAX);
+                        raw_payloads.output = raw_payload_text(&body);
+                        if status.is_success() {
+                            EvidenceAttemptStatus::Accepted
+                        } else {
+                            error_reason =
+                                Some(format!("shadow continuation HTTP {}", status.as_u16()));
+                            EvidenceAttemptStatus::Failed
+                        }
+                    }
+                    Err(error) => {
+                        error_reason = Some(error);
+                        EvidenceAttemptStatus::Failed
+                    }
+                }
+            }
+        }
+        Err(error) => {
+            error_reason = Some(error.to_string());
+            EvidenceAttemptStatus::Failed
+        }
+    };
+
+    build_shadow_terminal_record(
+        task,
+        ShadowTerminalInput {
+            started_at_unix_ms,
+            finished_at_unix_ms: unix_time_millis(),
+            status,
+            http_status,
+            response_headers,
+            response_metadata,
+            raw_payloads,
+            response_body_bytes,
+            error_reason,
+            abort_reason: None,
+        },
+    )
+}
+
+async fn read_shadow_response_body(response: reqwest::Response) -> Result<Bytes, String> {
+    let mut stream = response.bytes_stream();
+    let mut body = BytesMut::new();
+    let mut bytes_seen = 0_usize;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|error| {
+            format!(
+                "shadow continuation stream failed: {}",
+                sanitized_reqwest_error(&error)
+            )
+        })?;
+        bytes_seen = bytes_seen
+            .checked_add(chunk.len())
+            .ok_or_else(|| String::from("shadow continuation body is too large"))?;
+        if bytes_seen > MAX_PROXY_BODY_BYTES {
+            return Err(format!(
+                "shadow continuation body exceeded proxy limit: max_bytes={MAX_PROXY_BODY_BYTES}"
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
+}
+
+struct ShadowTerminalInput {
+    started_at_unix_ms: u64,
+    finished_at_unix_ms: u64,
+    status: EvidenceAttemptStatus,
+    http_status: Option<u16>,
+    response_headers: HeaderMap,
+    response_metadata: BTreeMap<String, String>,
+    raw_payloads: RawPayloads,
+    response_body_bytes: u64,
+    error_reason: Option<String>,
+    abort_reason: Option<String>,
+}
+
+fn build_shadow_terminal_record(
+    task: &ShadowContinuationTask,
+    input: ShadowTerminalInput,
+) -> EvidenceAttemptRecord {
+    let mut response_metadata = response_metadata(
+        reqwest::StatusCode::from_u16(input.http_status.unwrap_or(599))
+            .unwrap_or(reqwest::StatusCode::INTERNAL_SERVER_ERROR),
+        &input.response_headers,
+        input.response_body_bytes,
+        input
+            .finished_at_unix_ms
+            .saturating_sub(input.started_at_unix_ms),
+    );
+    response_metadata.extend(input.response_metadata);
+    add_shadow_metadata(
+        &mut response_metadata,
+        &task.source,
+        task.shadow_attempt_timeout_ms,
+        task.parallel_downgrade_attempts,
+    );
+    response_metadata.insert(
+        String::from("shadow_terminal_status"),
+        input.status.as_str().to_owned(),
+    );
+
+    EvidenceAttemptRecord {
+        attempt_id: task.attempt_id.clone(),
+        group_id: task.group_id.clone(),
+        request_id: task.request_id.clone(),
+        attempt_number: task.source.attempt_number,
+        role: EvidenceAttemptRole::ShadowContinued,
+        shown_to_downstream: false,
+        started_at_unix_ms: input.started_at_unix_ms,
+        finished_at_unix_ms: Some(input.finished_at_unix_ms),
+        upstream_profile: metadata_value(&task.source.request_metadata, "upstream_profile"),
+        model_id: task.model_id.clone(),
+        thinking_mode: metadata_value(&task.source.request_metadata, "attempt_thinking_mode"),
+        thinking_budget_tokens: metadata_u32(
+            &task.source.request_metadata,
+            "attempt_thinking_budget_tokens",
+        ),
+        thinking_max_tokens: metadata_u32(
+            &task.source.request_metadata,
+            "attempt_thinking_max_tokens",
+        ),
+        detector_features: evidence_detector_features(&task.source.response_metadata),
+        status: input.status,
+        http_status: input.http_status,
+        error_reason: input.error_reason,
+        retry_reason: None,
+        abort_reason: input.abort_reason,
+        shadow_skip_reason: None,
+        request_metadata: task.source.request_metadata.clone(),
+        response_metadata,
+        raw_payloads: {
+            let mut raw_payloads = input.raw_payloads;
+            if raw_payloads.input.is_none() {
+                raw_payloads.input = raw_payload_text(&task.upstream_body);
+            }
+            raw_payloads
+        },
+    }
+}
+
+fn push_shadow_skipped_record(
+    state: &ShadowEvidenceState,
+    runtime: &ShieldedRetryRuntime,
+    source: &AttemptRecord,
+    settings: &AppConfig,
+    skip_reason: ShadowSkipReason,
+) {
+    if let Some(record) = build_shadow_skipped_record(runtime, source, settings, skip_reason) {
+        state.push_record(record);
+    }
+}
+
+fn build_shadow_skipped_record(
+    runtime: &ShieldedRetryRuntime,
+    source: &AttemptRecord,
+    settings: &AppConfig,
+    skip_reason: ShadowSkipReason,
+) -> Option<EvidenceAttemptRecord> {
+    let attempt_id = AttemptId::from_string(format!(
+        "{}-shadow-{}-skipped",
+        runtime.request_id.as_str(),
+        source.attempt_number
+    ))
+    .ok()?;
+    let finished_at = source.finished_at_unix_ms;
+    let mut response_metadata = BTreeMap::new();
+    response_metadata.insert(String::from("shadow_skipped"), String::from("true"));
+    response_metadata.insert(
+        String::from("shadow_skip_reason"),
+        skip_reason.as_str().to_owned(),
+    );
+    add_shadow_metadata(
+        &mut response_metadata,
+        source,
+        settings.evidence.shadow.shadow_attempt_timeout_ms,
+        settings.evidence.shadow.parallel_downgrade_attempts,
+    );
+    response_metadata.extend(evidence_detector_features(&source.response_metadata));
+    Some(EvidenceAttemptRecord {
+        attempt_id,
+        group_id: runtime.request_id.as_str().to_owned(),
+        request_id: runtime.request_id.clone(),
+        attempt_number: source.attempt_number,
+        role: EvidenceAttemptRole::ShadowContinued,
+        shown_to_downstream: false,
+        started_at_unix_ms: source
+            .finished_at_unix_ms
+            .unwrap_or(source.started_at_unix_ms),
+        finished_at_unix_ms: finished_at,
+        upstream_profile: metadata_value(&source.request_metadata, "upstream_profile"),
+        model_id: runtime.model_id.clone(),
+        thinking_mode: metadata_value(&source.request_metadata, "attempt_thinking_mode"),
+        thinking_budget_tokens: metadata_u32(
+            &source.request_metadata,
+            "attempt_thinking_budget_tokens",
+        ),
+        thinking_max_tokens: metadata_u32(&source.request_metadata, "attempt_thinking_max_tokens"),
+        detector_features: evidence_detector_features(&source.response_metadata),
+        status: EvidenceAttemptStatus::Skipped,
+        http_status: source.http_status,
+        error_reason: None,
+        retry_reason: None,
+        abort_reason: None,
+        shadow_skip_reason: Some(skip_reason),
+        request_metadata: source.request_metadata.clone(),
+        response_metadata,
+        raw_payloads: RawPayloads::default(),
+    })
+}
+
+fn shadow_attempt_id(
+    request_id: &RequestId,
+    source_attempt_number: u32,
+    sequence: u32,
+) -> Option<AttemptId> {
+    AttemptId::from_string(format!(
+        "{}-shadow-{}-{sequence}",
+        request_id.as_str(),
+        source_attempt_number
+    ))
+    .ok()
+}
+
+fn add_shadow_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    source: &AttemptRecord,
+    timeout_ms: u64,
+    parallel_downgrade_attempts: bool,
+) {
+    metadata.insert(String::from("shadow_continuation"), String::from("true"));
+    metadata.insert(
+        String::from("shadow_source_attempt_id"),
+        source.attempt_id.as_str().to_owned(),
+    );
+    metadata.insert(
+        String::from("shadow_attempt_timeout_ms"),
+        timeout_ms.to_string(),
+    );
+    metadata.insert(
+        String::from("shadow_parallel_downgrade_attempts"),
+        parallel_downgrade_attempts.to_string(),
+    );
+    metadata.extend(evidence_detector_features(&source.response_metadata));
+}
+
+fn metadata_value(metadata: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    metadata
+        .get(key)
+        .filter(|value| value.as_str() != "unset" && value.as_str() != "unknown")
+        .cloned()
+}
+
+fn metadata_u32(metadata: &BTreeMap<String, String>, key: &str) -> Option<u32> {
+    metadata_value(metadata, key).and_then(|value| value.parse::<u32>().ok())
 }
 
 fn json_response(status: StatusCode, body: String) -> Response<Body> {

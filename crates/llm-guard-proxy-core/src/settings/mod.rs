@@ -13,12 +13,12 @@ mod tests;
 
 pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
-    AppConfig, CloudflareConfig, ConfigToggle, DownstreamDropPolicy, HeartbeatConfig,
-    HeartbeatMode, LoopGuardConfig, LoopGuardMode, MetadataConfig, ObservabilityConfig,
-    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
-    SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
-    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    AppConfig, CloudflareConfig, ConfigToggle, DownstreamDropPolicy, EvidenceConfig,
+    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, LoopGuardMode,
+    MetadataConfig, ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig,
+    RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig,
+    ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 pub use reload::{
     ConfigHandle, ConfigManager, MissingConfigPolicy, ReloadOutcome, ReloadWatcher,
@@ -48,6 +48,19 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "observability.retention.prune_to_bytes",
     "observability.retention.max_records",
     "observability.retention.prune_to_records",
+    "evidence.enabled",
+    "evidence.include_raw_payloads",
+    "evidence.include_request_headers",
+    "evidence.max_bytes",
+    "evidence.prune_to_bytes",
+    "evidence.max_records",
+    "evidence.prune_to_records",
+    "evidence.shadow.enabled",
+    "evidence.shadow.keep_looping_attempt_running",
+    "evidence.shadow.parallel_downgrade_attempts",
+    "evidence.shadow.max_shadow_attempts_per_request",
+    "evidence.shadow.max_global_shadow_in_flight",
+    "evidence.shadow.shadow_attempt_timeout_ms",
     "thinking.enabled",
     "thinking.force_disable",
     "thinking.mode",
@@ -123,4 +136,6 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "upstream.base_url",
     "upstreams.topology",
     "observability.sqlite_path",
+    "evidence.sqlite_path",
+    "evidence.blob_cache_dir",
 ];

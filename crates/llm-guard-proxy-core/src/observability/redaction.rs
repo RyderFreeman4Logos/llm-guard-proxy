@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use super::{error::ObservabilityError, model::RawPayloads};
+use super::{
+    error::ObservabilityError,
+    model::{RawPayloadChunk, RawPayloads},
+};
 
 const REDACTED: &str = "[REDACTED]";
 const SENSITIVE_KEY_MARKERS: &[&str] = &[
@@ -75,17 +78,24 @@ pub(super) fn sanitize_raw_payloads(raw: &RawPayloads, capture_raw_payloads: boo
         output: sanitize_optional_text(raw.output.as_ref()),
         reasoning: sanitize_optional_text(raw.reasoning.as_ref()),
         tool_calls: sanitize_optional_text(raw.tool_calls.as_ref()),
+        chunks: raw
+            .chunks
+            .iter()
+            .map(|chunk| RawPayloadChunk::new(chunk.channel.clone(), sanitize_text(&chunk.text)))
+            .collect(),
     }
 }
 
 pub(super) fn sanitize_optional_text(value: Option<&String>) -> Option<String> {
-    value.map(|value| {
-        if looks_sensitive(value) {
-            REDACTED.to_owned()
-        } else {
-            value.clone()
-        }
-    })
+    value.map(|value| sanitize_text(value))
+}
+
+fn sanitize_text(value: &str) -> String {
+    if looks_sensitive(value) {
+        REDACTED.to_owned()
+    } else {
+        value.to_owned()
+    }
 }
 
 fn is_sensitive_key(key: &str) -> bool {

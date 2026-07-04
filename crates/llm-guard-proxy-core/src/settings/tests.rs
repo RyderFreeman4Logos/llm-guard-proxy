@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -5,12 +7,99 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use super::model::{
+    evidence_blob_cache_dir_from_xdg_cache_home, evidence_sqlite_path_from_xdg_state_home,
+};
 use super::{
     AppConfig, ConfigManager, ConfigParseError, DownstreamDropPolicy, HeartbeatMode, LoopGuardMode,
     MissingConfigPolicy, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ThinkingMode,
     ToolRequestThinkingPolicy, UpstreamRouteReason, ValidationError, parse::parse_config_text,
     redact_upstream_base_url,
 };
+
+const FULL_OVERRIDE_CONFIG: &str = r#"
+[server]
+port = 18100
+max_in_flight_requests = 2
+max_queued_generation_requests = 3
+generation_queue_timeout_ms = 4000
+max_control_plane_in_flight_requests = 5
+max_request_body_bytes = 1048576
+
+[upstream.metadata]
+context_length_override = 256000
+max_model_len_override = 256000
+
+[upstream]
+request_timeout_ms = 90000
+
+[observability]
+metrics_enabled = false
+health_upstream_probe_enabled = false
+health_upstream_probe_timeout_ms = 250
+debug_summary_enabled = true
+debug_summary_admin_token = "test-admin-token"
+debug_summary_max_records = 7
+
+[observability.retention]
+max_records = 50
+prune_to_records = 40
+
+[evidence]
+enabled = true
+sqlite_path = "state/llm-guard-proxy-test-evidence.sqlite3"
+blob_cache_dir = "cache/llm-guard-proxy-test-evidence-blobs"
+include_raw_payloads = true
+include_request_headers = true
+max_bytes = 1000
+prune_to_bytes = 800
+max_records = 50
+prune_to_records = 40
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = true
+parallel_downgrade_attempts = false
+max_shadow_attempts_per_request = 1
+max_global_shadow_in_flight = 3
+shadow_attempt_timeout_ms = 100
+
+[thinking]
+force_disable = true
+tool_request_policy = "passthrough"
+
+[heartbeat]
+mode = "json-whitespace"
+interval_secs = 5
+
+[loop_guard]
+mode = "monitor"
+output_repeated_line_threshold = 40
+output_token_window_size = 8
+output_repeated_token_window_threshold = 9
+output_suffix_cycle_threshold = 10
+output_low_progress_min_bytes = 2048
+output_low_progress_unique_ratio_percent = 25
+input_overlap_threshold_multiplier = 5
+
+[retry]
+max_attempts = 3
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+downstream_drop_policy = "detach"
+
+[upstream.stall]
+enabled = true
+idle_timeout_ms = 5000
+recovery_command = ["/usr/bin/systemctl", "--user", "restart", "vllm-aeon-27b-dflash-n12.service"]
+recovery_timeout_ms = 60000
+recovery_cooldown_ms = 45000
+recovery_budget_window_ms = 180000
+recovery_max_per_window = 1
+
+[cloudflare]
+enabled = false
+"#;
 
 #[test]
 fn defaults_match_issue_contract() {
@@ -48,6 +137,7 @@ fn defaults_match_issue_contract() {
         config.observability.retention.effective_prune_to_records(),
         80_000
     );
+    assert_default_evidence_config(&config);
     assert!(config.thinking.enabled);
     assert_eq!(config.thinking.mode, ThinkingMode::BoundedThinking);
     assert!(!config.thinking.force_disable);
@@ -105,6 +195,50 @@ fn defaults_match_issue_contract() {
     assert!(config.cloudflare.enabled);
     assert!(config.upstream_profiles.is_empty());
     assert_eq!(config.default_upstream_profile().name, "default");
+}
+
+fn assert_default_evidence_config(config: &AppConfig) {
+    assert!(!config.evidence.enabled);
+    assert_eq!(
+        config.evidence.sqlite_path,
+        PathBuf::from("~/.local/state/llm-guard-proxy/evidence.sqlite3")
+    );
+    assert_eq!(
+        config.evidence.blob_cache_dir,
+        PathBuf::from("~/.cache/llm-guard-proxy/evidence/blobs")
+    );
+    assert!(!config.evidence.include_raw_payloads);
+    assert!(!config.evidence.include_request_headers);
+    assert_eq!(config.evidence.max_bytes, 10_737_418_240);
+    assert_eq!(config.evidence.prune_to_bytes, 8_589_934_592);
+    assert_eq!(config.evidence.max_records, 100_000);
+    assert_eq!(config.evidence.effective_prune_to_records(), 80_000);
+    assert!(!config.evidence.shadow.enabled);
+    assert!(!config.evidence.shadow.keep_looping_attempt_running);
+    assert!(config.evidence.shadow.parallel_downgrade_attempts);
+    assert_eq!(config.evidence.shadow.max_shadow_attempts_per_request, 2);
+    assert_eq!(config.evidence.shadow.max_global_shadow_in_flight, 2);
+    assert_eq!(config.evidence.shadow.shadow_attempt_timeout_ms, 7_200_000);
+}
+
+#[test]
+fn evidence_default_paths_follow_xdg_inputs_and_home_fallbacks() {
+    assert_eq!(
+        evidence_sqlite_path_from_xdg_state_home(Some(PathBuf::from("/tmp/xdg-state"))),
+        PathBuf::from("/tmp/xdg-state/llm-guard-proxy/evidence.sqlite3")
+    );
+    assert_eq!(
+        evidence_blob_cache_dir_from_xdg_cache_home(Some(PathBuf::from("/tmp/xdg-cache"))),
+        PathBuf::from("/tmp/xdg-cache/llm-guard-proxy/evidence/blobs")
+    );
+    assert_eq!(
+        evidence_sqlite_path_from_xdg_state_home(None),
+        PathBuf::from("~/.local/state/llm-guard-proxy/evidence.sqlite3")
+    );
+    assert_eq!(
+        evidence_blob_cache_dir_from_xdg_cache_home(None),
+        PathBuf::from("~/.cache/llm-guard-proxy/evidence/blobs")
+    );
 }
 
 #[test]
@@ -377,73 +511,7 @@ context_length_override = 0
 
 #[test]
 fn parses_toml_with_defaults_and_overrides() {
-    let config = parse_config_text(
-        r#"
-[server]
-port = 18100
-max_in_flight_requests = 2
-max_queued_generation_requests = 3
-generation_queue_timeout_ms = 4000
-max_control_plane_in_flight_requests = 5
-max_request_body_bytes = 1048576
-
-[upstream.metadata]
-context_length_override = 256000
-max_model_len_override = 256000
-
-[upstream]
-request_timeout_ms = 90000
-
-[observability]
-metrics_enabled = false
-health_upstream_probe_enabled = false
-health_upstream_probe_timeout_ms = 250
-debug_summary_enabled = true
-debug_summary_admin_token = "test-admin-token"
-debug_summary_max_records = 7
-
-[observability.retention]
-max_records = 50
-prune_to_records = 40
-
-[thinking]
-force_disable = true
-tool_request_policy = "passthrough"
-
-[heartbeat]
-mode = "json-whitespace"
-interval_secs = 5
-
-[loop_guard]
-mode = "monitor"
-output_repeated_line_threshold = 40
-output_token_window_size = 8
-output_repeated_token_window_threshold = 9
-output_suffix_cycle_threshold = 10
-output_low_progress_min_bytes = 2048
-output_low_progress_unique_ratio_percent = 25
-input_overlap_threshold_multiplier = 5
-
-[retry]
-max_attempts = 3
-anti_loop_hint_enabled = false
-shielded_streaming_enabled = true
-downstream_drop_policy = "detach"
-
-[upstream.stall]
-enabled = true
-idle_timeout_ms = 5000
-recovery_command = ["/usr/bin/systemctl", "--user", "restart", "vllm-aeon-27b-dflash-n12.service"]
-recovery_timeout_ms = 60000
-recovery_cooldown_ms = 45000
-recovery_budget_window_ms = 180000
-recovery_max_per_window = 1
-
-[cloudflare]
-enabled = false
-"#,
-    )
-    .expect("config should parse");
+    let config = parse_config_text(FULL_OVERRIDE_CONFIG).expect("config should parse");
 
     assert_eq!(config.server.bind_host, "127.0.0.1");
     assert_eq!(config.server.port, 18_100);
@@ -468,6 +536,28 @@ enabled = false
         Some(256_000)
     );
     assert_parsed_observability_overrides(&config);
+    assert!(config.evidence.enabled);
+    assert_eq!(
+        config.evidence.sqlite_path,
+        PathBuf::from("state/llm-guard-proxy-test-evidence.sqlite3")
+    );
+    assert_eq!(
+        config.evidence.blob_cache_dir,
+        PathBuf::from("cache/llm-guard-proxy-test-evidence-blobs")
+    );
+    assert!(config.evidence.include_raw_payloads);
+    assert!(config.evidence.include_request_headers);
+    assert_eq!(config.evidence.max_bytes, 1_000);
+    assert_eq!(config.evidence.prune_to_bytes, 800);
+    assert_eq!(config.evidence.max_records, 50);
+    assert_eq!(config.evidence.prune_to_records, Some(40));
+    assert_eq!(config.evidence.effective_prune_to_records(), 40);
+    assert!(config.evidence.shadow.enabled);
+    assert!(config.evidence.shadow.keep_looping_attempt_running);
+    assert!(!config.evidence.shadow.parallel_downgrade_attempts);
+    assert_eq!(config.evidence.shadow.max_shadow_attempts_per_request, 1);
+    assert_eq!(config.evidence.shadow.max_global_shadow_in_flight, 3);
+    assert_eq!(config.evidence.shadow.shadow_attempt_timeout_ms, 100);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::JsonWhitespace);
     assert_eq!(config.heartbeat.interval_secs, 5);
     assert_eq!(config.loop_guard.mode, LoopGuardMode::Monitor);
@@ -631,6 +721,111 @@ max_records = 10
         config.observability.retention.effective_prune_to_records(),
         8
     );
+}
+
+#[test]
+fn validates_evidence_paths_and_retention() {
+    let mut config = AppConfig::default();
+    config.evidence.sqlite_path = PathBuf::new();
+
+    let error = config
+        .validate()
+        .expect_err("empty evidence sqlite path should fail");
+    assert_eq!(error.field(), "evidence.sqlite_path");
+
+    config.evidence.sqlite_path = PathBuf::from("evidence.sqlite3");
+    let error = config
+        .validate()
+        .expect_err("bare evidence sqlite path should fail");
+    assert_eq!(error.field(), "evidence.sqlite_path");
+
+    config.evidence.sqlite_path = PathBuf::from("storage/evidence.sqlite3");
+    config.evidence.blob_cache_dir = PathBuf::new();
+    let error = config
+        .validate()
+        .expect_err("empty evidence blob cache path should fail");
+    assert_eq!(error.field(), "evidence.blob_cache_dir");
+
+    config.evidence.blob_cache_dir = PathBuf::from("blobs");
+    let error = config
+        .validate()
+        .expect_err("bare evidence blob cache path should fail");
+    assert_eq!(error.field(), "evidence.blob_cache_dir");
+
+    config.evidence.blob_cache_dir = PathBuf::from("cache/blobs");
+    config.evidence.max_bytes = 10;
+    config.evidence.prune_to_bytes = 11;
+    let error = config
+        .validate()
+        .expect_err("evidence byte hysteresis should fail");
+    assert_eq!(error.field(), "evidence.prune_to_bytes");
+
+    config.evidence.prune_to_bytes = 10;
+    config.evidence.max_records = 10;
+    config.evidence.prune_to_records = Some(11);
+    let error = config
+        .validate()
+        .expect_err("evidence record hysteresis should fail");
+    assert_eq!(error.field(), "evidence.prune_to_records");
+}
+
+#[cfg(unix)]
+#[test]
+fn validates_evidence_rejects_unsafe_parent_permissions_when_disabled() {
+    let root = unique_test_path("unsafe-evidence-parent");
+    fs::create_dir_all(&root).expect("test evidence parent should be created");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
+        .expect("test evidence parent permissions should be configurable");
+
+    let mut config = AppConfig::default();
+    config.evidence.enabled = false;
+    config.evidence.sqlite_path = root.join("evidence.sqlite3");
+    config.evidence.blob_cache_dir = root.join("blobs");
+
+    let error = config
+        .validate()
+        .expect_err("disabled evidence should still reject unsafe parent permissions");
+
+    assert_eq!(error.field(), "evidence.sqlite_path");
+    assert!(error.message().contains("group or other users"));
+
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .expect("test evidence parent permissions should be restorable");
+    remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn validates_evidence_rejects_symlink_path_components_when_disabled() {
+    let root = unique_test_path("symlink-evidence-path");
+    let real = root.join("real");
+    let link = root.join("link");
+    fs::create_dir_all(&real).expect("real evidence directory should be created");
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+        .expect("root permissions should be owner-private");
+    fs::set_permissions(&real, fs::Permissions::from_mode(0o700))
+        .expect("real evidence permissions should be owner-private");
+    symlink(&real, &link).expect("test symlink should be created");
+
+    let mut config = AppConfig::default();
+    config.evidence.enabled = false;
+    config.evidence.sqlite_path = link.join("evidence.sqlite3");
+    config.evidence.blob_cache_dir = real.join("blobs");
+    let error = config
+        .validate()
+        .expect_err("disabled evidence should still reject sqlite symlink components");
+    assert_eq!(error.field(), "evidence.sqlite_path");
+    assert!(error.message().contains("symlink"));
+
+    config.evidence.sqlite_path = real.join("evidence.sqlite3");
+    config.evidence.blob_cache_dir = link.join("blobs");
+    let error = config
+        .validate()
+        .expect_err("disabled evidence should still reject blob cache symlink components");
+    assert_eq!(error.field(), "evidence.blob_cache_dir");
+    assert!(error.message().contains("symlink"));
+
+    remove_dir_all(&root);
 }
 
 #[test]
@@ -1383,6 +1578,13 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_admin_token"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.retention.prune_to_records"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.include_raw_payloads"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.include_request_headers"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.prune_to_records"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.keep_looping_attempt_running"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.max_global_shadow_in_flight"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_command"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_timeout_ms"));
@@ -1398,6 +1600,8 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstreams.topology"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"observability.sqlite_path"));
+    assert!(RESTART_REQUIRED_FIELDS.contains(&"evidence.sqlite_path"));
+    assert!(RESTART_REQUIRED_FIELDS.contains(&"evidence.blob_cache_dir"));
 }
 
 fn write_config(path: &Path, contents: &str) {
@@ -1414,6 +1618,12 @@ fn unique_test_path(file_name: &str) -> PathBuf {
 
 fn remove_file(path: &Path) {
     if let Err(error) = fs::remove_file(path) {
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    }
+}
+
+fn remove_dir_all(path: &Path) {
+    if let Err(error) = fs::remove_dir_all(path) {
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 }

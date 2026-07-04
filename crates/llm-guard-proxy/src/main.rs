@@ -5,7 +5,7 @@ mod proxy;
 use std::{ffi::OsString, future::pending, path::PathBuf, process::ExitCode, time::Duration};
 
 use llm_guard_proxy_core::{
-    ConfigManager, ObservabilityStore, RequestId, redact_upstream_base_url,
+    ConfigManager, EvidenceStore, ObservabilityStore, RequestId, redact_upstream_base_url,
 };
 use tokio::net::TcpListener;
 
@@ -32,6 +32,7 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         .snapshot()
         .map_err(|error| error.to_string())?;
     let store = ObservabilityStore::open(manager.handle()).map_err(|error| error.to_string())?;
+    let evidence_store = EvidenceStore::open(manager.handle());
     let _watcher = manager
         .spawn_polling(Duration::from_secs(1))
         .map_err(|error| error.to_string())?;
@@ -56,6 +57,7 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         manager.handle(),
         manager.path().to_path_buf(),
         store,
+        evidence_store,
         proxy::build_http_client().map_err(|error| error.to_string())?,
     );
     proxy::serve_until_shutdown(listener, state, shutdown_signal())

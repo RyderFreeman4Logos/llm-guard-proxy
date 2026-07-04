@@ -1,4 +1,11 @@
-use std::{collections::HashSet, path::PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::{
+    collections::HashSet,
+    env, fs,
+    io::ErrorKind,
+    path::{Path, PathBuf},
+};
 
 use super::ValidationError;
 use url::Url;
@@ -24,6 +31,8 @@ pub struct AppConfig {
     pub shielding: ShieldingConfig,
     /// Observability storage and retention settings.
     pub observability: ObservabilityConfig,
+    /// Opt-in shadow evidence ledger settings.
+    pub evidence: EvidenceConfig,
     /// Thinking budget policy for later request rewriting.
     pub thinking: ThinkingConfig,
     /// Loop detection policy.
@@ -50,6 +59,7 @@ impl AppConfig {
         self.upstream.validate()?;
         self.validate_upstream_profiles()?;
         self.observability.validate()?;
+        self.evidence.validate()?;
         self.thinking.validate("thinking.max_tokens")?;
         self.loop_guard.validate()?;
         self.retry.validate()?;
@@ -170,6 +180,14 @@ impl AppConfig {
         self.observability.debug_summary_max_records =
             requested.observability.debug_summary_max_records;
         self.observability.retention = requested.observability.retention.clone();
+        self.evidence.enabled = requested.evidence.enabled;
+        self.evidence.include_raw_payloads = requested.evidence.include_raw_payloads;
+        self.evidence.include_request_headers = requested.evidence.include_request_headers;
+        self.evidence.max_bytes = requested.evidence.max_bytes;
+        self.evidence.prune_to_bytes = requested.evidence.prune_to_bytes;
+        self.evidence.max_records = requested.evidence.max_records;
+        self.evidence.prune_to_records = requested.evidence.prune_to_records;
+        self.evidence.shadow = requested.evidence.shadow.clone();
         self.thinking = requested.thinking.clone();
         self.loop_guard = requested.loop_guard.clone();
         self.retry = requested.retry.clone();
@@ -214,6 +232,18 @@ impl AppConfig {
             "observability.sqlite_path",
             self.observability.sqlite_path.display().to_string(),
             requested.observability.sqlite_path.display().to_string(),
+        );
+        push_change(
+            &mut changes,
+            "evidence.sqlite_path",
+            self.evidence.sqlite_path.display().to_string(),
+            requested.evidence.sqlite_path.display().to_string(),
+        );
+        push_change(
+            &mut changes,
+            "evidence.blob_cache_dir",
+            self.evidence.blob_cache_dir.display().to_string(),
+            requested.evidence.blob_cache_dir.display().to_string(),
         );
         changes
     }
@@ -732,6 +762,169 @@ impl Default for ObservabilityConfig {
     }
 }
 
+/// Opt-in evidence storage and raw payload capture settings.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceConfig {
+    /// Enables the shadow evidence ledger.
+    pub enabled: bool,
+    /// `SQLite` evidence ledger path. This is restart-required when changed.
+    pub sqlite_path: PathBuf,
+    /// Reserved cache directory for future bounded raw payload sidecars.
+    pub blob_cache_dir: PathBuf,
+    /// Enables sensitive raw prompt/output/reasoning/tool payload capture.
+    pub include_raw_payloads: bool,
+    /// Includes non-secret request/header metadata. Secrets remain redacted.
+    pub include_request_headers: bool,
+    /// Hard maximum actual evidence storage budget in bytes.
+    pub max_bytes: u64,
+    /// Hysteresis target after byte pruning.
+    pub prune_to_bytes: u64,
+    /// Maximum retained evidence rows across groups, attempts, and chunks.
+    pub max_records: u64,
+    /// Optional hysteresis target after record-count pruning.
+    pub prune_to_records: Option<u64>,
+    /// Shadow continuation limits.
+    pub shadow: EvidenceShadowConfig,
+}
+
+impl EvidenceConfig {
+    /// Effective evidence record-count pruning target.
+    #[must_use]
+    pub fn effective_prune_to_records(&self) -> u64 {
+        self.prune_to_records
+            .unwrap_or_else(|| default_prune_to_records(self.max_records))
+    }
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            !self.sqlite_path.as_os_str().is_empty(),
+            "evidence.sqlite_path",
+            "must not be empty",
+        )?;
+        require(
+            path_has_explicit_parent(&self.sqlite_path),
+            "evidence.sqlite_path",
+            "must include an explicit parent directory",
+        )?;
+        require(
+            !self.blob_cache_dir.as_os_str().is_empty(),
+            "evidence.blob_cache_dir",
+            "must not be empty",
+        )?;
+        require(
+            path_has_explicit_parent(&self.blob_cache_dir),
+            "evidence.blob_cache_dir",
+            "must include an explicit parent directory",
+        )?;
+        if self.enabled || self.sqlite_path != default_evidence_sqlite_path() {
+            validate_evidence_sqlite_path(&self.sqlite_path)?;
+        }
+        if self.enabled || self.blob_cache_dir != default_evidence_blob_cache_dir() {
+            validate_evidence_blob_cache_dir(&self.blob_cache_dir)?;
+        }
+        require(
+            self.max_bytes > 0,
+            "evidence.max_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.prune_to_bytes > 0,
+            "evidence.prune_to_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.prune_to_bytes <= self.max_bytes,
+            "evidence.prune_to_bytes",
+            "must be less than or equal to max_bytes",
+        )?;
+        require(
+            self.max_records > 0,
+            "evidence.max_records",
+            "must be greater than zero",
+        )?;
+        if let Some(prune_to_records) = self.prune_to_records {
+            require(
+                prune_to_records > 0,
+                "evidence.prune_to_records",
+                "must be greater than zero",
+            )?;
+            require(
+                prune_to_records <= self.max_records,
+                "evidence.prune_to_records",
+                "must be less than or equal to max_records",
+            )?;
+        }
+        self.shadow.validate()
+    }
+}
+
+impl Default for EvidenceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sqlite_path: default_evidence_sqlite_path(),
+            blob_cache_dir: default_evidence_blob_cache_dir(),
+            include_raw_payloads: false,
+            include_request_headers: false,
+            max_bytes: 10_737_418_240,
+            prune_to_bytes: 8_589_934_592,
+            max_records: 100_000,
+            prune_to_records: None,
+            shadow: EvidenceShadowConfig::default(),
+        }
+    }
+}
+
+/// Shadow continuation resource limits for evidence collection.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceShadowConfig {
+    /// Enables evidence-only shadow bookkeeping after loop signals.
+    pub enabled: bool,
+    /// Requests continuing the looped high-thinking attempt for evidence.
+    pub keep_looping_attempt_running: bool,
+    /// Allows the fallback/downgrade ladder to run while shadow evidence is collected.
+    pub parallel_downgrade_attempts: bool,
+    /// Maximum evidence-only shadow attempts recorded for one downstream request.
+    pub max_shadow_attempts_per_request: u32,
+    /// Maximum evidence-only shadow attempts in flight across all requests.
+    pub max_global_shadow_in_flight: usize,
+    /// Terminal timeout for one evidence-only shadow attempt.
+    pub shadow_attempt_timeout_ms: u64,
+}
+
+impl EvidenceShadowConfig {
+    fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            self.max_shadow_attempts_per_request <= 10,
+            "evidence.shadow.max_shadow_attempts_per_request",
+            "must be less than or equal to 10",
+        )?;
+        require(
+            self.max_global_shadow_in_flight <= 1_024,
+            "evidence.shadow.max_global_shadow_in_flight",
+            "must be less than or equal to 1024",
+        )?;
+        require(
+            self.shadow_attempt_timeout_ms > 0,
+            "evidence.shadow.shadow_attempt_timeout_ms",
+            "must be greater than zero",
+        )
+    }
+}
+
+impl Default for EvidenceShadowConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keep_looping_attempt_running: false,
+            parallel_downgrade_attempts: true,
+            max_shadow_attempts_per_request: 2,
+            max_global_shadow_in_flight: 2,
+            shadow_attempt_timeout_ms: 7_200_000,
+        }
+    }
+}
+
 /// Retention limits for observability records and artifacts.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RetentionConfig {
@@ -817,6 +1010,145 @@ const fn default_prune_to_records(max_records: u64) -> u64 {
     let gap = if gap == 0 { 1 } else { gap };
     let target = max_records.saturating_sub(gap);
     if target == 0 { 1 } else { target }
+}
+
+fn path_has_explicit_parent(path: &Path) -> bool {
+    path.parent()
+        .is_some_and(|parent| !parent.as_os_str().is_empty())
+}
+
+fn default_evidence_sqlite_path() -> PathBuf {
+    evidence_sqlite_path_from_xdg_state_home(env::var_os("XDG_STATE_HOME").map(PathBuf::from))
+}
+
+fn default_evidence_blob_cache_dir() -> PathBuf {
+    evidence_blob_cache_dir_from_xdg_cache_home(env::var_os("XDG_CACHE_HOME").map(PathBuf::from))
+}
+
+pub(super) fn evidence_sqlite_path_from_xdg_state_home(xdg_state_home: Option<PathBuf>) -> PathBuf {
+    xdg_state_home
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("~/.local/state"))
+        .join("llm-guard-proxy")
+        .join("evidence.sqlite3")
+}
+
+pub(super) fn evidence_blob_cache_dir_from_xdg_cache_home(
+    xdg_cache_home: Option<PathBuf>,
+) -> PathBuf {
+    xdg_cache_home
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("~/.cache"))
+        .join("llm-guard-proxy")
+        .join("evidence")
+        .join("blobs")
+}
+
+fn validate_evidence_sqlite_path(path: &Path) -> Result<(), ValidationError> {
+    const FIELD: &str = "evidence.sqlite_path";
+    let resolved = resolve_evidence_validation_path(path, FIELD)?;
+    reject_symlink_path_components(&resolved, FIELD)?;
+    if let Some(metadata) = path_metadata_if_exists(&resolved, FIELD)? {
+        require(
+            !metadata.file_type().is_symlink() && metadata.is_file(),
+            FIELD,
+            "must be a regular file when it already exists",
+        )?;
+    }
+    if let Some(parent) = resolved.parent() {
+        validate_existing_owner_private_directory(parent, FIELD)?;
+    }
+    Ok(())
+}
+
+fn validate_evidence_blob_cache_dir(path: &Path) -> Result<(), ValidationError> {
+    const FIELD: &str = "evidence.blob_cache_dir";
+    let resolved = resolve_evidence_validation_path(path, FIELD)?;
+    reject_symlink_path_components(&resolved, FIELD)?;
+    validate_existing_owner_private_directory(&resolved, FIELD)?;
+    if let Some(parent) = resolved.parent() {
+        validate_existing_owner_private_directory(parent, FIELD)?;
+    }
+    Ok(())
+}
+
+fn resolve_evidence_validation_path(
+    path: &Path,
+    field: &'static str,
+) -> Result<PathBuf, ValidationError> {
+    if path.starts_with("~") {
+        let home = env::var_os("HOME").ok_or_else(|| {
+            ValidationError::new(field, "HOME must be set when evidence path starts with ~")
+        })?;
+        let suffix = path.strip_prefix("~").unwrap_or(path);
+        return Ok(PathBuf::from(home).join(suffix));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn reject_symlink_path_components(path: &Path, field: &'static str) -> Result<(), ValidationError> {
+    let mut inspected = PathBuf::new();
+    for component in path.components() {
+        inspected.push(component.as_os_str());
+        match fs::symlink_metadata(&inspected) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(ValidationError::new(
+                    field,
+                    format!(
+                        "must not contain symlink path component {}",
+                        inspected.display()
+                    ),
+                ));
+            }
+            Ok(_metadata) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(ValidationError::new(
+                    field,
+                    format!("must be inspectable: {error}"),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_existing_owner_private_directory(
+    path: &Path,
+    field: &'static str,
+) -> Result<(), ValidationError> {
+    let Some(metadata) = path_metadata_if_exists(path, field)? else {
+        return Ok(());
+    };
+    require(
+        !metadata.file_type().is_symlink() && metadata.is_dir(),
+        field,
+        "existing storage parent must be a real directory",
+    )?;
+    #[cfg(unix)]
+    {
+        let mode = metadata.permissions().mode() & 0o777;
+        require(
+            mode.trailing_zeros() >= 6,
+            field,
+            "existing storage parent must not be accessible by group or other users",
+        )?;
+    }
+    Ok(())
+}
+
+fn path_metadata_if_exists(
+    path: &Path,
+    field: &'static str,
+) -> Result<Option<fs::Metadata>, ValidationError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(ValidationError::new(
+            field,
+            format!("must be inspectable: {error}"),
+        )),
+    }
 }
 
 /// Thinking-budget behavior for requests that carry tool/function-calling hints.

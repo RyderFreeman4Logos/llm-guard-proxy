@@ -97,6 +97,26 @@ impl AttemptStatus {
     }
 }
 
+/// Raw stream payload fragment captured in upstream arrival order.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawPayloadChunk {
+    /// Stable channel label for the fragment.
+    pub channel: String,
+    /// Raw fragment text after capture-boundary redaction.
+    pub text: String,
+}
+
+impl RawPayloadChunk {
+    /// Builds one raw stream fragment.
+    #[must_use]
+    pub fn new(channel: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            channel: channel.into(),
+            text: text.into(),
+        }
+    }
+}
+
 /// Optional raw payload fragments that may be persisted only when configured.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RawPayloads {
@@ -108,6 +128,8 @@ pub struct RawPayloads {
     pub reasoning: Option<String>,
     /// Raw tool-call payload.
     pub tool_calls: Option<String>,
+    /// Raw stream fragments in upstream arrival order.
+    pub chunks: Vec<RawPayloadChunk>,
 }
 
 /// Metadata captured for one completed downstream request.

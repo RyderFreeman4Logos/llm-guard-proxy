@@ -4,10 +4,16 @@
 //! Issue #1 intentionally kept this crate small. Later issues add proxy,
 //! retry, and request-shielding behavior behind core interfaces.
 
+mod evidence;
 mod loop_detector;
 mod observability;
 mod settings;
 
+pub use evidence::{
+    EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceError,
+    EvidenceGroupRecord, EvidencePruningStats, EvidenceRetentionUsage, EvidenceShadowRecord,
+    EvidenceStore, EvidenceStoreWrite, ShadowSkipReason,
+};
 pub use loop_detector::{
     BoundedFeatureSummary, ChannelizedLoopDetector, DetectorEventKind, DetectorSummary,
     LoopDetector, LoopDetectorInput, LoopInputProfile, LoopReasonCode, LoopSeverity, LoopSignal,
@@ -16,20 +22,20 @@ pub use loop_detector::{
 pub use observability::{
     AttemptId, AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary,
     DownstreamMode, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram,
-    ObservabilityError, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId,
-    RequestMetricCount, RequestRecord, RequestStatus, RetentionPruningStats, RetentionUsage,
-    StoreWrite, UpstreamErrorMetricCount, UpstreamMode,
+    ObservabilityError, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloadChunk,
+    RawPayloads, RequestId, RequestMetricCount, RequestRecord, RequestStatus,
+    RetentionPruningStats, RetentionUsage, StoreWrite, UpstreamErrorMetricCount, UpstreamMode,
 };
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
-    DEFAULT_CONFIG_RELATIVE_PATH, DownstreamDropPolicy, HeartbeatConfig, HeartbeatMode,
-    LoopGuardConfig, LoopGuardMode, MetadataConfig, MissingConfigPolicy, ObservabilityConfig,
-    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher,
-    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
-    SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
-    UpstreamStallConfig, ValidationError, default_config_path, redact_upstream_base_url,
-    validate_upstream_base_url,
+    DEFAULT_CONFIG_RELATIVE_PATH, DownstreamDropPolicy, EvidenceConfig, EvidenceShadowConfig,
+    HeartbeatConfig, HeartbeatMode, LoopGuardConfig, LoopGuardMode, MetadataConfig,
+    MissingConfigPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
+    ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig, RetryConfig,
+    RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig,
+    ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, ValidationError, default_config_path,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 
 /// Public service name used by the binary and documentation.

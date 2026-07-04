@@ -19,7 +19,7 @@ pub use ids::{AttemptId, RequestId};
 pub use model::{
     AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
     HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram, ObservabilityMetricsSnapshot,
-    RawPayloads, RequestMetricCount, RequestRecord, RequestStatus, RetentionPruningStats,
-    RetentionUsage, StoreWrite, UpstreamErrorMetricCount, UpstreamMode,
+    RawPayloadChunk, RawPayloads, RequestMetricCount, RequestRecord, RequestStatus,
+    RetentionPruningStats, RetentionUsage, StoreWrite, UpstreamErrorMetricCount, UpstreamMode,
 };
 pub use store::ObservabilityStore;
