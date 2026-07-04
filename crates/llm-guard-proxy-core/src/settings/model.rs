@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{collections::HashSet, path::PathBuf};
 
 use super::ValidationError;
 use url::Url;
@@ -7,6 +7,9 @@ const REDACTED_URL_PART: &str = "redacted";
 const INVALID_URL_DISPLAY: &str = "[invalid URL]";
 const LOOP_GUARD_MAX_SEMANTIC_WINDOW_TOKENS: u32 = 256;
 const LOOP_GUARD_MAX_SEMANTIC_HISTORY_WINDOWS: u32 = 256;
+const DEFAULT_UPSTREAM_PROFILE_NAME: &str = "default";
+const MAX_UPSTREAM_PROFILE_NAME_BYTES: usize = 128;
+const MAX_UPSTREAM_MODEL_ALIAS_BYTES: usize = 256;
 
 /// Complete application configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -15,6 +18,8 @@ pub struct AppConfig {
     pub server: ServerConfig,
     /// Upstream OpenAI-compatible service settings.
     pub upstream: UpstreamConfig,
+    /// Additional named upstream profiles matched by request model.
+    pub upstream_profiles: Vec<UpstreamProfileConfig>,
     /// Client shielding behavior flags.
     pub shielding: ShieldingConfig,
     /// Observability storage and retention settings.
@@ -43,12 +48,42 @@ impl AppConfig {
     pub fn validate(&self) -> Result<(), ValidationError> {
         self.server.validate()?;
         self.upstream.validate()?;
+        self.validate_upstream_profiles()?;
         self.observability.validate()?;
+        self.thinking.validate("thinking.max_tokens")?;
         self.loop_guard.validate()?;
         self.retry.validate()?;
         self.upstream_stall.validate()?;
         self.validate_upstream_stall_timeout_order()?;
         self.heartbeat.validate()
+    }
+
+    fn validate_upstream_profiles(&self) -> Result<(), ValidationError> {
+        let mut names = HashSet::from([DEFAULT_UPSTREAM_PROFILE_NAME.to_owned()]);
+        let mut match_models = HashSet::new();
+
+        for profile in &self.upstream_profiles {
+            profile.validate()?;
+            require(
+                names.insert(profile.name.clone()),
+                "upstreams.name",
+                "must be unique and must not duplicate the implicit default profile",
+            )?;
+            for model in &profile.match_models {
+                require(
+                    !model.trim().is_empty(),
+                    "upstreams.match_models",
+                    "must not contain empty model aliases",
+                )?;
+                require(
+                    match_models.insert(model.clone()),
+                    "upstreams.match_models",
+                    "model aliases must be unique across upstream profiles",
+                )?;
+            }
+        }
+
+        Ok(())
     }
 
     fn validate_upstream_stall_timeout_order(&self) -> Result<(), ValidationError> {
@@ -58,8 +93,58 @@ impl AppConfig {
                 "upstream.stall.idle_timeout_ms",
                 "must be less than upstream.request_timeout_ms when upstream stall recovery is enabled",
             )?;
+            for profile in &self.upstream_profiles {
+                require(
+                    self.upstream_stall.idle_timeout_ms < profile.request_timeout_ms,
+                    "upstream.stall.idle_timeout_ms",
+                    "must be less than every upstream profile request_timeout_ms when upstream stall recovery is enabled",
+                )?;
+            }
         }
         Ok(())
+    }
+
+    /// Selects the effective upstream profile for a request model.
+    #[must_use]
+    pub fn select_upstream_profile(&self, model: Option<&str>) -> SelectedUpstreamProfile {
+        let model = model.and_then(|model| {
+            let trimmed = model.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        });
+        if let Some(model) = model {
+            if let Some(profile) = self
+                .upstream_profiles
+                .iter()
+                .find(|profile| profile.matches_model(model))
+            {
+                return SelectedUpstreamProfile {
+                    profile: profile.clone(),
+                    route_reason: UpstreamRouteReason::MatchedModel,
+                };
+            }
+            return SelectedUpstreamProfile {
+                profile: self.default_upstream_profile(),
+                route_reason: UpstreamRouteReason::DefaultUnmatchedModel,
+            };
+        }
+
+        SelectedUpstreamProfile {
+            profile: self.default_upstream_profile(),
+            route_reason: UpstreamRouteReason::DefaultNoModel,
+        }
+    }
+
+    /// Builds the implicit default profile from legacy `[upstream]` and `[thinking]`.
+    #[must_use]
+    pub fn default_upstream_profile(&self) -> UpstreamProfileConfig {
+        UpstreamProfileConfig {
+            name: DEFAULT_UPSTREAM_PROFILE_NAME.to_owned(),
+            match_models: Vec::new(),
+            base_url: self.upstream.base_url.clone(),
+            request_timeout_ms: self.upstream.request_timeout_ms,
+            metadata: self.upstream.metadata.clone(),
+            thinking: self.thinking.clone(),
+        }
     }
 
     pub(crate) fn apply_reloadable_from(&mut self, requested: &Self) {
@@ -93,6 +178,9 @@ impl AppConfig {
         self.cloudflare = requested.cloudflare.clone();
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
         self.upstream.metadata = requested.upstream.metadata.clone();
+        if self.upstream_profiles_topology_matches(requested) {
+            self.apply_reloadable_upstream_profile_fields(requested);
+        }
     }
 
     pub(crate) fn restart_required_changes(&self, requested: &Self) -> Vec<RestartRequiredChange> {
@@ -115,6 +203,12 @@ impl AppConfig {
             self.upstream.base_url.clone(),
             requested.upstream.base_url.clone(),
         );
+        push_structural_change(
+            &mut changes,
+            "upstreams.topology",
+            &self.upstream_profile_topology(),
+            &requested.upstream_profile_topology(),
+        );
         push_change(
             &mut changes,
             "observability.sqlite_path",
@@ -122,6 +216,46 @@ impl AppConfig {
             requested.observability.sqlite_path.display().to_string(),
         );
         changes
+    }
+
+    fn upstream_profiles_topology_matches(&self, requested: &Self) -> bool {
+        self.upstream_profile_topology() == requested.upstream_profile_topology()
+    }
+
+    fn upstream_profile_topology(&self) -> Vec<UpstreamProfileTopology> {
+        self.upstream_profiles
+            .iter()
+            .map(UpstreamProfileTopology::from)
+            .collect()
+    }
+
+    fn apply_reloadable_upstream_profile_fields(&mut self, requested: &Self) {
+        for (active, requested) in self
+            .upstream_profiles
+            .iter_mut()
+            .zip(requested.upstream_profiles.iter())
+        {
+            active.request_timeout_ms = requested.request_timeout_ms;
+            active.metadata = requested.metadata.clone();
+            active.thinking = requested.thinking.clone();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UpstreamProfileTopology {
+    name: String,
+    base_url: String,
+    match_models: Vec<String>,
+}
+
+impl From<&UpstreamProfileConfig> for UpstreamProfileTopology {
+    fn from(profile: &UpstreamProfileConfig) -> Self {
+        Self {
+            name: profile.name.clone(),
+            base_url: profile.base_url.clone(),
+            match_models: profile.match_models.clone(),
+        }
     }
 }
 
@@ -246,6 +380,126 @@ impl Default for UpstreamConfig {
     }
 }
 
+/// Named upstream profile with model routing and per-upstream policy.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UpstreamProfileConfig {
+    /// Unique profile name used in observability metadata.
+    pub name: String,
+    /// Request JSON `model` aliases routed to this profile.
+    pub match_models: Vec<String>,
+    /// Base URL for OpenAI-compatible requests.
+    pub base_url: String,
+    /// Total upstream request timeout, including streamed response body reads.
+    pub request_timeout_ms: u64,
+    /// Metadata discovery and model context enrichment policy.
+    pub metadata: MetadataConfig,
+    /// Thinking budget policy for this profile.
+    pub thinking: ThinkingConfig,
+}
+
+impl UpstreamProfileConfig {
+    fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            !self.name.trim().is_empty(),
+            "upstreams.name",
+            "must not be empty",
+        )?;
+        require(
+            self.name == self.name.trim(),
+            "upstreams.name",
+            "must not have leading or trailing whitespace",
+        )?;
+        require(
+            self.name.len() <= MAX_UPSTREAM_PROFILE_NAME_BYTES,
+            "upstreams.name",
+            "must be at most 128 bytes",
+        )?;
+        require(
+            !self.match_models.is_empty(),
+            "upstreams.match_models",
+            "must contain at least one model alias",
+        )?;
+        for model in &self.match_models {
+            require(
+                model == model.trim(),
+                "upstreams.match_models",
+                "model aliases must not have leading or trailing whitespace",
+            )?;
+            require(
+                model.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+                "upstreams.match_models",
+                "model aliases must be at most 256 bytes",
+            )?;
+        }
+        validate_upstream_base_url(&self.base_url)?;
+        require(
+            self.request_timeout_ms > 0,
+            "upstreams.request_timeout_ms",
+            "must be greater than zero",
+        )?;
+        self.metadata.validate()?;
+        self.thinking.validate("upstreams.thinking.max_tokens")
+    }
+
+    /// Returns true when the request model selects this profile.
+    #[must_use]
+    pub fn matches_model(&self, model: &str) -> bool {
+        self.match_models.iter().any(|alias| alias == model)
+    }
+
+    /// Returns a display-safe upstream base URL.
+    #[must_use]
+    pub fn redacted_base_url(&self) -> String {
+        redact_upstream_base_url(&self.base_url)
+    }
+}
+
+impl Default for UpstreamProfileConfig {
+    fn default() -> Self {
+        let upstream = UpstreamConfig::default();
+        Self {
+            name: String::new(),
+            match_models: Vec::new(),
+            base_url: upstream.base_url,
+            request_timeout_ms: upstream.request_timeout_ms,
+            metadata: upstream.metadata,
+            thinking: ThinkingConfig::default(),
+        }
+    }
+}
+
+/// Effective upstream profile selected for one request.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SelectedUpstreamProfile {
+    /// Selected profile settings.
+    pub profile: UpstreamProfileConfig,
+    /// Why this profile was selected.
+    pub route_reason: UpstreamRouteReason,
+}
+
+/// Bounded route reason stored in observability metadata.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UpstreamRouteReason {
+    /// Request model matched a named profile alias.
+    MatchedModel,
+    /// Request had no usable model, so the implicit default profile was used.
+    DefaultNoModel,
+    /// Request model did not match any named profile, so the implicit default was used.
+    DefaultUnmatchedModel,
+}
+
+impl UpstreamRouteReason {
+    /// Returns the stable metadata label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MatchedModel => "matched_model",
+            Self::DefaultNoModel => "default_no_model",
+            Self::DefaultUnmatchedModel => "default_unmatched_model",
+        }
+    }
+}
+
 /// Validates the configured upstream base URL.
 ///
 /// # Errors
@@ -320,6 +574,8 @@ pub struct MetadataConfig {
     pub context_length_override: Option<u32>,
     /// Optional `max_model_len` override used when upstream metadata is absent.
     pub max_model_len_override: Option<u32>,
+    /// Reserved input-token margin subtracted during context-budget preflight.
+    pub input_token_safety_margin: u32,
 }
 
 impl MetadataConfig {
@@ -336,7 +592,14 @@ impl MetadataConfig {
         require_optional_positive(
             self.max_model_len_override,
             "upstream.metadata.max_model_len_override",
-        )
+        )?;
+        Ok(())
+    }
+
+    /// Returns a configured fallback context window when discovery is absent.
+    #[must_use]
+    pub fn context_window_override(&self) -> Option<u32> {
+        self.context_length_override.or(self.max_model_len_override)
     }
 }
 
@@ -348,6 +611,7 @@ impl Default for MetadataConfig {
             refresh_interval_secs: 60,
             context_length_override: None,
             max_model_len_override: None,
+            input_token_safety_margin: 0,
         }
     }
 }
@@ -575,13 +839,43 @@ impl ToolRequestThinkingPolicy {
     }
 }
 
+/// Profile thinking rewrite mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ThinkingMode {
+    /// Leave caller thinking fields untouched.
+    Passthrough,
+    /// Force upstream thinking off.
+    ForceDisable,
+    /// Force the configured thinking budget even when callers disabled thinking.
+    ForceThinking,
+    /// Inject or raise thinking up to the configured budget while respecting caller disablement.
+    #[default]
+    BoundedThinking,
+}
+
+impl ThinkingMode {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Passthrough => "passthrough",
+            Self::ForceDisable => "force_disable",
+            Self::ForceThinking => "force_thinking",
+            Self::BoundedThinking => "bounded_thinking",
+        }
+    }
+}
+
 /// Thinking budget policy for later request rewriting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThinkingConfig {
+    /// Profile rewrite mode.
+    pub mode: ThinkingMode,
     /// Enables default thinking budget injection.
     pub enabled: bool,
     /// Forces all recognized upstream thinking budgets to zero.
     pub force_disable: bool,
+    /// Optional output cap written to OpenAI-compatible token limit fields.
+    pub max_tokens: Option<u32>,
     /// Thinking token budget. A zero budget disables injection.
     pub budget_tokens: u32,
     /// Adjusts `max_tokens` so callers keep their apparent answer budget.
@@ -590,11 +884,41 @@ pub struct ThinkingConfig {
     pub tool_request_policy: ToolRequestThinkingPolicy,
 }
 
+impl ThinkingConfig {
+    /// Returns the mode after applying legacy switches.
+    #[must_use]
+    pub const fn effective_mode(&self) -> ThinkingMode {
+        if self.force_disable {
+            ThinkingMode::ForceDisable
+        } else if !self.enabled {
+            ThinkingMode::Passthrough
+        } else {
+            self.mode
+        }
+    }
+
+    /// Returns the TOML-compatible output budget accounting label.
+    #[must_use]
+    pub const fn budget_accounting(&self) -> &'static str {
+        if self.preserve_answer_budget {
+            "preserve_answer_budget"
+        } else {
+            "total_cap"
+        }
+    }
+
+    fn validate(&self, max_tokens_field: &'static str) -> Result<(), ValidationError> {
+        require_optional_positive(self.max_tokens, max_tokens_field)
+    }
+}
+
 impl Default for ThinkingConfig {
     fn default() -> Self {
         Self {
+            mode: ThinkingMode::BoundedThinking,
             enabled: true,
             force_disable: false,
+            max_tokens: None,
             budget_tokens: 32_768,
             preserve_answer_budget: true,
             tool_request_policy: ToolRequestThinkingPolicy::Apply,
@@ -991,6 +1315,23 @@ fn push_change(
             field,
             active,
             requested,
+        });
+    }
+}
+
+fn push_structural_change<T>(
+    changes: &mut Vec<RestartRequiredChange>,
+    field: &'static str,
+    active: &T,
+    requested: &T,
+) where
+    T: Eq + std::fmt::Debug,
+{
+    if active != requested {
+        changes.push(RestartRequiredChange {
+            field,
+            active: format!("{active:?}"),
+            requested: format!("{requested:?}"),
         });
     }
 }

@@ -3,7 +3,9 @@ use std::{collections::BTreeMap, pin::Pin, time::Duration};
 use axum::body::Bytes;
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
-use llm_guard_proxy_core::{RawPayloads, StreamChannel, ThinkingConfig, ToolRequestThinkingPolicy};
+use llm_guard_proxy_core::{
+    RawPayloads, StreamChannel, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy,
+};
 use serde_json::{Map, Number, Value, json};
 use tokio::time::timeout;
 
@@ -286,12 +288,31 @@ fn apply_thinking_policy(
         String::from("thinking_tool_request_detected"),
         is_tool_request.to_string(),
     );
-    if thinking.force_disable {
-        let outcome = apply_force_disable_thinking(object, &budget_observations, &mut metadata);
-        let answer_budget =
-            apply_answer_budget_preservation(object, false, outcome.answer_budget_delta);
-        metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
+    if !thinking.enabled && !thinking.force_disable {
+        let outcome = thinking_noop("policy_disabled", &budget_observations);
+        metadata.extend(thinking_outcome_metadata(
+            &outcome,
+            &AnswerBudgetDecision::default(),
+        ));
         return metadata;
+    }
+    match thinking.effective_mode() {
+        ThinkingMode::Passthrough => {
+            let outcome = thinking_noop("mode_passthrough", &budget_observations);
+            metadata.extend(thinking_outcome_metadata(
+                &outcome,
+                &AnswerBudgetDecision::default(),
+            ));
+            return metadata;
+        }
+        ThinkingMode::ForceDisable => {
+            let outcome = apply_force_disable_thinking(object, &budget_observations, &mut metadata);
+            let answer_budget =
+                apply_answer_budget_preservation(object, false, outcome.answer_budget_delta);
+            metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
+            return metadata;
+        }
+        ThinkingMode::ForceThinking | ThinkingMode::BoundedThinking => {}
     }
     if is_tool_request
         && matches!(
@@ -306,19 +327,31 @@ fn apply_thinking_policy(
         ));
         return metadata;
     }
-    let outcome = apply_thinking_budget_policy(
-        object,
-        thinking,
-        configured_budget,
-        &budget_observations,
-        disable_marker,
-        &mut metadata,
-    );
+    let outcome = match thinking.effective_mode() {
+        ThinkingMode::ForceThinking => apply_force_thinking_policy(
+            object,
+            configured_budget,
+            &budget_observations,
+            &mut metadata,
+        ),
+        ThinkingMode::BoundedThinking => apply_thinking_budget_policy(
+            object,
+            thinking,
+            configured_budget,
+            &budget_observations,
+            disable_marker,
+            &mut metadata,
+        ),
+        ThinkingMode::Passthrough | ThinkingMode::ForceDisable => {
+            unreachable!("passthrough and force-disable modes return before budget rewriting")
+        }
+    };
     let answer_budget = apply_answer_budget_preservation(
         object,
         thinking.preserve_answer_budget,
         outcome.answer_budget_delta,
     );
+    let answer_budget = apply_configured_total_cap(object, thinking, answer_budget);
 
     metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
     metadata
@@ -354,8 +387,18 @@ fn initial_thinking_metadata(
             thinking.enabled.to_string(),
         ),
         (
+            String::from("thinking_policy_mode"),
+            thinking.effective_mode().as_str().to_owned(),
+        ),
+        (
             String::from("thinking_force_disable_enabled"),
             thinking.force_disable.to_string(),
+        ),
+        (
+            String::from("thinking_policy_max_tokens"),
+            thinking
+                .max_tokens
+                .map_or_else(|| String::from("none"), |max_tokens| max_tokens.to_string()),
         ),
         (
             String::from("thinking_policy_budget_tokens"),
@@ -364,6 +407,10 @@ fn initial_thinking_metadata(
         (
             String::from("thinking_preserve_answer_budget_enabled"),
             thinking.preserve_answer_budget.to_string(),
+        ),
+        (
+            String::from("thinking_budget_accounting"),
+            thinking.budget_accounting().to_owned(),
         ),
         (
             String::from("thinking_tool_request_policy"),
@@ -408,6 +455,70 @@ fn initial_thinking_metadata(
             observed_budget_paths(budget_observations, configured_budget),
         ),
     ])
+}
+
+fn apply_force_thinking_policy(
+    object: &mut Map<String, Value>,
+    configured_budget: u64,
+    budget_observations: &BudgetObservations,
+    metadata: &mut BTreeMap<String, String>,
+) -> ThinkingPolicyOutcome {
+    if configured_budget == 0 {
+        return thinking_noop("configured_budget_zero", budget_observations);
+    }
+
+    let enable_marker_paths = normalize_force_enable_markers(object, metadata);
+    metadata.insert(
+        String::from("thinking_enable_marker_rewritten_paths"),
+        join_paths(&enable_marker_paths),
+    );
+
+    if budget_observations.is_empty() {
+        let mut outcome = inject_missing_budget(object, configured_budget, metadata);
+        outcome.reason = "forced_configured_budget";
+        outcome.rewrite_applied = outcome.rewrite_applied || !enable_marker_paths.is_empty();
+        return outcome;
+    }
+
+    let mut rewritten_paths = Vec::new();
+    let mut preserved_paths = Vec::new();
+    let mut malformed_paths = Vec::new();
+    let mut answer_budget_delta = 0;
+    for observation in &budget_observations.entries {
+        match observation.state {
+            BudgetState::Numeric(existing_budget) if existing_budget == configured_budget => {
+                preserved_paths.push(observation.path);
+            }
+            BudgetState::Numeric(existing_budget) => {
+                if set_budget_at_path(object, observation.path, configured_budget) {
+                    rewritten_paths.push(observation.path);
+                    answer_budget_delta =
+                        answer_budget_delta.max(configured_budget.saturating_sub(existing_budget));
+                } else {
+                    malformed_paths.push(observation.path);
+                }
+            }
+            BudgetState::Malformed => {
+                if set_budget_at_path(object, observation.path, configured_budget) {
+                    rewritten_paths.push(observation.path);
+                    answer_budget_delta = answer_budget_delta.max(configured_budget);
+                } else {
+                    malformed_paths.push(observation.path);
+                }
+            }
+        }
+    }
+
+    ThinkingPolicyOutcome {
+        rewrite_applied: !rewritten_paths.is_empty() || !enable_marker_paths.is_empty(),
+        reason: "forced_configured_budget",
+        final_budget: configured_budget.to_string(),
+        answer_budget_delta,
+        rewritten_paths,
+        preserved_paths,
+        malformed_paths,
+        zero_paths: Vec::new(),
+    }
 }
 
 fn apply_thinking_budget_policy(
@@ -900,6 +1011,30 @@ fn normalize_force_disable_markers(
     rewritten_paths
 }
 
+fn normalize_force_enable_markers(
+    object: &mut Map<String, Value>,
+    metadata: &mut BTreeMap<String, String>,
+) -> Vec<JsonPath> {
+    let mut rewritten_paths = Vec::new();
+    for path in DISABLE_MARKER_PATHS {
+        if matches!(
+            value_at_path(object, path.path),
+            PathValue::Value(Value::Bool(false))
+        ) && set_bool_at_path(object, *path, true)
+        {
+            rewritten_paths.push(*path);
+        }
+    }
+
+    match rewritten_paths.as_slice() {
+        [] => {}
+        [path] => insert_disable_marker_metadata(metadata, *path),
+        [_first, ..] => insert_multiple_disable_marker_metadata(metadata),
+    }
+
+    rewritten_paths
+}
+
 fn set_budget_at_path(object: &mut Map<String, Value>, path: JsonPath, budget: u64) -> bool {
     let Some((&last, parents)) = path.path.split_last() else {
         return false;
@@ -960,6 +1095,48 @@ fn apply_answer_budget_preservation(
         };
         *value = Value::Number(Number::from(adjusted));
         decision.adjusted_fields.push(field);
+        decision.applied = true;
+    }
+    decision
+}
+
+fn apply_configured_total_cap(
+    object: &mut Map<String, Value>,
+    thinking: &ThinkingConfig,
+    mut decision: AnswerBudgetDecision,
+) -> AnswerBudgetDecision {
+    let Some(max_tokens) = thinking.max_tokens else {
+        return decision;
+    };
+    if thinking.preserve_answer_budget {
+        return decision;
+    }
+    let max_tokens = u64::from(max_tokens);
+    for field in ANSWER_BUDGET_FIELDS {
+        match object.get_mut(*field) {
+            Some(value) if value.as_u64() == Some(max_tokens) => {
+                decision.preserved_fields.push(field);
+            }
+            Some(value) if value.as_u64().is_some() => {
+                *value = Value::Number(Number::from(max_tokens));
+                decision.adjusted_fields.push(field);
+                decision.applied = true;
+            }
+            Some(_value) => {
+                decision.malformed_fields.push(field);
+            }
+            None => {}
+        }
+    }
+    if decision.adjusted_fields.is_empty()
+        && decision.preserved_fields.is_empty()
+        && decision.malformed_fields.is_empty()
+    {
+        object.insert(
+            String::from("max_tokens"),
+            Value::Number(Number::from(max_tokens)),
+        );
+        decision.adjusted_fields.push("max_tokens");
         decision.applied = true;
     }
     decision

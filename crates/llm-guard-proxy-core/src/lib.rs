@@ -25,8 +25,9 @@ pub use settings::{
     DEFAULT_CONFIG_RELATIVE_PATH, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, LoopGuardMode,
     MetadataConfig, MissingConfigPolicy, ObservabilityConfig, RELOADABLE_FIELDS,
     RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig,
-    RetryConfig, ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy,
-    UpstreamConfig, UpstreamStallConfig, ValidationError, default_config_path,
+    RetryConfig, SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig,
+    ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, ValidationError, default_config_path,
     redact_upstream_base_url, validate_upstream_base_url,
 };
 

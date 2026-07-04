@@ -913,6 +913,51 @@ max_model_len_override = 8192
 }
 
 #[tokio::test]
+async fn model_metadata_uses_named_profile_context_override_for_matching_record() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "fallback-route"
+base_url = "{base_url}"
+match_models = ["fallback-model"]
+
+[upstreams.metadata]
+context_length_override = 12345
+"#,
+            base_url = fake.base_url,
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=model-metadata-no-context",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("body should be text");
+    let model = first_model(&body);
+    assert_eq!(model["id"], "fallback-model");
+    assert_eq!(model["extra"], "keep");
+    assert_normalized_context_fields(&model, 12_345);
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=model-metadata-no-context"
+    );
+}
+
+#[tokio::test]
 async fn hot_reloaded_disabled_discovery_stops_model_metadata_enrichment() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -3041,6 +3086,307 @@ force_disable = true
 }
 
 #[tokio::test]
+async fn per_model_routing_selects_named_upstream_and_records_bounded_metadata() {
+    let mut default = FakeUpstream::spawn().await;
+    let mut aeon = FakeUpstream::spawn().await;
+    let mut fast = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &default.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "{aeon_base_url}"
+match_models = ["aeon-ultimate"]
+request_timeout_ms = 90000
+
+[upstreams.metadata]
+context_length_override = 4096
+input_token_safety_margin = 64
+
+[upstreams.thinking]
+mode = "force_thinking"
+thinking_token_budget = 128
+
+[[upstreams]]
+name = "fast-no-think"
+base_url = "{fast_base_url}"
+match_models = ["fast-local"]
+
+[upstreams.thinking]
+mode = "force_disable"
+"#,
+            aeon_base_url = aeon.base_url,
+            fast_base_url = fast.base_url,
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"aeon-ultimate","prompt":"hello","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.text().await.expect("body should be text"),
+        r#"{"id":"cmpl-test","object":"text_completion"}"#
+    );
+    let observed = aeon.recv_next().await;
+    assert_eq!(observed.path_and_query, "/v1/completions");
+    assert!(
+        default
+            .recv_within(Duration::from_millis(100))
+            .await
+            .is_none()
+    );
+    assert!(fast.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["upstream_profile"], "aeon-chat");
+        assert_eq!(metadata["upstream_route_reason"], "matched_model");
+        assert_eq!(metadata["upstream_request_timeout_ms"], "90000");
+        assert_eq!(metadata["upstream_context_window_tokens"], "4096");
+        assert_eq!(metadata["upstream_input_token_safety_margin"], "64");
+        assert!(!metadata.to_string().contains("hello"));
+    }
+}
+
+#[tokio::test]
+async fn unmatched_or_missing_model_routes_to_default_profile() {
+    let mut default = FakeUpstream::spawn().await;
+    let mut aeon = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &default.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "{aeon_base_url}"
+match_models = ["aeon-ultimate"]
+"#,
+            aeon_base_url = aeon.base_url,
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"unmatched-model","prompt":"hello","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.text().await.expect("body should be text");
+    let unmatched = default.recv_next().await;
+    assert_eq!(unmatched.path_and_query, "/v1/completions");
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"prompt":"missing model","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.text().await.expect("body should be text");
+    let missing = default.recv_next().await;
+    assert_eq!(missing.path_and_query, "/v1/completions");
+    assert!(aeon.recv_within(Duration::from_millis(100)).await.is_none());
+}
+
+#[tokio::test]
+async fn per_profile_thinking_force_thinking_overrides_disable_marker_and_total_cap() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "{base_url}"
+match_models = ["aeon-ultimate"]
+
+[upstreams.thinking]
+mode = "force_thinking"
+max_tokens = 10
+thinking_token_budget = 4
+budget_accounting = "total_cap"
+"#,
+            base_url = fake.base_url,
+        ),
+    )
+    .await;
+    let body = Bytes::from_static(
+        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"ping"}],"stream":true,"thinking":{"budget_tokens":1},"chat_template_kwargs":{"enable_thinking":false},"max_tokens":2}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.text().await.expect("body should be text");
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 4);
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        true
+    );
+    assert_eq!(observed_body["max_tokens"], 10);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["upstream_profile"], "aeon-chat");
+        assert_eq!(metadata["thinking_policy_mode"], "force_thinking");
+        assert_eq!(
+            metadata["thinking_rewrite_reason"],
+            "forced_configured_budget"
+        );
+        assert_eq!(metadata["thinking_budget_final_tokens"], "4");
+        assert_eq!(
+            metadata["thinking_answer_budget_adjusted_fields"],
+            "max_tokens"
+        );
+    }
+}
+
+#[tokio::test]
+async fn per_profile_thinking_force_disable_writes_zero_budget_and_disable_marker() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "fast-no-think"
+base_url = "{base_url}"
+match_models = ["fast-local"]
+
+[upstreams.thinking]
+mode = "force_disable"
+"#,
+            base_url = fake.base_url,
+        ),
+    )
+    .await;
+    let body = Bytes::from_static(
+        br#"{"model":"fast-local","messages":[{"role":"user","content":"ping"}],"stream":true,"thinking":{"budget_tokens":9},"chat_template_kwargs":{"enable_thinking":true},"max_tokens":64}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.text().await.expect("body should be text");
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 0);
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+    assert_eq!(observed_body["max_tokens"], 64);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["upstream_profile"], "fast-no-think");
+        assert_eq!(metadata["thinking_policy_mode"], "force_disable");
+        assert_eq!(
+            metadata["thinking_rewrite_reason"],
+            "force_disabled_thinking"
+        );
+        assert_eq!(metadata["thinking_budget_final_tokens"], "0");
+        assert_eq!(metadata["thinking_rewrite_applied"], "true");
+    }
+}
+
+#[tokio::test]
+async fn per_profile_thinking_passthrough_leaves_caller_thinking_fields_unchanged() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "tool-route"
+base_url = "{base_url}"
+match_models = ["tool-model"]
+
+[upstreams.thinking]
+mode = "passthrough"
+"#,
+            base_url = fake.base_url,
+        ),
+    )
+    .await;
+    let body = Bytes::from_static(
+        br#"{"model":"tool-model","messages":[{"role":"user","content":"ping"}],"stream":true,"thinking":{"budget_tokens":7},"chat_template_kwargs":{"enable_thinking":false},"max_tokens":2}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _ = response.text().await.expect("body should be text");
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 7);
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+    assert_eq!(observed_body["max_tokens"], 2);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["upstream_profile"], "tool-route");
+        assert_eq!(metadata["thinking_policy_mode"], "passthrough");
+        assert_eq!(metadata["thinking_rewrite_reason"], "mode_passthrough");
+        assert_eq!(metadata["thinking_rewrite_applied"], "false");
+    }
+}
+
+#[tokio::test]
 async fn streaming_chat_downstream_drop_cancels_upstream_relay() {
     let mut upstream = CancellableUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&upstream.base_url, true).await;
@@ -4692,6 +5038,285 @@ async fn completions_forwards_body_without_policy_rewrite() {
 }
 
 #[tokio::test]
+async fn context_budget_preflight_allows_equal_window_and_rejects_chat_overflow() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[upstream.metadata]
+context_length_override = 6
+input_token_safety_margin = 1
+
+[thinking]
+mode = "passthrough"
+"#,
+    )
+    .await;
+
+    let allowed = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"a b c"}],"max_tokens":1}"#,
+        )
+        .send()
+        .await
+        .expect("allowed proxy request should complete");
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let _allowed_json = shielded_final_json(allowed).await;
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+
+    let rejected = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"a b c d"}],"max_tokens":1}"#,
+        )
+        .send()
+        .await
+        .expect("rejected proxy request should complete");
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(rejected).await;
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "context_budget_exceeded");
+    assert_eq!(error["error"]["param"], "messages");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .expect("message should be string")
+            .contains("auto-compaction")
+    );
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let attempt_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .expect("attempt count should be readable");
+    assert_eq!(attempt_count, 1);
+    let rejected_metadata_json: String = connection
+        .query_row(
+            "SELECT request_metadata_json FROM requests ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rejected request metadata should be readable");
+    let rejected_metadata: serde_json::Value =
+        serde_json::from_str(&rejected_metadata_json).expect("metadata should parse");
+    assert_eq!(rejected_metadata["context_budget_preflight"], "rejected");
+    assert_eq!(rejected_metadata["context_budget_param"], "messages");
+    assert_eq!(rejected_metadata["context_budget_window_tokens"], "6");
+    assert_eq!(
+        rejected_metadata["context_budget_total_estimate_tokens"],
+        "7"
+    );
+    assert_eq!(rejected_metadata["upstream_profile"], "default");
+    assert!(!rejected_metadata.to_string().contains("a b c d"));
+}
+
+#[tokio::test]
+async fn context_budget_preflight_counts_chat_tool_definitions_before_forwarding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[upstream.metadata]
+context_length_override = 6
+
+[thinking]
+mode = "passthrough"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"ok"}],"tools":[{"type":"function","function":{"name":"lookup","description":"one two three four five six","parameters":{"type":"object","properties":{"city":{"type":"string","description":"target city"}},"required":["city"]}}}],"max_tokens":1}"#,
+        )
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(response).await;
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "context_budget_exceeded");
+    assert_eq!(error["error"]["param"], "messages");
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let rejected_metadata_json: String = connection
+        .query_row(
+            "SELECT request_metadata_json FROM requests ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("rejected request metadata should be readable");
+    let rejected_metadata: serde_json::Value =
+        serde_json::from_str(&rejected_metadata_json).expect("metadata should parse");
+    assert_eq!(rejected_metadata["context_budget_preflight"], "rejected");
+    assert_eq!(rejected_metadata["context_budget_param"], "messages");
+    assert!(
+        rejected_metadata["context_budget_total_estimate_tokens"]
+            .as_str()
+            .and_then(|tokens| tokens.parse::<u64>().ok())
+            .is_some_and(|tokens| tokens > 6)
+    );
+    assert!(!rejected_metadata_json.contains("one two three four five six"));
+    assert!(!rejected_metadata_json.contains("target city"));
+}
+
+#[tokio::test]
+async fn context_budget_preflight_rejects_completions_prompt_before_forwarding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[upstream.metadata]
+context_length_override = 3
+",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-completion","prompt":"one two three","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(response).await;
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "context_budget_exceeded");
+    assert_eq!(error["error"]["param"], "prompt");
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let attempt_count: i64 = connection
+        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .expect("attempt count should be readable");
+    assert_eq!(attempt_count, 0);
+}
+
+#[tokio::test]
+async fn context_budget_preflight_rejects_unbroken_prompt_before_forwarding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[upstream.metadata]
+context_length_override = 100
+",
+    )
+    .await;
+    let long_prompt = "x".repeat(1_000);
+    let body = format!(r#"{{"model":"test-completion","prompt":"{long_prompt}","max_tokens":1}}"#);
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(response).await;
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "context_budget_exceeded");
+    assert_eq!(error["error"]["param"], "prompt");
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+}
+
+#[tokio::test]
+async fn hot_reloaded_profile_safety_margin_changes_context_preflight() {
+    let mut fake = FakeUpstream::spawn().await;
+    let fake_base_url = fake.base_url.clone();
+    let profile_config = |safety_margin: u32| {
+        format!(
+            r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "{fake_base_url}"
+match_models = ["aeon-ultimate"]
+
+[upstreams.metadata]
+context_length_override = 6
+input_token_safety_margin = {safety_margin}
+
+[upstreams.thinking]
+mode = "passthrough"
+"#,
+        )
+    };
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &profile_config(0),
+    )
+    .await;
+    let body = r#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"a b c d"}],"max_tokens":1}"#;
+
+    let allowed = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("allowed proxy request should complete");
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let _allowed_json = shielded_final_json(allowed).await;
+    let _observed = fake.recv_next().await;
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &profile_config(1),
+    );
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("profile safety margin reload should succeed");
+    assert!(outcome.applied);
+    assert!(outcome.restart_required_changes.is_empty());
+
+    let rejected = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("rejected proxy request should complete");
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(rejected).await;
+    assert_eq!(error["error"]["code"], "context_budget_exceeded");
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+}
+
+#[tokio::test]
 async fn non_chat_embeddings_pass_through_without_policy_rewrite() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -6008,6 +6633,12 @@ async fn shielded_final_json(response: reqwest::Response) -> serde_json::Value {
             panic!("shielded JSON body should parse: {error}; body={body:?}")
         })
     }
+}
+
+async fn response_json(response: reqwest::Response) -> serde_json::Value {
+    let body = response.text().await.expect("body should be readable");
+    serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("response body should parse as JSON: {error}; body={body}"))
 }
 
 fn final_json_from_sse_body(body: &[u8]) -> serde_json::Value {

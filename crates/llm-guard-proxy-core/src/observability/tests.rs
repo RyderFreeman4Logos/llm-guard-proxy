@@ -402,6 +402,22 @@ fn redacts_authorization_and_api_key_like_values_before_persistence() {
             String::from("application/json"),
         ),
         (String::from("first_token_latency_ms"), String::from("12")),
+        (
+            String::from("upstream_context_window_tokens"),
+            String::from("4096"),
+        ),
+        (
+            String::from("upstream_input_token_safety_margin"),
+            String::from("64"),
+        ),
+        (
+            String::from("context_budget_total_estimate_tokens"),
+            String::from("6"),
+        ),
+        (
+            String::from("thinking_policy_max_tokens"),
+            String::from("50000"),
+        ),
     ]);
     request.raw_payloads = RawPayloads {
         input: Some(String::from(r#"{"api_key":"sk-fixture-secret"}"#)),
@@ -436,6 +452,10 @@ WHERE request_id = 'req-redaction'
     assert!(!metadata_json.contains("fixture-api-key-value"));
     assert!(metadata_json.contains("[REDACTED]"));
     assert!(metadata_json.contains(r#""first_token_latency_ms":"12""#));
+    assert!(metadata_json.contains(r#""upstream_context_window_tokens":"4096""#));
+    assert!(metadata_json.contains(r#""upstream_input_token_safety_margin":"64""#));
+    assert!(metadata_json.contains(r#""context_budget_total_estimate_tokens":"6""#));
+    assert!(metadata_json.contains(r#""thinking_policy_max_tokens":"50000""#));
     assert_eq!(raw_input.as_deref(), Some("[REDACTED]"));
     assert_eq!(
         raw_output.as_deref(),

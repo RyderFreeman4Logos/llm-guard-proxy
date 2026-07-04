@@ -1,13 +1,17 @@
 use axum::body::Bytes;
-use llm_guard_proxy_core::MetadataConfig;
+use llm_guard_proxy_core::{AppConfig, MetadataConfig};
 use serde_json::{Map, Number, Value};
 
 /// Enriches OpenAI-compatible model list responses with normalized context metadata.
 ///
 /// Invalid JSON, non-list payloads, and responses without usable model metadata are returned
 /// byte-for-byte so generic proxy behavior stays pass-through unless enrichment can help.
-pub(super) fn enrich_models_body(config: &MetadataConfig, body: Bytes) -> Bytes {
-    if !config.discovery_enabled || !config.enrich_responses {
+pub(super) fn enrich_models_body(
+    config: &AppConfig,
+    selected_metadata: &MetadataConfig,
+    body: Bytes,
+) -> Bytes {
+    if !selected_metadata.discovery_enabled || !selected_metadata.enrich_responses {
         return body;
     }
 
@@ -22,7 +26,8 @@ pub(super) fn enrich_models_body(config: &MetadataConfig, body: Bytes) -> Bytes 
     let mut changed = false;
     for model in models {
         if let Some(record) = model.as_object_mut() {
-            changed |= enrich_model_record(config, record);
+            let metadata = metadata_for_model_record(config, selected_metadata, record);
+            changed |= enrich_model_record(metadata, record);
         }
     }
 
@@ -33,7 +38,26 @@ pub(super) fn enrich_models_body(config: &MetadataConfig, body: Bytes) -> Bytes 
     serde_json::to_vec(&value).map_or(body, Bytes::from)
 }
 
+fn metadata_for_model_record<'config>(
+    config: &'config AppConfig,
+    selected_metadata: &'config MetadataConfig,
+    record: &Map<String, Value>,
+) -> &'config MetadataConfig {
+    let Some(model_id) = record.get("id").and_then(Value::as_str) else {
+        return selected_metadata;
+    };
+    config
+        .upstream_profiles
+        .iter()
+        .find(|profile| profile.matches_model(model_id))
+        .map_or(selected_metadata, |profile| &profile.metadata)
+}
+
 fn enrich_model_record(config: &MetadataConfig, record: &mut Map<String, Value>) -> bool {
+    if !config.discovery_enabled || !config.enrich_responses {
+        return false;
+    }
+
     let Some(context_length) =
         discovered_context_length(record).or_else(|| fallback_context_length(config))
     else {
@@ -54,10 +78,7 @@ fn discovered_context_length(record: &Map<String, Value>) -> Option<u64> {
 }
 
 fn fallback_context_length(config: &MetadataConfig) -> Option<u64> {
-    config
-        .context_length_override
-        .or(config.max_model_len_override)
-        .map(u64::from)
+    config.context_window_override().map(u64::from)
 }
 
 fn numeric_field(record: &Map<String, Value>, key: &str) -> Option<u64> {
