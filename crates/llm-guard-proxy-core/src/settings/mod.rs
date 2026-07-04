@@ -13,11 +13,12 @@ mod tests;
 
 pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
-    AppConfig, CloudflareConfig, ConfigToggle, HeartbeatConfig, HeartbeatMode, LoopGuardConfig,
-    LoopGuardMode, MetadataConfig, ObservabilityConfig, RestartRequiredChange, RetentionConfig,
-    RetryConfig, SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig,
-    ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    AppConfig, CloudflareConfig, ConfigToggle, DownstreamDropPolicy, HeartbeatConfig,
+    HeartbeatMode, LoopGuardConfig, LoopGuardMode, MetadataConfig, ObservabilityConfig,
+    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
+    SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
+    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 pub use reload::{
     ConfigHandle, ConfigManager, MissingConfigPolicy, ReloadOutcome, ReloadWatcher,
@@ -76,6 +77,9 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "retry.enabled",
     "retry.max_attempts",
     "retry.anti_loop_hint_enabled",
+    "retry.shielded_streaming_enabled",
+    "retry.downstream_drop_policy",
+    "retry.ladder",
     "upstream.stall.enabled",
     "upstream.stall.idle_timeout_ms",
     "upstream.stall.recovery_command",

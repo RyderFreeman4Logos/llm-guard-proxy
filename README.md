@@ -220,8 +220,28 @@ reasoning_semantic_history_window_count = 16
 
 [retry]
 enabled = true
-max_attempts = 5
+max_attempts = 3
 anti_loop_hint_enabled = true
+shielded_streaming_enabled = false
+downstream_drop_policy = "cancel" # cancel, detach
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+anti_loop_hint = "Previous attempt became repetitive. Do not repeat prior analysis; answer directly."
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+max_tokens = 50000
 
 [heartbeat]
 mode = "sse" # sse, json-whitespace, disabled
@@ -295,6 +315,9 @@ Reloadable fields:
 - `retry.enabled`
 - `retry.max_attempts`
 - `retry.anti_loop_hint_enabled`
+- `retry.shielded_streaming_enabled`
+- `retry.downstream_drop_policy`
+- `retry.ladder`
 - `heartbeat.mode`
 - `heartbeat.interval_secs`
 - `cloudflare.enabled`

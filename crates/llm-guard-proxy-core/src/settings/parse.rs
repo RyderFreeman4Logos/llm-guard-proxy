@@ -1,10 +1,11 @@
 use std::path::PathBuf;
 
 use super::{
-    AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, HeartbeatConfig, HeartbeatMode,
-    LoopGuardConfig, LoopGuardMode, MetadataConfig, ObservabilityConfig, RetentionConfig,
-    RetryConfig, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamStallConfig,
+    AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DownstreamDropPolicy,
+    HeartbeatConfig, HeartbeatMode, LoopGuardConfig, LoopGuardMode, MetadataConfig,
+    ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig, ServerConfig,
+    ShieldingConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamProfileConfig, UpstreamStallConfig,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -22,6 +23,7 @@ enum Section {
     Thinking,
     LoopGuard,
     Retry,
+    RetryLadder(usize),
     UpstreamStall,
     Heartbeat,
     Cloudflare,
@@ -96,6 +98,10 @@ fn parse_section(
         let index = config.upstream_profiles.len() - 1;
         *current_upstream_profile = Some(index);
         return Ok(Section::UpstreamProfile(index));
+    }
+    if line == "[[retry.ladder]]" {
+        config.retry.ladder.push(RetryLadderConfig::default());
+        return Ok(Section::RetryLadder(config.retry.ladder.len() - 1));
     }
     let section = &line[1..line.len() - 1];
     match section {
@@ -202,6 +208,9 @@ fn assign_value(
         Section::Thinking => assign_thinking(&mut config.thinking, key, value, line_number),
         Section::LoopGuard => assign_loop_guard(&mut config.loop_guard, key, value, line_number),
         Section::Retry => assign_retry(&mut config.retry, key, value, line_number),
+        Section::RetryLadder(index) => {
+            assign_retry_ladder(&mut config.retry.ladder[index], key, value, line_number)
+        }
         Section::UpstreamStall => {
             assign_upstream_stall(&mut config.upstream_stall, key, value, line_number)
         }
@@ -625,9 +634,81 @@ fn assign_retry(
         "anti_loop_hint_enabled" => {
             config.anti_loop_hint_enabled = parse_bool(value, line_number)?;
         }
+        "shielded_streaming_enabled" => {
+            config.shielded_streaming_enabled = parse_bool(value, line_number)?;
+        }
+        "downstream_drop_policy" => {
+            config.downstream_drop_policy = parse_downstream_drop_policy(value, line_number)?;
+        }
         _ => return unknown_key("retry", key, line_number),
     }
     Ok(())
+}
+
+fn assign_retry_ladder(
+    config: &mut RetryLadderConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "name" => config.name = parse_string(value, line_number)?,
+        "mode" | "thinking_mode" => {
+            config.thinking.mode = parse_thinking_mode(value, line_number)?;
+        }
+        "enabled" => config.thinking.enabled = parse_bool(value, line_number)?,
+        "force_disable" => config.thinking.force_disable = parse_bool(value, line_number)?,
+        "max_tokens" => {
+            config.thinking.max_tokens =
+                Some(parse_u32(value, line_number, "retry.ladder.max_tokens")?);
+        }
+        "budget_tokens" => {
+            config.thinking.budget_tokens =
+                parse_u32(value, line_number, "retry.ladder.budget_tokens")?;
+        }
+        "thinking_token_budget" => {
+            config.thinking.budget_tokens =
+                parse_u32(value, line_number, "retry.ladder.thinking_token_budget")?;
+        }
+        "preserve_answer_budget" => {
+            config.thinking.preserve_answer_budget = parse_bool(value, line_number)?;
+        }
+        "budget_accounting" => {
+            config.thinking.preserve_answer_budget = parse_budget_accounting(value, line_number)?;
+        }
+        "tool_request_policy" => {
+            config.thinking.tool_request_policy =
+                parse_tool_request_thinking_policy(value, line_number)?;
+        }
+        "apply_to_tool_requests" => {
+            config.thinking.tool_request_policy = if parse_bool(value, line_number)? {
+                ToolRequestThinkingPolicy::Apply
+            } else {
+                ToolRequestThinkingPolicy::Passthrough
+            };
+        }
+        "anti_loop_hint" => {
+            config.anti_loop_hint = parse_optional_string(value, line_number)?;
+        }
+        _ => return unknown_key("retry.ladder", key, line_number),
+    }
+    Ok(())
+}
+
+fn parse_downstream_drop_policy(
+    value: &str,
+    line_number: usize,
+) -> Result<DownstreamDropPolicy, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "cancel" => Ok(DownstreamDropPolicy::Cancel),
+        "detach" => Ok(DownstreamDropPolicy::Detach),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid retry.downstream_drop_policy {other:?}; expected \"cancel\" or \"detach\""
+            ),
+        )),
+    }
 }
 
 fn assign_upstream_stall(
