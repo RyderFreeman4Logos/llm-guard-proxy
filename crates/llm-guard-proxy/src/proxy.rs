@@ -28,10 +28,11 @@ use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
-    DownstreamMode, Health, HeartbeatMode, LICENSE, LatencyHistogram, MetadataConfig,
-    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
-    RequestStatus, RetryConfig, SERVICE_NAME, ThinkingConfig, UpstreamMode, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    DownstreamDropPolicy, DownstreamMode, Health, HeartbeatMode, LICENSE, LatencyHistogram,
+    MetadataConfig, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId,
+    RequestRecord, RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME, ThinkingConfig,
+    UpstreamMode, UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -39,7 +40,7 @@ use thiserror::Error;
 use tokio::{
     net::TcpListener,
     process::Command,
-    sync::{Mutex as AsyncMutex, Notify},
+    sync::{Mutex as AsyncMutex, Notify, oneshot},
     time::{Instant, Interval, MissedTickBehavior, timeout},
 };
 
@@ -1215,7 +1216,7 @@ async fn forward_openai_request(
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry);
     let upstream_stall_policy = UpstreamStallPolicy::from_config(&config.upstream_stall);
     if prepared_request.shielded_chat_plan.intercepted {
-        add_retry_request_metadata(&mut request_metadata, retry_policy);
+        add_retry_request_metadata(&mut request_metadata, &retry_policy);
         return forward_shielded_chat_with_retries(
             ShieldedRetryRuntime {
                 client: state.client.clone(),
@@ -1225,6 +1226,8 @@ async fn forward_openai_request(
                 downstream_uri: uri,
                 downstream_headers,
                 upstream_body: prepared_request.shielded_chat_plan.upstream_body,
+                downstream_body: prepared_request.shielded_chat_plan.downstream_body,
+                chat_kind: prepared_request.shielded_chat_plan.kind,
                 upstream_timeout: Duration::from_millis(
                     prepared_request.upstream_profile.request_timeout_ms,
                 ),
@@ -1462,12 +1465,21 @@ struct ResponseDispatch<'request> {
 }
 
 struct ShieldedChatPlan {
+    downstream_body: Bytes,
     upstream_body: Bytes,
     intercepted: bool,
+    kind: ShieldedChatKind,
     thinking_policy_applied: bool,
     liveness: ShieldedLivenessSelection,
     thinking_metadata: BTreeMap<String, String>,
     loop_context: shielded_chat::LoopInspectionContext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShieldedChatKind {
+    NonStream,
+    Stream,
+    Generic,
 }
 
 fn plan_shielded_chat(
@@ -1478,15 +1490,38 @@ fn plan_shielded_chat(
     uri: &Uri,
     body: &Bytes,
 ) -> ShieldedChatPlan {
-    let (request, intercepted) = if should_intercept_non_stream_chat(method, uri, config) {
-        let non_stream_request = shielded_chat::prepare_non_stream_request(body, thinking);
-        if non_stream_request.is_some() {
-            (non_stream_request, true)
+    let retry_initial_thinking = config
+        .retry
+        .ladder
+        .first()
+        .map_or(thinking, |entry| &entry.thinking);
+    let (request, intercepted, kind) = if should_intercept_non_stream_chat(method, uri, config) {
+        if let Some(non_stream_request) =
+            shielded_chat::prepare_non_stream_request(body, retry_initial_thinking)
+        {
+            (Some(non_stream_request), true, ShieldedChatKind::NonStream)
+        } else if let Some(stream_request) = shielded_chat::prepare_stream_request(
+            body,
+            if config.retry.shielded_streaming_enabled {
+                retry_initial_thinking
+            } else {
+                thinking
+            },
+        ) {
+            (
+                Some(stream_request),
+                config.retry.shielded_streaming_enabled,
+                if config.retry.shielded_streaming_enabled {
+                    ShieldedChatKind::Stream
+                } else {
+                    ShieldedChatKind::Generic
+                },
+            )
         } else {
-            (shielded_chat::prepare_stream_request(body, thinking), false)
+            (None, false, ShieldedChatKind::Generic)
         }
     } else {
-        (None, false)
+        (None, false, ShieldedChatKind::Generic)
     };
     let upstream_body = request.as_ref().map_or_else(
         || body.clone(),
@@ -1496,7 +1531,7 @@ fn plan_shielded_chat(
         .as_ref()
         .map_or_else(BTreeMap::new, |request| request.thinking_metadata().clone());
     let thinking_policy_applied = request.is_some();
-    let liveness = select_shielded_liveness(state, config, body, intercepted, unix_time_millis());
+    let liveness = select_shielded_liveness(state, config, body, kind, unix_time_millis());
     let loop_context = if intercepted {
         shielded_chat::LoopInspectionContext::from_request_body(&config.loop_guard, body)
     } else {
@@ -1504,8 +1539,10 @@ fn plan_shielded_chat(
     };
 
     ShieldedChatPlan {
+        downstream_body: body.clone(),
         upstream_body,
         intercepted,
+        kind,
         thinking_policy_applied,
         liveness,
         thinking_metadata,
@@ -1547,29 +1584,71 @@ impl ShieldedLivenessMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ShieldedRetryPolicy {
     enabled: bool,
     max_attempts: u32,
     anti_loop_hint_enabled: bool,
+    shielded_streaming_enabled: bool,
+    downstream_drop_policy: DownstreamDropPolicy,
+    ladder: Vec<RetryLadderConfig>,
 }
 
 impl ShieldedRetryPolicy {
     fn from_config(config: &RetryConfig) -> Self {
-        Self {
-            enabled: config.enabled,
-            max_attempts: if config.enabled {
+        let max_attempts = if config.enabled {
+            if config.ladder.is_empty() {
                 config.max_attempts
             } else {
-                1
-            },
+                config
+                    .max_attempts
+                    .min(u32::try_from(config.ladder.len()).unwrap_or(u32::MAX))
+            }
+        } else {
+            1
+        };
+        Self {
+            enabled: config.enabled,
+            max_attempts,
             anti_loop_hint_enabled: config.anti_loop_hint_enabled,
+            shielded_streaming_enabled: config.shielded_streaming_enabled,
+            downstream_drop_policy: config.downstream_drop_policy,
+            ladder: config.ladder.clone(),
         }
     }
 
-    fn allows_retry_after(self, attempt_number: u32) -> bool {
+    fn allows_retry_after(&self, attempt_number: u32) -> bool {
         self.enabled && attempt_number < self.max_attempts
     }
+
+    fn attempt_plan(
+        &self,
+        attempt_number: u32,
+        fallback_thinking: &ThinkingConfig,
+    ) -> ShieldedAttemptPlan {
+        let index = attempt_number.saturating_sub(1);
+        self.ladder
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .map_or_else(
+                || ShieldedAttemptPlan {
+                    name: format!("attempt-{attempt_number}"),
+                    thinking: fallback_thinking.clone(),
+                    anti_loop_hint: None,
+                },
+                |entry| ShieldedAttemptPlan {
+                    name: entry.name.clone(),
+                    thinking: entry.thinking.clone(),
+                    anti_loop_hint: entry.anti_loop_hint.clone(),
+                },
+            )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShieldedAttemptPlan {
+    name: String,
+    thinking: ThinkingConfig,
+    anti_loop_hint: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2147,6 +2226,8 @@ struct ShieldedRetryRuntime {
     downstream_uri: Uri,
     downstream_headers: HeaderMap,
     upstream_body: Bytes,
+    downstream_body: Bytes,
+    chat_kind: ShieldedChatKind,
     upstream_timeout: Duration,
     store: ObservabilityStore,
     request_id: RequestId,
@@ -2183,6 +2264,7 @@ struct ShieldedStartedAttempt {
 
 struct ShieldedAcceptedOutcome {
     body: Bytes,
+    sse_body: Bytes,
     raw_payloads: RawPayloads,
     response_metadata: BTreeMap<String, String>,
     prior_attempt_records: Vec<AttemptRecord>,
@@ -2191,6 +2273,7 @@ struct ShieldedAcceptedOutcome {
 
 struct ShieldedAggregatedAttempt {
     body: Bytes,
+    sse_body: Bytes,
     raw_payloads: RawPayloads,
     response_metadata: BTreeMap<String, String>,
     final_attempt: FinalAttemptContext,
@@ -2202,12 +2285,6 @@ struct ShieldedFailureOutcome {
     response_metadata: BTreeMap<String, String>,
     attempt_records: Vec<AttemptRecord>,
     upstream_mode: UpstreamMode,
-    forwarded_response: Option<Box<ShieldedForwardedFailure>>,
-}
-
-struct ShieldedForwardedFailure {
-    started: ShieldedStartedAttempt,
-    final_attempt: FinalAttemptContext,
 }
 
 struct ShieldedTerminalForward {
@@ -2250,20 +2327,10 @@ async fn forward_shielded_chat_with_retries(
     runtime: ShieldedRetryRuntime,
     in_flight_permit: InFlightPermit,
 ) -> Result<Response<Body>, ProxyError> {
-    if runtime.liveness.mode == ShieldedLivenessMode::Disabled {
-        return Ok(
-            match run_shielded_attempts(runtime.clone(), None, Vec::new(), true, None).await {
-                ShieldedRunOutcome::Accepted(outcome) => {
-                    shielded_retry_success_response(&runtime, outcome, in_flight_permit)
-                }
-                ShieldedRunOutcome::Failed(failure) => {
-                    shielded_retry_error_response(&runtime, failure, in_flight_permit)
-                }
-                ShieldedRunOutcome::TerminalForward(terminal) => {
-                    shielded_retry_terminal_forward_response(&runtime, terminal, in_flight_permit)
-                }
-            },
-        );
+    if runtime.liveness.mode == ShieldedLivenessMode::Disabled
+        && runtime.chat_kind != ShieldedChatKind::Stream
+    {
+        return Ok(immediate_shielded_retry_response(&runtime, in_flight_permit).await);
     }
 
     match begin_shielded_retry(&runtime).await {
@@ -2326,9 +2393,15 @@ async fn forward_shielded_chat_with_retries(
                     )),
                 }
             });
+            let aggregate = maybe_detach_shielded_aggregate(aggregate, &runtime.retry_policy);
             let response_body = ShieldedLivenessBody::new(
                 aggregate,
                 runtime.liveness.mode,
+                if runtime.chat_kind == ShieldedChatKind::Stream {
+                    ShieldedAcceptedResponseMode::OpenAiSse
+                } else {
+                    ShieldedAcceptedResponseMode::JsonCompletion
+                },
                 runtime.liveness.heartbeat_interval_secs,
                 observer,
                 in_flight_permit,
@@ -2348,6 +2421,52 @@ async fn forward_shielded_chat_with_retries(
             shielded_retry_terminal_forward_response(&runtime, terminal, in_flight_permit),
         ),
     }
+}
+
+async fn immediate_shielded_retry_response(
+    runtime: &ShieldedRetryRuntime,
+    in_flight_permit: InFlightPermit,
+) -> Response<Body> {
+    match run_shielded_attempts(runtime.clone(), None, Vec::new(), true, None).await {
+        ShieldedRunOutcome::Accepted(outcome) => {
+            shielded_retry_success_response(runtime, outcome, in_flight_permit)
+        }
+        ShieldedRunOutcome::Failed(failure) => {
+            shielded_retry_error_response(runtime, failure, in_flight_permit)
+        }
+        ShieldedRunOutcome::TerminalForward(terminal) => {
+            shielded_retry_terminal_forward_response(runtime, terminal, in_flight_permit)
+        }
+    }
+}
+
+fn maybe_detach_shielded_aggregate(
+    aggregate: ShieldedAggregateFuture,
+    policy: &ShieldedRetryPolicy,
+) -> ShieldedAggregateFuture {
+    if policy.downstream_drop_policy != DownstreamDropPolicy::Detach {
+        return aggregate;
+    }
+
+    let (sender, receiver) =
+        oneshot::channel::<Result<ShieldedAcceptedOutcome, ShieldedFailureOutcome>>();
+    tokio::spawn(async move {
+        let _ = sender.send(aggregate.await);
+    });
+    Box::pin(async move {
+        receiver.await.unwrap_or_else(|_closed| {
+            Err(ShieldedFailureOutcome {
+                error_type: "llm_guard_upstream_error",
+                error_message: String::from("detached shielded upstream attempt result was lost"),
+                response_metadata: BTreeMap::from([(
+                    String::from("downstream_drop_policy"),
+                    String::from("detach"),
+                )]),
+                attempt_records: Vec::new(),
+                upstream_mode: UpstreamMode::NotApplicable,
+            })
+        })
+    })
 }
 
 enum ShieldedAttemptStep {
@@ -2387,7 +2506,7 @@ fn shielded_start_failure_step(
             AttemptStatus::Failed
         },
         if can_retry { next_retry_cause } else { None },
-        runtime.retry_policy,
+        &runtime.retry_policy,
     ));
     if can_retry {
         return ShieldedStartFailureStep::Retry {
@@ -2398,7 +2517,7 @@ fn shielded_start_failure_step(
     ShieldedStartFailureStep::Failed(shielded_failure_outcome(
         failure,
         std::mem::take(attempt_records),
-        runtime.retry_policy,
+        &runtime.retry_policy,
     ))
 }
 
@@ -2423,7 +2542,7 @@ fn shielded_started_attempt_step(
                     &started.info,
                     AttemptStatus::Retried,
                     Some(cause),
-                    runtime.retry_policy,
+                    &runtime.retry_policy,
                     "retryable upstream status before shielded stream",
                 ));
                 return ShieldedAttemptStep::Retry {
@@ -2436,11 +2555,16 @@ fn shielded_started_attempt_step(
                 cause,
                 "retryable upstream status attempts exhausted before shielded stream",
             );
-            return ShieldedAttemptStep::Failed(shielded_forwarded_status_failure_outcome(
+            attempt_records.push(attempt_failure_record(
+                &failure,
+                AttemptStatus::Failed,
+                None,
+                &runtime.retry_policy,
+            ));
+            return ShieldedAttemptStep::Failed(shielded_failure_outcome(
                 failure,
                 std::mem::take(attempt_records),
-                runtime.retry_policy,
-                started,
+                &runtime.retry_policy,
             ));
         }
         if allow_terminal_forward {
@@ -2457,12 +2581,12 @@ fn shielded_started_attempt_step(
             &failure,
             AttemptStatus::Failed,
             None,
-            runtime.retry_policy,
+            &runtime.retry_policy,
         ));
         return ShieldedAttemptStep::Failed(shielded_failure_outcome(
             failure,
             std::mem::take(attempt_records),
-            runtime.retry_policy,
+            &runtime.retry_policy,
         ));
     }
 
@@ -2474,12 +2598,12 @@ fn shielded_started_attempt_step(
         &failure,
         AttemptStatus::Failed,
         None,
-        runtime.retry_policy,
+        &runtime.retry_policy,
     ));
     ShieldedAttemptStep::Failed(shielded_failure_outcome(
         failure,
         std::mem::take(attempt_records),
-        runtime.retry_policy,
+        &runtime.retry_policy,
     ))
 }
 
@@ -2551,6 +2675,7 @@ async fn aggregate_shielded_attempt(
                 aggregated.raw_payloads.clone(),
             ),
             body: aggregated.body,
+            sse_body: aggregated.sse_body,
             raw_payloads: aggregated.raw_payloads,
             response_metadata: aggregated.response_metadata,
         }),
@@ -2625,6 +2750,7 @@ async fn run_shielded_attempts(
             Ok(aggregated) => {
                 return ShieldedRunOutcome::Accepted(ShieldedAcceptedOutcome {
                     body: aggregated.body,
+                    sse_body: aggregated.sse_body,
                     raw_payloads: aggregated.raw_payloads,
                     response_metadata: aggregated.response_metadata,
                     prior_attempt_records: attempt_records,
@@ -2646,7 +2772,7 @@ async fn run_shielded_attempts(
                     &failure,
                     retry_attempt_status(can_retry),
                     retry_cause_for_attempt_record(can_retry, next_retry_cause),
-                    runtime.retry_policy,
+                    &runtime.retry_policy,
                 ));
                 update_shielded_attempt_progress(attempt_progress.as_ref(), &attempt_records, None);
                 if can_retry {
@@ -2657,7 +2783,7 @@ async fn run_shielded_attempts(
                 return ShieldedRunOutcome::Failed(shielded_failure_outcome(
                     failure,
                     attempt_records,
-                    runtime.retry_policy,
+                    &runtime.retry_policy,
                 ));
             }
         }
@@ -3087,13 +3213,17 @@ async fn start_shielded_attempt(
 ) -> Result<ShieldedStartedAttempt, ShieldedAttemptFailure> {
     let attempt_id = AttemptId::for_request(&runtime.request_id, attempt_number);
     let attempt_started_at_unix_ms = unix_time_millis();
+    let attempt_plan = runtime
+        .retry_policy
+        .attempt_plan(attempt_number, &runtime.upstream_profile.thinking);
     let (upstream_body, anti_loop_hint_applied) =
-        shielded_attempt_body(runtime, attempt_number, retry_cause);
+        shielded_attempt_body(runtime, attempt_number, retry_cause, &attempt_plan);
     let request_metadata = shielded_attempt_request_metadata(
         runtime,
         attempt_number,
         retry_cause,
         anti_loop_hint_applied,
+        &attempt_plan,
     );
     match send_upstream_request(
         &runtime.client,
@@ -3180,20 +3310,37 @@ fn shielded_attempt_body(
     runtime: &ShieldedRetryRuntime,
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
+    attempt_plan: &ShieldedAttemptPlan,
 ) -> (Bytes, bool) {
+    let prepared_body = match runtime.chat_kind {
+        ShieldedChatKind::NonStream => shielded_chat::prepare_non_stream_request(
+            &runtime.downstream_body,
+            &attempt_plan.thinking,
+        ),
+        ShieldedChatKind::Stream => {
+            shielded_chat::prepare_stream_request(&runtime.downstream_body, &attempt_plan.thinking)
+        }
+        ShieldedChatKind::Generic => None,
+    }
+    .map_or_else(
+        || runtime.upstream_body.clone(),
+        |request| request.upstream_body(),
+    );
+
     if attempt_number > 1
         && runtime.retry_policy.anti_loop_hint_enabled
         && matches!(retry_cause, Some(ShieldedRetryCause::LoopDetected))
     {
         if let Some(body) = shielded_chat::body_with_anti_loop_retry_hint(
-            &runtime.upstream_body,
+            &prepared_body,
             attempt_number,
             runtime.retry_policy.max_attempts,
+            attempt_plan.anti_loop_hint.as_deref(),
         ) {
             return (body, true);
         }
     }
-    (runtime.upstream_body.clone(), false)
+    (prepared_body, false)
 }
 
 fn shielded_attempt_request_metadata(
@@ -3201,6 +3348,7 @@ fn shielded_attempt_request_metadata(
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
     anti_loop_hint_applied: bool,
+    attempt_plan: &ShieldedAttemptPlan,
 ) -> BTreeMap<String, String> {
     let mut metadata = attempt_request_metadata(
         &runtime.downstream_method,
@@ -3221,22 +3369,29 @@ fn shielded_attempt_request_metadata(
     );
     add_retry_attempt_metadata(
         &mut metadata,
-        runtime.retry_policy,
+        &runtime.retry_policy,
         attempt_number,
         retry_cause,
         anti_loop_hint_applied,
+        attempt_plan,
     );
     metadata
 }
 
 fn add_retry_attempt_metadata(
     metadata: &mut BTreeMap<String, String>,
-    policy: ShieldedRetryPolicy,
+    policy: &ShieldedRetryPolicy,
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
     anti_loop_hint_applied: bool,
+    attempt_plan: &ShieldedAttemptPlan,
 ) {
     metadata.insert(String::from("attempt_number"), attempt_number.to_string());
+    metadata.insert(
+        String::from("attempt_index"),
+        attempt_number.saturating_sub(1).to_string(),
+    );
+    metadata.insert(String::from("attempt_name"), attempt_plan.name.clone());
     metadata.insert(
         String::from("retry_policy_enabled"),
         policy.enabled.to_string(),
@@ -3260,11 +3415,34 @@ fn add_retry_attempt_metadata(
         String::from("retry_anti_loop_hint_applied"),
         anti_loop_hint_applied.to_string(),
     );
+    metadata.insert(
+        String::from("retry_shielded_streaming_enabled"),
+        policy.shielded_streaming_enabled.to_string(),
+    );
+    metadata.insert(
+        String::from("downstream_drop_policy"),
+        policy.downstream_drop_policy.as_str().to_owned(),
+    );
+    metadata.insert(
+        String::from("attempt_thinking_mode"),
+        attempt_plan.thinking.effective_mode().as_str().to_owned(),
+    );
+    metadata.insert(
+        String::from("attempt_thinking_budget_tokens"),
+        attempt_plan.thinking.budget_tokens.to_string(),
+    );
+    metadata.insert(
+        String::from("attempt_thinking_max_tokens"),
+        attempt_plan
+            .thinking
+            .max_tokens
+            .map_or_else(|| String::from("unset"), |value| value.to_string()),
+    );
 }
 
 fn add_retry_request_metadata(
     metadata: &mut BTreeMap<String, String>,
-    policy: ShieldedRetryPolicy,
+    policy: &ShieldedRetryPolicy,
 ) {
     metadata.insert(
         String::from("retry_policy_enabled"),
@@ -3277,6 +3455,14 @@ fn add_retry_request_metadata(
     metadata.insert(
         String::from("retry_anti_loop_hint_enabled"),
         policy.anti_loop_hint_enabled.to_string(),
+    );
+    metadata.insert(
+        String::from("retry_shielded_streaming_enabled"),
+        policy.shielded_streaming_enabled.to_string(),
+    );
+    metadata.insert(
+        String::from("downstream_drop_policy"),
+        policy.downstream_drop_policy.as_str().to_owned(),
     );
 }
 
@@ -3419,9 +3605,10 @@ fn attempt_failure_record(
     failure: &ShieldedAttemptFailure,
     status: AttemptStatus,
     retry_cause: Option<ShieldedRetryCause>,
-    policy: ShieldedRetryPolicy,
+    policy: &ShieldedRetryPolicy,
 ) -> AttemptRecord {
     let mut response_metadata = failure.response_metadata.clone();
+    copy_attempt_request_metadata(&mut response_metadata, &failure.request_metadata);
     response_metadata.insert(
         String::from("attempt_number"),
         failure.attempt_number.to_string(),
@@ -3471,11 +3658,32 @@ fn attempt_failure_record(
     }
 }
 
+fn copy_attempt_request_metadata(
+    response_metadata: &mut BTreeMap<String, String>,
+    request_metadata: &BTreeMap<String, String>,
+) {
+    for key in [
+        "attempt_index",
+        "attempt_name",
+        "retry_previous_reason",
+        "retry_anti_loop_hint_applied",
+        "retry_shielded_streaming_enabled",
+        "downstream_drop_policy",
+        "attempt_thinking_mode",
+        "attempt_thinking_budget_tokens",
+        "attempt_thinking_max_tokens",
+    ] {
+        if let Some(value) = request_metadata.get(key) {
+            response_metadata.insert(key.to_owned(), value.clone());
+        }
+    }
+}
+
 fn started_status_attempt_record(
     info: &ShieldedAttemptInfo,
     status: AttemptStatus,
     retry_cause: Option<ShieldedRetryCause>,
-    policy: ShieldedRetryPolicy,
+    policy: &ShieldedRetryPolicy,
     message: &str,
 ) -> AttemptRecord {
     let failure = status_failure(
@@ -3489,7 +3697,7 @@ fn started_status_attempt_record(
 fn shielded_failure_outcome(
     failure: ShieldedAttemptFailure,
     attempt_records: Vec<AttemptRecord>,
-    policy: ShieldedRetryPolicy,
+    policy: &ShieldedRetryPolicy,
 ) -> ShieldedFailureOutcome {
     let mut response_metadata = failure.response_metadata.clone();
     response_metadata.extend(retry_chain_metadata(
@@ -3497,66 +3705,31 @@ fn shielded_failure_outcome(
         policy,
         RequestStatus::Failed.as_str(),
     ));
+    let error_type = structured_shielded_error_type(&failure);
     ShieldedFailureOutcome {
-        error_type: failure.error_type,
+        error_type,
         error_message: failure.error_message,
         response_metadata,
         attempt_records,
         upstream_mode: failure.upstream_mode,
-        forwarded_response: None,
     }
 }
 
-fn shielded_forwarded_status_failure_outcome(
-    failure: ShieldedAttemptFailure,
-    attempt_records: Vec<AttemptRecord>,
-    policy: ShieldedRetryPolicy,
-    started: ShieldedStartedAttempt,
-) -> ShieldedFailureOutcome {
-    let final_attempt = started.info.clone().into_final_context(
-        status_failure_final_attempt_metadata(&failure),
-        RawPayloads::default(),
-    );
-    let mut chain_attempts = attempt_records.clone();
-    chain_attempts.push(final_attempt_record(
-        final_attempt.clone(),
-        &failure.request_id,
-        failure.finished_at_unix_ms,
-        0,
-        &BodyCompletion::UpstreamStatusError(failure.error_message.clone()),
-    ));
-    let mut response_metadata = failure.response_metadata.clone();
-    response_metadata.extend(retry_chain_metadata(
-        &chain_attempts,
-        policy,
-        RequestStatus::Failed.as_str(),
-    ));
-    ShieldedFailureOutcome {
-        error_type: failure.error_type,
-        error_message: failure.error_message,
-        response_metadata,
-        attempt_records,
-        upstream_mode: failure.upstream_mode,
-        forwarded_response: Some(Box::new(ShieldedForwardedFailure {
-            started,
-            final_attempt,
-        })),
+fn structured_shielded_error_type(failure: &ShieldedAttemptFailure) -> &'static str {
+    if matches!(failure.retry_cause, Some(ShieldedRetryCause::LoopDetected))
+        || failure.abort_reason.as_deref() == Some("loop_guard")
+    {
+        return "llm_guard_loop_retry_exhausted";
     }
-}
-
-fn status_failure_final_attempt_metadata(
-    failure: &ShieldedAttemptFailure,
-) -> BTreeMap<String, String> {
-    let mut metadata = BTreeMap::new();
-    for key in ["status_code", "upstream_response_received"] {
-        if let Some(value) = failure.response_metadata.get(key) {
-            metadata.insert(key.to_owned(), value.clone());
-        }
+    if failure
+        .response_metadata
+        .get("upstream_stall_detected")
+        .is_some_and(|value| value == "true")
+        || failure.error_message.contains("timeout")
+    {
+        return "llm_guard_attempt_timeout";
     }
-    if failure.retry_cause.is_some() {
-        metadata.insert(String::from("retry_exhausted"), String::from("true"));
-    }
-    metadata
+    "llm_guard_upstream_error"
 }
 
 fn terminal_forward_failure(
@@ -3565,25 +3738,21 @@ fn terminal_forward_failure(
 ) -> ShieldedFailureOutcome {
     let failure = status_failure_without_retry(&terminal.started.info, message);
     let mut attempt_records = terminal.prior_attempt_records;
+    let disabled_policy = ShieldedRetryPolicy {
+        enabled: false,
+        max_attempts: 1,
+        anti_loop_hint_enabled: false,
+        shielded_streaming_enabled: false,
+        downstream_drop_policy: DownstreamDropPolicy::Cancel,
+        ladder: Vec::new(),
+    };
     attempt_records.push(attempt_failure_record(
         &failure,
         AttemptStatus::Failed,
         None,
-        ShieldedRetryPolicy {
-            enabled: false,
-            max_attempts: 1,
-            anti_loop_hint_enabled: false,
-        },
+        &disabled_policy,
     ));
-    shielded_failure_outcome(
-        failure,
-        attempt_records,
-        ShieldedRetryPolicy {
-            enabled: false,
-            max_attempts: 1,
-            anti_loop_hint_enabled: false,
-        },
-    )
+    shielded_failure_outcome(failure, attempt_records, &disabled_policy)
 }
 
 fn shielded_retry_success_response(
@@ -3639,10 +3808,6 @@ fn shielded_retry_error_response(
     failure: ShieldedFailureOutcome,
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
-    if failure.forwarded_response.is_some() {
-        return shielded_retry_forwarded_failure_response(runtime, failure, in_flight_permit);
-    }
-
     let body = proxy_error_json_body(failure.error_type, &failure.error_message);
     let response_headers = json_response_headers(body.len());
     let observer = shielded_retry_observer(
@@ -3664,50 +3829,6 @@ fn shielded_retry_error_response(
         ObservedBufferedBody::new_with_completion(body, observer, in_flight_permit, completion);
     response_with_headers(
         StatusCode::BAD_GATEWAY,
-        response_headers,
-        Body::from_stream(response_body),
-    )
-}
-
-fn shielded_retry_forwarded_failure_response(
-    runtime: &ShieldedRetryRuntime,
-    mut failure: ShieldedFailureOutcome,
-    in_flight_permit: InFlightPermit,
-) -> Response<Body> {
-    let forwarded = failure
-        .forwarded_response
-        .take()
-        .expect("forwarded failure response should be present");
-    let upstream_status = forwarded.started.info.upstream_status;
-    let upstream_headers = forwarded.started.info.upstream_headers.clone();
-    let mut response_headers = HeaderMap::new();
-    copy_response_headers(&upstream_headers, &mut response_headers);
-    let terminal_completion = BodyCompletion::UpstreamStatusError(failure.error_message);
-    let mut extra_response_metadata = failure.response_metadata;
-    extra_response_metadata.remove("response_body_bytes");
-    extra_response_metadata.remove("latency_ms");
-    let observer = shielded_retry_observer(
-        runtime,
-        ShieldedRetryObserverInput {
-            downstream_mode: downstream_mode_from_headers(&upstream_headers),
-            downstream_status: upstream_status,
-            downstream_headers: response_headers.clone(),
-            upstream_mode: forwarded.final_attempt.upstream_mode,
-            extra_response_metadata,
-            raw_payloads: RawPayloads::default(),
-            completed_attempt_records: failure.attempt_records,
-            final_attempt: Some(forwarded.final_attempt),
-            attempt_progress: None,
-        },
-    );
-    let response_body = ObservedUpstreamBody::new_with_completion(
-        forwarded.started.response.bytes_stream(),
-        observer,
-        in_flight_permit,
-        terminal_completion,
-    );
-    response_with_headers(
-        upstream_status,
         response_headers,
         Body::from_stream(response_body),
     )
@@ -3783,7 +3904,7 @@ fn shielded_retry_observer(
         completed_attempt_records: input.completed_attempt_records,
         final_attempt: input.final_attempt,
         retry_observation: Some(RetryObservation {
-            policy: runtime.retry_policy,
+            policy: runtime.retry_policy.clone(),
         }),
         attempt_progress: input.attempt_progress,
     }
@@ -3812,7 +3933,7 @@ struct FinalAttemptContext {
     raw_payloads: RawPayloads,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct RetryObservation {
     policy: ShieldedRetryPolicy,
 }
@@ -3905,7 +4026,7 @@ impl ForwardedBodyObserver {
         if let Some(retry_observation) = self.retry_observation {
             response_metadata.extend(retry_chain_metadata(
                 &attempts,
-                retry_observation.policy,
+                &retry_observation.policy,
                 completion.request_status().as_str(),
             ));
         }
@@ -3936,6 +4057,7 @@ fn final_attempt_record(
     body_bytes: u64,
     completion: &BodyCompletion,
 ) -> AttemptRecord {
+    let request_metadata = attempt.request_metadata;
     let mut response_metadata = response_metadata(
         attempt.upstream_status,
         &attempt.upstream_headers,
@@ -3943,6 +4065,7 @@ fn final_attempt_record(
         finished_at_unix_ms.saturating_sub(attempt.started_at_unix_ms),
     );
     response_metadata.extend(attempt.extra_response_metadata);
+    copy_attempt_request_metadata(&mut response_metadata, &request_metadata);
     response_metadata.insert(
         String::from("attempt_number"),
         attempt.attempt_number.to_string(),
@@ -3967,7 +4090,7 @@ fn final_attempt_record(
         error_reason: completion.error_reason(),
         retry_reason: None,
         abort_reason: completion.abort_reason(),
-        request_metadata: attempt.request_metadata,
+        request_metadata,
         response_metadata,
         raw_payloads: attempt.raw_payloads,
     }
@@ -3975,7 +4098,7 @@ fn final_attempt_record(
 
 fn retry_chain_metadata(
     attempts: &[AttemptRecord],
-    policy: ShieldedRetryPolicy,
+    policy: &ShieldedRetryPolicy,
     final_outcome: &str,
 ) -> BTreeMap<String, String> {
     BTreeMap::from([
@@ -3990,6 +4113,14 @@ fn retry_chain_metadata(
         (
             String::from("retry_anti_loop_hint_enabled"),
             policy.anti_loop_hint_enabled.to_string(),
+        ),
+        (
+            String::from("retry_shielded_streaming_enabled"),
+            policy.shielded_streaming_enabled.to_string(),
+        ),
+        (
+            String::from("downstream_drop_policy"),
+            policy.downstream_drop_policy.as_str().to_owned(),
         ),
         (
             String::from("retry_attempt_count"),
@@ -4028,7 +4159,6 @@ fn attempt_chain_summary(attempts: &[AttemptRecord]) -> String {
 enum BodyCompletion {
     Succeeded,
     UpstreamStreamError(String),
-    UpstreamStatusError(String),
     DownstreamDropped,
 }
 
@@ -4036,7 +4166,7 @@ impl BodyCompletion {
     const fn request_status(&self) -> RequestStatus {
         match self {
             Self::Succeeded => RequestStatus::Succeeded,
-            Self::UpstreamStreamError(_) | Self::UpstreamStatusError(_) => RequestStatus::Failed,
+            Self::UpstreamStreamError(_) => RequestStatus::Failed,
             Self::DownstreamDropped => RequestStatus::Aborted,
         }
     }
@@ -4044,7 +4174,7 @@ impl BodyCompletion {
     const fn attempt_status(&self) -> AttemptStatus {
         match self {
             Self::Succeeded => AttemptStatus::Succeeded,
-            Self::UpstreamStreamError(_) | Self::UpstreamStatusError(_) => AttemptStatus::Failed,
+            Self::UpstreamStreamError(_) => AttemptStatus::Failed,
             Self::DownstreamDropped => AttemptStatus::Aborted,
         }
     }
@@ -4052,7 +4182,6 @@ impl BodyCompletion {
     fn error_reason(&self) -> Option<String> {
         match self {
             Self::UpstreamStreamError(error) => Some(format!("upstream_stream_error: {error}")),
-            Self::UpstreamStatusError(error) => Some(format!("upstream_status_error: {error}")),
             Self::Succeeded | Self::DownstreamDropped => None,
         }
     }
@@ -4060,7 +4189,7 @@ impl BodyCompletion {
     fn abort_reason(&self) -> Option<String> {
         match self {
             Self::DownstreamDropped => Some(String::from("downstream_body_dropped_before_eof")),
-            Self::Succeeded | Self::UpstreamStreamError(_) | Self::UpstreamStatusError(_) => None,
+            Self::Succeeded | Self::UpstreamStreamError(_) => None,
         }
     }
 }
@@ -4208,10 +4337,17 @@ impl Drop for ObservedBufferedBody {
 type ShieldedAggregateFuture =
     Pin<Box<dyn Future<Output = Result<ShieldedAcceptedOutcome, ShieldedFailureOutcome>> + Send>>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShieldedAcceptedResponseMode {
+    JsonCompletion,
+    OpenAiSse,
+}
+
 struct ShieldedLivenessBody {
     aggregate: ShieldedAggregateFuture,
     interval: Interval,
     mode: ShieldedLivenessMode,
+    accepted_response_mode: ShieldedAcceptedResponseMode,
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: InFlightPermit,
     bytes_seen: u64,
@@ -4223,6 +4359,7 @@ impl ShieldedLivenessBody {
     fn new(
         aggregate: ShieldedAggregateFuture,
         mode: ShieldedLivenessMode,
+        accepted_response_mode: ShieldedAcceptedResponseMode,
         interval_secs: u64,
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
@@ -4234,6 +4371,7 @@ impl ShieldedLivenessBody {
             aggregate,
             interval,
             mode,
+            accepted_response_mode,
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
             bytes_seen: 0,
@@ -4254,10 +4392,15 @@ impl ShieldedLivenessBody {
         Poll::Ready(Some(Ok(bytes)))
     }
 
-    fn accepted_chunk(&self, body: &Bytes) -> Bytes {
-        match self.mode {
-            ShieldedLivenessMode::Sse => sse_final_frame(body),
-            ShieldedLivenessMode::JsonWhitespace | ShieldedLivenessMode::Disabled => body.clone(),
+    fn accepted_chunk(&self, outcome: &ShieldedAcceptedOutcome) -> Bytes {
+        match self.accepted_response_mode {
+            ShieldedAcceptedResponseMode::OpenAiSse => outcome.sse_body.clone(),
+            ShieldedAcceptedResponseMode::JsonCompletion => match self.mode {
+                ShieldedLivenessMode::Sse => sse_final_frame(&outcome.body),
+                ShieldedLivenessMode::JsonWhitespace | ShieldedLivenessMode::Disabled => {
+                    outcome.body.clone()
+                }
+            },
         }
     }
 
@@ -4287,7 +4430,7 @@ impl Stream for ShieldedLivenessBody {
 
         match this.aggregate.as_mut().poll(cx) {
             Poll::Ready(Ok(outcome)) => {
-                let chunk = this.accepted_chunk(&outcome.body);
+                let chunk = this.accepted_chunk(&outcome);
                 if let Some(observer) = &mut this.observer {
                     observer.completed_attempt_records = outcome.prior_attempt_records;
                     observer
@@ -4305,15 +4448,12 @@ impl Stream for ShieldedLivenessBody {
                 return this.count_and_emit(chunk);
             }
             Poll::Ready(Err(failure)) => {
-                let forwarded_final_attempt = failure
-                    .forwarded_response
-                    .map(|forwarded| forwarded.final_attempt);
                 if let Some(observer) = &mut this.observer {
                     observer.completed_attempt_records = failure.attempt_records;
                     observer
                         .extra_response_metadata
                         .extend(failure.response_metadata);
-                    observer.final_attempt = forwarded_final_attempt;
+                    observer.final_attempt = None;
                 }
                 let error_type = failure.error_type;
                 let error_message = failure.error_message;
@@ -4603,9 +4743,10 @@ fn select_shielded_liveness(
     state: &ProxyState,
     config: &AppConfig,
     body: &Bytes,
-    shielded_chat: bool,
+    kind: ShieldedChatKind,
     now_unix_ms: u64,
 ) -> ShieldedLivenessSelection {
+    let shielded_chat = !matches!(kind, ShieldedChatKind::Generic);
     let input_fingerprint = shielded_chat
         .then(|| chat_input_fingerprint(body))
         .flatten();
@@ -4620,12 +4761,19 @@ fn select_shielded_liveness(
                 config.loop_guard.max_repeated_inputs,
             )
         });
-    // Non-stream OpenAI-compatible clients require JSON framing even when the
-    // proxy internally forces upstream SSE for inspection and retry.
-    let mode = match config.heartbeat.mode {
-        HeartbeatMode::JsonWhitespace => ShieldedLivenessMode::JsonWhitespace,
-        HeartbeatMode::Sse if repeat_observation.repeated => ShieldedLivenessMode::JsonWhitespace,
-        HeartbeatMode::Disabled | HeartbeatMode::Sse => ShieldedLivenessMode::Disabled,
+    let mode = match kind {
+        ShieldedChatKind::Stream => ShieldedLivenessMode::Sse,
+        ShieldedChatKind::NonStream | ShieldedChatKind::Generic => {
+            // Non-stream OpenAI-compatible clients require JSON framing even when the
+            // proxy internally forces upstream SSE for inspection and retry.
+            match config.heartbeat.mode {
+                HeartbeatMode::JsonWhitespace => ShieldedLivenessMode::JsonWhitespace,
+                HeartbeatMode::Sse if repeat_observation.repeated => {
+                    ShieldedLivenessMode::JsonWhitespace
+                }
+                HeartbeatMode::Disabled | HeartbeatMode::Sse => ShieldedLivenessMode::Disabled,
+            }
+        }
     };
 
     ShieldedLivenessSelection {

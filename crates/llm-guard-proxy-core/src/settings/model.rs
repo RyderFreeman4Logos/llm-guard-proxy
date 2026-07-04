@@ -1115,6 +1115,12 @@ pub struct RetryConfig {
     pub max_attempts: u32,
     /// Adds a bounded deterministic anti-loop hint to retries after loop aborts.
     pub anti_loop_hint_enabled: bool,
+    /// Routes downstream `stream=true` chat completions through shielded retry.
+    pub shielded_streaming_enabled: bool,
+    /// Controls upstream attempt lifetime after a downstream response body drop.
+    pub downstream_drop_policy: DownstreamDropPolicy,
+    /// Optional named retry ladder entries. Empty preserves legacy repeated attempts.
+    pub ladder: Vec<RetryLadderConfig>,
 }
 
 impl RetryConfig {
@@ -1128,7 +1134,16 @@ impl RetryConfig {
             self.max_attempts <= 10,
             "retry.max_attempts",
             "must be less than or equal to 10",
-        )
+        )?;
+        require(
+            self.ladder.len() <= 10,
+            "retry.ladder",
+            "must contain at most 10 entries",
+        )?;
+        for (index, entry) in self.ladder.iter().enumerate() {
+            entry.validate(index)?;
+        }
+        Ok(())
     }
 }
 
@@ -1138,7 +1153,76 @@ impl Default for RetryConfig {
             enabled: true,
             max_attempts: 5,
             anti_loop_hint_enabled: true,
+            shielded_streaming_enabled: false,
+            downstream_drop_policy: DownstreamDropPolicy::Cancel,
+            ladder: Vec::new(),
         }
+    }
+}
+
+/// Upstream attempt behavior after a downstream body is dropped.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DownstreamDropPolicy {
+    /// Dropping the downstream body cancels the in-progress upstream attempt.
+    #[default]
+    Cancel,
+    /// Dropping the downstream body detaches the in-progress upstream attempt.
+    Detach,
+}
+
+impl DownstreamDropPolicy {
+    /// Returns the TOML-compatible label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cancel => "cancel",
+            Self::Detach => "detach",
+        }
+    }
+}
+
+/// One named rung in the shielded retry ladder.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RetryLadderConfig {
+    /// Bounded name recorded in observability.
+    pub name: String,
+    /// Thinking rewrite policy selected for this attempt.
+    pub thinking: ThinkingConfig,
+    /// Optional bounded behavioral hint for loop-triggered retries.
+    pub anti_loop_hint: Option<String>,
+}
+
+impl RetryLadderConfig {
+    fn validate(&self, _index: usize) -> Result<(), ValidationError> {
+        require(
+            !self.name.trim().is_empty(),
+            "retry.ladder.name",
+            "must not be empty",
+        )?;
+        require(
+            self.name == self.name.trim(),
+            "retry.ladder.name",
+            "must not have leading or trailing whitespace",
+        )?;
+        require(
+            self.name.len() <= 64,
+            "retry.ladder.name",
+            "must be at most 64 bytes",
+        )?;
+        self.thinking.validate("retry.ladder.max_tokens")?;
+        if let Some(hint) = &self.anti_loop_hint {
+            require(
+                !hint.trim().is_empty(),
+                "retry.ladder.anti_loop_hint",
+                "must not be empty when set",
+            )?;
+            require(
+                hint.len() <= 512,
+                "retry.ladder.anti_loop_hint",
+                "must be at most 512 bytes",
+            )?;
+        }
+        Ok(())
     }
 }
 

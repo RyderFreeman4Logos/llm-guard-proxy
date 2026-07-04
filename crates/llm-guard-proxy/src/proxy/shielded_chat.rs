@@ -100,6 +100,7 @@ pub(super) fn body_with_anti_loop_retry_hint(
     body: &Bytes,
     attempt_number: u32,
     max_attempts: u32,
+    configured_hint: Option<&str>,
 ) -> Option<Bytes> {
     let mut value = serde_json::from_slice::<Value>(body).ok()?;
     let object = value.as_object_mut()?;
@@ -108,7 +109,10 @@ pub(super) fn body_with_anti_loop_retry_hint(
         0,
         json!({
             "role": "system",
-            "content": anti_loop_retry_hint(attempt_number, max_attempts),
+            "content": configured_hint.map_or_else(
+                || anti_loop_retry_hint(attempt_number, max_attempts),
+                str::to_owned,
+            ),
         }),
     );
     serde_json::to_vec(&value).ok().map(Bytes::from)
@@ -1312,6 +1316,7 @@ impl BudgetObservations {
 /// Accepted, aggregated OpenAI-compatible chat completion response.
 pub(super) struct AggregatedChatCompletion {
     pub(super) body: Bytes,
+    pub(super) sse_body: Bytes,
     pub(super) response_metadata: BTreeMap<String, String>,
     pub(super) raw_payloads: RawPayloads,
 }
@@ -1327,6 +1332,7 @@ pub(super) async fn aggregate_stream(
 ) -> Result<AggregatedChatCompletion, AggregationError> {
     let mut stream = Box::pin(stream);
     let mut buffer = BytesMut::new();
+    let mut sse_body = BytesMut::new();
     let mut bytes_seen = 0_usize;
     let mut state = ChatAggregation::new(attempt_started_at_unix_ms, &loop_context);
 
@@ -1350,6 +1356,7 @@ pub(super) async fn aggregate_stream(
             )));
         }
         buffer.extend_from_slice(&chunk);
+        sse_body.extend_from_slice(&chunk);
 
         while let Some(event) = next_sse_event(&mut buffer) {
             state.apply_event(&event)?;
@@ -1362,7 +1369,7 @@ pub(super) async fn aggregate_stream(
         ));
     }
 
-    state.finish(request_id, request_model_id)
+    state.finish(request_id, request_model_id, sse_body.freeze())
 }
 
 async fn next_stream_chunk(
@@ -1535,6 +1542,7 @@ impl ChatAggregation {
         mut self,
         request_id: &str,
         request_model_id: Option<&str>,
+        sse_body: Bytes,
     ) -> Result<AggregatedChatCompletion, AggregationError> {
         self.ensure_usable()?;
         self.observe_completed_tool_calls()?;
@@ -1548,6 +1556,7 @@ impl ChatAggregation {
 
         Ok(AggregatedChatCompletion {
             body: Bytes::from(body),
+            sse_body,
             response_metadata,
             raw_payloads,
         })

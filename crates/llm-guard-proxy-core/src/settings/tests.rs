@@ -6,9 +6,10 @@ use std::{
 };
 
 use super::{
-    AppConfig, ConfigManager, ConfigParseError, HeartbeatMode, LoopGuardMode, MissingConfigPolicy,
-    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ThinkingMode, ToolRequestThinkingPolicy,
-    UpstreamRouteReason, ValidationError, parse::parse_config_text, redact_upstream_base_url,
+    AppConfig, ConfigManager, ConfigParseError, DownstreamDropPolicy, HeartbeatMode, LoopGuardMode,
+    MissingConfigPolicy, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamRouteReason, ValidationError, parse::parse_config_text,
+    redact_upstream_base_url,
 };
 
 #[test]
@@ -87,6 +88,12 @@ fn defaults_match_issue_contract() {
     assert!(config.retry.enabled);
     assert_eq!(config.retry.max_attempts, 5);
     assert!(config.retry.anti_loop_hint_enabled);
+    assert!(!config.retry.shielded_streaming_enabled);
+    assert_eq!(
+        config.retry.downstream_drop_policy,
+        DownstreamDropPolicy::Cancel
+    );
+    assert!(config.retry.ladder.is_empty());
     assert!(!config.upstream_stall.enabled);
     assert_eq!(config.upstream_stall.idle_timeout_ms, 30_000);
     assert!(config.upstream_stall.recovery_command.is_empty());
@@ -98,6 +105,64 @@ fn defaults_match_issue_contract() {
     assert!(config.cloudflare.enabled);
     assert!(config.upstream_profiles.is_empty());
     assert_eq!(config.default_upstream_profile().name, "default");
+}
+
+#[test]
+fn parses_retry_ladder_stream_shielding_and_drop_policy() {
+    let config = parse_config_text(
+        r#"
+[retry]
+enabled = true
+max_attempts = 3
+anti_loop_hint_enabled = true
+shielded_streaming_enabled = true
+downstream_drop_policy = "detach"
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+anti_loop_hint = "Previous attempt became repetitive. Answer directly."
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+max_tokens = 50000
+"#,
+    )
+    .expect("retry ladder config should parse");
+
+    config.validate().expect("retry ladder should validate");
+    assert!(config.retry.shielded_streaming_enabled);
+    assert_eq!(
+        config.retry.downstream_drop_policy,
+        DownstreamDropPolicy::Detach
+    );
+    assert_eq!(config.retry.ladder.len(), 3);
+    assert_eq!(config.retry.ladder[0].name, "max-thinking");
+    assert_eq!(
+        config.retry.ladder[0].thinking.mode,
+        ThinkingMode::ForceThinking
+    );
+    assert_eq!(config.retry.ladder[0].thinking.max_tokens, Some(50_000));
+    assert_eq!(config.retry.ladder[0].thinking.budget_tokens, 32_768);
+    assert_eq!(config.retry.ladder[1].name, "bounded-thinking");
+    assert_eq!(config.retry.ladder[1].thinking.budget_tokens, 8_192);
+    assert_eq!(
+        config.retry.ladder[1].anti_loop_hint.as_deref(),
+        Some("Previous attempt became repetitive. Answer directly.")
+    );
+    assert_eq!(
+        config.retry.ladder[2].thinking.mode,
+        ThinkingMode::ForceDisable
+    );
 }
 
 #[test]
@@ -362,6 +427,8 @@ input_overlap_threshold_multiplier = 5
 [retry]
 max_attempts = 3
 anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+downstream_drop_policy = "detach"
 
 [upstream.stall]
 enabled = true
@@ -414,8 +481,7 @@ enabled = false
         25
     );
     assert_eq!(config.loop_guard.input_overlap_threshold_multiplier, 5);
-    assert_eq!(config.retry.max_attempts, 3);
-    assert!(!config.retry.anti_loop_hint_enabled);
+    assert_parsed_retry_overrides(&config);
     assert_parsed_upstream_stall_overrides(&config);
     assert!(!config.cloudflare.enabled);
 }
@@ -514,6 +580,16 @@ fn assert_parsed_upstream_stall_overrides(config: &AppConfig) {
     assert_eq!(config.upstream_stall.recovery_cooldown_ms, 45_000);
     assert_eq!(config.upstream_stall.recovery_budget_window_ms, 180_000);
     assert_eq!(config.upstream_stall.recovery_max_per_window, 1);
+}
+
+fn assert_parsed_retry_overrides(config: &AppConfig) {
+    assert_eq!(config.retry.max_attempts, 3);
+    assert!(!config.retry.anti_loop_hint_enabled);
+    assert!(config.retry.shielded_streaming_enabled);
+    assert_eq!(
+        config.retry.downstream_drop_policy,
+        DownstreamDropPolicy::Detach
+    );
 }
 
 fn assert_parsed_observability_overrides(config: &AppConfig) {
@@ -1300,6 +1376,9 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_minimum_token_count"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_history_window_count"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.anti_loop_hint_enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"retry.shielded_streaming_enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"retry.downstream_drop_policy"));
+    assert!(RELOADABLE_FIELDS.contains(&"retry.ladder"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.metrics_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_admin_token"));

@@ -1142,7 +1142,7 @@ mode = "enforce"
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = response.text().await.expect("error body should be text");
-    assert!(body.contains("upstream_body_error"));
+    assert!(body.contains("llm_guard_loop_retry_exhausted"));
     assert!(!body.contains("reasoning loop line"));
 
     let request_row = read_last_observability_row(&proxy.sqlite_path, "requests");
@@ -1208,7 +1208,7 @@ enabled = false
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = response.text().await.expect("error body should be text");
-    assert!(body.contains("upstream_body_error"));
+    assert!(body.contains("llm_guard_loop_retry_exhausted"));
     assert!(!body.contains("bsdtar"));
     assert!(!body.contains("zipfile"));
 
@@ -1741,6 +1741,178 @@ anti_loop_hint_enabled = true
 }
 
 #[tokio::test]
+async fn retry_ladder_advances_from_max_thinking_loop_to_bounded_success() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 3
+anti_loop_hint_enabled = true
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+anti_loop_hint = "Previous attempt became repetitive. Answer directly."
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+max_tokens = 50000
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    assert!(!aggregated.to_string().contains("reasoning loop line"));
+
+    let first_attempt = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+    assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
+    assert_eq!(body_thinking_budget(&second_attempt.body), Some(8_192));
+    assert!(!body_contains_retry_hint(&first_attempt.body));
+    let second_body_text = String::from_utf8_lossy(&second_attempt.body);
+    assert!(second_body_text.contains("Previous attempt became repetitive. Answer directly."));
+    assert!(!second_body_text.contains("reasoning loop line"));
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].response_metadata["attempt_name"],
+        "max-thinking"
+    );
+    assert_eq!(attempts[0].response_metadata["attempt_index"], "0");
+    assert_eq!(
+        attempts[0].response_metadata["attempt_thinking_mode"],
+        "force_thinking"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["attempt_thinking_budget_tokens"],
+        "32768"
+    );
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(
+        attempts[1].response_metadata["attempt_name"],
+        "bounded-thinking"
+    );
+    assert_eq!(attempts[1].response_metadata["attempt_index"], "1");
+    assert_eq!(
+        attempts[1].response_metadata["retry_previous_reason"],
+        "previous_loop_detected"
+    );
+    assert_eq!(
+        attempts[1].response_metadata["attempt_thinking_budget_tokens"],
+        "8192"
+    );
+}
+
+#[tokio::test]
+async fn retry_ladder_advances_to_no_thinking_after_two_loop_rejections() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 3
+anti_loop_hint_enabled = false
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+thinking_token_budget = 8192
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-twice-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let first_attempt = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+    let third_attempt = fake.recv_next().await;
+    assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
+    assert_eq!(body_thinking_budget(&second_attempt.body), Some(8_192));
+    assert_eq!(body_thinking_budget(&third_attempt.body), Some(0));
+    assert!(!body_contains_retry_hint(&second_attempt.body));
+    assert!(!body_contains_retry_hint(&third_attempt.body));
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(
+        attempts[0].response_metadata["attempt_name"],
+        "max-thinking"
+    );
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(
+        attempts[1].response_metadata["attempt_name"],
+        "bounded-thinking"
+    );
+    assert_eq!(attempts[1].status, "retried");
+    assert_eq!(attempts[2].response_metadata["attempt_name"], "no-thinking");
+    assert_eq!(attempts[2].status, "succeeded");
+    assert_eq!(
+        attempts[2].response_metadata["attempt_thinking_mode"],
+        "force_disable"
+    );
+}
+
+#[tokio::test]
 async fn shielded_retry_runs_recovery_command_after_upstream_stall_then_succeeds() {
     let mut fake = FakeUpstream::spawn().await;
     let recovery_root = unique_test_dir("stall-recovery");
@@ -2168,7 +2340,7 @@ max_attempts = 3
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     let body = response.text().await.expect("error body should be text");
-    assert!(body.contains("upstream_body_error"));
+    assert!(body.contains("llm_guard_loop_retry_exhausted"));
     assert!(!body.contains("reasoning loop line"));
     for _ in 0..3 {
         let _ = fake.recv_next().await;
@@ -2290,7 +2462,7 @@ max_attempts = 3
 }
 
 #[tokio::test]
-async fn shielded_retry_exhausted_upstream_status_preserves_final_response_semantics() {
+async fn shielded_retry_exhausted_upstream_status_returns_structured_proxy_error() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -2318,14 +2490,7 @@ max_attempts = 2
         .await
         .expect("proxy request should complete");
 
-    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(
-        response
-            .headers()
-            .get("retry-after")
-            .and_then(|value| value.to_str().ok()),
-        Some("7")
-    );
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
     assert_eq!(
         response
             .headers()
@@ -2334,10 +2499,8 @@ max_attempts = 2
         Some("application/json")
     );
     let body = response.text().await.expect("body should be text");
-    assert_eq!(
-        body,
-        r#"{"error":{"type":"upstream_test_error","message":"try again"}}"#
-    );
+    assert!(body.contains("llm_guard_upstream_error"));
+    assert!(!body.contains("rate-limit"));
 
     let _first = fake.recv_next().await;
     let _second = fake.recv_next().await;
@@ -2346,7 +2509,7 @@ max_attempts = 2
     let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
     assert_eq!(request_row.status, "failed");
-    assert_eq!(request_row.http_status, 429);
+    assert_eq!(request_row.http_status, 502);
     assert_eq!(request_row.response_metadata["retry_attempt_count"], "2");
     assert_eq!(
         request_row.response_metadata["retry_attempt_chain"],
@@ -3086,6 +3249,135 @@ force_disable = true
 }
 
 #[tokio::test]
+async fn shielded_streaming_commit_gate_sends_heartbeat_before_openai_sse_release() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[heartbeat]
+interval_secs = 1
+
+[retry]
+shielded_streaming_enabled = true
+",
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=slow-shielded",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"stream"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let mut body = response.into_body().into_data_stream();
+    let heartbeat = next_chunk(
+        &mut body,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "shielded stream heartbeat",
+    )
+    .await;
+    assert_eq!(
+        heartbeat,
+        Bytes::from_static(b": llm-guard-proxy heartbeat\n\n")
+    );
+    assert!(!String::from_utf8_lossy(&heartbeat).contains("content"));
+    assert!(!String::from_utf8_lossy(&heartbeat).contains("tool_calls"));
+
+    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    assert!(released.contains("data:"));
+    assert!(released.contains("chat.completion.chunk"));
+    assert!(released.contains("Hel"));
+    assert!(!released.contains("event: final"));
+
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].response_metadata["retry_shielded_streaming_enabled"],
+        "true"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["downstream_liveness_mode"],
+        "sse"
+    );
+}
+
+#[tokio::test]
+async fn shielded_streaming_discards_rejected_tool_call_buffer_before_success() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+interval_secs = 1
+
+[loop_guard]
+mode = "enforce"
+
+[retry]
+max_attempts = 2
+shielded_streaming_enabled = true
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=tool-loop-then-content-success",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"tool"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let first = next_chunk(
+        &mut body,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "shielded stream heartbeat",
+    )
+    .await;
+    let mut released = String::from_utf8_lossy(&first).into_owned();
+    if first == Bytes::from_static(b": llm-guard-proxy heartbeat\n\n") {
+        assert!(!released.contains("tool_calls"));
+        released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    } else {
+        released.push_str(&collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await);
+    }
+    assert!(released.contains("Safe"));
+    assert!(!released.contains("lookup"));
+    assert!(!released.contains("arguments"));
+    assert!(!released.contains("tool_calls"));
+
+    let _first_attempt = fake.recv_next().await;
+    let _second_attempt = fake.recv_next().await;
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[1].status, "succeeded");
+}
+
+#[tokio::test]
 async fn per_model_routing_selects_named_upstream_and_records_bounded_metadata() {
     let mut default = FakeUpstream::spawn().await;
     let mut aeon = FakeUpstream::spawn().await;
@@ -3524,6 +3816,81 @@ mode = "json-whitespace"
     let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
     assert_eq!(drop_event.label, "cancellable-chat-sse");
     assert_forwarded_abort_recorded(&proxy);
+}
+
+#[tokio::test]
+async fn shielded_non_stream_detach_drop_allows_upstream_attempt_to_continue_until_timeout() {
+    let mut upstream = CancellableUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "json-whitespace"
+
+[retry]
+downstream_drop_policy = "detach"
+
+[upstream.stall]
+enabled = true
+idle_timeout_ms = 200
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("shielded chat request should receive response headers");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let observed = upstream.recv_request().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+
+    let mut downstream = response.bytes_stream();
+    let heartbeat = next_chunk(
+        &mut downstream,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "detach JSON prefix",
+    )
+    .await;
+    assert_eq!(heartbeat, Bytes::from_static(b" \n"));
+    drop(downstream);
+
+    assert!(
+        upstream
+            .recv_drop_optional_within(Duration::from_millis(50))
+            .await
+            .is_none(),
+        "detach mode should not cancel upstream immediately on downstream drop"
+    );
+    let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+    assert_eq!(drop_event.label, "cancellable-chat-sse");
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "aborted");
+    assert_eq!(
+        request_row.abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+    assert_eq!(
+        request_row.response_metadata["downstream_drop_policy"],
+        "detach"
+    );
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "aborted");
+    assert_eq!(
+        attempts[0].response_metadata["downstream_drop_policy"],
+        "detach"
+    );
 }
 
 #[tokio::test]
@@ -5589,7 +5956,7 @@ enabled = false
         .await
         .expect("timeout error body should read");
     let body = String::from_utf8(body.to_vec()).expect("timeout error body should be UTF-8");
-    assert!(body.contains("upstream_body_error"));
+    assert!(body.contains("llm_guard_attempt_timeout"));
     assert!(body.contains("timeout_failure"));
     assert_safe_operational_text("shielded timeout body", &body);
 
@@ -6618,6 +6985,23 @@ where
         .unwrap_or_else(|error| panic!("{label} should not fail: {error}"))
 }
 
+async fn collect_stream_text<S, E>(body: &mut S, wait: Duration) -> String
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut bytes = Vec::new();
+    loop {
+        match timeout(wait, body.next()).await {
+            Ok(Some(Ok(chunk))) => bytes.extend_from_slice(&chunk),
+            Ok(Some(Err(error))) => panic!("stream should not fail: {error}"),
+            Ok(None) => break,
+            Err(error) => panic!("stream should finish before timeout: {error}"),
+        }
+    }
+    String::from_utf8(bytes).expect("stream body should be UTF-8")
+}
+
 async fn shielded_final_json(response: reqwest::Response) -> serde_json::Value {
     let content_type = response
         .headers()
@@ -6966,6 +7350,13 @@ impl CancellableUpstream {
             .await
             .expect("upstream response body should be dropped before timeout")
             .expect("upstream drop channel should stay open")
+    }
+
+    async fn recv_drop_optional_within(&mut self, wait: Duration) -> Option<UpstreamDropEvent> {
+        timeout(wait, self.drop_receiver.recv())
+            .await
+            .ok()
+            .flatten()
     }
 }
 
@@ -7344,6 +7735,18 @@ fn fake_chat_completion_response(
             repeated_reasoning_line_sse_response(200)
         });
     }
+    if path_and_query.contains("test=loop-twice-then-success") {
+        if next_fake_attempt_count(state, path_and_query) <= 2 {
+            return Some(repeated_reasoning_line_sse_response(200));
+        }
+        return Some(chat_completion_sse_response(body));
+    }
+    if path_and_query.contains("test=tool-loop-then-content-success") {
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            return Some(repeated_tool_fingerprint_sse_response());
+        }
+        return Some(content_only_chat_completion_sse_response());
+    }
     if path_and_query.contains("test=always-429") {
         return Some(upstream_status_json_response(StatusCode::TOO_MANY_REQUESTS));
     }
@@ -7409,9 +7812,38 @@ fn body_contains_retry_hint(body: &Bytes) -> bool {
                 message
                     .get("content")
                     .and_then(serde_json::Value::as_str)
-                    .is_some_and(|content| content.contains("llm-guard-proxy retry hint"))
+                    .is_some_and(|content| {
+                        content.contains("llm-guard-proxy retry hint")
+                            || content.contains("Previous attempt became repetitive")
+                    })
             })
         })
+}
+
+fn body_thinking_budget(body: &Bytes) -> Option<u64> {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    [
+        &["thinking", "budget_tokens"][..],
+        &["thinking_token_budget"][..],
+        &["thinking_budget"][..],
+        &["chat_template_kwargs", "thinking_budget"][..],
+        &["extra_body", "thinking_token_budget"][..],
+        &["extra_body", "thinking_budget"][..],
+        &["extra_body", "thinking", "budget_tokens"][..],
+        &["extra_body", "chat_template_kwargs", "thinking_budget"][..],
+    ]
+    .into_iter()
+    .find_map(|path| json_path(&value, path).and_then(serde_json::Value::as_u64))
+}
+
+fn json_path<'value>(
+    mut value: &'value serde_json::Value,
+    path: &[&str],
+) -> Option<&'value serde_json::Value> {
+    for key in path {
+        value = value.get(*key)?;
+    }
+    Some(value)
 }
 
 fn upstream_status_json_response(status: StatusCode) -> Response<Body> {
@@ -7600,6 +8032,40 @@ fn chat_completion_sse_response(body: &Bytes) -> Response<Body> {
         HeaderValue::from_static("chat-completions-sse"),
     );
     response
+}
+
+fn content_only_chat_completion_sse_response() -> Response<Body> {
+    let chunks = [
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "role": "assistant",
+                    "content": "Safe"
+                },
+                "finish_reason": null
+            }]
+        })),
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "content": " answer"
+                },
+                "finish_reason": "stop"
+            }]
+        })),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    chat_completion_stream_response("chat-completions-content-only-sse", chunks)
 }
 
 fn slow_chat_completion_sse_response(body: &Bytes) -> Response<Body> {
