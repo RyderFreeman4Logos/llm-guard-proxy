@@ -20,6 +20,8 @@ enum Section {
     Shielding,
     Observability,
     ObservabilityRetention,
+    Evidence,
+    EvidenceShadow,
     Thinking,
     LoopGuard,
     Retry,
@@ -129,6 +131,8 @@ fn parse_section(
         "shielding" => Ok(Section::Shielding),
         "observability" => Ok(Section::Observability),
         "observability.retention" => Ok(Section::ObservabilityRetention),
+        "evidence" => Ok(Section::Evidence),
+        "evidence.shadow" => Ok(Section::EvidenceShadow),
         "thinking" => Ok(Section::Thinking),
         "loop_guard" => Ok(Section::LoopGuard),
         "retry" => Ok(Section::Retry),
@@ -204,6 +208,10 @@ fn assign_value(
         }
         Section::ObservabilityRetention => {
             assign_retention(&mut config.observability.retention, key, value, line_number)
+        }
+        Section::Evidence => assign_evidence(&mut config.evidence, key, value, line_number),
+        Section::EvidenceShadow => {
+            assign_evidence_shadow(&mut config.evidence.shadow, key, value, line_number)
         }
         Section::Thinking => assign_thinking(&mut config.thinking, key, value, line_number),
         Section::LoopGuard => assign_loop_guard(&mut config.loop_guard, key, value, line_number),
@@ -415,6 +423,78 @@ fn assign_retention(
             )?);
         }
         _ => return unknown_key("observability.retention", key, line_number),
+    }
+    Ok(())
+}
+
+fn assign_evidence(
+    config: &mut super::EvidenceConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "sqlite_path" => config.sqlite_path = PathBuf::from(parse_string(value, line_number)?),
+        "blob_cache_dir" => {
+            config.blob_cache_dir = PathBuf::from(parse_string(value, line_number)?);
+        }
+        "include_raw_payloads" => config.include_raw_payloads = parse_bool(value, line_number)?,
+        "include_request_headers" => {
+            config.include_request_headers = parse_bool(value, line_number)?;
+        }
+        "max_bytes" => config.max_bytes = parse_u64(value, line_number, "evidence.max_bytes")?,
+        "prune_to_bytes" => {
+            config.prune_to_bytes = parse_u64(value, line_number, "evidence.prune_to_bytes")?;
+        }
+        "max_records" => {
+            config.max_records = parse_u64(value, line_number, "evidence.max_records")?;
+        }
+        "prune_to_records" => {
+            config.prune_to_records =
+                Some(parse_u64(value, line_number, "evidence.prune_to_records")?);
+        }
+        _ => return unknown_key("evidence", key, line_number),
+    }
+    Ok(())
+}
+
+fn assign_evidence_shadow(
+    config: &mut super::EvidenceShadowConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "keep_looping_attempt_running" => {
+            config.keep_looping_attempt_running = parse_bool(value, line_number)?;
+        }
+        "parallel_downgrade_attempts" => {
+            config.parallel_downgrade_attempts = parse_bool(value, line_number)?;
+        }
+        "max_shadow_attempts_per_request" => {
+            config.max_shadow_attempts_per_request = parse_u32(
+                value,
+                line_number,
+                "evidence.shadow.max_shadow_attempts_per_request",
+            )?;
+        }
+        "max_global_shadow_in_flight" => {
+            config.max_global_shadow_in_flight = parse_usize(
+                value,
+                line_number,
+                "evidence.shadow.max_global_shadow_in_flight",
+            )?;
+        }
+        "shadow_attempt_timeout_ms" => {
+            config.shadow_attempt_timeout_ms = parse_u64(
+                value,
+                line_number,
+                "evidence.shadow.shadow_attempt_timeout_ms",
+            )?;
+        }
+        _ => return unknown_key("evidence.shadow", key, line_number),
     }
     Ok(())
 }

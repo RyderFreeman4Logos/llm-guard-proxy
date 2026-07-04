@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use axum::http::header::{AUTHORIZATION, CONNECTION, LOCATION};
 use futures_util::{Stream, StreamExt, stream};
 use llm_guard_proxy_core::ConfigManager;
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, oneshot},
@@ -1393,6 +1393,7 @@ mode = "monitor"
 debug_summary_admin_token = "admin-token"
 debug_summary_max_records = 5
 "#,
+        "",
     )
     .await;
 
@@ -1741,6 +1742,781 @@ anti_loop_hint_enabled = true
 }
 
 #[tokio::test]
+async fn evidence_disabled_creates_no_evidence_artifacts_after_proxy_request() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _json = shielded_final_json(response).await;
+    let _observed = fake.recv_next().await;
+    assert!(!proxy.evidence_sqlite_path.exists());
+}
+
+#[tokio::test]
+async fn evidence_enabled_records_loop_primary_and_fallback_without_raw_payloads() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = false
+include_request_headers = false
+
+[evidence.shadow]
+enabled = false
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    let _first_attempt = fake.recv_next().await;
+    let _second_attempt = fake.recv_next().await;
+
+    let rows = read_evidence_attempt_rows(&proxy.evidence_sqlite_path);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].role, "primary");
+    assert_eq!(rows[0].shown_to_downstream, 0);
+    assert_eq!(rows[0].status, "rejected");
+    assert_eq!(rows[0].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(rows[0].detector_features["loop_detected"], "true");
+    assert_eq!(rows[1].role, "fallback");
+    assert_eq!(rows[1].shown_to_downstream, 1);
+    assert_eq!(rows[1].status, "accepted");
+    assert_eq!(rows[1].thinking_budget_tokens, Some(32_768));
+
+    let connection = Connection::open(&proxy.evidence_sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM evidence_groups"),
+        1
+    );
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM evidence_chunks"),
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE raw_input IS NOT NULL OR raw_output IS NOT NULL OR raw_reasoning IS NOT NULL OR raw_tool_calls IS NOT NULL",
+        ),
+        0
+    );
+}
+
+#[tokio::test]
+async fn evidence_shadow_keep_false_does_not_record_shadow_or_extra_upstream_attempt() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = false
+max_shadow_attempts_per_request = 1
+max_global_shadow_in_flight = 1
+shadow_attempt_timeout_ms = 50
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let _primary = fake.recv_next().await;
+    let _fallback = fake.recv_next().await;
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "keep_looping_attempt_running=false must abort the looped primary instead of issuing a shadow upstream request"
+    );
+
+    let rows = read_evidence_attempt_rows(&proxy.evidence_sqlite_path);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].role, "primary");
+    assert_eq!(rows[0].status, "rejected");
+    assert_eq!(rows[0].shown_to_downstream, 0);
+    assert_eq!(rows[1].role, "fallback");
+    assert_eq!(rows[1].status, "accepted");
+    assert_eq!(rows[1].shown_to_downstream, 1);
+    assert!(!rows.iter().any(|row| row.role == "shadow_continued"));
+
+    let connection = Connection::open(&proxy.evidence_sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE role = 'shadow_continued'",
+        ),
+        0
+    );
+}
+
+#[tokio::test]
+async fn evidence_raw_capture_redacts_headers_and_payload_secrets() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r"
+enabled = true
+include_raw_payloads = true
+include_request_headers = true
+",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, "Bearer downstream-secret")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"Bearer qb secret «redacted:sk-…»"}]}"#,
+        )
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _json = shielded_final_json(response).await;
+    let _observed = fake.recv_next().await;
+
+    let connection = Connection::open(&proxy.evidence_sqlite_path).expect("sqlite should open");
+    let chunks = read_evidence_chunks(&connection);
+    assert_eq!(chunks.len(), 6);
+    assert_eq!(chunks[0].0, "input");
+    assert_eq!(chunks[0].1, 0);
+    assert!(chunks[0].2.contains("[REDACTED]"));
+    assert!(!chunks[0].2.contains("sk-"));
+    assert_eq!(
+        &chunks[1..],
+        &[
+            (String::from("content"), 1, String::from("Hel")),
+            (String::from("content"), 2, String::from("lo")),
+            (String::from("reasoning"), 3, String::from("think")),
+            (String::from("tool_arguments"), 4, String::from(r#"{"q""#)),
+            (String::from("tool_arguments"), 5, String::from(r#":"x"}"#)),
+        ]
+    );
+    let (request_metadata_json, raw_input, raw_output): (String, Option<String>, Option<String>) =
+        connection
+            .query_row(
+                "SELECT request_metadata_json, raw_input, raw_output FROM evidence_attempts",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("raw evidence attempt should exist");
+    assert!(request_metadata_json.contains("request_header_authorization"));
+    assert!(request_metadata_json.contains("[REDACTED]"));
+    assert!(!request_metadata_json.contains("downstream-secret"));
+    assert!(
+        !raw_input
+            .as_deref()
+            .unwrap_or_default()
+            .contains("sk-live-secret")
+    );
+    assert!(!raw_input.as_deref().unwrap_or_default().contains("qb"));
+    assert!(
+        raw_input
+            .as_deref()
+            .unwrap_or_default()
+            .contains("[REDACTED]")
+    );
+    assert_eq!(raw_output.as_deref(), Some("Hello"));
+}
+
+#[tokio::test]
+async fn evidence_raw_capture_preserves_loop_rejected_primary_reasoning() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = true
+
+[evidence.shadow]
+enabled = false
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    let _first_attempt = fake.recv_next().await;
+    let _second_attempt = fake.recv_next().await;
+
+    let connection = Connection::open(&proxy.evidence_sqlite_path).expect("sqlite should open");
+    let raw_reasoning: Option<String> = connection
+        .query_row(
+            "SELECT raw_reasoning FROM evidence_attempts WHERE role = 'primary'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("primary raw reasoning should query");
+    let raw_reasoning = raw_reasoning.expect("looped primary should keep raw reasoning");
+    assert!(raw_reasoning.contains("reasoning loop line"));
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_chunks c \
+             JOIN evidence_attempts a ON a.attempt_id = c.attempt_id \
+             WHERE a.role = 'primary' AND c.channel = 'reasoning'",
+        ),
+        3
+    );
+}
+
+#[tokio::test]
+async fn evidence_shadow_raw_capture_records_stream_channels_and_redacts_secrets() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = true
+include_request_headers = true
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = true
+max_shadow_attempts_per_request = 1
+max_global_shadow_in_flight = 1
+shadow_attempt_timeout_ms = 2000
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-shadow-raw-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, "Bearer tiny-header")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"Bearer tiny-token sk-t"}]}"#,
+        )
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let upstream_requests = recv_n_upstream_requests(&mut fake, 3).await;
+    assert_eq!(
+        upstream_requests
+            .iter()
+            .filter(|request| body_contains_retry_hint(&request.body))
+            .count(),
+        1
+    );
+    assert_eq!(
+        upstream_requests
+            .iter()
+            .filter(|request| !body_contains_retry_hint(&request.body))
+            .count(),
+        2
+    );
+    wait_for_evidence_role_status_count(
+        &proxy.evidence_sqlite_path,
+        "shadow_continued",
+        "accepted",
+        1,
+    )
+    .await;
+
+    let connection = Connection::open(&proxy.evidence_sqlite_path).expect("sqlite should open");
+    assert_shadow_raw_attempt_redacts_and_preserves_stream_payloads(&connection);
+    assert_shadow_raw_chunks_redacted(&connection);
+}
+
+fn assert_shadow_raw_attempt_redacts_and_preserves_stream_payloads(connection: &Connection) {
+    let (request_metadata_json, raw_input, raw_output, raw_reasoning, raw_tool_calls): (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    ) = connection
+        .query_row(
+            "SELECT request_metadata_json, raw_input, raw_output, raw_reasoning, raw_tool_calls \
+             FROM evidence_attempts WHERE role = 'shadow_continued'",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .expect("shadow raw evidence attempt should exist");
+    assert!(request_metadata_json.contains("request_header_authorization"));
+    assert!(request_metadata_json.contains("[REDACTED]"));
+    assert!(!request_metadata_json.contains("tiny-header"));
+    let raw_input = raw_input.expect("shadow raw input should be captured");
+    assert!(raw_input.contains("[REDACTED]"));
+    assert!(!raw_input.contains("tiny-token"));
+    assert!(!raw_input.contains("sk-t"));
+    assert_eq!(raw_output.as_deref(), Some("Hello"));
+    assert_eq!(raw_reasoning.as_deref(), Some("think"));
+    let tool_calls: serde_json::Value = serde_json::from_str(
+        raw_tool_calls
+            .as_deref()
+            .expect("shadow raw tool calls should be captured"),
+    )
+    .expect("shadow raw tool calls should be JSON");
+    assert_eq!(tool_calls[0]["function"]["name"], "lookup");
+    assert_eq!(tool_calls[0]["function"]["arguments"], r#"{"q":"x"}"#);
+}
+
+fn assert_shadow_raw_chunks_redacted(connection: &Connection) {
+    let shadow_chunks = read_evidence_chunks_for_role(connection, "shadow_continued");
+    assert_eq!(shadow_chunks.len(), 6);
+    assert_eq!(shadow_chunks[0].0, "input");
+    assert_eq!(shadow_chunks[0].1, 0);
+    assert!(shadow_chunks[0].2.contains("[REDACTED]"));
+    assert!(!shadow_chunks[0].2.contains("tiny-token"));
+    assert!(!shadow_chunks[0].2.contains("sk-t"));
+    assert_eq!(
+        &shadow_chunks[1..],
+        &[
+            (String::from("content"), 1, String::from("Hel")),
+            (String::from("content"), 2, String::from("lo")),
+            (String::from("reasoning"), 3, String::from("think")),
+            (String::from("tool_arguments"), 4, String::from(r#"{"q""#)),
+            (String::from("tool_arguments"), 5, String::from(r#":"x"}"#)),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn evidence_shadow_skeleton_records_skipped_shadow_without_affecting_fallback() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = true
+max_shadow_attempts_per_request = 1
+max_global_shadow_in_flight = 0
+shadow_attempt_timeout_ms = 10
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    let _first_attempt = fake.recv_next().await;
+    let _second_attempt = fake.recv_next().await;
+
+    let rows = read_evidence_attempt_rows(&proxy.evidence_sqlite_path);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2].role, "shadow_continued");
+    assert_eq!(rows[2].shown_to_downstream, 0);
+    assert_eq!(rows[2].status, "skipped");
+    assert_eq!(rows[2].shadow_skip_reason.as_deref(), Some("global_limit"));
+}
+
+#[tokio::test]
+async fn evidence_shadow_per_request_limit_records_skip_without_extra_upstream_attempt() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = true
+max_shadow_attempts_per_request = 0
+max_global_shadow_in_flight = 1
+shadow_attempt_timeout_ms = 50
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    let _first_attempt = fake.recv_next().await;
+    let _second_attempt = fake.recv_next().await;
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "per-request shadow limit should not issue a shadow upstream request"
+    );
+
+    let rows = read_evidence_attempt_rows(&proxy.evidence_sqlite_path);
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2].role, "shadow_continued");
+    assert_eq!(rows[2].status, "skipped");
+    assert_eq!(
+        rows[2].shadow_skip_reason.as_deref(),
+        Some("per_request_limit")
+    );
+}
+
+#[tokio::test]
+async fn evidence_shadow_timeout_releases_global_permit_for_next_request() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = true
+max_shadow_attempts_per_request = 1
+max_global_shadow_in_flight = 1
+shadow_attempt_timeout_ms = 20
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+"#,
+    )
+    .await;
+
+    send_shadow_timeout_request(&proxy, 1).await;
+    let first_requests = recv_shadow_timeout_upstream_requests(&mut fake).await;
+    assert_eq!(
+        first_requests
+            .iter()
+            .filter(|request| body_contains_retry_hint(&request.body))
+            .count(),
+        1
+    );
+    wait_for_evidence_status_count(&proxy.evidence_sqlite_path, "shadow_timeout", 1).await;
+
+    send_shadow_timeout_request(&proxy, 2).await;
+    let second_requests = recv_shadow_timeout_upstream_requests(&mut fake).await;
+    assert_eq!(
+        second_requests
+            .iter()
+            .filter(|request| body_contains_retry_hint(&request.body))
+            .count(),
+        1
+    );
+    wait_for_evidence_status_count(&proxy.evidence_sqlite_path, "shadow_timeout", 2).await;
+
+    let connection = Connection::open(&proxy.evidence_sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts \
+             WHERE role = 'shadow_continued' AND status = 'skipped' \
+             AND shadow_skip_reason = 'global_limit'",
+        ),
+        0
+    );
+}
+
+#[tokio::test]
+async fn evidence_shadow_global_limit_skips_concurrent_request_and_releases_permit() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = true
+max_shadow_attempts_per_request = 1
+max_global_shadow_in_flight = 1
+shadow_attempt_timeout_ms = 2000
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+"#,
+    )
+    .await;
+
+    let first_client = proxy.client.clone();
+    let first_base_url = proxy.base_url.clone();
+    let first_request = tokio::spawn(async move {
+        send_shadow_timeout_request_parts(&first_client, &first_base_url, 1).await;
+    });
+    let first_requests = recv_shadow_timeout_upstream_requests(&mut fake).await;
+    assert_eq!(
+        first_requests
+            .iter()
+            .filter(|request| body_contains_retry_hint(&request.body))
+            .count(),
+        1
+    );
+
+    send_shadow_timeout_request(&proxy, 2).await;
+    let second_requests = recv_n_upstream_requests(&mut fake, 2).await;
+    assert_eq!(
+        second_requests
+            .iter()
+            .filter(|request| body_contains_retry_hint(&request.body))
+            .count(),
+        1
+    );
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "global shadow limit should skip the concurrent shadow request"
+    );
+    first_request
+        .await
+        .expect("first concurrent shadow request task should finish");
+
+    wait_for_evidence_status_count(&proxy.evidence_sqlite_path, "shadow_timeout", 1).await;
+    let connection = Connection::open(&proxy.evidence_sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts \
+             WHERE role = 'shadow_continued' AND status = 'shadow_timeout'",
+        ),
+        1
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts \
+             WHERE role = 'shadow_continued' AND status = 'skipped' \
+             AND shadow_skip_reason = 'global_limit'",
+        ),
+        1
+    );
+
+    send_shadow_timeout_request(&proxy, 3).await;
+    let third_requests = recv_shadow_timeout_upstream_requests(&mut fake).await;
+    assert_eq!(
+        third_requests
+            .iter()
+            .filter(|request| body_contains_retry_hint(&request.body))
+            .count(),
+        1
+    );
+    wait_for_evidence_status_count(&proxy.evidence_sqlite_path, "shadow_timeout", 2).await;
+}
+
+#[tokio::test]
+async fn evidence_shadow_downstream_drop_records_terminal_status_and_releases_global_permit() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = true
+max_shadow_attempts_per_request = 1
+max_global_shadow_in_flight = 1
+shadow_attempt_timeout_ms = 20
+
+[heartbeat]
+mode = "json-whitespace"
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+downstream_drop_policy = "detach"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-shadow-timeout-then-success&id=drop",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should start");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut downstream = response.bytes_stream();
+    let heartbeat = next_chunk(
+        &mut downstream,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "drop test shielded heartbeat",
+    )
+    .await;
+    assert_eq!(heartbeat, Bytes::from_static(b" \n"));
+    drop(downstream);
+
+    let first_requests = recv_shadow_timeout_upstream_requests(&mut fake).await;
+    assert_eq!(
+        first_requests
+            .iter()
+            .filter(|request| body_contains_retry_hint(&request.body))
+            .count(),
+        1
+    );
+    wait_for_evidence_status_count(&proxy.evidence_sqlite_path, "shadow_timeout", 1).await;
+    assert_shadow_timeout_count_stays(&proxy.evidence_sqlite_path, 1).await;
+
+    send_shadow_timeout_request(&proxy, 2).await;
+    let second_requests = recv_shadow_timeout_upstream_requests(&mut fake).await;
+    assert_eq!(
+        second_requests
+            .iter()
+            .filter(|request| body_contains_retry_hint(&request.body))
+            .count(),
+        1
+    );
+    wait_for_evidence_status_count(&proxy.evidence_sqlite_path, "shadow_timeout", 2).await;
+
+    assert_shadow_timeout_summary(&proxy.evidence_sqlite_path, 2, 2);
+}
+
+#[tokio::test]
 async fn retry_ladder_advances_from_max_thinking_loop_to_bounded_success() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -1910,6 +2686,78 @@ thinking_mode = "force_disable"
         attempts[2].response_metadata["attempt_thinking_mode"],
         "force_disable"
     );
+}
+
+#[tokio::test]
+async fn retry_anti_loop_hint_stays_single_message_across_repeated_loop_retries() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 3
+anti_loop_hint_enabled = true
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+thinking_token_budget = 8192
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-twice-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let first_attempt = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+    let third_attempt = fake.recv_next().await;
+    assert_eq!(retry_hint_count(&first_attempt.body), 0);
+    assert_eq!(retry_hint_count(&second_attempt.body), 1);
+    assert_eq!(retry_hint_count(&third_attempt.body), 1);
+
+    let second_body_text = String::from_utf8_lossy(&second_attempt.body);
+    assert!(second_body_text.contains("retry_attempt=2/3"));
+    let third_body_text = String::from_utf8_lossy(&third_attempt.body);
+    assert!(third_body_text.contains("retry_attempt=3/3"));
+    assert!(
+        !third_body_text.contains("retry_attempt=2/3"),
+        "retry bodies must be rebuilt from the original downstream body, not from the previous generated retry body"
+    );
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[1].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[2].status, "succeeded");
 }
 
 #[tokio::test]
@@ -3737,6 +4585,7 @@ async fn non_stream_chat_downstream_drop_cancels_upstream_body() {
 [shielding]
 enabled = false
 ",
+        "",
         "",
     )
     .await;
@@ -7224,6 +8073,17 @@ struct AttemptChainRow {
     response_metadata: serde_json::Value,
 }
 
+#[derive(Debug)]
+struct EvidenceAttemptRow {
+    role: String,
+    shown_to_downstream: i64,
+    status: String,
+    retry_reason: Option<String>,
+    shadow_skip_reason: Option<String>,
+    thinking_budget_tokens: Option<u32>,
+    detector_features: serde_json::Value,
+}
+
 fn read_attempt_chain_rows(sqlite_path: &Path) -> Vec<AttemptChainRow> {
     let connection = Connection::open(sqlite_path).expect("sqlite should open");
     let mut statement = connection
@@ -7253,6 +8113,232 @@ fn read_attempt_chain_rows(sqlite_path: &Path) -> Vec<AttemptChainRow> {
         .expect("attempt chain query should execute")
         .map(|row| row.expect("attempt chain row should decode"))
         .collect()
+}
+
+fn read_evidence_attempt_rows(sqlite_path: &Path) -> Vec<EvidenceAttemptRow> {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let mut statement = connection
+        .prepare(
+            "SELECT role, shown_to_downstream, status, retry_reason, shadow_skip_reason, \
+             thinking_budget_tokens, detector_features_json FROM evidence_attempts ORDER BY rowid",
+        )
+        .expect("evidence attempt query should prepare");
+    statement
+        .query_map([], |row| {
+            let detector_features_json: String = row.get(6)?;
+            let detector_features =
+                serde_json::from_str(&detector_features_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+            Ok(EvidenceAttemptRow {
+                role: row.get(0)?,
+                shown_to_downstream: row.get(1)?,
+                status: row.get(2)?,
+                retry_reason: row.get(3)?,
+                shadow_skip_reason: row.get(4)?,
+                thinking_budget_tokens: row.get(5)?,
+                detector_features,
+            })
+        })
+        .expect("evidence attempt query should execute")
+        .map(|row| row.expect("evidence attempt row should decode"))
+        .collect()
+}
+
+fn count_rows(connection: &Connection, sql: &str) -> u64 {
+    let count: i64 = connection
+        .query_row(sql, [], |row| row.get(0))
+        .expect("count query should succeed");
+    u64::try_from(count).expect("count should be nonnegative")
+}
+
+async fn assert_shadow_timeout_count_stays(sqlite_path: &Path, expected_count: u64) {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE role = 'shadow_continued'",
+        ),
+        expected_count
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts \
+             WHERE role = 'shadow_continued' AND status = 'shadow_timeout'",
+        ),
+        expected_count
+    );
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE role = 'shadow_continued'",
+        ),
+        expected_count
+    );
+}
+
+fn assert_shadow_timeout_summary(
+    sqlite_path: &Path,
+    expected_timeout_count: u64,
+    expected_request_count: u64,
+) {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts \
+             WHERE role = 'shadow_continued' AND status = 'shadow_timeout'",
+        ),
+        expected_timeout_count
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts \
+             WHERE role = 'shadow_continued' AND status = 'skipped' \
+             AND shadow_skip_reason = 'global_limit'",
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(DISTINCT request_id) FROM evidence_attempts \
+             WHERE role = 'shadow_continued'",
+        ),
+        expected_request_count
+    );
+}
+
+fn read_evidence_chunks(connection: &Connection) -> Vec<(String, i64, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT channel, sequence_number, chunk_text \
+             FROM evidence_chunks ORDER BY sequence_number",
+        )
+        .expect("evidence chunks query should prepare");
+    statement
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("evidence chunks query should execute")
+        .map(|row| row.expect("evidence chunk row should decode"))
+        .collect()
+}
+
+fn read_evidence_chunks_for_role(
+    connection: &Connection,
+    role: &str,
+) -> Vec<(String, i64, String)> {
+    let mut statement = connection
+        .prepare(
+            "SELECT c.channel, c.sequence_number, c.chunk_text \
+             FROM evidence_chunks c \
+             JOIN evidence_attempts a ON a.attempt_id = c.attempt_id \
+             WHERE a.role = ?1 \
+             ORDER BY c.sequence_number",
+        )
+        .expect("role evidence chunks query should prepare");
+    statement
+        .query_map(params![role], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .expect("role evidence chunks query should execute")
+        .map(|row| row.expect("role evidence chunk row should decode"))
+        .collect()
+}
+
+async fn send_shadow_timeout_request(proxy: &ProxyFixture, request_index: u32) {
+    send_shadow_timeout_request_parts(&proxy.client, &proxy.base_url, request_index).await;
+}
+
+async fn send_shadow_timeout_request_parts(
+    client: &reqwest::Client,
+    base_url: &str,
+    request_index: u32,
+) {
+    let response = client
+        .post(format!(
+            "{base_url}/v1/chat/completions?test=loop-once-shadow-timeout-then-success&id={request_index}",
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+}
+
+async fn recv_shadow_timeout_upstream_requests(fake: &mut FakeUpstream) -> Vec<ObservedRequest> {
+    recv_n_upstream_requests(fake, 3).await
+}
+
+async fn recv_n_upstream_requests(
+    fake: &mut FakeUpstream,
+    expected_count: usize,
+) -> Vec<ObservedRequest> {
+    let mut requests = Vec::new();
+    for _ in 0..expected_count {
+        requests.push(
+            timeout(Duration::from_secs(2), fake.recv_next())
+                .await
+                .expect("expected request should reach upstream"),
+        );
+    }
+    requests
+}
+
+async fn wait_for_evidence_status_count(sqlite_path: &Path, status: &str, expected: u64) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if sqlite_path.exists() {
+                let connection = Connection::open(sqlite_path).expect("sqlite should open");
+                let query =
+                    format!("SELECT COUNT(*) FROM evidence_attempts WHERE status = '{status}'");
+                if count_rows(&connection, &query) >= expected {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("evidence status count should reach expected value");
+}
+
+async fn wait_for_evidence_role_status_count(
+    sqlite_path: &Path,
+    role: &str,
+    status: &str,
+    expected: u64,
+) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if sqlite_path.exists() {
+                let connection = Connection::open(sqlite_path).expect("sqlite should open");
+                let count: i64 = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM evidence_attempts WHERE role = ?1 AND status = ?2",
+                        params![role, status],
+                        |row| row.get(0),
+                    )
+                    .expect("evidence role status count query should succeed");
+                if u64::try_from(count).expect("count should be nonnegative") >= expected {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("evidence role status count should reach expected value");
 }
 
 fn read_last_observability_row(sqlite_path: &Path, table: &str) -> ObservabilityRow {
@@ -7728,6 +8814,24 @@ fn fake_chat_completion_response(
             repeated_reasoning_line_sse_response(200)
         });
     }
+    if path_and_query.contains("test=loop-once-shadow-raw-then-success") {
+        if body_contains_retry_hint(body) {
+            return Some(chat_completion_sse_response(body));
+        }
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            return Some(repeated_reasoning_line_sse_response(200));
+        }
+        return Some(chat_completion_sse_response(body));
+    }
+    if path_and_query.contains("test=loop-once-shadow-timeout-then-success") {
+        if body_contains_retry_hint(body) {
+            return Some(chat_completion_sse_response(body));
+        }
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            return Some(repeated_reasoning_line_sse_response(200));
+        }
+        return Some(stalled_chat_completion_sse_response());
+    }
     if path_and_query.contains("test=loop-once-then-success") {
         return Some(if body_contains_retry_hint(body) {
             chat_completion_sse_response(body)
@@ -7799,6 +8903,10 @@ fn next_fake_attempt_count(state: &FakeUpstreamState, key: &str) -> u64 {
 }
 
 fn body_contains_retry_hint(body: &Bytes) -> bool {
+    retry_hint_count(body) > 0
+}
+
+fn retry_hint_count(body: &Bytes) -> usize {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
@@ -7807,16 +8915,19 @@ fn body_contains_retry_hint(body: &Bytes) -> bool {
                 .and_then(serde_json::Value::as_array)
                 .cloned()
         })
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|content| {
-                        content.contains("llm-guard-proxy retry hint")
-                            || content.contains("Previous attempt became repetitive")
-                    })
-            })
+        .map_or(0, |messages| {
+            messages
+                .iter()
+                .filter(|message| {
+                    message
+                        .get("content")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|content| {
+                            content.contains("llm-guard-proxy retry hint")
+                                || content.contains("Previous attempt became repetitive")
+                        })
+                })
+                .count()
         })
 }
 
@@ -8693,6 +9804,7 @@ struct ProxyFixture {
     state: ProxyState,
     store: ObservabilityStore,
     sqlite_path: PathBuf,
+    evidence_sqlite_path: PathBuf,
     root: PathBuf,
 }
 
@@ -8733,6 +9845,7 @@ impl ProxyFixture {
             server_config,
             "",
             "",
+            "",
         )
         .await
     }
@@ -8764,6 +9877,7 @@ impl ProxyFixture {
             "",
             metadata_config,
             "",
+            "",
         )
         .await
     }
@@ -8780,6 +9894,20 @@ impl ProxyFixture {
             "",
             "",
             observability_config,
+            "",
+        )
+        .await
+    }
+
+    async fn spawn_with_evidence_config(upstream_base_url: &str, evidence_config: &str) -> Self {
+        Self::spawn_with_full_options(
+            upstream_base_url,
+            true,
+            AppConfig::default().server.max_in_flight_requests,
+            "",
+            "",
+            "",
+            evidence_config,
         )
         .await
     }
@@ -8791,29 +9919,35 @@ impl ProxyFixture {
         server_config: &str,
         metadata_config: &str,
         observability_config: &str,
+        evidence_config: &str,
     ) -> Self {
         let root = unique_test_dir("proxy");
         fs::create_dir_all(&root).expect("test root should be created");
         set_owner_only_dir(&root);
         let config_path = root.join("config.toml");
         let sqlite_path = root.join("storage").join("observability.sqlite3");
+        let evidence_sqlite_path = root.join("storage").join("evidence.sqlite3");
         write_proxy_config_with_observability(ProxyConfigWriteOptions {
             config_path: &config_path,
             upstream_base_url,
             sqlite_path: &sqlite_path,
+            evidence_sqlite_path: &evidence_sqlite_path,
             observability_enabled,
             max_in_flight_requests,
             server_config,
             metadata_config,
             observability_config,
+            evidence_config,
         });
         let manager =
             ConfigManager::from_explicit_path(&config_path).expect("proxy config should load");
         let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+        let evidence_store = EvidenceStore::open(manager.handle());
         let state = ProxyState::new(
             manager.handle(),
             manager.path().to_path_buf(),
             store.clone(),
+            evidence_store,
             build_http_client().expect("client should build"),
         );
         let app = router(state.clone());
@@ -8836,6 +9970,7 @@ impl ProxyFixture {
             state,
             store,
             sqlite_path,
+            evidence_sqlite_path,
             root,
         }
     }
@@ -8855,15 +9990,18 @@ fn write_proxy_config(
     max_in_flight_requests: usize,
     metadata_config: &str,
 ) {
+    let evidence_sqlite_path = sqlite_path.with_file_name("evidence.sqlite3");
     write_proxy_config_with_observability(ProxyConfigWriteOptions {
         config_path,
         upstream_base_url,
         sqlite_path,
+        evidence_sqlite_path: &evidence_sqlite_path,
         observability_enabled,
         max_in_flight_requests,
         server_config: "",
         metadata_config,
         observability_config: "",
+        evidence_config: "",
     });
 }
 
@@ -8872,11 +10010,13 @@ struct ProxyConfigWriteOptions<'a> {
     config_path: &'a Path,
     upstream_base_url: &'a str,
     sqlite_path: &'a Path,
+    evidence_sqlite_path: &'a Path,
     observability_enabled: bool,
     max_in_flight_requests: usize,
     server_config: &'a str,
     metadata_config: &'a str,
     observability_config: &'a str,
+    evidence_config: &'a str,
 }
 
 fn write_proxy_config_with_observability(options: ProxyConfigWriteOptions<'_>) {
@@ -8902,6 +10042,11 @@ capture_raw_payloads = false
 max_bytes = {TEST_MAX_BYTES}
 prune_to_bytes = {TEST_PRUNE_TO_BYTES}
 max_records = {TEST_MAX_RECORDS}
+
+[evidence]
+sqlite_path = "{evidence_sqlite_path}"
+blob_cache_dir = "{blob_cache_dir}"
+{evidence_config}
 "#,
             max_in_flight_requests = options.max_in_flight_requests,
             server_config = options.server_config,
@@ -8909,6 +10054,14 @@ max_records = {TEST_MAX_RECORDS}
             metadata_config = options.metadata_config,
             observability_enabled = options.observability_enabled,
             sqlite_path = options.sqlite_path.display(),
+            evidence_sqlite_path = options.evidence_sqlite_path.display(),
+            blob_cache_dir = options
+                .evidence_sqlite_path
+                .parent()
+                .expect("evidence sqlite path should have parent")
+                .join("evidence-blobs")
+                .display(),
+            evidence_config = options.evidence_config,
             observability_config = options.observability_config,
         ),
     )

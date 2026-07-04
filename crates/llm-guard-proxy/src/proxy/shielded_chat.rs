@@ -4,7 +4,8 @@ use axum::body::Bytes;
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
-    RawPayloads, StreamChannel, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy,
+    RawPayloadChunk, RawPayloads, StreamChannel, ThinkingConfig, ThinkingMode,
+    ToolRequestThinkingPolicy,
 };
 use serde_json::{Map, Number, Value, json};
 use tokio::time::timeout;
@@ -14,6 +15,8 @@ use super::{MAX_PROXY_BODY_BYTES, sanitized_reqwest_error, unix_time_millis};
 mod loop_guard;
 pub(super) use loop_guard::{AggregationError, LoopInspectionContext};
 use loop_guard::{LoopDetector, observe_completed_tool_call, observe_fragment};
+
+const RAW_STREAM_CHUNK_LIMIT: usize = 2_048;
 
 /// Prepared upstream request body for shielded non-stream chat completion handling.
 pub(super) struct PreparedChatRequest {
@@ -1433,6 +1436,7 @@ struct ChatAggregation {
     first_byte_latency_ms: Option<u64>,
     first_token_latency_ms: Option<u64>,
     stats: DeltaStats,
+    raw_stream_chunks: Vec<RawPayloadChunk>,
 }
 
 impl ChatAggregation {
@@ -1526,13 +1530,20 @@ impl ChatAggregation {
             }
             if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
                 self.stats.delta_count = self.stats.delta_count.saturating_add(1);
-                builder.apply_delta(
+                let apply_result = builder.apply_delta(
                     delta,
                     &mut self.stats,
                     &mut self.first_token_latency_ms,
                     self.attempt_started_at_unix_ms,
                     &mut self.loop_detector,
-                )?;
+                    &mut self.raw_stream_chunks,
+                );
+                if let Err(error) = apply_result {
+                    return Err(error.with_raw_payloads(raw_payloads_from_choices(
+                        &self.choices,
+                        &self.raw_stream_chunks,
+                    )));
+                }
             }
         }
         Ok(())
@@ -1545,12 +1556,19 @@ impl ChatAggregation {
         sse_body: Bytes,
     ) -> Result<AggregatedChatCompletion, AggregationError> {
         self.ensure_usable()?;
-        self.observe_completed_tool_calls()?;
+        if let Err(error) = self.observe_completed_tool_calls() {
+            return Err(error.with_raw_payloads(raw_payloads_from_choices(
+                &self.choices,
+                &self.raw_stream_chunks,
+            )));
+        }
         let response_metadata = response_metadata(&self);
         let completion_fields =
             CompletionFields::from_aggregation(&self, request_id, request_model_id);
+        let raw_stream_chunks = std::mem::take(&mut self.raw_stream_chunks);
         let finalized_choices = finalize_choices(self.choices);
-        let raw_payloads = finalized_choices.raw_payloads();
+        let mut raw_payloads = finalized_choices.raw_payloads();
+        raw_payloads.chunks = raw_stream_chunks;
         let body = completion_body(completion_fields, finalized_choices.choices)
             .map_err(AggregationError::plain)?;
 
@@ -1636,6 +1654,7 @@ impl FinalizedChoices {
             output: (!self.raw_output.is_empty()).then(|| self.raw_output.clone()),
             reasoning: (!self.raw_reasoning.is_empty()).then(|| self.raw_reasoning.clone()),
             tool_calls: raw_tool_calls,
+            chunks: Vec::new(),
         }
     }
 }
@@ -1666,6 +1685,36 @@ fn finalize_choices(choices: BTreeMap<u64, ChoiceBuilder>) -> FinalizedChoices {
         raw_output,
         raw_reasoning,
         raw_tool_calls,
+    }
+}
+
+fn raw_payloads_from_choices(
+    choices: &BTreeMap<u64, ChoiceBuilder>,
+    raw_stream_chunks: &[RawPayloadChunk],
+) -> RawPayloads {
+    let mut raw_output = String::new();
+    let mut raw_reasoning = String::new();
+    let mut raw_tool_calls = Vec::new();
+
+    for choice in choices.values() {
+        raw_output.push_str(&choice.content);
+        raw_reasoning.push_str(&choice.reasoning);
+        if let Some(function_call) = &choice.function_call {
+            raw_tool_calls.push(json!({
+                "function_call": function_call.as_value(),
+            }));
+        }
+        raw_tool_calls.extend(choice.tool_calls.values().map(ToolCallBuilder::as_value));
+    }
+
+    RawPayloads {
+        input: None,
+        output: (!raw_output.is_empty()).then_some(raw_output),
+        reasoning: (!raw_reasoning.is_empty()).then_some(raw_reasoning),
+        tool_calls: (!raw_tool_calls.is_empty())
+            .then(|| serde_json::to_string(&raw_tool_calls).ok())
+            .flatten(),
+        chunks: raw_stream_chunks.to_vec(),
     }
 }
 
@@ -1849,6 +1898,7 @@ impl ChoiceBuilder {
         first_token_latency_ms: &mut Option<u64>,
         attempt_started_at_unix_ms: u64,
         loop_detector: &mut Option<LoopDetector>,
+        raw_stream_chunks: &mut Vec<RawPayloadChunk>,
     ) -> Result<(), AggregationError> {
         copy_extension_fields(
             delta,
@@ -1860,26 +1910,28 @@ impl ChoiceBuilder {
         }
         if let Some(content) = delta.get("content").and_then(Value::as_str) {
             if !content.is_empty() {
-                observe_fragment(loop_detector, StreamChannel::Content, content)?;
                 self.content.push_str(content);
                 stats.content_delta_count = stats.content_delta_count.saturating_add(1);
                 mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
+                observe_fragment(loop_detector, StreamChannel::Content, content)?;
+                push_raw_stream_chunk(raw_stream_chunks, StreamChannel::Content, content);
             }
         }
         for field in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(reasoning) = delta.get(field).and_then(Value::as_str) {
                 if !reasoning.is_empty() {
-                    observe_fragment(loop_detector, StreamChannel::Reasoning, reasoning)?;
                     self.reasoning.push_str(reasoning);
                     stats.reasoning_delta_count = stats.reasoning_delta_count.saturating_add(1);
                     mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
+                    observe_fragment(loop_detector, StreamChannel::Reasoning, reasoning)?;
+                    push_raw_stream_chunk(raw_stream_chunks, StreamChannel::Reasoning, reasoning);
                 }
             }
         }
         if let Some(function_call) = delta.get("function_call").and_then(Value::as_object) {
             self.function_call
                 .get_or_insert_with(FunctionCallBuilder::default)
-                .apply_delta(function_call, loop_detector)?;
+                .apply_delta(function_call, loop_detector, raw_stream_chunks)?;
             mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
         }
         if let Some(refusal) = delta.get("refusal") {
@@ -1904,7 +1956,7 @@ impl ChoiceBuilder {
                             index,
                             ..ToolCallBuilder::default()
                         })
-                        .apply_delta(tool_call, loop_detector)?;
+                        .apply_delta(tool_call, loop_detector, raw_stream_chunks)?;
                     stats.tool_call_delta_count = stats.tool_call_delta_count.saturating_add(1);
                     mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
                 }
@@ -1999,14 +2051,16 @@ impl FunctionCallBuilder {
         &mut self,
         function_call: &Map<String, Value>,
         loop_detector: &mut Option<LoopDetector>,
+        raw_stream_chunks: &mut Vec<RawPayloadChunk>,
     ) -> Result<(), AggregationError> {
         if let Some(name) = function_call.get("name").and_then(Value::as_str) {
             self.name.get_or_insert_with(|| name.to_owned());
         }
         if let Some(arguments) = function_call.get("arguments").and_then(Value::as_str) {
-            observe_fragment(loop_detector, StreamChannel::ToolArguments, arguments)?;
             self.saw_arguments = true;
             self.arguments.push_str(arguments);
+            observe_fragment(loop_detector, StreamChannel::ToolArguments, arguments)?;
+            push_raw_stream_chunk(raw_stream_chunks, StreamChannel::ToolArguments, arguments);
         }
         Ok(())
     }
@@ -2032,6 +2086,20 @@ impl FunctionCallBuilder {
         }
         if self.saw_arguments {
             function_call.insert(String::from("arguments"), Value::String(self.arguments));
+        }
+        Value::Object(function_call)
+    }
+
+    fn as_value(&self) -> Value {
+        let mut function_call = Map::new();
+        if let Some(name) = &self.name {
+            function_call.insert(String::from("name"), Value::String(name.clone()));
+        }
+        if self.saw_arguments {
+            function_call.insert(
+                String::from("arguments"),
+                Value::String(self.arguments.clone()),
+            );
         }
         Value::Object(function_call)
     }
@@ -2072,6 +2140,7 @@ impl ToolCallBuilder {
         &mut self,
         tool_call: &Map<String, Value>,
         loop_detector: &mut Option<LoopDetector>,
+        raw_stream_chunks: &mut Vec<RawPayloadChunk>,
     ) -> Result<(), AggregationError> {
         if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
             self.id.get_or_insert_with(|| id.to_owned());
@@ -2084,8 +2153,9 @@ impl ToolCallBuilder {
                 self.function_name.get_or_insert_with(|| name.to_owned());
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                observe_fragment(loop_detector, StreamChannel::ToolArguments, arguments)?;
                 self.function_arguments.push_str(arguments);
+                observe_fragment(loop_detector, StreamChannel::ToolArguments, arguments)?;
+                push_raw_stream_chunk(raw_stream_chunks, StreamChannel::ToolArguments, arguments);
             }
         }
         Ok(())
@@ -2098,6 +2168,17 @@ impl ToolCallBuilder {
             "function": {
                 "name": self.function_name.unwrap_or_default(),
                 "arguments": self.function_arguments,
+            },
+        })
+    }
+
+    fn as_value(&self) -> Value {
+        json!({
+            "id": self.id.clone().unwrap_or_else(|| format!("call_{}", self.index)),
+            "type": self.type_name.clone().unwrap_or_else(|| String::from("function")),
+            "function": {
+                "name": self.function_name.clone().unwrap_or_default(),
+                "arguments": self.function_arguments.clone(),
             },
         })
     }
@@ -2131,6 +2212,13 @@ fn mark_first_token(first_token_latency_ms: &mut Option<u64>, attempt_started_at
         *first_token_latency_ms =
             Some(unix_time_millis().saturating_sub(attempt_started_at_unix_ms));
     }
+}
+
+fn push_raw_stream_chunk(chunks: &mut Vec<RawPayloadChunk>, channel: StreamChannel, text: &str) {
+    if text.is_empty() || chunks.len() >= RAW_STREAM_CHUNK_LIMIT {
+        return;
+    }
+    chunks.push(RawPayloadChunk::new(channel.as_str(), text));
 }
 
 fn string_field<'value>(value: &'value Value, key: &str) -> Option<&'value str> {

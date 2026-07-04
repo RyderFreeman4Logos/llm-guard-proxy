@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt};
 use axum::body::Bytes;
 use llm_guard_proxy_core::{
     ChannelizedLoopDetector, DetectorSummary, LoopDetector as CoreLoopDetector, LoopDetectorInput,
-    LoopGuardConfig, LoopGuardMode, LoopInputProfile, LoopSignal, StreamChannel,
+    LoopGuardConfig, LoopGuardMode, LoopInputProfile, LoopSignal, RawPayloads, StreamChannel,
     ToolCallFingerprintInput,
 };
 
@@ -12,6 +12,7 @@ use llm_guard_proxy_core::{
 pub(in crate::proxy) struct AggregationError {
     message: String,
     response_metadata: BTreeMap<String, String>,
+    raw_payloads: Box<RawPayloads>,
 }
 
 impl AggregationError {
@@ -19,6 +20,7 @@ impl AggregationError {
         Self {
             message: message.into(),
             response_metadata: BTreeMap::new(),
+            raw_payloads: Box::default(),
         }
     }
 
@@ -35,6 +37,7 @@ impl AggregationError {
                     idle_timeout_ms.to_string(),
                 ),
             ]),
+            raw_payloads: Box::default(),
         }
     }
 
@@ -42,11 +45,21 @@ impl AggregationError {
         Self {
             message: loop_detection_message(signal),
             response_metadata: signal.legacy_abort_metadata(),
+            raw_payloads: Box::default(),
         }
+    }
+
+    pub(super) fn with_raw_payloads(mut self, raw_payloads: RawPayloads) -> Self {
+        self.raw_payloads = Box::new(raw_payloads);
+        self
     }
 
     pub(in crate::proxy) fn response_metadata(&self) -> &BTreeMap<String, String> {
         &self.response_metadata
+    }
+
+    pub(in crate::proxy) fn raw_payloads(&self) -> &RawPayloads {
+        self.raw_payloads.as_ref()
     }
 
     pub(in crate::proxy) fn is_loop_detected(&self) -> bool {

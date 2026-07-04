@@ -424,6 +424,7 @@ fn redacts_authorization_and_api_key_like_values_before_persistence() {
         output: Some(String::from("model output without credentials")),
         reasoning: Some(String::from("reasoning with token=fixture-secret")),
         tool_calls: None,
+        chunks: Vec::new(),
     };
 
     store
@@ -474,6 +475,7 @@ fn redacts_common_raw_payload_secret_forms_before_persistence() {
         output: Some(String::from("credential = fixture-credential")),
         reasoning: Some(String::from("secret: fixture-secret")),
         tool_calls: Some(String::from(r#"{"arguments":{"passwd":"fixture-passwd"}}"#)),
+        chunks: Vec::new(),
     };
     let mut attempt = attempt_record(
         "attempt-raw-secrets",
@@ -487,6 +489,7 @@ fn redacts_common_raw_payload_secret_forms_before_persistence() {
         output: Some(String::from("token=fixture-token")),
         reasoning: Some(String::from(r#"{"api_key":"fixture-api-key"}"#)),
         tool_calls: Some(String::from("credential: fixture-tool-credential")),
+        chunks: Vec::new(),
     };
 
     store
@@ -527,6 +530,7 @@ fn retention_deletes_oldest_requests_until_actual_storage_under_prune_target() {
             output: Some("y".repeat(40_000)),
             reasoning: None,
             tool_calls: None,
+            chunks: Vec::new(),
         };
         store
             .record_request(&request)
