@@ -15,8 +15,9 @@ pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, HeartbeatConfig, HeartbeatMode, LoopGuardConfig,
     LoopGuardMode, MetadataConfig, ObservabilityConfig, RestartRequiredChange, RetentionConfig,
-    RetryConfig, ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy,
-    UpstreamConfig, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    RetryConfig, SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig,
+    ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 pub use reload::{
     ConfigHandle, ConfigManager, MissingConfigPolicy, ReloadOutcome, ReloadWatcher,
@@ -48,9 +49,14 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "observability.retention.prune_to_records",
     "thinking.enabled",
     "thinking.force_disable",
+    "thinking.mode",
+    "thinking.max_tokens",
     "thinking.budget_tokens",
+    "thinking.thinking_token_budget",
+    "thinking.budget_accounting",
     "thinking.preserve_answer_budget",
     "thinking.tool_request_policy",
+    "thinking.apply_to_tool_requests",
     "loop_guard.enabled",
     "loop_guard.mode",
     "loop_guard.normalized_input_window_secs",
@@ -86,6 +92,24 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstream.metadata.refresh_interval_secs",
     "upstream.metadata.context_length_override",
     "upstream.metadata.max_model_len_override",
+    "upstream.metadata.input_token_safety_margin",
+    "upstreams.request_timeout_ms",
+    "upstreams.metadata.discovery_enabled",
+    "upstreams.metadata.enrich_responses",
+    "upstreams.metadata.refresh_interval_secs",
+    "upstreams.metadata.context_length_override",
+    "upstreams.metadata.max_model_len_override",
+    "upstreams.metadata.input_token_safety_margin",
+    "upstreams.thinking.enabled",
+    "upstreams.thinking.force_disable",
+    "upstreams.thinking.mode",
+    "upstreams.thinking.max_tokens",
+    "upstreams.thinking.budget_tokens",
+    "upstreams.thinking.thinking_token_budget",
+    "upstreams.thinking.budget_accounting",
+    "upstreams.thinking.preserve_answer_budget",
+    "upstreams.thinking.tool_request_policy",
+    "upstreams.thinking.apply_to_tool_requests",
 ];
 
 /// Fields read at process startup that require a restart when changed.
@@ -93,5 +117,6 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "server.bind_host",
     "server.port",
     "upstream.base_url",
+    "upstreams.topology",
     "observability.sqlite_path",
 ];

@@ -7,8 +7,8 @@ use std::{
 
 use super::{
     AppConfig, ConfigManager, ConfigParseError, HeartbeatMode, LoopGuardMode, MissingConfigPolicy,
-    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ToolRequestThinkingPolicy, ValidationError,
-    parse::parse_config_text, redact_upstream_base_url,
+    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ThinkingMode, ToolRequestThinkingPolicy,
+    UpstreamRouteReason, ValidationError, parse::parse_config_text, redact_upstream_base_url,
 };
 
 #[test]
@@ -48,7 +48,9 @@ fn defaults_match_issue_contract() {
         80_000
     );
     assert!(config.thinking.enabled);
+    assert_eq!(config.thinking.mode, ThinkingMode::BoundedThinking);
     assert!(!config.thinking.force_disable);
+    assert_eq!(config.thinking.max_tokens, None);
     assert_eq!(config.thinking.budget_tokens, 32_768);
     assert_eq!(
         config.thinking.tool_request_policy,
@@ -94,6 +96,8 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.upstream_stall.recovery_max_per_window, 2);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
     assert!(config.cloudflare.enabled);
+    assert!(config.upstream_profiles.is_empty());
+    assert_eq!(config.default_upstream_profile().name, "default");
 }
 
 #[test]
@@ -112,6 +116,198 @@ fn validates_enabled_upstream_stall_idle_timeout_precedes_request_timeout() {
             .message()
             .contains("less than upstream.request_timeout_ms")
     );
+}
+
+#[test]
+fn parses_named_upstream_profiles_and_preserves_legacy_default_profile() {
+    let config = parse_config_text(
+        r#"
+[upstream]
+base_url = "http://default.example/v1"
+request_timeout_ms = 120000
+
+[upstream.metadata]
+context_length_override = 4096
+input_token_safety_margin = 64
+
+[thinking]
+mode = "bounded_thinking"
+thinking_token_budget = 1234
+budget_accounting = "preserve_answer_budget"
+
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://aeon.example/v1"
+match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon"]
+request_timeout_ms = 7200000
+
+[upstreams.metadata]
+discovery_enabled = true
+context_length_override = 262144
+input_token_safety_margin = 2048
+
+[upstreams.thinking]
+mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+budget_accounting = "total_cap"
+apply_to_tool_requests = true
+
+[[upstreams]]
+name = "fast-no-think"
+base_url = "http://127.0.0.1:18100/v1"
+match_models = ["fast-local"]
+
+[upstreams.thinking]
+mode = "force_disable"
+"#,
+    )
+    .expect("profile config should parse");
+
+    assert_eq!(config.upstream.base_url, "http://default.example/v1");
+    assert_eq!(config.thinking.budget_tokens, 1_234);
+    assert_eq!(
+        config.upstream.metadata.context_length_override,
+        Some(4_096)
+    );
+    assert_eq!(config.upstream.metadata.input_token_safety_margin, 64);
+
+    assert_eq!(config.upstream_profiles.len(), 2);
+    let aeon = &config.upstream_profiles[0];
+    assert_eq!(aeon.name, "aeon-chat");
+    assert_eq!(aeon.base_url, "http://aeon.example/v1");
+    assert_eq!(
+        aeon.match_models,
+        vec![
+            String::from("aeon-ultimate"),
+            String::from("qwen3.6-27b-decensor-by-aeon"),
+        ]
+    );
+    assert_eq!(aeon.request_timeout_ms, 7_200_000);
+    assert_eq!(aeon.metadata.context_length_override, Some(262_144));
+    assert_eq!(aeon.metadata.input_token_safety_margin, 2_048);
+    assert_eq!(aeon.thinking.mode, ThinkingMode::ForceThinking);
+    assert_eq!(aeon.thinking.max_tokens, Some(50_000));
+    assert_eq!(aeon.thinking.budget_tokens, 32_768);
+    assert!(!aeon.thinking.preserve_answer_budget);
+
+    let fast = &config.upstream_profiles[1];
+    assert_eq!(fast.name, "fast-no-think");
+    assert_eq!(fast.match_models, vec![String::from("fast-local")]);
+    assert_eq!(fast.thinking.mode, ThinkingMode::ForceDisable);
+
+    config.validate().expect("profile config should validate");
+}
+
+#[test]
+fn selects_named_profile_by_model_and_defaults_without_match() {
+    let config = parse_config_text(
+        r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://aeon.example/v1"
+match_models = ["aeon-ultimate"]
+
+[[upstreams]]
+name = "fast-no-think"
+base_url = "http://fast.example/v1"
+match_models = ["fast-local"]
+"#,
+    )
+    .expect("profile config should parse");
+
+    let aeon = config.select_upstream_profile(Some("aeon-ultimate"));
+    assert_eq!(aeon.profile.name, "aeon-chat");
+    assert_eq!(aeon.route_reason, UpstreamRouteReason::MatchedModel);
+
+    let fallback = config.select_upstream_profile(Some("unknown"));
+    assert_eq!(fallback.profile.name, "default");
+    assert_eq!(
+        fallback.route_reason,
+        UpstreamRouteReason::DefaultUnmatchedModel
+    );
+
+    let no_model = config.select_upstream_profile(None);
+    assert_eq!(no_model.profile.name, "default");
+    assert_eq!(no_model.route_reason, UpstreamRouteReason::DefaultNoModel);
+}
+
+#[test]
+fn validates_named_upstream_profile_uniqueness_and_required_metadata() {
+    for (contents, field) in [
+        (
+            r#"
+[[upstreams]]
+name = "dup"
+base_url = "http://one.example/v1"
+match_models = ["one"]
+
+[[upstreams]]
+name = "dup"
+base_url = "http://two.example/v1"
+match_models = ["two"]
+"#,
+            "upstreams.name",
+        ),
+        (
+            r#"
+[[upstreams]]
+name = "one"
+base_url = "http://one.example/v1"
+match_models = ["same"]
+
+[[upstreams]]
+name = "two"
+base_url = "http://two.example/v1"
+match_models = ["same"]
+"#,
+            "upstreams.match_models",
+        ),
+        (
+            r#"
+[[upstreams]]
+name = ""
+base_url = "http://one.example/v1"
+match_models = ["one"]
+"#,
+            "upstreams.name",
+        ),
+        (
+            r#"
+[[upstreams]]
+name = "bad-url"
+base_url = "ftp://one.example/v1"
+match_models = ["one"]
+"#,
+            "upstream.base_url",
+        ),
+        (
+            r#"
+[[upstreams]]
+name = "bad-timeout"
+base_url = "http://one.example/v1"
+match_models = ["one"]
+request_timeout_ms = 0
+"#,
+            "upstreams.request_timeout_ms",
+        ),
+        (
+            r#"
+[[upstreams]]
+name = "bad-metadata"
+base_url = "http://one.example/v1"
+match_models = ["one"]
+
+[upstreams.metadata]
+context_length_override = 0
+"#,
+            "upstream.metadata.context_length_override",
+        ),
+    ] {
+        let config = parse_config_text(contents).expect("config syntax should parse");
+        let error = config.validate().expect_err("profile config should fail");
+        assert_eq!(error.field(), field);
+    }
 }
 
 #[test]
@@ -844,6 +1040,174 @@ reasoning_semantic_history_window_count = 20
 }
 
 #[test]
+fn reload_applies_safe_named_profile_fields_without_changing_topology() {
+    let path = unique_test_path("profile-reload.toml");
+    write_config(
+        &path,
+        r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://aeon.example/v1"
+match_models = ["aeon-ultimate"]
+request_timeout_ms = 120000
+
+[upstreams.metadata]
+context_length_override = 4096
+input_token_safety_margin = 64
+
+[upstreams.thinking]
+mode = "bounded_thinking"
+thinking_token_budget = 1024
+"#,
+    );
+    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
+
+    write_config(
+        &path,
+        r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://aeon.example/v1"
+match_models = ["aeon-ultimate"]
+request_timeout_ms = 90000
+
+[upstreams.metadata]
+context_length_override = 8192
+input_token_safety_margin = 128
+
+[upstreams.thinking]
+mode = "force_thinking"
+thinking_token_budget = 2048
+"#,
+    );
+    let outcome = manager.reload().expect("profile reload should succeed");
+    let snapshot = manager
+        .handle()
+        .snapshot()
+        .expect("snapshot should succeed");
+    let profile = snapshot.select_upstream_profile(Some("aeon-ultimate"));
+
+    assert!(outcome.applied);
+    assert!(outcome.restart_required_changes.is_empty());
+    assert_eq!(profile.profile.request_timeout_ms, 90_000);
+    assert_eq!(
+        profile.profile.metadata.context_length_override,
+        Some(8_192)
+    );
+    assert_eq!(profile.profile.metadata.input_token_safety_margin, 128);
+    assert_eq!(profile.profile.thinking.mode, ThinkingMode::ForceThinking);
+    assert_eq!(profile.profile.thinking.budget_tokens, 2_048);
+
+    remove_file(&path);
+}
+
+#[test]
+fn reload_reports_named_profile_topology_changes_without_half_updating_routes() {
+    let path = unique_test_path("profile-topology-reload.toml");
+    write_config(
+        &path,
+        r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://aeon.example/v1"
+match_models = ["aeon-ultimate"]
+request_timeout_ms = 120000
+
+[upstreams.thinking]
+thinking_token_budget = 1024
+"#,
+    );
+    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
+
+    write_config(
+        &path,
+        r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://new-aeon.example/v1"
+match_models = ["renamed-model"]
+request_timeout_ms = 90000
+
+[upstreams.thinking]
+thinking_token_budget = 2048
+"#,
+    );
+    let outcome = manager
+        .reload()
+        .expect("topology reload should report restart requirement");
+    let snapshot = manager
+        .handle()
+        .snapshot()
+        .expect("snapshot should succeed");
+    let old_route = snapshot.select_upstream_profile(Some("aeon-ultimate"));
+    let renamed_route = snapshot.select_upstream_profile(Some("renamed-model"));
+
+    assert!(!outcome.applied);
+    assert_eq!(outcome.restart_required_changes.len(), 1);
+    assert_eq!(
+        outcome.restart_required_changes[0].field,
+        "upstreams.topology"
+    );
+    assert_eq!(old_route.profile.name, "aeon-chat");
+    assert_eq!(old_route.profile.base_url, "http://aeon.example/v1");
+    assert_eq!(old_route.profile.thinking.budget_tokens, 1_024);
+    assert_eq!(renamed_route.profile.name, "default");
+
+    remove_file(&path);
+}
+
+#[test]
+fn reload_reports_match_model_topology_changes_with_delimiter_like_aliases() {
+    let path = unique_test_path("profile-topology-delimiter-reload.toml");
+    write_config(
+        &path,
+        r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://aeon.example/v1"
+match_models = ["a,b"]
+
+[upstreams.thinking]
+thinking_token_budget = 1024
+"#,
+    );
+    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
+
+    write_config(
+        &path,
+        r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://aeon.example/v1"
+match_models = ["a", "b"]
+
+[upstreams.thinking]
+thinking_token_budget = 1024
+"#,
+    );
+    let outcome = manager
+        .reload()
+        .expect("topology reload should report restart requirement");
+    let snapshot = manager
+        .handle()
+        .snapshot()
+        .expect("snapshot should succeed");
+    let old_route = snapshot.select_upstream_profile(Some("a,b"));
+    let split_route = snapshot.select_upstream_profile(Some("a"));
+
+    assert!(!outcome.applied);
+    assert_eq!(outcome.restart_required_changes.len(), 1);
+    assert_eq!(
+        outcome.restart_required_changes[0].field,
+        "upstreams.topology"
+    );
+    assert_eq!(old_route.profile.name, "aeon-chat");
+    assert_eq!(split_route.profile.name, "default");
+
+    remove_file(&path);
+}
+
+#[test]
 fn polling_watcher_applies_reloadable_file_changes() {
     let path = unique_test_path("polling-reload.toml");
     write_config(
@@ -915,7 +1279,11 @@ interval_secs = 4
 fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"thinking.force_disable"));
+    assert!(RELOADABLE_FIELDS.contains(&"thinking.mode"));
+    assert!(RELOADABLE_FIELDS.contains(&"thinking.max_tokens"));
     assert!(RELOADABLE_FIELDS.contains(&"thinking.tool_request_policy"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstreams.thinking.mode"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstreams.metadata.input_token_safety_margin"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_queued_generation_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.generation_queue_timeout_ms"));
@@ -949,6 +1317,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.generation_queue_timeout_ms"));
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.max_control_plane_in_flight_requests"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
+    assert!(RESTART_REQUIRED_FIELDS.contains(&"upstreams.topology"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"observability.sqlite_path"));
 }
 

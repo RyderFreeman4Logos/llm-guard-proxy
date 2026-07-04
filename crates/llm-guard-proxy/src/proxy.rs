@@ -30,8 +30,8 @@ use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
     DownstreamMode, Health, HeartbeatMode, LICENSE, LatencyHistogram, MetadataConfig,
     ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
-    RequestStatus, RetryConfig, SERVICE_NAME, UpstreamMode, UpstreamStallConfig,
-    redact_upstream_base_url, validate_upstream_base_url,
+    RequestStatus, RetryConfig, SERVICE_NAME, ThinkingConfig, UpstreamMode, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -1019,7 +1019,7 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
             let finished_at_unix_ms = unix_time_millis();
             let error_type = error.error_type();
             let error_reason = error.to_string();
-            let response = proxy_error_response(error.status(), error_type, &error_reason);
+            let response = proxy_error_response_from_error(&error);
             let request_metadata = error.request_metadata().cloned().unwrap_or_else(|| {
                 BTreeMap::from([(String::from("proxy_error"), error_type.to_owned())])
             });
@@ -1209,41 +1209,35 @@ async fn forward_openai_request(
         body.len(),
         config.shielding.enabled,
     );
-    let upstream_url = build_upstream_url(&config.upstream.base_url, &uri)
-        .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
-    let reqwest_method = upstream_method(&method)
-        .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
-    let model_id = extract_model_id(&body);
-    let shielded_chat_plan = plan_shielded_chat(state, &config, &method, &uri, &body);
-    add_shielded_request_metadata(
-        &mut request_metadata,
-        shielded_chat_plan.intercepted,
-        shielded_chat_plan.thinking_policy_applied,
-        &shielded_chat_plan.liveness,
-        &shielded_chat_plan.thinking_metadata,
-    );
+    let prepared_request =
+        prepare_openai_forward_request(state, &config, &method, &uri, &body, &mut request_metadata)
+            .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry);
     let upstream_stall_policy = UpstreamStallPolicy::from_config(&config.upstream_stall);
-    if shielded_chat_plan.intercepted {
+    if prepared_request.shielded_chat_plan.intercepted {
         add_retry_request_metadata(&mut request_metadata, retry_policy);
         return forward_shielded_chat_with_retries(
             ShieldedRetryRuntime {
                 client: state.client.clone(),
-                method: reqwest_method,
-                upstream_url,
+                method: prepared_request.reqwest_method,
+                upstream_url: prepared_request.upstream_url,
                 downstream_method: method,
                 downstream_uri: uri,
                 downstream_headers,
-                upstream_body: shielded_chat_plan.upstream_body,
-                upstream_timeout: Duration::from_millis(config.upstream.request_timeout_ms),
+                upstream_body: prepared_request.shielded_chat_plan.upstream_body,
+                upstream_timeout: Duration::from_millis(
+                    prepared_request.upstream_profile.request_timeout_ms,
+                ),
                 store: state.store.clone(),
                 request_id: request_id.clone(),
                 started_at_unix_ms,
-                model_id,
+                model_id: prepared_request.model_id,
                 request_metadata,
-                liveness: shielded_chat_plan.liveness,
-                thinking_metadata: shielded_chat_plan.thinking_metadata,
-                loop_context: shielded_chat_plan.loop_context,
+                upstream_profile: prepared_request.upstream_profile,
+                route_reason: prepared_request.route_reason,
+                liveness: prepared_request.shielded_chat_plan.liveness,
+                thinking_metadata: prepared_request.shielded_chat_plan.thinking_metadata,
+                loop_context: prepared_request.shielded_chat_plan.loop_context,
                 retry_policy,
                 upstream_stall_policy,
                 upstream_stall_recovery: state.upstream_stall_recovery.clone(),
@@ -1258,20 +1252,75 @@ async fn forward_openai_request(
         method,
         uri,
         downstream_headers,
-        reqwest_method,
-        upstream_url,
-        upstream_body: shielded_chat_plan.upstream_body,
-        upstream_timeout: Duration::from_millis(config.upstream.request_timeout_ms),
-        liveness: shielded_chat_plan.liveness,
-        thinking_policy_applied: shielded_chat_plan.thinking_policy_applied,
-        thinking_metadata: shielded_chat_plan.thinking_metadata,
+        reqwest_method: prepared_request.reqwest_method,
+        upstream_url: prepared_request.upstream_url,
+        upstream_body: prepared_request.shielded_chat_plan.upstream_body,
+        upstream_timeout: Duration::from_millis(
+            prepared_request.upstream_profile.request_timeout_ms,
+        ),
+        upstream_profile: prepared_request.upstream_profile,
+        route_reason: prepared_request.route_reason,
+        liveness: prepared_request.shielded_chat_plan.liveness,
+        thinking_policy_applied: prepared_request.shielded_chat_plan.thinking_policy_applied,
+        thinking_metadata: prepared_request.shielded_chat_plan.thinking_metadata,
         request_id,
         started_at_unix_ms,
-        model_id,
+        model_id: prepared_request.model_id,
         request_metadata,
         in_flight_permit,
     })
     .await
+}
+
+struct PreparedOpenAiRequest {
+    model_id: Option<String>,
+    upstream_profile: UpstreamProfileConfig,
+    route_reason: UpstreamRouteReason,
+    upstream_url: Url,
+    reqwest_method: reqwest::Method,
+    shielded_chat_plan: ShieldedChatPlan,
+}
+
+fn prepare_openai_forward_request(
+    state: &ProxyState,
+    config: &AppConfig,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    request_metadata: &mut BTreeMap<String, String>,
+) -> Result<PreparedOpenAiRequest, ProxyError> {
+    let model_id = extract_model_id(body);
+    let selected_profile = config.select_upstream_profile(model_id.as_deref());
+    let upstream_profile = selected_profile.profile;
+    let route_reason = selected_profile.route_reason;
+    add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
+    let upstream_url = build_upstream_url(&upstream_profile.base_url, uri)?;
+    let reqwest_method = upstream_method(method)?;
+    let shielded_chat_plan =
+        plan_shielded_chat(state, config, &upstream_profile.thinking, method, uri, body);
+    add_shielded_request_metadata(
+        request_metadata,
+        shielded_chat_plan.intercepted,
+        shielded_chat_plan.thinking_policy_applied,
+        &shielded_chat_plan.liveness,
+        &shielded_chat_plan.thinking_metadata,
+    );
+    request_metadata.extend(context_budget_preflight(
+        method,
+        uri,
+        body,
+        &shielded_chat_plan.upstream_body,
+        &upstream_profile,
+    )?);
+
+    Ok(PreparedOpenAiRequest {
+        model_id,
+        upstream_profile,
+        route_reason,
+        upstream_url,
+        reqwest_method,
+        shielded_chat_plan,
+    })
 }
 
 struct GenericForwardContext<'request> {
@@ -1284,6 +1333,8 @@ struct GenericForwardContext<'request> {
     upstream_url: Url,
     upstream_body: Bytes,
     upstream_timeout: Duration,
+    upstream_profile: UpstreamProfileConfig,
+    route_reason: UpstreamRouteReason,
     liveness: ShieldedLivenessSelection,
     thinking_policy_applied: bool,
     thinking_metadata: BTreeMap<String, String>,
@@ -1301,6 +1352,11 @@ async fn forward_generic_openai_request(
     let attempt_started_at_unix_ms = unix_time_millis();
     let mut attempt_request_metadata =
         attempt_request_metadata(&context.method, &context.uri, &context.downstream_headers);
+    add_upstream_profile_metadata(
+        &mut attempt_request_metadata,
+        &context.upstream_profile,
+        context.route_reason,
+    );
     add_shielded_request_metadata(
         &mut attempt_request_metadata,
         false,
@@ -1343,6 +1399,7 @@ async fn forward_generic_openai_request(
             method: &context.method,
             uri: &context.uri,
             config: context.config,
+            metadata_config: &context.upstream_profile.metadata,
         },
         response_parts,
         upstream_response,
@@ -1401,6 +1458,7 @@ struct ResponseDispatch<'request> {
     method: &'request Method,
     uri: &'request Uri,
     config: &'request AppConfig,
+    metadata_config: &'request MetadataConfig,
 }
 
 struct ShieldedChatPlan {
@@ -1415,19 +1473,17 @@ struct ShieldedChatPlan {
 fn plan_shielded_chat(
     state: &ProxyState,
     config: &AppConfig,
+    thinking: &ThinkingConfig,
     method: &Method,
     uri: &Uri,
     body: &Bytes,
 ) -> ShieldedChatPlan {
     let (request, intercepted) = if should_intercept_non_stream_chat(method, uri, config) {
-        let non_stream_request = shielded_chat::prepare_non_stream_request(body, &config.thinking);
+        let non_stream_request = shielded_chat::prepare_non_stream_request(body, thinking);
         if non_stream_request.is_some() {
             (non_stream_request, true)
         } else {
-            (
-                shielded_chat::prepare_stream_request(body, &config.thinking),
-                false,
-            )
+            (shielded_chat::prepare_stream_request(body, thinking), false)
         }
     } else {
         (None, false)
@@ -1603,12 +1659,13 @@ async fn forward_upstream_response(
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
     let upstream_headers = response_parts.upstream_headers.clone();
-    if should_enrich_models_response(dispatch.method, dispatch.uri, dispatch.config) {
+    if should_enrich_models_response(dispatch.method, dispatch.uri, dispatch.metadata_config) {
         return forward_enriched_models_response(
             response_parts,
             upstream_response,
             in_flight_permit,
-            &dispatch.config.upstream.metadata,
+            dispatch.config,
+            dispatch.metadata_config,
         )
         .await;
     }
@@ -1655,15 +1712,236 @@ async fn read_upstream_body_bytes(
     Ok(body.freeze())
 }
 
-fn should_enrich_models_response(method: &Method, uri: &Uri, config: &AppConfig) -> bool {
+fn should_enrich_models_response(method: &Method, uri: &Uri, metadata: &MetadataConfig) -> bool {
     method == Method::GET
         && uri.path() == "/v1/models"
-        && config.upstream.metadata.discovery_enabled
-        && config.upstream.metadata.enrich_responses
+        && metadata.discovery_enabled
+        && metadata.enrich_responses
 }
 
 fn should_intercept_non_stream_chat(method: &Method, uri: &Uri, config: &AppConfig) -> bool {
     method == Method::POST && uri.path() == "/v1/chat/completions" && config.shielding.enabled
+}
+
+fn context_budget_preflight(
+    method: &Method,
+    uri: &Uri,
+    original_body: &Bytes,
+    upstream_body: &Bytes,
+    profile: &UpstreamProfileConfig,
+) -> Result<BTreeMap<String, String>, ProxyError> {
+    let Some(param) = context_budget_param(method, uri) else {
+        return Ok(BTreeMap::from([(
+            String::from("context_budget_preflight"),
+            String::from("not_applicable"),
+        )]));
+    };
+    let Some(context_window) = profile.metadata.context_window_override().map(u64::from) else {
+        return Ok(BTreeMap::from([(
+            String::from("context_budget_preflight"),
+            String::from("skipped_no_context_window"),
+        )]));
+    };
+
+    let original_json = serde_json::from_slice::<serde_json::Value>(original_body).ok();
+    let upstream_json = serde_json::from_slice::<serde_json::Value>(upstream_body).ok();
+    let input_tokens = original_json.as_ref().map_or_else(
+        || estimate_text_tokens(original_body),
+        |value| estimate_request_input_tokens(param, value),
+    );
+    let reserved_output_tokens = upstream_json
+        .as_ref()
+        .map_or(0, estimate_reserved_output_tokens);
+    let safety_margin = u64::from(profile.metadata.input_token_safety_margin);
+    let total_tokens = input_tokens
+        .saturating_add(reserved_output_tokens)
+        .saturating_add(safety_margin);
+    let estimate = ContextBudgetEstimate {
+        param,
+        context_window,
+        input_tokens,
+        reserved_output_tokens,
+        safety_margin,
+        total_tokens,
+    };
+    if estimate.exceeds_window() {
+        return Err(ProxyError::context_budget_exceeded(estimate));
+    }
+    Ok(estimate.metadata("allowed"))
+}
+
+fn context_budget_param(method: &Method, uri: &Uri) -> Option<&'static str> {
+    if method != Method::POST {
+        return None;
+    }
+    match uri.path() {
+        "/v1/chat/completions" => Some("messages"),
+        "/v1/completions" => Some("prompt"),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ContextBudgetEstimate {
+    param: &'static str,
+    context_window: u64,
+    input_tokens: u64,
+    reserved_output_tokens: u64,
+    safety_margin: u64,
+    total_tokens: u64,
+}
+
+impl ContextBudgetEstimate {
+    const fn exceeds_window(self) -> bool {
+        self.total_tokens > self.context_window
+    }
+
+    fn metadata(self, status: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            (String::from("context_budget_preflight"), status.to_owned()),
+            (String::from("context_budget_param"), self.param.to_owned()),
+            (
+                String::from("context_budget_window_tokens"),
+                self.context_window.to_string(),
+            ),
+            (
+                String::from("context_budget_input_estimate_tokens"),
+                self.input_tokens.to_string(),
+            ),
+            (
+                String::from("context_budget_reserved_output_tokens"),
+                self.reserved_output_tokens.to_string(),
+            ),
+            (
+                String::from("context_budget_safety_margin_tokens"),
+                self.safety_margin.to_string(),
+            ),
+            (
+                String::from("context_budget_total_estimate_tokens"),
+                self.total_tokens.to_string(),
+            ),
+        ])
+    }
+
+    fn message(self) -> String {
+        format!(
+            "Input plus reserved output exceeds upstream context window; lower the caller auto-compaction threshold, input tokens, or requested max_tokens. estimated_total_tokens={} context_window_tokens={} input_tokens={} reserved_output_tokens={} safety_margin_tokens={}",
+            self.total_tokens,
+            self.context_window,
+            self.input_tokens,
+            self.reserved_output_tokens,
+            self.safety_margin
+        )
+    }
+}
+
+fn estimate_request_input_tokens(param: &str, value: &serde_json::Value) -> u64 {
+    match param {
+        "messages" => estimate_chat_request_input_tokens(value),
+        "prompt" => value.get("prompt").map_or(0, estimate_json_input_tokens),
+        _ => 0,
+    }
+}
+
+fn estimate_chat_request_input_tokens(value: &serde_json::Value) -> u64 {
+    let message_tokens = value
+        .get("messages")
+        .map_or(0, estimate_chat_messages_tokens);
+    let tool_definition_tokens = estimate_json_fields_tokens(value, &["tools", "functions"]);
+    message_tokens.saturating_add(tool_definition_tokens)
+}
+
+fn estimate_chat_messages_tokens(value: &serde_json::Value) -> u64 {
+    let serde_json::Value::Array(messages) = value else {
+        return estimate_json_input_tokens(value);
+    };
+    messages.iter().map(estimate_chat_message_tokens).sum()
+}
+
+fn estimate_chat_message_tokens(value: &serde_json::Value) -> u64 {
+    let serde_json::Value::Object(message) = value else {
+        return estimate_json_input_tokens(value);
+    };
+    estimate_object_fields_tokens(
+        message,
+        &[
+            "role",
+            "name",
+            "content",
+            "tool_call_id",
+            "tool_calls",
+            "function_call",
+        ],
+    )
+}
+
+fn estimate_json_input_tokens(value: &serde_json::Value) -> u64 {
+    match value {
+        serde_json::Value::String(text) => estimate_text_tokens(text.as_bytes()),
+        serde_json::Value::Array(values) => values.iter().map(estimate_json_input_tokens).sum(),
+        serde_json::Value::Object(object) => object.values().map(estimate_json_input_tokens).sum(),
+        serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => 0,
+    }
+}
+
+fn estimate_text_tokens(bytes: &[u8]) -> u64 {
+    let text = String::from_utf8_lossy(bytes);
+    let bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let byte_estimate = bytes.saturating_add(3) / 4;
+    let word_count = u64::try_from(text.split_whitespace().count()).unwrap_or(u64::MAX);
+    byte_estimate.max(word_count)
+}
+
+fn estimate_json_fields_tokens(value: &serde_json::Value, fields: &[&str]) -> u64 {
+    let serde_json::Value::Object(object) = value else {
+        return 0;
+    };
+    estimate_object_fields_tokens(object, fields)
+}
+
+fn estimate_object_fields_tokens(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fields: &[&str],
+) -> u64 {
+    fields
+        .iter()
+        .filter_map(|field| object.get(*field))
+        .map(estimate_json_input_tokens)
+        .fold(0_u64, u64::saturating_add)
+}
+
+fn estimate_reserved_output_tokens(value: &serde_json::Value) -> u64 {
+    let output_cap = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+        .iter()
+        .filter_map(|field| value.get(*field).and_then(serde_json::Value::as_u64))
+        .max()
+        .unwrap_or(0);
+    output_cap.max(estimate_thinking_budget_tokens(value))
+}
+
+fn estimate_thinking_budget_tokens(value: &serde_json::Value) -> u64 {
+    [
+        &["thinking", "budget_tokens"][..],
+        &["thinking_token_budget"][..],
+        &["thinking_budget"][..],
+        &["chat_template_kwargs", "thinking_budget"][..],
+        &["extra_body", "thinking_budget"][..],
+        &["extra_body", "thinking_token_budget"][..],
+        &["extra_body", "thinking", "budget_tokens"][..],
+        &["extra_body", "chat_template_kwargs", "thinking_budget"][..],
+    ]
+    .iter()
+    .filter_map(|path| numeric_json_path(value, path))
+    .max()
+    .unwrap_or(0)
+}
+
+fn numeric_json_path(value: &serde_json::Value, path: &[&str]) -> Option<u64> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    current.as_u64()
 }
 
 fn upstream_method(method: &Method) -> Result<reqwest::Method, ProxyError> {
@@ -1840,6 +2118,7 @@ async fn forward_enriched_models_response(
     response_parts: ForwardedResponseParts,
     upstream_response: reqwest::Response,
     in_flight_permit: InFlightPermit,
+    config: &AppConfig,
     metadata_config: &MetadataConfig,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
@@ -1848,7 +2127,7 @@ async fn forward_enriched_models_response(
         Ok(body) => body,
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
-    let body = model_metadata::enrich_models_body(metadata_config, body);
+    let body = model_metadata::enrich_models_body(config, metadata_config, body);
     let observer = response_parts.into_observer();
     let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit);
 
@@ -1874,6 +2153,8 @@ struct ShieldedRetryRuntime {
     started_at_unix_ms: u64,
     model_id: Option<String>,
     request_metadata: BTreeMap<String, String>,
+    upstream_profile: UpstreamProfileConfig,
+    route_reason: UpstreamRouteReason,
     liveness: ShieldedLivenessSelection,
     thinking_metadata: BTreeMap<String, String>,
     loop_context: shielded_chat::LoopInspectionContext,
@@ -2925,6 +3206,11 @@ fn shielded_attempt_request_metadata(
         &runtime.downstream_method,
         &runtime.downstream_uri,
         &runtime.downstream_headers,
+    );
+    add_upstream_profile_metadata(
+        &mut metadata,
+        &runtime.upstream_profile,
+        runtime.route_reason,
     );
     add_shielded_request_metadata(
         &mut metadata,
@@ -4440,6 +4726,35 @@ fn request_body_bytes_hint(headers: &HeaderMap) -> String {
         .map_or_else(|| String::from("unknown"), |bytes| bytes.to_string())
 }
 
+fn add_upstream_profile_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    profile: &UpstreamProfileConfig,
+    route_reason: UpstreamRouteReason,
+) {
+    let context_window = profile.metadata.context_window_override();
+    metadata.insert(String::from("upstream_profile"), profile.name.clone());
+    metadata.insert(
+        String::from("upstream_route_reason"),
+        route_reason.as_str().to_owned(),
+    );
+    metadata.insert(
+        String::from("upstream_request_timeout_ms"),
+        profile.request_timeout_ms.to_string(),
+    );
+    metadata.insert(
+        String::from("upstream_context_window_configured"),
+        context_window.is_some().to_string(),
+    );
+    metadata.insert(
+        String::from("upstream_context_window_tokens"),
+        context_window.map_or_else(|| String::from("unknown"), |value| value.to_string()),
+    );
+    metadata.insert(
+        String::from("upstream_input_token_safety_margin"),
+        profile.metadata.input_token_safety_margin.to_string(),
+    );
+}
+
 fn add_shielded_request_metadata(
     metadata: &mut BTreeMap<String, String>,
     shielded_chat: bool,
@@ -4848,13 +5163,31 @@ fn text_response(status: StatusCode, text: String) -> Response<Body> {
 }
 
 fn proxy_error_response(status: StatusCode, error_type: &str, message: &str) -> Response<Body> {
+    proxy_error_response_with_code(status, error_type, message, None, None)
+}
+
+fn proxy_error_response_with_code(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+    code: Option<&str>,
+    param: Option<&str>,
+) -> Response<Body> {
+    let mut error = serde_json::Map::from_iter([
+        (String::from("type"), json!(error_type)),
+        (String::from("message"), json!(message)),
+    ]);
+    if let Some(code) = code {
+        error.insert(String::from("code"), json!(code));
+    }
+    if let Some(param) = param {
+        error.insert(String::from("param"), json!(param));
+    }
     let mut response = Response::new(Body::from(
-        json!({
-            "error": {
-                "type": error_type,
-                "message": message,
-            }
-        })
+        serde_json::Value::Object(serde_json::Map::from_iter([(
+            String::from("error"),
+            serde_json::Value::Object(error),
+        )]))
         .to_string(),
     ));
     *response.status_mut() = status;
@@ -4862,6 +5195,24 @@ fn proxy_error_response(status: StatusCode, error_type: &str, message: &str) -> 
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     response
+}
+
+fn proxy_error_response_from_error(error: &ProxyError) -> Response<Body> {
+    match error {
+        ProxyError::ContextBudgetExceeded {
+            message,
+            param,
+            code,
+            ..
+        } => proxy_error_response_with_code(
+            error.status(),
+            error.error_type(),
+            message,
+            Some(code),
+            Some(param),
+        ),
+        _ => proxy_error_response(error.status(), error.error_type(), &error.to_string()),
+    }
 }
 
 fn admission_error_response(
@@ -4921,6 +5272,13 @@ enum ProxyError {
         reason: String,
         observability: Option<Box<FailedUpstreamObservability>>,
     },
+    #[error("{message}")]
+    ContextBudgetExceeded {
+        message: String,
+        param: &'static str,
+        code: &'static str,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
 }
 
 impl ProxyError {
@@ -4960,6 +5318,15 @@ impl ProxyError {
         }
     }
 
+    fn context_budget_exceeded(estimate: ContextBudgetEstimate) -> Self {
+        Self::ContextBudgetExceeded {
+            message: estimate.message(),
+            param: estimate.param,
+            code: "context_budget_exceeded",
+            request_metadata: Some(estimate.metadata("rejected")),
+        }
+    }
+
     const fn status(&self) -> StatusCode {
         match self {
             Self::RequestBody { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -4967,6 +5334,7 @@ impl ProxyError {
             | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidMethod { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRequestPath(error) => error.status(),
+            Self::ContextBudgetExceeded { .. } => StatusCode::BAD_REQUEST,
             Self::UpstreamTransport { .. } | Self::UpstreamBody { .. } => StatusCode::BAD_GATEWAY,
         }
     }
@@ -4978,6 +5346,7 @@ impl ProxyError {
             Self::InvalidUpstreamUrl { .. } => "invalid_upstream_url",
             Self::InvalidRequestPath(error) => error.error_type(),
             Self::InvalidMethod { .. } => "invalid_method",
+            Self::ContextBudgetExceeded { .. } => "invalid_request_error",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
             Self::UpstreamBody { .. } => "upstream_body_error",
         }
@@ -4998,6 +5367,10 @@ impl ProxyError {
                 ..
             }
             | Self::InvalidMethod {
+                request_metadata: Some(request_metadata),
+                ..
+            }
+            | Self::ContextBudgetExceeded {
                 request_metadata: Some(request_metadata),
                 ..
             } => Some(request_metadata),
@@ -5023,6 +5396,10 @@ impl ProxyError {
             }
             | Self::InvalidRequestPath(_)
             | Self::InvalidMethod {
+                request_metadata: None,
+                ..
+            }
+            | Self::ContextBudgetExceeded {
                 request_metadata: None,
                 ..
             }
@@ -5052,6 +5429,7 @@ impl ProxyError {
             | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidRequestPath(_)
             | Self::InvalidMethod { .. }
+            | Self::ContextBudgetExceeded { .. }
             | Self::UpstreamTransport {
                 observability: None,
                 ..
@@ -5086,6 +5464,21 @@ impl ProxyError {
                 reason,
                 request_metadata: Some(request_metadata),
             },
+            Self::ContextBudgetExceeded {
+                message,
+                param,
+                code,
+                request_metadata: existing_metadata,
+            } => {
+                let mut merged = existing_metadata.unwrap_or_default();
+                merged.extend(request_metadata);
+                Self::ContextBudgetExceeded {
+                    message,
+                    param,
+                    code,
+                    request_metadata: Some(merged),
+                }
+            }
             error @ (Self::InvalidRequestPath(_)
             | Self::UpstreamTransport { .. }
             | Self::UpstreamBody { .. }) => error,
@@ -5116,7 +5509,8 @@ impl ProxyError {
             | Self::ConfigSnapshot { .. }
             | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidRequestPath(_)
-            | Self::InvalidMethod { .. }) => error,
+            | Self::InvalidMethod { .. }
+            | Self::ContextBudgetExceeded { .. }) => error,
         }
     }
 }

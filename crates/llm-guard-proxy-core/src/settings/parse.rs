@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, HeartbeatConfig, HeartbeatMode,
     LoopGuardConfig, LoopGuardMode, MetadataConfig, ObservabilityConfig, RetentionConfig,
-    RetryConfig, ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy,
-    UpstreamConfig, UpstreamStallConfig,
+    RetryConfig, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamStallConfig,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -13,6 +13,9 @@ enum Section {
     Server,
     Upstream,
     UpstreamMetadata,
+    UpstreamProfile(usize),
+    UpstreamProfileMetadata(usize),
+    UpstreamProfileThinking(usize),
     Shielding,
     Observability,
     ObservabilityRetention,
@@ -27,6 +30,7 @@ enum Section {
 pub(crate) fn parse_config_text(contents: &str) -> Result<AppConfig, ConfigParseError> {
     let mut config = AppConfig::default();
     let mut section = Section::Root;
+    let mut current_upstream_profile = None;
 
     for (index, raw_line) in contents.lines().enumerate() {
         let line_number = index + 1;
@@ -36,7 +40,12 @@ pub(crate) fn parse_config_text(contents: &str) -> Result<AppConfig, ConfigParse
             continue;
         }
         if line.starts_with('[') {
-            section = parse_section(line, line_number)?;
+            section = parse_section(
+                &mut config,
+                &mut current_upstream_profile,
+                line,
+                line_number,
+            )?;
             continue;
         }
         let (key, value) = split_key_value(line, line_number)?;
@@ -68,18 +77,49 @@ fn strip_comment(line: &str, line_number: usize) -> Result<&str, ConfigParseErro
     }
 }
 
-fn parse_section(line: &str, line_number: usize) -> Result<Section, ConfigParseError> {
+fn parse_section(
+    config: &mut AppConfig,
+    current_upstream_profile: &mut Option<usize>,
+    line: &str,
+    line_number: usize,
+) -> Result<Section, ConfigParseError> {
     if !line.ends_with(']') {
         return Err(ConfigParseError::new(
             line_number,
             "section header must end with ]",
         ));
     }
+    if line == "[[upstreams]]" {
+        config
+            .upstream_profiles
+            .push(UpstreamProfileConfig::default());
+        let index = config.upstream_profiles.len() - 1;
+        *current_upstream_profile = Some(index);
+        return Ok(Section::UpstreamProfile(index));
+    }
     let section = &line[1..line.len() - 1];
     match section {
         "server" => Ok(Section::Server),
         "upstream" => Ok(Section::Upstream),
         "upstream.metadata" => Ok(Section::UpstreamMetadata),
+        "upstreams.metadata" => current_upstream_profile.map_or_else(
+            || {
+                Err(ConfigParseError::new(
+                    line_number,
+                    "[upstreams.metadata] must follow a [[upstreams]] profile",
+                ))
+            },
+            |index| Ok(Section::UpstreamProfileMetadata(index)),
+        ),
+        "upstreams.thinking" => current_upstream_profile.map_or_else(
+            || {
+                Err(ConfigParseError::new(
+                    line_number,
+                    "[upstreams.thinking] must follow a [[upstreams]] profile",
+                ))
+            },
+            |index| Ok(Section::UpstreamProfileThinking(index)),
+        ),
         "shielding" => Ok(Section::Shielding),
         "observability" => Ok(Section::Observability),
         "observability.retention" => Ok(Section::ObservabilityRetention),
@@ -134,6 +174,24 @@ fn assign_value(
         Section::UpstreamMetadata => {
             assign_metadata(&mut config.upstream.metadata, key, value, line_number)
         }
+        Section::UpstreamProfile(index) => assign_upstream_profile(
+            &mut config.upstream_profiles[index],
+            key,
+            value,
+            line_number,
+        ),
+        Section::UpstreamProfileMetadata(index) => assign_metadata(
+            &mut config.upstream_profiles[index].metadata,
+            key,
+            value,
+            line_number,
+        ),
+        Section::UpstreamProfileThinking(index) => assign_thinking(
+            &mut config.upstream_profiles[index].thinking,
+            key,
+            value,
+            line_number,
+        ),
         Section::Shielding => assign_shielding(&mut config.shielding, key, value, line_number),
         Section::Observability => {
             assign_observability(&mut config.observability, key, value, line_number)
@@ -150,6 +208,25 @@ fn assign_value(
         Section::Heartbeat => assign_heartbeat(&mut config.heartbeat, key, value, line_number),
         Section::Cloudflare => assign_cloudflare(&mut config.cloudflare, key, value, line_number),
     }
+}
+
+fn assign_upstream_profile(
+    config: &mut UpstreamProfileConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "name" => config.name = parse_string(value, line_number)?,
+        "base_url" => config.base_url = parse_string(value, line_number)?,
+        "match_models" => config.match_models = parse_string_array(value, line_number)?,
+        "request_timeout_ms" => {
+            config.request_timeout_ms =
+                parse_u64(value, line_number, "upstreams.request_timeout_ms")?;
+        }
+        _ => return unknown_key("upstreams", key, line_number),
+    }
+    Ok(())
 }
 
 fn assign_server(
@@ -235,6 +312,13 @@ fn assign_metadata(
                 line_number,
                 "upstream.metadata.max_model_len_override",
             )?);
+        }
+        "input_token_safety_margin" => {
+            config.input_token_safety_margin = parse_u32(
+                value,
+                line_number,
+                "upstream.metadata.input_token_safety_margin",
+            )?;
         }
         _ => return unknown_key("upstream.metadata", key, line_number),
     }
@@ -333,18 +417,63 @@ fn assign_thinking(
     line_number: usize,
 ) -> Result<(), ConfigParseError> {
     match key {
+        "mode" => config.mode = parse_thinking_mode(value, line_number)?,
         "enabled" => config.enabled = parse_bool(value, line_number)?,
         "force_disable" => config.force_disable = parse_bool(value, line_number)?,
+        "max_tokens" => {
+            config.max_tokens = Some(parse_u32(value, line_number, "thinking.max_tokens")?);
+        }
         "budget_tokens" => {
             config.budget_tokens = parse_u32(value, line_number, "thinking.budget_tokens")?;
         }
+        "thinking_token_budget" => {
+            config.budget_tokens = parse_u32(value, line_number, "thinking.thinking_token_budget")?;
+        }
         "preserve_answer_budget" => config.preserve_answer_budget = parse_bool(value, line_number)?,
+        "budget_accounting" => {
+            config.preserve_answer_budget = parse_budget_accounting(value, line_number)?;
+        }
         "tool_request_policy" => {
             config.tool_request_policy = parse_tool_request_thinking_policy(value, line_number)?;
+        }
+        "apply_to_tool_requests" => {
+            config.tool_request_policy = if parse_bool(value, line_number)? {
+                ToolRequestThinkingPolicy::Apply
+            } else {
+                ToolRequestThinkingPolicy::Passthrough
+            };
         }
         _ => return unknown_key("thinking", key, line_number),
     }
     Ok(())
+}
+
+fn parse_thinking_mode(value: &str, line_number: usize) -> Result<ThinkingMode, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "passthrough" => Ok(ThinkingMode::Passthrough),
+        "force_disable" => Ok(ThinkingMode::ForceDisable),
+        "force_thinking" => Ok(ThinkingMode::ForceThinking),
+        "bounded_thinking" => Ok(ThinkingMode::BoundedThinking),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid thinking.mode {other:?}; expected \"passthrough\", \"force_disable\", \"force_thinking\", or \"bounded_thinking\""
+            ),
+        )),
+    }
+}
+
+fn parse_budget_accounting(value: &str, line_number: usize) -> Result<bool, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "preserve_answer_budget" => Ok(true),
+        "total_cap" => Ok(false),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid thinking.budget_accounting {other:?}; expected \"total_cap\" or \"preserve_answer_budget\""
+            ),
+        )),
+    }
 }
 
 fn parse_tool_request_thinking_policy(
