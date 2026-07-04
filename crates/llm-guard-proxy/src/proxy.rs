@@ -4325,7 +4325,7 @@ fn select_shielded_liveness(
         .flatten();
     let repeat_observation = input_fingerprint
         .as_deref()
-        .filter(|_fingerprint| config.loop_guard.enabled)
+        .filter(|_fingerprint| !config.loop_guard.effective_mode().is_disabled())
         .map_or_else(RepeatInputObservation::default, |fingerprint| {
             state.repeat_inputs.observe(
                 fingerprint,

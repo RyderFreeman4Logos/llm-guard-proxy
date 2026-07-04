@@ -96,9 +96,9 @@ The shielded chat core is enabled by default for non-streaming chat completions:
 - Downstream non-stream chat requests are sent upstream with `stream=true`.
 - The default downstream response is `text/event-stream`. While the shielded upstream attempt is pending, the proxy emits comment heartbeats shaped as `: llm-guard-proxy heartbeat`. After the attempt is accepted, it emits `event: final` with the accepted OpenAI-compatible chat completion JSON in the `data:` field.
 - If the same normalized input fingerprint repeats within the loop-guard window, the downstream response switches to `application/json` with leading whitespace heartbeat bytes before the final JSON body. Standard JSON parsers accept the leading whitespace.
-- The same `[loop_guard]` section also inspects shielded upstream SSE deltas for loops in hidden reasoning fields, visible content, and tool-call argument fragments. Detected output loops abort the shielded attempt through the existing upstream-body error path and record only bounded hashes/counters in observability metadata by default.
+- The same `[loop_guard]` section also feeds shielded upstream SSE deltas into a channelized loop detector for hidden reasoning fields, visible content, tool-call argument fragments, and completed tool fingerprints. `mode = "monitor"` records bounded signals without aborting; `mode = "enforce"` aborts high-confidence abort candidates through the existing upstream-body error path. Feature metadata contains hashes, counters, window sizes, severity, confidence, reason codes, and channel summaries by default.
 - `heartbeat.mode = "disabled"` keeps the legacy buffered JSON response for shielded non-stream chat completions.
-- Attempt observability records include first-byte latency, first-token latency, finish reason, parsed content/reasoning/tool-call delta counters, and `loop_*` diagnostics when loop guard aborts a shielded attempt.
+- Attempt observability records include first-byte latency, first-token latency, finish reason, parsed content/reasoning/tool-call delta counters, and bounded `loop_*` diagnostics when monitor or enforce mode emits detector signals.
 - Downstream `stream=true` chat requests currently stay on the generic streaming path to preserve first-chunk timing and backpressure behavior while later issues add release-after-inspection streaming.
 - Set `[shielding] enabled = false` and hot reload the config to fall back to generic forwarding for rollback or compatibility testing.
 
@@ -190,6 +190,7 @@ tool_request_policy = "apply"
 
 [loop_guard]
 enabled = true
+mode = "monitor" # disabled, monitor, enforce
 normalized_input_window_secs = 120
 max_repeated_inputs = 1
 output_repeated_line_threshold = 24
@@ -210,6 +211,12 @@ reasoning_semantic_history_window_count = 16
 # conservative majority-overlap threshold; raise the threshold to reduce false
 # positives, lower it to catch looser paraphrases, or disable it to keep only
 # the hash, suffix-cycle, and low-progress detectors.
+#
+# Detector mode controls channelized output-loop decisions. `disabled` skips
+# detector work, `monitor` writes bounded content-free signal summaries, and
+# `enforce` preserves abort behavior for high-confidence reasoning and tool-loop
+# candidates. Raw reasoning, visible content, and tool arguments are still not
+# persisted unless observability.capture_raw_payloads is enabled.
 
 [retry]
 enabled = true
@@ -270,6 +277,7 @@ Reloadable fields:
 - `thinking.preserve_answer_budget`
 - `thinking.tool_request_policy`
 - `loop_guard.enabled`
+- `loop_guard.mode`
 - `loop_guard.normalized_input_window_secs`
 - `loop_guard.max_repeated_inputs`
 - `loop_guard.output_repeated_line_threshold`

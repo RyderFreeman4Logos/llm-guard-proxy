@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, pin::Pin, time::Duration};
 use axum::body::Bytes;
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
-use llm_guard_proxy_core::{RawPayloads, ThinkingConfig, ToolRequestThinkingPolicy};
+use llm_guard_proxy_core::{RawPayloads, StreamChannel, ThinkingConfig, ToolRequestThinkingPolicy};
 use serde_json::{Map, Number, Value, json};
 use tokio::time::timeout;
 
@@ -11,7 +11,7 @@ use super::{MAX_PROXY_BODY_BYTES, sanitized_reqwest_error, unix_time_millis};
 
 mod loop_guard;
 pub(super) use loop_guard::{AggregationError, LoopInspectionContext};
-use loop_guard::{LoopChannel, LoopDetector, observe_fragment};
+use loop_guard::{LoopDetector, observe_completed_tool_call, observe_fragment};
 
 /// Prepared upstream request body for shielded non-stream chat completion handling.
 pub(super) struct PreparedChatRequest {
@@ -1355,11 +1355,12 @@ impl ChatAggregation {
     }
 
     fn finish(
-        self,
+        mut self,
         request_id: &str,
         request_model_id: Option<&str>,
     ) -> Result<AggregatedChatCompletion, AggregationError> {
         self.ensure_usable()?;
+        self.observe_completed_tool_calls()?;
         let response_metadata = response_metadata(&self);
         let completion_fields =
             CompletionFields::from_aggregation(&self, request_id, request_model_id);
@@ -1385,6 +1386,13 @@ impl ChatAggregation {
             return Err(AggregationError::plain(
                 "upstream SSE ended before a final chat completion marker",
             ));
+        }
+        Ok(())
+    }
+
+    fn observe_completed_tool_calls(&mut self) -> Result<(), AggregationError> {
+        for choice in self.choices.values() {
+            choice.observe_completed_tool_calls(&mut self.loop_detector)?;
         }
         Ok(())
     }
@@ -1601,6 +1609,9 @@ fn response_metadata(aggregation: &ChatAggregation) -> BTreeMap<String, String> 
         String::from("response_header_content-type"),
         String::from("application/json"),
     );
+    if let Some(loop_detector) = &aggregation.loop_detector {
+        metadata.extend(loop_detector.summary().metadata(loop_detector.mode()));
+    }
     metadata
 }
 
@@ -1663,7 +1674,7 @@ impl ChoiceBuilder {
         }
         if let Some(content) = delta.get("content").and_then(Value::as_str) {
             if !content.is_empty() {
-                observe_fragment(loop_detector, LoopChannel::Content, content)?;
+                observe_fragment(loop_detector, StreamChannel::Content, content)?;
                 self.content.push_str(content);
                 stats.content_delta_count = stats.content_delta_count.saturating_add(1);
                 mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
@@ -1672,7 +1683,7 @@ impl ChoiceBuilder {
         for field in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(reasoning) = delta.get(field).and_then(Value::as_str) {
                 if !reasoning.is_empty() {
-                    observe_fragment(loop_detector, LoopChannel::Reasoning, reasoning)?;
+                    observe_fragment(loop_detector, StreamChannel::Reasoning, reasoning)?;
                     self.reasoning.push_str(reasoning);
                     stats.reasoning_delta_count = stats.reasoning_delta_count.saturating_add(1);
                     mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
@@ -1775,6 +1786,19 @@ impl ChoiceBuilder {
         insert_extension_fields(&mut choice, self.extension_fields);
         Value::Object(choice)
     }
+
+    fn observe_completed_tool_calls(
+        &self,
+        loop_detector: &mut Option<LoopDetector>,
+    ) -> Result<(), AggregationError> {
+        if let Some(function_call) = &self.function_call {
+            function_call.observe_completed(loop_detector)?;
+        }
+        for tool_call in self.tool_calls.values() {
+            tool_call.observe_completed(loop_detector)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -1794,9 +1818,23 @@ impl FunctionCallBuilder {
             self.name.get_or_insert_with(|| name.to_owned());
         }
         if let Some(arguments) = function_call.get("arguments").and_then(Value::as_str) {
-            observe_fragment(loop_detector, LoopChannel::ToolCallArguments, arguments)?;
+            observe_fragment(loop_detector, StreamChannel::ToolArguments, arguments)?;
             self.saw_arguments = true;
             self.arguments.push_str(arguments);
+        }
+        Ok(())
+    }
+
+    fn observe_completed(
+        &self,
+        loop_detector: &mut Option<LoopDetector>,
+    ) -> Result<(), AggregationError> {
+        if self.saw_arguments {
+            observe_completed_tool_call(
+                loop_detector,
+                self.name.as_deref().unwrap_or(""),
+                &self.arguments,
+            )?;
         }
         Ok(())
     }
@@ -1860,7 +1898,7 @@ impl ToolCallBuilder {
                 self.function_name.get_or_insert_with(|| name.to_owned());
             }
             if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
-                observe_fragment(loop_detector, LoopChannel::ToolCallArguments, arguments)?;
+                observe_fragment(loop_detector, StreamChannel::ToolArguments, arguments)?;
                 self.function_arguments.push_str(arguments);
             }
         }
@@ -1876,6 +1914,20 @@ impl ToolCallBuilder {
                 "arguments": self.function_arguments,
             },
         })
+    }
+
+    fn observe_completed(
+        &self,
+        loop_detector: &mut Option<LoopDetector>,
+    ) -> Result<(), AggregationError> {
+        if self.function_arguments.is_empty() {
+            return Ok(());
+        }
+        observe_completed_tool_call(
+            loop_detector,
+            self.function_name.as_deref().unwrap_or(""),
+            &self.function_arguments,
+        )
     }
 }
 

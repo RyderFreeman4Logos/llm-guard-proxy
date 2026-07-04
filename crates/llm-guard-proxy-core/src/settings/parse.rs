@@ -2,9 +2,9 @@ use std::path::PathBuf;
 
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, HeartbeatConfig, HeartbeatMode,
-    LoopGuardConfig, MetadataConfig, ObservabilityConfig, RetentionConfig, RetryConfig,
-    ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy, UpstreamConfig,
-    UpstreamStallConfig,
+    LoopGuardConfig, LoopGuardMode, MetadataConfig, ObservabilityConfig, RetentionConfig,
+    RetryConfig, ServerConfig, ShieldingConfig, ThinkingConfig, ToolRequestThinkingPolicy,
+    UpstreamConfig, UpstreamStallConfig,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -371,6 +371,7 @@ fn assign_loop_guard(
 ) -> Result<(), ConfigParseError> {
     match key {
         "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "mode" => config.mode = parse_loop_guard_mode(value, line_number)?,
         "normalized_input_window_secs" => {
             config.normalized_input_window_secs = parse_u64(
                 value,
@@ -462,6 +463,23 @@ fn assign_loop_guard(
         _ => return unknown_key("loop_guard", key, line_number),
     }
     Ok(())
+}
+
+fn parse_loop_guard_mode(
+    value: &str,
+    line_number: usize,
+) -> Result<LoopGuardMode, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "disabled" => Ok(LoopGuardMode::Disabled),
+        "monitor" => Ok(LoopGuardMode::Monitor),
+        "enforce" => Ok(LoopGuardMode::Enforce),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid loop_guard.mode {other:?}; expected \"disabled\", \"monitor\", or \"enforce\""
+            ),
+        )),
+    }
 }
 
 fn assign_retry(
