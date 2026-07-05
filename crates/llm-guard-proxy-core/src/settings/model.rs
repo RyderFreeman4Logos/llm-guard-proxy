@@ -23,6 +23,8 @@ const MAX_UPSTREAM_MODEL_ALIAS_BYTES: usize = 256;
 pub struct AppConfig {
     /// Process listener settings. These are restart-required.
     pub server: ServerConfig,
+    /// Additional downstream listener sockets. These are restart-required.
+    pub listeners: Vec<ListenerConfig>,
     /// Upstream OpenAI-compatible service settings.
     pub upstream: UpstreamConfig,
     /// Additional named upstream profiles matched by request model.
@@ -58,6 +60,7 @@ impl AppConfig {
         self.server.validate()?;
         self.upstream.validate()?;
         self.validate_upstream_profiles()?;
+        self.validate_listeners()?;
         self.observability.validate()?;
         self.evidence.validate()?;
         self.thinking.validate("thinking.max_tokens")?;
@@ -96,6 +99,50 @@ impl AppConfig {
         Ok(())
     }
 
+    fn validate_listeners(&self) -> Result<(), ValidationError> {
+        let allowed_profile_names = self.upstream_profile_names();
+        let mut names = HashSet::from([self.default_listener().name]);
+        let mut ports = HashSet::from([self.server.port]);
+
+        for listener in &self.listeners {
+            listener.validate()?;
+            require(
+                names.insert(listener.name.clone()),
+                "listeners.name",
+                "must be unique and must not duplicate the implicit default listener",
+            )?;
+            // Fail closed for same-port listeners. Wildcard/specific conflicts and
+            // same-port behavior across address families depend on OS socket options.
+            require(
+                ports.insert(listener.port),
+                "listeners.port",
+                "listener ports must be unique to avoid startup bind conflicts",
+            )?;
+            if let Some(allowed_upstreams) = &listener.allowed_upstreams {
+                require(
+                    !allowed_upstreams.is_empty(),
+                    "listeners.allowed_upstreams",
+                    "must not be empty when set",
+                )?;
+                let mut names = HashSet::new();
+                for upstream in allowed_upstreams {
+                    require(
+                        names.insert(upstream.clone()),
+                        "listeners.allowed_upstreams",
+                        "must not contain duplicate upstream profile names",
+                    )?;
+                    require(
+                        allowed_profile_names.contains(upstream),
+                        "listeners.allowed_upstreams",
+                        "must reference default or a configured upstream profile name",
+                    )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn validate_upstream_stall_timeout_order(&self) -> Result<(), ValidationError> {
         if self.upstream_stall.enabled {
             require(
@@ -112,6 +159,16 @@ impl AppConfig {
             }
         }
         Ok(())
+    }
+
+    fn upstream_profile_names(&self) -> HashSet<String> {
+        let mut names = HashSet::from([DEFAULT_UPSTREAM_PROFILE_NAME.to_owned()]);
+        names.extend(
+            self.upstream_profiles
+                .iter()
+                .map(|profile| profile.name.clone()),
+        );
+        names
     }
 
     /// Selects the effective upstream profile for a request model.
@@ -144,6 +201,18 @@ impl AppConfig {
         }
     }
 
+    /// Selects an upstream profile by configured profile name.
+    #[must_use]
+    pub fn upstream_profile_by_name(&self, name: &str) -> Option<UpstreamProfileConfig> {
+        if name == DEFAULT_UPSTREAM_PROFILE_NAME {
+            return Some(self.default_upstream_profile());
+        }
+        self.upstream_profiles
+            .iter()
+            .find(|profile| profile.name == name)
+            .cloned()
+    }
+
     /// Builds the implicit default profile from legacy `[upstream]` and `[thinking]`.
     #[must_use]
     pub fn default_upstream_profile(&self) -> UpstreamProfileConfig {
@@ -152,9 +221,51 @@ impl AppConfig {
             match_models: Vec::new(),
             base_url: self.upstream.base_url.clone(),
             request_timeout_ms: self.upstream.request_timeout_ms,
+            max_in_flight_requests: None,
+            max_queued_generation_requests: None,
             metadata: self.upstream.metadata.clone(),
             thinking: self.thinking.clone(),
         }
+    }
+
+    /// Builds the implicit listener from legacy `[server]` settings.
+    #[must_use]
+    pub fn default_listener(&self) -> ListenerConfig {
+        ListenerConfig {
+            name: String::from("default"),
+            bind_host: self.server.bind_host.clone(),
+            port: self.server.port,
+            allowed_upstreams: None,
+        }
+    }
+
+    /// Returns the legacy listener followed by all configured extra listeners.
+    #[must_use]
+    pub fn effective_listeners(&self) -> Vec<ListenerConfig> {
+        let mut listeners = Vec::with_capacity(self.listeners.len().saturating_add(1));
+        listeners.push(self.default_listener());
+        listeners.extend(self.listeners.clone());
+        listeners
+    }
+
+    /// Returns bind addresses for every effective downstream listener.
+    ///
+    /// The first address is always the legacy `[server]` listener so callers
+    /// that only display one listener can keep using `default_listener()`.
+    #[must_use]
+    pub fn effective_listener_addresses(&self) -> Vec<String> {
+        self.effective_listeners()
+            .into_iter()
+            .map(|listener| listener.bind_address())
+            .collect()
+    }
+
+    /// Returns true when any named upstream declares independent generation admission limits.
+    #[must_use]
+    pub fn has_upstream_profile_generation_limits(&self) -> bool {
+        self.upstream_profiles
+            .iter()
+            .any(UpstreamProfileConfig::has_generation_limits)
     }
 
     pub(crate) fn apply_reloadable_from(&mut self, requested: &Self) {
@@ -215,6 +326,12 @@ impl AppConfig {
             self.server.port.to_string(),
             requested.server.port.to_string(),
         );
+        push_structural_change(
+            &mut changes,
+            "listeners.topology",
+            &self.listener_topology(),
+            &requested.listener_topology(),
+        );
         push_change(
             &mut changes,
             "upstream.base_url",
@@ -248,6 +365,10 @@ impl AppConfig {
         changes
     }
 
+    fn listener_topology(&self) -> Vec<ListenerTopology> {
+        self.listeners.iter().map(ListenerTopology::from).collect()
+    }
+
     fn upstream_profiles_topology_matches(&self, requested: &Self) -> bool {
         self.upstream_profile_topology() == requested.upstream_profile_topology()
     }
@@ -266,8 +387,29 @@ impl AppConfig {
             .zip(requested.upstream_profiles.iter())
         {
             active.request_timeout_ms = requested.request_timeout_ms;
+            active.max_in_flight_requests = requested.max_in_flight_requests;
+            active.max_queued_generation_requests = requested.max_queued_generation_requests;
             active.metadata = requested.metadata.clone();
             active.thinking = requested.thinking.clone();
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ListenerTopology {
+    name: String,
+    bind_host: String,
+    port: u16,
+    allowed_upstreams: Option<Vec<String>>,
+}
+
+impl From<&ListenerConfig> for ListenerTopology {
+    fn from(listener: &ListenerConfig) -> Self {
+        Self {
+            name: listener.name.clone(),
+            bind_host: listener.bind_host.clone(),
+            port: listener.port,
+            allowed_upstreams: listener.allowed_upstreams.clone(),
         }
     }
 }
@@ -368,6 +510,100 @@ impl Default for ServerConfig {
     }
 }
 
+/// One downstream TCP listener and optional upstream profile allow-list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ListenerConfig {
+    /// Stable listener identity stored in observability metadata.
+    pub name: String,
+    /// Interface or hostname to bind.
+    pub bind_host: String,
+    /// TCP port for this listener.
+    pub port: u16,
+    /// Allowed upstream profile names. `None` means all configured profiles.
+    pub allowed_upstreams: Option<Vec<String>>,
+}
+
+impl ListenerConfig {
+    fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            !self.name.trim().is_empty(),
+            "listeners.name",
+            "must not be empty",
+        )?;
+        require(
+            self.name == self.name.trim(),
+            "listeners.name",
+            "must not have leading or trailing whitespace",
+        )?;
+        require(
+            self.name.len() <= MAX_UPSTREAM_PROFILE_NAME_BYTES,
+            "listeners.name",
+            "must be at most 128 bytes",
+        )?;
+        require(
+            !self.bind_host.trim().is_empty(),
+            "listeners.bind_host",
+            "must not be empty",
+        )?;
+        require(
+            self.port > 0,
+            "listeners.port",
+            "must be between 1 and 65535",
+        )?;
+        if let Some(allowed_upstreams) = &self.allowed_upstreams {
+            for upstream in allowed_upstreams {
+                require(
+                    !upstream.trim().is_empty(),
+                    "listeners.allowed_upstreams",
+                    "must not contain empty upstream profile names",
+                )?;
+                require(
+                    upstream == upstream.trim(),
+                    "listeners.allowed_upstreams",
+                    "upstream profile names must not have leading or trailing whitespace",
+                )?;
+                require(
+                    upstream.len() <= MAX_UPSTREAM_PROFILE_NAME_BYTES,
+                    "listeners.allowed_upstreams",
+                    "upstream profile names must be at most 128 bytes",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns true when this listener may route to the selected upstream profile.
+    #[must_use]
+    pub fn allows_upstream(&self, profile_name: &str) -> bool {
+        self.allowed_upstreams
+            .as_ref()
+            .is_none_or(|allowed| allowed.iter().any(|upstream| upstream == profile_name))
+    }
+
+    /// Returns this listener's bind address in host:port form.
+    #[must_use]
+    pub fn bind_address(&self) -> String {
+        if self.bind_host.contains(':')
+            && !(self.bind_host.starts_with('[') && self.bind_host.ends_with(']'))
+        {
+            return format!("[{}]:{}", self.bind_host, self.port);
+        }
+        format!("{}:{}", self.bind_host, self.port)
+    }
+}
+
+impl Default for ListenerConfig {
+    fn default() -> Self {
+        let server = ServerConfig::default();
+        Self {
+            name: String::new(),
+            bind_host: server.bind_host,
+            port: server.port,
+            allowed_upstreams: None,
+        }
+    }
+}
+
 /// Upstream OpenAI-compatible service settings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpstreamConfig {
@@ -421,6 +657,10 @@ pub struct UpstreamProfileConfig {
     pub base_url: String,
     /// Total upstream request timeout, including streamed response body reads.
     pub request_timeout_ms: u64,
+    /// Optional per-profile in-flight generation request limit.
+    pub max_in_flight_requests: Option<usize>,
+    /// Optional per-profile queue length for generation requests waiting on this profile.
+    pub max_queued_generation_requests: Option<usize>,
     /// Metadata discovery and model context enrichment policy.
     pub metadata: MetadataConfig,
     /// Thinking budget policy for this profile.
@@ -467,8 +707,42 @@ impl UpstreamProfileConfig {
             "upstreams.request_timeout_ms",
             "must be greater than zero",
         )?;
+        if let Some(max_in_flight_requests) = self.max_in_flight_requests {
+            require(
+                max_in_flight_requests > 0,
+                "upstreams.max_in_flight_requests",
+                "must be greater than zero",
+            )?;
+        }
+        if let Some(max_queued_generation_requests) = self.max_queued_generation_requests {
+            require(
+                max_queued_generation_requests <= 10_000,
+                "upstreams.max_queued_generation_requests",
+                "must be less than or equal to 10000",
+            )?;
+        }
         self.metadata.validate()?;
         self.thinking.validate("upstreams.thinking.max_tokens")
+    }
+
+    /// Returns true when this profile uses an independent generation admission limiter.
+    #[must_use]
+    pub const fn has_generation_limits(&self) -> bool {
+        self.max_in_flight_requests.is_some() || self.max_queued_generation_requests.is_some()
+    }
+
+    /// Effective in-flight limit for this profile, inheriting the server default when omitted.
+    #[must_use]
+    pub fn effective_max_in_flight_requests(&self, server: &ServerConfig) -> usize {
+        self.max_in_flight_requests
+            .unwrap_or(server.max_in_flight_requests)
+    }
+
+    /// Effective queue limit for this profile, inheriting the server default when omitted.
+    #[must_use]
+    pub fn effective_max_queued_generation_requests(&self, server: &ServerConfig) -> usize {
+        self.max_queued_generation_requests
+            .unwrap_or(server.max_queued_generation_requests)
     }
 
     /// Returns true when the request model selects this profile.
@@ -492,6 +766,8 @@ impl Default for UpstreamProfileConfig {
             match_models: Vec::new(),
             base_url: upstream.base_url,
             request_timeout_ms: upstream.request_timeout_ms,
+            max_in_flight_requests: None,
+            max_queued_generation_requests: None,
             metadata: upstream.metadata,
             thinking: ThinkingConfig::default(),
         }

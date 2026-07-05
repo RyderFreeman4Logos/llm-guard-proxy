@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DownstreamDropPolicy,
-    HeartbeatConfig, HeartbeatMode, LoopGuardConfig, LoopGuardMode, MetadataConfig,
+    HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig, LoopGuardMode, MetadataConfig,
     ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig, ServerConfig,
     ShieldingConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
     UpstreamProfileConfig, UpstreamStallConfig,
@@ -12,6 +12,7 @@ use super::{
 enum Section {
     Root,
     Server,
+    Listener(usize),
     Upstream,
     UpstreamMetadata,
     UpstreamProfile(usize),
@@ -101,6 +102,11 @@ fn parse_section(
         *current_upstream_profile = Some(index);
         return Ok(Section::UpstreamProfile(index));
     }
+    if line == "[[listeners]]" {
+        config.listeners.push(ListenerConfig::default());
+        let index = config.listeners.len() - 1;
+        return Ok(Section::Listener(index));
+    }
     if line == "[[retry.ladder]]" {
         config.retry.ladder.push(RetryLadderConfig::default());
         return Ok(Section::RetryLadder(config.retry.ladder.len() - 1));
@@ -180,6 +186,9 @@ fn assign_value(
             "config keys must be inside a section",
         )),
         Section::Server => assign_server(&mut config.server, key, value, line_number),
+        Section::Listener(index) => {
+            assign_listener(&mut config.listeners[index], key, value, line_number)
+        }
         Section::Upstream => assign_upstream(&mut config.upstream, key, value, line_number),
         Section::UpstreamMetadata => {
             assign_metadata(&mut config.upstream.metadata, key, value, line_number)
@@ -227,6 +236,24 @@ fn assign_value(
     }
 }
 
+fn assign_listener(
+    config: &mut ListenerConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "name" => config.name = parse_string(value, line_number)?,
+        "bind_host" => config.bind_host = parse_string(value, line_number)?,
+        "port" => config.port = parse_u16(value, line_number, "listeners.port")?,
+        "allowed_upstreams" => {
+            config.allowed_upstreams = Some(parse_string_array(value, line_number)?);
+        }
+        _ => return unknown_key("listeners", key, line_number),
+    }
+    Ok(())
+}
+
 fn assign_upstream_profile(
     config: &mut UpstreamProfileConfig,
     key: &str,
@@ -240,6 +267,20 @@ fn assign_upstream_profile(
         "request_timeout_ms" => {
             config.request_timeout_ms =
                 parse_u64(value, line_number, "upstreams.request_timeout_ms")?;
+        }
+        "max_in_flight_requests" => {
+            config.max_in_flight_requests = Some(parse_usize(
+                value,
+                line_number,
+                "upstreams.max_in_flight_requests",
+            )?);
+        }
+        "max_queued_generation_requests" => {
+            config.max_queued_generation_requests = Some(parse_usize(
+                value,
+                line_number,
+                "upstreams.max_queued_generation_requests",
+            )?);
         }
         _ => return unknown_key("upstreams", key, line_number),
     }

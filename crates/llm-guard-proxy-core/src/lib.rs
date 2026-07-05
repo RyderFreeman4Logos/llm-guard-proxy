@@ -29,7 +29,7 @@ pub use observability::{
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
     DEFAULT_CONFIG_RELATIVE_PATH, DownstreamDropPolicy, EvidenceConfig, EvidenceShadowConfig,
-    HeartbeatConfig, HeartbeatMode, LoopGuardConfig, LoopGuardMode, MetadataConfig,
+    HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig, LoopGuardMode, MetadataConfig,
     MissingConfigPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
     ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig, RetryConfig,
     RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig,
