@@ -7,6 +7,7 @@
 mod evidence;
 pub mod gwp;
 mod loop_detector;
+mod model_alias;
 mod observability;
 mod settings;
 
@@ -23,6 +24,10 @@ pub use loop_detector::{
     BoundedFeatureSummary, ChannelizedLoopDetector, DetectorEventKind, DetectorSummary,
     LoopDetector, LoopDetectorInput, LoopInputProfile, LoopReasonCode, LoopSeverity, LoopSignal,
     StreamChannel, ToolCallFingerprintInput,
+};
+pub use model_alias::{
+    AliasKind, AliasResolutionError, AliasTarget, DEFAULT_WORKFLOW_TIMEOUT_MS,
+    MAX_WORKFLOW_TIMEOUT_MS, ModelAliasConfig, ModelAliasResolver,
 };
 pub use observability::{
     AttemptId, AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary,

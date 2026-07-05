@@ -143,6 +143,7 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "server.bind_host",
     "server.port",
     "listeners.topology",
+    "model_aliases.topology",
     "upstream.base_url",
     "upstreams.topology",
     "observability.sqlite_path",
