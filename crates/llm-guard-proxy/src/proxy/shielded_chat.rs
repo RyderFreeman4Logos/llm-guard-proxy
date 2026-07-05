@@ -4,8 +4,8 @@ use axum::body::Bytes;
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
-    RawPayloadChunk, RawPayloads, StreamChannel, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy,
+    NoThinkingMarkerPolicy, RawPayloadChunk, RawPayloads, StreamChannel, ThinkingConfig,
+    ThinkingMode, ToolRequestThinkingPolicy,
 };
 use serde_json::{Map, Number, Value, json};
 use tokio::time::timeout;
@@ -157,6 +157,19 @@ enum DisableMarker {
     Malformed(JsonPath),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct NoThinkingMarkerPath {
+    path: JsonPath,
+    source: &'static str,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NoThinkingMarkerDetection {
+    detected: bool,
+    source: &'static str,
+    is_escape_hatch: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 struct AnswerBudgetDecision {
     applied: bool,
@@ -268,6 +281,136 @@ const DISABLE_MARKER_PATHS: &[JsonPath] = &[
     EXTRA_BODY_CHAT_TEMPLATE_ENABLE_THINKING,
 ];
 
+const ROOT_REASONING_EFFORT: JsonPath = JsonPath {
+    path: &["reasoning_effort"],
+    variant: "root-reasoning-effort",
+};
+
+const EXTRA_BODY_REASONING_EFFORT: JsonPath = JsonPath {
+    path: &["extra_body", "reasoning_effort"],
+    variant: "extra-body-reasoning-effort",
+};
+
+const ROOT_MODEL_REASONING_EFFORT: JsonPath = JsonPath {
+    path: &["model_reasoning_effort"],
+    variant: "root-model-reasoning-effort",
+};
+
+const EXTRA_BODY_MODEL_REASONING_EFFORT: JsonPath = JsonPath {
+    path: &["extra_body", "model_reasoning_effort"],
+    variant: "extra-body-model-reasoning-effort",
+};
+
+const ROOT_DISABLE_THINKING_ESCAPE_HATCH: JsonPath = JsonPath {
+    path: &["llm_guard_proxy_disable_thinking"],
+    variant: "root-disable-thinking-escape-hatch",
+};
+
+const EXTRA_BODY_DISABLE_THINKING_ESCAPE_HATCH: JsonPath = JsonPath {
+    path: &["extra_body", "llm_guard_proxy_disable_thinking"],
+    variant: "extra-body-disable-thinking-escape-hatch",
+};
+
+const ESCAPE_HATCH_NO_THINKING_MARKERS: &[NoThinkingMarkerPath] = &[
+    NoThinkingMarkerPath {
+        path: ROOT_DISABLE_THINKING_ESCAPE_HATCH,
+        source: "llm_guard_proxy_disable_thinking",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_DISABLE_THINKING_ESCAPE_HATCH,
+        source: "extra_body.llm_guard_proxy_disable_thinking",
+    },
+];
+
+const BOOLEAN_NO_THINKING_MARKERS: &[NoThinkingMarkerPath] = &[
+    NoThinkingMarkerPath {
+        path: ROOT_ENABLE_THINKING,
+        source: "enable_thinking",
+    },
+    NoThinkingMarkerPath {
+        path: THINKING_ENABLE_THINKING,
+        source: "thinking.enable_thinking",
+    },
+    NoThinkingMarkerPath {
+        path: THINKING_ENABLED,
+        source: "thinking.enabled",
+    },
+    NoThinkingMarkerPath {
+        path: ROOT_CHAT_TEMPLATE_ENABLE_THINKING,
+        source: "chat_template_kwargs.enable_thinking",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_ENABLE_THINKING,
+        source: "extra_body.enable_thinking",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_THINKING_ENABLE_THINKING,
+        source: "extra_body.thinking.enable_thinking",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_THINKING_ENABLED,
+        source: "extra_body.thinking.enabled",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_CHAT_TEMPLATE_ENABLE_THINKING,
+        source: "extra_body.chat_template_kwargs.enable_thinking",
+    },
+];
+
+const REASONING_EFFORT_NO_THINKING_MARKERS: &[NoThinkingMarkerPath] = &[
+    NoThinkingMarkerPath {
+        path: ROOT_REASONING_EFFORT,
+        source: "reasoning_effort.none",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_REASONING_EFFORT,
+        source: "extra_body.reasoning_effort.none",
+    },
+    NoThinkingMarkerPath {
+        path: ROOT_MODEL_REASONING_EFFORT,
+        source: "model_reasoning_effort.none",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_MODEL_REASONING_EFFORT,
+        source: "extra_body.model_reasoning_effort.none",
+    },
+];
+
+const BUDGET_NO_THINKING_MARKERS: &[NoThinkingMarkerPath] = &[
+    NoThinkingMarkerPath {
+        path: CANONICAL_THINKING_BUDGET,
+        source: "thinking.budget_tokens.zero",
+    },
+    NoThinkingMarkerPath {
+        path: ROOT_THINKING_TOKEN_BUDGET,
+        source: "thinking_token_budget.zero",
+    },
+    NoThinkingMarkerPath {
+        path: ROOT_THINKING_BUDGET,
+        source: "thinking_budget.zero",
+    },
+    NoThinkingMarkerPath {
+        path: ROOT_CHAT_TEMPLATE_THINKING_BUDGET,
+        source: "chat_template_kwargs.thinking_budget.zero",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_THINKING_TOKEN_BUDGET,
+        source: "extra_body.thinking_token_budget.zero",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_THINKING_BUDGET,
+        source: "extra_body.thinking_budget.zero",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_CANONICAL_THINKING_BUDGET,
+        source: "extra_body.thinking.budget_tokens.zero",
+    },
+    NoThinkingMarkerPath {
+        path: EXTRA_BODY_CHAT_TEMPLATE_THINKING_BUDGET,
+        source: "extra_body.chat_template_kwargs.thinking_budget.zero",
+    },
+];
+
 const ANSWER_BUDGET_FIELDS: &[&str] = &["max_tokens", "max_completion_tokens", "max_output_tokens"];
 
 #[derive(Debug)]
@@ -332,6 +475,10 @@ fn apply_thinking_policy(
             &outcome,
             &AnswerBudgetDecision::default(),
         ));
+        return metadata;
+    }
+    if record_force_thinking_marker_decision(object, thinking, &budget_observations, &mut metadata)
+    {
         return metadata;
     }
     let outcome = match thinking.effective_mode() {
@@ -424,6 +571,10 @@ fn initial_thinking_metadata(
             thinking.tool_request_policy.as_str().to_owned(),
         ),
         (
+            String::from("thinking_no_thinking_marker_policy"),
+            thinking.no_thinking_marker_policy.as_str().to_owned(),
+        ),
+        (
             String::from("thinking_budget_previous_state"),
             previous_budget_state(budget_observations, configured_budget),
         ),
@@ -462,6 +613,69 @@ fn initial_thinking_metadata(
             observed_budget_paths(budget_observations, configured_budget),
         ),
     ])
+}
+
+/// Evaluates the no-thinking marker policy for `ForceThinking` mode.
+///
+/// Returns `true` if the request bypasses force-thinking (caller marker
+/// passthrough), in which case the caller should return immediately.
+/// Returns `false` if force-thinking should proceed. When a marker was
+/// detected but overridden, records observability metadata and returns
+/// `false`.
+fn record_force_thinking_marker_decision(
+    object: &Map<String, Value>,
+    thinking: &ThinkingConfig,
+    budget_observations: &BudgetObservations,
+    metadata: &mut BTreeMap<String, String>,
+) -> bool {
+    if thinking.effective_mode() != ThinkingMode::ForceThinking {
+        return false;
+    }
+    let marker = detect_no_thinking_markers(object);
+    let should_bypass = match thinking.no_thinking_marker_policy {
+        NoThinkingMarkerPolicy::Force => false,
+        NoThinkingMarkerPolicy::RespectNoThinkingMarkers => marker.detected,
+        NoThinkingMarkerPolicy::EscapeHatchOnly => marker.is_escape_hatch,
+    };
+    if should_bypass {
+        metadata.insert(
+            String::from("thinking_no_thinking_marker_detected"),
+            marker.detected.to_string(),
+        );
+        metadata.insert(
+            String::from("thinking_no_thinking_marker_source"),
+            marker.source.to_owned(),
+        );
+        metadata.insert(
+            String::from("thinking_no_thinking_marker_escape_hatch"),
+            marker.is_escape_hatch.to_string(),
+        );
+        let outcome = thinking_noop("caller_no_thinking_marker_passthrough", budget_observations);
+        metadata.extend(thinking_outcome_metadata(
+            &outcome,
+            &AnswerBudgetDecision::default(),
+        ));
+        return true;
+    }
+    if marker.detected {
+        metadata.insert(
+            String::from("thinking_no_thinking_marker_detected"),
+            String::from("true"),
+        );
+        metadata.insert(
+            String::from("thinking_no_thinking_marker_source"),
+            marker.source.to_owned(),
+        );
+        metadata.insert(
+            String::from("thinking_no_thinking_marker_escape_hatch"),
+            marker.is_escape_hatch.to_string(),
+        );
+        metadata.insert(
+            String::from("thinking_no_thinking_marker_overridden"),
+            String::from("true"),
+        );
+    }
+    false
 }
 
 fn apply_force_thinking_policy(
@@ -907,6 +1121,62 @@ fn find_disable_marker(object: &Map<String, Value>) -> DisableMarker {
     }
 
     malformed.map_or(DisableMarker::None, DisableMarker::Malformed)
+}
+
+fn detect_no_thinking_markers(object: &Map<String, Value>) -> NoThinkingMarkerDetection {
+    for marker in ESCAPE_HATCH_NO_THINKING_MARKERS {
+        if matches!(
+            value_at_path(object, marker.path.path),
+            PathValue::Value(Value::Bool(true))
+        ) {
+            return NoThinkingMarkerDetection {
+                detected: true,
+                source: marker.source,
+                is_escape_hatch: true,
+            };
+        }
+    }
+
+    for marker in BOOLEAN_NO_THINKING_MARKERS {
+        if matches!(
+            value_at_path(object, marker.path.path),
+            PathValue::Value(Value::Bool(false))
+        ) {
+            return NoThinkingMarkerDetection {
+                detected: true,
+                source: marker.source,
+                is_escape_hatch: false,
+            };
+        }
+    }
+
+    for marker in REASONING_EFFORT_NO_THINKING_MARKERS {
+        if matches!(
+            value_at_path(object, marker.path.path),
+            PathValue::Value(Value::String(value)) if value.trim().eq_ignore_ascii_case("none")
+        ) {
+            return NoThinkingMarkerDetection {
+                detected: true,
+                source: marker.source,
+                is_escape_hatch: false,
+            };
+        }
+    }
+
+    for marker in BUDGET_NO_THINKING_MARKERS {
+        if matches!(
+            value_at_path(object, marker.path.path),
+            PathValue::Value(value) if matches!(token_budget_value(value), BudgetState::Numeric(0))
+        ) {
+            return NoThinkingMarkerDetection {
+                detected: true,
+                source: marker.source,
+                is_escape_hatch: false,
+            };
+        }
+    }
+
+    NoThinkingMarkerDetection::default()
 }
 
 enum PathValue<'a> {

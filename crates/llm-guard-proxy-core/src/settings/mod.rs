@@ -15,10 +15,11 @@ pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, DownstreamDropPolicy, EvidenceConfig,
     EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig,
-    LoopGuardMode, MetadataConfig, ObservabilityConfig, RestartRequiredChange, RetentionConfig,
-    RetryConfig, RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShieldingConfig,
-    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig,
+    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
+    SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
+    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 pub use reload::{
     ConfigHandle, ConfigManager, MissingConfigPolicy, ReloadOutcome, ReloadWatcher,
@@ -70,6 +71,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "thinking.budget_accounting",
     "thinking.preserve_answer_budget",
     "thinking.tool_request_policy",
+    "thinking.no_thinking_marker_policy",
     "thinking.apply_to_tool_requests",
     "loop_guard.enabled",
     "loop_guard.mode",
@@ -128,6 +130,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstreams.thinking.budget_accounting",
     "upstreams.thinking.preserve_answer_budget",
     "upstreams.thinking.tool_request_policy",
+    "upstreams.thinking.no_thinking_marker_policy",
     "upstreams.thinking.apply_to_tool_requests",
 ];
 

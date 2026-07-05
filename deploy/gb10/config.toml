@@ -39,6 +39,11 @@ force_disable = false
 budget_tokens = 32768
 preserve_answer_budget = true
 tool_request_policy = "passthrough"
+# ForceThinking defaults to overriding caller no-thinking markers. Set to
+# "respect_no_thinking_markers" only when caller latency/compatibility control
+# is more important than enforcing the proxy's quality budget. The
+# "escape_hatch_only" mode honors llm_guard_proxy_disable_thinking=true only.
+no_thinking_marker_policy = "force"
 
 [loop_guard]
 enabled = true

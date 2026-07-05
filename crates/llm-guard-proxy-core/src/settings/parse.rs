@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DownstreamDropPolicy,
     HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig, LoopGuardMode, MetadataConfig,
-    ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig, ServerConfig,
-    ShieldingConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
-    UpstreamProfileConfig, UpstreamStallConfig,
+    NoThinkingMarkerPolicy, ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig,
+    ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy,
+    UpstreamConfig, UpstreamProfileConfig, UpstreamStallConfig,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -566,6 +566,9 @@ fn assign_thinking(
         "tool_request_policy" => {
             config.tool_request_policy = parse_tool_request_thinking_policy(value, line_number)?;
         }
+        "no_thinking_marker_policy" | "thinking.no_thinking_marker_policy" => {
+            config.no_thinking_marker_policy = parse_no_thinking_marker_policy(value, line_number)?;
+        }
         "apply_to_tool_requests" => {
             config.tool_request_policy = if parse_bool(value, line_number)? {
                 ToolRequestThinkingPolicy::Apply
@@ -617,6 +620,23 @@ fn parse_tool_request_thinking_policy(
             line_number,
             format!(
                 "invalid thinking.tool_request_policy {other:?}; expected \"apply\" or \"passthrough\""
+            ),
+        )),
+    }
+}
+
+fn parse_no_thinking_marker_policy(
+    value: &str,
+    line_number: usize,
+) -> Result<NoThinkingMarkerPolicy, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "force" => Ok(NoThinkingMarkerPolicy::Force),
+        "respect_no_thinking_markers" => Ok(NoThinkingMarkerPolicy::RespectNoThinkingMarkers),
+        "escape_hatch_only" => Ok(NoThinkingMarkerPolicy::EscapeHatchOnly),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid thinking.no_thinking_marker_policy {other:?}; expected \"force\", \"respect_no_thinking_markers\", or \"escape_hatch_only\""
             ),
         )),
     }
@@ -800,6 +820,10 @@ fn assign_retry_ladder(
         "tool_request_policy" => {
             config.thinking.tool_request_policy =
                 parse_tool_request_thinking_policy(value, line_number)?;
+        }
+        "no_thinking_marker_policy" | "thinking.no_thinking_marker_policy" => {
+            config.thinking.no_thinking_marker_policy =
+                parse_no_thinking_marker_policy(value, line_number)?;
         }
         "apply_to_tool_requests" => {
             config.thinking.tool_request_policy = if parse_bool(value, line_number)? {

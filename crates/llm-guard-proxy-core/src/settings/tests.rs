@@ -12,9 +12,9 @@ use super::model::{
 };
 use super::{
     AppConfig, ConfigManager, ConfigParseError, DownstreamDropPolicy, HeartbeatMode, LoopGuardMode,
-    MissingConfigPolicy, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamRouteReason, ValidationError, parse::parse_config_text,
-    redact_upstream_base_url,
+    MissingConfigPolicy, NoThinkingMarkerPolicy, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
+    ThinkingMode, ToolRequestThinkingPolicy, UpstreamRouteReason, ValidationError,
+    parse::parse_config_text, redact_upstream_base_url,
 };
 
 const FULL_OVERRIDE_CONFIG: &str = r#"
@@ -163,6 +163,10 @@ fn defaults_match_issue_contract() {
         config.thinking.tool_request_policy,
         ToolRequestThinkingPolicy::Apply
     );
+    assert_eq!(
+        config.thinking.no_thinking_marker_policy,
+        NoThinkingMarkerPolicy::Force
+    );
     assert!(config.loop_guard.enabled);
     assert_eq!(config.loop_guard.mode, LoopGuardMode::Monitor);
     assert_eq!(config.loop_guard.effective_mode(), LoopGuardMode::Monitor);
@@ -211,6 +215,54 @@ fn defaults_match_issue_contract() {
     assert!(config.cloudflare.enabled);
     assert!(config.upstream_profiles.is_empty());
     assert_eq!(config.default_upstream_profile().name, "default");
+}
+
+#[test]
+fn parses_no_thinking_marker_policy_values() {
+    let respect = parse_config_text(
+        r#"
+[thinking]
+no_thinking_marker_policy = "respect_no_thinking_markers"
+"#,
+    )
+    .expect("respect marker policy should parse");
+    assert_eq!(
+        respect.thinking.no_thinking_marker_policy,
+        NoThinkingMarkerPolicy::RespectNoThinkingMarkers
+    );
+
+    let escape_hatch = parse_config_text(
+        r#"
+[thinking]
+thinking.no_thinking_marker_policy = "escape_hatch_only"
+"#,
+    )
+    .expect("escape hatch marker policy should parse");
+    assert_eq!(
+        escape_hatch.thinking.no_thinking_marker_policy,
+        NoThinkingMarkerPolicy::EscapeHatchOnly
+    );
+}
+
+#[test]
+fn rejects_invalid_no_thinking_marker_policy() {
+    let error = parse_config_text(
+        r#"
+[thinking]
+no_thinking_marker_policy = "sometimes"
+"#,
+    )
+    .expect_err("invalid marker policy should fail");
+
+    assert_eq!(error.line(), 3);
+    assert!(
+        error
+            .message()
+            .contains("invalid thinking.no_thinking_marker_policy")
+    );
+    assert!(error.message().contains("force"));
+    assert!(error.message().contains("respect_no_thinking_markers"));
+    assert!(error.message().contains("escape_hatch_only"));
 }
 
 fn assert_default_evidence_config(config: &AppConfig) {
@@ -273,6 +325,7 @@ name = "max-thinking"
 thinking_mode = "force_thinking"
 max_tokens = 50000
 thinking_token_budget = 32768
+no_thinking_marker_policy = "respect_no_thinking_markers"
 
 [[retry.ladder]]
 name = "bounded-thinking"
@@ -303,6 +356,10 @@ max_tokens = 50000
     );
     assert_eq!(config.retry.ladder[0].thinking.max_tokens, Some(50_000));
     assert_eq!(config.retry.ladder[0].thinking.budget_tokens, 32_768);
+    assert_eq!(
+        config.retry.ladder[0].thinking.no_thinking_marker_policy,
+        NoThinkingMarkerPolicy::RespectNoThinkingMarkers
+    );
     assert_eq!(config.retry.ladder[1].name, "bounded-thinking");
     assert_eq!(config.retry.ladder[1].thinking.budget_tokens, 8_192);
     assert_eq!(
@@ -369,6 +426,7 @@ max_tokens = 50000
 thinking_token_budget = 32768
 budget_accounting = "total_cap"
 apply_to_tool_requests = true
+no_thinking_marker_policy = "escape_hatch_only"
 
 [[upstreams]]
 name = "fast-no-think"
@@ -409,6 +467,10 @@ mode = "force_disable"
     assert_eq!(aeon.thinking.max_tokens, Some(50_000));
     assert_eq!(aeon.thinking.budget_tokens, 32_768);
     assert!(!aeon.thinking.preserve_answer_budget);
+    assert_eq!(
+        aeon.thinking.no_thinking_marker_policy,
+        NoThinkingMarkerPolicy::EscapeHatchOnly
+    );
 
     let fast = &config.upstream_profiles[1];
     assert_eq!(fast.name, "fast-no-think");
@@ -1435,6 +1497,7 @@ max_request_body_bytes = 512
 
 [thinking]
 force_disable = true
+no_thinking_marker_policy = "respect_no_thinking_markers"
 
 [upstream]
 request_timeout_ms = 90000
@@ -1469,6 +1532,10 @@ reasoning_semantic_history_window_count = 20
     assert_eq!(snapshot.server.max_control_plane_in_flight_requests, 2);
     assert_eq!(snapshot.server.max_request_body_bytes, 512);
     assert!(snapshot.thinking.force_disable);
+    assert_eq!(
+        snapshot.thinking.no_thinking_marker_policy,
+        NoThinkingMarkerPolicy::RespectNoThinkingMarkers
+    );
     assert_eq!(snapshot.upstream.request_timeout_ms, 90_000);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 3);
@@ -1540,6 +1607,7 @@ input_token_safety_margin = 128
 [upstreams.thinking]
 mode = "force_thinking"
 thinking_token_budget = 2048
+no_thinking_marker_policy = "escape_hatch_only"
 "#,
     );
     let outcome = manager.reload().expect("profile reload should succeed");
@@ -1561,6 +1629,10 @@ thinking_token_budget = 2048
     assert_eq!(profile.profile.metadata.input_token_safety_margin, 128);
     assert_eq!(profile.profile.thinking.mode, ThinkingMode::ForceThinking);
     assert_eq!(profile.profile.thinking.budget_tokens, 2_048);
+    assert_eq!(
+        profile.profile.thinking.no_thinking_marker_policy,
+        NoThinkingMarkerPolicy::EscapeHatchOnly
+    );
 
     remove_file(&path);
 }
@@ -1798,7 +1870,9 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.mode"));
     assert!(RELOADABLE_FIELDS.contains(&"thinking.max_tokens"));
     assert!(RELOADABLE_FIELDS.contains(&"thinking.tool_request_policy"));
+    assert!(RELOADABLE_FIELDS.contains(&"thinking.no_thinking_marker_policy"));
     assert!(RELOADABLE_FIELDS.contains(&"upstreams.thinking.mode"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstreams.thinking.no_thinking_marker_policy"));
     assert!(RELOADABLE_FIELDS.contains(&"upstreams.metadata.input_token_safety_margin"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_queued_generation_requests"));
