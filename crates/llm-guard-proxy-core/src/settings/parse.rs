@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::model_alias::{AliasKind, ModelAliasConfig};
+use crate::profile::{ProfileConfig, ProfileKind, ShieldedBuffering};
 use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
 use super::{
@@ -22,6 +23,7 @@ enum Section {
     UpstreamProfileMetadata(usize),
     UpstreamProfileThinking(usize),
     ModelAlias(usize),
+    Profile(String),
     Workflow(String),
     Shielding,
     Observability,
@@ -87,6 +89,7 @@ fn strip_comment(line: &str, line_number: usize) -> Result<&str, ConfigParseErro
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_section(
     config: &mut AppConfig,
     current_upstream_profile: &mut Option<usize>,
@@ -147,6 +150,32 @@ fn parse_section(
             ));
         }
         return Ok(Section::Workflow(workflow_id.to_owned()));
+    }
+    if let Some(raw_profile_name) = section.strip_prefix("profiles.") {
+        let profile_name = raw_profile_name.trim_matches('"');
+        if profile_name.trim().is_empty() {
+            return Err(ConfigParseError::new(
+                line_number,
+                "profile section name must not be empty",
+            ));
+        }
+        if profile_name != profile_name.trim() {
+            return Err(ConfigParseError::new(
+                line_number,
+                "profile section name must not have leading or trailing whitespace",
+            ));
+        }
+        if config
+            .profiles
+            .insert(profile_name.to_owned(), ProfileConfig::default())
+            .is_some()
+        {
+            return Err(ConfigParseError::new(
+                line_number,
+                format!("duplicate profile section [{section}]"),
+            ));
+        }
+        return Ok(Section::Profile(profile_name.to_owned()));
     }
     match section {
         "server" => Ok(Section::Server),
@@ -250,6 +279,15 @@ fn assign_value(
         Section::ModelAlias(index) => {
             assign_model_alias(&mut config.model_aliases[*index], key, value, line_number)
         }
+        Section::Profile(profile_name) => {
+            let profile = config.profiles.get_mut(profile_name).ok_or_else(|| {
+                ConfigParseError::new(
+                    line_number,
+                    format!("profile section {profile_name:?} was not initialized"),
+                )
+            })?;
+            assign_profile(profile, key, value, line_number)
+        }
         Section::Workflow(workflow_id) => {
             let workflow = config.workflows.get_mut(workflow_id).ok_or_else(|| {
                 ConfigParseError::new(
@@ -281,6 +319,59 @@ fn assign_value(
         }
         Section::Heartbeat => assign_heartbeat(&mut config.heartbeat, key, value, line_number),
         Section::Cloudflare => assign_cloudflare(&mut config.cloudflare, key, value, line_number),
+    }
+}
+
+fn assign_profile(
+    config: &mut ProfileConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "kind" => config.kind = parse_profile_kind(value, line_number)?,
+        "allowed_models" => config.allowed_models = parse_string_array(value, line_number)?,
+        "daily_request_limit" => {
+            config.daily_request_limit = Some(parse_u32(
+                value,
+                line_number,
+                "profiles.daily_request_limit",
+            )?);
+        }
+        "shielded_buffering" => {
+            config.shielded_buffering = parse_shielded_buffering(value, line_number)?;
+        }
+        "guard_pack" => config.guard_pack = Some(parse_string(value, line_number)?),
+        _ => return unknown_key("profiles", key, line_number),
+    }
+    Ok(())
+}
+
+fn parse_profile_kind(value: &str, line_number: usize) -> Result<ProfileKind, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "child" => Ok(ProfileKind::Child),
+        "adult" => Ok(ProfileKind::Adult),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!("invalid profiles.kind {other:?}; expected \"child\" or \"adult\""),
+        )),
+    }
+}
+
+fn parse_shielded_buffering(
+    value: &str,
+    line_number: usize,
+) -> Result<ShieldedBuffering, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "off" => Ok(ShieldedBuffering::Off),
+        "buffered_sse" => Ok(ShieldedBuffering::BufferedSse),
+        "sanitized" => Ok(ShieldedBuffering::Sanitized),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid profiles.shielded_buffering {other:?}; expected \"off\", \"buffered_sse\", or \"sanitized\""
+            ),
+        )),
     }
 }
 
