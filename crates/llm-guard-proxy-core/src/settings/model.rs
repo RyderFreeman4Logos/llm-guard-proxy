@@ -1447,6 +1447,29 @@ impl ToolRequestThinkingPolicy {
     }
 }
 
+/// How force-thinking mode treats explicit caller no-thinking markers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NoThinkingMarkerPolicy {
+    /// Force thinking even when callers explicitly ask for no-thinking.
+    #[default]
+    Force,
+    /// Leave explicit caller no-thinking requests untouched.
+    RespectNoThinkingMarkers,
+    /// Force normal no-thinking markers but honor the proxy escape hatch.
+    EscapeHatchOnly,
+}
+
+impl NoThinkingMarkerPolicy {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Force => "force",
+            Self::RespectNoThinkingMarkers => "respect_no_thinking_markers",
+            Self::EscapeHatchOnly => "escape_hatch_only",
+        }
+    }
+}
+
 /// Profile thinking rewrite mode.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ThinkingMode {
@@ -1490,6 +1513,8 @@ pub struct ThinkingConfig {
     pub preserve_answer_budget: bool,
     /// Request-class policy for tool/function-calling requests.
     pub tool_request_policy: ToolRequestThinkingPolicy,
+    /// How force-thinking mode treats explicit caller no-thinking markers.
+    pub no_thinking_marker_policy: NoThinkingMarkerPolicy,
 }
 
 impl ThinkingConfig {
@@ -1530,6 +1555,7 @@ impl Default for ThinkingConfig {
             budget_tokens: 32_768,
             preserve_answer_budget: true,
             tool_request_policy: ToolRequestThinkingPolicy::Apply,
+            no_thinking_marker_policy: NoThinkingMarkerPolicy::Force,
         }
     }
 }
