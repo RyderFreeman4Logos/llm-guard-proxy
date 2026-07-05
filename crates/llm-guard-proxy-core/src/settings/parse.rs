@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
 use super::{
-    AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DownstreamDropPolicy,
-    HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig, LoopGuardMode, MetadataConfig,
-    NoThinkingMarkerPolicy, ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig,
-    ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy,
-    UpstreamConfig, UpstreamProfileConfig, UpstreamStallConfig,
+    AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DefaultInjectionSchema,
+    DownstreamDropPolicy, HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig,
+    LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig, RetentionConfig,
+    RetryConfig, RetryLadderConfig, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamStallConfig,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -569,6 +569,9 @@ fn assign_thinking(
         "no_thinking_marker_policy" | "thinking.no_thinking_marker_policy" => {
             config.no_thinking_marker_policy = parse_no_thinking_marker_policy(value, line_number)?;
         }
+        "default_injection_schema" | "thinking.default_injection_schema" => {
+            config.default_injection_schema = parse_default_injection_schema(value, line_number)?;
+        }
         "apply_to_tool_requests" => {
             config.tool_request_policy = if parse_bool(value, line_number)? {
                 ToolRequestThinkingPolicy::Apply
@@ -591,6 +594,22 @@ fn parse_thinking_mode(value: &str, line_number: usize) -> Result<ThinkingMode, 
             line_number,
             format!(
                 "invalid thinking.mode {other:?}; expected \"passthrough\", \"force_disable\", \"force_thinking\", or \"bounded_thinking\""
+            ),
+        )),
+    }
+}
+
+fn parse_default_injection_schema(
+    value: &str,
+    line_number: usize,
+) -> Result<DefaultInjectionSchema, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "canonical" => Ok(DefaultInjectionSchema::Canonical),
+        "chat_template_kwargs" => Ok(DefaultInjectionSchema::ChatTemplateKwargs),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid thinking.default_injection_schema {other:?}; expected \"canonical\" or \"chat_template_kwargs\""
             ),
         )),
     }
@@ -824,6 +843,10 @@ fn assign_retry_ladder(
         "no_thinking_marker_policy" | "thinking.no_thinking_marker_policy" => {
             config.thinking.no_thinking_marker_policy =
                 parse_no_thinking_marker_policy(value, line_number)?;
+        }
+        "default_injection_schema" | "thinking.default_injection_schema" => {
+            config.thinking.default_injection_schema =
+                parse_default_injection_schema(value, line_number)?;
         }
         "apply_to_tool_requests" => {
             config.thinking.tool_request_policy = if parse_bool(value, line_number)? {

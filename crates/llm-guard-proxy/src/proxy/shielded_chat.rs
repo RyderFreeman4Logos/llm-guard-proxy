@@ -4,8 +4,8 @@ use axum::body::Bytes;
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
-    NoThinkingMarkerPolicy, RawPayloadChunk, RawPayloads, StreamChannel, ThinkingConfig,
-    ThinkingMode, ToolRequestThinkingPolicy,
+    DefaultInjectionSchema, NoThinkingMarkerPolicy, RawPayloadChunk, RawPayloads, StreamChannel,
+    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy,
 };
 use serde_json::{Map, Number, Value, json};
 use tokio::time::timeout;
@@ -456,7 +456,12 @@ fn apply_thinking_policy(
             return metadata;
         }
         ThinkingMode::ForceDisable => {
-            let outcome = apply_force_disable_thinking(object, &budget_observations, &mut metadata);
+            let outcome = apply_force_disable_thinking(
+                object,
+                &budget_observations,
+                &mut metadata,
+                thinking.default_injection_schema,
+            );
             let answer_budget =
                 apply_answer_budget_preservation(object, false, outcome.answer_budget_delta);
             metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
@@ -487,6 +492,7 @@ fn apply_thinking_policy(
             configured_budget,
             &budget_observations,
             &mut metadata,
+            thinking.default_injection_schema,
         ),
         ThinkingMode::BoundedThinking => apply_thinking_budget_policy(
             object,
@@ -573,6 +579,10 @@ fn initial_thinking_metadata(
         (
             String::from("thinking_no_thinking_marker_policy"),
             thinking.no_thinking_marker_policy.as_str().to_owned(),
+        ),
+        (
+            String::from("thinking_default_injection_schema"),
+            thinking.default_injection_schema.as_str().to_owned(),
         ),
         (
             String::from("thinking_budget_previous_state"),
@@ -683,6 +693,7 @@ fn apply_force_thinking_policy(
     configured_budget: u64,
     budget_observations: &BudgetObservations,
     metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
 ) -> ThinkingPolicyOutcome {
     if configured_budget == 0 {
         return thinking_noop("configured_budget_zero", budget_observations);
@@ -695,7 +706,8 @@ fn apply_force_thinking_policy(
     );
 
     if budget_observations.is_empty() {
-        let mut outcome = inject_missing_budget(object, configured_budget, metadata);
+        let mut outcome =
+            inject_missing_budget(object, configured_budget, metadata, default_schema);
         outcome.reason = "forced_configured_budget";
         outcome.rewrite_applied = outcome.rewrite_applied || !enable_marker_paths.is_empty();
         return outcome;
@@ -765,9 +777,13 @@ fn apply_thinking_budget_policy(
             insert_disable_marker_metadata(metadata, path);
             thinking_noop("malformed_disable_marker", budget_observations)
         }
-        DisableMarker::None => {
-            apply_budget_observations(object, configured_budget, budget_observations, metadata)
-        }
+        DisableMarker::None => apply_budget_observations(
+            object,
+            configured_budget,
+            budget_observations,
+            metadata,
+            thinking.default_injection_schema,
+        ),
     }
 }
 
@@ -775,15 +791,16 @@ fn apply_force_disable_thinking(
     object: &mut Map<String, Value>,
     budget_observations: &BudgetObservations,
     metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
 ) -> ThinkingPolicyOutcome {
-    let disable_marker_paths = normalize_force_disable_markers(object, metadata);
+    let disable_marker_paths = normalize_force_disable_markers(object, metadata, default_schema);
     metadata.insert(
         String::from("thinking_disable_marker_rewritten_paths"),
         join_paths(&disable_marker_paths),
     );
 
     if budget_observations.is_empty() {
-        let path = injection_path(object);
+        let path = injection_path(object, default_schema);
         metadata.insert(String::from("thinking_schema_path"), path.display_path());
         metadata.insert(
             String::from("thinking_schema_variant"),
@@ -855,9 +872,10 @@ fn apply_budget_observations(
     configured_budget: u64,
     budget_observations: &BudgetObservations,
     metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
 ) -> ThinkingPolicyOutcome {
     if budget_observations.is_empty() {
-        return inject_missing_budget(object, configured_budget, metadata);
+        return inject_missing_budget(object, configured_budget, metadata, default_schema);
     }
 
     let zero_paths = budget_observations.zero_paths();
@@ -938,14 +956,20 @@ fn inject_missing_budget(
     object: &mut Map<String, Value>,
     configured_budget: u64,
     metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
 ) -> ThinkingPolicyOutcome {
-    let path = injection_path(object);
+    let path = injection_path(object, default_schema);
     metadata.insert(String::from("thinking_schema_path"), path.display_path());
     metadata.insert(
         String::from("thinking_schema_variant"),
         path.variant.to_owned(),
     );
     if set_budget_at_path(object, path, configured_budget) {
+        if let Some(enable_path) = chat_template_enable_marker_path(path) {
+            if matches!(value_at_path(object, enable_path.path), PathValue::Missing) {
+                let _enabled = set_bool_at_path(object, enable_path, true);
+            }
+        }
         return ThinkingPolicyOutcome {
             rewrite_applied: true,
             reason: "injected_missing_budget",
@@ -1211,7 +1235,7 @@ fn token_budget_value(value: &Value) -> BudgetState {
     }
 }
 
-fn injection_path(object: &Map<String, Value>) -> JsonPath {
+fn injection_path(object: &Map<String, Value>, default_schema: DefaultInjectionSchema) -> JsonPath {
     if object_at_path(object, &["chat_template_kwargs"]) {
         return ROOT_CHAT_TEMPLATE_THINKING_BUDGET;
     }
@@ -1221,10 +1245,16 @@ fn injection_path(object: &Map<String, Value>) -> JsonPath {
     if object_at_path(object, &["extra_body", "thinking"]) {
         return EXTRA_BODY_CANONICAL_THINKING_BUDGET;
     }
-    CANONICAL_THINKING_BUDGET
+    match default_schema {
+        DefaultInjectionSchema::Canonical => CANONICAL_THINKING_BUDGET,
+        DefaultInjectionSchema::ChatTemplateKwargs => ROOT_CHAT_TEMPLATE_THINKING_BUDGET,
+    }
 }
 
-fn force_disable_marker_path(object: &Map<String, Value>) -> JsonPath {
+fn force_disable_marker_path(
+    object: &Map<String, Value>,
+    default_schema: DefaultInjectionSchema,
+) -> JsonPath {
     if object_at_path(object, &["chat_template_kwargs"]) {
         return ROOT_CHAT_TEMPLATE_ENABLE_THINKING;
     }
@@ -1237,10 +1267,23 @@ fn force_disable_marker_path(object: &Map<String, Value>) -> JsonPath {
     if object_at_path(object, &["thinking"]) {
         return THINKING_ENABLED;
     }
+    if default_schema == DefaultInjectionSchema::ChatTemplateKwargs {
+        return ROOT_CHAT_TEMPLATE_ENABLE_THINKING;
+    }
     if object_at_path(object, &["extra_body"]) {
         return EXTRA_BODY_ENABLE_THINKING;
     }
     THINKING_ENABLED
+}
+
+fn chat_template_enable_marker_path(budget_path: JsonPath) -> Option<JsonPath> {
+    if budget_path.path == ROOT_CHAT_TEMPLATE_THINKING_BUDGET.path {
+        return Some(ROOT_CHAT_TEMPLATE_ENABLE_THINKING);
+    }
+    if budget_path.path == EXTRA_BODY_CHAT_TEMPLATE_THINKING_BUDGET.path {
+        return Some(EXTRA_BODY_CHAT_TEMPLATE_ENABLE_THINKING);
+    }
+    None
 }
 
 fn object_at_path(object: &Map<String, Value>, path: &[&str]) -> bool {
@@ -1257,6 +1300,7 @@ fn object_at_path(object: &Map<String, Value>, path: &[&str]) -> bool {
 fn normalize_force_disable_markers(
     object: &mut Map<String, Value>,
     metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
 ) -> Vec<JsonPath> {
     let mut rewritten_paths = Vec::new();
     let mut disabled_marker_present = false;
@@ -1273,7 +1317,7 @@ fn normalize_force_disable_markers(
     }
 
     if rewritten_paths.is_empty() && !disabled_marker_present {
-        let path = force_disable_marker_path(object);
+        let path = force_disable_marker_path(object, default_schema);
         if set_bool_at_path(object, path, false) {
             rewritten_paths.push(path);
         }

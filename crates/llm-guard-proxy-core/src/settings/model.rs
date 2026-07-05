@@ -1496,6 +1496,28 @@ impl ThinkingMode {
     }
 }
 
+/// Default schema for injecting a thinking budget when no existing thinking markers are present.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DefaultInjectionSchema {
+    /// Use the canonical `thinking.budget_tokens` schema.
+    #[default]
+    Canonical,
+    /// Use `chat_template_kwargs.enable_thinking` and `chat_template_kwargs.thinking_budget`.
+    ///
+    /// Required by AEON/Qwen vLLM backends that ignore the canonical thinking schema.
+    ChatTemplateKwargs,
+}
+
+impl DefaultInjectionSchema {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::ChatTemplateKwargs => "chat_template_kwargs",
+        }
+    }
+}
+
 /// Thinking budget policy for later request rewriting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ThinkingConfig {
@@ -1515,6 +1537,8 @@ pub struct ThinkingConfig {
     pub tool_request_policy: ToolRequestThinkingPolicy,
     /// How force-thinking mode treats explicit caller no-thinking markers.
     pub no_thinking_marker_policy: NoThinkingMarkerPolicy,
+    /// Default schema for injecting thinking budget into requests without existing markers.
+    pub default_injection_schema: DefaultInjectionSchema,
 }
 
 impl ThinkingConfig {
@@ -1556,6 +1580,7 @@ impl Default for ThinkingConfig {
             preserve_answer_budget: true,
             tool_request_policy: ToolRequestThinkingPolicy::Apply,
             no_thinking_marker_policy: NoThinkingMarkerPolicy::Force,
+            default_injection_schema: DefaultInjectionSchema::Canonical,
         }
     }
 }

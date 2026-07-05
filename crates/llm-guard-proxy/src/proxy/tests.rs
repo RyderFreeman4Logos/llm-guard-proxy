@@ -3547,6 +3547,201 @@ async fn shielded_non_stream_chat_preserves_stream_options_while_forcing_usage()
 }
 
 #[tokio::test]
+async fn force_thinking_canonical_default_injects_thinking_budget_tokens() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+mode = "force_thinking"
+"#,
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
+    assert!(observed_body.get("chat_template_kwargs").is_none());
+    assert_eq!(observed_body["max_tokens"], 32_832);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(metadata["thinking_default_injection_schema"], "canonical");
+        assert_eq!(metadata["thinking_schema_path"], "thinking.budget_tokens");
+        assert_eq!(metadata["thinking_schema_variant"], "canonical");
+        assert_eq!(
+            metadata["thinking_rewrite_reason"],
+            "forced_configured_budget"
+        );
+    }
+}
+
+#[tokio::test]
+async fn force_thinking_chat_template_kwargs_schema_injects_enable_thinking_and_budget() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+mode = "force_thinking"
+default_injection_schema = "chat_template_kwargs"
+"#,
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        true
+    );
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["thinking_budget"],
+        32_768
+    );
+    assert!(observed_body.get("thinking").is_none());
+    assert_eq!(observed_body["max_tokens"], 32_832);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(
+            metadata["thinking_default_injection_schema"],
+            "chat_template_kwargs"
+        );
+        assert_eq!(
+            metadata["thinking_schema_path"],
+            "chat_template_kwargs.thinking_budget"
+        );
+        assert_eq!(metadata["thinking_schema_variant"], "chat-template-kwargs");
+        assert_eq!(
+            metadata["thinking_rewrite_reason"],
+            "forced_configured_budget"
+        );
+    }
+}
+
+#[tokio::test]
+async fn force_thinking_chat_template_kwargs_schema_preserves_existing_containers() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+mode = "force_thinking"
+default_injection_schema = "chat_template_kwargs"
+"#,
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"extra_body":{"thinking":{}},"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(
+        observed_body["extra_body"]["thinking"]["budget_tokens"],
+        32_768
+    );
+    assert!(observed_body.get("chat_template_kwargs").is_none());
+    assert_eq!(observed_body["max_tokens"], 32_832);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(
+            metadata["thinking_default_injection_schema"],
+            "chat_template_kwargs"
+        );
+        assert_eq!(
+            metadata["thinking_schema_path"],
+            "extra_body.thinking.budget_tokens"
+        );
+        assert_eq!(metadata["thinking_schema_variant"], "extra-body-canonical");
+    }
+}
+
+#[tokio::test]
+async fn hot_reloaded_default_injection_schema_changes_injection_path() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+mode = "force_thinking"
+
+[loop_guard]
+enabled = false
+"#,
+    )
+    .await;
+
+    let canonical_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"schema-before"}],"max_tokens":64}"#,
+    )
+    .await;
+    assert_eq!(canonical_body["thinking"]["budget_tokens"], 32_768);
+    assert!(canonical_body.get("chat_template_kwargs").is_none());
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+mode = "force_thinking"
+default_injection_schema = "chat_template_kwargs"
+
+[loop_guard]
+enabled = false
+"#,
+    );
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("default injection schema reload should succeed");
+    assert!(outcome.applied);
+
+    let chat_template_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"schema-after"}],"max_tokens":64}"#,
+    )
+    .await;
+    assert!(chat_template_body.get("thinking").is_none());
+    assert_eq!(
+        chat_template_body["chat_template_kwargs"]["enable_thinking"],
+        true
+    );
+    assert_eq!(
+        chat_template_body["chat_template_kwargs"]["thinking_budget"],
+        32_768
+    );
+}
+
+#[tokio::test]
 async fn shielded_thinking_policy_injects_missing_budget_and_preserves_answer_reserve() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
