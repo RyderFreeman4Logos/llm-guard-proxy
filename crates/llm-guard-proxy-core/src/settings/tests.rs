@@ -23,6 +23,8 @@ port = 18100
 max_in_flight_requests = 2
 max_queued_generation_requests = 3
 generation_queue_timeout_ms = 4000
+generation_queue_full_status = 429
+generation_queue_retry_after_secs = 30
 max_control_plane_in_flight_requests = 5
 max_request_body_bytes = 1048576
 
@@ -127,6 +129,8 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.server.max_in_flight_requests, 16);
     assert_eq!(config.server.max_queued_generation_requests, 64);
     assert_eq!(config.server.generation_queue_timeout_ms, 30_000);
+    assert_eq!(config.server.generation_queue_full_status, 503);
+    assert_eq!(config.server.generation_queue_retry_after_secs, None);
     assert_eq!(config.server.max_control_plane_in_flight_requests, 128);
     assert_eq!(config.server.max_request_body_bytes, 67_108_864);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
@@ -174,6 +178,30 @@ fn defaults_match_issue_contract() {
     assert!(config.loop_guard.enabled);
     assert_eq!(config.loop_guard.mode, LoopGuardMode::Monitor);
     assert_eq!(config.loop_guard.effective_mode(), LoopGuardMode::Monitor);
+    assert_default_loop_guard_fields(&config);
+    assert!(config.retry.enabled);
+    assert_eq!(config.retry.max_attempts, 5);
+    assert!(config.retry.anti_loop_hint_enabled);
+    assert!(!config.retry.shielded_streaming_enabled);
+    assert_eq!(
+        config.retry.downstream_drop_policy,
+        DownstreamDropPolicy::Cancel
+    );
+    assert!(config.retry.ladder.is_empty());
+    assert!(!config.upstream_stall.enabled);
+    assert_eq!(config.upstream_stall.idle_timeout_ms, 30_000);
+    assert!(config.upstream_stall.recovery_command.is_empty());
+    assert_eq!(config.upstream_stall.recovery_timeout_ms, 300_000);
+    assert_eq!(config.upstream_stall.recovery_cooldown_ms, 300_000);
+    assert_eq!(config.upstream_stall.recovery_budget_window_ms, 900_000);
+    assert_eq!(config.upstream_stall.recovery_max_per_window, 2);
+    assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
+    assert!(config.cloudflare.enabled);
+    assert!(config.upstream_profiles.is_empty());
+    assert_eq!(config.default_upstream_profile().name, "default");
+}
+
+fn assert_default_loop_guard_fields(config: &AppConfig) {
     assert_eq!(config.loop_guard.normalized_input_window_secs, 120);
     assert_eq!(config.loop_guard.max_repeated_inputs, 1);
     assert_eq!(config.loop_guard.output_repeated_line_threshold, 24);
@@ -199,26 +227,6 @@ fn defaults_match_issue_contract() {
         config.loop_guard.reasoning_semantic_history_window_count,
         16
     );
-    assert!(config.retry.enabled);
-    assert_eq!(config.retry.max_attempts, 5);
-    assert!(config.retry.anti_loop_hint_enabled);
-    assert!(!config.retry.shielded_streaming_enabled);
-    assert_eq!(
-        config.retry.downstream_drop_policy,
-        DownstreamDropPolicy::Cancel
-    );
-    assert!(config.retry.ladder.is_empty());
-    assert!(!config.upstream_stall.enabled);
-    assert_eq!(config.upstream_stall.idle_timeout_ms, 30_000);
-    assert!(config.upstream_stall.recovery_command.is_empty());
-    assert_eq!(config.upstream_stall.recovery_timeout_ms, 300_000);
-    assert_eq!(config.upstream_stall.recovery_cooldown_ms, 300_000);
-    assert_eq!(config.upstream_stall.recovery_budget_window_ms, 900_000);
-    assert_eq!(config.upstream_stall.recovery_max_per_window, 2);
-    assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
-    assert!(config.cloudflare.enabled);
-    assert!(config.upstream_profiles.is_empty());
-    assert_eq!(config.default_upstream_profile().name, "default");
 }
 
 #[test]
@@ -676,6 +684,8 @@ fn parses_toml_with_defaults_and_overrides() {
     assert_eq!(config.server.max_in_flight_requests, 2);
     assert_eq!(config.server.max_queued_generation_requests, 3);
     assert_eq!(config.server.generation_queue_timeout_ms, 4_000);
+    assert_eq!(config.server.generation_queue_full_status, 429);
+    assert_eq!(config.server.generation_queue_retry_after_secs, Some(30));
     assert_eq!(config.server.max_control_plane_in_flight_requests, 5);
     assert_eq!(config.server.max_request_body_bytes, 1_048_576);
     assert_eq!(config.listeners.len(), 2);
@@ -1244,6 +1254,34 @@ fn validates_server_admission_queue_bounds() {
         .expect_err("zero generation queue timeout should fail");
 
     assert_eq!(error.field(), "server.generation_queue_timeout_ms");
+
+    config = AppConfig::default();
+    config.server.generation_queue_full_status = 200;
+
+    let error = config
+        .validate()
+        .expect_err("non-error generation queue-full status should fail");
+
+    assert_eq!(error.field(), "server.generation_queue_full_status");
+}
+
+#[test]
+fn rejects_invalid_generation_queue_full_status_config() {
+    for status in [200_u16, 399, 600] {
+        let error = parse_config_text(&format!(
+            r"
+[server]
+generation_queue_full_status = {status}
+"
+        ))
+        .expect_err("invalid queue-full status should fail during parsing");
+
+        assert!(
+            error
+                .to_string()
+                .contains("server.generation_queue_full_status")
+        );
+    }
 }
 
 #[test]
@@ -1521,6 +1559,7 @@ port = 18009
 max_in_flight_requests = 4
 max_queued_generation_requests = 8
 generation_queue_timeout_ms = 2000
+generation_queue_full_status = 503
 max_control_plane_in_flight_requests = 3
 max_request_body_bytes = 1048576
 
@@ -1548,6 +1587,8 @@ port = 19000
 max_in_flight_requests = 2
 max_queued_generation_requests = 1
 generation_queue_timeout_ms = 1000
+generation_queue_full_status = 429
+generation_queue_retry_after_secs = 30
 max_control_plane_in_flight_requests = 2
 max_request_body_bytes = 512
 
@@ -1586,6 +1627,8 @@ reasoning_semantic_history_window_count = 20
     assert_eq!(snapshot.server.max_in_flight_requests, 2);
     assert_eq!(snapshot.server.max_queued_generation_requests, 1);
     assert_eq!(snapshot.server.generation_queue_timeout_ms, 1_000);
+    assert_eq!(snapshot.server.generation_queue_full_status, 429);
+    assert_eq!(snapshot.server.generation_queue_retry_after_secs, Some(30));
     assert_eq!(snapshot.server.max_control_plane_in_flight_requests, 2);
     assert_eq!(snapshot.server.max_request_body_bytes, 512);
     assert!(snapshot.thinking.force_disable);
@@ -1876,6 +1919,7 @@ port = 18009
 max_in_flight_requests = 4
 max_queued_generation_requests = 8
 generation_queue_timeout_ms = 2000
+generation_queue_full_status = 503
 max_control_plane_in_flight_requests = 3
 max_request_body_bytes = 1048576
 
@@ -1898,6 +1942,8 @@ port = 19000
 max_in_flight_requests = 2
 max_queued_generation_requests = 1
 generation_queue_timeout_ms = 1000
+generation_queue_full_status = 429
+generation_queue_retry_after_secs = 30
 max_control_plane_in_flight_requests = 2
 max_request_body_bytes = 512
 
@@ -1924,6 +1970,8 @@ interval_secs = 4
     assert_eq!(snapshot.server.max_in_flight_requests, 2);
     assert_eq!(snapshot.server.max_queued_generation_requests, 1);
     assert_eq!(snapshot.server.generation_queue_timeout_ms, 1_000);
+    assert_eq!(snapshot.server.generation_queue_full_status, 429);
+    assert_eq!(snapshot.server.generation_queue_retry_after_secs, Some(30));
     assert_eq!(snapshot.server.max_control_plane_in_flight_requests, 2);
     assert_eq!(snapshot.server.max_request_body_bytes, 512);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
@@ -1949,6 +1997,8 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_queued_generation_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.generation_queue_timeout_ms"));
+    assert!(RELOADABLE_FIELDS.contains(&"server.generation_queue_full_status"));
+    assert!(RELOADABLE_FIELDS.contains(&"server.generation_queue_retry_after_secs"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_control_plane_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_request_body_bytes"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.mode"));
@@ -1987,6 +2037,8 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.max_queued_generation_requests"));
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.generation_queue_timeout_ms"));
+    assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.generation_queue_full_status"));
+    assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.generation_queue_retry_after_secs"));
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.max_control_plane_in_flight_requests"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstreams.topology"));

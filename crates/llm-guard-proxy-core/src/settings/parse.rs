@@ -308,6 +308,17 @@ fn assign_server(
             config.generation_queue_timeout_ms =
                 parse_u64(value, line_number, "server.generation_queue_timeout_ms")?;
         }
+        "generation_queue_full_status" => {
+            config.generation_queue_full_status =
+                parse_http_error_status(value, line_number, "server.generation_queue_full_status")?;
+        }
+        "generation_queue_retry_after_secs" => {
+            config.generation_queue_retry_after_secs = Some(parse_u32(
+                value,
+                line_number,
+                "server.generation_queue_retry_after_secs",
+            )?);
+        }
         "max_control_plane_in_flight_requests" => {
             config.max_control_plane_in_flight_requests = parse_usize(
                 value,
@@ -1084,6 +1095,28 @@ fn parse_u16(value: &str, line_number: usize, field: &str) -> Result<u16, Config
             format!("{field} must fit in an unsigned 16-bit port"),
         )
     })
+}
+
+fn parse_http_error_status(
+    value: &str,
+    line_number: usize,
+    field: &str,
+) -> Result<u16, ConfigParseError> {
+    let number = parse_u64(value, line_number, field)?;
+    let status = u16::try_from(number).map_err(|_error| {
+        ConfigParseError::new(
+            line_number,
+            format!("{field} must fit in an unsigned 16-bit HTTP status"),
+        )
+    })?;
+    if (400..=599).contains(&status) {
+        Ok(status)
+    } else {
+        Err(ConfigParseError::new(
+            line_number,
+            format!("{field} must be an HTTP error status between 400 and 599"),
+        ))
+    }
 }
 
 fn parse_u32(value: &str, line_number: usize, field: &str) -> Result<u32, ConfigParseError> {

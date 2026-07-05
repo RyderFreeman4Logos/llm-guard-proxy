@@ -34,6 +34,8 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "server.max_in_flight_requests",
     "server.max_queued_generation_requests",
     "server.generation_queue_timeout_ms",
+    "server.generation_queue_full_status",
+    "server.generation_queue_retry_after_secs",
     "server.max_control_plane_in_flight_requests",
     "server.max_request_body_bytes",
     "shielding.enabled",

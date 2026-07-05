@@ -273,6 +273,9 @@ impl AppConfig {
         self.server.max_queued_generation_requests =
             requested.server.max_queued_generation_requests;
         self.server.generation_queue_timeout_ms = requested.server.generation_queue_timeout_ms;
+        self.server.generation_queue_full_status = requested.server.generation_queue_full_status;
+        self.server.generation_queue_retry_after_secs =
+            requested.server.generation_queue_retry_after_secs;
         self.server.max_control_plane_in_flight_requests =
             requested.server.max_control_plane_in_flight_requests;
         self.server.max_request_body_bytes = requested.server.max_request_body_bytes;
@@ -444,6 +447,10 @@ pub struct ServerConfig {
     pub max_queued_generation_requests: usize,
     /// Maximum milliseconds a queued generation request may wait for capacity.
     pub generation_queue_timeout_ms: u64,
+    /// HTTP error status returned when the generation queue rejects a request.
+    pub generation_queue_full_status: u16,
+    /// Retry-After seconds returned when the generation queue rejects a request.
+    pub generation_queue_retry_after_secs: Option<u32>,
     /// Maximum `/v1/models` requests admitted into upstream forwarding.
     pub max_control_plane_in_flight_requests: usize,
     /// Maximum downstream request body bytes buffered before forwarding.
@@ -472,6 +479,11 @@ impl ServerConfig {
             self.generation_queue_timeout_ms > 0,
             "server.generation_queue_timeout_ms",
             "must be greater than zero",
+        )?;
+        require(
+            (400..=599).contains(&self.generation_queue_full_status),
+            "server.generation_queue_full_status",
+            "must be an HTTP error status between 400 and 599",
         )?;
         require(
             self.max_control_plane_in_flight_requests > 0,
@@ -504,6 +516,8 @@ impl Default for ServerConfig {
             max_in_flight_requests: 16,
             max_queued_generation_requests: 64,
             generation_queue_timeout_ms: 30_000,
+            generation_queue_full_status: 503,
+            generation_queue_retry_after_secs: None,
             max_control_plane_in_flight_requests: 128,
             max_request_body_bytes: 67_108_864,
         }
