@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::model_alias::{AliasKind, ModelAliasConfig};
+
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DefaultInjectionSchema,
     DownstreamDropPolicy, HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig,
@@ -18,6 +20,7 @@ enum Section {
     UpstreamProfile(usize),
     UpstreamProfileMetadata(usize),
     UpstreamProfileThinking(usize),
+    ModelAlias(usize),
     Shielding,
     Observability,
     ObservabilityRetention,
@@ -106,6 +109,11 @@ fn parse_section(
         config.listeners.push(ListenerConfig::default());
         let index = config.listeners.len() - 1;
         return Ok(Section::Listener(index));
+    }
+    if line == "[[model_aliases]]" {
+        config.model_aliases.push(ModelAliasConfig::default());
+        let index = config.model_aliases.len() - 1;
+        return Ok(Section::ModelAlias(index));
     }
     if line == "[[retry.ladder]]" {
         config.retry.ladder.push(RetryLadderConfig::default());
@@ -211,6 +219,9 @@ fn assign_value(
             value,
             line_number,
         ),
+        Section::ModelAlias(index) => {
+            assign_model_alias(&mut config.model_aliases[index], key, value, line_number)
+        }
         Section::Shielding => assign_shielding(&mut config.shielding, key, value, line_number),
         Section::Observability => {
             assign_observability(&mut config.observability, key, value, line_number)
@@ -233,6 +244,40 @@ fn assign_value(
         }
         Section::Heartbeat => assign_heartbeat(&mut config.heartbeat, key, value, line_number),
         Section::Cloudflare => assign_cloudflare(&mut config.cloudflare, key, value, line_number),
+    }
+}
+
+fn assign_model_alias(
+    config: &mut ModelAliasConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "id" => config.id = parse_string(value, line_number)?,
+        "kind" => config.kind = parse_alias_kind(value, line_number)?,
+        "upstream_profile" => config.upstream_profile = Some(parse_string(value, line_number)?),
+        "workflow_id" => config.workflow_id = Some(parse_string(value, line_number)?),
+        "workflow_timeout_ms" => {
+            config.workflow_timeout_ms = Some(parse_u64(
+                value,
+                line_number,
+                "model_aliases.workflow_timeout_ms",
+            )?);
+        }
+        _ => return unknown_key("model_aliases", key, line_number),
+    }
+    Ok(())
+}
+
+fn parse_alias_kind(value: &str, line_number: usize) -> Result<AliasKind, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "upstream" => Ok(AliasKind::Upstream),
+        "workflow" => Ok(AliasKind::Workflow),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!("invalid model_aliases.kind {other:?}; expected \"upstream\" or \"workflow\""),
+        )),
     }
 }
 

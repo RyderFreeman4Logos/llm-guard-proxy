@@ -7,6 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use crate::model_alias::{AliasKind, MAX_WORKFLOW_TIMEOUT_MS, ModelAliasConfig};
+
 use super::ValidationError;
 use url::Url;
 
@@ -29,6 +31,8 @@ pub struct AppConfig {
     pub upstream: UpstreamConfig,
     /// Additional named upstream profiles matched by request model.
     pub upstream_profiles: Vec<UpstreamProfileConfig>,
+    /// Virtual model aliases exposed to clients.
+    pub model_aliases: Vec<ModelAliasConfig>,
     /// Client shielding behavior flags.
     pub shielding: ShieldingConfig,
     /// Observability storage and retention settings.
@@ -60,6 +64,7 @@ impl AppConfig {
         self.server.validate()?;
         self.upstream.validate()?;
         self.validate_upstream_profiles()?;
+        self.validate_model_aliases()?;
         self.validate_listeners()?;
         self.observability.validate()?;
         self.evidence.validate()?;
@@ -136,6 +141,91 @@ impl AppConfig {
                         "listeners.allowed_upstreams",
                         "must reference default or a configured upstream profile name",
                     )?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn validate_model_aliases(&self) -> Result<(), ValidationError> {
+        let allowed_profile_names = self.upstream_profile_names();
+        let mut ids = HashSet::new();
+
+        for alias in &self.model_aliases {
+            require(
+                !alias.id.trim().is_empty(),
+                "model_aliases.id",
+                "must not be empty",
+            )?;
+            require(
+                alias.id == alias.id.trim(),
+                "model_aliases.id",
+                "must not have leading or trailing whitespace",
+            )?;
+            require(
+                alias.id.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+                "model_aliases.id",
+                "must be at most 256 bytes",
+            )?;
+            require(
+                ids.insert(alias.id.clone()),
+                "model_aliases.id",
+                "must be unique",
+            )?;
+            match alias.kind {
+                AliasKind::Upstream => {
+                    let profile = alias.upstream_profile.as_deref().ok_or_else(|| {
+                        ValidationError::new(
+                            "model_aliases.upstream_profile",
+                            "must be set for upstream aliases",
+                        )
+                    })?;
+                    require(
+                        !profile.trim().is_empty(),
+                        "model_aliases.upstream_profile",
+                        "must not be empty for upstream aliases",
+                    )?;
+                    require(
+                        profile == profile.trim(),
+                        "model_aliases.upstream_profile",
+                        "must not have leading or trailing whitespace",
+                    )?;
+                    require(
+                        allowed_profile_names.contains(profile),
+                        "model_aliases.upstream_profile",
+                        "must reference default or a configured upstream profile name",
+                    )?;
+                }
+                AliasKind::Workflow => {
+                    let workflow_id = alias.workflow_id.as_deref().ok_or_else(|| {
+                        ValidationError::new(
+                            "model_aliases.workflow_id",
+                            "must be set for workflow aliases",
+                        )
+                    })?;
+                    require(
+                        !workflow_id.trim().is_empty(),
+                        "model_aliases.workflow_id",
+                        "must not be empty for workflow aliases",
+                    )?;
+                    require(
+                        workflow_id == workflow_id.trim(),
+                        "model_aliases.workflow_id",
+                        "must not have leading or trailing whitespace",
+                    )?;
+                    if let Some(timeout) = alias.workflow_timeout_ms {
+                        require(
+                            timeout > 0,
+                            "model_aliases.workflow_timeout_ms",
+                            "must be greater than zero when set",
+                        )?;
+                        require(
+                            timeout <= MAX_WORKFLOW_TIMEOUT_MS,
+                            "model_aliases.workflow_timeout_ms",
+                            "must not exceed the maximum allowed timeout",
+                        )?;
+                    }
                 }
             }
         }
@@ -347,6 +437,12 @@ impl AppConfig {
             &self.upstream_profile_topology(),
             &requested.upstream_profile_topology(),
         );
+        push_structural_change(
+            &mut changes,
+            "model_aliases.topology",
+            &self.model_alias_topology(),
+            &requested.model_alias_topology(),
+        );
         push_change(
             &mut changes,
             "observability.sqlite_path",
@@ -380,6 +476,13 @@ impl AppConfig {
         self.upstream_profiles
             .iter()
             .map(UpstreamProfileTopology::from)
+            .collect()
+    }
+
+    fn model_alias_topology(&self) -> Vec<ModelAliasTopology> {
+        self.model_aliases
+            .iter()
+            .map(ModelAliasTopology::from)
             .collect()
     }
 
@@ -430,6 +533,27 @@ impl From<&UpstreamProfileConfig> for UpstreamProfileTopology {
             name: profile.name.clone(),
             base_url: profile.base_url.clone(),
             match_models: profile.match_models.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ModelAliasTopology {
+    id: String,
+    kind: AliasKind,
+    upstream_profile: Option<String>,
+    workflow_id: Option<String>,
+    workflow_timeout_ms: Option<u64>,
+}
+
+impl From<&ModelAliasConfig> for ModelAliasTopology {
+    fn from(alias: &ModelAliasConfig) -> Self {
+        Self {
+            id: alias.id.clone(),
+            kind: alias.kind,
+            upstream_profile: alias.upstream_profile.clone(),
+            workflow_id: alias.workflow_id.clone(),
+            workflow_timeout_ms: alias.workflow_timeout_ms,
         }
     }
 }

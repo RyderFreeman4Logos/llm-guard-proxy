@@ -16,6 +16,7 @@ use super::{
     RESTART_REQUIRED_FIELDS, ThinkingMode, ToolRequestThinkingPolicy, UpstreamRouteReason,
     ValidationError, parse::parse_config_text, redact_upstream_base_url,
 };
+use crate::{AliasKind, AliasTarget, ModelAliasResolver};
 
 const FULL_OVERRIDE_CONFIG: &str = r#"
 [server]
@@ -50,6 +51,17 @@ request_timeout_ms = 90000
 name = "qwen3-embedding-8b"
 base_url = "http://embedding.example/v1"
 match_models = ["embedding-model"]
+
+[[model_aliases]]
+id = "gpt-default"
+kind = "upstream"
+upstream_profile = "default"
+
+[[model_aliases]]
+id = "family/child-safe-general-v1"
+kind = "workflow"
+workflow_id = "family.child_safe_general.v1"
+workflow_timeout_ms = 120000
 
 [observability]
 metrics_enabled = false
@@ -198,6 +210,7 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
     assert!(config.cloudflare.enabled);
     assert!(config.upstream_profiles.is_empty());
+    assert!(config.model_aliases.is_empty());
     assert_eq!(config.default_upstream_profile().name, "default");
 }
 
@@ -578,6 +591,123 @@ match_models = ["fast-local"]
 }
 
 #[test]
+fn parses_and_resolves_model_aliases_from_config() {
+    let config = parse_config_text(
+        r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://aeon.example/v1"
+match_models = ["aeon-ultimate"]
+
+[[model_aliases]]
+id = "gpt-default"
+kind = "upstream"
+upstream_profile = "default"
+
+[[model_aliases]]
+id = "family/child-safe-general-v1"
+kind = "workflow"
+workflow_id = "family.child_safe_general.v1"
+workflow_timeout_ms = 120000
+"#,
+    )
+    .expect("alias config should parse");
+
+    config.validate().expect("alias config should validate");
+
+    let resolver = ModelAliasResolver::new(config.model_aliases.clone());
+    assert_eq!(
+        resolver.resolve("gpt-default"),
+        Ok(AliasTarget::Upstream {
+            profile_name: String::from("default"),
+        })
+    );
+    assert_eq!(
+        resolver.resolve("family/child-safe-general-v1"),
+        Ok(AliasTarget::Workflow {
+            workflow_id: String::from("family.child_safe_general.v1"),
+            timeout_ms: 120_000,
+        })
+    );
+}
+
+#[test]
+fn validates_model_alias_requirements() {
+    for (contents, field) in [
+        (
+            r#"
+[[model_aliases]]
+id = ""
+kind = "upstream"
+upstream_profile = "default"
+"#,
+            "model_aliases.id",
+        ),
+        (
+            r#"
+[[model_aliases]]
+id = "dup"
+kind = "upstream"
+upstream_profile = "default"
+
+[[model_aliases]]
+id = "dup"
+kind = "workflow"
+workflow_id = "workflow.dup"
+"#,
+            "model_aliases.id",
+        ),
+        (
+            r#"
+[[model_aliases]]
+id = "missing-profile"
+kind = "upstream"
+"#,
+            "model_aliases.upstream_profile",
+        ),
+        (
+            r#"
+[[model_aliases]]
+id = "unknown-profile"
+kind = "upstream"
+upstream_profile = "missing"
+"#,
+            "model_aliases.upstream_profile",
+        ),
+        (
+            r#"
+[[model_aliases]]
+id = "missing-workflow"
+kind = "workflow"
+"#,
+            "model_aliases.workflow_id",
+        ),
+    ] {
+        let config = parse_config_text(contents).expect("config syntax should parse");
+        let error = config.validate().expect_err("alias config should fail");
+        assert_eq!(error.field(), field);
+    }
+}
+
+#[test]
+fn rejects_invalid_model_alias_kind() {
+    let error = parse_config_text(
+        r#"
+[[model_aliases]]
+id = "bad-kind"
+kind = "external"
+upstream_profile = "default"
+"#,
+    )
+    .expect_err("invalid alias kind should fail");
+
+    assert_eq!(error.line(), 4);
+    assert!(error.message().contains("invalid model_aliases.kind"));
+    assert!(error.message().contains("upstream"));
+    assert!(error.message().contains("workflow"));
+}
+
+#[test]
 fn validates_named_upstream_profile_uniqueness_and_required_metadata() {
     for (contents, field) in [
         (
@@ -726,6 +856,7 @@ fn parses_toml_with_defaults_and_overrides() {
         config.upstream.metadata.max_model_len_override,
         Some(256_000)
     );
+    assert_parsed_model_aliases(&config);
     assert_parsed_observability_overrides(&config);
     assert!(config.evidence.enabled);
     assert_eq!(
@@ -765,6 +896,23 @@ fn parses_toml_with_defaults_and_overrides() {
     assert_parsed_retry_overrides(&config);
     assert_parsed_upstream_stall_overrides(&config);
     assert!(!config.cloudflare.enabled);
+}
+
+fn assert_parsed_model_aliases(config: &AppConfig) {
+    assert_eq!(config.model_aliases.len(), 2);
+    assert_eq!(config.model_aliases[0].id, "gpt-default");
+    assert_eq!(config.model_aliases[0].kind, AliasKind::Upstream);
+    assert_eq!(
+        config.model_aliases[0].upstream_profile.as_deref(),
+        Some("default")
+    );
+    assert_eq!(config.model_aliases[1].id, "family/child-safe-general-v1");
+    assert_eq!(config.model_aliases[1].kind, AliasKind::Workflow);
+    assert_eq!(
+        config.model_aliases[1].workflow_id.as_deref(),
+        Some("family.child_safe_general.v1")
+    );
+    assert_eq!(config.model_aliases[1].workflow_timeout_ms, Some(120_000));
 }
 
 #[test]
@@ -2043,6 +2191,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstreams.topology"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"listeners.topology"));
+    assert!(RESTART_REQUIRED_FIELDS.contains(&"model_aliases.topology"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"observability.sqlite_path"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"evidence.sqlite_path"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"evidence.blob_cache_dir"));
