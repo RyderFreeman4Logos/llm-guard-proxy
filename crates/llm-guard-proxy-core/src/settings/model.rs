@@ -1,13 +1,14 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     io::ErrorKind,
     path::{Path, PathBuf},
 };
 
 use crate::model_alias::{AliasKind, MAX_WORKFLOW_TIMEOUT_MS, ModelAliasConfig};
+use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
 use super::ValidationError;
 use url::Url;
@@ -33,6 +34,8 @@ pub struct AppConfig {
     pub upstream_profiles: Vec<UpstreamProfileConfig>,
     /// Virtual model aliases exposed to clients.
     pub model_aliases: Vec<ModelAliasConfig>,
+    /// Configured guard workflows.
+    pub workflows: HashMap<String, WorkflowConfig>,
     /// Client shielding behavior flags.
     pub shielding: ShieldingConfig,
     /// Observability storage and retention settings.
@@ -65,6 +68,7 @@ impl AppConfig {
         self.upstream.validate()?;
         self.validate_upstream_profiles()?;
         self.validate_model_aliases()?;
+        self.validate_workflows()?;
         self.validate_listeners()?;
         self.observability.validate()?;
         self.evidence.validate()?;
@@ -148,6 +152,20 @@ impl AppConfig {
         Ok(())
     }
 
+    fn validate_workflows(&self) -> Result<(), ValidationError> {
+        for (id, workflow) in &self.workflows {
+            require(!id.trim().is_empty(), "workflows.id", "must not be empty")?;
+            require(
+                id == id.trim(),
+                "workflows.id",
+                "must not have leading or trailing whitespace",
+            )?;
+            require(id.len() <= 256, "workflows.id", "must be at most 256 bytes")?;
+            workflow.validate(id)?;
+        }
+        Ok(())
+    }
+
     fn validate_model_aliases(&self) -> Result<(), ValidationError> {
         let allowed_profile_names = self.upstream_profile_names();
         let mut ids = HashSet::new();
@@ -213,6 +231,11 @@ impl AppConfig {
                         workflow_id == workflow_id.trim(),
                         "model_aliases.workflow_id",
                         "must not have leading or trailing whitespace",
+                    )?;
+                    require(
+                        self.workflows.contains_key(workflow_id),
+                        "model_aliases.workflow_id",
+                        "must reference a configured workflow",
                     )?;
                     if let Some(timeout) = alias.workflow_timeout_ms {
                         require(
@@ -398,6 +421,7 @@ impl AppConfig {
         self.upstream_stall = requested.upstream_stall.clone();
         self.heartbeat = requested.heartbeat.clone();
         self.cloudflare = requested.cloudflare.clone();
+        self.workflows.clone_from(&requested.workflows);
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
         self.upstream.metadata = requested.upstream.metadata.clone();
         if self.upstream_profiles_topology_matches(requested) {
@@ -498,6 +522,56 @@ impl AppConfig {
             active.metadata = requested.metadata.clone();
             active.thinking = requested.thinking.clone();
         }
+    }
+}
+
+impl WorkflowConfig {
+    fn validate(&self, workflow_id: &str) -> Result<(), ValidationError> {
+        require(
+            matches!(self.runtime_kind, WorkflowRuntime::Stdio),
+            "workflows.runtime_kind",
+            "must be stdio",
+        )?;
+        require(
+            !self.command.trim().is_empty(),
+            "workflows.command",
+            "must not be empty",
+        )?;
+        require(
+            self.command == self.command.trim(),
+            "workflows.command",
+            "must not have leading or trailing whitespace",
+        )?;
+        require(
+            self.args.iter().all(|argument| !argument.trim().is_empty()),
+            "workflows.args",
+            "must not contain empty argv entries",
+        )?;
+        require(
+            self.timeout_ms > 0,
+            "workflows.timeout_ms",
+            "must be greater than zero",
+        )?;
+        require(
+            self.timeout_ms <= Self::max_timeout_ms(),
+            "workflows.timeout_ms",
+            "must not exceed the maximum allowed timeout",
+        )?;
+        require(
+            self.max_stdout_bytes > 0,
+            "workflows.max_stdout_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.max_stdout_bytes <= 64 * 1024 * 1024,
+            "workflows.max_stdout_bytes",
+            "must be less than or equal to 67108864",
+        )?;
+        require(
+            !workflow_id.contains(char::is_whitespace),
+            "workflows.id",
+            "must not contain whitespace",
+        )
     }
 }
 
