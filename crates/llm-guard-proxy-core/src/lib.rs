@@ -5,6 +5,7 @@
 //! retry, and request-shielding behavior behind core interfaces.
 
 mod evidence;
+pub mod gwp;
 mod loop_detector;
 mod observability;
 mod settings;
@@ -13,6 +14,10 @@ pub use evidence::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceError,
     EvidenceGroupRecord, EvidencePruningStats, EvidenceRetentionUsage, EvidenceShadowRecord,
     EvidenceStore, EvidenceStoreWrite, ShadowSkipReason,
+};
+pub use gwp::{
+    GWP_PROTOCOL_VERSION, GwpAudit, GwpDecision, GwpHook, GwpInvocation, GwpProfile,
+    GwpProfileKind, GwpResult, GwpTraceMode,
 };
 pub use loop_detector::{
     BoundedFeatureSummary, ChannelizedLoopDetector, DetectorEventKind, DetectorSummary,
