@@ -16,7 +16,10 @@ use super::{
     RESTART_REQUIRED_FIELDS, ThinkingMode, ToolRequestThinkingPolicy, UpstreamRouteReason,
     ValidationError, parse::parse_config_text, redact_upstream_base_url,
 };
-use crate::{AliasKind, AliasTarget, ModelAliasResolver, WorkflowRuntime};
+use crate::{
+    AliasKind, AliasTarget, DEFAULT_PROFILE_NAME, ModelAliasResolver, ProfileConfig, ProfileKind,
+    ShieldedBuffering, WorkflowRuntime,
+};
 
 const FULL_OVERRIDE_CONFIG: &str = r#"
 [server]
@@ -69,6 +72,18 @@ command = "python"
 args = ["workflows/content_review.py"]
 timeout_ms = 120000
 max_stdout_bytes = 1048576
+
+[profiles.child_default]
+kind = "child"
+allowed_models = ["family/child-safe-general-v1"]
+daily_request_limit = 50
+shielded_buffering = "buffered_sse"
+guard_pack = "family_basic"
+
+[profiles.adult_default]
+kind = "adult"
+allowed_models = ["gpt-default", "family/child-safe-general-v1"]
+shielded_buffering = "off"
 
 [observability]
 metrics_enabled = false
@@ -984,6 +999,7 @@ fn parses_toml_with_defaults_and_overrides() {
         Some(256_000)
     );
     assert_parsed_model_aliases(&config);
+    assert_parsed_profiles(&config);
     assert_parsed_observability_overrides(&config);
     assert!(config.evidence.enabled);
     assert_eq!(
@@ -1023,6 +1039,115 @@ fn parses_toml_with_defaults_and_overrides() {
     assert_parsed_retry_overrides(&config);
     assert_parsed_upstream_stall_overrides(&config);
     assert!(!config.cloudflare.enabled);
+}
+
+fn assert_parsed_profiles(config: &AppConfig) {
+    assert_eq!(config.profiles.len(), 2);
+    let child = config
+        .profiles
+        .get("child_default")
+        .expect("child profile should parse");
+    assert_eq!(child.kind, ProfileKind::Child);
+    assert_eq!(
+        child.allowed_models,
+        vec![String::from("family/child-safe-general-v1")]
+    );
+    assert_eq!(child.daily_request_limit, Some(50));
+    assert_eq!(child.shielded_buffering, ShieldedBuffering::BufferedSse);
+    assert_eq!(child.guard_pack.as_deref(), Some("family_basic"));
+
+    let adult = config
+        .profiles
+        .get("adult_default")
+        .expect("adult profile should parse");
+    assert_eq!(adult.kind, ProfileKind::Adult);
+    assert_eq!(
+        adult.allowed_models,
+        vec![
+            String::from("gpt-default"),
+            String::from("family/child-safe-general-v1"),
+        ]
+    );
+    assert_eq!(adult.daily_request_limit, None);
+    assert_eq!(adult.shielded_buffering, ShieldedBuffering::Off);
+    assert_eq!(adult.guard_pack, None);
+}
+
+#[test]
+fn implicit_default_profile_exists_when_none_configured() {
+    let config = AppConfig::default();
+
+    config.validate().expect("default config should validate");
+    let profile = config
+        .caller_profile_by_name(DEFAULT_PROFILE_NAME)
+        .expect("implicit default profile should exist");
+
+    assert_eq!(profile.kind, ProfileKind::Adult);
+    assert!(profile.daily_request_limit.is_none());
+}
+
+#[test]
+fn validates_caller_profile_requirements() {
+    for (contents, field) in [
+        (
+            r#"
+[[model_aliases]]
+id = "gpt-default"
+kind = "upstream"
+upstream_profile = "default"
+
+[profiles.child_default]
+kind = "child"
+allowed_models = ["missing-model"]
+"#,
+            "profiles.allowed_models",
+        ),
+        (
+            r#"
+[profiles.child_default]
+kind = "child"
+daily_request_limit = 0
+"#,
+            "profiles.daily_request_limit",
+        ),
+    ] {
+        let config = parse_config_text(contents).expect("config syntax should parse");
+        let error = config.validate().expect_err("profile config should fail");
+        assert_eq!(error.field(), field);
+    }
+}
+
+#[test]
+fn validates_empty_caller_profile_name() {
+    let mut config = AppConfig::default();
+    config
+        .profiles
+        .insert(String::new(), ProfileConfig::default());
+
+    let error = config
+        .validate()
+        .expect_err("empty profile name should fail validation");
+
+    assert_eq!(error.field(), "profiles.name");
+}
+
+#[test]
+fn duplicate_caller_profile_sections_fail_to_parse() {
+    let error = parse_config_text(
+        r#"
+[profiles.child_default]
+kind = "child"
+
+[profiles.child_default]
+kind = "adult"
+"#,
+    )
+    .expect_err("duplicate profile sections should fail");
+
+    assert!(
+        error.message().contains("duplicate profile section"),
+        "unexpected error: {error}"
+    );
 }
 
 fn assert_parsed_model_aliases(config: &AppConfig) {
@@ -2302,6 +2427,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"retry.shielded_streaming_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.downstream_drop_policy"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.ladder"));
+    assert!(RELOADABLE_FIELDS.contains(&"profiles"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.metrics_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_admin_token"));

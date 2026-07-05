@@ -98,6 +98,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "retry.shielded_streaming_enabled",
     "retry.downstream_drop_policy",
     "retry.ladder",
+    "profiles",
     "workflows",
     "upstream.stall.enabled",
     "upstream.stall.idle_timeout_ms",

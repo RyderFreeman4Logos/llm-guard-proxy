@@ -9,6 +9,7 @@ pub mod gwp;
 mod loop_detector;
 mod model_alias;
 mod observability;
+pub mod profile;
 mod settings;
 pub mod workflow;
 
@@ -36,6 +37,10 @@ pub use observability::{
     ObservabilityError, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloadChunk,
     RawPayloads, RequestId, RequestMetricCount, RequestRecord, RequestStatus,
     RetentionPruningStats, RetentionUsage, StoreWrite, UpstreamErrorMetricCount, UpstreamMode,
+};
+pub use profile::{
+    BlockReason, DEFAULT_PROFILE_NAME, ProfileCheckResult, ProfileConfig, ProfileKind,
+    ShieldedBuffering,
 };
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,

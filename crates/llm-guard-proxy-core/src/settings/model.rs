@@ -8,6 +8,7 @@ use std::{
 };
 
 use crate::model_alias::{AliasKind, MAX_WORKFLOW_TIMEOUT_MS, ModelAliasConfig};
+use crate::profile::{DEFAULT_PROFILE_NAME, ProfileConfig};
 use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
 use super::ValidationError;
@@ -20,6 +21,8 @@ const LOOP_GUARD_MAX_SEMANTIC_HISTORY_WINDOWS: u32 = 256;
 const DEFAULT_UPSTREAM_PROFILE_NAME: &str = "default";
 const MAX_UPSTREAM_PROFILE_NAME_BYTES: usize = 128;
 const MAX_UPSTREAM_MODEL_ALIAS_BYTES: usize = 256;
+const MAX_CALLER_PROFILE_NAME_BYTES: usize = 128;
+const MAX_GUARD_PACK_NAME_BYTES: usize = 256;
 
 /// Complete application configuration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -34,6 +37,8 @@ pub struct AppConfig {
     pub upstream_profiles: Vec<UpstreamProfileConfig>,
     /// Virtual model aliases exposed to clients.
     pub model_aliases: Vec<ModelAliasConfig>,
+    /// Caller profiles and their request policy.
+    pub profiles: HashMap<String, ProfileConfig>,
     /// Configured guard workflows.
     pub workflows: HashMap<String, WorkflowConfig>,
     /// Client shielding behavior flags.
@@ -68,6 +73,7 @@ impl AppConfig {
         self.upstream.validate()?;
         self.validate_upstream_profiles()?;
         self.validate_model_aliases()?;
+        self.validate_profiles()?;
         self.validate_workflows()?;
         self.validate_listeners()?;
         self.observability.validate()?;
@@ -256,6 +262,82 @@ impl AppConfig {
         Ok(())
     }
 
+    fn validate_profiles(&self) -> Result<(), ValidationError> {
+        let configured_aliases = self
+            .model_aliases
+            .iter()
+            .map(|alias| alias.id.as_str())
+            .collect::<HashSet<_>>();
+
+        for (name, profile) in &self.profiles {
+            require(
+                !name.trim().is_empty(),
+                "profiles.name",
+                "must not be empty",
+            )?;
+            require(
+                name == name.trim(),
+                "profiles.name",
+                "must not have leading or trailing whitespace",
+            )?;
+            require(
+                name.len() <= MAX_CALLER_PROFILE_NAME_BYTES,
+                "profiles.name",
+                "must be at most 128 bytes",
+            )?;
+            for model in &profile.allowed_models {
+                require(
+                    !model.trim().is_empty(),
+                    "profiles.allowed_models",
+                    "must not contain empty model aliases",
+                )?;
+                require(
+                    model == model.trim(),
+                    "profiles.allowed_models",
+                    "model aliases must not have leading or trailing whitespace",
+                )?;
+                require(
+                    model.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+                    "profiles.allowed_models",
+                    "model aliases must be at most 256 bytes",
+                )?;
+                if !configured_aliases.is_empty() {
+                    require(
+                        configured_aliases.contains(model.as_str()),
+                        "profiles.allowed_models",
+                        "must reference configured model aliases",
+                    )?;
+                }
+            }
+            if let Some(limit) = profile.daily_request_limit {
+                require(
+                    limit > 0,
+                    "profiles.daily_request_limit",
+                    "must be greater than zero when set",
+                )?;
+            }
+            if let Some(guard_pack) = &profile.guard_pack {
+                require(
+                    !guard_pack.trim().is_empty(),
+                    "profiles.guard_pack",
+                    "must not be empty when set",
+                )?;
+                require(
+                    guard_pack == guard_pack.trim(),
+                    "profiles.guard_pack",
+                    "must not have leading or trailing whitespace",
+                )?;
+                require(
+                    guard_pack.len() <= MAX_GUARD_PACK_NAME_BYTES,
+                    "profiles.guard_pack",
+                    "must be at most 256 bytes",
+                )?;
+            }
+        }
+
+        Ok(())
+    }
+
     fn validate_upstream_stall_timeout_order(&self) -> Result<(), ValidationError> {
         if self.upstream_stall.enabled {
             require(
@@ -341,6 +423,21 @@ impl AppConfig {
         }
     }
 
+    /// Builds the implicit default caller profile used when no profiles are configured.
+    #[must_use]
+    pub fn default_caller_profile(&self) -> ProfileConfig {
+        ProfileConfig::default()
+    }
+
+    /// Selects a caller profile by name, including the implicit default when no profiles exist.
+    #[must_use]
+    pub fn caller_profile_by_name(&self, name: &str) -> Option<ProfileConfig> {
+        if self.profiles.is_empty() && name == DEFAULT_PROFILE_NAME {
+            return Some(self.default_caller_profile());
+        }
+        self.profiles.get(name).cloned()
+    }
+
     /// Builds the implicit listener from legacy `[server]` settings.
     #[must_use]
     pub fn default_listener(&self) -> ListenerConfig {
@@ -421,6 +518,7 @@ impl AppConfig {
         self.upstream_stall = requested.upstream_stall.clone();
         self.heartbeat = requested.heartbeat.clone();
         self.cloudflare = requested.cloudflare.clone();
+        self.profiles.clone_from(&requested.profiles);
         self.workflows.clone_from(&requested.workflows);
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
         self.upstream.metadata = requested.upstream.metadata.clone();
