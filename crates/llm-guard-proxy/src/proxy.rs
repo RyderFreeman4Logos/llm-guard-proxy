@@ -33,8 +33,8 @@ use llm_guard_proxy_core::{
     HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, MetadataConfig,
     ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
     RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
-    ShadowSkipReason, ThinkingConfig, UpstreamMode, UpstreamProfileConfig, UpstreamRouteReason,
-    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -2998,6 +2998,12 @@ struct ShieldedAcceptedOutcome {
     final_attempt: FinalAttemptContext,
 }
 
+struct ShieldedDirectRelayOutcome {
+    started: ShieldedStartedAttempt,
+    prior_attempt_records: Vec<AttemptRecord>,
+    response_metadata: BTreeMap<String, String>,
+}
+
 struct ShieldedAggregatedAttempt {
     body: Bytes,
     sse_body: Bytes,
@@ -3020,6 +3026,7 @@ struct ShieldedTerminalForward {
 
 enum ShieldedRunOutcome {
     Accepted(ShieldedAcceptedOutcome),
+    DirectRelay(ShieldedDirectRelayOutcome),
     Failed(ShieldedFailureOutcome),
     TerminalForward(ShieldedTerminalForward),
 }
@@ -3113,7 +3120,12 @@ async fn forward_shielded_chat_with_retries(
                 )
                 .await
                 {
-                    ShieldedRunOutcome::Accepted(outcome) => Ok(outcome),
+                    ShieldedRunOutcome::Accepted(outcome) => {
+                        Ok(ShieldedAggregateOutcome::Accepted(outcome))
+                    }
+                    ShieldedRunOutcome::DirectRelay(outcome) => {
+                        Ok(ShieldedAggregateOutcome::DirectRelay(outcome))
+                    }
                     ShieldedRunOutcome::Failed(failure) => Err(failure),
                     ShieldedRunOutcome::TerminalForward(terminal) => Err(terminal_forward_failure(
                         terminal,
@@ -3159,6 +3171,9 @@ async fn immediate_shielded_retry_response(
         ShieldedRunOutcome::Accepted(outcome) => {
             shielded_retry_success_response(runtime, outcome, in_flight_permit)
         }
+        ShieldedRunOutcome::DirectRelay(outcome) => {
+            shielded_retry_direct_relay_response(runtime, outcome, in_flight_permit)
+        }
         ShieldedRunOutcome::Failed(failure) => {
             shielded_retry_error_response(runtime, failure, in_flight_permit)
         }
@@ -3177,7 +3192,7 @@ fn maybe_detach_shielded_aggregate(
     }
 
     let (sender, receiver) =
-        oneshot::channel::<Result<ShieldedAcceptedOutcome, ShieldedFailureOutcome>>();
+        oneshot::channel::<Result<ShieldedAggregateOutcome, ShieldedFailureOutcome>>();
     tokio::spawn(async move {
         let _ = sender.send(aggregate.await);
     });
@@ -3473,15 +3488,16 @@ async fn run_shielded_attempts(
             }
         };
 
+        if should_direct_relay_no_thinking_stream(&runtime, &started.info, retry_cause) {
+            return ShieldedRunOutcome::DirectRelay(direct_relay_no_thinking_stream_outcome(
+                started,
+                &attempt_records,
+            ));
+        }
+
         match aggregate_shielded_attempt(&runtime, started).await {
             Ok(aggregated) => {
-                return ShieldedRunOutcome::Accepted(ShieldedAcceptedOutcome {
-                    body: aggregated.body,
-                    sse_body: aggregated.sse_body,
-                    response_metadata: aggregated.response_metadata,
-                    prior_attempt_records: attempt_records,
-                    final_attempt: aggregated.final_attempt,
-                });
+                return shielded_accepted_outcome(aggregated, attempt_records);
             }
             Err(mut failure) => {
                 let next_retry_cause = failure.retry_cause;
@@ -3516,6 +3532,57 @@ async fn run_shielded_attempts(
             }
         }
     }
+}
+
+fn shielded_accepted_outcome(
+    aggregated: ShieldedAggregatedAttempt,
+    attempt_records: Vec<AttemptRecord>,
+) -> ShieldedRunOutcome {
+    ShieldedRunOutcome::Accepted(ShieldedAcceptedOutcome {
+        body: aggregated.body,
+        sse_body: aggregated.sse_body,
+        response_metadata: aggregated.response_metadata,
+        prior_attempt_records: attempt_records,
+        final_attempt: aggregated.final_attempt,
+    })
+}
+
+fn direct_relay_no_thinking_stream_outcome(
+    started: ShieldedStartedAttempt,
+    attempt_records: &[AttemptRecord],
+) -> ShieldedDirectRelayOutcome {
+    ShieldedDirectRelayOutcome {
+        started,
+        prior_attempt_records: attempt_records.to_vec(),
+        response_metadata: no_thinking_direct_relay_metadata(),
+    }
+}
+
+fn should_direct_relay_no_thinking_stream(
+    runtime: &ShieldedRetryRuntime,
+    info: &ShieldedAttemptInfo,
+    retry_cause: Option<ShieldedRetryCause>,
+) -> bool {
+    runtime.chat_kind == ShieldedChatKind::Stream
+        && info.attempt_number > 1
+        && matches!(retry_cause, Some(ShieldedRetryCause::LoopDetected))
+        && info
+            .request_metadata
+            .get("attempt_thinking_mode")
+            .is_some_and(|mode| mode == ThinkingMode::ForceDisable.as_str())
+}
+
+fn no_thinking_direct_relay_metadata() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            String::from("shielded_direct_streaming_relay"),
+            String::from("true"),
+        ),
+        (
+            String::from("shielded_loop_inspection_skipped"),
+            String::from("no_thinking_direct_streaming_relay"),
+        ),
+    ])
 }
 
 const fn retry_attempt_status(can_retry: bool) -> AttemptStatus {
@@ -4637,6 +4704,44 @@ fn shielded_retry_terminal_forward_response(
     )
 }
 
+fn shielded_retry_direct_relay_response(
+    runtime: &ShieldedRetryRuntime,
+    outcome: ShieldedDirectRelayOutcome,
+    in_flight_permit: InFlightPermit,
+) -> Response<Body> {
+    let upstream_status = outcome.started.info.upstream_status;
+    let upstream_headers = outcome.started.info.upstream_headers.clone();
+    let final_attempt = outcome
+        .started
+        .info
+        .clone()
+        .into_final_context(outcome.response_metadata.clone(), RawPayloads::default());
+    let observer = shielded_retry_observer(
+        runtime,
+        ShieldedRetryObserverInput {
+            downstream_mode: DownstreamMode::Streaming,
+            downstream_status: upstream_status,
+            downstream_headers: upstream_headers.clone(),
+            upstream_mode: final_attempt.upstream_mode,
+            extra_response_metadata: outcome.response_metadata,
+            raw_payloads: RawPayloads::default(),
+            completed_attempt_records: outcome.prior_attempt_records,
+            final_attempt: Some(final_attempt),
+            attempt_progress: None,
+        },
+    );
+    let response_body = ObservedUpstreamBody::new(
+        outcome.started.response.bytes_stream(),
+        observer,
+        in_flight_permit,
+    );
+    downstream_response(
+        upstream_status,
+        &upstream_headers,
+        Body::from_stream(response_body),
+    )
+}
+
 struct ShieldedRetryObserverInput {
     downstream_mode: DownstreamMode,
     downstream_status: reqwest::StatusCode,
@@ -5114,8 +5219,14 @@ impl Drop for ObservedBufferedBody {
     }
 }
 
+enum ShieldedAggregateOutcome {
+    Accepted(ShieldedAcceptedOutcome),
+    DirectRelay(ShieldedDirectRelayOutcome),
+}
+
 type ShieldedAggregateFuture =
-    Pin<Box<dyn Future<Output = Result<ShieldedAcceptedOutcome, ShieldedFailureOutcome>> + Send>>;
+    Pin<Box<dyn Future<Output = Result<ShieldedAggregateOutcome, ShieldedFailureOutcome>> + Send>>;
+type DirectRelayStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShieldedAcceptedResponseMode {
@@ -5125,6 +5236,7 @@ enum ShieldedAcceptedResponseMode {
 
 struct ShieldedLivenessBody {
     aggregate: ShieldedAggregateFuture,
+    direct_stream: Option<DirectRelayStream>,
     interval: Interval,
     mode: ShieldedLivenessMode,
     accepted_response_mode: ShieldedAcceptedResponseMode,
@@ -5149,6 +5261,7 @@ impl ShieldedLivenessBody {
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
             aggregate,
+            direct_stream: None,
             interval,
             mode,
             accepted_response_mode,
@@ -5191,6 +5304,56 @@ impl ShieldedLivenessBody {
             ShieldedLivenessMode::JsonWhitespace | ShieldedLivenessMode::Disabled => body,
         }
     }
+
+    fn start_direct_relay(&mut self, outcome: ShieldedDirectRelayOutcome) {
+        let mut final_attempt = outcome
+            .started
+            .info
+            .into_final_context(outcome.response_metadata.clone(), RawPayloads::default());
+        if let Some(observer) = &mut self.observer {
+            observer
+                .completed_attempt_records
+                .clone_from(&outcome.prior_attempt_records);
+            observer
+                .extra_response_metadata
+                .extend(outcome.response_metadata);
+            final_attempt
+                .extra_response_metadata
+                .extend(observer.extra_response_metadata.clone());
+            if let Some(progress) = &observer.attempt_progress {
+                let mut progress = shielded_attempt_progress(progress);
+                progress.completed_attempt_records = outcome.prior_attempt_records;
+                progress.current_attempt = Some(final_attempt.clone());
+            }
+            observer.final_attempt = Some(final_attempt);
+        }
+        self.direct_stream = Some(Box::pin(outcome.started.response.bytes_stream()));
+    }
+
+    fn poll_direct_stream(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Bytes, Infallible>>> {
+        let Some(stream) = &mut self.direct_stream else {
+            return Poll::Pending;
+        };
+        match stream.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(bytes))) => self.count_and_emit(bytes),
+            Poll::Ready(Some(Err(error))) => {
+                let error_message = sanitized_reqwest_error(&error);
+                let chunk = self.error_chunk("llm_guard_upstream_error", &error_message);
+                self.terminal_completion = Some(BodyCompletion::UpstreamStreamError(error_message));
+                self.direct_stream = None;
+                self.count_and_emit(chunk)
+            }
+            Poll::Ready(None) => {
+                self.direct_stream = None;
+                self.record_once(&BodyCompletion::Succeeded);
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 impl Stream for ShieldedLivenessBody {
@@ -5208,8 +5371,12 @@ impl Stream for ShieldedLivenessBody {
             return this.count_and_emit(json_whitespace_heartbeat());
         }
 
+        if this.direct_stream.is_some() {
+            return this.poll_direct_stream(cx);
+        }
+
         match this.aggregate.as_mut().poll(cx) {
-            Poll::Ready(Ok(outcome)) => {
+            Poll::Ready(Ok(ShieldedAggregateOutcome::Accepted(outcome))) => {
                 let chunk = this.accepted_chunk(&outcome);
                 if let Some(observer) = &mut this.observer {
                     observer.completed_attempt_records = outcome.prior_attempt_records;
@@ -5225,6 +5392,10 @@ impl Stream for ShieldedLivenessBody {
                 }
                 this.terminal_completion = Some(BodyCompletion::Succeeded);
                 return this.count_and_emit(chunk);
+            }
+            Poll::Ready(Ok(ShieldedAggregateOutcome::DirectRelay(outcome))) => {
+                this.start_direct_relay(outcome);
+                return this.poll_direct_stream(cx);
             }
             Poll::Ready(Err(failure)) => {
                 if let Some(observer) = &mut this.observer {

@@ -4237,6 +4237,188 @@ shielded_streaming_enabled = true
 }
 
 #[tokio::test]
+async fn shielded_streaming_direct_relays_final_no_thinking_retry_after_loop_downgrades() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 3
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+max_tokens = 50000
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=loop-twice-then-success",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"stream"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let mut body = response.into_body().into_data_stream();
+    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    assert!(released.contains("chat.completion.chunk"));
+    assert!(released.contains("Hel"));
+    assert!(released.contains("data: [DONE]"));
+    assert!(!released.contains("event: final"));
+    assert!(!released.contains("reasoning loop line"));
+
+    let first_attempt = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+    let third_attempt = fake.recv_next().await;
+    assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
+    assert_eq!(body_thinking_budget(&second_attempt.body), Some(8_192));
+    assert_eq!(body_thinking_budget(&third_attempt.body), Some(0));
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[1].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[2].status, "succeeded");
+    assert_eq!(attempts[2].response_metadata["attempt_name"], "no-thinking");
+    assert_eq!(
+        attempts[2].response_metadata["attempt_thinking_mode"],
+        "force_disable"
+    );
+    assert_eq!(
+        attempts[2].response_metadata["shielded_direct_streaming_relay"],
+        "true"
+    );
+    assert_eq!(
+        attempts[2].response_metadata["shielded_loop_inspection_skipped"],
+        "no_thinking_direct_streaming_relay"
+    );
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    assert_eq!(
+        request_row.response_metadata["shielded_direct_streaming_relay"],
+        "true"
+    );
+}
+
+#[tokio::test]
+async fn shielded_streaming_direct_no_thinking_drop_cancels_upstream_relay() {
+    let mut upstream = CancellableUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &upstream.base_url,
+        true,
+        1,
+        r#"
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 3
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+downstream_drop_policy = "cancel"
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+thinking_token_budget = 8192
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-twice-then-cancellable-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"stream"}],"stream":true}"#)
+        .send()
+        .await
+        .expect("streaming direct relay request should receive response headers");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut downstream = response.bytes_stream();
+    let first = next_chunk(
+        &mut downstream,
+        STREAM_COMPLETION_TIMEOUT,
+        "first direct no-thinking SSE chunk",
+    )
+    .await;
+    assert!(first.starts_with(b"data: "));
+    drop(downstream);
+
+    let first_attempt = upstream.recv_request().await;
+    let second_attempt = upstream.recv_request().await;
+    let third_attempt = upstream.recv_request().await;
+    assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
+    assert_eq!(body_thinking_budget(&second_attempt.body), Some(8_192));
+    assert_eq!(body_thinking_budget(&third_attempt.body), Some(0));
+
+    let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+    assert_eq!(drop_event.label, "cancellable-chat-sse");
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "aborted");
+    assert_eq!(
+        request_row.abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[2].status, "aborted");
+    assert_eq!(
+        attempts[2].abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+    assert_eq!(
+        attempts[2].response_metadata["shielded_direct_streaming_relay"],
+        "true"
+    );
+}
+
+#[tokio::test]
 async fn per_model_routing_selects_named_upstream_and_records_bounded_metadata() {
     let mut default = FakeUpstream::spawn().await;
     let mut aeon = FakeUpstream::spawn().await;
@@ -10176,6 +10358,7 @@ struct CancellableUpstream {
 struct CancellableUpstreamState {
     request_sender: mpsc::Sender<ObservedRequest>,
     drop_sender: mpsc::Sender<UpstreamDropEvent>,
+    attempt_counts: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl CancellableUpstream {
@@ -10187,6 +10370,7 @@ impl CancellableUpstream {
             .with_state(CancellableUpstreamState {
                 request_sender,
                 drop_sender,
+                attempt_counts: Arc::new(Mutex::new(HashMap::new())),
             });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -10489,17 +10673,35 @@ async fn cancellable_upstream_handler(
 ) -> Response<Body> {
     let observed = observe_request(request).await;
     let body = observed.body.clone();
+    let path_and_query = observed.path_and_query.clone();
     state
         .request_sender
         .send(observed)
         .await
         .expect("cancellable upstream observation should send");
 
+    if path_and_query.contains("test=loop-twice-then-cancellable-success")
+        && body_requests_stream(&body)
+        && next_cancellable_attempt_count(&state, &path_and_query) <= 2
+    {
+        return repeated_reasoning_line_sse_response(200);
+    }
+
     if body_requests_stream(&body) {
         cancellable_chat_sse_response(state.drop_sender)
     } else {
         cancellable_chat_json_response(state.drop_sender)
     }
+}
+
+fn next_cancellable_attempt_count(state: &CancellableUpstreamState, key: &str) -> u64 {
+    let mut counts = state
+        .attempt_counts
+        .lock()
+        .expect("cancellable attempt counts should lock");
+    let entry = counts.entry(key.to_owned()).or_insert(0);
+    *entry = entry.saturating_add(1);
+    *entry
 }
 
 async fn fake_upstream_handler(
