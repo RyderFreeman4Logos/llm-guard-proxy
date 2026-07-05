@@ -1,0 +1,19 @@
+{
+  "id": "commonsenseqa_58",
+  "source": "commonsenseqa",
+  "expected_severity": "abort_candidate",
+  "channel": "reasoning",
+  "fragments": [
+    "Wait, I need to reconsider the approach here.\n",
+    "Wait, I need to reconsider the approach here.\n",
+    "Wait, I need to reconsider the approach here.\n",
+    "Wait, I need to reconsider the approach here.\n"
+  ],
+  "derived_metrics": {
+    "original_reasoning_chars": 32782,
+    "original_unique_token_ratio": 0.0003,
+    "original_ngram5_repeat_ratio": 0.9997,
+    "original_hard_rules_hit": "hard:top_80char_window_count>=25; hard:chars>30000 & unique_ratio<0.12 & ngram5_repeat>0.25"
+  },
+  "description": "Synthetic reasoning loop derived from AEON issue #14 commonsenseqa_58 metrics. Original had 32782 reasoning chars, unique_ratio=0.0003, ngram5=0.9997. Fragment text is synthetic; only the repetition pattern is preserved."
+}

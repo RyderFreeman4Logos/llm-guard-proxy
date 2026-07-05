@@ -1,0 +1,25 @@
+{
+  "description": "Loop detector fixture corpus derived from AEON issue #14 artifacts",
+  "source": "AEON issue #14 sanitized evaluation bundle (2026-07-04)",
+  "original_sample_size": 1841,
+  "hard_loop_rate": "4.0% (74/1841)",
+  "mild_or_hard_rate": "22.8% (420/1841)",
+  "categories": {
+    "hard_positives": {
+      "count": 8,
+      "expected_severity": "abort_candidate",
+      "description": "Synthetic reasoning streams reproducing hard loop signals"
+    },
+    "mild_positives": {
+      "count": 5,
+      "expected_severity": "suspect_or_observe",
+      "description": "Borderline cases that should remain telemetry-only"
+    },
+    "clean_negatives": {
+      "count": 5,
+      "expected_severity": "none",
+      "description": "Clean controls from sources with 0% hard loops"
+    }
+  },
+  "note": "All fixture text is synthetic. No raw CoT/reasoning is committed. Fixtures preserve only the repetition patterns and derived metrics."
+}

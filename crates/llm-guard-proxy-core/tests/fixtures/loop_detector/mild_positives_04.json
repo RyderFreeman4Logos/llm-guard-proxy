@@ -1,0 +1,16 @@
+{
+  "id": "bbh_boolean_expressions_15",
+  "source": "bbh/boolean_expressions",
+  "expected_severity": "suspect_or_observe",
+  "channel": "reasoning",
+  "fragments": [
+    "Let me work through this.\n",
+    "Let me work through this.\n"
+  ],
+  "derived_metrics": {
+    "original_reasoning_chars": 12680,
+    "original_unique_token_ratio": 0.158,
+    "original_ngram5_repeat_ratio": 0.1522
+  },
+  "description": "Synthetic mild loop derived from AEON issue #14 bbh_boolean_expressions_15. Borderline case: original unique_ratio=0.1580. 2 repetitions (below abort threshold) to test Suspect-only behavior."
+}

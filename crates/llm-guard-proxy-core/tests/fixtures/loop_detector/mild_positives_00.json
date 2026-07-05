@@ -1,0 +1,16 @@
+{
+  "id": "arc_challenge_49",
+  "source": "arc_challenge",
+  "expected_severity": "suspect_or_observe",
+  "channel": "reasoning",
+  "fragments": [
+    "Let me work through this.\n",
+    "Let me work through this.\n"
+  ],
+  "derived_metrics": {
+    "original_reasoning_chars": 19464,
+    "original_unique_token_ratio": 0.1581,
+    "original_ngram5_repeat_ratio": 0.1302
+  },
+  "description": "Synthetic mild loop derived from AEON issue #14 arc_challenge_49. Borderline case: original unique_ratio=0.1581. 2 repetitions (below abort threshold) to test Suspect-only behavior."
+}

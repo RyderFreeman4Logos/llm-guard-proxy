@@ -1,0 +1,25 @@
+{
+  "id": "bbh_multistep_arithmetic_two_14",
+  "source": "bbh/multistep_arithmetic_two",
+  "expected_severity": "abort_candidate",
+  "channel": "reasoning",
+  "fragments": [
+    "Actually, let me try a different method now.\n",
+    "Actually, let me try a different method now.\n",
+    "Actually, let me try a different method now.\n",
+    "Actually, let me try a different method now.\n",
+    "Actually, let me try a different method now.\n",
+    "Actually, let me try a different method now.\n",
+    "Actually, let me try a different method now.\n",
+    "Actually, let me try a different method now.\n",
+    "Actually, let me try a different method now.\n",
+    "Actually, let me try a different method now.\n"
+  ],
+  "derived_metrics": {
+    "original_reasoning_chars": 89019,
+    "original_unique_token_ratio": 0.0319,
+    "original_ngram5_repeat_ratio": 0.7398,
+    "original_hard_rules_hit": "hard:reasoning_chars>80000; hard:wait_count>=80; hard:chars>30000 & unique_ratio<0.12 & ngram5_repeat>0.25"
+  },
+  "description": "Synthetic reasoning loop derived from AEON issue #14 bbh_multistep_arithmetic_two_14 metrics. Original had 89019 reasoning chars, unique_ratio=0.0319, ngram5=0.7398. Fragment text is synthetic; only the repetition pattern is preserved."
+}
