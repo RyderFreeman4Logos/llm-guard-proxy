@@ -1,0 +1,18 @@
+{
+  "source": "bbh/tracking_shuffled_objects_three_objects",
+  "expected_severity": "none",
+  "channel": "reasoning",
+  "fragments": [
+    "First, I'll identify the key variables in this problem.\n",
+    "The equation of motion relates position to time.\n",
+    "Substituting the given values into our formula.\n",
+    "The result follows directly from the calculation above.\n",
+    "Therefore, the answer is consistent with our expectations.\n"
+  ],
+  "derived_metrics": {
+    "source_mean_reasoning_chars": 3776.4857142857145,
+    "source_n": 35,
+    "source_hard_pct": 0.0
+  },
+  "description": "Clean control derived from AEON issue #14 source 'bbh/tracking_shuffled_objects_three_objects'. Source has 0% hard loops across 35 samples. Unique reasoning fragments with no repetition."
+}

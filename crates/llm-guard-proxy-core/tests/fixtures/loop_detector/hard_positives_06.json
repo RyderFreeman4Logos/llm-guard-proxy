@@ -1,0 +1,25 @@
+{
+  "id": "gsm8k_17",
+  "source": "gsm8k",
+  "expected_severity": "abort_candidate",
+  "channel": "reasoning",
+  "fragments": [
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n"
+  ],
+  "derived_metrics": {
+    "original_reasoning_chars": 82882,
+    "original_unique_token_ratio": 0.0363,
+    "original_ngram5_repeat_ratio": 0.7319,
+    "original_hard_rules_hit": "hard:reasoning_chars>80000; hard:top_80char_window_count>=25; hard:wait_count>=80; hard:chars>30000 & unique_ratio<0.12 & ngram5_repeat>0.25"
+  },
+  "description": "Synthetic reasoning loop derived from AEON issue #14 gsm8k_17 metrics. Original had 82882 reasoning chars, unique_ratio=0.0363, ngram5=0.7319. Fragment text is synthetic; only the repetition pattern is preserved."
+}

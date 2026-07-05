@@ -1,0 +1,25 @@
+{
+  "id": "HumanEval_46",
+  "source": "humaneval",
+  "expected_severity": "abort_candidate",
+  "channel": "reasoning",
+  "fragments": [
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n",
+    "Let me think about this step by step carefully.\n"
+  ],
+  "derived_metrics": {
+    "original_reasoning_chars": 56485,
+    "original_unique_token_ratio": 0.0603,
+    "original_ngram5_repeat_ratio": 0.2618,
+    "original_hard_rules_hit": "hard:wait_count>=80; hard:chars>30000 & unique_ratio<0.12 & ngram5_repeat>0.25"
+  },
+  "description": "Synthetic reasoning loop derived from AEON issue #14 HumanEval_46 metrics. Original had 56485 reasoning chars, unique_ratio=0.0603, ngram5=0.2618. Fragment text is synthetic; only the repetition pattern is preserved."
+}
