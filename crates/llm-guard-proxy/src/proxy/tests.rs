@@ -138,6 +138,10 @@ async fn metrics_expose_retained_gauges_without_secrets() {
         .expect("metrics request should complete");
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.text().await.expect("metrics should be text");
+    assert_metric_type(&body, "llm_guard_proxy_generation_active", "gauge");
+    assert_metric_type(&body, "llm_guard_proxy_generation_queued", "gauge");
+    assert_metric_type(&body, "llm_guard_proxy_generation_profile_active", "gauge");
+    assert_metric_type(&body, "llm_guard_proxy_generation_profile_queued", "gauge");
     assert_metric_type(&body, "llm_guard_proxy_current_retained_requests", "gauge");
     assert_metric_type(&body, "llm_guard_proxy_current_retained_attempts", "gauge");
     assert_metric_type(&body, "llm_guard_proxy_current_retained_retries", "gauge");
@@ -222,6 +226,60 @@ async fn retained_metrics_stay_prometheus_safe_after_pruning() {
         metric_value(&after, "llm_guard_proxy_storage_pruned_attempts_total")
             > before_pruned_attempts
     );
+}
+
+#[tokio::test]
+async fn metrics_expose_generation_active_and_queued_gauges() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_queued_generation_requests = 1\ngeneration_queue_timeout_ms = 5000\n",
+    )
+    .await;
+    let active_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=metrics-active"),
+    )
+    .await;
+    assert_eq!(active_response.status(), StatusCode::OK);
+    let active_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("active request should reach upstream");
+    assert_eq!(
+        active_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=metrics-active"
+    );
+
+    let (queued_request, queued_body_polled) = tracked_json_request(
+        "/v1/completions?slot=metrics-queued",
+        br#"{"prompt":"queued"}"#,
+    );
+    let queued = tokio::spawn(proxy_handler(State(proxy.state.clone()), queued_request));
+    sleep(Duration::from_millis(50)).await;
+    assert!(!queued_body_polled.load(Ordering::SeqCst));
+    assert!(!queued.is_finished());
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        metric_value(&metrics, "llm_guard_proxy_generation_active"),
+        1
+    );
+    assert_eq!(
+        metric_value(&metrics, "llm_guard_proxy_generation_queued"),
+        1
+    );
+
+    queued.abort();
+    assert!(
+        queued
+            .await
+            .expect_err("queued metrics request should be aborted")
+            .is_cancelled()
+    );
+    drop(active_response);
 }
 
 #[tokio::test]
@@ -9785,6 +9843,348 @@ async fn generation_queue_full_fails_without_body_buffering_or_upstream_forward(
     drop(first_response);
 }
 
+#[tokio::test]
+async fn generation_queue_full_returns_configured_429_status() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_queued_generation_requests = 0\ngeneration_queue_timeout_ms = 1000\ngeneration_queue_full_status = 429\n",
+    )
+    .await;
+    let active_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=configured-status-active"),
+    )
+    .await;
+    assert_eq!(active_response.status(), StatusCode::OK);
+    let active_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("active request should hold generation capacity");
+    assert_eq!(
+        active_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=configured-status-active"
+    );
+
+    let (overflow_request, overflow_body_polled) = tracked_json_request(
+        "/v1/completions?slot=configured-status-overflow",
+        br#"{"prompt":"overflow"}"#,
+    );
+    let overflow_response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy_handler(State(proxy.state.clone()), overflow_request),
+    )
+    .await
+    .expect("queue-full response should be bounded");
+
+    assert_eq!(overflow_response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        overflow_response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    assert!(
+        !overflow_body_polled.load(Ordering::SeqCst),
+        "configured queue-full rejection must not read the request body"
+    );
+    assert_no_upstream_request(&mut fake).await;
+    drop(active_response);
+}
+
+#[tokio::test]
+async fn generation_queue_full_returns_configured_retry_after() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_queued_generation_requests = 0\ngeneration_queue_timeout_ms = 1000\ngeneration_queue_retry_after_secs = 30\n",
+    )
+    .await;
+    let active_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=configured-retry-active"),
+    )
+    .await;
+    assert_eq!(active_response.status(), StatusCode::OK);
+    let active_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("active request should hold generation capacity");
+    assert_eq!(
+        active_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=configured-retry-active"
+    );
+
+    let (overflow_request, overflow_body_polled) = tracked_json_request(
+        "/v1/completions?slot=configured-retry-overflow",
+        br#"{"prompt":"overflow"}"#,
+    );
+    let overflow_response = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy_handler(State(proxy.state.clone()), overflow_request),
+    )
+    .await
+    .expect("queue-full response should be bounded");
+
+    assert_eq!(overflow_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        overflow_response
+            .headers()
+            .get("retry-after")
+            .and_then(|value| value.to_str().ok()),
+        Some("30")
+    );
+    assert!(
+        !overflow_body_polled.load(Ordering::SeqCst),
+        "configured Retry-After queue-full rejection must not read the request body"
+    );
+    assert_no_upstream_request(&mut fake).await;
+    drop(active_response);
+}
+
+#[tokio::test]
+async fn queued_request_cancelled_on_downstream_disconnect_never_reaches_upstream() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_queued_generation_requests = 1\ngeneration_queue_timeout_ms = 5000\n",
+    )
+    .await;
+    let active_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=cancel-active"),
+    )
+    .await;
+    assert_eq!(active_response.status(), StatusCode::OK);
+    let active_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("active request should hold generation capacity");
+    assert_eq!(
+        active_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=cancel-active"
+    );
+
+    let (cancelled_request, cancelled_body_polled) = tracked_json_request(
+        "/v1/completions?slot=cancelled-queued",
+        br#"{"prompt":"cancelled"}"#,
+    );
+    let cancelled = tokio::spawn(proxy_handler(State(proxy.state.clone()), cancelled_request));
+    sleep(Duration::from_millis(50)).await;
+    assert!(!cancelled_body_polled.load(Ordering::SeqCst));
+    assert!(!cancelled.is_finished());
+
+    cancelled.abort();
+    assert!(
+        cancelled
+            .await
+            .expect_err("queued request future should be cancelled")
+            .is_cancelled()
+    );
+    assert!(!cancelled_body_polled.load(Ordering::SeqCst));
+    let cancel_record = read_latest_aborted_request_metadata(&proxy);
+    assert_eq!(
+        cancel_record.abort_reason.as_deref(),
+        Some("downstream_disconnected_while_queued")
+    );
+    assert_eq!(
+        cancel_record.request_metadata["admission_outcome"],
+        "queue_cancelled"
+    );
+    assert_eq!(cancel_record.request_metadata["path"], "/v1/completions");
+    assert_no_upstream_request(&mut fake).await;
+
+    let (replacement_request, replacement_body_polled) = tracked_json_request(
+        "/v1/completions?slot=replacement-queued",
+        br#"{"prompt":"replacement"}"#,
+    );
+    let replacement = tokio::spawn(proxy_handler(
+        State(proxy.state.clone()),
+        replacement_request,
+    ));
+    sleep(Duration::from_millis(50)).await;
+    assert!(
+        !replacement_body_polled.load(Ordering::SeqCst),
+        "replacement should be queued before capacity is released"
+    );
+    assert!(
+        !replacement.is_finished(),
+        "replacement should queue, proving the cancelled request left the queue"
+    );
+
+    drop(active_response);
+    let replacement_response = timeout(STREAM_COMPLETION_TIMEOUT, replacement)
+        .await
+        .expect("replacement should complete after capacity is released")
+        .expect("replacement task should not panic");
+    assert_eq!(replacement_response.status(), StatusCode::OK);
+    let _body = to_bytes(replacement_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("replacement body should read");
+    let replacement_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("replacement request should reach upstream after release");
+    assert_eq!(
+        replacement_observed.path_and_query,
+        "/v1/completions?slot=replacement-queued"
+    );
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+async fn queued_request_cancelled_on_downstream_disconnect_per_profile_limiter() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        16,
+        &format!(
+            r#"max_queued_generation_requests = 0
+generation_queue_timeout_ms = 5000
+
+[[upstreams]]
+name = "embedding"
+base_url = "{}"
+match_models = ["embedding-model"]
+max_in_flight_requests = 1
+max_queued_generation_requests = 1
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+    let active_response = proxy_handler(
+        State(proxy.state.clone()),
+        embedding_request("/v1/embeddings?test=long-json&slot=profile-cancel-active"),
+    )
+    .await;
+    assert_eq!(active_response.status(), StatusCode::OK);
+    let active_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("active profile request should hold profile capacity");
+    assert_eq!(
+        active_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=profile-cancel-active"
+    );
+
+    let cancelled = tokio::spawn(proxy_handler(
+        State(proxy.state.clone()),
+        embedding_request("/v1/embeddings?test=long-json&slot=profile-cancelled-queued"),
+    ));
+    sleep(Duration::from_millis(50)).await;
+    assert!(!cancelled.is_finished());
+    cancelled.abort();
+    assert!(
+        cancelled
+            .await
+            .expect_err("queued profile request future should be cancelled")
+            .is_cancelled()
+    );
+    let cancel_record = read_latest_aborted_request_metadata(&proxy);
+    assert_eq!(
+        cancel_record.request_metadata["admission_outcome"],
+        "queue_cancelled"
+    );
+    assert_eq!(cancel_record.request_metadata["path"], "/v1/embeddings");
+    assert_no_upstream_request(&mut fake).await;
+
+    let replacement = tokio::spawn(proxy_handler(
+        State(proxy.state.clone()),
+        embedding_request("/v1/embeddings?test=long-json&slot=profile-replacement-queued"),
+    ));
+    sleep(Duration::from_millis(50)).await;
+    assert!(
+        !replacement.is_finished(),
+        "replacement should queue in the profile limiter"
+    );
+
+    drop(active_response);
+    let replacement_response = timeout(STREAM_COMPLETION_TIMEOUT, replacement)
+        .await
+        .expect("profile replacement should complete after capacity is released")
+        .expect("profile replacement task should not panic");
+    assert_eq!(replacement_response.status(), StatusCode::OK);
+    let _body = to_bytes(replacement_response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("profile replacement body should read");
+    let replacement_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("profile replacement request should reach upstream after release");
+    assert_eq!(
+        replacement_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=profile-replacement-queued"
+    );
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+async fn high_queue_capacity_allows_c32_without_immediate_rejection() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_queued_generation_requests = 256\ngeneration_queue_timeout_ms = 5000\n",
+    )
+    .await;
+    let active_response = proxy_handler(
+        State(proxy.state.clone()),
+        empty_get_request("/v1/embeddings?test=long-json&slot=c32-active"),
+    )
+    .await;
+    assert_eq!(active_response.status(), StatusCode::OK);
+    let active_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("active request should hold generation capacity");
+    assert_eq!(
+        active_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=c32-active"
+    );
+
+    let mut queued = Vec::new();
+    for index in 0..32 {
+        let uri = format!("/v1/completions?slot=c32-{index}");
+        let (request, body_polled) = tracked_json_request(&uri, br#"{"prompt":"queued"}"#);
+        let handle = tokio::spawn(proxy_handler(State(proxy.state.clone()), request));
+        queued.push((handle, body_polled));
+    }
+    sleep(Duration::from_millis(50)).await;
+
+    for (index, (handle, body_polled)) in queued.iter().enumerate() {
+        assert!(
+            !handle.is_finished(),
+            "queued request {index} should wait instead of being rejected"
+        );
+        assert!(
+            !body_polled.load(Ordering::SeqCst),
+            "queued request {index} must not read its body before admission"
+        );
+    }
+    assert_no_upstream_request(&mut fake).await;
+
+    for (handle, _body_polled) in queued {
+        handle.abort();
+        assert!(
+            handle
+                .await
+                .expect_err("queued c32 request should be aborted")
+                .is_cancelled()
+        );
+    }
+    drop(active_response);
+}
+
 fn tracked_json_request(uri: &str, body: &'static [u8]) -> (Request<Body>, Arc<AtomicBool>) {
     let polled = Arc::new(AtomicBool::new(false));
     let request_body = Body::from_stream(stream::once({
@@ -10475,6 +10875,34 @@ fn read_single_request_and_attempt_metadata(
     let attempt_metadata =
         serde_json::from_str(&attempt_metadata_json).expect("attempt metadata should parse");
     (request_metadata, attempt_metadata)
+}
+
+struct AbortedRequestMetadata {
+    abort_reason: Option<String>,
+    request_metadata: serde_json::Value,
+}
+
+fn read_latest_aborted_request_metadata(proxy: &ProxyFixture) -> AbortedRequestMetadata {
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let (http_status, abort_reason, request_metadata_json): (Option<i64>, Option<String>, String) =
+        connection
+            .query_row(
+                "SELECT http_status, abort_reason, request_metadata_json \
+             FROM requests WHERE status = 'aborted' ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("aborted request row should exist");
+    assert_eq!(
+        http_status, None,
+        "queued cancellation should not invent an HTTP response status"
+    );
+    let request_metadata =
+        serde_json::from_str(&request_metadata_json).expect("request metadata should parse");
+    AbortedRequestMetadata {
+        abort_reason,
+        request_metadata,
+    }
 }
 
 async fn post_chat_and_observe_body(

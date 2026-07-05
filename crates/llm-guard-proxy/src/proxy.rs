@@ -55,7 +55,7 @@ const HEADER_VALUE_NOT_UTF8: &str = "[non-utf8]";
 const HEADER_VALUE_REDACTED: &str = "[redacted]";
 const DEBUG_SUMMARY_PATH: &str = "/debug/recent-requests";
 const IN_FLIGHT_CAPACITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
-const ADMISSION_RETRY_AFTER_SECS: &str = "1";
+const ADMISSION_RETRY_AFTER_SECS: u32 = 1;
 const RECOVERY_PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(100);
 const RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE: Duration = Duration::from_millis(500);
 const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
@@ -120,36 +120,49 @@ impl ProxyState {
 
     async fn acquire_generation_permit(
         &self,
-    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
-        self.acquire_generation_permit_with_limiter(Arc::clone(&self.generation_requests))
-            .await
+        record_context: AdmissionRecordContext,
+    ) -> Result<GenerationAdmission, AdmissionFailure> {
+        self.acquire_generation_permit_with_limiter(
+            Arc::clone(&self.generation_requests),
+            record_context,
+        )
+        .await
     }
 
     async fn acquire_generation_body_routing_permit(
         &self,
-    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
-        self.acquire_generation_permit_with_limiter(Arc::clone(
-            &self.generation_body_routing_requests,
-        ))
+        record_context: AdmissionRecordContext,
+    ) -> Result<GenerationAdmission, AdmissionFailure> {
+        self.acquire_generation_permit_with_limiter(
+            Arc::clone(&self.generation_body_routing_requests),
+            record_context,
+        )
         .await
     }
 
     async fn acquire_generation_permit_with_limiter(
         &self,
         limiter: Arc<InFlightLimiter>,
-    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
+        record_context: AdmissionRecordContext,
+    ) -> Result<GenerationAdmission, AdmissionFailure> {
         let config = self
             .config
             .snapshot()
             .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
         if let Some(permit) = limiter.try_acquire(config.server.max_in_flight_requests) {
-            return Ok((config, permit));
+            return Ok(GenerationAdmission::acquired(
+                config,
+                permit,
+                Duration::ZERO,
+            ));
         }
 
         let Some(queue_permit) = limiter.try_enqueue(config.server.max_queued_generation_requests)
         else {
             return Err(AdmissionFailure::GenerationQueueFull {
                 max_queued_generation_requests: config.server.max_queued_generation_requests,
+                status: config.server.generation_queue_full_status,
+                retry_after_secs: config.server.generation_queue_retry_after_secs,
             });
         };
 
@@ -157,6 +170,7 @@ impl ProxyState {
             limiter,
             queue_permit,
             config.server.generation_queue_timeout_ms,
+            record_context,
         )
         .await
     }
@@ -166,21 +180,33 @@ impl ProxyState {
         limiter: Arc<InFlightLimiter>,
         _queue_permit: QueuedAdmissionPermit,
         timeout_ms: u64,
-    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        record_context: AdmissionRecordContext,
+    ) -> Result<GenerationAdmission, AdmissionFailure> {
+        let queued_at = Instant::now();
+        let mut cancel_recorder =
+            QueuedAdmissionCancelRecorder::new(record_context, queued_at, timeout_ms);
+        let deadline = queued_at + Duration::from_millis(timeout_ms);
         loop {
-            let config = self
-                .config
-                .snapshot()
-                .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+            let config = match self.config.snapshot() {
+                Ok(config) => config,
+                Err(error) => {
+                    cancel_recorder.disarm();
+                    return Err(AdmissionFailure::ConfigSnapshot(error.to_string()));
+                }
+            };
             if let Some(permit) = limiter.try_acquire(config.server.max_in_flight_requests) {
-                return Ok((config, permit));
+                let queue_wait = queued_at.elapsed();
+                cancel_recorder.disarm();
+                return Ok(GenerationAdmission::acquired(config, permit, queue_wait));
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                let queue_wait_ms = duration_millis_u64(queued_at.elapsed());
+                cancel_recorder.disarm();
                 return Err(AdmissionFailure::GenerationQueueTimeout {
                     generation_queue_timeout_ms: timeout_ms,
+                    queue_wait_ms,
                 });
             }
 
@@ -194,7 +220,8 @@ impl ProxyState {
         &self,
         model_id: Option<&str>,
         body_routing_permit: InFlightPermit,
-    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
+        record_context: AdmissionRecordContext,
+    ) -> Result<GenerationAdmission, AdmissionFailure> {
         let config = self
             .config
             .snapshot()
@@ -208,7 +235,11 @@ impl ProxyState {
                 .effective_max_in_flight_requests(&config.server),
         ) {
             drop(body_routing_permit);
-            return Ok((config, permit));
+            return Ok(GenerationAdmission::acquired(
+                config,
+                permit,
+                Duration::ZERO,
+            ));
         }
 
         let max_queued_generation_requests = selected_profile
@@ -218,6 +249,8 @@ impl ProxyState {
             drop(body_routing_permit);
             return Err(AdmissionFailure::GenerationQueueFull {
                 max_queued_generation_requests,
+                status: config.server.generation_queue_full_status,
+                retry_after_secs: config.server.generation_queue_retry_after_secs,
             });
         };
 
@@ -227,6 +260,7 @@ impl ProxyState {
             queue_permit,
             model_id.map(str::to_owned),
             config.server.generation_queue_timeout_ms,
+            record_context,
         )
         .await
     }
@@ -236,29 +270,47 @@ impl ProxyState {
         _queue_permit: QueuedAdmissionPermit,
         model_id: Option<String>,
         timeout_ms: u64,
-    ) -> Result<(AppConfig, InFlightPermit), AdmissionFailure> {
-        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        record_context: AdmissionRecordContext,
+    ) -> Result<GenerationAdmission, AdmissionFailure> {
+        let queued_at = Instant::now();
+        let mut cancel_recorder =
+            QueuedAdmissionCancelRecorder::new(record_context, queued_at, timeout_ms);
+        let deadline = queued_at + Duration::from_millis(timeout_ms);
         loop {
-            let config = self
-                .config
-                .snapshot()
-                .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+            let config = match self.config.snapshot() {
+                Ok(config) => config,
+                Err(error) => {
+                    cancel_recorder.disarm();
+                    return Err(AdmissionFailure::ConfigSnapshot(error.to_string()));
+                }
+            };
             let selected_profile =
-                select_allowed_upstream_profile(&config, &self.listener, model_id.as_deref())
-                    .map_err(AdmissionFailure::ListenerUpstreamDenied)?;
+                match select_allowed_upstream_profile(&config, &self.listener, model_id.as_deref())
+                {
+                    Ok(selected_profile) => selected_profile,
+                    Err(error) => {
+                        cancel_recorder.disarm();
+                        return Err(AdmissionFailure::ListenerUpstreamDenied(error));
+                    }
+                };
             let limiter = self.generation_limiter_for_profile(&selected_profile.profile);
             if let Some(permit) = limiter.try_acquire(
                 selected_profile
                     .profile
                     .effective_max_in_flight_requests(&config.server),
             ) {
-                return Ok((config, permit));
+                let queue_wait = queued_at.elapsed();
+                cancel_recorder.disarm();
+                return Ok(GenerationAdmission::acquired(config, permit, queue_wait));
             }
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
+                let queue_wait_ms = duration_millis_u64(queued_at.elapsed());
+                cancel_recorder.disarm();
                 return Err(AdmissionFailure::GenerationQueueTimeout {
                     generation_queue_timeout_ms: timeout_ms,
+                    queue_wait_ms,
                 });
             }
 
@@ -293,6 +345,22 @@ impl ProxyState {
             .ok_or(AdmissionFailure::ControlPlaneLimitExceeded {
                 max_control_plane_in_flight_requests,
             })
+    }
+
+    fn admission_metrics_snapshot(&self) -> AdmissionMetricsSnapshot {
+        let generation = self.generation_requests.snapshot_counts();
+        let mut profiles = generation_profile_limiters(&self.generation_profile_requests)
+            .iter()
+            .map(|(profile, limiter)| ProfileAdmissionMetrics {
+                profile: profile.clone(),
+                counts: limiter.snapshot_counts(),
+            })
+            .collect::<Vec<_>>();
+        profiles.sort_by(|left, right| left.profile.cmp(&right.profile));
+        AdmissionMetricsSnapshot {
+            generation,
+            profiles,
+        }
     }
 }
 
@@ -357,12 +425,89 @@ impl InFlightLimiter {
         counts.queued = counts.queued.saturating_sub(1);
         self.notify.notify_waiters();
     }
+
+    fn snapshot_counts(&self) -> AdmissionCounts {
+        *admission_counts(&self.counts)
+    }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 struct AdmissionCounts {
     active: usize,
     queued: usize,
+}
+
+#[derive(Debug)]
+struct AdmissionMetricsSnapshot {
+    generation: AdmissionCounts,
+    profiles: Vec<ProfileAdmissionMetrics>,
+}
+
+#[derive(Debug)]
+struct ProfileAdmissionMetrics {
+    profile: String,
+    counts: AdmissionCounts,
+}
+
+#[derive(Debug)]
+struct GenerationAdmission {
+    config: AppConfig,
+    permit: InFlightPermit,
+    queue_wait: Duration,
+}
+
+impl GenerationAdmission {
+    fn acquired(config: AppConfig, permit: InFlightPermit, queue_wait: Duration) -> Self {
+        Self {
+            config,
+            permit,
+            queue_wait,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AdmissionRecordContext {
+    store: ObservabilityStore,
+    request_id: RequestId,
+    started_at_unix_ms: u64,
+    request_metadata: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct QueuedAdmissionCancelRecorder {
+    record: Option<QueuedAdmissionCancelRecord>,
+}
+
+impl QueuedAdmissionCancelRecorder {
+    fn new(context: AdmissionRecordContext, queued_at: Instant, timeout_ms: u64) -> Self {
+        Self {
+            record: Some(QueuedAdmissionCancelRecord {
+                context,
+                queued_at,
+                timeout_ms,
+            }),
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.record = None;
+    }
+}
+
+impl Drop for QueuedAdmissionCancelRecorder {
+    fn drop(&mut self) {
+        if let Some(record) = self.record.take() {
+            record_queued_admission_cancel(record);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct QueuedAdmissionCancelRecord {
+    context: AdmissionRecordContext,
+    queued_at: Instant,
+    timeout_ms: u64,
 }
 
 fn admission_counts(current: &Mutex<AdmissionCounts>) -> MutexGuard<'_, AdmissionCounts> {
@@ -422,11 +567,16 @@ enum AdmissionFailure {
     )]
     GenerationQueueFull {
         max_queued_generation_requests: usize,
+        status: u16,
+        retry_after_secs: Option<u32>,
     },
     #[error(
         "proxy generation request queue wait timed out: generation_queue_timeout_ms={generation_queue_timeout_ms}"
     )]
-    GenerationQueueTimeout { generation_queue_timeout_ms: u64 },
+    GenerationQueueTimeout {
+        generation_queue_timeout_ms: u64,
+        queue_wait_ms: u64,
+    },
     #[error(
         "proxy control-plane request limit exceeded: max_control_plane_in_flight_requests={max_control_plane_in_flight_requests}"
     )]
@@ -438,13 +588,17 @@ enum AdmissionFailure {
 }
 
 impl AdmissionFailure {
-    const fn status(&self) -> StatusCode {
+    fn status(&self) -> StatusCode {
         match self {
             Self::ConfigSnapshot(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Self::ListenerUpstreamDenied(_) => StatusCode::BAD_REQUEST,
-            Self::GenerationQueueFull { .. }
-            | Self::GenerationQueueTimeout { .. }
-            | Self::ControlPlaneLimitExceeded { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::GenerationQueueFull { status, .. } => match StatusCode::from_u16(*status) {
+                Ok(status) => status,
+                Err(_error) => StatusCode::SERVICE_UNAVAILABLE,
+            },
+            Self::GenerationQueueTimeout { .. } | Self::ControlPlaneLimitExceeded { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
         }
     }
 
@@ -460,12 +614,55 @@ impl AdmissionFailure {
         }
     }
 
-    const fn retry_after(&self) -> Option<&'static str> {
+    fn retry_after(&self) -> Option<String> {
         match self {
             Self::ConfigSnapshot(_) | Self::ListenerUpstreamDenied(_) => None,
-            Self::GenerationQueueFull { .. }
-            | Self::GenerationQueueTimeout { .. }
-            | Self::ControlPlaneLimitExceeded { .. } => Some(ADMISSION_RETRY_AFTER_SECS),
+            Self::GenerationQueueFull {
+                retry_after_secs, ..
+            } => Some(
+                retry_after_secs
+                    .unwrap_or(ADMISSION_RETRY_AFTER_SECS)
+                    .to_string(),
+            ),
+            Self::GenerationQueueTimeout { .. } | Self::ControlPlaneLimitExceeded { .. } => {
+                Some(ADMISSION_RETRY_AFTER_SECS.to_string())
+            }
+        }
+    }
+
+    fn request_metadata(&self) -> BTreeMap<String, String> {
+        match self {
+            Self::GenerationQueueFull {
+                max_queued_generation_requests,
+                ..
+            } => BTreeMap::from([
+                (
+                    String::from("admission_outcome"),
+                    String::from("queue_full_rejected"),
+                ),
+                (String::from("queue_wait_ms"), String::from("0")),
+                (
+                    String::from("max_queued_generation_requests"),
+                    max_queued_generation_requests.to_string(),
+                ),
+            ]),
+            Self::GenerationQueueTimeout {
+                generation_queue_timeout_ms,
+                queue_wait_ms,
+            } => BTreeMap::from([
+                (
+                    String::from("admission_outcome"),
+                    String::from("queue_timeout"),
+                ),
+                (String::from("queue_wait_ms"), queue_wait_ms.to_string()),
+                (
+                    String::from("generation_queue_timeout_ms"),
+                    generation_queue_timeout_ms.to_string(),
+                ),
+            ]),
+            Self::ConfigSnapshot(_)
+            | Self::ListenerUpstreamDenied(_)
+            | Self::ControlPlaneLimitExceeded { .. } => BTreeMap::new(),
         }
     }
 }
@@ -673,7 +870,10 @@ async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
     match state.config.snapshot() {
         Ok(config) if config.observability.metrics_enabled.is_enabled() => {
             match state.store.metrics_snapshot() {
-                Ok(snapshot) => text_response(StatusCode::OK, render_metrics(&snapshot)),
+                Ok(snapshot) => {
+                    let admission = state.admission_metrics_snapshot();
+                    text_response(StatusCode::OK, render_metrics(&snapshot, &admission))
+                }
                 Err(error) => proxy_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "metrics_snapshot_failed",
@@ -845,8 +1045,12 @@ fn render_debug_summary_json(limit: u32, summaries: &[DebugRequestSummary]) -> s
     })
 }
 
-fn render_metrics(snapshot: &ObservabilityMetricsSnapshot) -> String {
+fn render_metrics(
+    snapshot: &ObservabilityMetricsSnapshot,
+    admission: &AdmissionMetricsSnapshot,
+) -> String {
     let mut output = String::new();
+    push_admission_metrics(&mut output, admission);
     push_request_metrics(&mut output, snapshot);
     push_attempt_metrics(&mut output, snapshot);
     push_retry_and_error_metrics(&mut output, snapshot);
@@ -854,6 +1058,61 @@ fn render_metrics(snapshot: &ObservabilityMetricsSnapshot) -> String {
     push_heartbeat_metrics(&mut output, snapshot);
     push_storage_metrics(&mut output, snapshot);
     output
+}
+
+fn push_admission_metrics(output: &mut String, admission: &AdmissionMetricsSnapshot) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_generation_active",
+        "Current generation requests holding an admitted upstream slot.",
+        "gauge",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_generation_active",
+        &[],
+        usize_to_u64(admission.generation.active),
+    );
+    push_metric_header(
+        output,
+        "llm_guard_proxy_generation_queued",
+        "Current generation requests waiting for an upstream slot.",
+        "gauge",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_generation_queued",
+        &[],
+        usize_to_u64(admission.generation.queued),
+    );
+    push_metric_header(
+        output,
+        "llm_guard_proxy_generation_profile_active",
+        "Current per-profile generation requests holding an admitted upstream slot.",
+        "gauge",
+    );
+    for profile in &admission.profiles {
+        push_metric_line(
+            output,
+            "llm_guard_proxy_generation_profile_active",
+            &[("profile", &profile.profile)],
+            usize_to_u64(profile.counts.active),
+        );
+    }
+    push_metric_header(
+        output,
+        "llm_guard_proxy_generation_profile_queued",
+        "Current per-profile generation requests waiting for an upstream slot.",
+        "gauge",
+    );
+    for profile in &admission.profiles {
+        push_metric_line(
+            output,
+            "llm_guard_proxy_generation_profile_queued",
+            &[("profile", &profile.profile)],
+            usize_to_u64(profile.counts.queued),
+        );
+    }
 }
 
 fn push_request_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
@@ -1172,6 +1431,7 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
         request,
         admission.permit,
         admission.permit_kind,
+        admission.admission_metadata,
         admission.config.server.max_request_body_bytes,
     )
     .await
@@ -1207,6 +1467,7 @@ struct RequestAdmission {
     config: AppConfig,
     permit: InFlightPermit,
     permit_kind: AdmissionPermitKind,
+    admission_metadata: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1241,6 +1502,7 @@ enum AdmissionOutcome {
     Rejected(Response<Body>),
 }
 
+#[allow(clippy::too_many_lines)]
 async fn admit_request(
     state: &ProxyState,
     request_id: &RequestId,
@@ -1295,11 +1557,22 @@ async fn admit_request(
             config,
             permit,
             permit_kind: AdmissionPermitKind::ControlPlane,
+            admission_metadata: acquired_admission_metadata(Duration::ZERO),
         }));
     }
 
     if config.has_upstream_profile_generation_limits() {
-        let (config, permit) = match state.acquire_generation_body_routing_permit().await {
+        let record_context = admission_record_context(
+            state,
+            request_id,
+            started_at_unix_ms,
+            &request,
+            Some(config.shielding.enabled),
+        );
+        let admission = match state
+            .acquire_generation_body_routing_permit(record_context)
+            .await
+        {
             Ok(admission) => admission,
             Err(error) => {
                 return reject_admission(
@@ -1313,13 +1586,24 @@ async fn admit_request(
             }
         };
         return AdmissionOutcome::Accepted(Box::new(RequestAdmission {
-            config,
-            permit,
+            config: admission.config,
+            permit: admission.permit,
             permit_kind: AdmissionPermitKind::BodyRouting,
+            admission_metadata: prefixed_acquired_admission_metadata(
+                "body_routing",
+                admission.queue_wait,
+            ),
         }));
     }
 
-    let (config, permit) = match state.acquire_generation_permit().await {
+    let record_context = admission_record_context(
+        state,
+        request_id,
+        started_at_unix_ms,
+        &request,
+        Some(config.shielding.enabled),
+    );
+    let admission = match state.acquire_generation_permit(record_context).await {
         Ok(admission) => admission,
         Err(error) => {
             return reject_admission(
@@ -1334,9 +1618,10 @@ async fn admit_request(
     };
 
     AdmissionOutcome::Accepted(Box::new(RequestAdmission {
-        config,
-        permit,
+        config: admission.config,
+        permit: admission.permit,
         permit_kind: AdmissionPermitKind::Generation,
+        admission_metadata: acquired_admission_metadata(admission.queue_wait),
     }))
 }
 
@@ -1368,6 +1653,7 @@ fn reject_admission(
             request_metadata: {
                 let mut metadata = request.pre_upstream_metadata(shielding_enabled);
                 add_listener_metadata(&mut metadata, &state.listener);
+                metadata.extend(error.request_metadata());
                 metadata
             },
             attempts: Vec::new(),
@@ -1376,10 +1662,54 @@ fn reject_admission(
     AdmissionOutcome::Rejected(response)
 }
 
+fn admission_record_context(
+    state: &ProxyState,
+    request_id: &RequestId,
+    started_at_unix_ms: u64,
+    request: &AdmissionRequestMetadata,
+    shielding_enabled: Option<bool>,
+) -> AdmissionRecordContext {
+    let mut request_metadata = request.pre_upstream_metadata(shielding_enabled);
+    add_listener_metadata(&mut request_metadata, &state.listener);
+    AdmissionRecordContext {
+        store: state.store.clone(),
+        request_id: request_id.clone(),
+        started_at_unix_ms,
+        request_metadata,
+    }
+}
+
+fn acquired_admission_metadata(queue_wait: Duration) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (String::from("admission_outcome"), String::from("acquired")),
+        (
+            String::from("queue_wait_ms"),
+            duration_millis_u64(queue_wait).to_string(),
+        ),
+    ])
+}
+
+fn prefixed_acquired_admission_metadata(
+    prefix: &str,
+    queue_wait: Duration,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            format!("{prefix}_admission_outcome"),
+            String::from("acquired"),
+        ),
+        (
+            format!("{prefix}_queue_wait_ms"),
+            duration_millis_u64(queue_wait).to_string(),
+        ),
+    ])
+}
+
 fn is_control_plane_models_request(method: &Method, uri: &Uri) -> bool {
     method == Method::GET && uri.path() == "/v1/models"
 }
 
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn forward_openai_request(
     state: &ProxyState,
     request_id: &RequestId,
@@ -1387,6 +1717,7 @@ async fn forward_openai_request(
     request: Request<Body>,
     in_flight_permit: InFlightPermit,
     admission_permit_kind: AdmissionPermitKind,
+    admission_metadata: BTreeMap<String, String>,
     max_request_body_bytes: usize,
 ) -> Result<Response<Body>, ProxyError> {
     let (parts, body) = request.into_parts();
@@ -1405,6 +1736,9 @@ async fn forward_openai_request(
             uri: &uri,
             downstream_headers: &downstream_headers,
             shielding_enabled_hint,
+            admission_metadata,
+            request_id,
+            started_at_unix_ms,
         },
     )
     .await?;
@@ -1412,6 +1746,7 @@ async fn forward_openai_request(
         config,
         body,
         in_flight_permit,
+        admission_metadata,
     } = body_admission;
     let mut request_metadata = request_metadata(
         &method,
@@ -1421,6 +1756,7 @@ async fn forward_openai_request(
         config.shielding.enabled,
     );
     add_listener_metadata(&mut request_metadata, &state.listener);
+    request_metadata.extend(admission_metadata);
     let prepared_request =
         prepare_openai_forward_request(state, &config, &method, &uri, &body, &mut request_metadata)
             .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
@@ -1493,6 +1829,7 @@ struct OpenAiBodyAdmission {
     config: AppConfig,
     body: Bytes,
     in_flight_permit: InFlightPermit,
+    admission_metadata: BTreeMap<String, String>,
 }
 
 struct BodyAdmissionContext<'request> {
@@ -1500,6 +1837,9 @@ struct BodyAdmissionContext<'request> {
     uri: &'request Uri,
     downstream_headers: &'request HeaderMap,
     shielding_enabled_hint: Option<bool>,
+    admission_metadata: BTreeMap<String, String>,
+    request_id: &'request RequestId,
+    started_at_unix_ms: u64,
 }
 
 async fn read_body_and_admit_generation(
@@ -1537,6 +1877,7 @@ async fn read_body_and_admit_generation(
             config,
             body,
             in_flight_permit,
+            admission_metadata: request.admission_metadata,
         });
     }
 
@@ -1547,6 +1888,7 @@ async fn read_body_and_admit_generation(
             config,
             body,
             in_flight_permit,
+            admission_metadata: request.admission_metadata,
         });
     }
 
@@ -1561,18 +1903,34 @@ async fn read_body_and_admit_generation(
             config,
             body,
             in_flight_permit,
+            admission_metadata: request.admission_metadata,
         });
     }
-    let (config, in_flight_permit) = state
-        .acquire_generation_permit_for_model(model_id_for_admission.as_deref(), in_flight_permit)
+    let record_context = AdmissionRecordContext {
+        store: state.store.clone(),
+        request_id: request.request_id.clone(),
+        started_at_unix_ms: request.started_at_unix_ms,
+        request_metadata: body_read_request_metadata.clone(),
+    };
+    let admission = state
+        .acquire_generation_permit_for_model(
+            model_id_for_admission.as_deref(),
+            in_flight_permit,
+            record_context,
+        )
         .await
         .map_err(|error| {
-            ProxyError::admission(error).with_request_metadata(body_read_request_metadata)
+            let mut metadata = body_read_request_metadata;
+            metadata.extend(error.request_metadata());
+            ProxyError::admission(error).with_request_metadata(metadata)
         })?;
+    let mut admission_metadata = request.admission_metadata;
+    admission_metadata.extend(acquired_admission_metadata(admission.queue_wait));
     Ok(OpenAiBodyAdmission {
-        config,
+        config: admission.config,
         body,
-        in_flight_permit,
+        in_flight_permit: admission.permit,
+        admission_metadata,
     })
 }
 
@@ -6191,6 +6549,46 @@ struct FailedRequestRecord {
     attempts: Vec<AttemptRecord>,
 }
 
+fn record_queued_admission_cancel(record: QueuedAdmissionCancelRecord) {
+    let context = record.context;
+    let finished_at_unix_ms = unix_time_millis();
+    let queue_wait_ms = duration_millis_u64(record.queued_at.elapsed());
+    let error_type = "proxy_generation_queue_cancelled";
+    let abort_reason = "downstream_disconnected_while_queued";
+    let mut request_metadata = context.request_metadata;
+    request_metadata.extend(BTreeMap::from([
+        (
+            String::from("admission_outcome"),
+            String::from("queue_cancelled"),
+        ),
+        (String::from("queue_wait_ms"), queue_wait_ms.to_string()),
+        (
+            String::from("generation_queue_timeout_ms"),
+            record.timeout_ms.to_string(),
+        ),
+    ]));
+    let mut response_metadata =
+        failed_response_metadata(context.started_at_unix_ms, finished_at_unix_ms, error_type);
+    response_metadata.insert(String::from("abort_reason"), abort_reason.to_owned());
+    let request_record = RequestRecord {
+        request_id: context.request_id,
+        started_at_unix_ms: context.started_at_unix_ms,
+        finished_at_unix_ms: Some(finished_at_unix_ms),
+        downstream_mode: DownstreamMode::NonStreamJson,
+        upstream_mode: UpstreamMode::NotApplicable,
+        model_id: None,
+        input_fingerprint: None,
+        status: RequestStatus::Aborted,
+        http_status: None,
+        error_reason: Some(format!("{error_type}: {abort_reason}")),
+        abort_reason: Some(abort_reason.to_owned()),
+        request_metadata,
+        response_metadata,
+        raw_payloads: RawPayloads::default(),
+    };
+    record_observability_many(&context.store, &request_record, &[]);
+}
+
 fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecord) {
     let mut response_metadata = failed_response_metadata(
         failure.started_at_unix_ms,
@@ -6950,13 +7348,13 @@ fn admission_error_response(
     status: StatusCode,
     error_type: &str,
     message: &str,
-    retry_after: Option<&'static str>,
+    retry_after: Option<String>,
 ) -> Response<Body> {
     let mut response = proxy_error_response(status, error_type, message);
     if let Some(retry_after) = retry_after {
-        response
-            .headers_mut()
-            .insert(RETRY_AFTER, HeaderValue::from_static(retry_after));
+        if let Ok(value) = HeaderValue::from_str(&retry_after) {
+            response.headers_mut().insert(RETRY_AFTER, value);
+        }
     }
     response
 }
@@ -6966,6 +7364,14 @@ fn unix_time_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
 }
 
 #[derive(Debug, Error)]
@@ -7082,7 +7488,7 @@ impl ProxyError {
         }
     }
 
-    const fn status(&self) -> StatusCode {
+    fn status(&self) -> StatusCode {
         match self {
             Self::RequestBody { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Self::ConfigSnapshot { .. }
