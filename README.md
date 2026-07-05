@@ -147,6 +147,23 @@ max_in_flight_requests = 16
 max_control_plane_in_flight_requests = 128
 max_request_body_bytes = 67108864
 
+[[listeners]]
+name = "embedding-legacy"
+bind_host = "127.0.0.1"
+port = 18002
+allowed_upstreams = ["qwen3-embedding-8b"]
+
+[[listeners]]
+name = "reranker-legacy"
+bind_host = "127.0.0.1"
+port = 18003
+allowed_upstreams = ["qwen3-reranker-8b"]
+
+[[listeners]]
+name = "aggregate"
+bind_host = "127.0.0.1"
+port = 18005
+
 [upstream]
 base_url = "http://gb10:18009/v1"
 request_timeout_ms = 120000
@@ -157,6 +174,16 @@ enrich_responses = true
 refresh_interval_secs = 60
 # context_length_override = 256000
 # max_model_len_override = 256000
+
+[[upstreams]]
+name = "qwen3-embedding-8b"
+base_url = "http://gb10:18012/v1"
+match_models = ["embedding-model"]
+
+[[upstreams]]
+name = "qwen3-reranker-8b"
+base_url = "http://gb10:18013/v1"
+match_models = ["rerank-model"]
 
 [shielding]
 enabled = true
@@ -277,6 +304,9 @@ unchanged. Force-disable takes precedence over `thinking.enabled`,
 Reloadable fields:
 
 - `server.max_in_flight_requests`
+- `server.max_queued_generation_requests`
+- `server.generation_queue_timeout_ms`
+- `server.max_control_plane_in_flight_requests`
 - `server.max_request_body_bytes`
 - `shielding.enabled`
 - `observability.enabled`
@@ -327,10 +357,26 @@ Reloadable fields:
 - `upstream.metadata.refresh_interval_secs`
 - `upstream.metadata.context_length_override`
 - `upstream.metadata.max_model_len_override`
+- `upstream.metadata.input_token_safety_margin`
 
 Restart-required fields:
 
 - `server.bind_host`
 - `server.port`
+- `listeners.topology`
 - `upstream.base_url`
+- `upstreams.topology`
 - `observability.sqlite_path`
+- `evidence.sqlite_path`
+- `evidence.blob_cache_dir`
+
+The legacy `[server]` listener is always active for backwards-compatible
+single-listener deployments. Additional `[[listeners]]` bind extra downstream
+ports in the same process. `allowed_upstreams` is optional; when omitted, the
+listener can route to the implicit `default` upstream and all named
+`[[upstreams]]`. When set, names must reference `default` or a configured
+upstream profile. Listener add/remove/bind/allow-list changes are
+restart-required and are reported as `listeners.topology` on config reload.
+Safe per-upstream fields such as request timeout, metadata, thinking policy,
+and generation limits remain hot-reloadable only when the upstream topology is
+unchanged.

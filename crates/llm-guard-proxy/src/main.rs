@@ -7,7 +7,7 @@ use std::{ffi::OsString, future::pending, path::PathBuf, process::ExitCode, time
 use llm_guard_proxy_core::{
     ConfigManager, EvidenceStore, ObservabilityStore, RequestId, redact_upstream_base_url,
 };
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -36,22 +36,32 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let _watcher = manager
         .spawn_polling(Duration::from_secs(1))
         .map_err(|error| error.to_string())?;
-    let bind_address = format!("{}:{}", config.server.bind_host, config.server.port);
-    let listener = TcpListener::bind(&bind_address)
-        .await
-        .map_err(|error| format!("failed to bind {bind_address}: {error}"))?;
-    let local_addr = listener
-        .local_addr()
-        .map_err(|error| format!("failed to read listener address: {error}"))?;
+    let mut bound_listeners = Vec::new();
+    for listener_config in config.effective_listeners() {
+        let bind_address = listener_config.bind_address();
+        let listener = TcpListener::bind(&bind_address)
+            .await
+            .map_err(|error| format!("failed to bind {bind_address}: {error}"))?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|error| format!("failed to read listener address: {error}"))?;
+        bound_listeners.push((listener_config, listener, local_addr));
+    }
     let request_id = RequestId::generate();
     eprintln!(
         "{}",
         proxy::render_health(&config, manager.path(), &request_id)
     );
-    eprintln!(
-        "{}",
-        render_listening(local_addr, &config.upstream.base_url)
-    );
+    for (listener_config, _listener, local_addr) in &bound_listeners {
+        eprintln!(
+            "{}",
+            render_listening(
+                listener_config.name.as_str(),
+                local_addr,
+                &config.upstream.base_url
+            )
+        );
+    }
 
     let state = proxy::ProxyState::new(
         manager.handle(),
@@ -60,9 +70,7 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         evidence_store,
         proxy::build_http_client().map_err(|error| error.to_string())?,
     );
-    proxy::serve_until_shutdown(listener, state, shutdown_signal())
-        .await
-        .map_err(|error| format!("server failed: {error}"))
+    serve_bound_listeners(bound_listeners, state).await
 }
 
 async fn shutdown_signal() {
@@ -94,9 +102,52 @@ async fn shutdown_signal() {
     }
 }
 
-fn render_listening(local_addr: impl std::fmt::Display, upstream_base_url: &str) -> String {
+async fn serve_bound_listeners(
+    bound_listeners: Vec<(
+        llm_guard_proxy_core::ListenerConfig,
+        TcpListener,
+        std::net::SocketAddr,
+    )>,
+    state: proxy::ProxyState,
+) -> Result<(), String> {
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ignored = shutdown_tx.send(true);
+    });
+
+    let mut servers = JoinSet::new();
+    for (listener_config, listener, _local_addr) in bound_listeners {
+        let listener_state = state.for_listener(listener_config);
+        let mut shutdown_rx = shutdown_rx.clone();
+        servers.spawn(async move {
+            proxy::serve_until_shutdown(listener, listener_state, async move {
+                if !*shutdown_rx.borrow() {
+                    let _ignored = shutdown_rx.changed().await;
+                }
+            })
+            .await
+        });
+    }
+
+    while let Some(result) = servers.join_next().await {
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => return Err(format!("server failed: {error}")),
+            Err(error) => return Err(format!("server task failed: {error}")),
+        }
+    }
+
+    Ok(())
+}
+
+fn render_listening(
+    listener_name: &str,
+    local_addr: impl std::fmt::Display,
+    upstream_base_url: &str,
+) -> String {
     format!(
-        "llm-guard-proxy listening={local_addr} upstream_base_url={}",
+        "llm-guard-proxy listener={listener_name} listening={local_addr} upstream_base_url={}",
         redact_upstream_base_url(upstream_base_url)
     )
 }
@@ -168,6 +219,7 @@ mod tests {
     #[test]
     fn renders_listening_with_redacted_upstream_base_url() {
         let rendered = render_listening(
+            "default",
             "127.0.0.1:18009",
             "https://user:secret@example.test/v1?x-api-key=sk-test&safe=ok#token=sk-test",
         );

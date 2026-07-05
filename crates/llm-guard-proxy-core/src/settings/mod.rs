@@ -14,10 +14,10 @@ mod tests;
 pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, DownstreamDropPolicy, EvidenceConfig,
-    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, LoopGuardConfig, LoopGuardMode,
-    MetadataConfig, ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig,
-    RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig,
-    ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
+    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig,
+    LoopGuardMode, MetadataConfig, ObservabilityConfig, RestartRequiredChange, RetentionConfig,
+    RetryConfig, RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShieldingConfig,
+    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
     UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 pub use reload::{
@@ -135,6 +135,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
 pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "server.bind_host",
     "server.port",
+    "listeners.topology",
     "upstream.base_url",
     "upstreams.topology",
     "observability.sqlite_path",

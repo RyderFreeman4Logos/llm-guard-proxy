@@ -26,12 +26,28 @@ generation_queue_timeout_ms = 4000
 max_control_plane_in_flight_requests = 5
 max_request_body_bytes = 1048576
 
+[[listeners]]
+name = "embedding-legacy"
+bind_host = "127.0.0.1"
+port = 18002
+allowed_upstreams = ["qwen3-embedding-8b"]
+
+[[listeners]]
+name = "aggregate"
+bind_host = "127.0.0.1"
+port = 18005
+
 [upstream.metadata]
 context_length_override = 256000
 max_model_len_override = 256000
 
 [upstream]
 request_timeout_ms = 90000
+
+[[upstreams]]
+name = "qwen3-embedding-8b"
+base_url = "http://embedding.example/v1"
+match_models = ["embedding-model"]
 
 [observability]
 metrics_enabled = false
@@ -544,6 +560,29 @@ fn parses_toml_with_defaults_and_overrides() {
     assert_eq!(config.server.generation_queue_timeout_ms, 4_000);
     assert_eq!(config.server.max_control_plane_in_flight_requests, 5);
     assert_eq!(config.server.max_request_body_bytes, 1_048_576);
+    assert_eq!(config.listeners.len(), 2);
+    assert_eq!(config.listeners[0].name, "embedding-legacy");
+    assert_eq!(config.listeners[0].bind_host, "127.0.0.1");
+    assert_eq!(config.listeners[0].port, 18_002);
+    assert_eq!(
+        config.listeners[0].allowed_upstreams.as_deref(),
+        Some(&[String::from("qwen3-embedding-8b")][..])
+    );
+    assert_eq!(config.listeners[1].name, "aggregate");
+    assert_eq!(config.listeners[1].port, 18_005);
+    assert_eq!(config.listeners[1].allowed_upstreams, None);
+    let effective_listeners = config.effective_listeners();
+    assert_eq!(effective_listeners.len(), 3);
+    assert_eq!(effective_listeners[0].name, "default");
+    assert_eq!(effective_listeners[0].port, 18_100);
+    assert_eq!(
+        config.effective_listener_addresses(),
+        vec![
+            String::from("127.0.0.1:18100"),
+            String::from("127.0.0.1:18002"),
+            String::from("127.0.0.1:18005"),
+        ]
+    );
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
     assert_eq!(config.upstream.request_timeout_ms, 90_000);
     assert!(config.thinking.force_disable);
@@ -598,6 +637,130 @@ fn parses_toml_with_defaults_and_overrides() {
     assert_parsed_retry_overrides(&config);
     assert_parsed_upstream_stall_overrides(&config);
     assert!(!config.cloudflare.enabled);
+}
+
+#[test]
+fn validates_listener_allowed_upstreams_and_socket_uniqueness() {
+    let config = parse_config_text(
+        r#"
+[[upstreams]]
+name = "embedding"
+base_url = "http://embedding.example/v1"
+match_models = ["embedding-model"]
+
+[[listeners]]
+name = "bad"
+port = 18002
+allowed_upstreams = ["missing"]
+"#,
+    )
+    .expect("config syntax should parse");
+    let error = config
+        .validate()
+        .expect_err("unknown listener upstream should fail");
+    assert_eq!(error.field(), "listeners.allowed_upstreams");
+
+    let config = parse_config_text(
+        r#"
+[[upstreams]]
+name = "embedding"
+base_url = "http://embedding.example/v1"
+match_models = ["embedding-model"]
+
+[[listeners]]
+name = "duplicate-socket"
+bind_host = "127.0.0.1"
+port = 18009
+allowed_upstreams = ["embedding"]
+"#,
+    )
+    .expect("config syntax should parse");
+    let error = config
+        .validate()
+        .expect_err("duplicate listener socket should fail");
+    assert_eq!(error.field(), "listeners.port");
+
+    let config = parse_config_text(
+        r#"
+[[listeners]]
+name = "wildcard"
+bind_host = "0.0.0.0"
+port = 18009
+"#,
+    )
+    .expect("config syntax should parse");
+    let error = config
+        .validate()
+        .expect_err("wildcard and default listener on the same port should fail");
+    assert_eq!(error.field(), "listeners.port");
+
+    let config = parse_config_text(
+        r#"
+[server]
+port = 18010
+
+[[listeners]]
+name = "loopback-one"
+bind_host = "127.0.0.1"
+port = 18009
+
+[[listeners]]
+name = "loopback-two"
+bind_host = "127.0.0.2"
+port = 18009
+"#,
+    )
+    .expect("config syntax should parse");
+    let error = config
+        .validate()
+        .expect_err("fail-closed same-port specific listener bindings should fail");
+    assert_eq!(error.field(), "listeners.port");
+
+    let config = parse_config_text(
+        r#"
+[[listeners]]
+name = "different-port"
+bind_host = "0.0.0.0"
+port = 18010
+"#,
+    )
+    .expect("config syntax should parse");
+    config
+        .validate()
+        .expect("different listener ports should validate");
+}
+
+#[test]
+fn effective_listener_addresses_include_default_and_extra_sockets_in_order() {
+    let config = parse_config_text(
+        r#"
+[server]
+bind_host = "0.0.0.0"
+port = 18009
+
+[[listeners]]
+name = "embedding"
+bind_host = "127.0.0.1"
+port = 18002
+
+[[listeners]]
+name = "aggregate"
+bind_host = "::1"
+port = 18005
+"#,
+    )
+    .expect("config syntax should parse");
+    config.validate().expect("listener sockets should validate");
+
+    assert_eq!(
+        config.effective_listener_addresses(),
+        vec![
+            String::from("0.0.0.0:18009"),
+            String::from("127.0.0.1:18002"),
+            String::from("[::1]:18005"),
+        ]
+    );
+    assert_eq!(config.default_listener().bind_address(), "0.0.0.0:18009");
 }
 
 #[test]
@@ -1458,6 +1621,58 @@ thinking_token_budget = 2048
 }
 
 #[test]
+fn reload_reports_listener_topology_changes_without_half_updating_listeners() {
+    let path = unique_test_path("listener-topology-reload.toml");
+    write_config(
+        &path,
+        r#"
+[[upstreams]]
+name = "embedding"
+base_url = "http://embedding.example/v1"
+match_models = ["embedding-model"]
+
+[[listeners]]
+name = "embedding-legacy"
+port = 18002
+allowed_upstreams = ["embedding"]
+"#,
+    );
+    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
+
+    write_config(
+        &path,
+        r#"
+[[upstreams]]
+name = "embedding"
+base_url = "http://embedding.example/v1"
+match_models = ["embedding-model"]
+
+[[listeners]]
+name = "embedding-legacy"
+port = 18003
+allowed_upstreams = ["embedding"]
+"#,
+    );
+    let outcome = manager
+        .reload()
+        .expect("listener topology reload should report restart requirement");
+    let snapshot = manager
+        .handle()
+        .snapshot()
+        .expect("snapshot should succeed");
+
+    assert!(!outcome.applied);
+    assert_eq!(outcome.restart_required_changes.len(), 1);
+    assert_eq!(
+        outcome.restart_required_changes[0].field,
+        "listeners.topology"
+    );
+    assert_eq!(snapshot.listeners[0].port, 18_002);
+
+    remove_file(&path);
+}
+
+#[test]
 fn reload_reports_match_model_topology_changes_with_delimiter_like_aliases() {
     let path = unique_test_path("profile-topology-delimiter-reload.toml");
     write_config(
@@ -1629,6 +1844,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.max_control_plane_in_flight_requests"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstreams.topology"));
+    assert!(RESTART_REQUIRED_FIELDS.contains(&"listeners.topology"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"observability.sqlite_path"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"evidence.sqlite_path"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"evidence.blob_cache_dir"));

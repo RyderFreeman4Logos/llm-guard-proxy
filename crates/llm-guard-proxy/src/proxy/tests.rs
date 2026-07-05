@@ -49,6 +49,17 @@ const MODEL_METADATA_CHUNKED_SECOND: &[u8] =
 const MODEL_METADATA_NO_CONTEXT_BODY: &str = r#"{"object":"list","data":[{"id":"fallback-model","object":"model","owned_by":"vllm","extra":"keep"}]}"#;
 const MODEL_METADATA_CONTEXT_LENGTH_BODY: &str = r#"{"object":"list","data":[{"id":"context-length-model","object":"model","context_length":256000,"owned_by":"vllm","extra":"keep"}]}"#;
 const MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY: &str = r#"{"object":"list","data":[{"id":"max-context-length-model","object":"model","max_context_length":256000,"owned_by":"vllm","extra":"keep"}]}"#;
+const MULTI_LISTENER_MODEL_METADATA_BODY: &str = r#"{"object":"list","data":[{"id":"chat-model","object":"model","owned_by":"vllm"},{"id":"embedding-model","object":"model","owned_by":"vllm"},{"id":"rerank-model","object":"model","owned_by":"vllm"}]}"#;
+const DISTINCT_UPSTREAM_CHAT_MODELS_BODY: &str =
+    r#"{"object":"list","data":[{"id":"chat-model","object":"model","owned_by":"vllm"}]}"#;
+const DISTINCT_UPSTREAM_EMBEDDING_ONLY_MODELS_BODY: &str =
+    r#"{"object":"list","data":[{"id":"embedding-model","object":"model","owned_by":"vllm"}]}"#;
+const DISTINCT_UPSTREAM_RERANK_ONLY_MODELS_BODY: &str =
+    r#"{"object":"list","data":[{"id":"rerank-model","object":"model","owned_by":"vllm"}]}"#;
+const DISTINCT_UPSTREAM_EMBEDDING_MODELS_BODY: &str = r#"{"object":"list","data":[{"id":"chat-model","object":"model","owned_by":"vllm"},{"id":"embedding-model","object":"model","owned_by":"vllm","first":"embedding"},{"id":"embedding-model","object":"model","owned_by":"vllm","first":"duplicate"}]}"#;
+const DISTINCT_UPSTREAM_RERANK_MODELS_BODY: &str = r#"{"object":"list","data":[{"id":"chat-model","object":"model","owned_by":"vllm"},{"id":"rerank-model","object":"model","owned_by":"vllm"}]}"#;
+const DISTINCT_UPSTREAM_SLOW_MODELS_BODY: &str =
+    r#"{"object":"list","data":[{"id":"slow-model","object":"model","owned_by":"vllm"}]}"#;
 const REPEATED_INPUT_LOOP_LINE: &str = "legitimate repeated input line for issue ten";
 const LARGE_MODEL_METADATA_EXTRA_BYTES: usize = 1024 * 1024;
 static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -7253,6 +7264,965 @@ async fn saturated_generation_requests_wait_for_in_flight_capacity() {
 }
 
 #[tokio::test]
+async fn restricted_embedding_listener_accepts_embedding_and_rejects_other_profiles() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &multi_listener_profile_config(&fake.base_url),
+    )
+    .await;
+    let listener = listener_config(&proxy, "embedding-legacy");
+    let state = proxy.state.for_listener(listener);
+
+    let accepted = proxy_handler(
+        State(state.clone()),
+        json_post_request(
+            "/v1/embeddings",
+            br#"{"model":"embedding-model","input":"hello"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let _body = to_bytes(accepted.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("accepted body should read");
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.path_and_query, "/v1/embeddings");
+
+    let rejected_chat = proxy_handler(
+        State(state.clone()),
+        json_post_request(
+            "/v1/chat/completions",
+            br#"{"model":"chat-model","messages":[{"role":"user","content":"hello"}]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(rejected_chat.status(), StatusCode::BAD_REQUEST);
+    let rejected_chat_body = to_bytes(rejected_chat.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("rejection body should read");
+    let rejected_chat_json: serde_json::Value =
+        serde_json::from_slice(&rejected_chat_body).expect("rejection should be JSON");
+    assert_eq!(
+        rejected_chat_json["error"]["type"],
+        "listener_upstream_not_allowed"
+    );
+
+    let rejected_rerank = proxy_handler(
+        State(state),
+        json_post_request(
+            "/v1/rerank",
+            br#"{"model":"rerank-model","query":"hello","documents":["hello"]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(rejected_rerank.status(), StatusCode::BAD_REQUEST);
+    let _body = to_bytes(rejected_rerank.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("rerank rejection body should read");
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+async fn restricted_listener_denial_bounds_untrusted_model_in_response_and_metadata() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &multi_listener_profile_config(&fake.base_url),
+    )
+    .await;
+    let listener = listener_config(&proxy, "embedding-legacy");
+    let oversized_model = format!("chat-model-{}", "x".repeat(4096));
+    let body = format!(
+        r#"{{"model":"{oversized_model}","messages":[{{"role":"user","content":"hello"}}]}}"#
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("chat request should build");
+
+    let response = proxy_handler(State(proxy.state.for_listener(listener)), request).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let response_body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("rejection body should read");
+    let response_body =
+        String::from_utf8(response_body.to_vec()).expect("rejection body should be utf-8");
+    let rejection: serde_json::Value =
+        serde_json::from_str(&response_body).expect("rejection should be JSON");
+    assert_eq!(rejection["error"]["type"], "listener_upstream_not_allowed");
+    assert!(response_body.len() < 1024);
+    assert!(!response_body.contains(&oversized_model));
+    assert_no_upstream_request(&mut fake).await;
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let request_row: (Option<String>, String, String) = connection
+        .query_row(
+            "SELECT model_id, error_reason, request_metadata_json FROM requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("denied request row should exist");
+    let persisted = format!("{} {}", request_row.0.unwrap_or_default(), request_row.1);
+    assert!(persisted.len() < 1024);
+    assert!(!persisted.contains(&oversized_model));
+    assert!(!request_row.2.contains(&oversized_model));
+}
+
+#[tokio::test]
+async fn aggregate_listener_accepts_chat_embeddings_and_rerank_profiles() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &multi_listener_profile_config(&fake.base_url),
+    )
+    .await;
+    let listener = listener_config(&proxy, "aggregate");
+    let state = proxy.state.for_listener(listener);
+
+    for (request, expected_path) in [
+        (
+            json_post_request(
+                "/v1/chat/completions",
+                br#"{"model":"chat-model","messages":[{"role":"user","content":"hello"}],"stream":true}"#,
+            ),
+            "/v1/chat/completions",
+        ),
+        (
+            json_post_request(
+                "/v1/embeddings",
+                br#"{"model":"embedding-model","input":"hello"}"#,
+            ),
+            "/v1/embeddings",
+        ),
+        (
+            json_post_request(
+                "/v1/rerank",
+                br#"{"model":"rerank-model","query":"hello","documents":["hello"]}"#,
+            ),
+            "/v1/rerank",
+        ),
+    ] {
+        let response = proxy_handler(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+            .await
+            .expect("response body should read");
+        let observed = fake.recv_next().await;
+        assert_eq!(observed.path_and_query, expected_path);
+    }
+}
+
+#[tokio::test]
+async fn restricted_models_request_filters_to_listener_reachable_models() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &multi_listener_profile_config(&fake.base_url),
+    )
+    .await;
+    let listener = listener_config(&proxy, "embedding-legacy");
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=multi-listener-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(model_ids, vec!["embedding-model"]);
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=multi-listener-models"
+    );
+}
+
+#[tokio::test]
+async fn restricted_models_request_filters_when_metadata_enrichment_is_disabled() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "embedding"
+base_url = "{0}"
+match_models = ["embedding-model"]
+
+[upstreams.metadata]
+discovery_enabled = false
+enrich_responses = false
+
+[[upstreams]]
+name = "rerank"
+base_url = "{0}"
+match_models = ["rerank-model"]
+
+[[listeners]]
+name = "embedding-legacy"
+bind_host = "127.0.0.1"
+port = 18002
+allowed_upstreams = ["embedding"]
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "embedding-legacy");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=multi-listener-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(model_ids, vec!["embedding-model"]);
+    assert_eq!(json["data"][0].get("context_length"), None);
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=multi-listener-models"
+    );
+}
+
+#[tokio::test]
+async fn restricted_models_request_filters_to_all_allowed_listener_profiles() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &multi_listener_profile_config(&fake.base_url),
+    )
+    .await;
+    let listener = listener_config(&proxy, "embedding-rerank");
+    let state = proxy.state.for_listener(listener);
+
+    let response = proxy_handler(
+        State(state.clone()),
+        empty_get_request("/v1/models?test=multi-listener-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(model_ids, vec!["embedding-model", "rerank-model"]);
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=multi-listener-models"
+    );
+
+    for (request, expected_path) in [
+        (
+            json_post_request(
+                "/v1/embeddings",
+                br#"{"model":"embedding-model","input":"hello"}"#,
+            ),
+            "/v1/embeddings",
+        ),
+        (
+            json_post_request(
+                "/v1/rerank",
+                br#"{"model":"rerank-model","query":"hello","documents":["hello"]}"#,
+            ),
+            "/v1/rerank",
+        ),
+    ] {
+        let response = proxy_handler(State(state.clone()), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+            .await
+            .expect("response body should read");
+        let observed = fake.recv_next().await;
+        assert_eq!(observed.path_and_query, expected_path);
+    }
+}
+
+#[tokio::test]
+async fn aggregate_models_request_fetches_all_configured_upstream_profiles() {
+    let mut chat = FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_CHAT_MODELS_BODY).await;
+    let mut embedding =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_EMBEDDING_ONLY_MODELS_BODY).await;
+    let mut rerank =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_RERANK_ONLY_MODELS_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &chat.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "embedding"
+base_url = "{0}"
+match_models = ["embedding-model"]
+
+[[upstreams]]
+name = "rerank"
+base_url = "{1}"
+match_models = ["rerank-model"]
+
+[[listeners]]
+name = "aggregate"
+bind_host = "127.0.0.1"
+port = 18005
+"#,
+            embedding.base_url, rerank.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "aggregate");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert!(model_ids.contains(&"chat-model"));
+    assert!(model_ids.contains(&"embedding-model"));
+    assert!(model_ids.contains(&"rerank-model"));
+    let observed = chat.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+    let observed = embedding.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+    let observed = rerank.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+}
+
+#[tokio::test]
+async fn restricted_models_request_fetches_and_merges_distinct_allowed_upstreams() {
+    let mut embedding =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_EMBEDDING_MODELS_BODY).await;
+    let mut rerank =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_RERANK_MODELS_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &embedding.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "embedding"
+base_url = "{0}"
+match_models = ["embedding-model"]
+
+[[upstreams]]
+name = "rerank"
+base_url = "{1}"
+match_models = ["rerank-model"]
+
+[[listeners]]
+name = "embedding-rerank"
+bind_host = "127.0.0.1"
+port = 18004
+allowed_upstreams = ["embedding", "rerank"]
+"#,
+            embedding.base_url, rerank.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "embedding-rerank");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let models = json["data"].as_array().expect("data should be an array");
+    let model_ids = models
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(model_ids, vec!["embedding-model", "rerank-model"]);
+    assert_eq!(models[0]["first"], "embedding");
+    assert!(model_ids.iter().all(|model_id| *model_id != "chat-model"));
+    let embedding_request = embedding.recv_next().await;
+    assert_eq!(
+        embedding_request.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+    let rerank_request = rerank.recv_next().await;
+    assert_eq!(
+        rerank_request.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+}
+
+#[tokio::test]
+async fn merged_models_enrichment_uses_each_allowed_profile_metadata_config() {
+    let mut embedding =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_EMBEDDING_ONLY_MODELS_BODY).await;
+    let mut rerank =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_RERANK_ONLY_MODELS_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &embedding.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "embedding"
+base_url = "{0}"
+match_models = ["embedding-model"]
+
+[upstreams.metadata]
+discovery_enabled = false
+enrich_responses = false
+
+[[upstreams]]
+name = "rerank"
+base_url = "{1}"
+match_models = ["rerank-model"]
+
+[upstreams.metadata]
+context_length_override = 12345
+
+[[listeners]]
+name = "embedding-rerank"
+bind_host = "127.0.0.1"
+port = 18004
+allowed_upstreams = ["embedding", "rerank"]
+"#,
+            embedding.base_url, rerank.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "embedding-rerank");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let models = json["data"].as_array().expect("data should be an array");
+
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0]["id"], "embedding-model");
+    assert_eq!(models[0].get("context_length"), None);
+    assert_eq!(models[1]["id"], "rerank-model");
+    assert_normalized_context_fields(&models[1], 12_345);
+    assert_eq!(
+        embedding.recv_next().await.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+    assert_eq!(
+        rerank.recv_next().await.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+}
+
+#[tokio::test]
+async fn restricted_models_request_records_distinct_observability_attempts_per_upstream() {
+    let mut embedding =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_EMBEDDING_MODELS_BODY).await;
+    let mut rerank =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_RERANK_MODELS_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &embedding.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "embedding"
+base_url = "{0}"
+match_models = ["embedding-model"]
+
+[[upstreams]]
+name = "rerank"
+base_url = "{1}"
+match_models = ["rerank-model"]
+
+[[listeners]]
+name = "embedding-rerank"
+bind_host = "127.0.0.1"
+port = 18004
+allowed_upstreams = ["embedding", "rerank"]
+"#,
+            embedding.base_url, rerank.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "embedding-rerank");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(model_ids, vec!["embedding-model", "rerank-model"]);
+    assert_eq!(
+        embedding.recv_next().await.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+    assert_eq!(
+        rerank.recv_next().await.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+
+    let attempts = read_attempt_request_metadata_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_ne!(attempts[0].attempt_id, attempts[1].attempt_id);
+    assert_eq!(attempts[0].request_id, attempts[1].request_id);
+    assert_eq!(attempts[0].attempt_number, 1);
+    assert_eq!(attempts[1].attempt_number, 2);
+    assert_eq!(attempts[0].status, "succeeded");
+    assert_eq!(attempts[1].status, "succeeded");
+    assert_eq!(
+        attempts[0].request_metadata["upstream_profile"],
+        "embedding"
+    );
+    assert_eq!(attempts[1].request_metadata["upstream_profile"], "rerank");
+}
+
+#[tokio::test]
+async fn restricted_models_request_skips_invalid_first_body_when_merging_distinct_upstreams() {
+    let mut invalid = FakeUpstream::spawn_with_models_body(r#"{"error":"not a model list"}"#).await;
+    let mut rerank =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_RERANK_MODELS_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &invalid.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "invalid"
+base_url = "{0}"
+match_models = ["invalid-model"]
+
+[[upstreams]]
+name = "rerank"
+base_url = "{1}"
+match_models = ["rerank-model"]
+
+[[listeners]]
+name = "invalid-rerank"
+bind_host = "127.0.0.1"
+port = 18006
+allowed_upstreams = ["invalid", "rerank"]
+"#,
+            invalid.base_url, rerank.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "invalid-rerank");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(model_ids, vec!["rerank-model"]);
+    let invalid_request = invalid.recv_next().await;
+    assert_eq!(
+        invalid_request.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+    let rerank_request = rerank.recv_next().await;
+    assert_eq!(
+        rerank_request.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+}
+
+#[tokio::test]
+async fn merged_models_response_uses_proxy_owned_success_headers_for_valid_body() {
+    let mut rate_limited = FakeUpstream::spawn_with_models_response(
+        StatusCode::TOO_MANY_REQUESTS,
+        r#"{"error":{"type":"rate_limit","message":"slow down"}}"#,
+        "rate-limited-models",
+    )
+    .await;
+    let mut rerank =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_RERANK_MODELS_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &rate_limited.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "rate-limited"
+base_url = "{0}"
+match_models = ["rate-limited-model"]
+
+[[upstreams]]
+name = "rerank"
+base_url = "{1}"
+match_models = ["rerank-model"]
+
+[[listeners]]
+name = "mixed-models"
+bind_host = "127.0.0.1"
+port = 18006
+allowed_upstreams = ["rate-limited", "rerank"]
+"#,
+            rate_limited.base_url, rerank.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "mixed-models");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    assert_eq!(response.headers().get(RETRY_AFTER), None);
+    assert_eq!(response.headers().get("x-upstream-endpoint"), None);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(model_ids, vec!["rerank-model"]);
+    assert_eq!(
+        rate_limited.recv_next().await.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+    assert_eq!(
+        rerank.recv_next().await.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+}
+
+#[tokio::test]
+async fn restricted_models_request_merges_implicit_default_and_named_allowed_upstream() {
+    let mut shared = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &shared.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "embedding"
+base_url = "{0}"
+match_models = ["embedding-model"]
+
+[[listeners]]
+name = "default-embedding"
+bind_host = "127.0.0.1"
+port = 18007
+allowed_upstreams = ["default", "embedding"]
+"#,
+            shared.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "default-embedding");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=multi-listener-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        model_ids,
+        vec!["chat-model", "embedding-model", "rerank-model"]
+    );
+    let default_request = shared.recv_next().await;
+    assert_eq!(
+        default_request.path_and_query,
+        "/v1/models?test=multi-listener-models"
+    );
+}
+
+#[tokio::test]
+async fn restricted_models_request_excludes_same_base_url_models_routed_to_disallowed_profiles() {
+    let mut shared = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &shared.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "embedding"
+base_url = "{0}"
+match_models = ["embedding-model"]
+
+[[upstreams]]
+name = "rerank"
+base_url = "{0}"
+match_models = ["rerank-model"]
+
+[[listeners]]
+name = "default-embedding"
+bind_host = "127.0.0.1"
+port = 18007
+allowed_upstreams = ["default", "embedding"]
+"#,
+            shared.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "default-embedding");
+    let state = proxy.state.for_listener(listener);
+
+    let response = proxy_handler(
+        State(state.clone()),
+        empty_get_request("/v1/models?test=multi-listener-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(model_ids, vec!["chat-model", "embedding-model"]);
+    let response = proxy_handler(
+        State(state),
+        json_post_request(
+            "/v1/rerank",
+            br#"{"model":"rerank-model","query":"hello","documents":["hello"]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let default_request = shared.recv_next().await;
+    assert_eq!(
+        default_request.path_and_query,
+        "/v1/models?test=multi-listener-models"
+    );
+}
+
+#[tokio::test]
+async fn restricted_models_request_uses_each_upstream_profile_timeout_when_merging() {
+    let mut fast =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_EMBEDDING_MODELS_BODY).await;
+    let mut slow = FakeUpstream::spawn_with_models_body_and_delay(
+        DISTINCT_UPSTREAM_SLOW_MODELS_BODY,
+        Duration::from_millis(150),
+    )
+    .await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fast.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "fast"
+base_url = "{0}"
+match_models = ["embedding-model"]
+request_timeout_ms = 50
+
+[[upstreams]]
+name = "slow"
+base_url = "{1}"
+match_models = ["slow-model"]
+request_timeout_ms = 1000
+
+[[listeners]]
+name = "fast-slow"
+bind_host = "127.0.0.1"
+port = 18008
+allowed_upstreams = ["fast", "slow"]
+"#,
+            fast.base_url, slow.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "fast-slow");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(model_ids, vec!["embedding-model", "slow-model"]);
+    let fast_request = fast.recv_next().await;
+    assert_eq!(
+        fast_request.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+    let slow_request = slow.recv_next().await;
+    assert_eq!(
+        slow_request.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+}
+
+#[tokio::test]
+async fn observability_records_listener_and_selected_upstream_profile() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &multi_listener_profile_config(&fake.base_url),
+    )
+    .await;
+    let listener = listener_config(&proxy, "embedding-legacy");
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        json_post_request(
+            "/v1/embeddings",
+            br#"{"model":"embedding-model","input":"hello"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("response body should read");
+    let _observed = fake.recv_next().await;
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    assert_eq!(request_metadata["listener_name"], "embedding-legacy");
+    assert_eq!(request_metadata["listener_port"], "18002");
+    assert_eq!(request_metadata["upstream_profile"], "embedding");
+    assert_eq!(attempt_metadata["listener_name"], "embedding-legacy");
+    assert_eq!(attempt_metadata["upstream_profile"], "embedding");
+}
+
+#[tokio::test]
 async fn matched_upstream_profile_has_independent_generation_capacity() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_admission_config(
@@ -7420,6 +8390,66 @@ max_queued_generation_requests = 0
         !queued_body_polled.load(Ordering::SeqCst),
         "aborted queued routing request must not read its body"
     );
+}
+
+#[tokio::test]
+async fn merged_models_request_records_successful_prior_attempt_when_later_fetch_fails() {
+    let mut embedding =
+        FakeUpstream::spawn_with_models_body(DISTINCT_UPSTREAM_EMBEDDING_MODELS_BODY).await;
+    let broken = BrokenUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &embedding.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "embedding"
+base_url = "{0}"
+match_models = ["embedding-model"]
+
+[[upstreams]]
+name = "broken"
+base_url = "{1}"
+match_models = ["broken-model"]
+request_timeout_ms = 50
+
+[[listeners]]
+name = "embedding-broken"
+bind_host = "127.0.0.1"
+port = 18010
+allowed_upstreams = ["embedding", "broken"]
+"#,
+            embedding.base_url, broken.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "embedding-broken");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        embedding.recv_next().await.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models"
+    );
+
+    let attempts = read_attempt_request_metadata_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].attempt_number, 1);
+    assert_eq!(attempts[1].attempt_number, 2);
+    assert_eq!(attempts[0].status, "succeeded");
+    assert_eq!(attempts[1].status, "failed");
+    assert_ne!(attempts[0].attempt_id, attempts[1].attempt_id);
+    assert_eq!(attempts[0].request_id, attempts[1].request_id);
+    assert_eq!(
+        attempts[0].request_metadata["upstream_profile"],
+        "embedding"
+    );
+    assert_eq!(attempts[1].request_metadata["upstream_profile"], "broken");
 }
 
 #[tokio::test]
@@ -8327,7 +9357,7 @@ async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
             error_type,
             error_reason,
             request_metadata,
-            attempt: None,
+            attempts: Vec::new(),
         },
     );
 
@@ -8606,6 +9636,15 @@ fn empty_get_request(uri: &'static str) -> Request<Body> {
         .expect("GET request should build")
 }
 
+fn json_post_request(uri: &'static str, body: &'static [u8]) -> Request<Body> {
+    Request::builder()
+        .method(Method::POST)
+        .uri(uri)
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .expect("JSON request should build")
+}
+
 fn embedding_request(uri: &'static str) -> Request<Body> {
     Request::builder()
         .method(Method::POST)
@@ -8615,6 +9654,57 @@ fn embedding_request(uri: &'static str) -> Request<Body> {
             r#"{"model":"embedding-model","input":"capacity test"}"#,
         ))
         .expect("embedding request should build")
+}
+
+fn listener_config(proxy: &ProxyFixture, name: &str) -> ListenerConfig {
+    proxy
+        .manager
+        .handle()
+        .snapshot()
+        .expect("snapshot should succeed")
+        .listeners
+        .into_iter()
+        .find(|listener| listener.name == name)
+        .unwrap_or_else(|| panic!("listener {name} should exist"))
+}
+
+fn multi_listener_profile_config(upstream_base_url: &str) -> String {
+    format!(
+        r#"
+[[upstreams]]
+name = "embedding"
+base_url = "{upstream_base_url}"
+match_models = ["embedding-model"]
+
+[[upstreams]]
+name = "rerank"
+base_url = "{upstream_base_url}"
+match_models = ["rerank-model"]
+
+[[listeners]]
+name = "embedding-legacy"
+bind_host = "127.0.0.1"
+port = 18002
+allowed_upstreams = ["embedding"]
+
+[[listeners]]
+name = "reranker-legacy"
+bind_host = "127.0.0.1"
+port = 18003
+allowed_upstreams = ["rerank"]
+
+[[listeners]]
+name = "embedding-rerank"
+bind_host = "127.0.0.1"
+port = 18004
+allowed_upstreams = ["embedding", "rerank"]
+
+[[listeners]]
+name = "aggregate"
+bind_host = "127.0.0.1"
+port = 18005
+"#
+    )
 }
 
 fn shielded_chat_request(uri: &'static str, body: &'static str) -> Request<Body> {
@@ -8727,6 +9817,15 @@ struct AttemptChainRow {
 }
 
 #[derive(Debug)]
+struct AttemptRequestMetadataRow {
+    attempt_id: String,
+    request_id: String,
+    attempt_number: u32,
+    status: String,
+    request_metadata: serde_json::Value,
+}
+
+#[derive(Debug)]
 struct EvidenceAttemptRow {
     role: String,
     shown_to_downstream: i64,
@@ -8735,6 +9834,37 @@ struct EvidenceAttemptRow {
     shadow_skip_reason: Option<String>,
     thinking_budget_tokens: Option<u32>,
     detector_features: serde_json::Value,
+}
+
+fn read_attempt_request_metadata_rows(sqlite_path: &Path) -> Vec<AttemptRequestMetadataRow> {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let mut statement = connection
+        .prepare(
+            "SELECT attempt_id, request_id, attempt_number, status, request_metadata_json \
+             FROM attempts ORDER BY rowid",
+        )
+        .expect("attempt metadata query should prepare");
+    statement
+        .query_map([], |row| {
+            let metadata_json: String = row.get(4)?;
+            let request_metadata = serde_json::from_str(&metadata_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    4,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            Ok(AttemptRequestMetadataRow {
+                attempt_id: row.get(0)?,
+                request_id: row.get(1)?,
+                attempt_number: row.get(2)?,
+                status: row.get(3)?,
+                request_metadata,
+            })
+        })
+        .expect("attempt metadata query should execute")
+        .map(|row| row.expect("attempt metadata row should decode"))
+        .collect()
 }
 
 fn read_attempt_chain_rows(sqlite_path: &Path) -> Vec<AttemptChainRow> {
@@ -9104,10 +10234,65 @@ struct FakeUpstreamState {
     sender: mpsc::Sender<ObservedRequest>,
     changing_model_len: Arc<AtomicU64>,
     attempt_counts: Arc<Mutex<HashMap<String, u64>>>,
+    models_body: Option<&'static str>,
+    models_status: StatusCode,
+    models_label: &'static str,
+    models_delay: Option<Duration>,
 }
 
 impl FakeUpstream {
     async fn spawn() -> Self {
+        Self::spawn_with_optional_models_body(None).await
+    }
+
+    async fn spawn_with_models_body(models_body: &'static str) -> Self {
+        Self::spawn_with_models_options(Some(models_body), None).await
+    }
+
+    async fn spawn_with_models_response(
+        models_status: StatusCode,
+        models_body: &'static str,
+        models_label: &'static str,
+    ) -> Self {
+        Self::spawn_with_models_response_options(
+            Some(models_body),
+            models_status,
+            models_label,
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_with_models_body_and_delay(
+        models_body: &'static str,
+        models_delay: Duration,
+    ) -> Self {
+        Self::spawn_with_models_options(Some(models_body), Some(models_delay)).await
+    }
+
+    async fn spawn_with_optional_models_body(models_body: Option<&'static str>) -> Self {
+        Self::spawn_with_models_options(models_body, None).await
+    }
+
+    async fn spawn_with_models_options(
+        models_body: Option<&'static str>,
+        models_delay: Option<Duration>,
+    ) -> Self {
+        Self::spawn_with_models_response_options(
+            models_body,
+            StatusCode::OK,
+            "models",
+            models_delay,
+        )
+        .await
+    }
+
+    async fn spawn_with_models_response_options(
+        models_body: Option<&'static str>,
+        models_status: StatusCode,
+        models_label: &'static str,
+        models_delay: Option<Duration>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(10);
         let app = Router::new()
             .fallback(fake_upstream_handler)
@@ -9115,6 +10300,10 @@ impl FakeUpstream {
                 sender,
                 changing_model_len: Arc::new(AtomicU64::new(128_000)),
                 attempt_counts: Arc::new(Mutex::new(HashMap::new())),
+                models_body,
+                models_status,
+                models_label,
+                models_delay,
             });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -9333,6 +10522,13 @@ async fn fake_upstream_handler(
         .send(observed)
         .await
         .expect("fake upstream observation should send");
+    if endpoint == "/v1/models"
+        && path_and_query.contains("test=distinct-multi-upstream-models")
+        && state.models_body.is_some()
+        && let Some(models_delay) = state.models_delay
+    {
+        sleep(models_delay).await;
+    }
 
     if is_sse_stream {
         return delayed_stream_response(
@@ -9403,6 +10599,21 @@ fn fake_upstream_endpoint_response(
         if path_and_query.contains("test=model-metadata-max-context-length") {
             return json_response("models", MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY.to_owned());
         }
+        if path_and_query.contains("test=multi-listener-models") {
+            return json_response("models", MULTI_LISTENER_MODEL_METADATA_BODY.to_owned());
+        }
+        if path_and_query.contains("test=distinct-multi-upstream-models")
+            && let Some(models_body) = state.models_body
+        {
+            let mut response = json_response(state.models_label, models_body.to_owned());
+            *response.status_mut() = state.models_status;
+            if state.models_status == StatusCode::TOO_MANY_REQUESTS {
+                response
+                    .headers_mut()
+                    .insert(RETRY_AFTER, HeaderValue::from_static("11"));
+            }
+            return response;
+        }
         if path_and_query.contains("test=model-metadata") {
             return json_response("models", MODEL_METADATA_BODY.to_owned());
         }
@@ -9427,6 +10638,10 @@ fn fake_upstream_endpoint_response(
         "/v1/embeddings" => (
             "embeddings",
             r#"{"object":"list","data":[{"embedding":[0.0]}]}"#,
+        ),
+        "/v1/rerank" => (
+            "rerank",
+            r#"{"object":"list","results":[{"index":0,"score":1.0}]}"#,
         ),
         _ => ("unknown", r#"{"error":"unsupported"}"#),
     };

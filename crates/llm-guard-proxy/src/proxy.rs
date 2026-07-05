@@ -30,11 +30,11 @@ use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
     DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
     EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore, EvidenceStoreWrite, Health,
-    HeartbeatMode, LICENSE, LatencyHistogram, MetadataConfig, ObservabilityMetricsSnapshot,
-    ObservabilityStore, RawPayloads, RequestId, RequestRecord, RequestStatus, RetryConfig,
-    RetryLadderConfig, SERVICE_NAME, ShadowSkipReason, ThinkingConfig, UpstreamMode,
-    UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url,
-    validate_upstream_base_url,
+    HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, MetadataConfig,
+    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
+    RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
+    ShadowSkipReason, ThinkingConfig, UpstreamMode, UpstreamProfileConfig, UpstreamRouteReason,
+    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -58,12 +58,14 @@ const IN_FLIGHT_CAPACITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100)
 const ADMISSION_RETRY_AFTER_SECS: &str = "1";
 const RECOVERY_PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(100);
 const RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE: Duration = Duration::from_millis(500);
+const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
 
 /// Shared HTTP proxy state.
 #[derive(Clone, Debug)]
 pub(crate) struct ProxyState {
     config: ConfigHandle,
     config_path: PathBuf,
+    listener: ListenerConfig,
     store: ObservabilityStore,
     evidence_store: EvidenceStore,
     client: Client,
@@ -89,6 +91,12 @@ impl ProxyState {
         Self {
             config,
             config_path,
+            listener: ListenerConfig {
+                name: String::from("default"),
+                bind_host: String::from("0.0.0.0"),
+                port: 0,
+                allowed_upstreams: None,
+            },
             store,
             evidence_store,
             client,
@@ -100,6 +108,14 @@ impl ProxyState {
             repeat_inputs: Arc::new(RepeatInputCache::default()),
             shadow_attempts: Arc::new(InFlightLimiter::default()),
         }
+    }
+
+    /// Returns a clone of this shared proxy state scoped to one downstream listener.
+    #[must_use]
+    pub(crate) fn for_listener(&self, listener: ListenerConfig) -> Self {
+        let mut state = self.clone();
+        state.listener = listener;
+        state
     }
 
     async fn acquire_generation_permit(
@@ -183,7 +199,8 @@ impl ProxyState {
             .config
             .snapshot()
             .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
-        let selected_profile = config.select_upstream_profile(model_id);
+        let selected_profile = select_allowed_upstream_profile(&config, &self.listener, model_id)
+            .map_err(AdmissionFailure::ListenerUpstreamDenied)?;
         let limiter = self.generation_limiter_for_profile(&selected_profile.profile);
         if let Some(permit) = limiter.try_acquire(
             selected_profile
@@ -226,7 +243,9 @@ impl ProxyState {
                 .config
                 .snapshot()
                 .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
-            let selected_profile = config.select_upstream_profile(model_id.as_deref());
+            let selected_profile =
+                select_allowed_upstream_profile(&config, &self.listener, model_id.as_deref())
+                    .map_err(AdmissionFailure::ListenerUpstreamDenied)?;
             let limiter = self.generation_limiter_for_profile(&selected_profile.profile);
             if let Some(permit) = limiter.try_acquire(
                 selected_profile
@@ -414,12 +433,15 @@ enum AdmissionFailure {
     ControlPlaneLimitExceeded {
         max_control_plane_in_flight_requests: usize,
     },
+    #[error("{0}")]
+    ListenerUpstreamDenied(ListenerUpstreamDenied),
 }
 
 impl AdmissionFailure {
     const fn status(&self) -> StatusCode {
         match self {
             Self::ConfigSnapshot(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::ListenerUpstreamDenied(_) => StatusCode::BAD_REQUEST,
             Self::GenerationQueueFull { .. }
             | Self::GenerationQueueTimeout { .. }
             | Self::ControlPlaneLimitExceeded { .. } => StatusCode::SERVICE_UNAVAILABLE,
@@ -431,6 +453,7 @@ impl AdmissionFailure {
             Self::ConfigSnapshot(_) => "config_snapshot_failed",
             Self::GenerationQueueFull { .. } => "proxy_generation_queue_full",
             Self::GenerationQueueTimeout { .. } => "proxy_generation_queue_timeout",
+            Self::ListenerUpstreamDenied(_) => "listener_upstream_not_allowed",
             Self::ControlPlaneLimitExceeded { .. } => {
                 "proxy_control_plane_in_flight_limit_exceeded"
             }
@@ -439,12 +462,23 @@ impl AdmissionFailure {
 
     const fn retry_after(&self) -> Option<&'static str> {
         match self {
-            Self::ConfigSnapshot(_) => None,
+            Self::ConfigSnapshot(_) | Self::ListenerUpstreamDenied(_) => None,
             Self::GenerationQueueFull { .. }
             | Self::GenerationQueueTimeout { .. }
             | Self::ControlPlaneLimitExceeded { .. } => Some(ADMISSION_RETRY_AFTER_SECS),
         }
     }
+}
+
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+#[error(
+    "listener {listener_name} on port {listener_port} does not allow upstream profile {upstream_profile} for model {model_id}"
+)]
+struct ListenerUpstreamDenied {
+    listener_name: String,
+    listener_port: u16,
+    upstream_profile: String,
+    model_id: String,
 }
 
 #[derive(Debug, Default)]
@@ -1101,12 +1135,13 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
         let error_type = error.error_type();
         let error_reason = error.to_string();
         let response = proxy_error_response(error.status(), error_type, &error_reason);
-        let request_metadata = pre_upstream_request_metadata(
+        let mut request_metadata = pre_upstream_request_metadata(
             request.method(),
             request.uri(),
             request.headers(),
             config_shielding_enabled(&state.config),
         );
+        add_listener_metadata(&mut request_metadata, &state.listener);
         record_failed_request(
             &state.store,
             FailedRequestRecord {
@@ -1117,7 +1152,7 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
                 error_type,
                 error_reason,
                 request_metadata,
-                attempt: None,
+                attempts: Vec::new(),
             },
         );
         return response;
@@ -1160,7 +1195,7 @@ async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) 
                     error_type,
                     error_reason,
                     request_metadata,
-                    attempt: error.attempt_record(),
+                    attempts: error.attempt_records(),
                 },
             );
             response
@@ -1228,8 +1263,12 @@ async fn admit_request(
                     http_status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                     error_type,
                     error_reason,
-                    request_metadata: request.pre_upstream_metadata(None),
-                    attempt: None,
+                    request_metadata: {
+                        let mut metadata = request.pre_upstream_metadata(None);
+                        add_listener_metadata(&mut metadata, &state.listener);
+                        metadata
+                    },
+                    attempts: Vec::new(),
                 },
             );
             return AdmissionOutcome::Rejected(response);
@@ -1326,8 +1365,12 @@ fn reject_admission(
             http_status: error.status().as_u16(),
             error_type,
             error_reason,
-            request_metadata: request.pre_upstream_metadata(shielding_enabled),
-            attempt: None,
+            request_metadata: {
+                let mut metadata = request.pre_upstream_metadata(shielding_enabled);
+                add_listener_metadata(&mut metadata, &state.listener);
+                metadata
+            },
+            attempts: Vec::new(),
         },
     );
     AdmissionOutcome::Rejected(response)
@@ -1377,11 +1420,14 @@ async fn forward_openai_request(
         body.len(),
         config.shielding.enabled,
     );
+    add_listener_metadata(&mut request_metadata, &state.listener);
     let prepared_request =
         prepare_openai_forward_request(state, &config, &method, &uri, &body, &mut request_metadata)
             .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry);
     let upstream_stall_policy = UpstreamStallPolicy::from_config(&config.upstream_stall);
+    let upstream_timeout =
+        Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
     if prepared_request.shielded_chat_plan.intercepted {
         add_retry_request_metadata(&mut request_metadata, &retry_policy);
         return forward_shielded_chat_with_retries(
@@ -1395,9 +1441,7 @@ async fn forward_openai_request(
                 upstream_body: prepared_request.shielded_chat_plan.upstream_body,
                 downstream_body: prepared_request.shielded_chat_plan.downstream_body,
                 chat_kind: prepared_request.shielded_chat_plan.kind,
-                upstream_timeout: Duration::from_millis(
-                    prepared_request.upstream_profile.request_timeout_ms,
-                ),
+                upstream_timeout,
                 config: state.config.clone(),
                 store: state.store.clone(),
                 evidence_store: state.evidence_store.clone(),
@@ -1405,6 +1449,7 @@ async fn forward_openai_request(
                 started_at_unix_ms,
                 model_id: prepared_request.model_id,
                 request_metadata,
+                listener: state.listener.clone(),
                 upstream_profile: prepared_request.upstream_profile,
                 route_reason: prepared_request.route_reason,
                 liveness: prepared_request.shielded_chat_plan.liveness,
@@ -1429,9 +1474,7 @@ async fn forward_openai_request(
         reqwest_method: prepared_request.reqwest_method,
         upstream_url: prepared_request.upstream_url,
         upstream_body: prepared_request.shielded_chat_plan.upstream_body,
-        upstream_timeout: Duration::from_millis(
-            prepared_request.upstream_profile.request_timeout_ms,
-        ),
+        upstream_timeout,
         upstream_profile: prepared_request.upstream_profile,
         route_reason: prepared_request.route_reason,
         liveness: prepared_request.shielded_chat_plan.liveness,
@@ -1467,22 +1510,24 @@ async fn read_body_and_admit_generation(
     max_request_body_bytes: usize,
     request: BodyAdmissionContext<'_>,
 ) -> Result<OpenAiBodyAdmission, ProxyError> {
-    let pre_body_request_metadata = pre_upstream_request_metadata(
+    let mut pre_body_request_metadata = pre_upstream_request_metadata(
         request.method,
         request.uri,
         request.downstream_headers,
         request.shielding_enabled_hint,
     );
+    add_listener_metadata(&mut pre_body_request_metadata, &state.listener);
     let body = read_body_bytes(body, max_request_body_bytes)
         .await
         .map_err(|error| error.with_request_metadata(pre_body_request_metadata))?;
-    let body_read_request_metadata = base_request_metadata(
+    let mut body_read_request_metadata = base_request_metadata(
         request.method,
         request.uri,
         request.downstream_headers,
         body.len().to_string(),
         request.shielding_enabled_hint,
     );
+    add_listener_metadata(&mut body_read_request_metadata, &state.listener);
     let config = state.config.snapshot().map_err(|error| {
         ProxyError::config_snapshot(error.to_string())
             .with_request_metadata(body_read_request_metadata.clone())
@@ -1506,6 +1551,11 @@ async fn read_body_and_admit_generation(
     }
 
     let model_id_for_admission = extract_model_id(&body);
+    select_allowed_upstream_profile(&config, &state.listener, model_id_for_admission.as_deref())
+        .map_err(|error| {
+            ProxyError::listener_denied(error)
+                .with_request_metadata(body_read_request_metadata.clone())
+        })?;
     if admission_permit_kind == AdmissionPermitKind::Generation {
         return Ok(OpenAiBodyAdmission {
             config,
@@ -1544,7 +1594,8 @@ fn prepare_openai_forward_request(
     request_metadata: &mut BTreeMap<String, String>,
 ) -> Result<PreparedOpenAiRequest, ProxyError> {
     let model_id = extract_model_id(body);
-    let selected_profile = config.select_upstream_profile(model_id.as_deref());
+    let selected_profile =
+        select_profile_for_request(config, &state.listener, method, uri, model_id.as_deref())?;
     let upstream_profile = selected_profile.profile;
     let route_reason = selected_profile.route_reason;
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
@@ -1577,6 +1628,73 @@ fn prepare_openai_forward_request(
     })
 }
 
+fn select_profile_for_request(
+    config: &AppConfig,
+    listener: &ListenerConfig,
+    method: &Method,
+    uri: &Uri,
+    model: Option<&str>,
+) -> Result<SelectedUpstreamProfile, ProxyError> {
+    if is_control_plane_models_request(method, uri)
+        && let Some(allowed_upstreams) = listener.allowed_upstreams.as_ref()
+        && let Some(profile_name) = allowed_upstreams.first()
+        && let Some(profile) = config.upstream_profile_by_name(profile_name)
+    {
+        return Ok(SelectedUpstreamProfile {
+            profile,
+            route_reason: UpstreamRouteReason::MatchedModel,
+        });
+    }
+    select_allowed_upstream_profile(config, listener, model).map_err(ProxyError::listener_denied)
+}
+
+fn select_allowed_upstream_profile(
+    config: &AppConfig,
+    listener: &ListenerConfig,
+    model: Option<&str>,
+) -> Result<SelectedUpstreamProfile, ListenerUpstreamDenied> {
+    let selected = config.select_upstream_profile(model);
+    if listener.allows_upstream(&selected.profile.name) {
+        return Ok(selected);
+    }
+    Err(ListenerUpstreamDenied {
+        listener_name: listener.name.clone(),
+        listener_port: listener.port,
+        upstream_profile: selected.profile.name,
+        model_id: denied_model_id_summary(model),
+    })
+}
+
+fn denied_model_id_summary(model: Option<&str>) -> String {
+    let Some(model) = model else {
+        return String::from("[none]");
+    };
+    if model.len() <= MAX_DENIED_MODEL_ID_BYTES && !looks_sensitive_text(model) {
+        return model.to_owned();
+    }
+    format!(
+        "[redacted model: bytes={}, hash={}]",
+        model.len(),
+        stable_text_hash(model)
+    )
+}
+
+fn stable_text_hash(value: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("siphash64:{:016x}", hasher.finish())
+}
+
+fn looks_sensitive_text(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized.contains("bearer ")
+        || normalized.contains("api_key")
+        || normalized.contains("api-key")
+        || normalized.contains("x-api-key")
+        || normalized.contains("authorization")
+        || normalized.contains("sk-")
+}
+
 struct GenericForwardContext<'request> {
     state: &'request ProxyState,
     config: &'request AppConfig,
@@ -1602,10 +1720,19 @@ struct GenericForwardContext<'request> {
 async fn forward_generic_openai_request(
     context: GenericForwardContext<'_>,
 ) -> Result<Response<Body>, ProxyError> {
+    if is_control_plane_models_request(&context.method, &context.uri)
+        && let Some(groups) =
+            listener_models_upstream_groups(context.config, &context.state.listener)
+        && groups.len() > 1
+    {
+        return forward_merged_models_response(context, groups).await;
+    }
+
     let attempt_id = AttemptId::for_request(context.request_id, 1);
     let attempt_started_at_unix_ms = unix_time_millis();
     let mut attempt_request_metadata =
         attempt_request_metadata(&context.method, &context.uri, &context.downstream_headers);
+    add_listener_metadata(&mut attempt_request_metadata, &context.state.listener);
     add_upstream_profile_metadata(
         &mut attempt_request_metadata,
         &context.upstream_profile,
@@ -1626,6 +1753,7 @@ async fn forward_generic_openai_request(
         upstream_body: context.upstream_body,
         upstream_timeout: context.upstream_timeout,
         attempt_id: attempt_id.clone(),
+        attempt_number: 1,
         request_id: context.request_id,
         attempt_started_at_unix_ms,
         request_metadata: &context.request_metadata,
@@ -1655,6 +1783,7 @@ async fn forward_generic_openai_request(
             method: &context.method,
             uri: &context.uri,
             config: context.config,
+            listener: &context.state.listener,
             metadata_config: &context.upstream_profile.metadata,
         },
         response_parts,
@@ -1662,6 +1791,218 @@ async fn forward_generic_openai_request(
         context.in_flight_permit,
     )
     .await
+}
+
+#[derive(Clone)]
+struct ModelsUpstreamGroup {
+    profile: UpstreamProfileConfig,
+    base_url: String,
+    request_timeout_ms: u64,
+    metadata: MetadataConfig,
+}
+
+struct CompletedModelsFetch {
+    body: Bytes,
+    attempt_record: AttemptRecord,
+    upstream_status: reqwest::StatusCode,
+    upstream_headers: HeaderMap,
+    upstream_mode: UpstreamMode,
+}
+
+async fn forward_merged_models_response(
+    context: GenericForwardContext<'_>,
+    groups: Vec<ModelsUpstreamGroup>,
+) -> Result<Response<Body>, ProxyError> {
+    let mut response_status = None;
+    let mut response_headers = None;
+    let mut response_mode = None;
+    let mut filtered_bodies = Vec::with_capacity(groups.len());
+    let mut attempt_records = Vec::with_capacity(groups.len());
+    for (index, group) in groups.iter().enumerate() {
+        let attempt_number = u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1);
+        let fetch = match fetch_models_upstream_group(
+            &context,
+            group,
+            attempt_number,
+            u32::try_from(groups.len()).unwrap_or(u32::MAX),
+        )
+        .await
+        {
+            Ok(fetch) => fetch,
+            Err(error) => return Err(error.with_completed_attempt_records(attempt_records)),
+        };
+        if response_status.is_none() {
+            response_status = Some(fetch.upstream_status);
+            response_headers = Some(fetch.upstream_headers.clone());
+            response_mode = Some(fetch.upstream_mode);
+        }
+        filtered_bodies.push(fetch.body);
+        attempt_records.push(fetch.attempt_record);
+    }
+
+    let metadata_config = groups
+        .first()
+        .map_or(&context.upstream_profile.metadata, |group| &group.metadata);
+    let merged_body = model_metadata::merge_models_bodies(filtered_bodies);
+    let (upstream_status, upstream_headers, upstream_mode) = if merged_body.has_valid_model_list {
+        (
+            reqwest::StatusCode::OK,
+            models_success_response_headers(),
+            UpstreamMode::NotApplicable,
+        )
+    } else {
+        (
+            response_status.unwrap_or(reqwest::StatusCode::OK),
+            response_headers.unwrap_or_default(),
+            response_mode.unwrap_or(UpstreamMode::NotApplicable),
+        )
+    };
+    let body =
+        model_metadata::enrich_models_body(context.config, metadata_config, merged_body.body);
+    let response_parts = ForwardedResponseParts {
+        config: context.state.config.clone(),
+        store: context.state.store.clone(),
+        evidence_store: context.state.evidence_store.clone(),
+        request_id: context.request_id.clone(),
+        started_at_unix_ms: context.started_at_unix_ms,
+        attempt_id: AttemptId::for_request(context.request_id, 1),
+        attempt_started_at_unix_ms: context.started_at_unix_ms,
+        upstream_mode,
+        model_id: context.model_id,
+        input_fingerprint: context.liveness.input_fingerprint.clone(),
+        upstream_status,
+        upstream_headers: upstream_headers.clone(),
+        request_metadata: context.request_metadata,
+        attempt_request_metadata: BTreeMap::new(),
+    };
+    let mut observer = response_parts.into_observer();
+    observer.completed_attempt_records = attempt_records;
+    observer.final_attempt = None;
+    let response_body = ObservedBufferedBody::new(body, observer, context.in_flight_permit);
+    Ok(downstream_response(
+        upstream_status,
+        &upstream_headers,
+        Body::from_stream(response_body),
+    ))
+}
+
+fn models_success_response_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers
+}
+
+async fn fetch_models_upstream_group(
+    context: &GenericForwardContext<'_>,
+    group: &ModelsUpstreamGroup,
+    attempt_number: u32,
+    attempt_max_attempts: u32,
+) -> Result<CompletedModelsFetch, ProxyError> {
+    let attempt_id = AttemptId::for_request(context.request_id, attempt_number);
+    let attempt_started_at_unix_ms = unix_time_millis();
+    let mut attempt_request_metadata =
+        attempt_request_metadata(&context.method, &context.uri, &context.downstream_headers);
+    attempt_request_metadata.insert(String::from("attempt_number"), attempt_number.to_string());
+    add_listener_metadata(&mut attempt_request_metadata, &context.state.listener);
+    add_upstream_profile_metadata(
+        &mut attempt_request_metadata,
+        &group.profile,
+        UpstreamRouteReason::MatchedModel,
+    );
+    add_shielded_request_metadata(
+        &mut attempt_request_metadata,
+        false,
+        context.thinking_policy_applied,
+        &context.liveness,
+        &context.thinking_metadata,
+    );
+
+    let upstream_url = build_upstream_url(&group.base_url, &context.uri)?;
+    let upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
+        client: &context.state.client,
+        method: context.reqwest_method.clone(),
+        upstream_url,
+        downstream_headers: &context.downstream_headers,
+        upstream_body: context.upstream_body.clone(),
+        upstream_timeout: Duration::from_millis(group.request_timeout_ms),
+        attempt_id: attempt_id.clone(),
+        attempt_number,
+        request_id: context.request_id,
+        attempt_started_at_unix_ms,
+        request_metadata: &context.request_metadata,
+        attempt_request_metadata: &attempt_request_metadata,
+    })
+    .await?;
+    let upstream_mode = upstream_mode_from_headers(upstream_response.headers());
+    let upstream_status = upstream_response.status();
+    let upstream_headers = upstream_response.headers().clone();
+    let body = match read_upstream_body_bytes(upstream_response.bytes_stream()).await {
+        Ok(body) => body,
+        Err(error) => {
+            return Err(upstream_body_error_with_observability(
+                error,
+                context.request_metadata.clone(),
+                attempt_request_metadata.clone(),
+                attempt_id,
+                attempt_number,
+                context.request_id.clone(),
+                attempt_started_at_unix_ms,
+            ));
+        }
+    };
+    let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
+    let body = filter_models_body_for_listener(context.config, &context.state.listener, body);
+    let attempt_record = final_attempt_record(
+        FinalAttemptContext {
+            attempt_id,
+            attempt_number,
+            attempt_max_attempts,
+            started_at_unix_ms: attempt_started_at_unix_ms,
+            upstream_mode,
+            upstream_status,
+            upstream_headers: upstream_headers.clone(),
+            request_metadata: attempt_request_metadata,
+            extra_response_metadata: BTreeMap::new(),
+            raw_payloads: RawPayloads::default(),
+        },
+        context.request_id,
+        unix_time_millis(),
+        body_len,
+        &BodyCompletion::Succeeded,
+    );
+
+    Ok(CompletedModelsFetch {
+        body,
+        attempt_record,
+        upstream_status,
+        upstream_headers,
+        upstream_mode,
+    })
+}
+
+fn upstream_body_error_with_observability(
+    error: ProxyError,
+    request_metadata: BTreeMap<String, String>,
+    attempt_request_metadata: BTreeMap<String, String>,
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    request_id: RequestId,
+    attempt_started_at_unix_ms: u64,
+) -> ProxyError {
+    let finished_at_unix_ms = unix_time_millis();
+    let error_reason = error.to_string();
+    let attempt_record = failed_attempt_record(FailedAttemptRecordInput {
+        attempt_id,
+        attempt_number,
+        request_id,
+        started_at_unix_ms: attempt_started_at_unix_ms,
+        finished_at_unix_ms,
+        error_type: error.error_type(),
+        error_reason: &error_reason,
+        request_metadata: attempt_request_metadata,
+        extra_response_metadata: BTreeMap::new(),
+    });
+    error.with_observability(request_metadata, attempt_record)
 }
 
 struct UpstreamAttemptContext<'request> {
@@ -1672,6 +2013,7 @@ struct UpstreamAttemptContext<'request> {
     upstream_body: Bytes,
     upstream_timeout: Duration,
     attempt_id: AttemptId,
+    attempt_number: u32,
     request_id: &'request RequestId,
     attempt_started_at_unix_ms: u64,
     request_metadata: &'request BTreeMap<String, String>,
@@ -1697,6 +2039,7 @@ async fn send_first_upstream_attempt(
             let error_reason = error.to_string();
             let attempt_record = failed_attempt_record(FailedAttemptRecordInput {
                 attempt_id: context.attempt_id,
+                attempt_number: context.attempt_number,
                 request_id: context.request_id.clone(),
                 started_at_unix_ms: context.attempt_started_at_unix_ms,
                 finished_at_unix_ms,
@@ -1714,6 +2057,7 @@ struct ResponseDispatch<'request> {
     method: &'request Method,
     uri: &'request Uri,
     config: &'request AppConfig,
+    listener: &'request ListenerConfig,
     metadata_config: &'request MetadataConfig,
 }
 
@@ -1991,12 +2335,18 @@ async fn forward_upstream_response(
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
     let upstream_headers = response_parts.upstream_headers.clone();
-    if should_enrich_models_response(dispatch.method, dispatch.uri, dispatch.metadata_config) {
-        return forward_enriched_models_response(
+    if should_buffer_models_response(
+        dispatch.method,
+        dispatch.uri,
+        dispatch.metadata_config,
+        dispatch.listener,
+    ) {
+        return forward_buffered_models_response(
             response_parts,
             upstream_response,
             in_flight_permit,
             dispatch.config,
+            dispatch.listener,
             dispatch.metadata_config,
         )
         .await;
@@ -2049,6 +2399,18 @@ fn should_enrich_models_response(method: &Method, uri: &Uri, metadata: &Metadata
         && uri.path() == "/v1/models"
         && metadata.discovery_enabled
         && metadata.enrich_responses
+}
+
+fn should_buffer_models_response(
+    method: &Method,
+    uri: &Uri,
+    metadata: &MetadataConfig,
+    listener: &ListenerConfig,
+) -> bool {
+    method == Method::GET
+        && uri.path() == "/v1/models"
+        && (listener.allowed_upstreams.is_some()
+            || should_enrich_models_response(method, uri, metadata))
 }
 
 fn should_intercept_non_stream_chat(method: &Method, uri: &Uri, config: &AppConfig) -> bool {
@@ -2439,6 +2801,7 @@ impl ForwardedResponseParts {
         let error_reason = error.to_string();
         let attempt_record = failed_attempt_record(FailedAttemptRecordInput {
             attempt_id: self.attempt_id,
+            attempt_number: 1,
             request_id: self.request_id,
             started_at_unix_ms: self.attempt_started_at_unix_ms,
             finished_at_unix_ms,
@@ -2451,11 +2814,12 @@ impl ForwardedResponseParts {
     }
 }
 
-async fn forward_enriched_models_response(
+async fn forward_buffered_models_response(
     response_parts: ForwardedResponseParts,
     upstream_response: reqwest::Response,
     in_flight_permit: InFlightPermit,
     config: &AppConfig,
+    listener: &ListenerConfig,
     metadata_config: &MetadataConfig,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
@@ -2464,6 +2828,7 @@ async fn forward_enriched_models_response(
         Ok(body) => body,
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
+    let body = filter_models_body_for_listener(config, listener, body);
     let body = model_metadata::enrich_models_body(config, metadata_config, body);
     let observer = response_parts.into_observer();
     let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit);
@@ -2473,6 +2838,65 @@ async fn forward_enriched_models_response(
         &upstream_headers,
         Body::from_stream(response_body),
     ))
+}
+
+fn filter_models_body_for_listener(
+    config: &AppConfig,
+    listener: &ListenerConfig,
+    body: Bytes,
+) -> Bytes {
+    if listener.allowed_upstreams.is_none() {
+        return body;
+    }
+    model_metadata::filter_models_body_by_id(body, |model_id| {
+        select_allowed_upstream_profile(config, listener, Some(model_id)).is_ok()
+    })
+}
+
+fn listener_models_upstream_groups(
+    config: &AppConfig,
+    listener: &ListenerConfig,
+) -> Option<Vec<ModelsUpstreamGroup>> {
+    let upstream_profiles = listener_models_upstream_profiles(config, listener);
+    let mut groups = Vec::<ModelsUpstreamGroup>::new();
+    for profile in upstream_profiles {
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.base_url == profile.base_url)
+        {
+            group.request_timeout_ms = group.request_timeout_ms.max(profile.request_timeout_ms);
+            continue;
+        }
+        groups.push(ModelsUpstreamGroup {
+            base_url: profile.base_url.clone(),
+            request_timeout_ms: profile.request_timeout_ms,
+            metadata: profile.metadata.clone(),
+            profile,
+        });
+    }
+
+    if groups.is_empty() {
+        None
+    } else {
+        Some(groups)
+    }
+}
+
+fn listener_models_upstream_profiles(
+    config: &AppConfig,
+    listener: &ListenerConfig,
+) -> Vec<UpstreamProfileConfig> {
+    if let Some(allowed_upstreams) = listener.allowed_upstreams.as_ref() {
+        return allowed_upstreams
+            .iter()
+            .filter_map(|profile_name| config.upstream_profile_by_name(profile_name))
+            .collect();
+    }
+
+    let mut profiles = Vec::with_capacity(config.upstream_profiles.len() + 1);
+    profiles.push(config.default_upstream_profile());
+    profiles.extend(config.upstream_profiles.iter().cloned());
+    profiles
 }
 
 #[derive(Clone)]
@@ -2494,6 +2918,7 @@ struct ShieldedRetryRuntime {
     started_at_unix_ms: u64,
     model_id: Option<String>,
     request_metadata: BTreeMap<String, String>,
+    listener: ListenerConfig,
     upstream_profile: UpstreamProfileConfig,
     route_reason: UpstreamRouteReason,
     liveness: ShieldedLivenessSelection,
@@ -3678,6 +4103,7 @@ fn shielded_attempt_request_metadata(
         &runtime.downstream_uri,
         &runtime.downstream_headers,
     );
+    add_listener_metadata(&mut metadata, &runtime.listener);
     add_upstream_profile_metadata(
         &mut metadata,
         &runtime.upstream_profile,
@@ -5092,6 +5518,19 @@ fn base_request_metadata(
     metadata
 }
 
+fn add_listener_metadata(metadata: &mut BTreeMap<String, String>, listener: &ListenerConfig) {
+    metadata.insert(String::from("listener_name"), listener.name.clone());
+    metadata.insert(
+        String::from("listener_bind_host"),
+        listener.bind_host.clone(),
+    );
+    metadata.insert(String::from("listener_port"), listener.port.to_string());
+    metadata.insert(
+        String::from("listener_restricted"),
+        listener.allowed_upstreams.is_some().to_string(),
+    );
+}
+
 fn select_shielded_liveness(
     state: &ProxyState,
     config: &AppConfig,
@@ -5535,6 +5974,7 @@ fn config_shielding_enabled(config: &ConfigHandle) -> Option<bool> {
 
 struct FailedAttemptRecordInput<'error> {
     attempt_id: AttemptId,
+    attempt_number: u32,
     request_id: RequestId,
     started_at_unix_ms: u64,
     finished_at_unix_ms: u64,
@@ -5554,7 +5994,7 @@ fn failed_attempt_record(input: FailedAttemptRecordInput<'_>) -> AttemptRecord {
     AttemptRecord {
         attempt_id: input.attempt_id,
         request_id: input.request_id,
-        attempt_number: 1,
+        attempt_number: input.attempt_number,
         started_at_unix_ms: input.started_at_unix_ms,
         finished_at_unix_ms: Some(input.finished_at_unix_ms),
         upstream_mode: UpstreamMode::NotApplicable,
@@ -5569,7 +6009,7 @@ fn failed_attempt_record(input: FailedAttemptRecordInput<'_>) -> AttemptRecord {
     }
 }
 
-struct FailedRequestRecord<'attempt> {
+struct FailedRequestRecord {
     request_id: RequestId,
     started_at_unix_ms: u64,
     finished_at_unix_ms: u64,
@@ -5577,16 +6017,16 @@ struct FailedRequestRecord<'attempt> {
     error_type: &'static str,
     error_reason: String,
     request_metadata: BTreeMap<String, String>,
-    attempt: Option<&'attempt AttemptRecord>,
+    attempts: Vec<AttemptRecord>,
 }
 
-fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecord<'_>) {
+fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecord) {
     let mut response_metadata = failed_response_metadata(
         failure.started_at_unix_ms,
         failure.finished_at_unix_ms,
         failure.error_type,
     );
-    if let Some(attempt) = failure.attempt {
+    if let Some(attempt) = failure.attempts.last() {
         copy_loop_response_metadata(&attempt.response_metadata, &mut response_metadata);
     }
     let request_record = RequestRecord {
@@ -5605,7 +6045,7 @@ fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecor
         response_metadata,
         raw_payloads: RawPayloads::default(),
     };
-    record_observability(store, &request_record, failure.attempt);
+    record_observability_many(store, &request_record, &failure.attempts);
 }
 
 fn copy_loop_response_metadata(
@@ -5617,15 +6057,6 @@ fn copy_loop_response_metadata(
             target.insert(key.clone(), value.clone());
         }
     }
-}
-
-fn record_observability(
-    store: &ObservabilityStore,
-    request: &RequestRecord,
-    attempt: Option<&AttemptRecord>,
-) {
-    let attempts = attempt.into_iter().cloned().collect::<Vec<_>>();
-    record_observability_many(store, request, &attempts);
 }
 
 fn record_observability_many(
@@ -6396,6 +6827,11 @@ enum ProxyError {
         failure: AdmissionFailure,
         request_metadata: Option<BTreeMap<String, String>>,
     },
+    #[error("{failure}")]
+    ListenerUpstreamDenied {
+        failure: ListenerUpstreamDenied,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
     #[error("upstream request failed: {failure}")]
     UpstreamTransport {
         failure: ReqwestFailureKind,
@@ -6452,6 +6888,13 @@ impl ProxyError {
         }
     }
 
+    fn listener_denied(failure: ListenerUpstreamDenied) -> Self {
+        Self::ListenerUpstreamDenied {
+            failure,
+            request_metadata: None,
+        }
+    }
+
     fn upstream_body(reason: String) -> Self {
         Self::UpstreamBody {
             reason,
@@ -6476,7 +6919,9 @@ impl ProxyError {
             | Self::InvalidMethod { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRequestPath(error) => error.status(),
             Self::Admission { failure, .. } => failure.status(),
-            Self::ContextBudgetExceeded { .. } => StatusCode::BAD_REQUEST,
+            Self::ListenerUpstreamDenied { .. } | Self::ContextBudgetExceeded { .. } => {
+                StatusCode::BAD_REQUEST
+            }
             Self::UpstreamTransport { .. } | Self::UpstreamBody { .. } => StatusCode::BAD_GATEWAY,
         }
     }
@@ -6489,6 +6934,7 @@ impl ProxyError {
             Self::InvalidRequestPath(error) => error.error_type(),
             Self::InvalidMethod { .. } => "invalid_method",
             Self::Admission { failure, .. } => failure.error_type(),
+            Self::ListenerUpstreamDenied { .. } => "listener_upstream_not_allowed",
             Self::ContextBudgetExceeded { .. } => "invalid_request_error",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
             Self::UpstreamBody { .. } => "upstream_body_error",
@@ -6514,6 +6960,10 @@ impl ProxyError {
                 ..
             }
             | Self::Admission {
+                request_metadata: Some(request_metadata),
+                ..
+            }
+            | Self::ListenerUpstreamDenied {
                 request_metadata: Some(request_metadata),
                 ..
             }
@@ -6550,6 +7000,10 @@ impl ProxyError {
                 request_metadata: None,
                 ..
             }
+            | Self::ListenerUpstreamDenied {
+                request_metadata: None,
+                ..
+            }
             | Self::ContextBudgetExceeded {
                 request_metadata: None,
                 ..
@@ -6565,7 +7019,7 @@ impl ProxyError {
         }
     }
 
-    fn attempt_record(&self) -> Option<&AttemptRecord> {
+    fn attempt_records(&self) -> Vec<AttemptRecord> {
         match self {
             Self::UpstreamTransport {
                 observability: Some(observability),
@@ -6574,13 +7028,18 @@ impl ProxyError {
             | Self::UpstreamBody {
                 observability: Some(observability),
                 ..
-            } => Some(&observability.attempt_record),
+            } => {
+                let mut attempts = observability.completed_attempt_records.clone();
+                attempts.push(observability.attempt_record.clone());
+                attempts
+            }
             Self::RequestBody { .. }
             | Self::ConfigSnapshot { .. }
             | Self::InvalidUpstreamUrl { .. }
             | Self::InvalidRequestPath(_)
             | Self::InvalidMethod { .. }
             | Self::Admission { .. }
+            | Self::ListenerUpstreamDenied { .. }
             | Self::ContextBudgetExceeded { .. }
             | Self::UpstreamTransport {
                 observability: None,
@@ -6589,7 +7048,7 @@ impl ProxyError {
             | Self::UpstreamBody {
                 observability: None,
                 ..
-            } => None,
+            } => Vec::new(),
         }
     }
 
@@ -6617,6 +7076,10 @@ impl ProxyError {
                 request_metadata: Some(request_metadata),
             },
             Self::Admission { failure, .. } => Self::Admission {
+                failure,
+                request_metadata: Some(request_metadata),
+            },
+            Self::ListenerUpstreamDenied { failure, .. } => Self::ListenerUpstreamDenied {
                 failure,
                 request_metadata: Some(request_metadata),
             },
@@ -6652,6 +7115,7 @@ impl ProxyError {
                 observability: Some(Box::new(FailedUpstreamObservability {
                     request_metadata,
                     attempt_record,
+                    completed_attempt_records: Vec::new(),
                 })),
             },
             Self::UpstreamBody { reason, .. } => Self::UpstreamBody {
@@ -6659,6 +7123,7 @@ impl ProxyError {
                 observability: Some(Box::new(FailedUpstreamObservability {
                     request_metadata,
                     attempt_record,
+                    completed_attempt_records: Vec::new(),
                 })),
             },
             error @ (Self::RequestBody { .. }
@@ -6667,7 +7132,41 @@ impl ProxyError {
             | Self::InvalidRequestPath(_)
             | Self::InvalidMethod { .. }
             | Self::Admission { .. }
+            | Self::ListenerUpstreamDenied { .. }
             | Self::ContextBudgetExceeded { .. }) => error,
+        }
+    }
+
+    fn with_completed_attempt_records(self, completed_attempt_records: Vec<AttemptRecord>) -> Self {
+        if completed_attempt_records.is_empty() {
+            return self;
+        }
+        match self {
+            Self::UpstreamTransport {
+                failure,
+                observability: Some(mut observability),
+            } => {
+                observability
+                    .completed_attempt_records
+                    .splice(0..0, completed_attempt_records);
+                Self::UpstreamTransport {
+                    failure,
+                    observability: Some(observability),
+                }
+            }
+            Self::UpstreamBody {
+                reason,
+                observability: Some(mut observability),
+            } => {
+                observability
+                    .completed_attempt_records
+                    .splice(0..0, completed_attempt_records);
+                Self::UpstreamBody {
+                    reason,
+                    observability: Some(observability),
+                }
+            }
+            error => error,
         }
     }
 }
@@ -6676,6 +7175,7 @@ impl ProxyError {
 struct FailedUpstreamObservability {
     request_metadata: BTreeMap<String, String>,
     attempt_record: AttemptRecord,
+    completed_attempt_records: Vec<AttemptRecord>,
 }
 
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
