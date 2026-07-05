@@ -1335,7 +1335,6 @@ pub(super) async fn aggregate_stream(
 ) -> Result<AggregatedChatCompletion, AggregationError> {
     let mut stream = Box::pin(stream);
     let mut buffer = BytesMut::new();
-    let mut sse_body = BytesMut::new();
     let mut bytes_seen = 0_usize;
     let mut state = ChatAggregation::new(attempt_started_at_unix_ms, &loop_context);
 
@@ -1359,7 +1358,6 @@ pub(super) async fn aggregate_stream(
             )));
         }
         buffer.extend_from_slice(&chunk);
-        sse_body.extend_from_slice(&chunk);
 
         while let Some(event) = next_sse_event(&mut buffer) {
             state.apply_event(&event)?;
@@ -1372,7 +1370,7 @@ pub(super) async fn aggregate_stream(
         ));
     }
 
-    state.finish(request_id, request_model_id, sse_body.freeze())
+    state.finish(request_id, request_model_id)
 }
 
 async fn next_stream_chunk(
@@ -1553,7 +1551,6 @@ impl ChatAggregation {
         mut self,
         request_id: &str,
         request_model_id: Option<&str>,
-        sse_body: Bytes,
     ) -> Result<AggregatedChatCompletion, AggregationError> {
         self.ensure_usable()?;
         if let Err(error) = self.observe_completed_tool_calls() {
@@ -1569,12 +1566,18 @@ impl ChatAggregation {
         let finalized_choices = finalize_choices(self.choices);
         let mut raw_payloads = finalized_choices.raw_payloads();
         raw_payloads.chunks = raw_stream_chunks;
-        let body = completion_body(completion_fields, finalized_choices.choices)
-            .map_err(AggregationError::plain)?;
+        let choices = finalized_choices.choices;
+        let sse_body = completion_sse_body(
+            &completion_fields,
+            finalized_choices.sse_delta_choices,
+            &choices,
+        )
+        .map_err(AggregationError::plain)?;
+        let body = completion_body(completion_fields, choices).map_err(AggregationError::plain)?;
 
         Ok(AggregatedChatCompletion {
             body: Bytes::from(body),
-            sse_body,
+            sse_body: Bytes::from(sse_body),
             response_metadata,
             raw_payloads,
         })
@@ -1639,6 +1642,7 @@ impl CompletionFields {
 
 struct FinalizedChoices {
     choices: Vec<Value>,
+    sse_delta_choices: Vec<Value>,
     raw_output: String,
     raw_reasoning: String,
     raw_tool_calls: Vec<Value>,
@@ -1664,10 +1668,12 @@ fn finalize_choices(choices: BTreeMap<u64, ChoiceBuilder>) -> FinalizedChoices {
     let mut raw_reasoning = String::new();
     let mut raw_tool_calls = Vec::new();
     let mut final_choices = Vec::with_capacity(choices.len());
+    let mut sse_delta_choices = Vec::with_capacity(choices.len());
 
     for choice in choices.into_values() {
         raw_output.push_str(&choice.content);
         raw_reasoning.push_str(&choice.reasoning);
+        sse_delta_choices.push(choice.sse_delta_choice());
         let choice = choice.into_value();
         if let Some(tool_calls) = choice
             .get("message")
@@ -1682,6 +1688,7 @@ fn finalize_choices(choices: BTreeMap<u64, ChoiceBuilder>) -> FinalizedChoices {
 
     FinalizedChoices {
         choices: final_choices,
+        sse_delta_choices,
         raw_output,
         raw_reasoning,
         raw_tool_calls,
@@ -1748,6 +1755,80 @@ fn completion_body(fields: CompletionFields, choices: Vec<Value>) -> Result<Vec<
 
     serde_json::to_vec(&Value::Object(response))
         .map_err(|error| format!("failed to serialize aggregated chat completion: {error}"))
+}
+
+fn completion_sse_body(
+    fields: &CompletionFields,
+    delta_choices: Vec<Value>,
+    choices: &[Value],
+) -> Result<Vec<u8>, String> {
+    let mut body = BytesMut::new();
+    append_completion_sse_chunk(&mut body, fields, delta_choices, false)?;
+    append_completion_sse_chunk(&mut body, fields, finish_sse_choices(choices), true)?;
+    body.extend_from_slice(b"data: [DONE]\n\n");
+    Ok(body.to_vec())
+}
+
+fn append_completion_sse_chunk(
+    body: &mut BytesMut,
+    fields: &CompletionFields,
+    choices: Vec<Value>,
+    include_usage: bool,
+) -> Result<(), String> {
+    let mut chunk = Map::from_iter([
+        (String::from("id"), Value::String(fields.id.clone())),
+        (
+            String::from("object"),
+            Value::String(String::from("chat.completion.chunk")),
+        ),
+        (
+            String::from("created"),
+            Value::Number(Number::from(fields.created)),
+        ),
+        (String::from("model"), Value::String(fields.model.clone())),
+        (String::from("choices"), Value::Array(choices)),
+    ]);
+    insert_extension_fields(&mut chunk, fields.extension_fields.clone());
+    if let Some(service_tier) = &fields.service_tier {
+        chunk.insert(String::from("service_tier"), service_tier.clone());
+    }
+    if let Some(system_fingerprint) = &fields.system_fingerprint {
+        chunk.insert(
+            String::from("system_fingerprint"),
+            Value::String(system_fingerprint.clone()),
+        );
+    }
+    if include_usage {
+        if let Some(usage) = &fields.usage {
+            chunk.insert(String::from("usage"), usage.clone());
+        }
+    }
+
+    let serialized = serde_json::to_vec(&Value::Object(chunk))
+        .map_err(|error| format!("failed to serialize aggregated chat completion SSE: {error}"))?;
+    body.extend_from_slice(b"data: ");
+    body.extend_from_slice(&serialized);
+    body.extend_from_slice(b"\n\n");
+    Ok(())
+}
+
+fn finish_sse_choices(choices: &[Value]) -> Vec<Value> {
+    choices
+        .iter()
+        .map(|choice| {
+            let index = choice
+                .get("index")
+                .cloned()
+                .unwrap_or_else(|| Value::Number(Number::from(0)));
+            let finish_reason = choice.get("finish_reason").cloned().unwrap_or(Value::Null);
+            let stream_choice = Map::from_iter([
+                (String::from("index"), index),
+                (String::from("delta"), Value::Object(Map::new())),
+                (String::from("finish_reason"), finish_reason),
+            ]);
+            Value::Object(stream_choice)
+        })
+        .collect()
 }
 
 fn copy_extension_fields(
@@ -1891,6 +1972,62 @@ impl ChoiceBuilder {
         merge_json_value(existing, next);
     }
 
+    fn sse_delta_choice(&self) -> Value {
+        let mut delta = Map::new();
+        let has_reasoning = !self.reasoning.is_empty();
+        let content = normalize_final_content_after_reasoning(self.content.clone(), has_reasoning);
+
+        delta.insert(
+            String::from("role"),
+            Value::String(
+                self.role
+                    .clone()
+                    .unwrap_or_else(|| String::from("assistant")),
+            ),
+        );
+        if !(content.is_empty() && (!self.tool_calls.is_empty() || self.function_call.is_some())) {
+            delta.insert(String::from("content"), Value::String(content));
+        }
+        if has_reasoning {
+            delta.insert(
+                String::from("reasoning_content"),
+                Value::String(self.reasoning.clone()),
+            );
+        }
+        if let Some(function_call) = &self.function_call {
+            delta.insert(String::from("function_call"), function_call.as_value());
+        }
+        if self.saw_refusal && !self.refusal.is_empty() {
+            delta.insert(String::from("refusal"), Value::String(self.refusal.clone()));
+        }
+        insert_extension_fields(&mut delta, self.message_extension_fields.clone());
+        if !self.tool_calls.is_empty() {
+            delta.insert(
+                String::from("tool_calls"),
+                Value::Array(
+                    self.tool_calls
+                        .values()
+                        .map(ToolCallBuilder::as_sse_delta_value)
+                        .collect(),
+                ),
+            );
+        }
+
+        let mut stream_choice = Map::from_iter([
+            (
+                String::from("index"),
+                Value::Number(Number::from(self.index)),
+            ),
+            (String::from("delta"), Value::Object(delta)),
+            (String::from("finish_reason"), Value::Null),
+        ]);
+        if let Some(logprobs) = &self.logprobs {
+            stream_choice.insert(String::from("logprobs"), logprobs.clone());
+        }
+        insert_extension_fields(&mut stream_choice, self.extension_fields.clone());
+        Value::Object(stream_choice)
+    }
+
     fn apply_delta(
         &mut self,
         delta: &Map<String, Value>,
@@ -1967,17 +2104,18 @@ impl ChoiceBuilder {
 
     fn into_value(self) -> Value {
         let mut message = Map::new();
+        let has_reasoning = !self.reasoning.is_empty();
+        let content = normalize_final_content_after_reasoning(self.content, has_reasoning);
         message.insert(
             String::from("role"),
             Value::String(self.role.unwrap_or_else(|| String::from("assistant"))),
         );
-        if self.content.is_empty() && (!self.tool_calls.is_empty() || self.function_call.is_some())
-        {
+        if content.is_empty() && (!self.tool_calls.is_empty() || self.function_call.is_some()) {
             message.insert(String::from("content"), Value::Null);
         } else {
-            message.insert(String::from("content"), Value::String(self.content));
+            message.insert(String::from("content"), Value::String(content));
         }
-        if !self.reasoning.is_empty() {
+        if has_reasoning {
             message.insert(
                 String::from("reasoning_content"),
                 Value::String(self.reasoning),
@@ -2036,6 +2174,31 @@ impl ChoiceBuilder {
             tool_call.observe_completed(loop_detector)?;
         }
         Ok(())
+    }
+}
+
+fn normalize_final_content_after_reasoning(content: String, has_reasoning: bool) -> String {
+    if !has_reasoning {
+        return content;
+    }
+
+    let mut trim_end = 0;
+    let mut saw_line_break = false;
+    for (index, character) in content.char_indices() {
+        if matches!(character, '\n' | '\r' | ' ' | '\t') {
+            if matches!(character, '\n' | '\r') {
+                saw_line_break = true;
+            }
+            trim_end = index + character.len_utf8();
+            continue;
+        }
+        break;
+    }
+
+    if saw_line_break {
+        content[trim_end..].to_owned()
+    } else {
+        content
     }
 }
 
@@ -2181,6 +2344,17 @@ impl ToolCallBuilder {
                 "arguments": self.function_arguments.clone(),
             },
         })
+    }
+
+    fn as_sse_delta_value(&self) -> Value {
+        let mut tool_call = self.as_value();
+        if let Some(tool_call) = tool_call.as_object_mut() {
+            tool_call.insert(
+                String::from("index"),
+                Value::Number(Number::from(self.index)),
+            );
+        }
+        tool_call
     }
 
     fn observe_completed(

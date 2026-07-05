@@ -1105,6 +1105,11 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
         aggregated["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
         r#"{"q":"x"}"#
     );
+    assert!(
+        aggregated["choices"][0]["message"]["tool_calls"][0]
+            .get("index")
+            .is_none()
+    );
     assert_eq!(aggregated["choices"][0]["finish_reason"], "stop");
     assert_eq!(aggregated["usage"]["prompt_tokens"], 3);
     assert_eq!(aggregated["usage"]["completion_tokens"], 2);
@@ -1120,6 +1125,39 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
     assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
     assert_eq!(observed_body["stream"], true);
     assert_eq!(observed_body["stream_options"]["include_usage"], true);
+}
+
+#[tokio::test]
+async fn shielded_non_stream_chat_trims_reasoning_separator_from_final_content() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=reasoning-leading-newlines",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"Say OK"}],"stream":false}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "OK");
+    assert_eq!(
+        aggregated["choices"][0]["message"]["reasoning_content"],
+        "think before answering"
+    );
+
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.method, Method::POST);
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=reasoning-leading-newlines"
+    );
 }
 
 #[tokio::test]
@@ -4175,6 +4213,148 @@ shielded_streaming_enabled = true
         attempts[0].response_metadata["downstream_liveness_mode"],
         "sse"
     );
+}
+
+#[tokio::test]
+async fn shielded_streaming_trims_reasoning_separator_from_released_openai_sse() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[retry]
+shielded_streaming_enabled = true
+",
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=reasoning-leading-newlines",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"Say OK"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("text/event-stream")
+    );
+    let mut body = response.into_body().into_data_stream();
+    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    assert!(released.contains("chat.completion.chunk"));
+    assert!(released.contains(r#""content":"OK""#), "{released}");
+    assert!(!released.contains(r#""content":"\n\nOK""#), "{released}");
+    assert!(released.contains("data: [DONE]"));
+    assert!(!released.contains("event: final"));
+
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=reasoning-leading-newlines"
+    );
+}
+
+#[tokio::test]
+async fn shielded_streaming_emits_aggregated_logprobs_once_in_openai_sse() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[retry]
+shielded_streaming_enabled = true
+",
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream":true,"logprobs":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    let chunks = openai_sse_json_chunks(&released);
+    assert_eq!(chunks.len(), 2, "{released}");
+    assert_eq!(chunks[0]["choices"][0]["delta"]["content"], "Hello");
+    let logprobs = chunks[0]["choices"][0]["logprobs"]["content"]
+        .as_array()
+        .expect("delta chunk should carry aggregated logprobs once");
+    assert_eq!(logprobs.len(), 2);
+    assert_eq!(logprobs[0]["token"], "Hello");
+    assert_eq!(logprobs[1]["token"], "!");
+    assert!(
+        chunks[1]["choices"][0].get("logprobs").is_none(),
+        "{released}"
+    );
+    assert_eq!(chunks[1]["choices"][0]["finish_reason"], "stop");
+    assert!(released.contains("data: [DONE]"));
+
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["logprobs"], true);
+}
+
+#[tokio::test]
+async fn shielded_streaming_emits_tool_calls_in_openai_delta_shape() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[retry]
+shielded_streaming_enabled = true
+",
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"tool"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    let chunks = openai_sse_json_chunks(&released);
+    assert_eq!(chunks.len(), 2, "{released}");
+    let tool_calls = chunks[0]["choices"][0]["delta"]["tool_calls"]
+        .as_array()
+        .expect("delta chunk should carry tool calls");
+    assert_eq!(tool_calls[0]["index"], 0);
+    assert_eq!(tool_calls[0]["id"], "call_1");
+    assert_eq!(tool_calls[0]["type"], "function");
+    assert_eq!(tool_calls[0]["function"]["name"], "lookup");
+    assert_eq!(tool_calls[0]["function"]["arguments"], r#"{"q":"x"}"#);
+    assert!(
+        chunks[1]["choices"][0]["delta"].get("tool_calls").is_none(),
+        "{released}"
+    );
+
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
 }
 
 #[tokio::test]
@@ -9705,6 +9885,30 @@ where
     String::from_utf8(bytes).expect("stream body should be UTF-8")
 }
 
+fn openai_sse_json_chunks(text: &str) -> Vec<serde_json::Value> {
+    let mut chunks = Vec::new();
+    for event in text.split("\n\n") {
+        let mut data = String::new();
+        for line in event.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(value) = line.strip_prefix("data:") {
+                if !data.is_empty() {
+                    data.push('\n');
+                }
+                data.push_str(value.trim_start());
+            }
+        }
+        let data = data.trim();
+        if data.is_empty() || data == "[DONE]" {
+            continue;
+        }
+        chunks.push(serde_json::from_str(data).unwrap_or_else(|error| {
+            panic!("OpenAI SSE data should parse as JSON: {error}; data={data}")
+        }));
+    }
+    chunks
+}
+
 async fn shielded_final_json(response: reqwest::Response) -> serde_json::Value {
     let content_type = response
         .headers()
@@ -10865,6 +11069,15 @@ fn fake_chat_completion_response(
     if !body_requests_stream(body) {
         return None;
     }
+    fake_streaming_chat_completion_response(path_and_query, state, body)
+        .or_else(|| Some(chat_completion_sse_response(body)))
+}
+
+fn fake_streaming_chat_completion_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+    body: &Bytes,
+) -> Option<Response<Body>> {
     if path_and_query.contains("test=compat-function-call") {
         return Some(chat_completion_compat_function_call_sse_response(body));
     }
@@ -10944,6 +11157,9 @@ fn fake_chat_completion_response(
     if path_and_query.contains("test=loop-reasoning-hundreds") {
         return Some(repeated_reasoning_line_sse_response(200));
     }
+    if path_and_query.contains("test=reasoning-leading-newlines") {
+        return Some(reasoning_then_leading_newline_content_sse_response());
+    }
     if path_and_query.contains("test=loop-reasoning-six") {
         return Some(repeated_reasoning_line_sse_response(6));
     }
@@ -10959,7 +11175,7 @@ fn fake_chat_completion_response(
     if path_and_query.contains("test=copy-input-over-threshold") {
         return Some(repeated_input_copy_sse_response(12));
     }
-    Some(chat_completion_sse_response(body))
+    None
 }
 
 fn next_fake_attempt_count(state: &FakeUpstreamState, key: &str) -> u64 {
@@ -11288,6 +11504,20 @@ fn repeated_reasoning_line_sse_response(repetitions: usize) -> Response<Body> {
             })
         },
         "reasoning loop line\n",
+    )
+}
+
+fn reasoning_then_leading_newline_content_sse_response() -> Response<Body> {
+    delta_fragments_sse_response(
+        "chat-completions-reasoning-leading-newlines-sse",
+        [
+            serde_json::json!({
+                "reasoning_content": "think before answering",
+            }),
+            serde_json::json!({
+                "content": "\n\nOK",
+            }),
+        ],
     )
 }
 
