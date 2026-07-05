@@ -28,14 +28,15 @@ pub use observability::{
 };
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
-    DEFAULT_CONFIG_RELATIVE_PATH, DownstreamDropPolicy, EvidenceConfig, EvidenceShadowConfig,
-    HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig, LoopGuardMode, MetadataConfig,
-    MissingConfigPolicy, NoThinkingMarkerPolicy, ObservabilityConfig, RELOADABLE_FIELDS,
-    RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig,
-    RetryConfig, RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShieldingConfig,
-    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, ValidationError, default_config_path,
-    redact_upstream_base_url, validate_upstream_base_url,
+    DEFAULT_CONFIG_RELATIVE_PATH, DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig,
+    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig,
+    LoopGuardMode, MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy,
+    ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher,
+    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
+    SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
+    UpstreamStallConfig, ValidationError, default_config_path, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 
 /// Public service name used by the binary and documentation.

@@ -37,6 +37,9 @@ prune_to_records = 80000
 enabled = true
 force_disable = false
 budget_tokens = 32768
+# AEON/Qwen vLLM ignores canonical thinking.budget_tokens on plain OpenAI
+# payloads; inject chat_template_kwargs when no caller schema exists.
+default_injection_schema = "chat_template_kwargs"
 preserve_answer_budget = true
 tool_request_policy = "passthrough"
 # ForceThinking defaults to overriding caller no-thinking markers. Set to

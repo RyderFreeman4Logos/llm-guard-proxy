@@ -13,9 +13,9 @@ mod tests;
 
 pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
-    AppConfig, CloudflareConfig, ConfigToggle, DownstreamDropPolicy, EvidenceConfig,
-    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig,
-    LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig,
+    AppConfig, CloudflareConfig, ConfigToggle, DefaultInjectionSchema, DownstreamDropPolicy,
+    EvidenceConfig, EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig,
+    LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig,
     RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
     SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
     ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
@@ -72,6 +72,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "thinking.preserve_answer_budget",
     "thinking.tool_request_policy",
     "thinking.no_thinking_marker_policy",
+    "thinking.default_injection_schema",
     "thinking.apply_to_tool_requests",
     "loop_guard.enabled",
     "loop_guard.mode",
@@ -131,6 +132,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstreams.thinking.preserve_answer_budget",
     "upstreams.thinking.tool_request_policy",
     "upstreams.thinking.no_thinking_marker_policy",
+    "upstreams.thinking.default_injection_schema",
     "upstreams.thinking.apply_to_tool_requests",
 ];
 

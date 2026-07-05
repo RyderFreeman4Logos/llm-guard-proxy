@@ -11,10 +11,10 @@ use super::model::{
     evidence_blob_cache_dir_from_xdg_cache_home, evidence_sqlite_path_from_xdg_state_home,
 };
 use super::{
-    AppConfig, ConfigManager, ConfigParseError, DownstreamDropPolicy, HeartbeatMode, LoopGuardMode,
-    MissingConfigPolicy, NoThinkingMarkerPolicy, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
-    ThinkingMode, ToolRequestThinkingPolicy, UpstreamRouteReason, ValidationError,
-    parse::parse_config_text, redact_upstream_base_url,
+    AppConfig, ConfigManager, ConfigParseError, DefaultInjectionSchema, DownstreamDropPolicy,
+    HeartbeatMode, LoopGuardMode, MissingConfigPolicy, NoThinkingMarkerPolicy, RELOADABLE_FIELDS,
+    RESTART_REQUIRED_FIELDS, ThinkingMode, ToolRequestThinkingPolicy, UpstreamRouteReason,
+    ValidationError, parse::parse_config_text, redact_upstream_base_url,
 };
 
 const FULL_OVERRIDE_CONFIG: &str = r#"
@@ -167,6 +167,10 @@ fn defaults_match_issue_contract() {
         config.thinking.no_thinking_marker_policy,
         NoThinkingMarkerPolicy::Force
     );
+    assert_eq!(
+        config.thinking.default_injection_schema,
+        DefaultInjectionSchema::Canonical
+    );
     assert!(config.loop_guard.enabled);
     assert_eq!(config.loop_guard.mode, LoopGuardMode::Monitor);
     assert_eq!(config.loop_guard.effective_mode(), LoopGuardMode::Monitor);
@@ -242,6 +246,53 @@ thinking.no_thinking_marker_policy = "escape_hatch_only"
         escape_hatch.thinking.no_thinking_marker_policy,
         NoThinkingMarkerPolicy::EscapeHatchOnly
     );
+}
+
+#[test]
+fn parses_default_injection_schema_values() {
+    let chat_template_kwargs = parse_config_text(
+        r#"
+[thinking]
+default_injection_schema = "chat_template_kwargs"
+"#,
+    )
+    .expect("chat template kwargs schema should parse");
+    assert_eq!(
+        chat_template_kwargs.thinking.default_injection_schema,
+        DefaultInjectionSchema::ChatTemplateKwargs
+    );
+
+    let canonical = parse_config_text(
+        r#"
+[thinking]
+thinking.default_injection_schema = "canonical"
+"#,
+    )
+    .expect("canonical schema alias should parse");
+    assert_eq!(
+        canonical.thinking.default_injection_schema,
+        DefaultInjectionSchema::Canonical
+    );
+}
+
+#[test]
+fn rejects_invalid_default_injection_schema() {
+    let error = parse_config_text(
+        r#"
+[thinking]
+default_injection_schema = "qwen"
+"#,
+    )
+    .expect_err("invalid default injection schema should fail");
+
+    assert_eq!(error.line(), 3);
+    assert!(
+        error
+            .message()
+            .contains("invalid thinking.default_injection_schema")
+    );
+    assert!(error.message().contains("canonical"));
+    assert!(error.message().contains("chat_template_kwargs"));
 }
 
 #[test]
@@ -427,6 +478,7 @@ thinking_token_budget = 32768
 budget_accounting = "total_cap"
 apply_to_tool_requests = true
 no_thinking_marker_policy = "escape_hatch_only"
+default_injection_schema = "chat_template_kwargs"
 
 [[upstreams]]
 name = "fast-no-think"
@@ -470,6 +522,10 @@ mode = "force_disable"
     assert_eq!(
         aeon.thinking.no_thinking_marker_policy,
         NoThinkingMarkerPolicy::EscapeHatchOnly
+    );
+    assert_eq!(
+        aeon.thinking.default_injection_schema,
+        DefaultInjectionSchema::ChatTemplateKwargs
     );
 
     let fast = &config.upstream_profiles[1];
@@ -1498,6 +1554,7 @@ max_request_body_bytes = 512
 [thinking]
 force_disable = true
 no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "chat_template_kwargs"
 
 [upstream]
 request_timeout_ms = 90000
@@ -1536,9 +1593,19 @@ reasoning_semantic_history_window_count = 20
         snapshot.thinking.no_thinking_marker_policy,
         NoThinkingMarkerPolicy::RespectNoThinkingMarkers
     );
+    assert_eq!(
+        snapshot.thinking.default_injection_schema,
+        DefaultInjectionSchema::ChatTemplateKwargs
+    );
     assert_eq!(snapshot.upstream.request_timeout_ms, 90_000);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 3);
+    assert_reloaded_loop_guard_fields(&snapshot);
+
+    remove_file(&path);
+}
+
+fn assert_reloaded_loop_guard_fields(snapshot: &AppConfig) {
     assert_eq!(snapshot.loop_guard.mode, LoopGuardMode::Monitor);
     assert_eq!(snapshot.loop_guard.output_repeated_line_threshold, 7);
     assert!(!snapshot.loop_guard.reasoning_semantic_detection_enabled);
@@ -1560,8 +1627,6 @@ reasoning_semantic_history_window_count = 20
         snapshot.loop_guard.reasoning_semantic_history_window_count,
         20
     );
-
-    remove_file(&path);
 }
 
 #[test]
@@ -1608,6 +1673,7 @@ input_token_safety_margin = 128
 mode = "force_thinking"
 thinking_token_budget = 2048
 no_thinking_marker_policy = "escape_hatch_only"
+default_injection_schema = "chat_template_kwargs"
 "#,
     );
     let outcome = manager.reload().expect("profile reload should succeed");
@@ -1632,6 +1698,10 @@ no_thinking_marker_policy = "escape_hatch_only"
     assert_eq!(
         profile.profile.thinking.no_thinking_marker_policy,
         NoThinkingMarkerPolicy::EscapeHatchOnly
+    );
+    assert_eq!(
+        profile.profile.thinking.default_injection_schema,
+        DefaultInjectionSchema::ChatTemplateKwargs
     );
 
     remove_file(&path);
@@ -1871,8 +1941,10 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.max_tokens"));
     assert!(RELOADABLE_FIELDS.contains(&"thinking.tool_request_policy"));
     assert!(RELOADABLE_FIELDS.contains(&"thinking.no_thinking_marker_policy"));
+    assert!(RELOADABLE_FIELDS.contains(&"thinking.default_injection_schema"));
     assert!(RELOADABLE_FIELDS.contains(&"upstreams.thinking.mode"));
     assert!(RELOADABLE_FIELDS.contains(&"upstreams.thinking.no_thinking_marker_policy"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstreams.thinking.default_injection_schema"));
     assert!(RELOADABLE_FIELDS.contains(&"upstreams.metadata.input_token_safety_margin"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_queued_generation_requests"));
