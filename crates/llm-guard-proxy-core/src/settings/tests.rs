@@ -16,7 +16,7 @@ use super::{
     RESTART_REQUIRED_FIELDS, ThinkingMode, ToolRequestThinkingPolicy, UpstreamRouteReason,
     ValidationError, parse::parse_config_text, redact_upstream_base_url,
 };
-use crate::{AliasKind, AliasTarget, ModelAliasResolver};
+use crate::{AliasKind, AliasTarget, ModelAliasResolver, WorkflowRuntime};
 
 const FULL_OVERRIDE_CONFIG: &str = r#"
 [server]
@@ -62,6 +62,13 @@ id = "family/child-safe-general-v1"
 kind = "workflow"
 workflow_id = "family.child_safe_general.v1"
 workflow_timeout_ms = 120000
+
+[workflows.family.child_safe_general.v1]
+runtime_kind = "stdio"
+command = "python"
+args = ["workflows/content_review.py"]
+timeout_ms = 120000
+max_stdout_bytes = 1048576
 
 [observability]
 metrics_enabled = false
@@ -211,6 +218,7 @@ fn defaults_match_issue_contract() {
     assert!(config.cloudflare.enabled);
     assert!(config.upstream_profiles.is_empty());
     assert!(config.model_aliases.is_empty());
+    assert!(config.workflows.is_empty());
     assert_eq!(config.default_upstream_profile().name, "default");
 }
 
@@ -609,6 +617,11 @@ id = "family/child-safe-general-v1"
 kind = "workflow"
 workflow_id = "family.child_safe_general.v1"
 workflow_timeout_ms = 120000
+
+[workflows."family.child_safe_general.v1"]
+runtime_kind = "stdio"
+command = "python"
+args = ["workflows/content_review.py"]
 "#,
     )
     .expect("alias config should parse");
@@ -687,6 +700,120 @@ kind = "workflow"
         let error = config.validate().expect_err("alias config should fail");
         assert_eq!(error.field(), field);
     }
+}
+
+#[test]
+fn parses_workflow_config_with_defaults_and_overrides() {
+    let config = parse_config_text(
+        r#"
+[workflows.family.content_review.v1]
+runtime_kind = "stdio"
+command = "python"
+args = ["workflows/content_review.py"]
+"#,
+    )
+    .expect("workflow config should parse");
+
+    config.validate().expect("workflow config should validate");
+    let workflow = config
+        .workflows
+        .get("family.content_review.v1")
+        .expect("workflow should be present");
+    assert_eq!(workflow.runtime_kind, WorkflowRuntime::Stdio);
+    assert_eq!(workflow.command, "python");
+    assert_eq!(
+        workflow.args,
+        vec![String::from("workflows/content_review.py")]
+    );
+    assert_eq!(workflow.timeout_ms, 120_000);
+    assert_eq!(workflow.max_stdout_bytes, 1_048_576);
+
+    let config = parse_config_text(
+        r#"
+[workflows.family.content_review.v1]
+runtime_kind = "stdio"
+command = "/bin/sh"
+args = ["review.sh"]
+timeout_ms = 600000
+max_stdout_bytes = 2048
+"#,
+    )
+    .expect("workflow config overrides should parse");
+
+    config
+        .validate()
+        .expect("workflow override config should validate");
+    let workflow = config
+        .workflows
+        .get("family.content_review.v1")
+        .expect("workflow should be present");
+    assert_eq!(workflow.command, "/bin/sh");
+    assert_eq!(workflow.args, vec![String::from("review.sh")]);
+    assert_eq!(workflow.timeout_ms, 600_000);
+    assert_eq!(workflow.max_stdout_bytes, 2_048);
+}
+
+#[test]
+fn rejects_invalid_workflow_config() {
+    for (contents, field) in [
+        (
+            r#"
+[workflows.bad]
+runtime_kind = "stdio"
+command = ""
+"#,
+            "workflows.command",
+        ),
+        (
+            r#"
+[workflows.bad]
+runtime_kind = "stdio"
+command = "python"
+timeout_ms = 0
+"#,
+            "workflows.timeout_ms",
+        ),
+        (
+            r#"
+[workflows.bad]
+runtime_kind = "stdio"
+command = "python"
+timeout_ms = 600001
+"#,
+            "workflows.timeout_ms",
+        ),
+        (
+            r#"
+[workflows.bad]
+runtime_kind = "stdio"
+command = "python"
+max_stdout_bytes = 0
+"#,
+            "workflows.max_stdout_bytes",
+        ),
+    ] {
+        let config = parse_config_text(contents).expect("config syntax should parse");
+        let error = config
+            .validate()
+            .expect_err("workflow config should fail validation");
+        assert_eq!(error.field(), field);
+    }
+}
+
+#[test]
+fn rejects_invalid_workflow_runtime_kind() {
+    let error = parse_config_text(
+        r#"
+[workflows.bad]
+runtime_kind = "http"
+command = "python"
+"#,
+    )
+    .expect_err("invalid workflow runtime should fail");
+
+    assert_eq!(error.line(), 3);
+    assert!(error.message().contains("invalid workflows.runtime_kind"));
+    assert!(error.message().contains("stdio"));
 }
 
 #[test]
@@ -913,6 +1040,18 @@ fn assert_parsed_model_aliases(config: &AppConfig) {
         Some("family.child_safe_general.v1")
     );
     assert_eq!(config.model_aliases[1].workflow_timeout_ms, Some(120_000));
+    let workflow = config
+        .workflows
+        .get("family.child_safe_general.v1")
+        .expect("workflow config should parse");
+    assert_eq!(workflow.runtime_kind, WorkflowRuntime::Stdio);
+    assert_eq!(workflow.command, "python");
+    assert_eq!(
+        workflow.args,
+        vec![String::from("workflows/content_review.py")]
+    );
+    assert_eq!(workflow.timeout_ms, 120_000);
+    assert_eq!(workflow.max_stdout_bytes, 1_048_576);
 }
 
 #[test]

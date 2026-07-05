@@ -10,6 +10,7 @@ mod loop_detector;
 mod model_alias;
 mod observability;
 mod settings;
+pub mod workflow;
 
 pub use evidence::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceError,
@@ -48,6 +49,7 @@ pub use settings::{
     UpstreamStallConfig, ValidationError, default_config_path, redact_upstream_base_url,
     validate_upstream_base_url,
 };
+pub use workflow::{StdioRuntime, WorkflowConfig, WorkflowRuntime};
 
 /// Public service name used by the binary and documentation.
 pub const SERVICE_NAME: &str = "llm-guard-proxy";

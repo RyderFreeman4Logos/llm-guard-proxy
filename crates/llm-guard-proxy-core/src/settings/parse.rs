@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use crate::model_alias::{AliasKind, ModelAliasConfig};
+use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DefaultInjectionSchema,
@@ -10,7 +11,7 @@ use super::{
     ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamStallConfig,
 };
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum Section {
     Root,
     Server,
@@ -21,6 +22,7 @@ enum Section {
     UpstreamProfileMetadata(usize),
     UpstreamProfileThinking(usize),
     ModelAlias(usize),
+    Workflow(String),
     Shielding,
     Observability,
     ObservabilityRetention,
@@ -57,7 +59,7 @@ pub(crate) fn parse_config_text(contents: &str) -> Result<AppConfig, ConfigParse
             continue;
         }
         let (key, value) = split_key_value(line, line_number)?;
-        assign_value(&mut config, section, key.trim(), value.trim(), line_number)?;
+        assign_value(&mut config, &section, key.trim(), value.trim(), line_number)?;
     }
 
     Ok(config)
@@ -120,6 +122,32 @@ fn parse_section(
         return Ok(Section::RetryLadder(config.retry.ladder.len() - 1));
     }
     let section = &line[1..line.len() - 1];
+    if let Some(raw_workflow_id) = section.strip_prefix("workflows.") {
+        let workflow_id = raw_workflow_id.trim_matches('"');
+        if workflow_id.trim().is_empty() {
+            return Err(ConfigParseError::new(
+                line_number,
+                "workflow section id must not be empty",
+            ));
+        }
+        if workflow_id != workflow_id.trim() || workflow_id.contains(char::is_whitespace) {
+            return Err(ConfigParseError::new(
+                line_number,
+                "workflow section id must not contain whitespace",
+            ));
+        }
+        if config
+            .workflows
+            .insert(workflow_id.to_owned(), WorkflowConfig::default())
+            .is_some()
+        {
+            return Err(ConfigParseError::new(
+                line_number,
+                format!("duplicate workflow section [{section}]"),
+            ));
+        }
+        return Ok(Section::Workflow(workflow_id.to_owned()));
+    }
     match section {
         "server" => Ok(Section::Server),
         "upstream" => Ok(Section::Upstream),
@@ -183,7 +211,7 @@ fn split_key_value(line: &str, line_number: usize) -> Result<(&str, &str), Confi
 
 fn assign_value(
     config: &mut AppConfig,
-    section: Section,
+    section: &Section,
     key: &str,
     value: &str,
     line_number: usize,
@@ -195,32 +223,41 @@ fn assign_value(
         )),
         Section::Server => assign_server(&mut config.server, key, value, line_number),
         Section::Listener(index) => {
-            assign_listener(&mut config.listeners[index], key, value, line_number)
+            assign_listener(&mut config.listeners[*index], key, value, line_number)
         }
         Section::Upstream => assign_upstream(&mut config.upstream, key, value, line_number),
         Section::UpstreamMetadata => {
             assign_metadata(&mut config.upstream.metadata, key, value, line_number)
         }
         Section::UpstreamProfile(index) => assign_upstream_profile(
-            &mut config.upstream_profiles[index],
+            &mut config.upstream_profiles[*index],
             key,
             value,
             line_number,
         ),
         Section::UpstreamProfileMetadata(index) => assign_metadata(
-            &mut config.upstream_profiles[index].metadata,
+            &mut config.upstream_profiles[*index].metadata,
             key,
             value,
             line_number,
         ),
         Section::UpstreamProfileThinking(index) => assign_thinking(
-            &mut config.upstream_profiles[index].thinking,
+            &mut config.upstream_profiles[*index].thinking,
             key,
             value,
             line_number,
         ),
         Section::ModelAlias(index) => {
-            assign_model_alias(&mut config.model_aliases[index], key, value, line_number)
+            assign_model_alias(&mut config.model_aliases[*index], key, value, line_number)
+        }
+        Section::Workflow(workflow_id) => {
+            let workflow = config.workflows.get_mut(workflow_id).ok_or_else(|| {
+                ConfigParseError::new(
+                    line_number,
+                    format!("workflow section {workflow_id:?} was not initialized"),
+                )
+            })?;
+            assign_workflow(workflow, key, value, line_number)
         }
         Section::Shielding => assign_shielding(&mut config.shielding, key, value, line_number),
         Section::Observability => {
@@ -237,13 +274,48 @@ fn assign_value(
         Section::LoopGuard => assign_loop_guard(&mut config.loop_guard, key, value, line_number),
         Section::Retry => assign_retry(&mut config.retry, key, value, line_number),
         Section::RetryLadder(index) => {
-            assign_retry_ladder(&mut config.retry.ladder[index], key, value, line_number)
+            assign_retry_ladder(&mut config.retry.ladder[*index], key, value, line_number)
         }
         Section::UpstreamStall => {
             assign_upstream_stall(&mut config.upstream_stall, key, value, line_number)
         }
         Section::Heartbeat => assign_heartbeat(&mut config.heartbeat, key, value, line_number),
         Section::Cloudflare => assign_cloudflare(&mut config.cloudflare, key, value, line_number),
+    }
+}
+
+fn assign_workflow(
+    config: &mut WorkflowConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "runtime_kind" => config.runtime_kind = parse_workflow_runtime(value, line_number)?,
+        "command" => config.command = parse_string(value, line_number)?,
+        "args" => config.args = parse_string_array(value, line_number)?,
+        "timeout_ms" => {
+            config.timeout_ms = parse_u64(value, line_number, "workflows.timeout_ms")?;
+        }
+        "max_stdout_bytes" => {
+            config.max_stdout_bytes =
+                parse_usize(value, line_number, "workflows.max_stdout_bytes")?;
+        }
+        _ => return unknown_key("workflows", key, line_number),
+    }
+    Ok(())
+}
+
+fn parse_workflow_runtime(
+    value: &str,
+    line_number: usize,
+) -> Result<WorkflowRuntime, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "stdio" => Ok(WorkflowRuntime::Stdio),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!("invalid workflows.runtime_kind {other:?}; expected \"stdio\""),
+        )),
     }
 }
 
