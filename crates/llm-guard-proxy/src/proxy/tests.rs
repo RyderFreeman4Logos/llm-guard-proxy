@@ -2921,6 +2921,159 @@ anti_loop_hint_enabled = true
     assert_eq!(attempts[1].response_metadata["attempt_max_attempts"], "5");
 }
 
+/// Regression test for issue #99: the anti-loop retry hint must not create a
+/// non-leading `system` message when the original request already has a leading
+/// `system` message. Qwen-style chat templates reject any non-leading system
+/// message with a 400 error.
+#[tokio::test]
+async fn shielded_retry_preserves_leading_system_message_on_loop_retry() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[
+                {"role":"system","content":"You are a helpful assistant."},
+                {"role":"user","content":"ping"}
+            ]}"#,
+        )
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let first_attempt = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+
+    // First attempt has no retry hint.
+    assert!(!body_contains_retry_hint(&first_attempt.body));
+
+    // Second attempt has the retry hint merged into the existing system message.
+    assert!(body_contains_retry_hint(&second_attempt.body));
+
+    // The upstream must receive at most one system message, and it must be at
+    // index 0. No non-leading system messages are allowed.
+    let second_messages = serde_json::from_slice::<serde_json::Value>(&second_attempt.body)
+        .expect("second attempt body should be valid JSON")
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .expect("messages should be an array")
+        .clone();
+
+    let system_count = second_messages
+        .iter()
+        .filter(|msg| msg.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .count();
+    assert_eq!(
+        system_count, 1,
+        "exactly one system message should exist after retry hint injection"
+    );
+
+    let first_role = second_messages[0]
+        .get("role")
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        first_role,
+        Some("system"),
+        "the system message must remain at index 0"
+    );
+
+    // The merged content should contain both the original instruction and the hint.
+    let merged_content = second_messages[0]
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .expect("merged system content should be a string");
+    assert!(merged_content.contains("You are a helpful assistant."));
+    assert!(merged_content.contains("llm-guard-proxy retry hint"));
+
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "successful retry should stop after the second upstream attempt"
+    );
+}
+
+/// Regression test for issue #99: when there is no existing system message,
+/// the retry hint creates a new leading system message as before. This verifies
+/// the existing behavior is preserved for requests without a system message.
+#[tokio::test]
+async fn shielded_retry_inserts_new_system_message_when_none_exists() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 5
+anti_loop_hint_enabled = true
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+
+    let _first = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+
+    assert!(body_contains_retry_hint(&second_attempt.body));
+
+    let second_messages = serde_json::from_slice::<serde_json::Value>(&second_attempt.body)
+        .expect("second attempt body should be valid JSON")
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .expect("messages should be an array")
+        .clone();
+
+    let first_role = second_messages[0]
+        .get("role")
+        .and_then(serde_json::Value::as_str);
+    assert_eq!(
+        first_role,
+        Some("system"),
+        "a new system message should be inserted at index 0"
+    );
+}
+
 #[tokio::test]
 async fn evidence_disabled_creates_no_evidence_artifacts_after_proxy_request() {
     let mut fake = FakeUpstream::spawn().await;
