@@ -17,6 +17,8 @@ use super::{
     ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
     UpstreamStallConfig,
 };
+#[cfg(feature = "guard")]
+use super::{UnknownKeyPolicy, VirtualKeyConfig};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum Section {
@@ -40,6 +42,10 @@ enum Section {
     Workflow(String),
     #[cfg(feature = "guard")]
     GuardWorkflows,
+    #[cfg(feature = "guard")]
+    VirtualKeys,
+    #[cfg(feature = "guard")]
+    VirtualKeyMap,
     Shielding,
     Observability,
     ObservabilityRetention,
@@ -239,6 +245,10 @@ fn parse_section(
         ),
         #[cfg(feature = "guard")]
         "guard_workflows" => Ok(Section::GuardWorkflows),
+        #[cfg(feature = "guard")]
+        "virtual_keys" => Ok(Section::VirtualKeys),
+        #[cfg(feature = "guard")]
+        "virtual_keys.keys" => Ok(Section::VirtualKeyMap),
         "shielding" => Ok(Section::Shielding),
         "observability" => Ok(Section::Observability),
         "observability.retention" => Ok(Section::ObservabilityRetention),
@@ -285,6 +295,11 @@ fn assign_value(
     value: &str,
     line_number: usize,
 ) -> Result<(), ConfigParseError> {
+    #[cfg(feature = "guard")]
+    if let Some(result) = assign_guard_value(config, section, key, value, line_number) {
+        return result;
+    }
+
     match section {
         Section::Root => Err(ConfigParseError::new(
             line_number,
@@ -332,34 +347,6 @@ fn assign_value(
             value,
             line_number,
         ),
-        #[cfg(feature = "guard")]
-        Section::ModelAlias(index) => {
-            assign_model_alias(&mut config.model_aliases[*index], key, value, line_number)
-        }
-        #[cfg(feature = "guard")]
-        Section::Profile(profile_name) => {
-            let profile = config.profiles.get_mut(profile_name).ok_or_else(|| {
-                ConfigParseError::new(
-                    line_number,
-                    format!("profile section {profile_name:?} was not initialized"),
-                )
-            })?;
-            assign_profile(profile, key, value, line_number)
-        }
-        #[cfg(feature = "guard")]
-        Section::Workflow(workflow_id) => {
-            let workflow = config.workflows.get_mut(workflow_id).ok_or_else(|| {
-                ConfigParseError::new(
-                    line_number,
-                    format!("workflow section {workflow_id:?} was not initialized"),
-                )
-            })?;
-            assign_workflow(workflow, key, value, line_number)
-        }
-        #[cfg(feature = "guard")]
-        Section::GuardWorkflows => {
-            assign_guard_workflows(&mut config.guard_workflows, key, value, line_number)
-        }
         Section::Shielding => assign_shielding(&mut config.shielding, key, value, line_number),
         Section::Observability => {
             assign_observability(&mut config.observability, key, value, line_number)
@@ -382,6 +369,74 @@ fn assign_value(
         }
         Section::Heartbeat => assign_heartbeat(&mut config.heartbeat, key, value, line_number),
         Section::Cloudflare => assign_cloudflare(&mut config.cloudflare, key, value, line_number),
+        #[cfg(feature = "guard")]
+        Section::ModelAlias(_)
+        | Section::Profile(_)
+        | Section::Workflow(_)
+        | Section::GuardWorkflows
+        | Section::VirtualKeys
+        | Section::VirtualKeyMap => unreachable!("guard sections are handled before this match"),
+    }
+}
+
+#[cfg(feature = "guard")]
+fn assign_guard_value(
+    config: &mut AppConfig,
+    section: &Section,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Option<Result<(), ConfigParseError>> {
+    match section {
+        Section::ModelAlias(index) => Some(assign_model_alias(
+            &mut config.model_aliases[*index],
+            key,
+            value,
+            line_number,
+        )),
+        Section::Profile(profile_name) => Some(
+            config
+                .profiles
+                .get_mut(profile_name)
+                .ok_or_else(|| {
+                    ConfigParseError::new(
+                        line_number,
+                        format!("profile section {profile_name:?} was not initialized"),
+                    )
+                })
+                .and_then(|profile| assign_profile(profile, key, value, line_number)),
+        ),
+        Section::Workflow(workflow_id) => Some(
+            config
+                .workflows
+                .get_mut(workflow_id)
+                .ok_or_else(|| {
+                    ConfigParseError::new(
+                        line_number,
+                        format!("workflow section {workflow_id:?} was not initialized"),
+                    )
+                })
+                .and_then(|workflow| assign_workflow(workflow, key, value, line_number)),
+        ),
+        Section::GuardWorkflows => Some(assign_guard_workflows(
+            &mut config.guard_workflows,
+            key,
+            value,
+            line_number,
+        )),
+        Section::VirtualKeys => Some(assign_virtual_keys(
+            &mut config.virtual_keys,
+            key,
+            value,
+            line_number,
+        )),
+        Section::VirtualKeyMap => Some(assign_virtual_key_map(
+            &mut config.virtual_keys,
+            key,
+            value,
+            line_number,
+        )),
+        _ => None,
     }
 }
 
@@ -478,6 +533,54 @@ fn assign_guard_workflows(
         _ => return unknown_key("guard_workflows", key, line_number),
     }
     Ok(())
+}
+
+#[cfg(feature = "guard")]
+fn assign_virtual_keys(
+    config: &mut VirtualKeyConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "unknown_key_policy" => {
+            config.unknown_key_policy = parse_unknown_key_policy(value, line_number)?;
+        }
+        _ => return unknown_key("virtual_keys", key, line_number),
+    }
+    Ok(())
+}
+
+#[cfg(feature = "guard")]
+fn assign_virtual_key_map(
+    config: &mut VirtualKeyConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    let profile_name = parse_string(value, line_number)?;
+    config
+        .keys
+        .insert(key.trim_matches('"').to_owned(), profile_name);
+    Ok(())
+}
+
+#[cfg(feature = "guard")]
+fn parse_unknown_key_policy(
+    value: &str,
+    line_number: usize,
+) -> Result<UnknownKeyPolicy, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "use_default_profile" => Ok(UnknownKeyPolicy::UseDefaultProfile),
+        "fail_closed" => Ok(UnknownKeyPolicy::FailClosed),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid virtual_keys.unknown_key_policy {other:?}; expected \"use_default_profile\" or \"fail_closed\""
+            ),
+        )),
+    }
 }
 
 #[cfg(feature = "guard")]

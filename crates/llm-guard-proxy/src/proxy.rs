@@ -32,9 +32,9 @@ use llm_guard_proxy_core::HotRestartConfig;
 use llm_guard_proxy_core::ParamOverrideConfig;
 #[cfg(feature = "guard")]
 use llm_guard_proxy_core::{
-    AliasTarget, DEFAULT_PROFILE_NAME, GWP_PROTOCOL_VERSION, GuardExecutor, GuardOutcome,
-    GwpDecision, GwpHook, GwpInvocation, GwpResult, GwpTraceMode, ModelAliasResolver,
-    ProfileConfig, StdioRuntime,
+    AliasTarget, BlockReason, DEFAULT_PROFILE_NAME, GWP_PROTOCOL_VERSION, GuardExecutor,
+    GuardOutcome, GwpDecision, GwpHook, GwpInvocation, GwpResult, GwpTraceMode, ModelAliasResolver,
+    ProfileCheckResult, ProfileConfig, StdioRuntime, UnknownKeyPolicy,
 };
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
@@ -71,6 +71,8 @@ const ADMISSION_RETRY_AFTER_SECS: u32 = 1;
 const RECOVERY_PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(100);
 const RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE: Duration = Duration::from_millis(500);
 const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
+#[cfg(feature = "guard")]
+const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
 
 /// Shared HTTP proxy state.
 #[derive(Clone, Debug)]
@@ -1781,9 +1783,16 @@ async fn forward_openai_request(
     add_listener_metadata(&mut request_metadata, &state.listener);
     request_metadata.extend(admission_metadata);
     #[allow(unused_mut)]
-    let mut prepared_request =
-        prepare_openai_forward_request(state, &config, &method, &uri, &body, &mut request_metadata)
-            .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    let mut prepared_request = prepare_openai_forward_request(
+        state,
+        &config,
+        &method,
+        &uri,
+        &downstream_headers,
+        &body,
+        &mut request_metadata,
+    )
+    .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     #[cfg(feature = "guard")]
     if let Some(workflow_alias) = prepared_request.workflow_alias.clone() {
         return handle_workflow_alias_request(WorkflowAliasRequestContext {
@@ -1793,6 +1802,7 @@ async fn forward_openai_request(
             started_at_unix_ms,
             requested_model: prepared_request.model_id.as_deref().unwrap_or_default(),
             request_body: prepared_request.shielded_chat_plan.downstream_body.clone(),
+            caller_profile_name: prepared_request.caller_profile_name.clone(),
             caller_profile: prepared_request.caller_profile.clone(),
             workflow_alias,
             request_metadata,
@@ -1831,6 +1841,8 @@ async fn forward_openai_request(
                 request_metadata,
                 listener: state.listener.clone(),
                 upstream_profile: prepared_request.upstream_profile,
+                #[cfg(feature = "guard")]
+                caller_profile_name: prepared_request.caller_profile_name,
                 #[cfg(feature = "guard")]
                 caller_profile: prepared_request.caller_profile,
                 route_reason: prepared_request.route_reason,
@@ -1985,6 +1997,8 @@ async fn read_body_and_admit_generation(
 struct PreparedOpenAiRequest {
     model_id: Option<String>,
     #[cfg(feature = "guard")]
+    caller_profile_name: String,
+    #[cfg(feature = "guard")]
     caller_profile: ProfileConfig,
     #[cfg(feature = "guard")]
     workflow_alias: Option<ResolvedWorkflowAlias>,
@@ -2002,19 +2016,42 @@ struct ResolvedWorkflowAlias {
     timeout_ms: u64,
 }
 
+#[cfg(feature = "guard")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedCallerProfile {
+    name: String,
+    config: ProfileConfig,
+    resolution: CallerProfileResolution,
+    enforce_policy: bool,
+}
+
+#[cfg(feature = "guard")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CallerProfileResolution {
+    VirtualKeyMatched,
+    DisabledDefault,
+    SingleProfileDefault,
+    UnknownUseDefault,
+}
+
 fn prepare_openai_forward_request(
     state: &ProxyState,
     config: &AppConfig,
     method: &Method,
     uri: &Uri,
+    downstream_headers: &HeaderMap,
     body: &Bytes,
     request_metadata: &mut BTreeMap<String, String>,
 ) -> Result<PreparedOpenAiRequest, ProxyError> {
+    #[cfg(not(feature = "guard"))]
+    let _ = downstream_headers;
     let model_id = extract_model_id(body);
     #[cfg(feature = "guard")]
-    let caller_profile = config
-        .caller_profile_by_name(DEFAULT_PROFILE_NAME)
-        .unwrap_or_else(|| config.default_caller_profile());
+    let caller_profile = resolve_caller_profile(config, downstream_headers)?;
+    #[cfg(feature = "guard")]
+    add_caller_profile_metadata(request_metadata, &caller_profile);
+    #[cfg(feature = "guard")]
+    enforce_caller_profile_policy(&caller_profile, model_id.as_deref())?;
     #[cfg(feature = "guard")]
     let workflow_alias = workflow_alias_for_model(config, model_id.as_deref())?;
     let selected_profile =
@@ -2052,7 +2089,9 @@ fn prepare_openai_forward_request(
     Ok(PreparedOpenAiRequest {
         model_id,
         #[cfg(feature = "guard")]
-        caller_profile,
+        caller_profile_name: caller_profile.name.clone(),
+        #[cfg(feature = "guard")]
+        caller_profile: caller_profile.config,
         #[cfg(feature = "guard")]
         workflow_alias,
         upstream_profile,
@@ -2061,6 +2100,176 @@ fn prepare_openai_forward_request(
         reqwest_method,
         shielded_chat_plan,
     })
+}
+
+#[cfg(feature = "guard")]
+fn resolve_caller_profile(
+    config: &AppConfig,
+    headers: &HeaderMap,
+) -> Result<ResolvedCallerProfile, ProxyError> {
+    if !config.virtual_keys.enabled {
+        return Ok(default_caller_profile(
+            config,
+            CallerProfileResolution::DisabledDefault,
+        ));
+    }
+
+    let virtual_key = extract_virtual_key(headers);
+    if let Some(virtual_key) = virtual_key
+        && let Some(profile_name) = virtual_key_profile_name(config, virtual_key)
+        && let Some(profile) = config.caller_profile_by_name(&profile_name)
+    {
+        return Ok(ResolvedCallerProfile {
+            name: profile_name,
+            config: profile,
+            resolution: CallerProfileResolution::VirtualKeyMatched,
+            enforce_policy: !config.profiles.is_empty(),
+        });
+    }
+
+    if virtual_key.is_none() && config.profiles.len() == 1 {
+        if let Some((profile_name, profile)) = config.profiles.iter().next() {
+            return Ok(ResolvedCallerProfile {
+                name: profile_name.clone(),
+                config: profile.clone(),
+                resolution: CallerProfileResolution::SingleProfileDefault,
+                enforce_policy: true,
+            });
+        }
+    }
+
+    match config.virtual_keys.unknown_key_policy {
+        UnknownKeyPolicy::UseDefaultProfile => Ok(default_caller_profile(
+            config,
+            CallerProfileResolution::UnknownUseDefault,
+        )),
+        UnknownKeyPolicy::FailClosed => Err(ProxyError::virtual_key_unauthorized()),
+    }
+}
+
+#[cfg(feature = "guard")]
+fn default_caller_profile(
+    config: &AppConfig,
+    resolution: CallerProfileResolution,
+) -> ResolvedCallerProfile {
+    let config_profile = config.caller_profile_by_name(DEFAULT_PROFILE_NAME);
+    ResolvedCallerProfile {
+        name: DEFAULT_PROFILE_NAME.to_owned(),
+        config: config_profile.unwrap_or_else(|| config.default_caller_profile()),
+        resolution,
+        enforce_policy: !config.profiles.is_empty(),
+    }
+}
+
+#[cfg(feature = "guard")]
+fn extract_virtual_key(headers: &HeaderMap) -> Option<&str> {
+    header_trimmed(headers, &HeaderName::from_static(X_VIRTUAL_KEY_HEADER))
+        .or_else(|| bearer_token(headers))
+}
+
+#[cfg(feature = "guard")]
+fn header_trimmed<'headers>(
+    headers: &'headers HeaderMap,
+    name: &HeaderName,
+) -> Option<&'headers str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(feature = "guard")]
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let value = header_trimmed(headers, &AUTHORIZATION)?;
+    value
+        .strip_prefix("Bearer ")
+        .or_else(|| value.strip_prefix("bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+#[cfg(feature = "guard")]
+fn virtual_key_profile_name(config: &AppConfig, virtual_key: &str) -> Option<String> {
+    let mut selected = None;
+    for (configured_key, profile_name) in &config.virtual_keys.keys {
+        if constant_time_eq(configured_key.as_bytes(), virtual_key.as_bytes()) {
+            selected = Some(profile_name.clone());
+        }
+    }
+    selected
+}
+
+#[cfg(feature = "guard")]
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let max_len = left.len().max(right.len());
+    let mut diff = left.len() ^ right.len();
+    for index in 0..max_len {
+        let left_byte = left.get(index).copied().unwrap_or_default();
+        let right_byte = right.get(index).copied().unwrap_or_default();
+        diff |= usize::from(left_byte ^ right_byte);
+    }
+    diff == 0
+}
+
+#[cfg(feature = "guard")]
+fn add_caller_profile_metadata(
+    request_metadata: &mut BTreeMap<String, String>,
+    caller_profile: &ResolvedCallerProfile,
+) {
+    request_metadata.insert(String::from("caller_profile"), caller_profile.name.clone());
+    request_metadata.insert(
+        String::from("virtual_key_resolution"),
+        caller_profile.resolution.as_str().to_owned(),
+    );
+}
+
+#[cfg(feature = "guard")]
+impl CallerProfileResolution {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::VirtualKeyMatched => "matched",
+            Self::DisabledDefault => "disabled_default",
+            Self::SingleProfileDefault => "single_profile_default",
+            Self::UnknownUseDefault => "unknown_use_default",
+        }
+    }
+}
+
+#[cfg(feature = "guard")]
+fn enforce_caller_profile_policy(
+    caller_profile: &ResolvedCallerProfile,
+    model_id: Option<&str>,
+) -> Result<(), ProxyError> {
+    if !caller_profile.enforce_policy {
+        return Ok(());
+    }
+    let Some(model_id) = normalized_model_id(model_id) else {
+        return Ok(());
+    };
+    match caller_profile.config.check_request(model_id, 0) {
+        ProfileCheckResult::Allow => Ok(()),
+        ProfileCheckResult::Block { reason } => Err(ProxyError::guard_blocked(format!(
+            "caller profile blocked request: {}",
+            profile_block_reason_message(&reason)
+        ))),
+    }
+}
+
+#[cfg(feature = "guard")]
+fn profile_block_reason_message(reason: &BlockReason) -> String {
+    match reason {
+        BlockReason::ModelNotAllowed { model } => {
+            format!(
+                "model not allowed: {}",
+                denied_model_id_summary(Some(model))
+            )
+        }
+        BlockReason::DailyLimitExceeded { limit } => {
+            format!("daily request limit exceeded: limit={limit}")
+        }
+        BlockReason::KindMismatch => String::from("profile kind mismatch"),
+    }
 }
 
 #[cfg(feature = "param-override")]
@@ -2192,6 +2401,7 @@ struct WorkflowAliasRequestContext<'request> {
     started_at_unix_ms: u64,
     requested_model: &'request str,
     request_body: Bytes,
+    caller_profile_name: String,
     caller_profile: ProfileConfig,
     workflow_alias: ResolvedWorkflowAlias,
     request_metadata: BTreeMap<String, String>,
@@ -2207,7 +2417,9 @@ async fn handle_workflow_alias_request(
         protocol_version: GWP_PROTOCOL_VERSION.to_owned(),
         hook: GwpHook::PreRequestGuard,
         request_id: context.request_id.to_string(),
-        profile: context.caller_profile.to_gwp_profile(DEFAULT_PROFILE_NAME),
+        profile: context
+            .caller_profile
+            .to_gwp_profile(&context.caller_profile_name),
         model_alias: context.requested_model.to_owned(),
         messages,
         policy: serde_json::Value::Null,
@@ -2417,6 +2629,7 @@ async fn apply_pre_request_guard(
         request_id.as_str(),
         prepared_request.model_id.as_deref().unwrap_or_default(),
         messages,
+        prepared_request.caller_profile_name.clone(),
         prepared_request.caller_profile.clone(),
     )
     .await;
@@ -2443,6 +2656,7 @@ async fn run_pre_request_guard(
     request_id: &str,
     model: &str,
     messages: Vec<serde_json::Value>,
+    profile_name: String,
     profile: ProfileConfig,
 ) -> GuardOutcome {
     let guard_config = config.guard_workflows.clone();
@@ -2455,6 +2669,7 @@ async fn run_pre_request_guard(
             &request_id,
             &model,
             &messages,
+            &profile_name,
             &profile,
         )
     })
@@ -2489,6 +2704,7 @@ async fn apply_post_response_guard(
         runtime.request_id.as_str(),
         runtime.model_id.as_deref().unwrap_or_default(),
         response.clone(),
+        runtime.caller_profile_name.clone(),
         runtime.caller_profile.clone(),
     )
     .await;
@@ -2513,6 +2729,7 @@ async fn run_post_response_guard(
     request_id: &str,
     model: &str,
     response: serde_json::Value,
+    profile_name: String,
     profile: ProfileConfig,
 ) -> GuardOutcome {
     let guard_config = config.guard_workflows.clone();
@@ -2525,6 +2742,7 @@ async fn run_post_response_guard(
             &request_id,
             &model,
             &response,
+            &profile_name,
             &profile,
         )
     })
@@ -3997,6 +4215,8 @@ struct ShieldedRetryRuntime {
     request_metadata: BTreeMap<String, String>,
     listener: ListenerConfig,
     upstream_profile: UpstreamProfileConfig,
+    #[cfg(feature = "guard")]
+    caller_profile_name: String,
     #[cfg(feature = "guard")]
     caller_profile: ProfileConfig,
     route_reason: UpstreamRouteReason,
@@ -8529,6 +8749,11 @@ enum ProxyError {
         reason: String,
         request_metadata: Option<BTreeMap<String, String>>,
     },
+    #[cfg(feature = "guard")]
+    #[error("virtual key is required or not recognized")]
+    VirtualKeyUnauthorized {
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
     #[error("upstream request failed: {failure}")]
     UpstreamTransport {
         failure: ReqwestFailureKind,
@@ -8607,6 +8832,16 @@ impl ProxyError {
         }
     }
 
+    #[cfg(feature = "guard")]
+    fn virtual_key_unauthorized() -> Self {
+        Self::VirtualKeyUnauthorized {
+            request_metadata: Some(BTreeMap::from([(
+                String::from("virtual_key_resolution"),
+                String::from("fail_closed"),
+            )])),
+        }
+    }
+
     fn context_budget_exceeded(estimate: ContextBudgetEstimate) -> Self {
         Self::ContextBudgetExceeded {
             message: estimate.message(),
@@ -8625,6 +8860,8 @@ impl ProxyError {
             Self::InvalidRequestPath(error) => error.status(),
             Self::Admission { failure, .. } => failure.status(),
             #[cfg(feature = "guard")]
+            Self::VirtualKeyUnauthorized { .. } => StatusCode::UNAUTHORIZED,
+            #[cfg(feature = "guard")]
             Self::GuardBlocked { .. } => StatusCode::FORBIDDEN,
             Self::ListenerUpstreamDenied { .. } | Self::ContextBudgetExceeded { .. } => {
                 StatusCode::BAD_REQUEST
@@ -8642,6 +8879,8 @@ impl ProxyError {
             Self::InvalidMethod { .. } => "invalid_method",
             Self::Admission { failure, .. } => failure.error_type(),
             Self::ListenerUpstreamDenied { .. } => "listener_upstream_not_allowed",
+            #[cfg(feature = "guard")]
+            Self::VirtualKeyUnauthorized { .. } => "virtual_key_unauthorized",
             #[cfg(feature = "guard")]
             Self::GuardBlocked { .. } => "guard_blocked",
             Self::ContextBudgetExceeded { .. } => "invalid_request_error",
@@ -8684,6 +8923,10 @@ impl ProxyError {
             Self::GuardBlocked {
                 request_metadata: Some(request_metadata),
                 ..
+            } => Some(request_metadata),
+            #[cfg(feature = "guard")]
+            Self::VirtualKeyUnauthorized {
+                request_metadata: Some(request_metadata),
             } => Some(request_metadata),
             Self::UpstreamTransport {
                 observability: Some(observability),
@@ -8735,6 +8978,10 @@ impl ProxyError {
                 request_metadata: None,
                 ..
             } => None,
+            #[cfg(feature = "guard")]
+            Self::VirtualKeyUnauthorized {
+                request_metadata: None,
+            } => None,
         }
     }
 
@@ -8769,7 +9016,7 @@ impl ProxyError {
                 ..
             } => Vec::new(),
             #[cfg(feature = "guard")]
-            Self::GuardBlocked { .. } => Vec::new(),
+            Self::GuardBlocked { .. } | Self::VirtualKeyUnauthorized { .. } => Vec::new(),
         }
     }
 
@@ -8809,6 +9056,16 @@ impl ProxyError {
                 reason,
                 request_metadata: Some(request_metadata),
             },
+            #[cfg(feature = "guard")]
+            Self::VirtualKeyUnauthorized {
+                request_metadata: existing_metadata,
+            } => {
+                let mut merged = existing_metadata.unwrap_or_default();
+                merged.extend(request_metadata);
+                Self::VirtualKeyUnauthorized {
+                    request_metadata: Some(merged),
+                }
+            }
             Self::ContextBudgetExceeded {
                 message,
                 param,
@@ -8861,7 +9118,7 @@ impl ProxyError {
             | Self::ListenerUpstreamDenied { .. }
             | Self::ContextBudgetExceeded { .. }) => error,
             #[cfg(feature = "guard")]
-            error @ Self::GuardBlocked { .. } => error,
+            error @ (Self::GuardBlocked { .. } | Self::VirtualKeyUnauthorized { .. }) => error,
         }
     }
 

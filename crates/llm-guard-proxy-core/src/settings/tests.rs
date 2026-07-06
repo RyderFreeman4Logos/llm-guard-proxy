@@ -19,7 +19,7 @@ use super::{
 #[cfg(feature = "guard")]
 use crate::{
     AliasKind, AliasTarget, DEFAULT_PROFILE_NAME, ModelAliasResolver, ProfileConfig, ProfileKind,
-    ShieldedBuffering, WorkflowRuntime,
+    ShieldedBuffering, UnknownKeyPolicy, WorkflowRuntime,
 };
 
 #[cfg(feature = "guard")]
@@ -91,6 +91,14 @@ guard_pack = "family_basic"
 kind = "adult"
 allowed_models = ["gpt-default", "family/child-safe-general-v1"]
 shielded_buffering = "off"
+
+[virtual_keys]
+enabled = true
+unknown_key_policy = "use_default_profile"
+
+[virtual_keys.keys]
+vk_adult_abc123 = "adult_default"
+vk_child_def456 = "child_default"
 
 [observability]
 metrics_enabled = false
@@ -1140,6 +1148,8 @@ fn parses_toml_with_defaults_and_overrides() {
     }
     #[cfg(feature = "guard")]
     assert_parsed_profiles(&config);
+    #[cfg(feature = "guard")]
+    assert_parsed_virtual_keys(&config);
     assert_parsed_observability_overrides(&config);
     assert!(config.evidence.enabled);
     assert_eq!(
@@ -1212,6 +1222,32 @@ fn assert_parsed_profiles(config: &AppConfig) {
     assert_eq!(adult.daily_request_limit, None);
     assert_eq!(adult.shielded_buffering, ShieldedBuffering::Off);
     assert_eq!(adult.guard_pack, None);
+}
+
+#[cfg(feature = "guard")]
+fn assert_parsed_virtual_keys(config: &AppConfig) {
+    assert!(config.virtual_keys.enabled);
+    assert_eq!(
+        config.virtual_keys.unknown_key_policy,
+        UnknownKeyPolicy::UseDefaultProfile
+    );
+    assert_eq!(config.virtual_keys.keys.len(), 2);
+    assert_eq!(
+        config
+            .virtual_keys
+            .keys
+            .get("vk_adult_abc123")
+            .map(String::as_str),
+        Some("adult_default")
+    );
+    assert_eq!(
+        config
+            .virtual_keys
+            .keys
+            .get("vk_child_def456")
+            .map(String::as_str),
+        Some("child_default")
+    );
 }
 
 #[test]
@@ -1293,6 +1329,43 @@ kind = "adult"
         error.message().contains("duplicate profile section"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+#[cfg(feature = "guard")]
+fn validates_virtual_key_requirements() {
+    for (contents, field) in [
+        (
+            r#"
+[profiles.default]
+kind = "adult"
+
+[virtual_keys.keys]
+vk_known = "missing"
+"#,
+            "virtual_keys.keys",
+        ),
+        (
+            r#"
+[profiles.adult]
+kind = "adult"
+
+[profiles.child]
+kind = "child"
+
+[virtual_keys]
+enabled = true
+unknown_key_policy = "use_default_profile"
+"#,
+            "virtual_keys.unknown_key_policy",
+        ),
+    ] {
+        let config = parse_config_text(contents).expect("config syntax should parse");
+        let error = config
+            .validate()
+            .expect_err("virtual key config should fail");
+        assert_eq!(error.field(), field);
+    }
 }
 
 #[test]
@@ -2599,6 +2672,8 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"retry.ladder"));
     #[cfg(feature = "guard")]
     assert!(RELOADABLE_FIELDS.contains(&"profiles"));
+    #[cfg(feature = "guard")]
+    assert!(RELOADABLE_FIELDS.contains(&"virtual_keys"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.metrics_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_admin_token"));

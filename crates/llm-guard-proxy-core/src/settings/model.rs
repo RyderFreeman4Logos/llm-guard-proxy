@@ -32,6 +32,8 @@ const MAX_UPSTREAM_MODEL_ALIAS_BYTES: usize = 256;
 const MAX_CALLER_PROFILE_NAME_BYTES: usize = 128;
 #[cfg(feature = "guard")]
 const MAX_GUARD_PACK_NAME_BYTES: usize = 256;
+#[cfg(feature = "guard")]
+const MAX_VIRTUAL_KEY_BYTES: usize = 512;
 
 /// Complete application configuration.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -50,6 +52,9 @@ pub struct AppConfig {
     /// Caller profiles and their request policy.
     #[cfg(feature = "guard")]
     pub profiles: HashMap<String, ProfileConfig>,
+    /// Virtual key to caller profile mapping.
+    #[cfg(feature = "guard")]
+    pub virtual_keys: VirtualKeyConfig,
     /// Configured guard workflows.
     #[cfg(feature = "guard")]
     pub workflows: HashMap<String, WorkflowConfig>,
@@ -91,6 +96,7 @@ impl AppConfig {
         {
             self.validate_model_aliases()?;
             self.validate_profiles()?;
+            self.validate_virtual_keys()?;
             self.validate_workflows()?;
             self.validate_guard_workflows()?;
         }
@@ -395,6 +401,48 @@ impl AppConfig {
         Ok(())
     }
 
+    #[cfg(feature = "guard")]
+    fn validate_virtual_keys(&self) -> Result<(), ValidationError> {
+        if self.virtual_keys.enabled
+            && self.profiles.len() > 1
+            && self.virtual_keys.unknown_key_policy == UnknownKeyPolicy::UseDefaultProfile
+        {
+            require(
+                self.profiles.contains_key(DEFAULT_PROFILE_NAME),
+                "virtual_keys.unknown_key_policy",
+                "use_default_profile requires a configured default profile when multiple profiles exist",
+            )?;
+        }
+        for (key, profile_name) in &self.virtual_keys.keys {
+            require(
+                !key.trim().is_empty(),
+                "virtual_keys.keys",
+                "must not contain empty key values",
+            )?;
+            require(
+                key == key.trim(),
+                "virtual_keys.keys",
+                "key values must not have leading or trailing whitespace",
+            )?;
+            require(
+                key.len() <= MAX_VIRTUAL_KEY_BYTES,
+                "virtual_keys.keys",
+                "key values must be at most 512 bytes",
+            )?;
+            require(
+                !profile_name.trim().is_empty(),
+                "virtual_keys.keys",
+                "profile names must not be empty",
+            )?;
+            require(
+                self.caller_profile_by_name(profile_name).is_some(),
+                "virtual_keys.keys",
+                "must reference a configured caller profile",
+            )?;
+        }
+        Ok(())
+    }
+
     fn validate_upstream_stall_timeout_order(&self) -> Result<(), ValidationError> {
         if self.upstream_stall.enabled {
             require(
@@ -583,6 +631,7 @@ impl AppConfig {
         #[cfg(feature = "guard")]
         {
             self.profiles.clone_from(&requested.profiles);
+            self.virtual_keys.clone_from(&requested.virtual_keys);
             self.workflows.clone_from(&requested.workflows);
             self.guard_workflows.clone_from(&requested.guard_workflows);
         }
@@ -781,6 +830,43 @@ impl Default for GuardWorkflowConfig {
             fail_closed_blocks: true,
         }
     }
+}
+
+/// Virtual key resolution settings for caller profile selection.
+#[cfg(feature = "guard")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VirtualKeyConfig {
+    /// Enables virtual key resolution for ambiguous requests.
+    pub enabled: bool,
+    /// Policy applied when a request has no usable key or an unknown key.
+    pub unknown_key_policy: UnknownKeyPolicy,
+    /// Virtual key value to caller profile name mapping.
+    ///
+    /// Virtual keys are identity labels for local policy routing, not strong
+    /// authentication secrets. Runtime code must not log these key values.
+    pub keys: HashMap<String, String>,
+}
+
+#[cfg(feature = "guard")]
+impl Default for VirtualKeyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            unknown_key_policy: UnknownKeyPolicy::UseDefaultProfile,
+            keys: HashMap::new(),
+        }
+    }
+}
+
+/// Policy for requests with no known virtual key.
+#[cfg(feature = "guard")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UnknownKeyPolicy {
+    /// Fall back to the default caller profile.
+    #[default]
+    UseDefaultProfile,
+    /// Reject the request with 401.
+    FailClosed,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

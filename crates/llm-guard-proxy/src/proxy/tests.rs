@@ -8557,6 +8557,186 @@ async fn forwarded_call_writes_observability_metadata() {
 }
 
 #[tokio::test]
+#[cfg(feature = "guard")]
+async fn valid_key_resolves_to_correct_profile() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &virtual_key_config("use_default_profile"),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, "Bearer vk_child_def456")
+        .body(r#"{"model":"child-model","prompt":"ping","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _observed = fake.recv().await;
+    let request_metadata = read_last_request_metadata(&proxy.sqlite_path);
+    assert_eq!(request_metadata["caller_profile"], "child_safe");
+    assert_eq!(request_metadata["virtual_key_resolution"], "matched");
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn unknown_key_uses_default() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &virtual_key_config("use_default_profile"),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, "Bearer vk_unknown")
+        .body(r#"{"model":"gpt-default","prompt":"ping","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _observed = fake.recv().await;
+    let request_metadata = read_last_request_metadata(&proxy.sqlite_path);
+    assert_eq!(request_metadata["caller_profile"], "default");
+    assert_eq!(
+        request_metadata["virtual_key_resolution"],
+        "unknown_use_default"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn unknown_key_fails_closed() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &virtual_key_config("fail_closed"),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, "Bearer vk_unknown")
+        .body(r#"{"model":"gpt-default","prompt":"ping","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_no_upstream_request(&mut fake).await;
+    let request_metadata = read_last_request_metadata(&proxy.sqlite_path);
+    assert_eq!(request_metadata["virtual_key_resolution"], "fail_closed");
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn no_key_single_profile_uses_default() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        single_profile_virtual_key_config(),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"solo-model","prompt":"ping","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _observed = fake.recv().await;
+    let request_metadata = read_last_request_metadata(&proxy.sqlite_path);
+    assert_eq!(request_metadata["caller_profile"], "solo");
+    assert_eq!(
+        request_metadata["virtual_key_resolution"],
+        "single_profile_default"
+    );
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn x_virtual_key_header_precedence() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &virtual_key_config("fail_closed"),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, "Bearer vk_child_def456")
+        .header("X-Virtual-Key", "vk_adult_abc123")
+        .body(r#"{"model":"adult-model","prompt":"ping","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _observed = fake.recv().await;
+    let request_metadata = read_last_request_metadata(&proxy.sqlite_path);
+    assert_eq!(request_metadata["caller_profile"], "default");
+    assert_eq!(request_metadata["virtual_key_resolution"], "matched");
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn key_not_logged_in_audit() {
+    let secret_key = "vk_child_def456";
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &virtual_key_config("use_default_profile"),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .header("X-Virtual-Key", secret_key)
+        .body(r#"{"model":"child-model","prompt":"ping","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _observed = fake.recv().await;
+    let persisted_metadata = read_last_request_metadata_json(&proxy.sqlite_path);
+    assert!(!persisted_metadata.contains(secret_key));
+    assert!(persisted_metadata.contains("child_safe"));
+}
+
+#[tokio::test]
 async fn observability_disabled_skips_new_forwarded_records() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, false).await;
@@ -11879,6 +12059,42 @@ max_stdout_bytes = 65536
     )
 }
 
+#[cfg(feature = "guard")]
+fn virtual_key_config(unknown_key_policy: &str) -> String {
+    format!(
+        r#"
+[profiles.default]
+kind = "adult"
+allowed_models = ["gpt-default", "adult-model"]
+
+[profiles.child_safe]
+kind = "child"
+allowed_models = ["child-model"]
+
+[virtual_keys]
+enabled = true
+unknown_key_policy = "{unknown_key_policy}"
+
+[virtual_keys.keys]
+vk_adult_abc123 = "default"
+vk_child_def456 = "child_safe"
+"#
+    )
+}
+
+#[cfg(feature = "guard")]
+fn single_profile_virtual_key_config() -> &'static str {
+    r#"
+[profiles.solo]
+kind = "adult"
+allowed_models = ["solo-model"]
+
+[virtual_keys]
+enabled = true
+unknown_key_policy = "fail_closed"
+"#
+}
+
 #[derive(Debug)]
 struct ForwardedRecordRow {
     status: String,
@@ -12300,6 +12516,24 @@ fn read_last_observability_row(sqlite_path: &Path, table: &str) -> Observability
         status: row.0,
         response_metadata,
     }
+}
+
+#[cfg(feature = "guard")]
+fn read_last_request_metadata(sqlite_path: &Path) -> serde_json::Value {
+    serde_json::from_str(&read_last_request_metadata_json(sqlite_path))
+        .expect("request metadata should be json")
+}
+
+#[cfg(feature = "guard")]
+fn read_last_request_metadata_json(sqlite_path: &Path) -> String {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    connection
+        .query_row(
+            "SELECT request_metadata_json FROM requests ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("request row should exist")
 }
 
 fn repeated_input_chat_body() -> String {

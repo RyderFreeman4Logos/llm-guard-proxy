@@ -52,16 +52,18 @@ impl GuardExecutor {
         request_id: &str,
         model: &str,
         messages: &[serde_json::Value],
+        profile_id: &str,
         profile: &ProfileConfig,
     ) -> GuardOutcome {
-        self.run_guard(
-            self.config.pre_request.as_deref(),
-            GwpHook::PreRequestGuard,
+        self.run_guard(GuardRunInput {
+            workflow_id: self.config.pre_request.as_deref(),
+            hook: GwpHook::PreRequestGuard,
             request_id,
             model,
             messages,
+            profile_id,
             profile,
-        )
+        })
     }
 
     /// Run the `post_response_guard` hook.
@@ -71,27 +73,30 @@ impl GuardExecutor {
         request_id: &str,
         model: &str,
         response: &serde_json::Value,
+        profile_id: &str,
         profile: &ProfileConfig,
     ) -> GuardOutcome {
-        self.run_guard(
-            self.config.post_response.as_deref(),
-            GwpHook::PostResponseGuard,
+        self.run_guard(GuardRunInput {
+            workflow_id: self.config.post_response.as_deref(),
+            hook: GwpHook::PostResponseGuard,
             request_id,
             model,
-            std::slice::from_ref(response),
+            messages: std::slice::from_ref(response),
+            profile_id,
             profile,
-        )
+        })
     }
 
-    fn run_guard(
-        &self,
-        workflow_id: Option<&str>,
-        hook: GwpHook,
-        request_id: &str,
-        model: &str,
-        messages: &[serde_json::Value],
-        profile: &ProfileConfig,
-    ) -> GuardOutcome {
+    fn run_guard(&self, input: GuardRunInput<'_>) -> GuardOutcome {
+        let GuardRunInput {
+            workflow_id,
+            hook,
+            request_id,
+            model,
+            messages,
+            profile_id,
+            profile,
+        } = input;
         let Some(workflow_id) = workflow_id else {
             return GuardOutcome::Skipped;
         };
@@ -104,7 +109,7 @@ impl GuardExecutor {
             protocol_version: GWP_PROTOCOL_VERSION.to_owned(),
             hook,
             request_id: request_id.to_owned(),
-            profile: profile.to_gwp_profile("default"),
+            profile: profile.to_gwp_profile(profile_id),
             model_alias: model.to_owned(),
             messages: messages.to_vec(),
             policy: serde_json::Value::Null,
@@ -157,6 +162,16 @@ impl GuardExecutor {
     }
 }
 
+struct GuardRunInput<'request> {
+    workflow_id: Option<&'request str>,
+    hook: GwpHook,
+    request_id: &'request str,
+    model: &'request str,
+    messages: &'request [serde_json::Value],
+    profile_id: &'request str,
+    profile: &'request ProfileConfig,
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -175,6 +190,7 @@ mod tests {
             "req-1",
             "model",
             &[json!({"role": "user", "content": "hello"})],
+            "default",
             &ProfileConfig::default(),
         );
 
@@ -196,6 +212,7 @@ mod tests {
             "req-1",
             "model",
             &[json!({"role": "user", "content": "hello"})],
+            "default",
             &ProfileConfig::default(),
         );
 
