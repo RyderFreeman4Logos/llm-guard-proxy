@@ -1441,6 +1441,140 @@ async fn post_response_guard_replace_changes_client_response() {
 }
 
 #[tokio::test]
+#[cfg(feature = "guard")]
+async fn workflow_alias_returns_chat_completion() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("workflow-alias-success");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let replacement = r#"[{"role":"assistant","content":"workflow answer"}]"#;
+    let script = write_guard_script(
+        &guard_root,
+        "workflow-alias-success",
+        guard_result("replace", Some(replacement)),
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &workflow_alias_config(&script, 120_000),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"family/child-safe-general-v1","messages":[{"role":"user","content":"ping"}]}"#,
+        )
+        .send()
+        .await
+        .expect("workflow alias request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = shielded_final_json(response).await;
+    assert_eq!(json["object"], "chat.completion");
+    assert_eq!(json["model"], "family/child-safe-general-v1");
+    assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(json["choices"][0]["message"]["content"], "workflow answer");
+    assert_eq!(json["choices"][0]["finish_reason"], "stop");
+    assert_eq!(json["usage"]["total_tokens"], 0);
+    assert!(fake.recv_within(STREAM_SECOND_CHUNK_GUARD).await.is_none());
+}
+
+#[test]
+#[cfg(feature = "guard")]
+fn unknown_workflow_id_returns_error() {
+    let config = AppConfig::default();
+    let workflow_alias = ResolvedWorkflowAlias {
+        workflow_id: String::from("missing_workflow"),
+        timeout_ms: 120_000,
+    };
+
+    let error = workflow_config_for_alias(&config, &workflow_alias)
+        .expect_err("missing workflow should fail closed");
+
+    assert!(error.to_string().contains("unconfigured workflow"));
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn workflow_timeout_returns_error() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("workflow-alias-timeout");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_slow_guard_script(&guard_root, "workflow-alias-timeout");
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &workflow_alias_config(&script, 20),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"family/child-safe-general-v1","messages":[{"role":"user","content":"ping"}]}"#,
+        )
+        .send()
+        .await
+        .expect("workflow alias request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = response_json(response).await;
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("timed out"))
+    );
+    assert!(fake.recv_within(STREAM_SECOND_CHUNK_GUARD).await.is_none());
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn workflow_block_returns_error() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("workflow-alias-block");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_guard_script(
+        &guard_root,
+        "workflow-alias-block",
+        guard_result("block", None),
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &workflow_alias_config(&script, 120_000),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"family/child-safe-general-v1","messages":[{"role":"user","content":"blocked"}]}"#,
+        )
+        .send()
+        .await
+        .expect("workflow alias request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = response_json(response).await;
+    assert_eq!(json["error"]["type"], "guard_blocked");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("guard summary"))
+    );
+    assert!(fake.recv_within(STREAM_SECOND_CHUNK_GUARD).await.is_none());
+}
+
+#[tokio::test]
 async fn shielded_loop_guard_catches_reasoning_line_repeated_hundreds_of_times() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -11674,6 +11808,13 @@ fn write_guard_script(root: &Path, name: &str, result: String) -> PathBuf {
 }
 
 #[cfg(feature = "guard")]
+fn write_slow_guard_script(root: &Path, name: &str) -> PathBuf {
+    let path = root.join(format!("{name}.sh"));
+    fs::write(&path, "#!/bin/sh\nsleep 2\n").expect("slow guard script should be written");
+    path
+}
+
+#[cfg(feature = "guard")]
 fn guard_result(decision: &str, replacement_messages: Option<&str>) -> String {
     format!(
         r#"{{"decision":"{decision}","risk_level":"test","tags":[],"summary":"guard summary","replacement_messages":{replacement_messages},"audit":{{"evidence_spans":[],"notes":[]}}}}"#,
@@ -11705,6 +11846,22 @@ fn guard_workflow_config(
         config.push_str(&workflow_config("post_guard", script));
     }
     config
+}
+
+#[cfg(feature = "guard")]
+fn workflow_alias_config(script: &Path, alias_timeout_ms: u64) -> String {
+    format!(
+        r#"
+[[model_aliases]]
+id = "family/child-safe-general-v1"
+kind = "workflow"
+workflow_id = "child_safe_general_v1"
+workflow_timeout_ms = {alias_timeout_ms}
+
+{}
+"#,
+        workflow_config("child_safe_general_v1", script)
+    )
 }
 
 #[cfg(feature = "guard")]
