@@ -1219,6 +1219,222 @@ async fn shielded_non_stream_chat_trims_reasoning_separator_from_final_content()
 }
 
 #[tokio::test]
+async fn pre_request_guard_allow_proceeds_to_upstream() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("guard-allow");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_guard_script(&guard_root, "allow", guard_result("allow", None));
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, true),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("guarded request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _json = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+}
+
+#[tokio::test]
+async fn pre_request_guard_block_returns_forbidden_without_upstream_call() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("guard-block");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_guard_script(&guard_root, "block", guard_result("block", None));
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, true),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"blocked"}]}"#)
+        .send()
+        .await
+        .expect("guarded request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(fake.recv_within(STREAM_SECOND_CHUNK_GUARD).await.is_none());
+}
+
+#[tokio::test]
+async fn pre_request_guard_replace_swaps_messages_before_upstream_call() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("guard-replace");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let replacement = r#"[{"role":"user","content":"redacted prompt"}]"#;
+    let script = write_guard_script(
+        &guard_root,
+        "replace",
+        guard_result("replace", Some(replacement)),
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, true),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"secret prompt"}]}"#)
+        .send()
+        .await
+        .expect("guarded request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _json = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["messages"][0]["content"], "redacted prompt");
+}
+
+#[tokio::test]
+async fn pre_request_guard_error_fail_closed_blocks_or_allows_by_config() {
+    let mut blocked_fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("guard-error-fail-closed");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_guard_script(
+        &guard_root,
+        "error-fail-closed",
+        guard_result("error_fail_closed", None),
+    );
+    let blocked_proxy = ProxyFixture::spawn_with_options(
+        &blocked_fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, true),
+    )
+    .await;
+
+    let blocked = blocked_proxy
+        .client
+        .post(format!("{}/v1/chat/completions", blocked_proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("guarded request should complete");
+    assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+    assert!(
+        blocked_fake
+            .recv_within(STREAM_SECOND_CHUNK_GUARD)
+            .await
+            .is_none()
+    );
+
+    let mut allowed_fake = FakeUpstream::spawn().await;
+    let allowed_proxy = ProxyFixture::spawn_with_options(
+        &allowed_fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, false),
+    )
+    .await;
+
+    let allowed = allowed_proxy
+        .client
+        .post(format!("{}/v1/chat/completions", allowed_proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("guarded request should complete");
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let _json = shielded_final_json(allowed).await;
+    let _observed = allowed_fake.recv_next().await;
+}
+
+#[tokio::test]
+async fn post_response_guard_block_returns_safe_refusal() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("guard-post-block");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_guard_script(&guard_root, "post-block", guard_result("block", None));
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(None, Some(&script), true),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("guarded request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = shielded_final_json(response).await;
+    assert_eq!(
+        json["choices"][0]["message"]["content"],
+        "I can't help with that request."
+    );
+    assert_eq!(json["choices"][0]["finish_reason"], "content_filter");
+    let _observed = fake.recv_next().await;
+}
+
+#[tokio::test]
+async fn post_response_guard_replace_changes_client_response() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("guard-post-replace");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let replacement = r#"[{"id":"chatcmpl-guarded","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"guarded answer"},"finish_reason":"stop"}]}]"#;
+    let script = write_guard_script(
+        &guard_root,
+        "post-replace",
+        guard_result("replace", Some(replacement)),
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(None, Some(&script), true),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("guarded request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = shielded_final_json(response).await;
+    assert_eq!(json["id"], "chatcmpl-guarded");
+    assert_eq!(json["choices"][0]["message"]["content"], "guarded answer");
+    let _observed = fake.recv_next().await;
+}
+
+#[tokio::test]
 async fn shielded_loop_guard_catches_reasoning_line_repeated_hundreds_of_times() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -11011,6 +11227,60 @@ fn shielded_chat_request(uri: &'static str, body: &'static str) -> Request<Body>
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .expect("shielded chat request should build")
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn write_guard_script(root: &Path, name: &str, result: String) -> PathBuf {
+    let path = root.join(format!("{name}.sh"));
+    let script = format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{result}'\n");
+    fs::write(&path, script).expect("guard script should be written");
+    path
+}
+
+fn guard_result(decision: &str, replacement_messages: Option<&str>) -> String {
+    format!(
+        r#"{{"decision":"{decision}","risk_level":"test","tags":[],"summary":"guard summary","replacement_messages":{replacement_messages},"audit":{{"evidence_spans":[],"notes":[]}}}}"#,
+        replacement_messages = replacement_messages.unwrap_or("null")
+    )
+}
+
+fn guard_workflow_config(
+    pre_request_script: Option<&Path>,
+    post_response_script: Option<&Path>,
+    fail_closed_blocks: bool,
+) -> String {
+    let mut config = String::from("\n[guard_workflows]\n");
+    if pre_request_script.is_some() {
+        config.push_str("pre_request = \"pre_guard\"\n");
+    }
+    if post_response_script.is_some() {
+        config.push_str("post_response = \"post_guard\"\n");
+    }
+    {
+        let fail_line = format!("fail_closed_blocks = {fail_closed_blocks}\n");
+        config.push_str(&fail_line);
+    }
+    if let Some(script) = pre_request_script {
+        config.push_str(&workflow_config("pre_guard", script));
+    }
+    if let Some(script) = post_response_script {
+        config.push_str(&workflow_config("post_guard", script));
+    }
+    config
+}
+
+fn workflow_config(id: &str, script: &Path) -> String {
+    format!(
+        r#"
+[workflows.{id}]
+runtime_kind = "stdio"
+command = "sh"
+args = ["{script}"]
+timeout_ms = 10000
+max_stdout_bytes = 65536
+"#,
+        script = script.display()
+    )
 }
 
 #[derive(Debug)]

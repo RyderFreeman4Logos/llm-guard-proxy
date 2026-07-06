@@ -5,6 +5,7 @@
 //! retry, and request-shielding behavior behind core interfaces.
 
 mod evidence;
+mod guard;
 pub mod gwp;
 mod loop_detector;
 mod model_alias;
@@ -18,6 +19,7 @@ pub use evidence::{
     EvidenceGroupRecord, EvidencePruningStats, EvidenceRetentionUsage, EvidenceShadowRecord,
     EvidenceStore, EvidenceStoreWrite, ShadowSkipReason,
 };
+pub use guard::{GuardExecutor, GuardOutcome};
 pub use gwp::{
     GWP_PROTOCOL_VERSION, GwpAudit, GwpDecision, GwpHook, GwpInvocation, GwpProfile,
     GwpProfileKind, GwpResult, GwpTraceMode,
@@ -45,8 +47,8 @@ pub use profile::{
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
     DEFAULT_CONFIG_RELATIVE_PATH, DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig,
-    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig,
-    LoopGuardMode, MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy,
+    EvidenceShadowConfig, GuardWorkflowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig,
+    LoopGuardConfig, LoopGuardMode, MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy,
     ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher,
     RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
     SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,

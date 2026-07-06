@@ -27,14 +27,15 @@ use axum::{
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
-    AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
-    DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
-    EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore, EvidenceStoreWrite, Health,
-    HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, MetadataConfig,
-    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
-    RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
-    ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DEFAULT_PROFILE_NAME,
+    DebugRequestSummary, DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord,
+    EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore,
+    EvidenceStoreWrite, GuardExecutor, GuardOutcome, Health, HeartbeatMode, LICENSE,
+    LatencyHistogram, ListenerConfig, MetadataConfig, ObservabilityMetricsSnapshot,
+    ObservabilityStore, ProfileConfig, RawPayloads, RequestId, RequestRecord, RequestStatus,
+    RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile, ShadowSkipReason,
+    ThinkingConfig, ThinkingMode, UpstreamMode, UpstreamProfileConfig, UpstreamRouteReason,
+    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -1757,9 +1758,12 @@ async fn forward_openai_request(
     );
     add_listener_metadata(&mut request_metadata, &state.listener);
     request_metadata.extend(admission_metadata);
-    let prepared_request =
+    let mut prepared_request =
         prepare_openai_forward_request(state, &config, &method, &uri, &body, &mut request_metadata)
             .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    apply_pre_request_guard(&config, request_id, &mut prepared_request)
+        .await
+        .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry);
     let upstream_stall_policy = UpstreamStallPolicy::from_config(&config.upstream_stall);
     let upstream_timeout =
@@ -1787,6 +1791,7 @@ async fn forward_openai_request(
                 request_metadata,
                 listener: state.listener.clone(),
                 upstream_profile: prepared_request.upstream_profile,
+                caller_profile: prepared_request.caller_profile,
                 route_reason: prepared_request.route_reason,
                 liveness: prepared_request.shielded_chat_plan.liveness,
                 thinking_metadata: prepared_request.shielded_chat_plan.thinking_metadata,
@@ -1936,6 +1941,7 @@ async fn read_body_and_admit_generation(
 
 struct PreparedOpenAiRequest {
     model_id: Option<String>,
+    caller_profile: ProfileConfig,
     upstream_profile: UpstreamProfileConfig,
     route_reason: UpstreamRouteReason,
     upstream_url: Url,
@@ -1952,6 +1958,9 @@ fn prepare_openai_forward_request(
     request_metadata: &mut BTreeMap<String, String>,
 ) -> Result<PreparedOpenAiRequest, ProxyError> {
     let model_id = extract_model_id(body);
+    let caller_profile = config
+        .caller_profile_by_name(DEFAULT_PROFILE_NAME)
+        .unwrap_or_else(|| config.default_caller_profile());
     let selected_profile =
         select_profile_for_request(config, &state.listener, method, uri, model_id.as_deref())?;
     let upstream_profile = selected_profile.profile;
@@ -1978,12 +1987,231 @@ fn prepare_openai_forward_request(
 
     Ok(PreparedOpenAiRequest {
         model_id,
+        caller_profile,
         upstream_profile,
         route_reason,
         upstream_url,
         reqwest_method,
         shielded_chat_plan,
     })
+}
+
+async fn apply_pre_request_guard(
+    config: &AppConfig,
+    request_id: &RequestId,
+    prepared_request: &mut PreparedOpenAiRequest,
+) -> Result<(), ProxyError> {
+    if config.guard_workflows.pre_request.is_none() {
+        return Ok(());
+    }
+    let Some(messages) =
+        chat_messages_from_body(&prepared_request.shielded_chat_plan.downstream_body)
+    else {
+        return Ok(());
+    };
+    let outcome = run_pre_request_guard(
+        config,
+        request_id.as_str(),
+        prepared_request.model_id.as_deref().unwrap_or_default(),
+        messages,
+        prepared_request.caller_profile.clone(),
+    )
+    .await;
+    match outcome {
+        GuardOutcome::Allow | GuardOutcome::Skipped => Ok(()),
+        GuardOutcome::Block { reason } => Err(ProxyError::guard_blocked(reason)),
+        GuardOutcome::Replace { messages } => {
+            prepared_request.shielded_chat_plan.downstream_body = replace_chat_messages(
+                &prepared_request.shielded_chat_plan.downstream_body,
+                &messages,
+            )?;
+            prepared_request.shielded_chat_plan.upstream_body = replace_chat_messages(
+                &prepared_request.shielded_chat_plan.upstream_body,
+                &messages,
+            )?;
+            Ok(())
+        }
+    }
+}
+
+async fn run_pre_request_guard(
+    config: &AppConfig,
+    request_id: &str,
+    model: &str,
+    messages: Vec<serde_json::Value>,
+    profile: ProfileConfig,
+) -> GuardOutcome {
+    let guard_config = config.guard_workflows.clone();
+    let workflows = config.workflows.clone();
+    let request_id = request_id.to_owned();
+    let model = model.to_owned();
+    let fail_closed_blocks = guard_config.fail_closed_blocks;
+    tokio::task::spawn_blocking(move || {
+        GuardExecutor::new(guard_config, workflows).pre_request_guard(
+            &request_id,
+            &model,
+            &messages,
+            &profile,
+        )
+    })
+    .await
+    .unwrap_or_else(|error| {
+        if fail_closed_blocks {
+            GuardOutcome::Block {
+                reason: format!("guard worker failed: {error}"),
+            }
+        } else {
+            GuardOutcome::Allow
+        }
+    })
+}
+
+async fn apply_post_response_guard(
+    runtime: &ShieldedRetryRuntime,
+    aggregated: &mut ShieldedAggregatedAttempt,
+) {
+    let Ok(config) = runtime.config.snapshot() else {
+        return;
+    };
+    if config.guard_workflows.post_response.is_none() {
+        return;
+    }
+    let Ok(response) = serde_json::from_slice::<serde_json::Value>(&aggregated.body) else {
+        return;
+    };
+    let outcome = run_post_response_guard(
+        &config,
+        runtime.request_id.as_str(),
+        runtime.model_id.as_deref().unwrap_or_default(),
+        response.clone(),
+        runtime.caller_profile.clone(),
+    )
+    .await;
+    match outcome {
+        GuardOutcome::Allow | GuardOutcome::Skipped => {}
+        GuardOutcome::Block { reason } => {
+            let body = safe_refusal_response_body(&response, &reason);
+            replace_aggregated_response_body(aggregated, &body);
+        }
+        GuardOutcome::Replace { messages } => {
+            if let Some(response) = messages.into_iter().next() {
+                let body = Bytes::from(response.to_string());
+                replace_aggregated_response_body(aggregated, &body);
+            }
+        }
+    }
+}
+
+async fn run_post_response_guard(
+    config: &AppConfig,
+    request_id: &str,
+    model: &str,
+    response: serde_json::Value,
+    profile: ProfileConfig,
+) -> GuardOutcome {
+    let guard_config = config.guard_workflows.clone();
+    let workflows = config.workflows.clone();
+    let request_id = request_id.to_owned();
+    let model = model.to_owned();
+    let fail_closed_blocks = guard_config.fail_closed_blocks;
+    tokio::task::spawn_blocking(move || {
+        GuardExecutor::new(guard_config, workflows).post_response_guard(
+            &request_id,
+            &model,
+            &response,
+            &profile,
+        )
+    })
+    .await
+    .unwrap_or_else(|error| {
+        if fail_closed_blocks {
+            GuardOutcome::Block {
+                reason: format!("guard worker failed: {error}"),
+            }
+        } else {
+            GuardOutcome::Allow
+        }
+    })
+}
+
+fn chat_messages_from_body(body: &Bytes) -> Option<Vec<serde_json::Value>> {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()?
+        .get("messages")?
+        .as_array()
+        .cloned()
+}
+
+fn replace_chat_messages(
+    body: &Bytes,
+    messages: &[serde_json::Value],
+) -> Result<Bytes, ProxyError> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(body).map_err(|error| {
+        ProxyError::guard_blocked(format!("guard could not parse request JSON: {error}"))
+    })?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(ProxyError::guard_blocked(String::from(
+            "guard could not rewrite a non-object request body",
+        )));
+    };
+    object.insert(
+        String::from("messages"),
+        serde_json::Value::Array(messages.to_vec()),
+    );
+    Ok(Bytes::from(value.to_string()))
+}
+
+fn replace_aggregated_response_body(aggregated: &mut ShieldedAggregatedAttempt, body: &Bytes) {
+    aggregated.body = body.clone();
+    aggregated.sse_body = openai_data_sse_body(body);
+    aggregated.response_metadata.insert(
+        String::from("guard_post_response_replaced"),
+        String::from("true"),
+    );
+}
+
+fn safe_refusal_response_body(original: &serde_json::Value, reason: &str) -> Bytes {
+    let refusal = "I can't help with that request.";
+    let mut response = original.clone();
+    if let Some(message) = response
+        .pointer_mut("/choices/0/message")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        message.insert(String::from("content"), json!(refusal));
+        message.insert(String::from("refusal"), json!(reason));
+        message.remove("tool_calls");
+        if let Some(choice) = response
+            .pointer_mut("/choices/0")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            choice.insert(String::from("finish_reason"), json!("content_filter"));
+        }
+        return Bytes::from(response.to_string());
+    }
+    Bytes::from(
+        json!({
+            "id": "chatcmpl-guard-refusal",
+            "object": "chat.completion",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": refusal,
+                    "refusal": reason
+                },
+                "finish_reason": "content_filter"
+            }]
+        })
+        .to_string(),
+    )
+}
+
+fn openai_data_sse_body(body: &Bytes) -> Bytes {
+    let mut frame = BytesMut::with_capacity(body.len().saturating_add(22));
+    frame.extend_from_slice(b"data: ");
+    frame.extend_from_slice(body);
+    frame.extend_from_slice(b"\n\ndata: [DONE]\n\n");
+    frame.freeze()
 }
 
 fn select_profile_for_request(
@@ -3278,6 +3506,7 @@ struct ShieldedRetryRuntime {
     request_metadata: BTreeMap<String, String>,
     listener: ListenerConfig,
     upstream_profile: UpstreamProfileConfig,
+    caller_profile: ProfileConfig,
     route_reason: UpstreamRouteReason,
     liveness: ShieldedLivenessSelection,
     thinking_metadata: BTreeMap<String, String>,
@@ -3854,7 +4083,8 @@ async fn run_shielded_attempts(
         }
 
         match aggregate_shielded_attempt(&runtime, started).await {
-            Ok(aggregated) => {
+            Ok(mut aggregated) => {
+                apply_post_response_guard(&runtime, &mut aggregated).await;
                 return shielded_accepted_outcome(aggregated, attempt_records);
             }
             Err(mut failure) => {
@@ -7409,6 +7639,11 @@ enum ProxyError {
         failure: ListenerUpstreamDenied,
         request_metadata: Option<BTreeMap<String, String>>,
     },
+    #[error("guard workflow blocked request: {reason}")]
+    GuardBlocked {
+        reason: String,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
     #[error("upstream request failed: {failure}")]
     UpstreamTransport {
         failure: ReqwestFailureKind,
@@ -7479,6 +7714,13 @@ impl ProxyError {
         }
     }
 
+    fn guard_blocked(reason: String) -> Self {
+        Self::GuardBlocked {
+            reason,
+            request_metadata: None,
+        }
+    }
+
     fn context_budget_exceeded(estimate: ContextBudgetEstimate) -> Self {
         Self::ContextBudgetExceeded {
             message: estimate.message(),
@@ -7496,6 +7738,7 @@ impl ProxyError {
             | Self::InvalidMethod { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRequestPath(error) => error.status(),
             Self::Admission { failure, .. } => failure.status(),
+            Self::GuardBlocked { .. } => StatusCode::FORBIDDEN,
             Self::ListenerUpstreamDenied { .. } | Self::ContextBudgetExceeded { .. } => {
                 StatusCode::BAD_REQUEST
             }
@@ -7512,6 +7755,7 @@ impl ProxyError {
             Self::InvalidMethod { .. } => "invalid_method",
             Self::Admission { failure, .. } => failure.error_type(),
             Self::ListenerUpstreamDenied { .. } => "listener_upstream_not_allowed",
+            Self::GuardBlocked { .. } => "guard_blocked",
             Self::ContextBudgetExceeded { .. } => "invalid_request_error",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
             Self::UpstreamBody { .. } => "upstream_body_error",
@@ -7541,6 +7785,10 @@ impl ProxyError {
                 ..
             }
             | Self::ListenerUpstreamDenied {
+                request_metadata: Some(request_metadata),
+                ..
+            }
+            | Self::GuardBlocked {
                 request_metadata: Some(request_metadata),
                 ..
             }
@@ -7581,6 +7829,10 @@ impl ProxyError {
                 request_metadata: None,
                 ..
             }
+            | Self::GuardBlocked {
+                request_metadata: None,
+                ..
+            }
             | Self::ContextBudgetExceeded {
                 request_metadata: None,
                 ..
@@ -7617,6 +7869,7 @@ impl ProxyError {
             | Self::InvalidMethod { .. }
             | Self::Admission { .. }
             | Self::ListenerUpstreamDenied { .. }
+            | Self::GuardBlocked { .. }
             | Self::ContextBudgetExceeded { .. }
             | Self::UpstreamTransport {
                 observability: None,
@@ -7658,6 +7911,10 @@ impl ProxyError {
             },
             Self::ListenerUpstreamDenied { failure, .. } => Self::ListenerUpstreamDenied {
                 failure,
+                request_metadata: Some(request_metadata),
+            },
+            Self::GuardBlocked { reason, .. } => Self::GuardBlocked {
+                reason,
                 request_metadata: Some(request_metadata),
             },
             Self::ContextBudgetExceeded {
@@ -7710,7 +7967,8 @@ impl ProxyError {
             | Self::InvalidMethod { .. }
             | Self::Admission { .. }
             | Self::ListenerUpstreamDenied { .. }
-            | Self::ContextBudgetExceeded { .. }) => error,
+            | Self::ContextBudgetExceeded { .. }
+            | Self::GuardBlocked { .. }) => error,
         }
     }
 

@@ -73,6 +73,11 @@ args = ["workflows/content_review.py"]
 timeout_ms = 120000
 max_stdout_bytes = 1048576
 
+[guard_workflows]
+pre_request = "family.child_safe_general.v1"
+post_response = "family.child_safe_general.v1"
+fail_closed_blocks = false
+
 [profiles.child_default]
 kind = "child"
 allowed_models = ["family/child-safe-general-v1"]
@@ -999,6 +1004,15 @@ fn parses_toml_with_defaults_and_overrides() {
         Some(256_000)
     );
     assert_parsed_model_aliases(&config);
+    assert_eq!(
+        config.guard_workflows.pre_request.as_deref(),
+        Some("family.child_safe_general.v1")
+    );
+    assert_eq!(
+        config.guard_workflows.post_response.as_deref(),
+        Some("family.child_safe_general.v1")
+    );
+    assert!(!config.guard_workflows.fail_closed_blocks);
     assert_parsed_profiles(&config);
     assert_parsed_observability_overrides(&config);
     assert!(config.evidence.enabled);
@@ -1148,6 +1162,23 @@ kind = "adult"
         error.message().contains("duplicate profile section"),
         "unexpected error: {error}"
     );
+}
+
+#[test]
+fn validates_guard_workflow_references() {
+    let config = parse_config_text(
+        r#"
+[guard_workflows]
+pre_request = "missing.guard"
+"#,
+    )
+    .expect("config syntax should parse");
+
+    let error = config
+        .validate()
+        .expect_err("missing guard workflow should fail validation");
+
+    assert_eq!(error.field(), "guard_workflows.pre_request");
 }
 
 fn assert_parsed_model_aliases(config: &AppConfig) {
