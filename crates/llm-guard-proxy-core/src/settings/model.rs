@@ -34,7 +34,7 @@ const MAX_CALLER_PROFILE_NAME_BYTES: usize = 128;
 const MAX_GUARD_PACK_NAME_BYTES: usize = 256;
 
 /// Complete application configuration.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AppConfig {
     /// Process listener settings. These are restart-required.
     pub server: ServerConfig,
@@ -478,6 +478,8 @@ impl AppConfig {
             metadata: self.upstream.metadata.clone(),
             hot_restart: self.upstream.hot_restart.clone(),
             thinking: self.thinking.clone(),
+            #[cfg(feature = "param-override")]
+            param_override: ParamOverrideConfig::default(),
         }
     }
 
@@ -687,8 +689,24 @@ impl AppConfig {
             active.metadata = requested.metadata.clone();
             active.hot_restart = requested.hot_restart.clone();
             active.thinking = requested.thinking.clone();
+            apply_reloadable_param_override(active, requested);
         }
     }
+}
+
+#[cfg(feature = "param-override")]
+fn apply_reloadable_param_override(
+    active: &mut UpstreamProfileConfig,
+    requested: &UpstreamProfileConfig,
+) {
+    active.param_override = requested.param_override.clone();
+}
+
+#[cfg(not(feature = "param-override"))]
+fn apply_reloadable_param_override(
+    _active: &mut UpstreamProfileConfig,
+    _requested: &UpstreamProfileConfig,
+) {
 }
 
 #[cfg(feature = "guard")]
@@ -1139,7 +1157,7 @@ impl Default for HotRestartConfig {
 }
 
 /// Named upstream profile with model routing and per-upstream policy.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct UpstreamProfileConfig {
     /// Unique profile name used in observability metadata.
     pub name: String,
@@ -1159,6 +1177,9 @@ pub struct UpstreamProfileConfig {
     pub hot_restart: HotRestartConfig,
     /// Thinking budget policy for this profile.
     pub thinking: ThinkingConfig,
+    /// Inference parameter override policy for this profile.
+    #[cfg(feature = "param-override")]
+    pub param_override: ParamOverrideConfig,
 }
 
 impl UpstreamProfileConfig {
@@ -1223,7 +1244,10 @@ impl UpstreamProfileConfig {
             messages: "upstreams.hot_restart.probe_messages",
             chat_template_kwargs: "upstreams.hot_restart.probe_chat_template_kwargs",
         })?;
-        self.thinking.validate("upstreams.thinking.max_tokens")
+        self.thinking.validate("upstreams.thinking.max_tokens")?;
+        #[cfg(feature = "param-override")]
+        self.param_override.validate("upstreams.param_override")?;
+        Ok(())
     }
 
     /// Returns true when this profile uses an independent generation admission limiter.
@@ -1272,17 +1296,64 @@ impl Default for UpstreamProfileConfig {
             metadata: upstream.metadata,
             hot_restart: upstream.hot_restart,
             thinking: ThinkingConfig::default(),
+            #[cfg(feature = "param-override")]
+            param_override: ParamOverrideConfig::default(),
         }
     }
 }
 
 /// Effective upstream profile selected for one request.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SelectedUpstreamProfile {
     /// Selected profile settings.
     pub profile: UpstreamProfileConfig,
     /// Why this profile was selected.
     pub route_reason: UpstreamRouteReason,
+}
+
+/// Per-profile OpenAI-compatible inference parameter overrides.
+#[cfg(feature = "param-override")]
+#[derive(Clone, Debug, PartialEq)]
+pub struct ParamOverrideConfig {
+    /// Enables request parameter rewriting for this profile.
+    pub enabled: bool,
+    /// Forced `temperature` value.
+    pub temperature: Option<f64>,
+    /// Forced `top_p` value.
+    pub top_p: Option<f64>,
+    /// Forced `top_k` value.
+    pub top_k: Option<u32>,
+    /// Forced `max_tokens` value.
+    pub max_tokens: Option<u32>,
+    /// Forced `frequency_penalty` value.
+    pub frequency_penalty: Option<f64>,
+    /// Forced `presence_penalty` value.
+    pub presence_penalty: Option<f64>,
+}
+
+#[cfg(feature = "param-override")]
+impl ParamOverrideConfig {
+    fn validate(&self, section: &'static str) -> Result<(), ValidationError> {
+        require_optional_finite(self.temperature, section, "temperature")?;
+        require_optional_finite(self.top_p, section, "top_p")?;
+        require_optional_finite(self.frequency_penalty, section, "frequency_penalty")?;
+        require_optional_finite(self.presence_penalty, section, "presence_penalty")
+    }
+}
+
+#[cfg(feature = "param-override")]
+impl Default for ParamOverrideConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+        }
+    }
 }
 
 /// Bounded route reason stored in observability metadata.
@@ -2598,4 +2669,35 @@ fn require_optional_positive(
     field: &'static str,
 ) -> Result<(), ValidationError> {
     require(value.unwrap_or(1) > 0, field, "must be greater than zero")
+}
+
+#[cfg(feature = "param-override")]
+fn require_optional_finite(
+    value: Option<f64>,
+    section: &'static str,
+    field: &'static str,
+) -> Result<(), ValidationError> {
+    if let Some(value) = value {
+        require(
+            value.is_finite(),
+            param_override_field_path(section, field),
+            "must be a finite number",
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "param-override")]
+fn param_override_field_path(section: &'static str, field: &'static str) -> &'static str {
+    match (section, field) {
+        ("upstreams.param_override", "temperature") => "upstreams.param_override.temperature",
+        ("upstreams.param_override", "top_p") => "upstreams.param_override.top_p",
+        ("upstreams.param_override", "frequency_penalty") => {
+            "upstreams.param_override.frequency_penalty"
+        }
+        ("upstreams.param_override", "presence_penalty") => {
+            "upstreams.param_override.presence_penalty"
+        }
+        _ => section,
+    }
 }

@@ -53,6 +53,8 @@ pub use profile::{
     BlockReason, DEFAULT_PROFILE_NAME, ProfileCheckResult, ProfileConfig, ProfileKind,
     ShieldedBuffering,
 };
+#[cfg(feature = "param-override")]
+pub use settings::ParamOverrideConfig;
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
     DEFAULT_CONFIG_RELATIVE_PATH, DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig,

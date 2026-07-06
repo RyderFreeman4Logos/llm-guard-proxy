@@ -14,6 +14,8 @@ mod tests;
 pub use error::{ConfigError, ConfigParseError, ValidationError};
 #[cfg(feature = "guard")]
 pub use model::GuardWorkflowConfig;
+#[cfg(feature = "param-override")]
+pub use model::ParamOverrideConfig;
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, DefaultInjectionSchema, DownstreamDropPolicy,
     EvidenceConfig, EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, HotRestartConfig,
@@ -150,6 +152,20 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstreams.thinking.no_thinking_marker_policy",
     "upstreams.thinking.default_injection_schema",
     "upstreams.thinking.apply_to_tool_requests",
+    #[cfg(feature = "param-override")]
+    "upstreams.param_override.enabled",
+    #[cfg(feature = "param-override")]
+    "upstreams.param_override.temperature",
+    #[cfg(feature = "param-override")]
+    "upstreams.param_override.top_p",
+    #[cfg(feature = "param-override")]
+    "upstreams.param_override.top_k",
+    #[cfg(feature = "param-override")]
+    "upstreams.param_override.max_tokens",
+    #[cfg(feature = "param-override")]
+    "upstreams.param_override.frequency_penalty",
+    #[cfg(feature = "param-override")]
+    "upstreams.param_override.presence_penalty",
     #[cfg(feature = "guard")]
     "profiles",
     #[cfg(feature = "guard")]

@@ -28,6 +28,8 @@ use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 #[cfg(feature = "upstream-hot-restart")]
 use llm_guard_proxy_core::HotRestartConfig;
+#[cfg(feature = "param-override")]
+use llm_guard_proxy_core::ParamOverrideConfig;
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
     DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
@@ -1391,7 +1393,14 @@ fn prometheus_escape_label(value: &str) -> String {
     escaped
 }
 
-async fn proxy_handler(State(state): State<ProxyState>, request: Request<Body>) -> Response<Body> {
+fn proxy_handler(
+    State(state): State<ProxyState>,
+    request: Request<Body>,
+) -> Pin<Box<dyn Future<Output = Response<Body>> + Send>> {
+    Box::pin(proxy_handler_inner(state, request))
+}
+
+async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Response<Body> {
     if request.method() == Method::GET && is_configured_debug_summary_request(&state, request.uri())
     {
         return debug_summary_response(&state, &request);
@@ -1984,8 +1993,16 @@ fn prepare_openai_forward_request(
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
     let upstream_url = build_upstream_url(&upstream_profile.base_url, uri)?;
     let reqwest_method = upstream_method(method)?;
-    let shielded_chat_plan =
-        plan_shielded_chat(state, config, &upstream_profile.thinking, method, uri, body);
+    let body = apply_param_override_if_configured(method, uri, body, &upstream_profile)?;
+    let mut shielded_chat_plan = plan_shielded_chat(
+        state,
+        config,
+        &upstream_profile.thinking,
+        method,
+        uri,
+        &body,
+    );
+    apply_param_override_to_shielded_plan(&mut shielded_chat_plan, &upstream_profile)?;
     add_shielded_request_metadata(
         request_metadata,
         shielded_chat_plan.intercepted,
@@ -1996,7 +2013,7 @@ fn prepare_openai_forward_request(
     request_metadata.extend(context_budget_preflight(
         method,
         uri,
-        body,
+        &body,
         &shielded_chat_plan.upstream_body,
         &upstream_profile,
     )?);
@@ -2011,6 +2028,127 @@ fn prepare_openai_forward_request(
         reqwest_method,
         shielded_chat_plan,
     })
+}
+
+#[cfg(feature = "param-override")]
+fn apply_param_override_if_configured(
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    profile: &UpstreamProfileConfig,
+) -> Result<Bytes, ProxyError> {
+    if method != Method::POST
+        || uri.path() != "/v1/chat/completions"
+        || !profile.param_override.enabled
+        || !param_override_has_fields(&profile.param_override)
+    {
+        return Ok(body.clone());
+    }
+    apply_param_override_to_body(body, profile)
+}
+
+#[cfg(feature = "param-override")]
+fn apply_param_override_to_shielded_plan(
+    plan: &mut ShieldedChatPlan,
+    profile: &UpstreamProfileConfig,
+) -> Result<(), ProxyError> {
+    plan.downstream_body = apply_param_override_to_body(&plan.downstream_body, profile)?;
+    plan.upstream_body = apply_param_override_to_body(&plan.upstream_body, profile)?;
+    Ok(())
+}
+
+#[cfg(not(feature = "param-override"))]
+fn apply_param_override_to_shielded_plan(
+    _plan: &mut ShieldedChatPlan,
+    _profile: &UpstreamProfileConfig,
+) -> Result<(), ProxyError> {
+    Ok(())
+}
+
+#[cfg(feature = "param-override")]
+fn apply_param_override_to_body(
+    body: &Bytes,
+    profile: &UpstreamProfileConfig,
+) -> Result<Bytes, ProxyError> {
+    if !profile.param_override.enabled || !param_override_has_fields(&profile.param_override) {
+        return Ok(body.clone());
+    }
+    let mut value = serde_json::from_slice::<serde_json::Value>(body)
+        .map_err(|error| ProxyError::request_body(format!("request body is not JSON: {error}")))?;
+    let serde_json::Value::Object(object) = &mut value else {
+        return Ok(body.clone());
+    };
+    apply_param_override_object(object, &profile.param_override);
+    let rewritten = serde_json::to_vec(&value).map_err(|error| {
+        ProxyError::request_body(format!("request body rewrite failed: {error}"))
+    })?;
+    Ok(Bytes::from(rewritten))
+}
+
+#[cfg(not(feature = "param-override"))]
+fn apply_param_override_if_configured(
+    _method: &Method,
+    _uri: &Uri,
+    body: &Bytes,
+    _profile: &UpstreamProfileConfig,
+) -> Result<Bytes, ProxyError> {
+    Ok(body.clone())
+}
+
+#[cfg(feature = "param-override")]
+fn param_override_has_fields(config: &ParamOverrideConfig) -> bool {
+    config.temperature.is_some()
+        || config.top_p.is_some()
+        || config.top_k.is_some()
+        || config.max_tokens.is_some()
+        || config.frequency_penalty.is_some()
+        || config.presence_penalty.is_some()
+}
+
+#[cfg(feature = "param-override")]
+fn apply_param_override_object(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    config: &ParamOverrideConfig,
+) {
+    insert_param_override_fields(object, config);
+    if let Some(serde_json::Value::Object(parameters)) = object.get_mut("parameters") {
+        insert_param_override_fields(parameters, config);
+    }
+}
+
+#[cfg(feature = "param-override")]
+fn insert_param_override_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    config: &ParamOverrideConfig,
+) {
+    insert_f64_override(object, "temperature", config.temperature);
+    insert_f64_override(object, "top_p", config.top_p);
+    insert_u32_override(object, "top_k", config.top_k);
+    insert_u32_override(object, "max_tokens", config.max_tokens);
+    insert_f64_override(object, "frequency_penalty", config.frequency_penalty);
+    insert_f64_override(object, "presence_penalty", config.presence_penalty);
+}
+
+#[cfg(feature = "param-override")]
+fn insert_f64_override(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+    value: Option<f64>,
+) {
+    if let Some(number) = value.and_then(serde_json::Number::from_f64) {
+        object.insert(field.to_owned(), serde_json::Value::Number(number));
+    }
+}
+
+#[cfg(feature = "param-override")]
+fn insert_u32_override(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+    value: Option<u32>,
+) {
+    if let Some(value) = value {
+        object.insert(field.to_owned(), serde_json::Value::Number(value.into()));
+    }
 }
 
 #[cfg(feature = "guard")]
@@ -5152,7 +5290,7 @@ fn shielded_attempt_body(
         |request| request.upstream_body(),
     );
 
-    if attempt_number > 1
+    let (prepared_body, anti_loop_hint_applied) = if attempt_number > 1
         && runtime.retry_policy.anti_loop_hint_enabled
         && matches!(retry_cause, Some(ShieldedRetryCause::LoopDetected))
     {
@@ -5162,10 +5300,33 @@ fn shielded_attempt_body(
             runtime.retry_policy.max_attempts,
             attempt_plan.anti_loop_hint.as_deref(),
         ) {
-            return (body, true);
+            (body, true)
+        } else {
+            (prepared_body, false)
         }
+    } else {
+        (prepared_body, false)
+    };
+    (
+        apply_param_override_to_body_or_original(prepared_body, &runtime.upstream_profile),
+        anti_loop_hint_applied,
+    )
+}
+
+#[cfg(feature = "param-override")]
+fn apply_param_override_to_body_or_original(body: Bytes, profile: &UpstreamProfileConfig) -> Bytes {
+    match apply_param_override_to_body(&body, profile) {
+        Ok(rewritten) => rewritten,
+        Err(_error) => body,
     }
-    (prepared_body, false)
+}
+
+#[cfg(not(feature = "param-override"))]
+fn apply_param_override_to_body_or_original(
+    body: Bytes,
+    _profile: &UpstreamProfileConfig,
+) -> Bytes {
+    body
 }
 
 fn shielded_attempt_request_metadata(
