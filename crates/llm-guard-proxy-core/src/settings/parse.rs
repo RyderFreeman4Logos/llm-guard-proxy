@@ -9,10 +9,11 @@ use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DefaultInjectionSchema,
-    DownstreamDropPolicy, HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig,
-    LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig, RetentionConfig,
-    RetryConfig, RetryLadderConfig, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamStallConfig,
+    DownstreamDropPolicy, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
+    LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig,
+    RetentionConfig, RetryConfig, RetryLadderConfig, ServerConfig, ShieldingConfig, ThinkingConfig,
+    ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
+    UpstreamStallConfig,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -22,8 +23,10 @@ enum Section {
     Listener(usize),
     Upstream,
     UpstreamMetadata,
+    UpstreamHotRestart,
     UpstreamProfile(usize),
     UpstreamProfileMetadata(usize),
+    UpstreamProfileHotRestart(usize),
     UpstreamProfileThinking(usize),
     #[cfg(feature = "guard")]
     ModelAlias(usize),
@@ -192,6 +195,7 @@ fn parse_section(
         "server" => Ok(Section::Server),
         "upstream" => Ok(Section::Upstream),
         "upstream.metadata" => Ok(Section::UpstreamMetadata),
+        "upstream.hot_restart" => Ok(Section::UpstreamHotRestart),
         "upstreams.metadata" => current_upstream_profile.map_or_else(
             || {
                 Err(ConfigParseError::new(
@@ -200,6 +204,15 @@ fn parse_section(
                 ))
             },
             |index| Ok(Section::UpstreamProfileMetadata(index)),
+        ),
+        "upstreams.hot_restart" => current_upstream_profile.map_or_else(
+            || {
+                Err(ConfigParseError::new(
+                    line_number,
+                    "[upstreams.hot_restart] must follow a [[upstreams]] profile",
+                ))
+            },
+            |index| Ok(Section::UpstreamProfileHotRestart(index)),
         ),
         "upstreams.thinking" => current_upstream_profile.map_or_else(
             || {
@@ -271,6 +284,9 @@ fn assign_value(
         Section::UpstreamMetadata => {
             assign_metadata(&mut config.upstream.metadata, key, value, line_number)
         }
+        Section::UpstreamHotRestart => {
+            assign_hot_restart(&mut config.upstream.hot_restart, key, value, line_number)
+        }
         Section::UpstreamProfile(index) => assign_upstream_profile(
             &mut config.upstream_profiles[*index],
             key,
@@ -279,6 +295,12 @@ fn assign_value(
         ),
         Section::UpstreamProfileMetadata(index) => assign_metadata(
             &mut config.upstream_profiles[*index].metadata,
+            key,
+            value,
+            line_number,
+        ),
+        Section::UpstreamProfileHotRestart(index) => assign_hot_restart(
+            &mut config.upstream_profiles[*index].hot_restart,
             key,
             value,
             line_number,
@@ -641,6 +663,42 @@ fn assign_metadata(
             )?;
         }
         _ => return unknown_key("upstream.metadata", key, line_number),
+    }
+    Ok(())
+}
+
+fn assign_hot_restart(
+    config: &mut HotRestartConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "probe_max_tokens" => {
+            config.probe_max_tokens =
+                parse_u32(value, line_number, "hot_restart.probe_max_tokens")?;
+        }
+        "probe_interval_secs" => {
+            config.probe_interval_secs =
+                parse_u64(value, line_number, "hot_restart.probe_interval_secs")?;
+        }
+        "probe_timeout_secs" => {
+            config.probe_timeout_secs =
+                parse_u64(value, line_number, "hot_restart.probe_timeout_secs")?;
+        }
+        "probe_messages" => {
+            config.probe_messages =
+                parse_json_value(value, line_number, "hot_restart.probe_messages")?;
+        }
+        "probe_chat_template_kwargs" => {
+            config.probe_chat_template_kwargs = parse_optional_json_value(
+                value,
+                line_number,
+                "hot_restart.probe_chat_template_kwargs",
+            )?;
+        }
+        _ => return unknown_key("hot_restart", key, line_number),
     }
     Ok(())
 }
@@ -1253,6 +1311,30 @@ fn parse_optional_string(
 ) -> Result<Option<String>, ConfigParseError> {
     let parsed = parse_string(value, line_number)?;
     Ok((!parsed.is_empty()).then_some(parsed))
+}
+
+fn parse_json_value(
+    value: &str,
+    line_number: usize,
+    field: &str,
+) -> Result<serde_json::Value, ConfigParseError> {
+    serde_json::from_str(value).map_err(|error| {
+        ConfigParseError::new(
+            line_number,
+            format!("invalid JSON value for {field}: {error}"),
+        )
+    })
+}
+
+fn parse_optional_json_value(
+    value: &str,
+    line_number: usize,
+    field: &str,
+) -> Result<Option<serde_json::Value>, ConfigParseError> {
+    if value == "null" {
+        return Ok(None);
+    }
+    parse_json_value(value, line_number, field).map(Some)
 }
 
 fn parse_string_array(value: &str, line_number: usize) -> Result<Vec<String>, ConfigParseError> {

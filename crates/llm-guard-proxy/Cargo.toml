@@ -8,7 +8,8 @@ repository.workspace = true
 description = "OpenAI-compatible LLM guard proxy service."
 
 [features]
-default = []
+default = ["upstream-hot-restart"]
+upstream-hot-restart = ["llm-guard-proxy-core/upstream-hot-restart"]
 guard = ["llm-guard-proxy-core/guard"]
 
 [dependencies]
