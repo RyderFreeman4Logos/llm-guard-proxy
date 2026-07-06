@@ -68,6 +68,8 @@ pub use settings::{
     validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
+pub use settings::{UnknownKeyPolicy, VirtualKeyConfig};
+#[cfg(feature = "guard")]
 pub use workflow::{StdioRuntime, WorkflowConfig, WorkflowRuntime};
 
 /// Public service name used by the binary and documentation.

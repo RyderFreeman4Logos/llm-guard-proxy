@@ -25,6 +25,8 @@ pub use model::{
     ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
     UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
+#[cfg(feature = "guard")]
+pub use model::{UnknownKeyPolicy, VirtualKeyConfig};
 pub use reload::{
     ConfigHandle, ConfigManager, MissingConfigPolicy, ReloadOutcome, ReloadWatcher,
     default_config_path,
@@ -168,6 +170,8 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstreams.param_override.presence_penalty",
     #[cfg(feature = "guard")]
     "profiles",
+    #[cfg(feature = "guard")]
+    "virtual_keys",
     #[cfg(feature = "guard")]
     "model_aliases",
     #[cfg(feature = "guard")]
