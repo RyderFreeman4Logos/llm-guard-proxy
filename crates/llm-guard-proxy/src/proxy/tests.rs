@@ -1219,6 +1219,7 @@ async fn shielded_non_stream_chat_trims_reasoning_separator_from_final_content()
 }
 
 #[tokio::test]
+#[cfg(feature = "guard")]
 async fn pre_request_guard_allow_proceeds_to_upstream() {
     let mut fake = FakeUpstream::spawn().await;
     let guard_root = unique_test_dir("guard-allow");
@@ -1248,6 +1249,7 @@ async fn pre_request_guard_allow_proceeds_to_upstream() {
 }
 
 #[tokio::test]
+#[cfg(feature = "guard")]
 async fn pre_request_guard_block_returns_forbidden_without_upstream_call() {
     let mut fake = FakeUpstream::spawn().await;
     let guard_root = unique_test_dir("guard-block");
@@ -1275,6 +1277,7 @@ async fn pre_request_guard_block_returns_forbidden_without_upstream_call() {
 }
 
 #[tokio::test]
+#[cfg(feature = "guard")]
 async fn pre_request_guard_replace_swaps_messages_before_upstream_call() {
     let mut fake = FakeUpstream::spawn().await;
     let guard_root = unique_test_dir("guard-replace");
@@ -1311,6 +1314,7 @@ async fn pre_request_guard_replace_swaps_messages_before_upstream_call() {
 }
 
 #[tokio::test]
+#[cfg(feature = "guard")]
 async fn pre_request_guard_error_fail_closed_blocks_or_allows_by_config() {
     let mut blocked_fake = FakeUpstream::spawn().await;
     let guard_root = unique_test_dir("guard-error-fail-closed");
@@ -1367,6 +1371,7 @@ async fn pre_request_guard_error_fail_closed_blocks_or_allows_by_config() {
 }
 
 #[tokio::test]
+#[cfg(feature = "guard")]
 async fn post_response_guard_block_returns_safe_refusal() {
     let mut fake = FakeUpstream::spawn().await;
     let guard_root = unique_test_dir("guard-post-block");
@@ -1400,6 +1405,7 @@ async fn post_response_guard_block_returns_safe_refusal() {
 }
 
 #[tokio::test]
+#[cfg(feature = "guard")]
 async fn post_response_guard_replace_changes_client_response() {
     let mut fake = FakeUpstream::spawn().await;
     let guard_root = unique_test_dir("guard-post-replace");
@@ -11230,6 +11236,7 @@ fn shielded_chat_request(uri: &'static str, body: &'static str) -> Request<Body>
 }
 
 #[allow(clippy::needless_pass_by_value)]
+#[cfg(feature = "guard")]
 fn write_guard_script(root: &Path, name: &str, result: String) -> PathBuf {
     let path = root.join(format!("{name}.sh"));
     let script = format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{result}'\n");
@@ -11237,6 +11244,7 @@ fn write_guard_script(root: &Path, name: &str, result: String) -> PathBuf {
     path
 }
 
+#[cfg(feature = "guard")]
 fn guard_result(decision: &str, replacement_messages: Option<&str>) -> String {
     format!(
         r#"{{"decision":"{decision}","risk_level":"test","tags":[],"summary":"guard summary","replacement_messages":{replacement_messages},"audit":{{"evidence_spans":[],"notes":[]}}}}"#,
@@ -11244,6 +11252,7 @@ fn guard_result(decision: &str, replacement_messages: Option<&str>) -> String {
     )
 }
 
+#[cfg(feature = "guard")]
 fn guard_workflow_config(
     pre_request_script: Option<&Path>,
     post_response_script: Option<&Path>,
@@ -11269,6 +11278,7 @@ fn guard_workflow_config(
     config
 }
 
+#[cfg(feature = "guard")]
 fn workflow_config(id: &str, script: &Path) -> String {
     format!(
         r#"

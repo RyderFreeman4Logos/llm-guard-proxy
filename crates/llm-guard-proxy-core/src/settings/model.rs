@@ -1,14 +1,20 @@
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     env, fs,
     io::ErrorKind,
     path::{Path, PathBuf},
 };
 
+#[cfg(feature = "guard")]
+use std::collections::HashMap;
+
+#[cfg(feature = "guard")]
 use crate::model_alias::{AliasKind, MAX_WORKFLOW_TIMEOUT_MS, ModelAliasConfig};
+#[cfg(feature = "guard")]
 use crate::profile::{DEFAULT_PROFILE_NAME, ProfileConfig};
+#[cfg(feature = "guard")]
 use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
 use super::ValidationError;
@@ -21,7 +27,9 @@ const LOOP_GUARD_MAX_SEMANTIC_HISTORY_WINDOWS: u32 = 256;
 const DEFAULT_UPSTREAM_PROFILE_NAME: &str = "default";
 const MAX_UPSTREAM_PROFILE_NAME_BYTES: usize = 128;
 const MAX_UPSTREAM_MODEL_ALIAS_BYTES: usize = 256;
+#[cfg(feature = "guard")]
 const MAX_CALLER_PROFILE_NAME_BYTES: usize = 128;
+#[cfg(feature = "guard")]
 const MAX_GUARD_PACK_NAME_BYTES: usize = 256;
 
 /// Complete application configuration.
@@ -36,12 +44,16 @@ pub struct AppConfig {
     /// Additional named upstream profiles matched by request model.
     pub upstream_profiles: Vec<UpstreamProfileConfig>,
     /// Virtual model aliases exposed to clients.
+    #[cfg(feature = "guard")]
     pub model_aliases: Vec<ModelAliasConfig>,
     /// Caller profiles and their request policy.
+    #[cfg(feature = "guard")]
     pub profiles: HashMap<String, ProfileConfig>,
     /// Configured guard workflows.
+    #[cfg(feature = "guard")]
     pub workflows: HashMap<String, WorkflowConfig>,
     /// Guard workflow configuration for pre-request and post-response hooks.
+    #[cfg(feature = "guard")]
     pub guard_workflows: GuardWorkflowConfig,
     /// Client shielding behavior flags.
     pub shielding: ShieldingConfig,
@@ -74,10 +86,13 @@ impl AppConfig {
         self.server.validate()?;
         self.upstream.validate()?;
         self.validate_upstream_profiles()?;
-        self.validate_model_aliases()?;
-        self.validate_profiles()?;
-        self.validate_workflows()?;
-        self.validate_guard_workflows()?;
+        #[cfg(feature = "guard")]
+        {
+            self.validate_model_aliases()?;
+            self.validate_profiles()?;
+            self.validate_workflows()?;
+            self.validate_guard_workflows()?;
+        }
         self.validate_listeners()?;
         self.observability.validate()?;
         self.evidence.validate()?;
@@ -161,6 +176,7 @@ impl AppConfig {
         Ok(())
     }
 
+    #[cfg(feature = "guard")]
     fn validate_workflows(&self) -> Result<(), ValidationError> {
         for (id, workflow) in &self.workflows {
             require(!id.trim().is_empty(), "workflows.id", "must not be empty")?;
@@ -175,6 +191,7 @@ impl AppConfig {
         Ok(())
     }
 
+    #[cfg(feature = "guard")]
     fn validate_guard_workflows(&self) -> Result<(), ValidationError> {
         self.validate_guard_workflow_id(
             "guard_workflows.pre_request",
@@ -186,6 +203,7 @@ impl AppConfig {
         )
     }
 
+    #[cfg(feature = "guard")]
     fn validate_guard_workflow_id(
         &self,
         field: &'static str,
@@ -208,6 +226,7 @@ impl AppConfig {
         )
     }
 
+    #[cfg(feature = "guard")]
     fn validate_model_aliases(&self) -> Result<(), ValidationError> {
         let allowed_profile_names = self.upstream_profile_names();
         let mut ids = HashSet::new();
@@ -298,6 +317,7 @@ impl AppConfig {
         Ok(())
     }
 
+    #[cfg(feature = "guard")]
     fn validate_profiles(&self) -> Result<(), ValidationError> {
         let configured_aliases = self
             .model_aliases
@@ -460,12 +480,14 @@ impl AppConfig {
     }
 
     /// Builds the implicit default caller profile used when no profiles are configured.
+    #[cfg(feature = "guard")]
     #[must_use]
     pub fn default_caller_profile(&self) -> ProfileConfig {
         ProfileConfig::default()
     }
 
     /// Selects a caller profile by name, including the implicit default when no profiles exist.
+    #[cfg(feature = "guard")]
     #[must_use]
     pub fn caller_profile_by_name(&self, name: &str) -> Option<ProfileConfig> {
         if self.profiles.is_empty() && name == DEFAULT_PROFILE_NAME {
@@ -554,9 +576,12 @@ impl AppConfig {
         self.upstream_stall = requested.upstream_stall.clone();
         self.heartbeat = requested.heartbeat.clone();
         self.cloudflare = requested.cloudflare.clone();
-        self.profiles.clone_from(&requested.profiles);
-        self.workflows.clone_from(&requested.workflows);
-        self.guard_workflows.clone_from(&requested.guard_workflows);
+        #[cfg(feature = "guard")]
+        {
+            self.profiles.clone_from(&requested.profiles);
+            self.workflows.clone_from(&requested.workflows);
+            self.guard_workflows.clone_from(&requested.guard_workflows);
+        }
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
         self.upstream.metadata = requested.upstream.metadata.clone();
         if self.upstream_profiles_topology_matches(requested) {
@@ -596,6 +621,7 @@ impl AppConfig {
             &self.upstream_profile_topology(),
             &requested.upstream_profile_topology(),
         );
+        #[cfg(feature = "guard")]
         push_structural_change(
             &mut changes,
             "model_aliases.topology",
@@ -638,6 +664,7 @@ impl AppConfig {
             .collect()
     }
 
+    #[cfg(feature = "guard")]
     fn model_alias_topology(&self) -> Vec<ModelAliasTopology> {
         self.model_aliases
             .iter()
@@ -660,6 +687,7 @@ impl AppConfig {
     }
 }
 
+#[cfg(feature = "guard")]
 impl WorkflowConfig {
     fn validate(&self, workflow_id: &str) -> Result<(), ValidationError> {
         require(
@@ -711,6 +739,7 @@ impl WorkflowConfig {
 }
 
 /// Configuration for guard workflow hooks.
+#[cfg(feature = "guard")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GuardWorkflowConfig {
     /// Workflow ID to invoke before forwarding to upstream.
@@ -721,6 +750,7 @@ pub struct GuardWorkflowConfig {
     pub fail_closed_blocks: bool,
 }
 
+#[cfg(feature = "guard")]
 impl Default for GuardWorkflowConfig {
     fn default() -> Self {
         Self {
@@ -767,6 +797,7 @@ impl From<&UpstreamProfileConfig> for UpstreamProfileTopology {
     }
 }
 
+#[cfg(feature = "guard")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ModelAliasTopology {
     id: String,
@@ -776,6 +807,7 @@ struct ModelAliasTopology {
     workflow_timeout_ms: Option<u64>,
 }
 
+#[cfg(feature = "guard")]
 impl From<&ModelAliasConfig> for ModelAliasTopology {
     fn from(alias: &ModelAliasConfig) -> Self {
         Self {

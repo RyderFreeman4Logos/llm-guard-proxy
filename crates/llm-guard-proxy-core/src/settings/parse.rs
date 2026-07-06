@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 
+#[cfg(feature = "guard")]
 use crate::model_alias::{AliasKind, ModelAliasConfig};
+#[cfg(feature = "guard")]
 use crate::profile::{ProfileConfig, ProfileKind, ShieldedBuffering};
+#[cfg(feature = "guard")]
 use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
 use super::{
@@ -22,9 +25,13 @@ enum Section {
     UpstreamProfile(usize),
     UpstreamProfileMetadata(usize),
     UpstreamProfileThinking(usize),
+    #[cfg(feature = "guard")]
     ModelAlias(usize),
+    #[cfg(feature = "guard")]
     Profile(String),
+    #[cfg(feature = "guard")]
     Workflow(String),
+    #[cfg(feature = "guard")]
     GuardWorkflows,
     Shielding,
     Observability,
@@ -116,6 +123,7 @@ fn parse_section(
         let index = config.listeners.len() - 1;
         return Ok(Section::Listener(index));
     }
+    #[cfg(feature = "guard")]
     if line == "[[model_aliases]]" {
         config.model_aliases.push(ModelAliasConfig::default());
         let index = config.model_aliases.len() - 1;
@@ -126,6 +134,7 @@ fn parse_section(
         return Ok(Section::RetryLadder(config.retry.ladder.len() - 1));
     }
     let section = &line[1..line.len() - 1];
+    #[cfg(feature = "guard")]
     if let Some(raw_workflow_id) = section.strip_prefix("workflows.") {
         let workflow_id = raw_workflow_id.trim_matches('"');
         if workflow_id.trim().is_empty() {
@@ -152,6 +161,7 @@ fn parse_section(
         }
         return Ok(Section::Workflow(workflow_id.to_owned()));
     }
+    #[cfg(feature = "guard")]
     if let Some(raw_profile_name) = section.strip_prefix("profiles.") {
         let profile_name = raw_profile_name.trim_matches('"');
         if profile_name.trim().is_empty() {
@@ -200,6 +210,7 @@ fn parse_section(
             },
             |index| Ok(Section::UpstreamProfileThinking(index)),
         ),
+        #[cfg(feature = "guard")]
         "guard_workflows" => Ok(Section::GuardWorkflows),
         "shielding" => Ok(Section::Shielding),
         "observability" => Ok(Section::Observability),
@@ -278,9 +289,11 @@ fn assign_value(
             value,
             line_number,
         ),
+        #[cfg(feature = "guard")]
         Section::ModelAlias(index) => {
             assign_model_alias(&mut config.model_aliases[*index], key, value, line_number)
         }
+        #[cfg(feature = "guard")]
         Section::Profile(profile_name) => {
             let profile = config.profiles.get_mut(profile_name).ok_or_else(|| {
                 ConfigParseError::new(
@@ -290,6 +303,7 @@ fn assign_value(
             })?;
             assign_profile(profile, key, value, line_number)
         }
+        #[cfg(feature = "guard")]
         Section::Workflow(workflow_id) => {
             let workflow = config.workflows.get_mut(workflow_id).ok_or_else(|| {
                 ConfigParseError::new(
@@ -299,6 +313,7 @@ fn assign_value(
             })?;
             assign_workflow(workflow, key, value, line_number)
         }
+        #[cfg(feature = "guard")]
         Section::GuardWorkflows => {
             assign_guard_workflows(&mut config.guard_workflows, key, value, line_number)
         }
@@ -327,6 +342,7 @@ fn assign_value(
     }
 }
 
+#[cfg(feature = "guard")]
 fn assign_profile(
     config: &mut ProfileConfig,
     key: &str,
@@ -352,6 +368,7 @@ fn assign_profile(
     Ok(())
 }
 
+#[cfg(feature = "guard")]
 fn parse_profile_kind(value: &str, line_number: usize) -> Result<ProfileKind, ConfigParseError> {
     match parse_string(value, line_number)?.trim() {
         "child" => Ok(ProfileKind::Child),
@@ -363,6 +380,7 @@ fn parse_profile_kind(value: &str, line_number: usize) -> Result<ProfileKind, Co
     }
 }
 
+#[cfg(feature = "guard")]
 fn parse_shielded_buffering(
     value: &str,
     line_number: usize,
@@ -380,6 +398,7 @@ fn parse_shielded_buffering(
     }
 }
 
+#[cfg(feature = "guard")]
 fn assign_workflow(
     config: &mut WorkflowConfig,
     key: &str,
@@ -402,6 +421,7 @@ fn assign_workflow(
     Ok(())
 }
 
+#[cfg(feature = "guard")]
 fn assign_guard_workflows(
     config: &mut super::GuardWorkflowConfig,
     key: &str,
@@ -417,6 +437,7 @@ fn assign_guard_workflows(
     Ok(())
 }
 
+#[cfg(feature = "guard")]
 fn parse_workflow_runtime(
     value: &str,
     line_number: usize,
@@ -430,6 +451,7 @@ fn parse_workflow_runtime(
     }
 }
 
+#[cfg(feature = "guard")]
 fn assign_model_alias(
     config: &mut ModelAliasConfig,
     key: &str,
@@ -453,6 +475,7 @@ fn assign_model_alias(
     Ok(())
 }
 
+#[cfg(feature = "guard")]
 fn parse_alias_kind(value: &str, line_number: usize) -> Result<AliasKind, ConfigParseError> {
     match parse_string(value, line_number)?.trim() {
         "upstream" => Ok(AliasKind::Upstream),

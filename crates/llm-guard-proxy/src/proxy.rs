@@ -27,16 +27,17 @@ use axum::{
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
-    AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DEFAULT_PROFILE_NAME,
-    DebugRequestSummary, DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord,
-    EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore,
-    EvidenceStoreWrite, GuardExecutor, GuardOutcome, Health, HeartbeatMode, LICENSE,
-    LatencyHistogram, ListenerConfig, MetadataConfig, ObservabilityMetricsSnapshot,
-    ObservabilityStore, ProfileConfig, RawPayloads, RequestId, RequestRecord, RequestStatus,
-    RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile, ShadowSkipReason,
-    ThinkingConfig, ThinkingMode, UpstreamMode, UpstreamProfileConfig, UpstreamRouteReason,
-    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
+    DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
+    EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore, EvidenceStoreWrite, Health,
+    HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, MetadataConfig,
+    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
+    RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
+    ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
+#[cfg(feature = "guard")]
+use llm_guard_proxy_core::{DEFAULT_PROFILE_NAME, GuardExecutor, GuardOutcome, ProfileConfig};
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;
@@ -1758,9 +1759,11 @@ async fn forward_openai_request(
     );
     add_listener_metadata(&mut request_metadata, &state.listener);
     request_metadata.extend(admission_metadata);
+    #[allow(unused_mut)]
     let mut prepared_request =
         prepare_openai_forward_request(state, &config, &method, &uri, &body, &mut request_metadata)
             .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    #[cfg(feature = "guard")]
     apply_pre_request_guard(&config, request_id, &mut prepared_request)
         .await
         .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
@@ -1791,6 +1794,7 @@ async fn forward_openai_request(
                 request_metadata,
                 listener: state.listener.clone(),
                 upstream_profile: prepared_request.upstream_profile,
+                #[cfg(feature = "guard")]
                 caller_profile: prepared_request.caller_profile,
                 route_reason: prepared_request.route_reason,
                 liveness: prepared_request.shielded_chat_plan.liveness,
@@ -1941,6 +1945,7 @@ async fn read_body_and_admit_generation(
 
 struct PreparedOpenAiRequest {
     model_id: Option<String>,
+    #[cfg(feature = "guard")]
     caller_profile: ProfileConfig,
     upstream_profile: UpstreamProfileConfig,
     route_reason: UpstreamRouteReason,
@@ -1958,6 +1963,7 @@ fn prepare_openai_forward_request(
     request_metadata: &mut BTreeMap<String, String>,
 ) -> Result<PreparedOpenAiRequest, ProxyError> {
     let model_id = extract_model_id(body);
+    #[cfg(feature = "guard")]
     let caller_profile = config
         .caller_profile_by_name(DEFAULT_PROFILE_NAME)
         .unwrap_or_else(|| config.default_caller_profile());
@@ -1987,6 +1993,7 @@ fn prepare_openai_forward_request(
 
     Ok(PreparedOpenAiRequest {
         model_id,
+        #[cfg(feature = "guard")]
         caller_profile,
         upstream_profile,
         route_reason,
@@ -1996,6 +2003,7 @@ fn prepare_openai_forward_request(
     })
 }
 
+#[cfg(feature = "guard")]
 async fn apply_pre_request_guard(
     config: &AppConfig,
     request_id: &RequestId,
@@ -2034,6 +2042,7 @@ async fn apply_pre_request_guard(
     }
 }
 
+#[cfg(feature = "guard")]
 async fn run_pre_request_guard(
     config: &AppConfig,
     request_id: &str,
@@ -2066,6 +2075,7 @@ async fn run_pre_request_guard(
     })
 }
 
+#[cfg(feature = "guard")]
 async fn apply_post_response_guard(
     runtime: &ShieldedRetryRuntime,
     aggregated: &mut ShieldedAggregatedAttempt,
@@ -2102,6 +2112,7 @@ async fn apply_post_response_guard(
     }
 }
 
+#[cfg(feature = "guard")]
 async fn run_post_response_guard(
     config: &AppConfig,
     request_id: &str,
@@ -2134,6 +2145,7 @@ async fn run_post_response_guard(
     })
 }
 
+#[cfg(feature = "guard")]
 fn chat_messages_from_body(body: &Bytes) -> Option<Vec<serde_json::Value>> {
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()?
@@ -2142,6 +2154,7 @@ fn chat_messages_from_body(body: &Bytes) -> Option<Vec<serde_json::Value>> {
         .cloned()
 }
 
+#[cfg(feature = "guard")]
 fn replace_chat_messages(
     body: &Bytes,
     messages: &[serde_json::Value],
@@ -2161,6 +2174,7 @@ fn replace_chat_messages(
     Ok(Bytes::from(value.to_string()))
 }
 
+#[cfg(feature = "guard")]
 fn replace_aggregated_response_body(aggregated: &mut ShieldedAggregatedAttempt, body: &Bytes) {
     aggregated.body = body.clone();
     aggregated.sse_body = openai_data_sse_body(body);
@@ -2170,6 +2184,7 @@ fn replace_aggregated_response_body(aggregated: &mut ShieldedAggregatedAttempt, 
     );
 }
 
+#[cfg(feature = "guard")]
 fn safe_refusal_response_body(original: &serde_json::Value, reason: &str) -> Bytes {
     let refusal = "I can't help with that request.";
     let mut response = original.clone();
@@ -2206,6 +2221,7 @@ fn safe_refusal_response_body(original: &serde_json::Value, reason: &str) -> Byt
     )
 }
 
+#[cfg(feature = "guard")]
 fn openai_data_sse_body(body: &Bytes) -> Bytes {
     let mut frame = BytesMut::with_capacity(body.len().saturating_add(22));
     frame.extend_from_slice(b"data: ");
@@ -3506,6 +3522,7 @@ struct ShieldedRetryRuntime {
     request_metadata: BTreeMap<String, String>,
     listener: ListenerConfig,
     upstream_profile: UpstreamProfileConfig,
+    #[cfg(feature = "guard")]
     caller_profile: ProfileConfig,
     route_reason: UpstreamRouteReason,
     liveness: ShieldedLivenessSelection,
@@ -4012,6 +4029,7 @@ async fn aggregate_shielded_attempt(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_shielded_attempts(
     runtime: ShieldedRetryRuntime,
     initial_attempt: Option<ShieldedStartedAttempt>,
@@ -4083,7 +4101,10 @@ async fn run_shielded_attempts(
         }
 
         match aggregate_shielded_attempt(&runtime, started).await {
-            Ok(mut aggregated) => {
+            Ok(aggregated) => {
+                #[cfg(feature = "guard")]
+                let mut aggregated = aggregated;
+                #[cfg(feature = "guard")]
                 apply_post_response_guard(&runtime, &mut aggregated).await;
                 return shielded_accepted_outcome(aggregated, attempt_records);
             }
@@ -7639,6 +7660,7 @@ enum ProxyError {
         failure: ListenerUpstreamDenied,
         request_metadata: Option<BTreeMap<String, String>>,
     },
+    #[cfg(feature = "guard")]
     #[error("guard workflow blocked request: {reason}")]
     GuardBlocked {
         reason: String,
@@ -7714,6 +7736,7 @@ impl ProxyError {
         }
     }
 
+    #[cfg(feature = "guard")]
     fn guard_blocked(reason: String) -> Self {
         Self::GuardBlocked {
             reason,
@@ -7738,6 +7761,7 @@ impl ProxyError {
             | Self::InvalidMethod { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRequestPath(error) => error.status(),
             Self::Admission { failure, .. } => failure.status(),
+            #[cfg(feature = "guard")]
             Self::GuardBlocked { .. } => StatusCode::FORBIDDEN,
             Self::ListenerUpstreamDenied { .. } | Self::ContextBudgetExceeded { .. } => {
                 StatusCode::BAD_REQUEST
@@ -7755,6 +7779,7 @@ impl ProxyError {
             Self::InvalidMethod { .. } => "invalid_method",
             Self::Admission { failure, .. } => failure.error_type(),
             Self::ListenerUpstreamDenied { .. } => "listener_upstream_not_allowed",
+            #[cfg(feature = "guard")]
             Self::GuardBlocked { .. } => "guard_blocked",
             Self::ContextBudgetExceeded { .. } => "invalid_request_error",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
@@ -7788,11 +7813,12 @@ impl ProxyError {
                 request_metadata: Some(request_metadata),
                 ..
             }
-            | Self::GuardBlocked {
+            | Self::ContextBudgetExceeded {
                 request_metadata: Some(request_metadata),
                 ..
-            }
-            | Self::ContextBudgetExceeded {
+            } => Some(request_metadata),
+            #[cfg(feature = "guard")]
+            Self::GuardBlocked {
                 request_metadata: Some(request_metadata),
                 ..
             } => Some(request_metadata),
@@ -7829,10 +7855,6 @@ impl ProxyError {
                 request_metadata: None,
                 ..
             }
-            | Self::GuardBlocked {
-                request_metadata: None,
-                ..
-            }
             | Self::ContextBudgetExceeded {
                 request_metadata: None,
                 ..
@@ -7843,6 +7865,11 @@ impl ProxyError {
             }
             | Self::UpstreamBody {
                 observability: None,
+                ..
+            } => None,
+            #[cfg(feature = "guard")]
+            Self::GuardBlocked {
+                request_metadata: None,
                 ..
             } => None,
         }
@@ -7869,7 +7896,6 @@ impl ProxyError {
             | Self::InvalidMethod { .. }
             | Self::Admission { .. }
             | Self::ListenerUpstreamDenied { .. }
-            | Self::GuardBlocked { .. }
             | Self::ContextBudgetExceeded { .. }
             | Self::UpstreamTransport {
                 observability: None,
@@ -7879,6 +7905,8 @@ impl ProxyError {
                 observability: None,
                 ..
             } => Vec::new(),
+            #[cfg(feature = "guard")]
+            Self::GuardBlocked { .. } => Vec::new(),
         }
     }
 
@@ -7913,6 +7941,7 @@ impl ProxyError {
                 failure,
                 request_metadata: Some(request_metadata),
             },
+            #[cfg(feature = "guard")]
             Self::GuardBlocked { reason, .. } => Self::GuardBlocked {
                 reason,
                 request_metadata: Some(request_metadata),
@@ -7967,8 +7996,9 @@ impl ProxyError {
             | Self::InvalidMethod { .. }
             | Self::Admission { .. }
             | Self::ListenerUpstreamDenied { .. }
-            | Self::ContextBudgetExceeded { .. }
-            | Self::GuardBlocked { .. }) => error,
+            | Self::ContextBudgetExceeded { .. }) => error,
+            #[cfg(feature = "guard")]
+            error @ Self::GuardBlocked { .. } => error,
         }
     }
 

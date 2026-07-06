@@ -5,13 +5,18 @@
 //! retry, and request-shielding behavior behind core interfaces.
 
 mod evidence;
+#[cfg(feature = "guard")]
 mod guard;
+#[cfg(feature = "guard")]
 pub mod gwp;
 mod loop_detector;
+#[cfg(feature = "guard")]
 mod model_alias;
 mod observability;
+#[cfg(feature = "guard")]
 pub mod profile;
 mod settings;
+#[cfg(feature = "guard")]
 pub mod workflow;
 
 pub use evidence::{
@@ -19,7 +24,9 @@ pub use evidence::{
     EvidenceGroupRecord, EvidencePruningStats, EvidenceRetentionUsage, EvidenceShadowRecord,
     EvidenceStore, EvidenceStoreWrite, ShadowSkipReason,
 };
+#[cfg(feature = "guard")]
 pub use guard::{GuardExecutor, GuardOutcome};
+#[cfg(feature = "guard")]
 pub use gwp::{
     GWP_PROTOCOL_VERSION, GwpAudit, GwpDecision, GwpHook, GwpInvocation, GwpProfile,
     GwpProfileKind, GwpResult, GwpTraceMode,
@@ -29,6 +36,7 @@ pub use loop_detector::{
     LoopDetector, LoopDetectorInput, LoopInputProfile, LoopReasonCode, LoopSeverity, LoopSignal,
     StreamChannel, ToolCallFingerprintInput,
 };
+#[cfg(feature = "guard")]
 pub use model_alias::{
     AliasKind, AliasResolutionError, AliasTarget, DEFAULT_WORKFLOW_TIMEOUT_MS,
     MAX_WORKFLOW_TIMEOUT_MS, ModelAliasConfig, ModelAliasResolver,
@@ -40,6 +48,7 @@ pub use observability::{
     RawPayloads, RequestId, RequestMetricCount, RequestRecord, RequestStatus,
     RetentionPruningStats, RetentionUsage, StoreWrite, UpstreamErrorMetricCount, UpstreamMode,
 };
+#[cfg(feature = "guard")]
 pub use profile::{
     BlockReason, DEFAULT_PROFILE_NAME, ProfileCheckResult, ProfileConfig, ProfileKind,
     ShieldedBuffering,
@@ -47,8 +56,8 @@ pub use profile::{
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
     DEFAULT_CONFIG_RELATIVE_PATH, DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig,
-    EvidenceShadowConfig, GuardWorkflowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig,
-    LoopGuardConfig, LoopGuardMode, MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy,
+    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig,
+    LoopGuardMode, MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy,
     ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher,
     RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
     SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
@@ -56,6 +65,7 @@ pub use settings::{
     UpstreamStallConfig, ValidationError, default_config_path, redact_upstream_base_url,
     validate_upstream_base_url,
 };
+#[cfg(feature = "guard")]
 pub use workflow::{StdioRuntime, WorkflowConfig, WorkflowRuntime};
 
 /// Public service name used by the binary and documentation.

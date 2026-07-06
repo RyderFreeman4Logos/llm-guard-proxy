@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 
+use crate::settings::GuardWorkflowConfig;
 use crate::{
-    GWP_PROTOCOL_VERSION, GuardWorkflowConfig, GwpDecision, GwpHook, GwpInvocation, GwpResult,
-    GwpTraceMode, ProfileConfig, StdioRuntime, WorkflowConfig,
+    GWP_PROTOCOL_VERSION, GwpDecision, GwpHook, GwpInvocation, GwpResult, GwpTraceMode,
+    ProfileConfig, StdioRuntime, WorkflowConfig,
 };
 
 /// Outcome of a guard check.
@@ -163,7 +164,8 @@ mod tests {
     use serde_json::json;
 
     use super::{GuardExecutor, GuardOutcome};
-    use crate::{GuardWorkflowConfig, GwpAudit, GwpDecision, GwpResult, ProfileConfig};
+    use crate::settings::GuardWorkflowConfig;
+    use crate::{GwpAudit, GwpDecision, GwpResult, ProfileConfig};
 
     #[test]
     fn skipped_when_no_hook_is_configured() {

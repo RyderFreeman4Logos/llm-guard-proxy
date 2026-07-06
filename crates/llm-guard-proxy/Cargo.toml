@@ -7,6 +7,10 @@ license.workspace = true
 repository.workspace = true
 description = "OpenAI-compatible LLM guard proxy service."
 
+[features]
+default = []
+guard = ["llm-guard-proxy-core/guard"]
+
 [dependencies]
 axum = "0.8"
 bytes = "1"
