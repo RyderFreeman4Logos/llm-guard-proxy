@@ -71,13 +71,13 @@ pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
     DEFAULT_CONFIG_RELATIVE_PATH, DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig,
     EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
-    LoopGuardConfig, LoopGuardMode, MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy,
-    ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher,
-    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
-    SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
-    UpstreamStallConfig, ValidationError, default_config_path, redact_upstream_base_url,
-    validate_upstream_base_url,
+    LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig, MissingConfigPolicy,
+    NoThinkingMarkerPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
+    ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig, RetryConfig,
+    RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt,
+    ShieldingConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig, ValidationError,
+    default_config_path, redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 pub use settings::{BudgetConfig, UnknownKeyPolicy, VirtualKeyConfig};

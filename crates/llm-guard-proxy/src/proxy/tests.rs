@@ -2764,6 +2764,22 @@ input_overlap_threshold_multiplier = 3
         "suspect"
     );
     assert_eq!(
+        attempt_row.response_metadata["loop_abort_candidate_count"],
+        "0"
+    );
+    assert_eq!(
+        attempt_row.response_metadata["loop_residual_signal_count"],
+        "1"
+    );
+    assert_eq!(
+        attempt_row.response_metadata["loop_content_signal_count"],
+        "1"
+    );
+    assert_eq!(
+        attempt_row.response_metadata["loop_reasoning_signal_count"],
+        "0"
+    );
+    assert_eq!(
         attempt_row.response_metadata["loop_signal_0_feature_threshold"],
         "12"
     );
@@ -3941,6 +3957,99 @@ max_tokens = 50000
         attempts[1].response_metadata["attempt_thinking_budget_tokens"],
         "8192"
     );
+}
+
+#[tokio::test]
+async fn truncate_cot_then_answer_uses_private_pre_loop_reasoning_without_downstream_exposure() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+on_reasoning_loop = "truncate_cot_then_answer"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = true
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-salvage"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    assert!(!aggregated.to_string().contains("reasoning loop line"));
+
+    let first_attempt = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+    assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
+    assert_eq!(body_thinking_budget(&second_attempt.body), Some(0));
+    let second_body_text = String::from_utf8_lossy(&second_attempt.body);
+    assert!(second_body_text.contains("llm-guard-proxy CoT salvage retry hint"));
+    assert!(second_body_text.contains("Private bounded pre-loop reasoning notes"));
+    assert!(second_body_text.contains("reasoning loop line"));
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(
+        attempts[0].response_metadata["loop_failure_policy"],
+        "truncate_cot_then_answer"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["loop_hard_abort_candidate"],
+        "true"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["loop_abort_channel"],
+        "reasoning"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["loop_abort_candidate_count"],
+        "1"
+    );
+    assert_eq!(attempts[1].response_metadata["cot_salvage_used"], "true");
+    assert_eq!(
+        attempts[1].response_metadata["cot_salvage_policy"],
+        "truncate_cot_then_answer"
+    );
+    assert_eq!(
+        attempts[1].response_metadata["attempt_thinking_budget_tokens"],
+        "0"
+    );
+    assert_eq!(
+        attempts[1].response_metadata["attempt_thinking_mode"],
+        "force_disable"
+    );
+    assert_eq!(attempts[1].response_metadata["finish_reason"], "stop");
 }
 
 #[tokio::test]
@@ -14291,6 +14400,7 @@ fn retry_hint_count(body: &Bytes) -> usize {
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|content| {
                             content.contains("llm-guard-proxy retry hint")
+                                || content.contains("llm-guard-proxy CoT salvage retry hint")
                                 || content.contains("Previous attempt became repetitive")
                         })
                 })

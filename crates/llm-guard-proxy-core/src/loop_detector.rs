@@ -376,9 +376,58 @@ impl DetectorSummary {
                 self.capped_signal_count.to_string(),
             );
         }
+        let mut abort_candidate_count = 0_u64;
+        let mut residual_signal_count = 0_u64;
+        let mut reasoning_signal_count = 0_u64;
+        let mut content_signal_count = 0_u64;
+        let mut tool_arguments_signal_count = 0_u64;
+        let mut tool_fingerprint_signal_count = 0_u64;
         for (index, signal) in self.signals.iter().enumerate() {
+            if signal.is_abort_candidate() {
+                abort_candidate_count = abort_candidate_count.saturating_add(1);
+            } else {
+                residual_signal_count = residual_signal_count.saturating_add(1);
+            }
+            match signal.channel {
+                StreamChannel::Reasoning => {
+                    reasoning_signal_count = reasoning_signal_count.saturating_add(1);
+                }
+                StreamChannel::Content => {
+                    content_signal_count = content_signal_count.saturating_add(1);
+                }
+                StreamChannel::ToolArguments => {
+                    tool_arguments_signal_count = tool_arguments_signal_count.saturating_add(1);
+                }
+                StreamChannel::ToolFingerprint => {
+                    tool_fingerprint_signal_count = tool_fingerprint_signal_count.saturating_add(1);
+                }
+            }
             metadata.extend(signal.summary_metadata(index));
         }
+        metadata.insert(
+            String::from("loop_abort_candidate_count"),
+            abort_candidate_count.to_string(),
+        );
+        metadata.insert(
+            String::from("loop_residual_signal_count"),
+            residual_signal_count.to_string(),
+        );
+        metadata.insert(
+            String::from("loop_reasoning_signal_count"),
+            reasoning_signal_count.to_string(),
+        );
+        metadata.insert(
+            String::from("loop_content_signal_count"),
+            content_signal_count.to_string(),
+        );
+        metadata.insert(
+            String::from("loop_tool_arguments_signal_count"),
+            tool_arguments_signal_count.to_string(),
+        );
+        metadata.insert(
+            String::from("loop_tool_fingerprint_signal_count"),
+            tool_fingerprint_signal_count.to_string(),
+        );
         metadata
     }
 }
@@ -1999,6 +2048,7 @@ mod tests {
             reasoning_semantic_window_token_count: 24,
             reasoning_semantic_minimum_token_count: 8,
             reasoning_semantic_history_window_count: 16,
+            on_reasoning_loop: crate::settings::LoopFailurePolicy::default(),
         }
     }
 }

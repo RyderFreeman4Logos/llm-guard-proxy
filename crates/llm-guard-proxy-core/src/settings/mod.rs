@@ -17,11 +17,12 @@ pub use model::ParamOverrideConfig;
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, DefaultInjectionSchema, DownstreamDropPolicy,
     EvidenceConfig, EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, HotRestartConfig,
-    ListenerConfig, LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy,
-    ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
-    SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
-    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    ListenerConfig, LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig,
+    NoThinkingMarkerPolicy, ObservabilityConfig, RestartRequiredChange, RetentionConfig,
+    RetryConfig, RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt,
+    ShieldingConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 pub use model::{BudgetConfig, GuardWorkflowConfig};
@@ -70,6 +71,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "evidence.shadow.max_shadow_attempts_per_request",
     "evidence.shadow.max_global_shadow_in_flight",
     "evidence.shadow.shadow_attempt_timeout_ms",
+    "evidence.shadow.compare_attempts",
     "thinking.enabled",
     "thinking.force_disable",
     "thinking.mode",
@@ -84,6 +86,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "thinking.apply_to_tool_requests",
     "loop_guard.enabled",
     "loop_guard.mode",
+    "loop_guard.on_reasoning_loop",
     "loop_guard.normalized_input_window_secs",
     "loop_guard.max_repeated_inputs",
     "loop_guard.output_repeated_line_threshold",

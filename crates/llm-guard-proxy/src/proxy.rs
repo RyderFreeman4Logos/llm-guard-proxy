@@ -41,11 +41,12 @@ use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
     DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
     EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore, EvidenceStoreWrite, Health,
-    HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, MetadataConfig,
-    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
-    RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
-    ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, LoopFailurePolicy, LoopGuardConfig,
+    MetadataConfig, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId,
+    RequestRecord, RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME,
+    SelectedUpstreamProfile, ShadowComparisonAttempt, ShadowSkipReason, ThinkingConfig,
+    ThinkingMode, UpstreamMode, UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -71,6 +72,8 @@ const IN_FLIGHT_CAPACITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100)
 const ADMISSION_RETRY_AFTER_SECS: u32 = 1;
 const RECOVERY_PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(100);
 const RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE: Duration = Duration::from_millis(500);
+const COT_SALVAGE_PREFIX_MAX_BYTES: usize = 4_096;
+const COT_SALVAGE_THINKING_BUDGET_TOKENS: u32 = 1_024;
 const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
 #[cfg(feature = "guard")]
 const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
@@ -1820,7 +1823,7 @@ async fn forward_openai_request(
     apply_pre_request_guard(&config, request_id, &mut prepared_request)
         .await
         .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
-    let retry_policy = ShieldedRetryPolicy::from_config(&config.retry);
+    let retry_policy = ShieldedRetryPolicy::from_config(&config.retry, &config.loop_guard);
     let upstream_stall_policy = UpstreamStallPolicy::from_config(&config.upstream_stall);
     let upstream_timeout =
         Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
@@ -3494,11 +3497,12 @@ struct ShieldedRetryPolicy {
     anti_loop_hint_enabled: bool,
     shielded_streaming_enabled: bool,
     downstream_drop_policy: DownstreamDropPolicy,
+    loop_failure_policy: LoopFailurePolicy,
     ladder: Vec<RetryLadderConfig>,
 }
 
 impl ShieldedRetryPolicy {
-    fn from_config(config: &RetryConfig) -> Self {
+    fn from_config(config: &RetryConfig, loop_guard: &LoopGuardConfig) -> Self {
         let max_attempts = if config.enabled {
             if config.ladder.is_empty() {
                 config.max_attempts
@@ -3516,6 +3520,7 @@ impl ShieldedRetryPolicy {
             anti_loop_hint_enabled: config.anti_loop_hint_enabled,
             shielded_streaming_enabled: config.shielded_streaming_enabled,
             downstream_drop_policy: config.downstream_drop_policy,
+            loop_failure_policy: loop_guard.on_reasoning_loop,
             ladder: config.ladder.clone(),
         }
     }
@@ -3528,9 +3533,11 @@ impl ShieldedRetryPolicy {
         &self,
         attempt_number: u32,
         fallback_thinking: &ThinkingConfig,
+        cot_salvage: Option<&CotSalvageContext>,
     ) -> ShieldedAttemptPlan {
         let index = attempt_number.saturating_sub(1);
-        self.ladder
+        let mut plan = self
+            .ladder
             .get(usize::try_from(index).unwrap_or(usize::MAX))
             .map_or_else(
                 || ShieldedAttemptPlan {
@@ -3543,7 +3550,11 @@ impl ShieldedRetryPolicy {
                     thinking: entry.thinking.clone(),
                     anti_loop_hint: entry.anti_loop_hint.clone(),
                 },
-            )
+            );
+        if let Some(cot_salvage) = cot_salvage {
+            plan.thinking = cot_salvage_thinking(cot_salvage.policy, &plan.thinking);
+        }
+        plan
     }
 }
 
@@ -3552,6 +3563,28 @@ struct ShieldedAttemptPlan {
     name: String,
     thinking: ThinkingConfig,
     anti_loop_hint: Option<String>,
+}
+
+fn cot_salvage_thinking(policy: LoopFailurePolicy, current: &ThinkingConfig) -> ThinkingConfig {
+    let mut thinking = current.clone();
+    match policy {
+        LoopFailurePolicy::RetryLadder => {}
+        LoopFailurePolicy::TruncateCotThenAnswer => {
+            thinking.mode = ThinkingMode::ForceDisable;
+            thinking.enabled = false;
+            thinking.force_disable = true;
+            thinking.budget_tokens = 0;
+            thinking.preserve_answer_budget = false;
+        }
+        LoopFailurePolicy::BoundedAnswerFromCot => {
+            thinking.mode = ThinkingMode::BoundedThinking;
+            thinking.enabled = true;
+            thinking.force_disable = false;
+            thinking.budget_tokens = COT_SALVAGE_THINKING_BUDGET_TOKENS;
+            thinking.preserve_answer_budget = false;
+        }
+    }
+    thinking
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4403,6 +4436,21 @@ struct ShieldedAttemptFailure {
     upstream_body: Bytes,
 }
 
+#[derive(Clone, Debug)]
+struct CotSalvageContext {
+    policy: LoopFailurePolicy,
+    source_attempt_id: AttemptId,
+    source_attempt_number: u32,
+    source_attempt_duration_ms: u64,
+    reasoning_prefix: String,
+}
+
+impl CotSalvageContext {
+    fn prefix_bytes(&self) -> usize {
+        self.reasoning_prefix.len()
+    }
+}
+
 async fn forward_shielded_chat_with_retries(
     runtime: ShieldedRetryRuntime,
     in_flight_permit: InFlightPermit,
@@ -4759,7 +4807,8 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
     let mut retry_cause = None;
     let mut attempt_records = Vec::new();
     loop {
-        let started = match start_shielded_attempt(runtime, attempt_number, retry_cause).await {
+        let started = match start_shielded_attempt(runtime, attempt_number, retry_cause, None).await
+        {
             Ok(started) => started,
             Err(failure) => {
                 match shielded_start_failure_step(runtime, failure, &mut attempt_records).await {
@@ -4842,11 +4891,19 @@ async fn run_shielded_attempts(
         .as_ref()
         .map_or(1, |attempt| attempt.info.attempt_number);
     let mut retry_cause = None;
+    let mut cot_salvage = None;
     loop {
         let started = if let Some(started) = current_attempt.take() {
             started
         } else {
-            match start_shielded_attempt(&runtime, attempt_number, retry_cause).await {
+            match start_shielded_attempt(
+                &runtime,
+                attempt_number,
+                retry_cause,
+                cot_salvage.as_ref(),
+            )
+            .await
+            {
                 Ok(started) => started,
                 Err(failure) => {
                     match shielded_start_failure_step(&runtime, failure, &mut attempt_records).await
@@ -4857,6 +4914,7 @@ async fn run_shielded_attempts(
                         } => {
                             attempt_number = next_attempt_number;
                             retry_cause = next_retry_cause;
+                            cot_salvage = None;
                             continue;
                         }
                         ShieldedStartFailureStep::Failed(outcome) => {
@@ -4888,6 +4946,7 @@ async fn run_shielded_attempts(
                 update_shielded_attempt_progress(attempt_progress.as_ref(), &attempt_records, None);
                 attempt_number = next_attempt_number;
                 retry_cause = next_retry_cause;
+                cot_salvage = None;
                 continue;
             }
             ShieldedAttemptStep::Failed(outcome) => return ShieldedRunOutcome::Failed(outcome),
@@ -4914,6 +4973,11 @@ async fn run_shielded_attempts(
             Err(mut failure) => {
                 let next_retry_cause = failure.retry_cause;
                 let mut can_retry = should_retry_after_shielded_failure(&runtime, &failure);
+                let next_cot_salvage = if can_retry {
+                    cot_salvage_context_for_failure(&runtime, &failure)
+                } else {
+                    None
+                };
                 let recovery_gate = recovery_gate_for_retryable_upstream_stall(
                     &runtime,
                     can_retry,
@@ -4934,6 +4998,7 @@ async fn run_shielded_attempts(
                 if can_retry {
                     attempt_number = failure.attempt_number.saturating_add(1);
                     retry_cause = next_retry_cause;
+                    cot_salvage = next_cot_salvage;
                     continue;
                 }
                 return ShieldedRunOutcome::Failed(shielded_failure_outcome(
@@ -4978,6 +5043,10 @@ fn should_direct_relay_no_thinking_stream(
     runtime.chat_kind == ShieldedChatKind::Stream
         && info.attempt_number > 1
         && matches!(retry_cause, Some(ShieldedRetryCause::LoopDetected))
+        && info
+            .request_metadata
+            .get("cot_salvage_used")
+            .is_none_or(|used| used != "true")
         && info
             .request_metadata
             .get("attempt_thinking_mode")
@@ -5706,14 +5775,22 @@ async fn start_shielded_attempt(
     runtime: &ShieldedRetryRuntime,
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
+    cot_salvage: Option<&CotSalvageContext>,
 ) -> Result<ShieldedStartedAttempt, ShieldedAttemptFailure> {
     let attempt_id = AttemptId::for_request(&runtime.request_id, attempt_number);
     let attempt_started_at_unix_ms = unix_time_millis();
-    let attempt_plan = runtime
-        .retry_policy
-        .attempt_plan(attempt_number, &runtime.upstream_profile.thinking);
-    let (upstream_body, anti_loop_hint_applied) =
-        shielded_attempt_body(runtime, attempt_number, retry_cause, &attempt_plan);
+    let attempt_plan = runtime.retry_policy.attempt_plan(
+        attempt_number,
+        &runtime.upstream_profile.thinking,
+        cot_salvage,
+    );
+    let (upstream_body, anti_loop_hint_applied) = shielded_attempt_body(
+        runtime,
+        attempt_number,
+        retry_cause,
+        &attempt_plan,
+        cot_salvage,
+    );
     let raw_request_body = raw_payload_text(&upstream_body);
     let evidence_upstream_body = upstream_body.clone();
     let request_metadata = shielded_attempt_request_metadata(
@@ -5722,6 +5799,7 @@ async fn start_shielded_attempt(
         retry_cause,
         anti_loop_hint_applied,
         &attempt_plan,
+        cot_salvage,
     );
     match send_upstream_request(
         &runtime.client,
@@ -5832,6 +5910,7 @@ fn shielded_attempt_body(
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
     attempt_plan: &ShieldedAttemptPlan,
+    cot_salvage: Option<&CotSalvageContext>,
 ) -> (Bytes, bool) {
     let prepared_body = match runtime.chat_kind {
         ShieldedChatKind::NonStream => shielded_chat::prepare_non_stream_request(
@@ -5847,6 +5926,22 @@ fn shielded_attempt_body(
         || runtime.upstream_body.clone(),
         |request| request.upstream_body(),
     );
+
+    if let Some(cot_salvage) = cot_salvage
+        && let Some(body) = shielded_chat::body_with_cot_salvage_retry_hint(
+            &prepared_body,
+            attempt_number,
+            runtime.retry_policy.max_attempts,
+            cot_salvage.policy.as_str(),
+            &cot_salvage.reasoning_prefix,
+            attempt_plan.anti_loop_hint.as_deref(),
+        )
+    {
+        return (
+            apply_param_override_to_body_or_original(body, &runtime.upstream_profile),
+            true,
+        );
+    }
 
     let (prepared_body, anti_loop_hint_applied) = if attempt_number > 1
         && runtime.retry_policy.anti_loop_hint_enabled
@@ -5893,6 +5988,7 @@ fn shielded_attempt_request_metadata(
     retry_cause: Option<ShieldedRetryCause>,
     anti_loop_hint_applied: bool,
     attempt_plan: &ShieldedAttemptPlan,
+    cot_salvage: Option<&CotSalvageContext>,
 ) -> BTreeMap<String, String> {
     let mut metadata = attempt_request_metadata(
         &runtime.downstream_method,
@@ -5919,6 +6015,7 @@ fn shielded_attempt_request_metadata(
         retry_cause,
         anti_loop_hint_applied,
         attempt_plan,
+        cot_salvage,
     );
     metadata
 }
@@ -5930,6 +6027,7 @@ fn add_retry_attempt_metadata(
     retry_cause: Option<ShieldedRetryCause>,
     anti_loop_hint_applied: bool,
     attempt_plan: &ShieldedAttemptPlan,
+    cot_salvage: Option<&CotSalvageContext>,
 ) {
     metadata.insert(String::from("attempt_number"), attempt_number.to_string());
     metadata.insert(
@@ -5965,6 +6063,10 @@ fn add_retry_attempt_metadata(
         policy.shielded_streaming_enabled.to_string(),
     );
     metadata.insert(
+        String::from("loop_failure_policy"),
+        policy.loop_failure_policy.as_str().to_owned(),
+    );
+    metadata.insert(
         String::from("downstream_drop_policy"),
         policy.downstream_drop_policy.as_str().to_owned(),
     );
@@ -5982,6 +6084,47 @@ fn add_retry_attempt_metadata(
             .thinking
             .max_tokens
             .map_or_else(|| String::from("unset"), |value| value.to_string()),
+    );
+    add_cot_salvage_request_metadata(metadata, cot_salvage, &attempt_plan.thinking);
+}
+
+fn add_cot_salvage_request_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    cot_salvage: Option<&CotSalvageContext>,
+    thinking: &ThinkingConfig,
+) {
+    let Some(cot_salvage) = cot_salvage else {
+        metadata.insert(String::from("cot_salvage_used"), String::from("false"));
+        return;
+    };
+    metadata.insert(String::from("cot_salvage_used"), String::from("true"));
+    metadata.insert(
+        String::from("cot_salvage_policy"),
+        cot_salvage.policy.as_str().to_owned(),
+    );
+    metadata.insert(
+        String::from("cot_salvage_source_attempt_id"),
+        cot_salvage.source_attempt_id.as_str().to_owned(),
+    );
+    metadata.insert(
+        String::from("cot_salvage_source_attempt_number"),
+        cot_salvage.source_attempt_number.to_string(),
+    );
+    metadata.insert(
+        String::from("cot_salvage_source_attempt_duration_ms"),
+        cot_salvage.source_attempt_duration_ms.to_string(),
+    );
+    metadata.insert(
+        String::from("cot_salvage_reasoning_prefix_bytes"),
+        cot_salvage.prefix_bytes().to_string(),
+    );
+    metadata.insert(
+        String::from("cot_salvage_thinking_budget_tokens"),
+        thinking.budget_tokens.to_string(),
+    );
+    metadata.insert(
+        String::from("cot_salvage_thinking_mode"),
+        thinking.effective_mode().as_str().to_owned(),
     );
 }
 
@@ -6004,6 +6147,10 @@ fn add_retry_request_metadata(
     metadata.insert(
         String::from("retry_shielded_streaming_enabled"),
         policy.shielded_streaming_enabled.to_string(),
+    );
+    metadata.insert(
+        String::from("loop_failure_policy"),
+        policy.loop_failure_policy.as_str().to_owned(),
     );
     metadata.insert(
         String::from("downstream_drop_policy"),
@@ -6083,6 +6230,50 @@ fn aggregation_failure(
         raw_payloads,
         upstream_body: info.upstream_body.clone(),
     }
+}
+
+fn cot_salvage_context_for_failure(
+    runtime: &ShieldedRetryRuntime,
+    failure: &ShieldedAttemptFailure,
+) -> Option<CotSalvageContext> {
+    if failure.retry_cause != Some(ShieldedRetryCause::LoopDetected)
+        || !runtime.retry_policy.loop_failure_policy.uses_cot_salvage()
+        || failure
+            .response_metadata
+            .get("loop_channel")
+            .is_none_or(|channel| channel != "reasoning")
+    {
+        return None;
+    }
+    let reasoning = failure.raw_payloads.reasoning.as_deref()?;
+    let reasoning_prefix = bounded_utf8_prefix(reasoning, COT_SALVAGE_PREFIX_MAX_BYTES);
+    if reasoning_prefix.trim().is_empty() {
+        return None;
+    }
+    Some(CotSalvageContext {
+        policy: runtime.retry_policy.loop_failure_policy,
+        source_attempt_id: failure.attempt_id.clone(),
+        source_attempt_number: failure.attempt_number,
+        source_attempt_duration_ms: failure
+            .finished_at_unix_ms
+            .saturating_sub(failure.started_at_unix_ms),
+        reasoning_prefix,
+    })
+}
+
+fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = 0;
+    for (index, character) in value.char_indices() {
+        let next_end = index + character.len_utf8();
+        if next_end > max_bytes {
+            break;
+        }
+        end = next_end;
+    }
+    value[..end].to_owned()
 }
 
 fn status_failure(
@@ -6235,10 +6426,19 @@ fn copy_attempt_request_metadata(
         "retry_previous_reason",
         "retry_anti_loop_hint_applied",
         "retry_shielded_streaming_enabled",
+        "loop_failure_policy",
         "downstream_drop_policy",
         "attempt_thinking_mode",
         "attempt_thinking_budget_tokens",
         "attempt_thinking_max_tokens",
+        "cot_salvage_used",
+        "cot_salvage_policy",
+        "cot_salvage_source_attempt_id",
+        "cot_salvage_source_attempt_number",
+        "cot_salvage_source_attempt_duration_ms",
+        "cot_salvage_reasoning_prefix_bytes",
+        "cot_salvage_thinking_budget_tokens",
+        "cot_salvage_thinking_mode",
     ] {
         if let Some(value) = request_metadata.get(key) {
             response_metadata.insert(key.to_owned(), value.clone());
@@ -6298,6 +6498,7 @@ fn terminal_forward_failure(
         anti_loop_hint_enabled: false,
         shielded_streaming_enabled: false,
         downstream_drop_policy: DownstreamDropPolicy::Cancel,
+        loop_failure_policy: LoopFailurePolicy::RetryLadder,
         ladder: Vec::new(),
     };
     attempt_records.push(attempt_failure_record(
@@ -6729,6 +6930,10 @@ fn retry_chain_metadata(
         (
             String::from("retry_shielded_streaming_enabled"),
             policy.shielded_streaming_enabled.to_string(),
+        ),
+        (
+            String::from("loop_failure_policy"),
+            policy.loop_failure_policy.as_str().to_owned(),
         ),
         (
             String::from("downstream_drop_policy"),
@@ -8148,6 +8353,14 @@ fn evidence_detector_features(metadata: &BTreeMap<String, String>) -> BTreeMap<S
                         | "reasoning_delta_count"
                         | "tool_call_delta_count"
                         | "finish_reason"
+                        | "loop_failure_policy"
+                        | "cot_salvage_used"
+                        | "cot_salvage_policy"
+                        | "cot_salvage_source_attempt_number"
+                        | "cot_salvage_reasoning_prefix_bytes"
+                        | "cot_salvage_thinking_budget_tokens"
+                        | "shadow_compare_attempt"
+                        | "shadow_terminal_status"
                 )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
@@ -8170,7 +8383,11 @@ fn maybe_schedule_shadow_continuation(
         }
     };
     let shadow = &settings.evidence.shadow;
-    if !settings.evidence.enabled || !shadow.enabled || !shadow.keep_looping_attempt_running {
+    if !settings.evidence.enabled || !shadow.enabled {
+        return;
+    }
+    let plans = shadow_attempt_plans(runtime, failure, source, &settings);
+    if plans.is_empty() {
         return;
     }
 
@@ -8184,12 +8401,25 @@ fn maybe_schedule_shadow_continuation(
         );
         return;
     }
+
+    for plan in plans {
+        schedule_shadow_attempt(runtime, source, &settings, plan);
+    }
+}
+
+fn schedule_shadow_attempt(
+    runtime: &ShieldedRetryRuntime,
+    source: &AttemptRecord,
+    settings: &AppConfig,
+    plan: ShadowAttemptPlan,
+) {
+    let shadow = &settings.evidence.shadow;
     if shadow.max_global_shadow_in_flight == 0 {
         push_shadow_skipped_record(
             &runtime.shadow_evidence,
             runtime,
             source,
-            &settings,
+            settings,
             ShadowSkipReason::GlobalLimit,
         );
         return;
@@ -8202,7 +8432,7 @@ fn maybe_schedule_shadow_continuation(
             &runtime.shadow_evidence,
             runtime,
             source,
-            &settings,
+            settings,
             ShadowSkipReason::GlobalLimit,
         );
         return;
@@ -8216,7 +8446,7 @@ fn maybe_schedule_shadow_continuation(
             &runtime.shadow_evidence,
             runtime,
             source,
-            &settings,
+            settings,
             ShadowSkipReason::PerRequestLimit,
         );
         return;
@@ -8229,7 +8459,7 @@ fn maybe_schedule_shadow_continuation(
             &runtime.shadow_evidence,
             runtime,
             source,
-            &settings,
+            settings,
             ShadowSkipReason::ContinuationUnavailable,
         );
         return;
@@ -8239,7 +8469,7 @@ fn maybe_schedule_shadow_continuation(
         method: runtime.method.clone(),
         upstream_url: runtime.upstream_url.clone(),
         downstream_headers: runtime.downstream_headers.clone(),
-        upstream_body: failure.upstream_body.clone(),
+        upstream_body: plan.upstream_body,
         upstream_timeout: runtime.upstream_timeout,
         evidence_store: runtime.evidence_store.clone(),
         shadow_evidence: runtime.shadow_evidence.clone(),
@@ -8247,10 +8477,12 @@ fn maybe_schedule_shadow_continuation(
         group_id: runtime.request_id.as_str().to_owned(),
         attempt_id,
         source: source.clone(),
+        request_metadata: plan.request_metadata,
         model_id: runtime.model_id.clone(),
         loop_context: runtime.loop_context.clone(),
         shadow_attempt_timeout_ms: shadow.shadow_attempt_timeout_ms,
         parallel_downgrade_attempts: shadow.parallel_downgrade_attempts,
+        comparison_attempt: plan.comparison_attempt,
         _permit: permit,
     };
     tokio::spawn(async move {
@@ -8260,6 +8492,133 @@ fn maybe_schedule_shadow_continuation(
             Ok(EvidenceStoreWrite::Written | EvidenceStoreWrite::Disabled) | Err(_) => {}
         }
     });
+}
+
+struct ShadowAttemptPlan {
+    upstream_body: Bytes,
+    request_metadata: BTreeMap<String, String>,
+    comparison_attempt: Option<ShadowComparisonAttempt>,
+}
+
+fn shadow_attempt_plans(
+    runtime: &ShieldedRetryRuntime,
+    failure: &ShieldedAttemptFailure,
+    source: &AttemptRecord,
+    settings: &AppConfig,
+) -> Vec<ShadowAttemptPlan> {
+    let shadow = &settings.evidence.shadow;
+    let mut plans = Vec::new();
+    if shadow.keep_looping_attempt_running {
+        plans.push(ShadowAttemptPlan {
+            upstream_body: failure.upstream_body.clone(),
+            request_metadata: source.request_metadata.clone(),
+            comparison_attempt: None,
+        });
+    }
+    for comparison in &shadow.compare_attempts {
+        if let Some(plan) = shadow_comparison_attempt_plan(runtime, failure, source, *comparison) {
+            plans.push(plan);
+        }
+    }
+    plans
+}
+
+fn shadow_comparison_attempt_plan(
+    runtime: &ShieldedRetryRuntime,
+    failure: &ShieldedAttemptFailure,
+    source: &AttemptRecord,
+    comparison: ShadowComparisonAttempt,
+) -> Option<ShadowAttemptPlan> {
+    let thinking = shadow_comparison_thinking(comparison, &runtime.upstream_profile.thinking);
+    let mut upstream_body = prepared_shadow_body(runtime, &thinking);
+    if comparison == ShadowComparisonAttempt::CotSalvage {
+        let reasoning = failure.raw_payloads.reasoning.as_deref()?;
+        let reasoning_prefix = bounded_utf8_prefix(reasoning, COT_SALVAGE_PREFIX_MAX_BYTES);
+        if reasoning_prefix.trim().is_empty() {
+            return None;
+        }
+        upstream_body = shielded_chat::body_with_cot_salvage_retry_hint(
+            &upstream_body,
+            source.attempt_number.saturating_add(1),
+            runtime.retry_policy.max_attempts,
+            comparison.as_str(),
+            &reasoning_prefix,
+            None,
+        )?;
+    }
+    upstream_body =
+        apply_param_override_to_body_or_original(upstream_body, &runtime.upstream_profile);
+    let mut request_metadata = source.request_metadata.clone();
+    request_metadata.insert(
+        String::from("shadow_compare_attempt"),
+        comparison.as_str().to_owned(),
+    );
+    request_metadata.insert(
+        String::from("attempt_thinking_mode"),
+        thinking.effective_mode().as_str().to_owned(),
+    );
+    request_metadata.insert(
+        String::from("attempt_thinking_budget_tokens"),
+        thinking.budget_tokens.to_string(),
+    );
+    request_metadata.insert(
+        String::from("attempt_thinking_max_tokens"),
+        thinking
+            .max_tokens
+            .map_or_else(|| String::from("unset"), |value| value.to_string()),
+    );
+    Some(ShadowAttemptPlan {
+        upstream_body,
+        request_metadata,
+        comparison_attempt: Some(comparison),
+    })
+}
+
+fn prepared_shadow_body(runtime: &ShieldedRetryRuntime, thinking: &ThinkingConfig) -> Bytes {
+    match runtime.chat_kind {
+        ShieldedChatKind::NonStream => {
+            shielded_chat::prepare_non_stream_request(&runtime.downstream_body, thinking)
+        }
+        ShieldedChatKind::Stream => {
+            shielded_chat::prepare_stream_request(&runtime.downstream_body, thinking)
+        }
+        ShieldedChatKind::Generic => None,
+    }
+    .map_or_else(
+        || runtime.upstream_body.clone(),
+        |request| request.upstream_body(),
+    )
+}
+
+fn shadow_comparison_thinking(
+    comparison: ShadowComparisonAttempt,
+    current: &ThinkingConfig,
+) -> ThinkingConfig {
+    let mut thinking = current.clone();
+    match comparison {
+        ShadowComparisonAttempt::MaxThinking => {
+            thinking.mode = ThinkingMode::ForceThinking;
+            thinking.enabled = true;
+            thinking.force_disable = false;
+            thinking.budget_tokens = thinking.budget_tokens.max(32_768);
+            thinking.preserve_answer_budget = true;
+        }
+        ShadowComparisonAttempt::BoundedThinking | ShadowComparisonAttempt::CotSalvage => {
+            thinking.mode = ThinkingMode::BoundedThinking;
+            thinking.enabled = true;
+            thinking.force_disable = false;
+            thinking.budget_tokens = COT_SALVAGE_THINKING_BUDGET_TOKENS;
+            thinking.preserve_answer_budget = false;
+        }
+        ShadowComparisonAttempt::NoThinking => {
+            thinking.mode = ThinkingMode::ForceDisable;
+            thinking.enabled = false;
+            thinking.force_disable = true;
+            thinking.budget_tokens = 0;
+            thinking.preserve_answer_budget = false;
+        }
+    }
+    thinking
 }
 
 struct ShadowContinuationTask {
@@ -8275,10 +8634,12 @@ struct ShadowContinuationTask {
     group_id: String,
     attempt_id: AttemptId,
     source: AttemptRecord,
+    request_metadata: BTreeMap<String, String>,
     model_id: Option<String>,
     loop_context: shielded_chat::LoopInspectionContext,
     shadow_attempt_timeout_ms: u64,
     parallel_downgrade_attempts: bool,
+    comparison_attempt: Option<ShadowComparisonAttempt>,
     _permit: InFlightPermit,
 }
 
@@ -8474,6 +8835,7 @@ fn build_shadow_terminal_record(
         &task.source,
         task.shadow_attempt_timeout_ms,
         task.parallel_downgrade_attempts,
+        task.comparison_attempt,
     );
     response_metadata.insert(
         String::from("shadow_terminal_status"),
@@ -8489,17 +8851,14 @@ fn build_shadow_terminal_record(
         shown_to_downstream: false,
         started_at_unix_ms: input.started_at_unix_ms,
         finished_at_unix_ms: Some(input.finished_at_unix_ms),
-        upstream_profile: metadata_value(&task.source.request_metadata, "upstream_profile"),
+        upstream_profile: metadata_value(&task.request_metadata, "upstream_profile"),
         model_id: task.model_id.clone(),
-        thinking_mode: metadata_value(&task.source.request_metadata, "attempt_thinking_mode"),
+        thinking_mode: metadata_value(&task.request_metadata, "attempt_thinking_mode"),
         thinking_budget_tokens: metadata_u32(
-            &task.source.request_metadata,
+            &task.request_metadata,
             "attempt_thinking_budget_tokens",
         ),
-        thinking_max_tokens: metadata_u32(
-            &task.source.request_metadata,
-            "attempt_thinking_max_tokens",
-        ),
+        thinking_max_tokens: metadata_u32(&task.request_metadata, "attempt_thinking_max_tokens"),
         detector_features: evidence_detector_features(&task.source.response_metadata),
         status: input.status,
         http_status: input.http_status,
@@ -8507,7 +8866,7 @@ fn build_shadow_terminal_record(
         retry_reason: None,
         abort_reason: input.abort_reason,
         shadow_skip_reason: None,
-        request_metadata: task.source.request_metadata.clone(),
+        request_metadata: task.request_metadata.clone(),
         response_metadata,
         raw_payloads: {
             let mut raw_payloads = input.raw_payloads;
@@ -8555,6 +8914,7 @@ fn build_shadow_skipped_record(
         source,
         settings.evidence.shadow.shadow_attempt_timeout_ms,
         settings.evidence.shadow.parallel_downgrade_attempts,
+        None,
     );
     response_metadata.extend(evidence_detector_features(&source.response_metadata));
     Some(EvidenceAttemptRecord {
@@ -8607,6 +8967,7 @@ fn add_shadow_metadata(
     source: &AttemptRecord,
     timeout_ms: u64,
     parallel_downgrade_attempts: bool,
+    comparison_attempt: Option<ShadowComparisonAttempt>,
 ) {
     metadata.insert(String::from("shadow_continuation"), String::from("true"));
     metadata.insert(
@@ -8621,6 +8982,12 @@ fn add_shadow_metadata(
         String::from("shadow_parallel_downgrade_attempts"),
         parallel_downgrade_attempts.to_string(),
     );
+    if let Some(comparison_attempt) = comparison_attempt {
+        metadata.insert(
+            String::from("shadow_compare_attempt"),
+            comparison_attempt.as_str().to_owned(),
+        );
+    }
     metadata.extend(evidence_detector_features(&source.response_metadata));
 }
 

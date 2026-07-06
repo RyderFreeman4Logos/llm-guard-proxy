@@ -137,6 +137,48 @@ pub(super) fn body_with_anti_loop_retry_hint(
     serde_json::to_vec(&value).ok().map(Bytes::from)
 }
 
+/// Returns a retry request body with bounded private reasoning salvage context.
+///
+/// The salvage context is sent only to the upstream retry attempt. It is not
+/// released downstream by this function, and the prompt explicitly instructs
+/// the model not to quote or continue the private notes.
+pub(super) fn body_with_cot_salvage_retry_hint(
+    body: &Bytes,
+    attempt_number: u32,
+    max_attempts: u32,
+    policy: &str,
+    reasoning_prefix: &str,
+    configured_hint: Option<&str>,
+) -> Option<Bytes> {
+    let mut value = serde_json::from_slice::<Value>(body).ok()?;
+    let object = value.as_object_mut()?;
+    let messages = object.get_mut("messages")?.as_array_mut()?;
+    let hint = cot_salvage_retry_hint(
+        attempt_number,
+        max_attempts,
+        policy,
+        reasoning_prefix,
+        configured_hint,
+    );
+    if messages
+        .first()
+        .and_then(|msg| msg.get("role"))
+        .and_then(Value::as_str)
+        .is_some_and(|role| role == "system")
+    {
+        merge_hint_into_existing_system_message(&mut messages[0], &hint);
+    } else {
+        messages.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": hint,
+            }),
+        );
+    }
+    serde_json::to_vec(&value).ok().map(Bytes::from)
+}
+
 /// Appends the anti-loop retry hint to the `content` field of an existing
 /// system message, separated by a blank line. Handles both string and
 /// multi-part (array) content shapes.
@@ -166,6 +208,21 @@ fn merge_hint_into_existing_system_message(system_message: &mut Value, hint: &st
 fn anti_loop_retry_hint(attempt_number: u32, max_attempts: u32) -> String {
     format!(
         "llm-guard-proxy retry hint: a prior shielded upstream attempt was aborted by loop protection. Avoid repeating the same output pattern and provide a concise fresh answer. retry_attempt={attempt_number}/{max_attempts}."
+    )
+}
+
+fn cot_salvage_retry_hint(
+    attempt_number: u32,
+    max_attempts: u32,
+    policy: &str,
+    reasoning_prefix: &str,
+    configured_hint: Option<&str>,
+) -> String {
+    let operator_hint = configured_hint.unwrap_or(
+        "Use the private notes only to preserve useful intermediate work. Do not quote, reveal, or continue the notes. Answer the original user request directly.",
+    );
+    format!(
+        "llm-guard-proxy CoT salvage retry hint: a prior shielded upstream attempt was aborted by reasoning-loop protection. policy={policy} retry_attempt={attempt_number}/{max_attempts}.\n\n{operator_hint}\n\nPrivate bounded pre-loop reasoning notes:\n{reasoning_prefix}"
     )
 }
 
@@ -2413,10 +2470,10 @@ impl ChoiceBuilder {
         for field in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(reasoning) = delta.get(field).and_then(Value::as_str) {
                 if !reasoning.is_empty() {
+                    observe_fragment(loop_detector, StreamChannel::Reasoning, reasoning)?;
                     self.reasoning.push_str(reasoning);
                     stats.reasoning_delta_count = stats.reasoning_delta_count.saturating_add(1);
                     mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
-                    observe_fragment(loop_detector, StreamChannel::Reasoning, reasoning)?;
                     push_raw_stream_chunk(raw_stream_chunks, StreamChannel::Reasoning, reasoning);
                 }
             }

@@ -41,10 +41,24 @@ impl AggregationError {
         }
     }
 
-    fn loop_detected(signal: &LoopSignal) -> Self {
+    fn loop_detected(signal: &LoopSignal, summary: &DetectorSummary, mode: LoopGuardMode) -> Self {
+        let mut response_metadata = signal.legacy_abort_metadata();
+        response_metadata.extend(summary.metadata(mode));
+        response_metadata.insert(
+            String::from("loop_hard_abort_candidate"),
+            String::from("true"),
+        );
+        response_metadata.insert(
+            String::from("loop_abort_channel"),
+            signal.channel.as_str().to_owned(),
+        );
+        response_metadata.insert(
+            String::from("loop_abort_severity"),
+            signal.severity.as_str().to_owned(),
+        );
         Self {
             message: loop_detection_message(signal),
-            response_metadata: signal.legacy_abort_metadata(),
+            response_metadata,
             raw_payloads: Box::default(),
         }
     }
@@ -177,7 +191,8 @@ impl LoopDetector {
             return Ok(());
         }
         if let Some(signal) = signals.iter().find(|signal| signal.is_abort_candidate()) {
-            return Err(AggregationError::loop_detected(signal));
+            let summary = self.summary();
+            return Err(AggregationError::loop_detected(signal, &summary, self.mode));
         }
         Ok(())
     }

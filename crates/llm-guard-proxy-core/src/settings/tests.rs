@@ -12,9 +12,10 @@ use super::model::{
 };
 use super::{
     AppConfig, ConfigManager, ConfigParseError, DefaultInjectionSchema, DownstreamDropPolicy,
-    HeartbeatMode, LoopGuardMode, MissingConfigPolicy, NoThinkingMarkerPolicy, RELOADABLE_FIELDS,
-    RESTART_REQUIRED_FIELDS, ThinkingMode, ToolRequestThinkingPolicy, UpstreamRouteReason,
-    ValidationError, parse::parse_config_text, redact_upstream_base_url,
+    HeartbeatMode, LoopFailurePolicy, LoopGuardMode, MissingConfigPolicy, NoThinkingMarkerPolicy,
+    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ShadowComparisonAttempt, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamRouteReason, ValidationError, parse::parse_config_text,
+    redact_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 use crate::{
@@ -141,6 +142,7 @@ parallel_downgrade_attempts = false
 max_shadow_attempts_per_request = 1
 max_global_shadow_in_flight = 3
 shadow_attempt_timeout_ms = 100
+compare_attempts = ["max-thinking", "bounded-thinking", "no-thinking", "cot-salvage"]
 
 [thinking]
 force_disable = true
@@ -152,6 +154,7 @@ interval_secs = 5
 
 [loop_guard]
 mode = "monitor"
+on_reasoning_loop = "truncate_cot_then_answer"
 output_repeated_line_threshold = 40
 output_token_window_size = 8
 output_repeated_token_window_threshold = 9
@@ -277,6 +280,10 @@ fn defaults_match_issue_contract() {
 }
 
 fn assert_default_loop_guard_fields(config: &AppConfig) {
+    assert_eq!(
+        config.loop_guard.on_reasoning_loop,
+        LoopFailurePolicy::RetryLadder
+    );
     assert_eq!(config.loop_guard.normalized_input_window_secs, 120);
     assert_eq!(config.loop_guard.max_repeated_inputs, 1);
     assert_eq!(config.loop_guard.output_repeated_line_threshold, 24);
@@ -421,6 +428,7 @@ fn assert_default_evidence_config(config: &AppConfig) {
     assert_eq!(config.evidence.shadow.max_shadow_attempts_per_request, 2);
     assert_eq!(config.evidence.shadow.max_global_shadow_in_flight, 2);
     assert_eq!(config.evidence.shadow.shadow_attempt_timeout_ms, 7_200_000);
+    assert!(config.evidence.shadow.compare_attempts.is_empty());
 }
 
 #[test]
@@ -1204,9 +1212,22 @@ fn parses_toml_with_defaults_and_overrides() {
     assert_eq!(config.evidence.shadow.max_shadow_attempts_per_request, 1);
     assert_eq!(config.evidence.shadow.max_global_shadow_in_flight, 3);
     assert_eq!(config.evidence.shadow.shadow_attempt_timeout_ms, 100);
+    assert_eq!(
+        config.evidence.shadow.compare_attempts,
+        vec![
+            ShadowComparisonAttempt::MaxThinking,
+            ShadowComparisonAttempt::BoundedThinking,
+            ShadowComparisonAttempt::NoThinking,
+            ShadowComparisonAttempt::CotSalvage,
+        ]
+    );
     assert_eq!(config.heartbeat.mode, HeartbeatMode::JsonWhitespace);
     assert_eq!(config.heartbeat.interval_secs, 5);
     assert_eq!(config.loop_guard.mode, LoopGuardMode::Monitor);
+    assert_eq!(
+        config.loop_guard.on_reasoning_loop,
+        LoopFailurePolicy::TruncateCotThenAnswer
+    );
     assert_eq!(config.loop_guard.output_repeated_line_threshold, 40);
     assert_eq!(config.loop_guard.output_token_window_size, 8);
     assert_eq!(config.loop_guard.output_repeated_token_window_threshold, 9);
@@ -1865,6 +1886,31 @@ mode = "enforce"
 }
 
 #[test]
+fn parses_loop_failure_policies() {
+    for (policy, expected) in [
+        ("retry_ladder", LoopFailurePolicy::RetryLadder),
+        (
+            "truncate_cot_then_answer",
+            LoopFailurePolicy::TruncateCotThenAnswer,
+        ),
+        (
+            "bounded_answer_from_cot",
+            LoopFailurePolicy::BoundedAnswerFromCot,
+        ),
+    ] {
+        let config = parse_config_text(&format!(
+            r#"
+[loop_guard]
+on_reasoning_loop = "{policy}"
+"#
+        ))
+        .expect("loop failure policy should parse");
+
+        assert_eq!(config.loop_guard.on_reasoning_loop, expected);
+    }
+}
+
+#[test]
 fn rejects_invalid_loop_guard_mode() {
     let error = parse_config_text(
         r#"
@@ -1879,6 +1925,46 @@ mode = "observe-everything"
     assert!(error.message().contains("disabled"));
     assert!(error.message().contains("monitor"));
     assert!(error.message().contains("enforce"));
+}
+
+#[test]
+fn rejects_invalid_loop_failure_policy() {
+    let error = parse_config_text(
+        r#"
+[loop_guard]
+on_reasoning_loop = "publish_raw_cot"
+"#,
+    )
+    .expect_err("invalid loop failure policy should fail");
+
+    assert_eq!(error.line(), 3);
+    assert!(
+        error
+            .message()
+            .contains("invalid loop_guard.on_reasoning_loop")
+    );
+    assert!(error.message().contains("retry_ladder"));
+    assert!(error.message().contains("truncate_cot_then_answer"));
+    assert!(error.message().contains("bounded_answer_from_cot"));
+}
+
+#[test]
+fn rejects_invalid_shadow_compare_attempt() {
+    let error = parse_config_text(
+        r#"
+[evidence.shadow]
+compare_attempts = ["max-thinking", "raw-cot"]
+"#,
+    )
+    .expect_err("invalid shadow compare attempt should fail");
+
+    assert_eq!(error.line(), 3);
+    assert!(
+        error
+            .message()
+            .contains("invalid evidence.shadow.compare_attempts entry")
+    );
+    assert!(error.message().contains("cot-salvage"));
 }
 
 #[cfg(feature = "guard")]
@@ -2920,6 +3006,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"server.max_control_plane_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_request_body_bytes"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.mode"));
+    assert!(RELOADABLE_FIELDS.contains(&"loop_guard.on_reasoning_loop"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.output_repeated_line_threshold"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.input_overlap_threshold_multiplier"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_detection_enabled"));
@@ -2954,6 +3041,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.keep_looping_attempt_running"));
     assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.max_global_shadow_in_flight"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.compare_attempts"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_command"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_timeout_ms"));

@@ -97,6 +97,7 @@ The shielded chat core is enabled by default for non-streaming chat completions:
 - The default downstream response is `text/event-stream`. While the shielded upstream attempt is pending, the proxy emits comment heartbeats shaped as `: llm-guard-proxy heartbeat`. After the attempt is accepted, it emits `event: final` with the accepted OpenAI-compatible chat completion JSON in the `data:` field.
 - If the same normalized input fingerprint repeats within the loop-guard window, the downstream response switches to `application/json` with leading whitespace heartbeat bytes before the final JSON body. Standard JSON parsers accept the leading whitespace.
 - The same `[loop_guard]` section also feeds shielded upstream SSE deltas into a channelized loop detector for hidden reasoning fields, visible content, tool-call argument fragments, and completed tool fingerprints. `mode = "monitor"` records bounded signals without aborting; `mode = "enforce"` aborts high-confidence abort candidates through the existing upstream-body error path. Feature metadata contains hashes, counters, window sizes, severity, confidence, reason codes, and channel summaries by default.
+- `loop_guard.on_reasoning_loop = "retry_ladder"` preserves the default retry ladder. Quality-first deployments can opt into `"truncate_cot_then_answer"` or `"bounded_answer_from_cot"` to retry a reasoning-channel loop with a bounded private pre-loop reasoning prefix and instructions to answer without continuing the loop.
 - `heartbeat.mode = "disabled"` keeps the legacy buffered JSON response for shielded non-stream chat completions.
 - Attempt observability records include first-byte latency, first-token latency, finish reason, parsed content/reasoning/tool-call delta counters, and bounded `loop_*` diagnostics when monitor or enforce mode emits detector signals.
 - Downstream `stream=true` chat requests currently stay on the generic streaming path to preserve first-chunk timing and backpressure behavior while later issues add release-after-inspection streaming.
@@ -119,6 +120,7 @@ The built-in defaults are intended for local, LAN, Tailscale, or Cloudflare-fron
 - Ctrl-C and SIGTERM start graceful shutdown: the listener stops accepting new connections and in-flight response bodies are allowed to finish or be canceled by downstream drop.
 - Request forwarding strips hop-by-hop headers, `Host`, `Content-Length`, and the admin-only `x-admin-token` header. OpenAI-compatible `Authorization` and `x-api-key` headers are forwarded to the upstream for normal `/v1/...` calls, but are redacted from logs, metrics, debug summaries, and observability metadata.
 - Raw prompts, raw outputs, reasoning text, and tool arguments are not persisted by default. Keep `observability.capture_raw_payloads = false` for shared LAN or Cloudflare exposure unless you have a separate data-handling reason to enable it.
+- CoT salvage policies send a bounded private reasoning prefix to the upstream retry attempt. The proxy does not release that prefix downstream, and evidence raw payload persistence remains disabled by default. Enabling `observability.capture_raw_payloads = true` or `evidence.include_raw_payloads = true` can persist prompts, outputs, reasoning, and tool arguments after redaction; treat those settings as sensitive debug modes.
 - `heartbeat.mode = "sse"` is the default downstream liveness mode for shielded non-stream chat and is suitable for Cloudflare-style idle timeout protection. Repeated normalized inputs switch to JSON whitespace heartbeat to preserve parseable non-stream JSON.
 
 ## Configuration
@@ -205,6 +207,26 @@ prune_to_bytes = 805306368
 max_records = 100000
 prune_to_records = 80000
 
+[evidence]
+enabled = false
+sqlite_path = "~/.local/state/llm-guard-proxy/evidence.sqlite3"
+blob_cache_dir = "~/.cache/llm-guard-proxy/evidence/blobs"
+include_raw_payloads = false
+include_request_headers = false
+max_bytes = 10737418240
+prune_to_bytes = 8589934592
+max_records = 100000
+
+[evidence.shadow]
+enabled = false
+keep_looping_attempt_running = false
+parallel_downgrade_attempts = true
+max_shadow_attempts_per_request = 2
+max_global_shadow_in_flight = 2
+shadow_attempt_timeout_ms = 7200000
+# Same-prompt evidence-only alternatives for offline quality tuning.
+# compare_attempts = ["max-thinking", "bounded-thinking", "no-thinking", "cot-salvage"]
+
 [thinking]
 enabled = true
 force_disable = false
@@ -218,6 +240,7 @@ tool_request_policy = "apply"
 [loop_guard]
 enabled = true
 mode = "monitor" # disabled, monitor, enforce
+on_reasoning_loop = "retry_ladder" # retry_ladder, truncate_cot_then_answer, bounded_answer_from_cot
 normalized_input_window_secs = 120
 max_repeated_inputs = 1
 output_repeated_line_threshold = 24
@@ -321,6 +344,20 @@ Reloadable fields:
 - `observability.retention.prune_to_bytes`
 - `observability.retention.max_records`
 - `observability.retention.prune_to_records`
+- `evidence.enabled`
+- `evidence.include_raw_payloads`
+- `evidence.include_request_headers`
+- `evidence.max_bytes`
+- `evidence.prune_to_bytes`
+- `evidence.max_records`
+- `evidence.prune_to_records`
+- `evidence.shadow.enabled`
+- `evidence.shadow.keep_looping_attempt_running`
+- `evidence.shadow.parallel_downgrade_attempts`
+- `evidence.shadow.max_shadow_attempts_per_request`
+- `evidence.shadow.max_global_shadow_in_flight`
+- `evidence.shadow.shadow_attempt_timeout_ms`
+- `evidence.shadow.compare_attempts`
 - `thinking.enabled`
 - `thinking.force_disable`
 - `thinking.budget_tokens`
@@ -328,6 +365,7 @@ Reloadable fields:
 - `thinking.tool_request_policy`
 - `loop_guard.enabled`
 - `loop_guard.mode`
+- `loop_guard.on_reasoning_loop`
 - `loop_guard.normalized_input_window_secs`
 - `loop_guard.max_repeated_inputs`
 - `loop_guard.output_repeated_line_threshold`
