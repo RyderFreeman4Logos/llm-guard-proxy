@@ -3600,6 +3600,9 @@ async fn shielded_retry_transient_upstream_status_then_success() {
 [heartbeat]
 mode = "disabled"
 
+[upstream.hot_restart]
+enabled = false
+
 [retry]
 max_attempts = 3
 "#,
@@ -3636,6 +3639,264 @@ max_attempts = 3
     );
     assert_eq!(attempts[0].response_metadata["status_code"], "503");
     assert_eq!(attempts[1].status, "succeeded");
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+#[tokio::test]
+async fn hot_restart_recovers_after_transient_failure() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[upstream.hot_restart]
+probe_interval_secs = 1
+probe_timeout_secs = 5
+
+[retry]
+max_attempts = 3
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=hot-restart-503-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated: serde_json::Value =
+        serde_json::from_str(&response.text().await.expect("body should be text"))
+            .expect("body should be JSON");
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let first = fake.recv_next().await;
+    let probe = fake.recv_next().await;
+    let retry = fake.recv_next().await;
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=hot-restart-503-then-success"
+    );
+    assert_eq!(probe.path_and_query, "/v1/chat/completions");
+    assert!(body_contains_text(&probe.body, "1+1=?"));
+    assert_eq!(
+        retry.path_and_query,
+        "/v1/chat/completions?test=hot-restart-503-then-success"
+    );
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(attempts[0].response_metadata["status_code"], "503");
+    assert_eq!(
+        attempts[0].response_metadata["hot_restart_recovery_status"],
+        "ready"
+    );
+    assert_eq!(attempts[1].status, "succeeded");
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+#[tokio::test]
+async fn hot_restart_times_out() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[upstream.hot_restart]
+probe_interval_secs = 1
+probe_timeout_secs = 1
+probe_messages = [{"role":"user","content":"hot-restart-never-ready"}]
+
+[retry]
+max_attempts = 3
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=hot-restart-always-503",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("1")
+    );
+    let _body = response.text().await.expect("body should be text");
+
+    let first = fake.recv_next().await;
+    let probe = fake.recv_next().await;
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=hot-restart-always-503"
+    );
+    assert_eq!(probe.path_and_query, "/v1/chat/completions");
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(
+        attempts[0].abort_reason.as_deref(),
+        Some("hot_restart_timeout")
+    );
+    assert_eq!(
+        attempts[0].response_metadata["hot_restart_recovery_status"],
+        "timeout"
+    );
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+#[tokio::test]
+async fn concurrent_requests_share_single_probe() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[upstream.hot_restart]
+probe_interval_secs = 1
+probe_timeout_secs = 5
+probe_messages = [{"role":"user","content":"hot-restart-shared-probe"}]
+
+[retry]
+max_attempts = 3
+"#,
+    )
+    .await;
+
+    let first = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=hot-restart-concurrent",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"one"}]}"#)
+        .send();
+    let second = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=hot-restart-concurrent",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"two"}]}"#)
+        .send();
+
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("first proxy request should complete");
+    let second = second.expect("second proxy request should complete");
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let _first_body = first.text().await.expect("first body should be text");
+    let _second_body = second.text().await.expect("second body should be text");
+
+    let mut observed = Vec::new();
+    for _ in 0..5 {
+        observed.push(fake.recv_next().await);
+    }
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+    let probe_count = observed
+        .iter()
+        .filter(|request| {
+            request.path_and_query == "/v1/chat/completions"
+                && body_contains_text(&request.body, "hot-restart-shared-probe")
+        })
+        .count();
+    let original_count = observed
+        .iter()
+        .filter(|request| {
+            request.path_and_query == "/v1/chat/completions?test=hot-restart-concurrent"
+        })
+        .count();
+    assert_eq!(probe_count, 1);
+    assert_eq!(original_count, 4);
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+#[tokio::test]
+async fn hot_restart_disabled_passes_through_error() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[upstream.hot_restart]
+enabled = false
+
+[retry]
+max_attempts = 1
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=hot-restart-503-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _body = response.text().await.expect("body should be text");
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=hot-restart-503-then-success"
+    );
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert!(
+        attempts[0]
+            .response_metadata
+            .get("hot_restart_recovery_status")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -7903,7 +8164,7 @@ enabled = false
     )
     .await;
 
-    let response = timeout(
+    let response = Box::pin(timeout(
         Duration::from_secs(2),
         proxy_handler(
             State(proxy.state.clone()),
@@ -7912,7 +8173,7 @@ enabled = false
                 r#"{"model":"test-chat","messages":[{"role":"user","content":"timeout"}]}"#,
             ),
         ),
-    )
+    ))
     .await
     .expect("shielded timeout response should be bounded");
 
@@ -9447,10 +9708,10 @@ max_queued_generation_requests = 0
 
     let (overflow_request, overflow_body_polled) =
         tracked_json_request("/v1/completions?slot=overflow", br#"{"prompt":"overflow"}"#);
-    let overflow_response = timeout(
+    let overflow_response = Box::pin(timeout(
         STREAM_HEADER_TIMEOUT,
         proxy_handler(State(proxy.state.clone()), overflow_request),
-    )
+    ))
     .await
     .expect("routing queue-full response should be bounded");
 
@@ -9594,13 +9855,13 @@ max_queued_generation_requests = 0
         "/v1/embeddings?test=long-json&slot=active"
     );
 
-    let model_response = timeout(
+    let model_response = Box::pin(timeout(
         STREAM_HEADER_TIMEOUT,
         proxy_handler(
             State(proxy.state.clone()),
             empty_get_request("/v1/models?test=model-metadata&slot=profile-limits"),
         ),
-    )
+    ))
     .await
     .expect("models request should bypass generation saturation in profile-limit mode");
     assert_eq!(model_response.status(), StatusCode::OK);
@@ -9673,13 +9934,13 @@ max_queued_generation_requests = 0
         "default queued request should wait on default generation capacity"
     );
 
-    let embedding_response = timeout(
+    let embedding_response = Box::pin(timeout(
         STREAM_HEADER_TIMEOUT,
         proxy_handler(
             State(proxy.state.clone()),
             embedding_request("/v1/embeddings?test=long-json&slot=embedding"),
         ),
-    )
+    ))
     .await
     .expect("matched profile request must not be blocked by default profile admission wait");
     assert_eq!(embedding_response.status(), StatusCode::OK);
@@ -9785,10 +10046,10 @@ match_models = ["embedding-model"]
         "/v1/embeddings?slot=reload-overflow",
         br#"{"model":"embedding-model","input":"overflow"}"#,
     );
-    let overflow_response = timeout(
+    let overflow_response = Box::pin(timeout(
         STREAM_HEADER_TIMEOUT,
         proxy_handler(State(proxy.state.clone()), overflow_request),
-    )
+    ))
     .await
     .expect("overflow response should be bounded");
     assert_eq!(overflow_response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -10020,10 +10281,10 @@ async fn generation_queue_full_fails_without_body_buffering_or_upstream_forward(
 
     let (overflow_request, overflow_body_polled) =
         tracked_json_request("/v1/completions?slot=overflow", br#"{"prompt":"overflow"}"#);
-    let overflow_response = timeout(
+    let overflow_response = Box::pin(timeout(
         STREAM_HEADER_TIMEOUT,
         proxy_handler(State(proxy.state.clone()), overflow_request),
-    )
+    ))
     .await
     .expect("queue-full response should be bounded");
 
@@ -10094,10 +10355,10 @@ async fn generation_queue_full_returns_configured_429_status() {
         "/v1/completions?slot=configured-status-overflow",
         br#"{"prompt":"overflow"}"#,
     );
-    let overflow_response = timeout(
+    let overflow_response = Box::pin(timeout(
         STREAM_HEADER_TIMEOUT,
         proxy_handler(State(proxy.state.clone()), overflow_request),
-    )
+    ))
     .await
     .expect("queue-full response should be bounded");
 
@@ -10146,10 +10407,10 @@ async fn generation_queue_full_returns_configured_retry_after() {
         "/v1/completions?slot=configured-retry-overflow",
         br#"{"prompt":"overflow"}"#,
     );
-    let overflow_response = timeout(
+    let overflow_response = Box::pin(timeout(
         STREAM_HEADER_TIMEOUT,
         proxy_handler(State(proxy.state.clone()), overflow_request),
-    )
+    ))
     .await
     .expect("queue-full response should be bounded");
 
@@ -10516,10 +10777,10 @@ async fn generation_queue_timeout_fails_without_body_buffering_or_upstream_forwa
         .header(CONTENT_TYPE, "application/json")
         .body(queued_body)
         .expect("queued request should build");
-    let queued_response = timeout(
+    let queued_response = Box::pin(timeout(
         STREAM_HEADER_TIMEOUT,
         proxy_handler(State(proxy.state.clone()), queued_request),
-    )
+    ))
     .await
     .expect("queue-timeout response should be bounded");
 
@@ -10589,13 +10850,13 @@ async fn models_bypass_generation_saturation_but_keep_control_plane_bound() {
         "/v1/models?test=model-metadata-large&slot=one"
     );
 
-    let second_model_response = timeout(
+    let second_model_response = Box::pin(timeout(
         STREAM_HEADER_TIMEOUT,
         proxy_handler(
             State(proxy.state.clone()),
             empty_get_request("/v1/models?test=model-metadata&slot=two"),
         ),
-    )
+    ))
     .await
     .expect("control-plane limit response should be bounded");
     assert_eq!(
@@ -12106,6 +12367,10 @@ async fn fake_upstream_handler(
     let observed = observe_request(request).await;
     let path_and_query = observed.path_and_query.clone();
     let body = observed.body.clone();
+    let is_hot_restart_probe = observed
+        .headers
+        .get("x-llm-guard-proxy-probe")
+        .is_some_and(|value| value == "hot-restart");
     let endpoint = observed
         .path_and_query
         .split('?')
@@ -12142,6 +12407,21 @@ async fn fake_upstream_handler(
             LONG_JSON_FIRST_CHUNK,
             LONG_JSON_SECOND_CHUNK,
         );
+    }
+    if endpoint == "/v1/chat/completions" && !body_requests_stream(&body) {
+        if body_contains_text(&body, "hot-restart-never-ready") {
+            return upstream_status_json_response(StatusCode::SERVICE_UNAVAILABLE);
+        }
+        if body_contains_text(&body, "hot-restart-shared-probe") {
+            sleep(Duration::from_millis(150)).await;
+        }
+        if is_hot_restart_probe {
+            return json_response(
+                "hot-restart-probe",
+                r#"{"id":"chatcmpl-probe","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#
+                    .to_owned(),
+            );
+        }
     }
 
     fake_upstream_endpoint_response(&endpoint, &path_and_query, &state, &body)
@@ -12325,11 +12605,8 @@ fn fake_streaming_chat_completion_response(
         }
         return Some(content_only_chat_completion_sse_response());
     }
-    if path_and_query.contains("test=always-429") {
-        return Some(upstream_status_json_response(StatusCode::TOO_MANY_REQUESTS));
-    }
-    if path_and_query.contains("test=bad-request") {
-        return Some(upstream_status_json_response(StatusCode::BAD_REQUEST));
+    if let Some(response) = fake_fixed_status_chat_completion_response(path_and_query) {
+        return Some(response);
     }
     if path_and_query.contains("test=transient-503-then-success") {
         if next_fake_attempt_count(state, path_and_query) == 1 {
@@ -12338,6 +12615,9 @@ fn fake_streaming_chat_completion_response(
             ));
         }
         return Some(chat_completion_sse_response(body));
+    }
+    if let Some(response) = fake_hot_restart_chat_completion_response(path_and_query, state, body) {
+        return Some(response);
     }
     if path_and_query.contains("test=stall-once-then-success") {
         if next_fake_attempt_count(state, path_and_query) == 1 {
@@ -12369,6 +12649,45 @@ fn fake_streaming_chat_completion_response(
     None
 }
 
+fn fake_fixed_status_chat_completion_response(path_and_query: &str) -> Option<Response<Body>> {
+    if path_and_query.contains("test=always-429") {
+        return Some(upstream_status_json_response(StatusCode::TOO_MANY_REQUESTS));
+    }
+    if path_and_query.contains("test=bad-request") {
+        return Some(upstream_status_json_response(StatusCode::BAD_REQUEST));
+    }
+    None
+}
+
+fn fake_hot_restart_chat_completion_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+    body: &Bytes,
+) -> Option<Response<Body>> {
+    if path_and_query.contains("test=hot-restart-503-then-success") {
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            return Some(upstream_status_json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+            ));
+        }
+        return Some(chat_completion_sse_response(body));
+    }
+    if path_and_query.contains("test=hot-restart-concurrent") {
+        if next_fake_attempt_count(state, path_and_query) <= 2 {
+            return Some(upstream_status_json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+            ));
+        }
+        return Some(chat_completion_sse_response(body));
+    }
+    if path_and_query.contains("test=hot-restart-always-503") {
+        return Some(upstream_status_json_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+        ));
+    }
+    None
+}
+
 fn next_fake_attempt_count(state: &FakeUpstreamState, key: &str) -> u64 {
     let mut counts = state
         .attempt_counts
@@ -12381,6 +12700,10 @@ fn next_fake_attempt_count(state: &FakeUpstreamState, key: &str) -> u64 {
 
 fn body_contains_retry_hint(body: &Bytes) -> bool {
     retry_hint_count(body) > 0
+}
+
+fn body_contains_text(body: &Bytes, needle: &str) -> bool {
+    std::str::from_utf8(body).is_ok_and(|text| text.contains(needle))
 }
 
 fn retry_hint_count(body: &Bytes) -> usize {

@@ -26,6 +26,8 @@ use axum::{
 };
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
+#[cfg(feature = "upstream-hot-restart")]
+use llm_guard_proxy_core::HotRestartConfig;
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
     DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
@@ -41,6 +43,8 @@ use llm_guard_proxy_core::{DEFAULT_PROFILE_NAME, GuardExecutor, GuardOutcome, Pr
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;
+#[cfg(feature = "upstream-hot-restart")]
+use tokio::task::JoinHandle;
 use tokio::{
     net::TcpListener,
     process::Command,
@@ -76,6 +80,8 @@ pub(crate) struct ProxyState {
     generation_profile_requests: Arc<Mutex<HashMap<String, Arc<InFlightLimiter>>>>,
     control_plane_requests: Arc<InFlightLimiter>,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
+    #[cfg(feature = "upstream-hot-restart")]
+    hot_restart_recovery: Arc<HotRestartCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
     shadow_attempts: Arc<InFlightLimiter>,
 }
@@ -107,6 +113,8 @@ impl ProxyState {
             generation_profile_requests: Arc::new(Mutex::new(HashMap::new())),
             control_plane_requests: Arc::new(InFlightLimiter::default()),
             upstream_stall_recovery: Arc::new(UpstreamStallRecoveryCoordinator::default()),
+            #[cfg(feature = "upstream-hot-restart")]
+            hot_restart_recovery: Arc::new(HotRestartCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
             shadow_attempts: Arc::new(InFlightLimiter::default()),
         }
@@ -1803,6 +1811,8 @@ async fn forward_openai_request(
                 retry_policy,
                 upstream_stall_policy,
                 upstream_stall_recovery: state.upstream_stall_recovery.clone(),
+                #[cfg(feature = "upstream-hot-restart")]
+                hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
                 shadow_evidence: ShadowEvidenceState::default(),
             },
@@ -2898,6 +2908,35 @@ struct UpstreamStallRecoveryState {
     last_result: Option<BTreeMap<String, String>>,
 }
 
+#[cfg(feature = "upstream-hot-restart")]
+#[derive(Debug, Default)]
+struct HotRestartCoordinator {
+    state: AsyncMutex<HotRestartState>,
+    notify: Notify,
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+#[derive(Debug, Default)]
+struct HotRestartState {
+    in_progress: Option<HotRestartProbeHandle>,
+    last_result: Option<HotRestartResult>,
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+#[derive(Debug)]
+struct HotRestartProbeHandle {
+    started_at: Instant,
+    join_handle: JoinHandle<HotRestartResult>,
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HotRestartResult {
+    Ready,
+    Timeout,
+    Error(String),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShieldedRetryCause {
     LoopDetected,
@@ -3531,6 +3570,8 @@ struct ShieldedRetryRuntime {
     retry_policy: ShieldedRetryPolicy,
     upstream_stall_policy: UpstreamStallPolicy,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
+    #[cfg(feature = "upstream-hot-restart")]
+    hot_restart_recovery: Arc<HotRestartCoordinator>,
     shadow_attempts: Arc<InFlightLimiter>,
     shadow_evidence: ShadowEvidenceState,
 }
@@ -3621,6 +3662,8 @@ struct ShieldedFailureOutcome {
     response_metadata: BTreeMap<String, String>,
     attempt_records: Vec<AttemptRecord>,
     upstream_mode: UpstreamMode,
+    downstream_status: StatusCode,
+    retry_after_secs: Option<u32>,
 }
 
 struct ShieldedTerminalForward {
@@ -3652,6 +3695,8 @@ struct ShieldedAttemptFailure {
     finished_at_unix_ms: u64,
     upstream_mode: UpstreamMode,
     http_status: Option<u16>,
+    #[cfg(feature = "upstream-hot-restart")]
+    transport_failure: Option<ReqwestFailureKind>,
     error_type: &'static str,
     error_message: String,
     retry_cause: Option<ShieldedRetryCause>,
@@ -3811,6 +3856,8 @@ fn maybe_detach_shielded_aggregate(
                 )]),
                 attempt_records: Vec::new(),
                 upstream_mode: UpstreamMode::NotApplicable,
+                downstream_status: StatusCode::BAD_GATEWAY,
+                retry_after_secs: None,
             })
         })
     })
@@ -3834,7 +3881,7 @@ enum ShieldedStartFailureStep {
     Failed(ShieldedFailureOutcome),
 }
 
-fn shielded_start_failure_step(
+async fn shielded_start_failure_step(
     runtime: &ShieldedRetryRuntime,
     failure: ShieldedAttemptFailure,
     attempt_records: &mut Vec<AttemptRecord>,
@@ -3845,6 +3892,21 @@ fn shielded_start_failure_step(
             .retry_policy
             .allows_retry_after(failure.attempt_number)
     });
+    #[cfg(feature = "upstream-hot-restart")]
+    let (failure, can_retry, terminal) = {
+        let mut failure = failure;
+        let mut can_retry = can_retry;
+        let mut terminal = None;
+        let hot_restart_gate =
+            hot_restart_gate_for_attempt_failure(runtime, can_retry, &failure).await;
+        can_retry = can_retry && hot_restart_gate.permits_retry;
+        failure.response_metadata.extend(hot_restart_gate.metadata);
+        if let Some(hot_restart_terminal) = hot_restart_gate.terminal {
+            failure.abort_reason = Some(hot_restart_terminal.abort_reason.to_owned());
+            terminal = Some(hot_restart_terminal);
+        }
+        (failure, can_retry, terminal)
+    };
     attempt_records.push(attempt_failure_record(
         &failure,
         if can_retry {
@@ -3861,14 +3923,24 @@ fn shielded_start_failure_step(
             retry_cause: next_retry_cause,
         };
     }
-    ShieldedStartFailureStep::Failed(shielded_failure_outcome(
+    let outcome = shielded_failure_outcome(
         failure,
         std::mem::take(attempt_records),
         &runtime.retry_policy,
-    ))
+    );
+    #[cfg(feature = "upstream-hot-restart")]
+    let outcome = {
+        let mut outcome = outcome;
+        if let Some(hot_restart_terminal) = terminal {
+            outcome.downstream_status = hot_restart_terminal.status;
+            outcome.retry_after_secs = hot_restart_terminal.retry_after_secs;
+        }
+        outcome
+    };
+    ShieldedStartFailureStep::Failed(outcome)
 }
 
-fn shielded_started_attempt_step(
+async fn shielded_started_attempt_step(
     runtime: &ShieldedRetryRuntime,
     started: ShieldedStartedAttempt,
     attempt_records: &mut Vec<AttemptRecord>,
@@ -3881,38 +3953,8 @@ fn shielded_started_attempt_step(
 
     if !started.info.upstream_status.is_success() {
         if let Some(cause) = retry_cause_for_upstream_status(started.info.upstream_status) {
-            if runtime
-                .retry_policy
-                .allows_retry_after(started.info.attempt_number)
-            {
-                attempt_records.push(started_status_attempt_record(
-                    &started.info,
-                    AttemptStatus::Retried,
-                    Some(cause),
-                    &runtime.retry_policy,
-                    "retryable upstream status before shielded stream",
-                ));
-                return ShieldedAttemptStep::Retry {
-                    attempt_number: started.info.attempt_number.saturating_add(1),
-                    retry_cause: Some(cause),
-                };
-            }
-            let failure = status_failure(
-                &started.info,
-                cause,
-                "retryable upstream status attempts exhausted before shielded stream",
-            );
-            attempt_records.push(attempt_failure_record(
-                &failure,
-                AttemptStatus::Failed,
-                None,
-                &runtime.retry_policy,
-            ));
-            return ShieldedAttemptStep::Failed(shielded_failure_outcome(
-                failure,
-                std::mem::take(attempt_records),
-                &runtime.retry_policy,
-            ));
+            return shielded_retryable_status_step(runtime, &started.info, cause, attempt_records)
+                .await;
         }
         if allow_terminal_forward {
             return ShieldedAttemptStep::TerminalForward(ShieldedTerminalForward {
@@ -3954,6 +3996,68 @@ fn shielded_started_attempt_step(
     ))
 }
 
+async fn shielded_retryable_status_step(
+    runtime: &ShieldedRetryRuntime,
+    info: &ShieldedAttemptInfo,
+    cause: ShieldedRetryCause,
+    attempt_records: &mut Vec<AttemptRecord>,
+) -> ShieldedAttemptStep {
+    let can_retry = runtime.retry_policy.allows_retry_after(info.attempt_number);
+    let failure = status_failure(
+        info,
+        cause,
+        "retryable upstream status before shielded stream",
+    );
+    #[cfg(feature = "upstream-hot-restart")]
+    let (failure, can_retry, terminal) = {
+        let mut failure = failure;
+        let mut can_retry = can_retry;
+        let mut terminal = None;
+        let hot_restart_gate =
+            hot_restart_gate_for_status(runtime, info.upstream_status, can_retry).await;
+        can_retry = can_retry && hot_restart_gate.permits_retry;
+        failure.response_metadata.extend(hot_restart_gate.metadata);
+        if let Some(hot_restart_terminal) = hot_restart_gate.terminal {
+            failure.abort_reason = Some(hot_restart_terminal.abort_reason.to_owned());
+            terminal = Some(hot_restart_terminal);
+        }
+        (failure, can_retry, terminal)
+    };
+    if can_retry {
+        attempt_records.push(attempt_failure_record(
+            &failure,
+            AttemptStatus::Retried,
+            Some(cause),
+            &runtime.retry_policy,
+        ));
+        return ShieldedAttemptStep::Retry {
+            attempt_number: info.attempt_number.saturating_add(1),
+            retry_cause: Some(cause),
+        };
+    }
+    attempt_records.push(attempt_failure_record(
+        &failure,
+        AttemptStatus::Failed,
+        None,
+        &runtime.retry_policy,
+    ));
+    let outcome = shielded_failure_outcome(
+        failure,
+        std::mem::take(attempt_records),
+        &runtime.retry_policy,
+    );
+    #[cfg(feature = "upstream-hot-restart")]
+    let outcome = {
+        let mut outcome = outcome;
+        if let Some(hot_restart_terminal) = terminal {
+            outcome.downstream_status = hot_restart_terminal.status;
+            outcome.retry_after_secs = hot_restart_terminal.retry_after_secs;
+        }
+        outcome
+    };
+    ShieldedAttemptStep::Failed(outcome)
+}
+
 async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOutcome {
     let mut attempt_number = 1;
     let mut retry_cause = None;
@@ -3962,7 +4066,7 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
         let started = match start_shielded_attempt(runtime, attempt_number, retry_cause).await {
             Ok(started) => started,
             Err(failure) => {
-                match shielded_start_failure_step(runtime, failure, &mut attempt_records) {
+                match shielded_start_failure_step(runtime, failure, &mut attempt_records).await {
                     ShieldedStartFailureStep::Retry {
                         attempt_number: next_attempt_number,
                         retry_cause: next_retry_cause,
@@ -3978,7 +4082,7 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
             }
         };
 
-        match shielded_started_attempt_step(runtime, started, &mut attempt_records, true) {
+        match shielded_started_attempt_step(runtime, started, &mut attempt_records, true).await {
             ShieldedAttemptStep::Aggregatable(started) => {
                 return ShieldedBeginOutcome::Aggregatable {
                     started,
@@ -4049,7 +4153,8 @@ async fn run_shielded_attempts(
             match start_shielded_attempt(&runtime, attempt_number, retry_cause).await {
                 Ok(started) => started,
                 Err(failure) => {
-                    match shielded_start_failure_step(&runtime, failure, &mut attempt_records) {
+                    match shielded_start_failure_step(&runtime, failure, &mut attempt_records).await
+                    {
                         ShieldedStartFailureStep::Retry {
                             attempt_number: next_attempt_number,
                             retry_cause: next_retry_cause,
@@ -4076,7 +4181,9 @@ async fn run_shielded_attempts(
             started,
             &mut attempt_records,
             allow_terminal_forward,
-        ) {
+        )
+        .await
+        {
             ShieldedAttemptStep::Aggregatable(started) => started,
             ShieldedAttemptStep::Retry {
                 attempt_number: next_attempt_number,
@@ -4217,6 +4324,295 @@ fn should_retry_after_shielded_failure(
         && runtime
             .retry_policy
             .allows_retry_after(failure.attempt_number)
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+struct HotRestartGate {
+    metadata: BTreeMap<String, String>,
+    permits_retry: bool,
+    terminal: Option<HotRestartTerminal>,
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+struct HotRestartTerminal {
+    status: StatusCode,
+    retry_after_secs: Option<u32>,
+    abort_reason: &'static str,
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+async fn hot_restart_gate_for_attempt_failure(
+    runtime: &ShieldedRetryRuntime,
+    can_retry: bool,
+    failure: &ShieldedAttemptFailure,
+) -> HotRestartGate {
+    let applies = can_retry
+        && runtime.upstream_profile.hot_restart.enabled
+        && matches!(failure.transport_failure, Some(ReqwestFailureKind::Connect));
+    hot_restart_gate(runtime, applies).await
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+async fn hot_restart_gate_for_status(
+    runtime: &ShieldedRetryRuntime,
+    status: reqwest::StatusCode,
+    can_retry: bool,
+) -> HotRestartGate {
+    let applies =
+        can_retry && runtime.upstream_profile.hot_restart.enabled && is_hot_restart_status(status);
+    hot_restart_gate(runtime, applies).await
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+async fn hot_restart_gate(runtime: &ShieldedRetryRuntime, applies: bool) -> HotRestartGate {
+    if !applies {
+        return HotRestartGate {
+            metadata: BTreeMap::new(),
+            permits_retry: true,
+            terminal: None,
+        };
+    }
+    let result = wait_for_hot_restart_recovery(runtime).await;
+    let mut metadata = hot_restart_recovery_metadata(true);
+    match result {
+        HotRestartResult::Ready => {
+            metadata.insert(
+                String::from("hot_restart_recovery_status"),
+                String::from("ready"),
+            );
+            HotRestartGate {
+                metadata,
+                permits_retry: true,
+                terminal: None,
+            }
+        }
+        HotRestartResult::Timeout => {
+            metadata.insert(
+                String::from("hot_restart_recovery_status"),
+                String::from("timeout"),
+            );
+            HotRestartGate {
+                metadata,
+                permits_retry: false,
+                terminal: Some(HotRestartTerminal {
+                    status: StatusCode::SERVICE_UNAVAILABLE,
+                    retry_after_secs: Some(hot_restart_retry_after_secs(
+                        &runtime.upstream_profile.hot_restart,
+                    )),
+                    abort_reason: "hot_restart_timeout",
+                }),
+            }
+        }
+        HotRestartResult::Error(error) => {
+            metadata.insert(
+                String::from("hot_restart_recovery_status"),
+                String::from("error"),
+            );
+            metadata.insert(String::from("hot_restart_recovery_error"), error);
+            HotRestartGate {
+                metadata,
+                permits_retry: false,
+                terminal: Some(HotRestartTerminal {
+                    status: StatusCode::BAD_GATEWAY,
+                    retry_after_secs: None,
+                    abort_reason: "hot_restart_error",
+                }),
+            }
+        }
+    }
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+const fn is_hot_restart_status(status: reqwest::StatusCode) -> bool {
+    matches!(status.as_u16(), 502..=504)
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+fn hot_restart_retry_after_secs(config: &HotRestartConfig) -> u32 {
+    u32::try_from(config.probe_interval_secs).unwrap_or(u32::MAX)
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+async fn wait_for_hot_restart_recovery(runtime: &ShieldedRetryRuntime) -> HotRestartResult {
+    let coordinator = &runtime.hot_restart_recovery;
+    let mut state = coordinator.state.lock().await;
+    if state.in_progress.is_none() {
+        let client = runtime.client.clone();
+        let base_url = runtime.upstream_profile.base_url.clone();
+        let config = runtime.upstream_profile.hot_restart.clone();
+        let model_id = hot_restart_probe_model(runtime);
+        let join_handle =
+            tokio::spawn(
+                async move { run_hot_restart_probe(client, base_url, config, model_id).await },
+            );
+        state.in_progress = Some(HotRestartProbeHandle {
+            started_at: Instant::now(),
+            join_handle,
+        });
+    }
+    drop(state);
+    wait_for_hot_restart_probe_result(coordinator).await
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+fn hot_restart_probe_model(runtime: &ShieldedRetryRuntime) -> Option<String> {
+    runtime.model_id.clone().or_else(|| {
+        runtime
+            .upstream_profile
+            .match_models
+            .first()
+            .map(ToOwned::to_owned)
+    })
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+async fn wait_for_hot_restart_probe_result(
+    coordinator: &Arc<HotRestartCoordinator>,
+) -> HotRestartResult {
+    loop {
+        let notified = coordinator.notify.notified();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+
+        let mut state = coordinator.state.lock().await;
+        if state.in_progress.is_none() {
+            return state.last_result.clone().unwrap_or_else(|| {
+                HotRestartResult::Error(String::from("hot-restart probe completed without result"))
+            });
+        }
+        if let Some(handle) = state.in_progress.as_mut()
+            && handle.join_handle.is_finished()
+        {
+            let Some(handle) = state.in_progress.take() else {
+                continue;
+            };
+            drop(state);
+            let _probe_elapsed = handle.started_at.elapsed();
+            let result = match handle.join_handle.await {
+                Ok(result) => result,
+                Err(error) => HotRestartResult::Error(format!("probe task failed: {error}")),
+            };
+            finish_hot_restart_recovery(coordinator, result.clone()).await;
+            return result;
+        }
+        drop(state);
+        let _ = timeout(Duration::from_millis(100), notified).await;
+    }
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+async fn finish_hot_restart_recovery(
+    coordinator: &HotRestartCoordinator,
+    result: HotRestartResult,
+) {
+    let mut state = coordinator.state.lock().await;
+    state.in_progress = None;
+    state.last_result = Some(result);
+    drop(state);
+    coordinator.notify.notify_waiters();
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+async fn run_hot_restart_probe(
+    client: Client,
+    base_url: String,
+    config: HotRestartConfig,
+    model_id: Option<String>,
+) -> HotRestartResult {
+    let deadline = Instant::now() + Duration::from_secs(config.probe_timeout_secs);
+    let interval = Duration::from_secs(config.probe_interval_secs);
+    loop {
+        if Instant::now() >= deadline {
+            return HotRestartResult::Timeout;
+        }
+        match send_hot_restart_probe(&client, &base_url, &config, model_id.as_deref()).await {
+            Ok(true) => return HotRestartResult::Ready,
+            Ok(false) => {}
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return HotRestartResult::Error(error);
+                }
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return HotRestartResult::Timeout;
+        }
+        tokio::time::sleep(std::cmp::min(interval, remaining)).await;
+    }
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+async fn send_hot_restart_probe(
+    client: &Client,
+    base_url: &str,
+    config: &HotRestartConfig,
+    model_id: Option<&str>,
+) -> Result<bool, String> {
+    let uri = Uri::from_static("/v1/chat/completions");
+    let upstream_url = build_upstream_url(base_url, &uri).map_err(|error| error.to_string())?;
+    let body = hot_restart_probe_body(config, model_id);
+    let response = client
+        .post(upstream_url)
+        .header(
+            HeaderName::from_static("x-llm-guard-proxy-probe"),
+            HeaderValue::from_static("hot-restart"),
+        )
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .body(body.to_string())
+        .timeout(Duration::from_secs(config.probe_interval_secs))
+        .send()
+        .await
+        .map_err(|error| sanitized_reqwest_error(&error))?;
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| sanitized_reqwest_error(&error))?;
+    let value = serde_json::from_slice::<serde_json::Value>(&body)
+        .map_err(|error| format!("probe response JSON decode failed: {error}"))?;
+    Ok(is_valid_hot_restart_completion(&value))
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+fn hot_restart_probe_body(config: &HotRestartConfig, model_id: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::Map::from_iter([
+        (String::from("messages"), config.probe_messages.clone()),
+        (
+            String::from("max_tokens"),
+            serde_json::Value::from(config.probe_max_tokens),
+        ),
+        (String::from("stream"), serde_json::Value::Bool(false)),
+    ]);
+    if let Some(model_id) = model_id {
+        body.insert(
+            String::from("model"),
+            serde_json::Value::String(model_id.to_owned()),
+        );
+    }
+    if let Some(kwargs) = &config.probe_chat_template_kwargs {
+        body.insert(String::from("chat_template_kwargs"), kwargs.clone());
+    }
+    serde_json::Value::Object(body)
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+fn is_valid_hot_restart_completion(value: &serde_json::Value) -> bool {
+    value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|choices| !choices.is_empty())
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+fn hot_restart_recovery_metadata(configured: bool) -> BTreeMap<String, String> {
+    BTreeMap::from([(
+        String::from("hot_restart_recovery_configured"),
+        configured.to_string(),
+    )])
 }
 
 struct UpstreamStallRecoveryGate {
@@ -4682,6 +5078,11 @@ async fn start_shielded_attempt(
                 finished_at_unix_ms,
                 upstream_mode: UpstreamMode::NotApplicable,
                 http_status: None,
+                #[cfg(feature = "upstream-hot-restart")]
+                transport_failure: match &error {
+                    ProxyError::UpstreamTransport { failure, .. } => Some(*failure),
+                    _ => None,
+                },
                 error_type: error.error_type(),
                 error_message: error.to_string(),
                 retry_cause,
@@ -4948,6 +5349,8 @@ fn aggregation_failure(
         finished_at_unix_ms,
         upstream_mode: info.upstream_mode,
         http_status: Some(info.upstream_status.as_u16()),
+        #[cfg(feature = "upstream-hot-restart")]
+        transport_failure: None,
         error_type: "upstream_body_error",
         error_message: error.to_string(),
         retry_cause,
@@ -4991,6 +5394,8 @@ fn status_failure(
         finished_at_unix_ms,
         upstream_mode: info.upstream_mode,
         http_status: Some(info.upstream_status.as_u16()),
+        #[cfg(feature = "upstream-hot-restart")]
+        transport_failure: None,
         error_type: "upstream_status_error",
         error_message: format!("{message}: HTTP {}", info.upstream_status.as_u16()),
         retry_cause: Some(cause),
@@ -5028,6 +5433,8 @@ fn status_failure_without_retry(
         finished_at_unix_ms,
         upstream_mode: info.upstream_mode,
         http_status: Some(info.upstream_status.as_u16()),
+        #[cfg(feature = "upstream-hot-restart")]
+        transport_failure: None,
         error_type: "upstream_body_error",
         error_message: message.to_owned(),
         retry_cause: None,
@@ -5120,21 +5527,6 @@ fn copy_attempt_request_metadata(
     }
 }
 
-fn started_status_attempt_record(
-    info: &ShieldedAttemptInfo,
-    status: AttemptStatus,
-    retry_cause: Option<ShieldedRetryCause>,
-    policy: &ShieldedRetryPolicy,
-    message: &str,
-) -> AttemptRecord {
-    let failure = status_failure(
-        info,
-        retry_cause.unwrap_or(ShieldedRetryCause::TransientUpstreamStatus),
-        message,
-    );
-    attempt_failure_record(&failure, status, retry_cause, policy)
-}
-
 fn shielded_failure_outcome(
     failure: ShieldedAttemptFailure,
     attempt_records: Vec<AttemptRecord>,
@@ -5153,6 +5545,8 @@ fn shielded_failure_outcome(
         response_metadata,
         attempt_records,
         upstream_mode: failure.upstream_mode,
+        downstream_status: StatusCode::BAD_GATEWAY,
+        retry_after_secs: None,
     }
 }
 
@@ -5250,12 +5644,18 @@ fn shielded_retry_error_response(
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     let body = proxy_error_json_body(failure.error_type, &failure.error_message);
-    let response_headers = json_response_headers(body.len());
+    let mut response_headers = json_response_headers(body.len());
+    if let Some(retry_after_secs) = failure.retry_after_secs
+        && let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string())
+    {
+        response_headers.insert(RETRY_AFTER, value);
+    }
+    let downstream_status = failure.downstream_status;
     let observer = shielded_retry_observer(
         runtime,
         ShieldedRetryObserverInput {
             downstream_mode: runtime.liveness.mode.downstream_mode(),
-            downstream_status: StatusCode::BAD_GATEWAY,
+            downstream_status,
             downstream_headers: response_headers.clone(),
             upstream_mode: failure.upstream_mode,
             extra_response_metadata: failure.response_metadata,
@@ -5268,11 +5668,10 @@ fn shielded_retry_error_response(
     let completion = BodyCompletion::UpstreamStreamError(failure.error_message);
     let response_body =
         ObservedBufferedBody::new_with_completion(body, observer, in_flight_permit, completion);
-    response_with_headers(
-        StatusCode::BAD_GATEWAY,
-        response_headers,
-        Body::from_stream(response_body),
-    )
+    let mut response = Response::new(Body::from_stream(response_body));
+    *response.status_mut() = downstream_status;
+    *response.headers_mut() = response_headers;
+    response
 }
 
 fn shielded_retry_terminal_forward_response(

@@ -18,6 +18,7 @@ use crate::profile::{DEFAULT_PROFILE_NAME, ProfileConfig};
 use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
 use super::ValidationError;
+use serde_json::json;
 use url::Url;
 
 const REDACTED_URL_PART: &str = "redacted";
@@ -475,6 +476,7 @@ impl AppConfig {
             max_in_flight_requests: None,
             max_queued_generation_requests: None,
             metadata: self.upstream.metadata.clone(),
+            hot_restart: self.upstream.hot_restart.clone(),
             thinking: self.thinking.clone(),
         }
     }
@@ -584,6 +586,7 @@ impl AppConfig {
         }
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
         self.upstream.metadata = requested.upstream.metadata.clone();
+        self.upstream.hot_restart = requested.upstream.hot_restart.clone();
         if self.upstream_profiles_topology_matches(requested) {
             self.apply_reloadable_upstream_profile_fields(requested);
         }
@@ -682,6 +685,7 @@ impl AppConfig {
             active.max_in_flight_requests = requested.max_in_flight_requests;
             active.max_queued_generation_requests = requested.max_queued_generation_requests;
             active.metadata = requested.metadata.clone();
+            active.hot_restart = requested.hot_restart.clone();
             active.thinking = requested.thinking.clone();
         }
     }
@@ -1013,6 +1017,8 @@ pub struct UpstreamConfig {
     pub request_timeout_ms: u64,
     /// Metadata discovery and model context enrichment policy.
     pub metadata: MetadataConfig,
+    /// Hot-restart detection and readiness probe policy.
+    pub hot_restart: HotRestartConfig,
 }
 
 impl UpstreamConfig {
@@ -1023,7 +1029,14 @@ impl UpstreamConfig {
             "upstream.request_timeout_ms",
             "must be greater than zero",
         )?;
-        self.metadata.validate()
+        self.metadata.validate()?;
+        self.hot_restart.validate(HotRestartValidationFields {
+            max_tokens: "upstream.hot_restart.probe_max_tokens",
+            interval_secs: "upstream.hot_restart.probe_interval_secs",
+            timeout_secs: "upstream.hot_restart.probe_timeout_secs",
+            messages: "upstream.hot_restart.probe_messages",
+            chat_template_kwargs: "upstream.hot_restart.probe_chat_template_kwargs",
+        })
     }
 
     /// Returns a display-safe upstream base URL.
@@ -1042,6 +1055,85 @@ impl Default for UpstreamConfig {
             base_url: String::from("http://gb10:18009/v1"),
             request_timeout_ms: 120_000,
             metadata: MetadataConfig::default(),
+            hot_restart: HotRestartConfig::default(),
+        }
+    }
+}
+
+/// Readiness probe settings used while an upstream appears to be restarting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HotRestartConfig {
+    /// Enables shared readiness probing after connection failures or 502/503/504.
+    pub enabled: bool,
+    /// Maximum tokens requested by readiness chat-completion probes.
+    pub probe_max_tokens: u32,
+    /// Seconds between probe attempts.
+    pub probe_interval_secs: u64,
+    /// Maximum seconds to wait for the upstream to pass a chat-completion probe.
+    pub probe_timeout_secs: u64,
+    /// Probe chat messages sent to `/v1/chat/completions`.
+    pub probe_messages: serde_json::Value,
+    /// Optional `chat_template_kwargs` attached to readiness probes.
+    pub probe_chat_template_kwargs: Option<serde_json::Value>,
+}
+
+impl HotRestartConfig {
+    fn validate(&self, fields: HotRestartValidationFields) -> Result<(), ValidationError> {
+        require(
+            self.probe_max_tokens > 0,
+            fields.max_tokens,
+            "must be greater than zero",
+        )?;
+        require(
+            self.probe_interval_secs > 0,
+            fields.interval_secs,
+            "must be greater than zero",
+        )?;
+        require(
+            self.probe_timeout_secs > 0,
+            fields.timeout_secs,
+            "must be greater than zero",
+        )?;
+        require(
+            self.probe_interval_secs <= self.probe_timeout_secs,
+            fields.interval_secs,
+            "must be less than or equal to probe_timeout_secs",
+        )?;
+        require(
+            self.probe_messages
+                .as_array()
+                .is_some_and(|messages| !messages.is_empty()),
+            fields.messages,
+            "must be a non-empty JSON array",
+        )?;
+        require(
+            self.probe_chat_template_kwargs
+                .as_ref()
+                .is_none_or(serde_json::Value::is_object),
+            fields.chat_template_kwargs,
+            "must be a JSON object when set",
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HotRestartValidationFields {
+    max_tokens: &'static str,
+    interval_secs: &'static str,
+    timeout_secs: &'static str,
+    messages: &'static str,
+    chat_template_kwargs: &'static str,
+}
+
+impl Default for HotRestartConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            probe_max_tokens: 1,
+            probe_interval_secs: 5,
+            probe_timeout_secs: 600,
+            probe_messages: json!([{"role": "user", "content": "1+1=?"}]),
+            probe_chat_template_kwargs: Some(json!({"enable_thinking": false})),
         }
     }
 }
@@ -1063,6 +1155,8 @@ pub struct UpstreamProfileConfig {
     pub max_queued_generation_requests: Option<usize>,
     /// Metadata discovery and model context enrichment policy.
     pub metadata: MetadataConfig,
+    /// Hot-restart detection and readiness probe policy.
+    pub hot_restart: HotRestartConfig,
     /// Thinking budget policy for this profile.
     pub thinking: ThinkingConfig,
 }
@@ -1122,6 +1216,13 @@ impl UpstreamProfileConfig {
             )?;
         }
         self.metadata.validate()?;
+        self.hot_restart.validate(HotRestartValidationFields {
+            max_tokens: "upstreams.hot_restart.probe_max_tokens",
+            interval_secs: "upstreams.hot_restart.probe_interval_secs",
+            timeout_secs: "upstreams.hot_restart.probe_timeout_secs",
+            messages: "upstreams.hot_restart.probe_messages",
+            chat_template_kwargs: "upstreams.hot_restart.probe_chat_template_kwargs",
+        })?;
         self.thinking.validate("upstreams.thinking.max_tokens")
     }
 
@@ -1169,6 +1270,7 @@ impl Default for UpstreamProfileConfig {
             max_in_flight_requests: None,
             max_queued_generation_requests: None,
             metadata: upstream.metadata,
+            hot_restart: upstream.hot_restart,
             thinking: ThinkingConfig::default(),
         }
     }

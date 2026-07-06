@@ -56,8 +56,8 @@ pub use profile::{
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
     DEFAULT_CONFIG_RELATIVE_PATH, DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig,
-    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig, LoopGuardConfig,
-    LoopGuardMode, MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy,
+    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
+    LoopGuardConfig, LoopGuardMode, MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy,
     ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher,
     RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
     SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,

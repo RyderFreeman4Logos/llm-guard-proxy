@@ -591,6 +591,79 @@ mode = "force_disable"
 }
 
 #[test]
+fn parses_hot_restart_overrides_for_default_and_named_upstreams() {
+    let config = parse_config_text(
+        r#"
+[upstream.hot_restart]
+probe_interval_secs = 3
+probe_timeout_secs = 30
+probe_messages = [{"role":"user","content":"ready?"}]
+probe_chat_template_kwargs = {"enable_thinking":false}
+
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://aeon.example/v1"
+match_models = ["aeon-ultimate"]
+
+[upstreams.hot_restart]
+enabled = false
+probe_max_tokens = 2
+probe_interval_secs = 2
+probe_timeout_secs = 20
+probe_messages = [{"role":"user","content":"probe"}]
+probe_chat_template_kwargs = null
+"#,
+    )
+    .expect("hot restart config should parse");
+
+    assert_eq!(config.upstream.hot_restart.probe_interval_secs, 3);
+    assert_eq!(
+        config.upstream.hot_restart.probe_messages,
+        serde_json::json!([{"role":"user","content":"ready?"}])
+    );
+    let aeon = &config.upstream_profiles[0];
+    assert!(!aeon.hot_restart.enabled);
+    assert_eq!(aeon.hot_restart.probe_max_tokens, 2);
+    assert_eq!(aeon.hot_restart.probe_chat_template_kwargs, None);
+    config
+        .validate()
+        .expect("hot restart config should validate");
+}
+
+#[test]
+fn validates_hot_restart_probe_bounds_and_shape() {
+    let config = parse_config_text(
+        r"
+[upstream.hot_restart]
+probe_interval_secs = 10
+probe_timeout_secs = 5
+",
+    )
+    .expect("config syntax should parse");
+    let error = config
+        .validate()
+        .expect_err("probe interval above timeout should fail");
+    assert_eq!(error.field(), "upstream.hot_restart.probe_interval_secs");
+
+    let config = parse_config_text(
+        r#"
+[[upstreams]]
+name = "bad-probe"
+base_url = "http://example.test/v1"
+match_models = ["bad-probe"]
+
+[upstreams.hot_restart]
+probe_messages = {}
+"#,
+    )
+    .expect("config syntax should parse");
+    let error = config
+        .validate()
+        .expect_err("probe messages must be an array");
+    assert_eq!(error.field(), "upstreams.hot_restart.probe_messages");
+}
+
+#[test]
 fn selects_named_profile_by_model_and_defaults_without_match() {
     let config = parse_config_text(
         r#"
@@ -2465,6 +2538,9 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"upstreams.thinking.no_thinking_marker_policy"));
     assert!(RELOADABLE_FIELDS.contains(&"upstreams.thinking.default_injection_schema"));
     assert!(RELOADABLE_FIELDS.contains(&"upstreams.metadata.input_token_safety_margin"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.hot_restart.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstreams.hot_restart.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstreams.hot_restart.probe_messages"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_queued_generation_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.generation_queue_timeout_ms"));
