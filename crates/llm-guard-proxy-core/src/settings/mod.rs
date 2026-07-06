@@ -14,9 +14,9 @@ mod tests;
 pub use error::{ConfigError, ConfigParseError, ValidationError};
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, DefaultInjectionSchema, DownstreamDropPolicy,
-    EvidenceConfig, EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig,
-    LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig,
-    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
+    EvidenceConfig, EvidenceShadowConfig, GuardWorkflowConfig, HeartbeatConfig, HeartbeatMode,
+    ListenerConfig, LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy,
+    ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
     SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
     ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
     UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
@@ -100,6 +100,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "retry.ladder",
     "profiles",
     "workflows",
+    "guard_workflows",
     "upstream.stall.enabled",
     "upstream.stall.idle_timeout_ms",
     "upstream.stall.recovery_command",

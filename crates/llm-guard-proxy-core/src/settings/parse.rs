@@ -25,6 +25,7 @@ enum Section {
     ModelAlias(usize),
     Profile(String),
     Workflow(String),
+    GuardWorkflows,
     Shielding,
     Observability,
     ObservabilityRetention,
@@ -199,6 +200,7 @@ fn parse_section(
             },
             |index| Ok(Section::UpstreamProfileThinking(index)),
         ),
+        "guard_workflows" => Ok(Section::GuardWorkflows),
         "shielding" => Ok(Section::Shielding),
         "observability" => Ok(Section::Observability),
         "observability.retention" => Ok(Section::ObservabilityRetention),
@@ -297,6 +299,9 @@ fn assign_value(
             })?;
             assign_workflow(workflow, key, value, line_number)
         }
+        Section::GuardWorkflows => {
+            assign_guard_workflows(&mut config.guard_workflows, key, value, line_number)
+        }
         Section::Shielding => assign_shielding(&mut config.shielding, key, value, line_number),
         Section::Observability => {
             assign_observability(&mut config.observability, key, value, line_number)
@@ -393,6 +398,21 @@ fn assign_workflow(
                 parse_usize(value, line_number, "workflows.max_stdout_bytes")?;
         }
         _ => return unknown_key("workflows", key, line_number),
+    }
+    Ok(())
+}
+
+fn assign_guard_workflows(
+    config: &mut super::GuardWorkflowConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "pre_request" => config.pre_request = Some(parse_string(value, line_number)?),
+        "post_response" => config.post_response = Some(parse_string(value, line_number)?),
+        "fail_closed_blocks" => config.fail_closed_blocks = parse_bool(value, line_number)?,
+        _ => return unknown_key("guard_workflows", key, line_number),
     }
     Ok(())
 }

@@ -41,6 +41,8 @@ pub struct AppConfig {
     pub profiles: HashMap<String, ProfileConfig>,
     /// Configured guard workflows.
     pub workflows: HashMap<String, WorkflowConfig>,
+    /// Guard workflow configuration for pre-request and post-response hooks.
+    pub guard_workflows: GuardWorkflowConfig,
     /// Client shielding behavior flags.
     pub shielding: ShieldingConfig,
     /// Observability storage and retention settings.
@@ -75,6 +77,7 @@ impl AppConfig {
         self.validate_model_aliases()?;
         self.validate_profiles()?;
         self.validate_workflows()?;
+        self.validate_guard_workflows()?;
         self.validate_listeners()?;
         self.observability.validate()?;
         self.evidence.validate()?;
@@ -170,6 +173,39 @@ impl AppConfig {
             workflow.validate(id)?;
         }
         Ok(())
+    }
+
+    fn validate_guard_workflows(&self) -> Result<(), ValidationError> {
+        self.validate_guard_workflow_id(
+            "guard_workflows.pre_request",
+            self.guard_workflows.pre_request.as_deref(),
+        )?;
+        self.validate_guard_workflow_id(
+            "guard_workflows.post_response",
+            self.guard_workflows.post_response.as_deref(),
+        )
+    }
+
+    fn validate_guard_workflow_id(
+        &self,
+        field: &'static str,
+        workflow_id: Option<&str>,
+    ) -> Result<(), ValidationError> {
+        let Some(workflow_id) = workflow_id else {
+            return Ok(());
+        };
+        require(!workflow_id.trim().is_empty(), field, "must not be empty")?;
+        require(
+            workflow_id == workflow_id.trim(),
+            field,
+            "must not have leading or trailing whitespace",
+        )?;
+        require(workflow_id.len() <= 256, field, "must be at most 256 bytes")?;
+        require(
+            self.workflows.contains_key(workflow_id),
+            field,
+            "must reference a configured workflow",
+        )
     }
 
     fn validate_model_aliases(&self) -> Result<(), ValidationError> {
@@ -520,6 +556,7 @@ impl AppConfig {
         self.cloudflare = requested.cloudflare.clone();
         self.profiles.clone_from(&requested.profiles);
         self.workflows.clone_from(&requested.workflows);
+        self.guard_workflows.clone_from(&requested.guard_workflows);
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
         self.upstream.metadata = requested.upstream.metadata.clone();
         if self.upstream_profiles_topology_matches(requested) {
@@ -670,6 +707,27 @@ impl WorkflowConfig {
             "workflows.id",
             "must not contain whitespace",
         )
+    }
+}
+
+/// Configuration for guard workflow hooks.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardWorkflowConfig {
+    /// Workflow ID to invoke before forwarding to upstream.
+    pub pre_request: Option<String>,
+    /// Workflow ID to invoke after receiving a shielded response from upstream.
+    pub post_response: Option<String>,
+    /// Whether `error_fail_closed` guard results should block the request or response.
+    pub fail_closed_blocks: bool,
+}
+
+impl Default for GuardWorkflowConfig {
+    fn default() -> Self {
+        Self {
+            pre_request: None,
+            post_response: None,
+            fail_closed_blocks: true,
+        }
     }
 }
 
