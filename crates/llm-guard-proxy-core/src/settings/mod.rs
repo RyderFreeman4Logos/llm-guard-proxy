@@ -186,6 +186,8 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "guard_workflows.pre_request",
     #[cfg(feature = "guard")]
     "guard_workflows.post_response",
+    #[cfg(feature = "family")]
+    "family",
 ];
 
 /// Fields read at process startup that require a restart when changed.

@@ -10,10 +10,17 @@ use std::{
 #[cfg(feature = "guard")]
 use std::collections::HashMap;
 
+#[cfg(feature = "family")]
+use crate::family::{
+    CHILD_SAFE_DAILY_REQUEST_LIMIT, CHILD_SAFE_MODEL_ALIAS, CHILD_SAFE_PROFILE_NAME,
+    CategoryAction, FAMILY_GUARD_PACK_NAME, FamilyPolicyConfig,
+};
 #[cfg(feature = "guard")]
 use crate::model_alias::{AliasKind, MAX_WORKFLOW_TIMEOUT_MS, ModelAliasConfig};
 #[cfg(feature = "guard")]
 use crate::profile::{DEFAULT_PROFILE_NAME, ProfileConfig};
+#[cfg(feature = "family")]
+use crate::profile::{ProfileKind, ShieldedBuffering};
 #[cfg(feature = "guard")]
 use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
@@ -64,6 +71,9 @@ pub struct AppConfig {
     /// Guard workflow configuration for pre-request and post-response hooks.
     #[cfg(feature = "guard")]
     pub guard_workflows: GuardWorkflowConfig,
+    /// Built-in family policy pack.
+    #[cfg(feature = "family")]
+    pub family: FamilyPolicyConfig,
     /// Client shielding behavior flags.
     pub shielding: ShieldingConfig,
     /// Observability storage and retention settings.
@@ -104,6 +114,8 @@ impl AppConfig {
             self.validate_workflows()?;
             self.validate_guard_workflows()?;
         }
+        #[cfg(feature = "family")]
+        self.validate_family()?;
         self.validate_listeners()?;
         self.observability.validate()?;
         self.evidence.validate()?;
@@ -440,6 +452,34 @@ impl AppConfig {
         Ok(())
     }
 
+    #[cfg(feature = "family")]
+    fn validate_family(&self) -> Result<(), ValidationError> {
+        for config in self.family.categories.values() {
+            if let Some(replacement) = &config.replacement {
+                require(
+                    !replacement.trim().is_empty(),
+                    "family.categories.replacement",
+                    "must not be empty when set",
+                )?;
+                require(
+                    replacement.len() <= 1024,
+                    "family.categories.replacement",
+                    "must be at most 1024 bytes",
+                )?;
+            }
+            if config.action == CategoryAction::Replace
+                && let Some(replacement) = &config.replacement
+            {
+                require(
+                    !replacement.trim().is_empty(),
+                    "family.categories.replacement",
+                    "must not be empty for replace actions",
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_upstream_stall_timeout_order(&self) -> Result<(), ValidationError> {
         if self.upstream_stall.enabled {
             require(
@@ -545,6 +585,24 @@ impl AppConfig {
         self.profiles.get(name).cloned()
     }
 
+    /// Applies derived family policy defaults after parsing config text.
+    #[cfg(feature = "family")]
+    pub(crate) fn apply_family_defaults(&mut self) {
+        if !self.family.enabled || self.profiles.contains_key(CHILD_SAFE_PROFILE_NAME) {
+            return;
+        }
+        self.profiles.insert(
+            CHILD_SAFE_PROFILE_NAME.to_owned(),
+            ProfileConfig {
+                kind: ProfileKind::Child,
+                allowed_models: vec![CHILD_SAFE_MODEL_ALIAS.to_owned()],
+                daily_request_limit: CHILD_SAFE_DAILY_REQUEST_LIMIT,
+                shielded_buffering: ShieldedBuffering::BufferedSse,
+                guard_pack: Some(FAMILY_GUARD_PACK_NAME.to_owned()),
+            },
+        );
+    }
+
     /// Builds the implicit listener from legacy `[server]` settings.
     #[must_use]
     pub fn default_listener(&self) -> ListenerConfig {
@@ -636,6 +694,11 @@ impl AppConfig {
             self.budget.reset_hour_utc = requested.budget.reset_hour_utc;
             self.workflows.clone_from(&requested.workflows);
             self.guard_workflows.clone_from(&requested.guard_workflows);
+        }
+        #[cfg(feature = "family")]
+        {
+            self.family.clone_from(&requested.family);
+            self.apply_family_defaults();
         }
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
         self.upstream.metadata = requested.upstream.metadata.clone();
