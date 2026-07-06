@@ -14,10 +14,10 @@ use super::ParamOverrideConfig;
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DefaultInjectionSchema,
     DownstreamDropPolicy, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
-    LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig,
-    RetentionConfig, RetryConfig, RetryLadderConfig, ServerConfig, ShieldingConfig, ThinkingConfig,
-    ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
-    UpstreamStallConfig,
+    LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy,
+    ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig, ServerConfig,
+    ShadowComparisonAttempt, ShieldingConfig, ThinkingConfig, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamStallConfig,
 };
 #[cfg(feature = "guard")]
 use super::{UnknownKeyPolicy, VirtualKeyConfig};
@@ -1147,9 +1147,40 @@ fn assign_evidence_shadow(
                 "evidence.shadow.shadow_attempt_timeout_ms",
             )?;
         }
+        "compare_attempts" => {
+            config.compare_attempts = parse_shadow_compare_attempts(value, line_number)?;
+        }
         _ => return unknown_key("evidence.shadow", key, line_number),
     }
     Ok(())
+}
+
+fn parse_shadow_compare_attempts(
+    value: &str,
+    line_number: usize,
+) -> Result<Vec<ShadowComparisonAttempt>, ConfigParseError> {
+    parse_string_array(value, line_number)?
+        .into_iter()
+        .map(|value| parse_shadow_compare_attempt(&value, line_number))
+        .collect()
+}
+
+fn parse_shadow_compare_attempt(
+    value: &str,
+    line_number: usize,
+) -> Result<ShadowComparisonAttempt, ConfigParseError> {
+    match value.trim() {
+        "max-thinking" => Ok(ShadowComparisonAttempt::MaxThinking),
+        "bounded-thinking" => Ok(ShadowComparisonAttempt::BoundedThinking),
+        "no-thinking" => Ok(ShadowComparisonAttempt::NoThinking),
+        "cot-salvage" => Ok(ShadowComparisonAttempt::CotSalvage),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid evidence.shadow.compare_attempts entry {other:?}; expected \"max-thinking\", \"bounded-thinking\", \"no-thinking\", or \"cot-salvage\""
+            ),
+        )),
+    }
 }
 
 fn assign_thinking(
@@ -1282,6 +1313,9 @@ fn assign_loop_guard(
     match key {
         "enabled" => config.enabled = parse_bool(value, line_number)?,
         "mode" => config.mode = parse_loop_guard_mode(value, line_number)?,
+        "on_reasoning_loop" => {
+            config.on_reasoning_loop = parse_loop_failure_policy(value, line_number)?;
+        }
         "normalized_input_window_secs" => {
             config.normalized_input_window_secs = parse_u64(
                 value,
@@ -1387,6 +1421,23 @@ fn parse_loop_guard_mode(
             line_number,
             format!(
                 "invalid loop_guard.mode {other:?}; expected \"disabled\", \"monitor\", or \"enforce\""
+            ),
+        )),
+    }
+}
+
+fn parse_loop_failure_policy(
+    value: &str,
+    line_number: usize,
+) -> Result<LoopFailurePolicy, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "retry_ladder" => Ok(LoopFailurePolicy::RetryLadder),
+        "truncate_cot_then_answer" => Ok(LoopFailurePolicy::TruncateCotThenAnswer),
+        "bounded_answer_from_cot" => Ok(LoopFailurePolicy::BoundedAnswerFromCot),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid loop_guard.on_reasoning_loop {other:?}; expected \"retry_ladder\", \"truncate_cot_then_answer\", or \"bounded_answer_from_cot\""
             ),
         )),
     }

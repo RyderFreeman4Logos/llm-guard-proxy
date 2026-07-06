@@ -1944,6 +1944,8 @@ pub struct EvidenceShadowConfig {
     pub max_global_shadow_in_flight: usize,
     /// Terminal timeout for one evidence-only shadow attempt.
     pub shadow_attempt_timeout_ms: u64,
+    /// Same-prompt alternative attempts recorded for offline quality tuning.
+    pub compare_attempts: Vec<ShadowComparisonAttempt>,
 }
 
 impl EvidenceShadowConfig {
@@ -1962,6 +1964,11 @@ impl EvidenceShadowConfig {
             self.shadow_attempt_timeout_ms > 0,
             "evidence.shadow.shadow_attempt_timeout_ms",
             "must be greater than zero",
+        )?;
+        require(
+            self.compare_attempts.len() <= 10,
+            "evidence.shadow.compare_attempts",
+            "must contain no more than 10 entries",
         )
     }
 }
@@ -1975,6 +1982,33 @@ impl Default for EvidenceShadowConfig {
             max_shadow_attempts_per_request: 2,
             max_global_shadow_in_flight: 2,
             shadow_attempt_timeout_ms: 7_200_000,
+            compare_attempts: Vec::new(),
+        }
+    }
+}
+
+/// Evidence-only same-prompt attempt variant used for offline comparison.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShadowComparisonAttempt {
+    /// Configured maximum thinking policy.
+    MaxThinking,
+    /// Small bounded thinking policy.
+    BoundedThinking,
+    /// No-thinking policy.
+    NoThinking,
+    /// `CoT` salvage synthesis policy.
+    CotSalvage,
+}
+
+impl ShadowComparisonAttempt {
+    /// Returns the TOML-compatible label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MaxThinking => "max-thinking",
+            Self::BoundedThinking => "bounded-thinking",
+            Self::NoThinking => "no-thinking",
+            Self::CotSalvage => "cot-salvage",
         }
     }
 }
@@ -2375,6 +2409,39 @@ pub enum LoopGuardMode {
     Enforce,
 }
 
+/// Policy applied when the reasoning-channel detector trips in enforce mode.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum LoopFailurePolicy {
+    /// Preserve existing behavior: abort and continue through the retry ladder.
+    #[default]
+    RetryLadder,
+    /// Retry with a bounded private prefix of reasoning and ask for a final answer.
+    TruncateCotThenAnswer,
+    /// Use private `CoT` internally for answer synthesis without exposing raw `CoT`.
+    BoundedAnswerFromCot,
+}
+
+impl LoopFailurePolicy {
+    /// Returns the TOML-compatible label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::RetryLadder => "retry_ladder",
+            Self::TruncateCotThenAnswer => "truncate_cot_then_answer",
+            Self::BoundedAnswerFromCot => "bounded_answer_from_cot",
+        }
+    }
+
+    /// Returns true when the policy should synthesize a salvage retry body.
+    #[must_use]
+    pub const fn uses_cot_salvage(self) -> bool {
+        matches!(
+            self,
+            Self::TruncateCotThenAnswer | Self::BoundedAnswerFromCot
+        )
+    }
+}
+
 impl LoopGuardMode {
     /// Returns the TOML-compatible mode label.
     #[must_use]
@@ -2400,6 +2467,8 @@ pub struct LoopGuardConfig {
     pub enabled: bool,
     /// Channelized detector decision mode.
     pub mode: LoopGuardMode,
+    /// Failure policy used when reasoning loop abort candidates are enforced.
+    pub on_reasoning_loop: LoopFailurePolicy,
     /// Time window used to compare normalized inputs.
     pub normalized_input_window_secs: u64,
     /// Repeat threshold that triggers loop-protection behavior.
@@ -2525,6 +2594,7 @@ impl Default for LoopGuardConfig {
         Self {
             enabled: true,
             mode: LoopGuardMode::Monitor,
+            on_reasoning_loop: LoopFailurePolicy::RetryLadder,
             normalized_input_window_secs: 120,
             max_repeated_inputs: 1,
             output_repeated_line_threshold: 24,
