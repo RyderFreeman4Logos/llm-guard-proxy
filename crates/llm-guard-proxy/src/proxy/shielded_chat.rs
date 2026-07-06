@@ -99,6 +99,12 @@ pub(super) fn prepare_stream_request(
 ///
 /// The hint is deterministic and contains only proxy retry metadata; it never
 /// copies raw prompt, output, reasoning, or upstream error text.
+///
+/// If the request already has a leading `system` message, the hint is merged
+/// into that message's content. Otherwise a new system message is inserted at
+/// index 0. This preserves the `OpenAI` chat-template invariant that `system`
+/// messages must only appear at the beginning of the message array — models
+/// such as Qwen3 reject non-leading system messages at the template level.
 pub(super) fn body_with_anti_loop_retry_hint(
     body: &Bytes,
     attempt_number: u32,
@@ -108,17 +114,53 @@ pub(super) fn body_with_anti_loop_retry_hint(
     let mut value = serde_json::from_slice::<Value>(body).ok()?;
     let object = value.as_object_mut()?;
     let messages = object.get_mut("messages")?.as_array_mut()?;
-    messages.insert(
-        0,
-        json!({
-            "role": "system",
-            "content": configured_hint.map_or_else(
-                || anti_loop_retry_hint(attempt_number, max_attempts),
-                str::to_owned,
-            ),
-        }),
+    let hint = configured_hint.map_or_else(
+        || anti_loop_retry_hint(attempt_number, max_attempts),
+        str::to_owned,
     );
+    if messages
+        .first()
+        .and_then(|msg| msg.get("role"))
+        .and_then(Value::as_str)
+        .is_some_and(|role| role == "system")
+    {
+        merge_hint_into_existing_system_message(&mut messages[0], &hint);
+    } else {
+        messages.insert(
+            0,
+            json!({
+                "role": "system",
+                "content": hint,
+            }),
+        );
+    }
     serde_json::to_vec(&value).ok().map(Bytes::from)
+}
+
+/// Appends the anti-loop retry hint to the `content` field of an existing
+/// system message, separated by a blank line. Handles both string and
+/// multi-part (array) content shapes.
+fn merge_hint_into_existing_system_message(system_message: &mut Value, hint: &str) {
+    let Some(content) = system_message.get_mut("content") else {
+        return;
+    };
+    match content {
+        Value::String(existing) => {
+            if !existing.is_empty() {
+                existing.push_str("\n\n");
+            }
+            existing.push_str(hint);
+        }
+        Value::Array(parts) => {
+            // OpenAI multi-part content: append a text part.
+            parts.push(json!({ "type": "text", "text": hint }));
+        }
+        // Non-standard content shape — replace with a string to guarantee the
+        // hint reaches the model.
+        _ => {
+            *content = Value::String(hint.to_owned());
+        }
+    }
 }
 
 fn anti_loop_retry_hint(attempt_number: u32, max_attempts: u32) -> String {
