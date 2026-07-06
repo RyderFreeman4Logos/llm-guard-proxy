@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+#[cfg(feature = "family")]
+use crate::family::{CategoryAction, CategoryConfig, FamilyCategory};
 #[cfg(feature = "guard")]
 use crate::model_alias::{AliasKind, ModelAliasConfig};
 #[cfg(feature = "guard")]
@@ -48,6 +50,10 @@ enum Section {
     VirtualKeyMap,
     #[cfg(feature = "guard")]
     Budget,
+    #[cfg(feature = "family")]
+    Family,
+    #[cfg(feature = "family")]
+    FamilyCategory(FamilyCategory),
     Shielding,
     Observability,
     ObservabilityRetention,
@@ -86,6 +92,9 @@ pub(crate) fn parse_config_text(contents: &str) -> Result<AppConfig, ConfigParse
         let (key, value) = split_key_value(line, line_number)?;
         assign_value(&mut config, &section, key.trim(), value.trim(), line_number)?;
     }
+
+    #[cfg(feature = "family")]
+    config.apply_family_defaults();
 
     Ok(config)
 }
@@ -203,6 +212,17 @@ fn parse_section(
         }
         return Ok(Section::Profile(profile_name.to_owned()));
     }
+    #[cfg(feature = "family")]
+    if let Some(raw_category) = section.strip_prefix("family.categories.") {
+        let category_key = raw_category.trim_matches('"');
+        let Some(category) = FamilyCategory::from_key(category_key) else {
+            return Err(ConfigParseError::new(
+                line_number,
+                format!("unknown family category {category_key:?}"),
+            ));
+        };
+        return Ok(Section::FamilyCategory(category));
+    }
     match section {
         "server" => Ok(Section::Server),
         "upstream" => Ok(Section::Upstream),
@@ -253,6 +273,8 @@ fn parse_section(
         "virtual_keys.keys" => Ok(Section::VirtualKeyMap),
         #[cfg(feature = "guard")]
         "budget" => Ok(Section::Budget),
+        #[cfg(feature = "family")]
+        "family" => Ok(Section::Family),
         "shielding" => Ok(Section::Shielding),
         "observability" => Ok(Section::Observability),
         "observability.retention" => Ok(Section::ObservabilityRetention),
@@ -301,6 +323,10 @@ fn assign_value(
 ) -> Result<(), ConfigParseError> {
     #[cfg(feature = "guard")]
     if let Some(result) = assign_guard_value(config, section, key, value, line_number) {
+        return result;
+    }
+    #[cfg(feature = "family")]
+    if let Some(result) = assign_family_value(config, section, key, value, line_number) {
         return result;
     }
 
@@ -381,6 +407,10 @@ fn assign_value(
         | Section::VirtualKeys
         | Section::VirtualKeyMap
         | Section::Budget => unreachable!("guard sections are handled before this match"),
+        #[cfg(feature = "family")]
+        Section::Family | Section::FamilyCategory(_) => {
+            unreachable!("family sections are handled before this match")
+        }
     }
 }
 
@@ -443,6 +473,82 @@ fn assign_guard_value(
         )),
         Section::Budget => Some(assign_budget(&mut config.budget, key, value, line_number)),
         _ => None,
+    }
+}
+
+#[cfg(feature = "family")]
+fn assign_family_value(
+    config: &mut AppConfig,
+    section: &Section,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Option<Result<(), ConfigParseError>> {
+    match section {
+        Section::Family => Some(assign_family(&mut config.family, key, value, line_number)),
+        Section::FamilyCategory(category) => {
+            let default_category_config = config.family.category_config(*category);
+            let category_config = config
+                .family
+                .categories
+                .entry(*category)
+                .or_insert(default_category_config);
+            Some(assign_family_category(
+                category_config,
+                key,
+                value,
+                line_number,
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "family")]
+fn assign_family(
+    config: &mut crate::FamilyPolicyConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        _ => return unknown_key("family", key, line_number),
+    }
+    Ok(())
+}
+
+#[cfg(feature = "family")]
+fn assign_family_category(
+    config: &mut CategoryConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "action" => config.action = parse_category_action(value, line_number)?,
+        "replacement" => config.replacement = Some(parse_string(value, line_number)?),
+        _ => return unknown_key("family.categories", key, line_number),
+    }
+    Ok(())
+}
+
+#[cfg(feature = "family")]
+fn parse_category_action(
+    value: &str,
+    line_number: usize,
+) -> Result<CategoryAction, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "block" => Ok(CategoryAction::Block),
+        "replace" => Ok(CategoryAction::Replace),
+        "defer" => Ok(CategoryAction::Defer),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid family.categories.action {other:?}; expected \"block\", \"replace\", or \"defer\""
+            ),
+        )),
     }
 }
 

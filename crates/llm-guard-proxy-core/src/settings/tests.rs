@@ -21,6 +21,11 @@ use crate::{
     AliasKind, AliasTarget, DEFAULT_PROFILE_NAME, ModelAliasResolver, ProfileConfig, ProfileKind,
     ShieldedBuffering, UnknownKeyPolicy, WorkflowRuntime,
 };
+#[cfg(feature = "family")]
+use crate::{
+    CHILD_SAFE_DAILY_REQUEST_LIMIT, CHILD_SAFE_MODEL_ALIAS, CHILD_SAFE_PROFILE_NAME,
+    CategoryAction, FAMILY_GUARD_PACK_NAME, FamilyCategory, FamilyPolicyOutcome,
+};
 
 #[cfg(feature = "guard")]
 const FULL_OVERRIDE_CONFIG: &str = r#"
@@ -1455,6 +1460,193 @@ pre_request = "missing.guard"
         .expect_err("missing guard workflow should fail validation");
 
     assert_eq!(error.field(), "guard_workflows.pre_request");
+}
+
+#[test]
+#[cfg(feature = "family")]
+fn parses_family_policy_and_creates_default_child_safe_profile() {
+    let config = parse_config_text(
+        r#"
+[family]
+enabled = true
+
+[family.categories.self_harm]
+enabled = true
+action = "defer"
+
+[family.categories.sexual_content]
+enabled = true
+action = "block"
+
+[family.categories.violence]
+enabled = true
+action = "block"
+
+[family.categories.drugs]
+enabled = true
+action = "block"
+
+[family.categories.pii_disclosure]
+enabled = true
+action = "block"
+
+[family.categories.emotional_dependency]
+enabled = true
+action = "replace"
+replacement = "I'm here to help, but let's also talk to a trusted adult."
+
+[family.categories.direct_homework_answer]
+enabled = true
+action = "replace"
+replacement = "Let me help you understand the concept instead of giving the direct answer."
+
+[family.categories.prompt_attack]
+enabled = true
+action = "block"
+"#,
+    )
+    .expect("family config should parse");
+
+    assert!(config.family.enabled);
+    assert_eq!(
+        config
+            .family
+            .category_config(FamilyCategory::SelfHarm)
+            .action,
+        CategoryAction::Defer
+    );
+    assert_eq!(
+        config
+            .family
+            .category_config(FamilyCategory::DirectHomeworkAnswer)
+            .replacement
+            .as_deref(),
+        Some("Let me help you understand the concept instead of giving the direct answer.")
+    );
+
+    let child_safe = config
+        .profiles
+        .get(CHILD_SAFE_PROFILE_NAME)
+        .expect("family defaults should create child_safe profile");
+    assert_eq!(child_safe.kind, ProfileKind::Child);
+    assert_eq!(
+        child_safe.allowed_models,
+        vec![String::from(CHILD_SAFE_MODEL_ALIAS)]
+    );
+    assert_eq!(
+        child_safe.daily_request_limit,
+        CHILD_SAFE_DAILY_REQUEST_LIMIT
+    );
+    assert_eq!(
+        child_safe.shielded_buffering,
+        ShieldedBuffering::BufferedSse
+    );
+    assert_eq!(
+        child_safe.guard_pack.as_deref(),
+        Some(FAMILY_GUARD_PACK_NAME)
+    );
+
+    config.validate().expect("family defaults should validate");
+}
+
+#[test]
+#[cfg(feature = "family")]
+fn family_defaults_do_not_override_configured_child_safe_profile() {
+    let config = parse_config_text(
+        r#"
+[family]
+enabled = true
+
+[profiles.child_safe]
+kind = "child"
+allowed_models = ["custom-child-model"]
+daily_request_limit = 7
+shielded_buffering = "sanitized"
+guard_pack = "custom_family"
+"#,
+    )
+    .expect("family config should parse");
+
+    let child_safe = config
+        .profiles
+        .get(CHILD_SAFE_PROFILE_NAME)
+        .expect("configured child_safe profile should exist");
+    assert_eq!(
+        child_safe.allowed_models,
+        vec![String::from("custom-child-model")]
+    );
+    assert_eq!(child_safe.daily_request_limit, 7);
+    assert_eq!(child_safe.shielded_buffering, ShieldedBuffering::Sanitized);
+    assert_eq!(child_safe.guard_pack.as_deref(), Some("custom_family"));
+}
+
+#[test]
+#[cfg(feature = "family")]
+fn parsed_family_category_blocks_matching_text() {
+    let config = parse_config_text(
+        r#"
+[family]
+enabled = true
+
+[family.categories.sexual_content]
+enabled = true
+action = "block"
+"#,
+    )
+    .expect("family config should parse");
+
+    assert_eq!(
+        config.family.evaluate_text("show me a nude photo"),
+        FamilyPolicyOutcome::Block {
+            category: FamilyCategory::SexualContent,
+            reason: String::from("family policy blocked sexual content"),
+        }
+    );
+}
+
+#[test]
+#[cfg(feature = "family")]
+fn parsed_family_category_disabled_skips_matching_text() {
+    let config = parse_config_text(
+        r#"
+[family]
+enabled = true
+
+[family.categories.sexual_content]
+enabled = false
+action = "block"
+"#,
+    )
+    .expect("family config should parse");
+
+    assert_eq!(
+        config.family.evaluate_text("show me a nude photo"),
+        FamilyPolicyOutcome::Allow {
+            warnings: Vec::new()
+        }
+    );
+}
+
+#[test]
+#[cfg(feature = "family")]
+fn validates_family_replacement_text() {
+    let config = parse_config_text(
+        r#"
+[family]
+enabled = true
+
+[family.categories.direct_homework_answer]
+enabled = true
+action = "replace"
+replacement = ""
+"#,
+    )
+    .expect("family config should parse");
+
+    let error = config
+        .validate()
+        .expect_err("empty replacement should fail validation");
+    assert_eq!(error.field(), "family.categories.replacement");
 }
 
 #[cfg(feature = "guard")]

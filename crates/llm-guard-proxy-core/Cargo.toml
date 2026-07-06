@@ -12,6 +12,7 @@ default = ["upstream-hot-restart", "param-override"]
 upstream-hot-restart = []
 param-override = []
 guard = ["dep:nix"]
+family = ["guard"]
 
 [dependencies]
 nix = { version = "0.29", features = ["signal", "process"], optional = true }

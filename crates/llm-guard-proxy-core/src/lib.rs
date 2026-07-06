@@ -7,6 +7,8 @@
 #[cfg(feature = "guard")]
 mod budget;
 mod evidence;
+#[cfg(feature = "family")]
+pub mod family;
 #[cfg(feature = "guard")]
 mod guard;
 #[cfg(feature = "guard")]
@@ -27,6 +29,12 @@ pub use evidence::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceError,
     EvidenceGroupRecord, EvidencePruningStats, EvidenceRetentionUsage, EvidenceShadowRecord,
     EvidenceStore, EvidenceStoreWrite, ShadowSkipReason,
+};
+#[cfg(feature = "family")]
+pub use family::{
+    CHILD_SAFE_DAILY_REQUEST_LIMIT, CHILD_SAFE_MODEL_ALIAS, CHILD_SAFE_PROFILE_NAME,
+    CategoryAction, CategoryConfig, FAMILY_GUARD_PACK_NAME, FamilyCategory, FamilyPolicyConfig,
+    FamilyPolicyOutcome, FamilyPolicyWarning,
 };
 #[cfg(feature = "guard")]
 pub use guard::{GuardExecutor, GuardOutcome};
