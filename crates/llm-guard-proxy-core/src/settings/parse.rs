@@ -46,6 +46,8 @@ enum Section {
     VirtualKeys,
     #[cfg(feature = "guard")]
     VirtualKeyMap,
+    #[cfg(feature = "guard")]
+    Budget,
     Shielding,
     Observability,
     ObservabilityRetention,
@@ -249,6 +251,8 @@ fn parse_section(
         "virtual_keys" => Ok(Section::VirtualKeys),
         #[cfg(feature = "guard")]
         "virtual_keys.keys" => Ok(Section::VirtualKeyMap),
+        #[cfg(feature = "guard")]
+        "budget" => Ok(Section::Budget),
         "shielding" => Ok(Section::Shielding),
         "observability" => Ok(Section::Observability),
         "observability.retention" => Ok(Section::ObservabilityRetention),
@@ -375,7 +379,8 @@ fn assign_value(
         | Section::Workflow(_)
         | Section::GuardWorkflows
         | Section::VirtualKeys
-        | Section::VirtualKeyMap => unreachable!("guard sections are handled before this match"),
+        | Section::VirtualKeyMap
+        | Section::Budget => unreachable!("guard sections are handled before this match"),
     }
 }
 
@@ -436,6 +441,7 @@ fn assign_guard_value(
             value,
             line_number,
         )),
+        Section::Budget => Some(assign_budget(&mut config.budget, key, value, line_number)),
         _ => None,
     }
 }
@@ -451,11 +457,8 @@ fn assign_profile(
         "kind" => config.kind = parse_profile_kind(value, line_number)?,
         "allowed_models" => config.allowed_models = parse_string_array(value, line_number)?,
         "daily_request_limit" => {
-            config.daily_request_limit = Some(parse_u32(
-                value,
-                line_number,
-                "profiles.daily_request_limit",
-            )?);
+            config.daily_request_limit =
+                parse_u64(value, line_number, "profiles.daily_request_limit")?;
         }
         "shielded_buffering" => {
             config.shielded_buffering = parse_shielded_buffering(value, line_number)?;
@@ -563,6 +566,25 @@ fn assign_virtual_key_map(
     config
         .keys
         .insert(key.trim_matches('"').to_owned(), profile_name);
+    Ok(())
+}
+
+#[cfg(feature = "guard")]
+fn assign_budget(
+    config: &mut super::BudgetConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "sqlite_path" => config.sqlite_path = parse_string(value, line_number)?,
+        "reset_timezone" => config.reset_timezone = parse_string(value, line_number)?,
+        "reset_hour_utc" => {
+            config.reset_hour_utc = parse_u32(value, line_number, "budget.reset_hour_utc")?;
+        }
+        _ => return unknown_key("budget", key, line_number),
+    }
     Ok(())
 }
 

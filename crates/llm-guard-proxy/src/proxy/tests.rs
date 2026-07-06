@@ -1575,6 +1575,173 @@ async fn workflow_block_returns_error() {
 }
 
 #[tokio::test]
+#[cfg(feature = "guard")]
+async fn request_counted_against_budget() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[profiles.default]
+kind = "adult"
+allowed_models = ["test-chat"]
+daily_request_limit = 2
+
+[budget]
+enabled = true
+"#,
+    )
+    .await;
+
+    let response = send_budget_chat_request(&proxy, None).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response.text().await.expect("body should be text");
+    let _observed = fake.recv_next().await;
+    assert_eq!(read_budget_count(&proxy.budget_sqlite_path, "default"), 1);
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn budget_exhausted_blocks_request() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[profiles.default]
+kind = "adult"
+allowed_models = ["test-chat"]
+daily_request_limit = 2
+
+[budget]
+enabled = true
+"#,
+    )
+    .await;
+
+    for _ in 0..2 {
+        let response = send_budget_chat_request(&proxy, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _body = response.text().await.expect("body should be text");
+        let _observed = fake.recv_next().await;
+    }
+    let blocked = send_budget_chat_request(&proxy, None).await;
+
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    let json = response_json(blocked).await;
+    assert_eq!(json["error"]["type"], "budget_exhausted");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("limit=2"))
+    );
+    assert_eq!(read_budget_count(&proxy.budget_sqlite_path, "default"), 2);
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn different_profiles_independent() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[profiles.adult]
+kind = "adult"
+allowed_models = ["test-chat"]
+daily_request_limit = 1
+
+[profiles.child]
+kind = "child"
+allowed_models = ["test-chat"]
+daily_request_limit = 1
+
+[virtual_keys]
+enabled = true
+unknown_key_policy = "fail_closed"
+
+[virtual_keys.keys]
+adult-key = "adult"
+child-key = "child"
+
+[budget]
+enabled = true
+"#,
+    )
+    .await;
+
+    let adult = send_budget_chat_request(&proxy, Some("adult-key")).await;
+    assert_eq!(adult.status(), StatusCode::OK);
+    let _body = adult.text().await.expect("body should be text");
+    let _adult_observed = fake.recv_next().await;
+    let child = send_budget_chat_request(&proxy, Some("child-key")).await;
+    assert_eq!(child.status(), StatusCode::OK);
+    let _body = child.text().await.expect("body should be text");
+    let _child_observed = fake.recv_next().await;
+    let adult_blocked = send_budget_chat_request(&proxy, Some("adult-key")).await;
+
+    assert_eq!(adult_blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(read_budget_count(&proxy.budget_sqlite_path, "adult"), 1);
+    assert_eq!(read_budget_count(&proxy.budget_sqlite_path, "child"), 1);
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn unlimited_profile_not_counted() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[profiles.default]
+kind = "adult"
+allowed_models = ["test-chat"]
+daily_request_limit = 0
+
+[budget]
+enabled = true
+"#,
+    )
+    .await;
+
+    for _ in 0..2 {
+        let response = send_budget_chat_request(&proxy, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _body = response.text().await.expect("body should be text");
+        let _observed = fake.recv_next().await;
+    }
+
+    assert_eq!(read_budget_count(&proxy.budget_sqlite_path, "default"), 0);
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn budget_disabled_no_check() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[profiles.default]
+kind = "adult"
+allowed_models = ["test-chat"]
+daily_request_limit = 1
+
+[budget]
+enabled = false
+"#,
+    )
+    .await;
+
+    for _ in 0..2 {
+        let response = send_budget_chat_request(&proxy, None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _body = response.text().await.expect("body should be text");
+        let _observed = fake.recv_next().await;
+    }
+
+    assert_eq!(read_budget_count(&proxy.budget_sqlite_path, "default"), 0);
+}
+
+#[tokio::test]
 async fn shielded_loop_guard_catches_reasoning_line_repeated_hundreds_of_times() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -10467,6 +10634,8 @@ max_queued_generation_requests = 0
         upstream_base_url: &fake.base_url,
         sqlite_path: &proxy.sqlite_path,
         evidence_sqlite_path: &proxy.evidence_sqlite_path,
+        #[cfg(feature = "guard")]
+        budget_sqlite_path: &proxy.budget_sqlite_path,
         observability_enabled: true,
         max_in_flight_requests: 1,
         server_config: &format!(
@@ -10482,6 +10651,7 @@ match_models = ["embedding-model"]
         metadata_config: "",
         observability_config: "",
         evidence_config: "",
+        extra_config: "",
     });
     let outcome = proxy
         .manager
@@ -10563,6 +10733,8 @@ match_models = ["embedding-model"]
         upstream_base_url: &fake.base_url,
         sqlite_path: &proxy.sqlite_path,
         evidence_sqlite_path: &proxy.evidence_sqlite_path,
+        #[cfg(feature = "guard")]
+        budget_sqlite_path: &proxy.budget_sqlite_path,
         observability_enabled: true,
         max_in_flight_requests: 1,
         server_config: &format!(
@@ -10580,6 +10752,7 @@ max_queued_generation_requests = 0
         metadata_config: "",
         observability_config: "",
         evidence_config: "",
+        extra_config: "",
     });
     let outcome = proxy
         .manager
@@ -10643,6 +10816,8 @@ match_models = ["embedding-model"]
         upstream_base_url: &fake.base_url,
         sqlite_path: &proxy.sqlite_path,
         evidence_sqlite_path: &proxy.evidence_sqlite_path,
+        #[cfg(feature = "guard")]
+        budget_sqlite_path: &proxy.budget_sqlite_path,
         observability_enabled: true,
         max_in_flight_requests: 2,
         server_config: &format!(
@@ -10660,6 +10835,7 @@ max_queued_generation_requests = 0
         metadata_config: "",
         observability_config: "",
         evidence_config: "",
+        extra_config: "",
     });
     let outcome = proxy
         .manager
@@ -11976,6 +12152,42 @@ fn shielded_chat_request(uri: &'static str, body: &'static str) -> Request<Body>
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(body))
         .expect("shielded chat request should build")
+}
+
+#[cfg(feature = "guard")]
+async fn send_budget_chat_request(
+    proxy: &ProxyFixture,
+    virtual_key: Option<&str>,
+) -> reqwest::Response {
+    let mut request = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"budget"}]}"#);
+    if let Some(virtual_key) = virtual_key {
+        request = request.header("x-virtual-key", virtual_key);
+    }
+    request
+        .send()
+        .await
+        .expect("budget request should complete")
+}
+
+#[cfg(feature = "guard")]
+fn read_budget_count(sqlite_path: &Path, profile: &str) -> u64 {
+    let connection = Connection::open(sqlite_path).expect("budget sqlite should open");
+    let count = connection
+        .query_row(
+            "SELECT count FROM budget_counts WHERE profile = ?1",
+            params![profile],
+            |row| row.get::<_, i64>(0),
+        )
+        .or_else(|source| match source {
+            rusqlite::Error::QueryReturnedNoRows => Ok(0),
+            source => Err(source),
+        })
+        .expect("budget count should read");
+    u64::try_from(count).expect("budget count should be non-negative")
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -14178,6 +14390,8 @@ struct ProxyFixture {
     store: ObservabilityStore,
     sqlite_path: PathBuf,
     evidence_sqlite_path: PathBuf,
+    #[cfg(feature = "guard")]
+    budget_sqlite_path: PathBuf,
     root: PathBuf,
 }
 
@@ -14285,6 +14499,21 @@ impl ProxyFixture {
         .await
     }
 
+    #[cfg(feature = "guard")]
+    async fn spawn_with_extra_config(upstream_base_url: &str, extra_config: &str) -> Self {
+        Self::spawn_with_full_options_and_extra(ProxyFixtureSpawnOptions {
+            upstream_base_url,
+            observability_enabled: true,
+            max_in_flight_requests: AppConfig::default().server.max_in_flight_requests,
+            server_config: "",
+            metadata_config: "",
+            observability_config: "",
+            evidence_config: "",
+            extra_config,
+        })
+        .await
+    }
+
     async fn spawn_with_full_options(
         upstream_base_url: &str,
         observability_enabled: bool,
@@ -14294,33 +14523,59 @@ impl ProxyFixture {
         observability_config: &str,
         evidence_config: &str,
     ) -> Self {
-        let root = unique_test_dir("proxy");
-        fs::create_dir_all(&root).expect("test root should be created");
-        set_owner_only_dir(&root);
-        let config_path = root.join("config.toml");
-        let sqlite_path = root.join("storage").join("observability.sqlite3");
-        let evidence_sqlite_path = root.join("storage").join("evidence.sqlite3");
-        write_proxy_config_with_observability(ProxyConfigWriteOptions {
-            config_path: &config_path,
+        Self::spawn_with_full_options_and_extra(ProxyFixtureSpawnOptions {
             upstream_base_url,
-            sqlite_path: &sqlite_path,
-            evidence_sqlite_path: &evidence_sqlite_path,
             observability_enabled,
             max_in_flight_requests,
             server_config,
             metadata_config,
             observability_config,
             evidence_config,
+            extra_config: "",
+        })
+        .await
+    }
+
+    async fn spawn_with_full_options_and_extra(options: ProxyFixtureSpawnOptions<'_>) -> Self {
+        let root = unique_test_dir("proxy");
+        fs::create_dir_all(&root).expect("test root should be created");
+        set_owner_only_dir(&root);
+        let config_path = root.join("config.toml");
+        let sqlite_path = root.join("storage").join("observability.sqlite3");
+        let evidence_sqlite_path = root.join("storage").join("evidence.sqlite3");
+        #[cfg(feature = "guard")]
+        let budget_sqlite_path = root.join("storage").join("budget.sqlite3");
+        write_proxy_config_with_observability(ProxyConfigWriteOptions {
+            config_path: &config_path,
+            upstream_base_url: options.upstream_base_url,
+            sqlite_path: &sqlite_path,
+            evidence_sqlite_path: &evidence_sqlite_path,
+            #[cfg(feature = "guard")]
+            budget_sqlite_path: &budget_sqlite_path,
+            observability_enabled: options.observability_enabled,
+            max_in_flight_requests: options.max_in_flight_requests,
+            server_config: options.server_config,
+            metadata_config: options.metadata_config,
+            observability_config: options.observability_config,
+            evidence_config: options.evidence_config,
+            extra_config: options.extra_config,
         });
         let manager =
             ConfigManager::from_explicit_path(&config_path).expect("proxy config should load");
         let store = ObservabilityStore::open(manager.handle()).expect("store should open");
         let evidence_store = EvidenceStore::open(manager.handle());
+        #[cfg(feature = "guard")]
+        let budget_store = Arc::new(
+            BudgetStore::open(&budget_sqlite_path.display().to_string())
+                .expect("budget store should open"),
+        );
         let state = ProxyState::new(
             manager.handle(),
             manager.path().to_path_buf(),
             store.clone(),
             evidence_store,
+            #[cfg(feature = "guard")]
+            budget_store,
             build_http_client().expect("client should build"),
         );
         let app = router(state.clone());
@@ -14344,9 +14599,23 @@ impl ProxyFixture {
             store,
             sqlite_path,
             evidence_sqlite_path,
+            #[cfg(feature = "guard")]
+            budget_sqlite_path,
             root,
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct ProxyFixtureSpawnOptions<'a> {
+    upstream_base_url: &'a str,
+    observability_enabled: bool,
+    max_in_flight_requests: usize,
+    server_config: &'a str,
+    metadata_config: &'a str,
+    observability_config: &'a str,
+    evidence_config: &'a str,
+    extra_config: &'a str,
 }
 
 impl Drop for ProxyFixture {
@@ -14364,17 +14633,22 @@ fn write_proxy_config(
     metadata_config: &str,
 ) {
     let evidence_sqlite_path = sqlite_path.with_file_name("evidence.sqlite3");
+    #[cfg(feature = "guard")]
+    let budget_sqlite_path = sqlite_path.with_file_name("budget.sqlite3");
     write_proxy_config_with_observability(ProxyConfigWriteOptions {
         config_path,
         upstream_base_url,
         sqlite_path,
         evidence_sqlite_path: &evidence_sqlite_path,
+        #[cfg(feature = "guard")]
+        budget_sqlite_path: &budget_sqlite_path,
         observability_enabled,
         max_in_flight_requests,
         server_config: "",
         metadata_config,
         observability_config: "",
         evidence_config: "",
+        extra_config: "",
     });
 }
 
@@ -14384,15 +14658,28 @@ struct ProxyConfigWriteOptions<'a> {
     upstream_base_url: &'a str,
     sqlite_path: &'a Path,
     evidence_sqlite_path: &'a Path,
+    #[cfg(feature = "guard")]
+    budget_sqlite_path: &'a Path,
     observability_enabled: bool,
     max_in_flight_requests: usize,
     server_config: &'a str,
     metadata_config: &'a str,
     observability_config: &'a str,
     evidence_config: &'a str,
+    extra_config: &'a str,
 }
 
 fn write_proxy_config_with_observability(options: ProxyConfigWriteOptions<'_>) {
+    #[cfg(feature = "guard")]
+    let budget_section = format!(
+        r#"
+[budget]
+sqlite_path = "{budget_sqlite_path}"
+"#,
+        budget_sqlite_path = options.budget_sqlite_path.display()
+    );
+    #[cfg(not(feature = "guard"))]
+    let budget_section = String::new();
     fs::write(
         options.config_path,
         format!(
@@ -14420,6 +14707,8 @@ max_records = {TEST_MAX_RECORDS}
 sqlite_path = "{evidence_sqlite_path}"
 blob_cache_dir = "{blob_cache_dir}"
 {evidence_config}
+{budget_section}
+{extra_config}
 "#,
             max_in_flight_requests = options.max_in_flight_requests,
             server_config = options.server_config,
@@ -14436,6 +14725,8 @@ blob_cache_dir = "{blob_cache_dir}"
                 .display(),
             evidence_config = options.evidence_config,
             observability_config = options.observability_config,
+            budget_section = budget_section,
+            extra_config = options.extra_config,
         ),
     )
     .expect("test config should be written");

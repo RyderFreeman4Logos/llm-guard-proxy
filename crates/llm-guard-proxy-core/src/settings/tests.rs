@@ -100,6 +100,12 @@ unknown_key_policy = "use_default_profile"
 vk_adult_abc123 = "adult_default"
 vk_child_def456 = "child_default"
 
+[budget]
+enabled = true
+sqlite_path = "state/llm-guard-proxy-test-budget.sqlite3"
+reset_timezone = "UTC"
+reset_hour_utc = 4
+
 [observability]
 metrics_enabled = false
 health_upstream_probe_enabled = false
@@ -207,6 +213,16 @@ fn defaults_match_issue_contract() {
         80_000
     );
     assert_default_evidence_config(&config);
+    #[cfg(feature = "guard")]
+    {
+        assert!(!config.budget.enabled);
+        assert_eq!(
+            config.budget.sqlite_path,
+            "~/.local/state/llm-guard-proxy/budget.sqlite3"
+        );
+        assert_eq!(config.budget.reset_timezone, "UTC");
+        assert_eq!(config.budget.reset_hour_utc, 0);
+    }
     assert!(config.thinking.enabled);
     assert_eq!(config.thinking.mode, ThinkingMode::BoundedThinking);
     assert!(!config.thinking.force_disable);
@@ -1150,6 +1166,16 @@ fn parses_toml_with_defaults_and_overrides() {
     assert_parsed_profiles(&config);
     #[cfg(feature = "guard")]
     assert_parsed_virtual_keys(&config);
+    #[cfg(feature = "guard")]
+    {
+        assert!(config.budget.enabled);
+        assert_eq!(
+            config.budget.sqlite_path,
+            "state/llm-guard-proxy-test-budget.sqlite3"
+        );
+        assert_eq!(config.budget.reset_timezone, "UTC");
+        assert_eq!(config.budget.reset_hour_utc, 4);
+    }
     assert_parsed_observability_overrides(&config);
     assert!(config.evidence.enabled);
     assert_eq!(
@@ -1203,7 +1229,7 @@ fn assert_parsed_profiles(config: &AppConfig) {
         child.allowed_models,
         vec![String::from("family/child-safe-general-v1")]
     );
-    assert_eq!(child.daily_request_limit, Some(50));
+    assert_eq!(child.daily_request_limit, 50);
     assert_eq!(child.shielded_buffering, ShieldedBuffering::BufferedSse);
     assert_eq!(child.guard_pack.as_deref(), Some("family_basic"));
 
@@ -1219,7 +1245,7 @@ fn assert_parsed_profiles(config: &AppConfig) {
             String::from("family/child-safe-general-v1"),
         ]
     );
-    assert_eq!(adult.daily_request_limit, None);
+    assert_eq!(adult.daily_request_limit, 0);
     assert_eq!(adult.shielded_buffering, ShieldedBuffering::Off);
     assert_eq!(adult.guard_pack, None);
 }
@@ -1261,15 +1287,14 @@ fn implicit_default_profile_exists_when_none_configured() {
         .expect("implicit default profile should exist");
 
     assert_eq!(profile.kind, ProfileKind::Adult);
-    assert!(profile.daily_request_limit.is_none());
+    assert_eq!(profile.daily_request_limit, 0);
 }
 
 #[test]
 #[cfg(feature = "guard")]
 fn validates_caller_profile_requirements() {
-    for (contents, field) in [
-        (
-            r#"
+    let config = parse_config_text(
+        r#"
 [[model_aliases]]
 id = "gpt-default"
 kind = "upstream"
@@ -1279,19 +1304,65 @@ upstream_profile = "default"
 kind = "child"
 allowed_models = ["missing-model"]
 "#,
-            "profiles.allowed_models",
-        ),
-        (
-            r#"
+    )
+    .expect("config syntax should parse");
+    let error = config.validate().expect_err("profile config should fail");
+    assert_eq!(error.field(), "profiles.allowed_models");
+}
+
+#[test]
+#[cfg(feature = "guard")]
+fn zero_daily_limit_is_unlimited() {
+    let config = parse_config_text(
+        r#"
 [profiles.child_default]
 kind = "child"
 daily_request_limit = 0
 "#,
-            "profiles.daily_request_limit",
+    )
+    .expect("config syntax should parse");
+
+    config
+        .validate()
+        .expect("zero profile daily limit should validate");
+    assert_eq!(
+        config
+            .profiles
+            .get("child_default")
+            .expect("profile should parse")
+            .daily_request_limit,
+        0
+    );
+}
+
+#[test]
+#[cfg(feature = "guard")]
+fn validates_budget_requirements() {
+    for (contents, field) in [
+        (
+            r#"
+[budget]
+sqlite_path = ""
+"#,
+            "budget.sqlite_path",
+        ),
+        (
+            r#"
+[budget]
+reset_timezone = "America/Los_Angeles"
+"#,
+            "budget.reset_timezone",
+        ),
+        (
+            r"
+[budget]
+reset_hour_utc = 24
+",
+            "budget.reset_hour_utc",
         ),
     ] {
         let config = parse_config_text(contents).expect("config syntax should parse");
-        let error = config.validate().expect_err("profile config should fail");
+        let error = config.validate().expect_err("budget config should fail");
         assert_eq!(error.field(), field);
     }
 }
@@ -2674,6 +2745,12 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"profiles"));
     #[cfg(feature = "guard")]
     assert!(RELOADABLE_FIELDS.contains(&"virtual_keys"));
+    #[cfg(feature = "guard")]
+    assert!(RELOADABLE_FIELDS.contains(&"budget.enabled"));
+    #[cfg(feature = "guard")]
+    assert!(RELOADABLE_FIELDS.contains(&"budget.reset_timezone"));
+    #[cfg(feature = "guard")]
+    assert!(RELOADABLE_FIELDS.contains(&"budget.reset_hour_utc"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.metrics_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_admin_token"));
@@ -2707,6 +2784,8 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RESTART_REQUIRED_FIELDS.contains(&"observability.sqlite_path"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"evidence.sqlite_path"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"evidence.blob_cache_dir"));
+    #[cfg(feature = "guard")]
+    assert!(RESTART_REQUIRED_FIELDS.contains(&"budget.sqlite_path"));
 }
 
 fn write_config(path: &Path, contents: &str) {

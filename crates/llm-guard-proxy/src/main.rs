@@ -4,6 +4,8 @@ mod proxy;
 
 use std::{ffi::OsString, future::pending, path::PathBuf, process::ExitCode, time::Duration};
 
+#[cfg(feature = "guard")]
+use llm_guard_proxy_core::BudgetStore;
 use llm_guard_proxy_core::{
     ConfigManager, EvidenceStore, ObservabilityStore, RequestId, redact_upstream_base_url,
 };
@@ -33,6 +35,10 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let store = ObservabilityStore::open(manager.handle()).map_err(|error| error.to_string())?;
     let evidence_store = EvidenceStore::open(manager.handle());
+    #[cfg(feature = "guard")]
+    let budget_store = std::sync::Arc::new(
+        BudgetStore::open(&config.budget.sqlite_path).map_err(|error| error.to_string())?,
+    );
     let _watcher = manager
         .spawn_polling(Duration::from_secs(1))
         .map_err(|error| error.to_string())?;
@@ -68,6 +74,8 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
         manager.path().to_path_buf(),
         store,
         evidence_store,
+        #[cfg(feature = "guard")]
+        budget_store,
         proxy::build_http_client().map_err(|error| error.to_string())?,
     );
     serve_bound_listeners(bound_listeners, state).await

@@ -4,6 +4,8 @@
 //! Issue #1 intentionally kept this crate small. Later issues add proxy,
 //! retry, and request-shielding behavior behind core interfaces.
 
+#[cfg(feature = "guard")]
+mod budget;
 mod evidence;
 #[cfg(feature = "guard")]
 mod guard;
@@ -19,6 +21,8 @@ mod settings;
 #[cfg(feature = "guard")]
 pub mod workflow;
 
+#[cfg(feature = "guard")]
+pub use budget::{BudgetCheck, BudgetError, BudgetStore, current_budget_date};
 pub use evidence::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceError,
     EvidenceGroupRecord, EvidencePruningStats, EvidenceRetentionUsage, EvidenceShadowRecord,
@@ -68,7 +72,7 @@ pub use settings::{
     validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
-pub use settings::{UnknownKeyPolicy, VirtualKeyConfig};
+pub use settings::{BudgetConfig, UnknownKeyPolicy, VirtualKeyConfig};
 #[cfg(feature = "guard")]
 pub use workflow::{StdioRuntime, WorkflowConfig, WorkflowRuntime};
 

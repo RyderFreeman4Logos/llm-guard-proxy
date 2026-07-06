@@ -45,9 +45,9 @@ pub struct ProfileConfig {
     /// Model aliases this profile is allowed to use.
     #[serde(default)]
     pub allowed_models: Vec<String>,
-    /// Maximum requests per day (`None` means unlimited).
+    /// Maximum requests per day (`0` means unlimited).
     #[serde(default)]
-    pub daily_request_limit: Option<u32>,
+    pub daily_request_limit: u64,
     /// Shielded buffering mode.
     #[serde(default)]
     pub shielded_buffering: ShieldedBuffering,
@@ -65,7 +65,7 @@ impl ProfileConfig {
 
     /// Check a request against this profile.
     #[must_use]
-    pub fn check_request(&self, model: &str, daily_count: u32) -> ProfileCheckResult {
+    pub fn check_request(&self, model: &str, daily_count: u64) -> ProfileCheckResult {
         if !self.is_model_allowed(model) {
             return ProfileCheckResult::Block {
                 reason: BlockReason::ModelNotAllowed {
@@ -73,12 +73,12 @@ impl ProfileConfig {
                 },
             };
         }
-        if let Some(limit) = self.daily_request_limit {
-            if daily_count >= limit {
-                return ProfileCheckResult::Block {
-                    reason: BlockReason::DailyLimitExceeded { limit },
-                };
-            }
+        if self.daily_request_limit > 0 && daily_count >= self.daily_request_limit {
+            return ProfileCheckResult::Block {
+                reason: BlockReason::DailyLimitExceeded {
+                    limit: self.daily_request_limit,
+                },
+            };
         }
         ProfileCheckResult::Allow
     }
@@ -98,7 +98,7 @@ impl Default for ProfileConfig {
         Self {
             kind: ProfileKind::Adult,
             allowed_models: Vec::new(),
-            daily_request_limit: None,
+            daily_request_limit: 0,
             shielded_buffering: ShieldedBuffering::Off,
             guard_pack: None,
         }
@@ -128,7 +128,7 @@ pub enum BlockReason {
     /// Daily request limit exceeded.
     DailyLimitExceeded {
         /// Configured daily request limit.
-        limit: u32,
+        limit: u64,
     },
     /// Profile kind does not match the required kind for this model.
     KindMismatch,
@@ -146,7 +146,7 @@ mod tests {
                 String::from("gpt-default"),
                 String::from("family/child-safe-general-v1"),
             ],
-            daily_request_limit: None,
+            daily_request_limit: 0,
             shielded_buffering: ShieldedBuffering::Off,
             guard_pack: None,
         }
@@ -168,7 +168,7 @@ mod tests {
         let profile = ProfileConfig {
             kind: ProfileKind::Child,
             allowed_models: vec![String::from("family/child-safe-general-v1")],
-            daily_request_limit: None,
+            daily_request_limit: 0,
             shielded_buffering: ShieldedBuffering::BufferedSse,
             guard_pack: Some(String::from("family_basic")),
         };
@@ -186,7 +186,7 @@ mod tests {
     #[test]
     fn daily_limit_exceeded_blocks_request() {
         let mut profile = adult_profile();
-        profile.daily_request_limit = Some(50);
+        profile.daily_request_limit = 50;
 
         assert_eq!(
             profile.check_request("gpt-default", 50),
@@ -197,11 +197,11 @@ mod tests {
     }
 
     #[test]
-    fn missing_daily_limit_allows_allowed_model_for_any_count() {
+    fn zero_daily_limit_allows_allowed_model_for_any_count() {
         let profile = adult_profile();
 
         assert_eq!(
-            profile.check_request("gpt-default", u32::MAX),
+            profile.check_request("gpt-default", u64::MAX),
             ProfileCheckResult::Allow
         );
     }
