@@ -1576,6 +1576,556 @@ async fn workflow_block_returns_error() {
 
 #[tokio::test]
 #[cfg(feature = "guard")]
+async fn models_endpoint_includes_aliases() {
+    let fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("models-aliases");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_guard_script(
+        &guard_root,
+        "models-aliases",
+        guard_result("replace", Some(r#"[{"role":"assistant","content":"ok"}]"#)),
+    );
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        &format!(
+            r#"
+[[model_aliases]]
+id = "alias-chat"
+kind = "upstream"
+upstream_profile = "default"
+
+[[model_aliases]]
+id = "family/child-safe-general-v1"
+kind = "workflow"
+workflow_id = "child_safe_general_v1"
+
+{}
+"#,
+            workflow_config("child_safe_general_v1", &script)
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/v1/models?test=model-metadata", proxy.base_url))
+        .send()
+        .await
+        .expect("models request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("models body should be text");
+    let json: serde_json::Value = serde_json::from_str(&body).expect("models should be JSON");
+    let models = json["data"]
+        .as_array()
+        .expect("models data should be array");
+    let model_ids = models
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+    assert!(model_ids.contains(&"aeon-ultimate"));
+    assert!(model_ids.contains(&"alias-chat"));
+    assert!(model_ids.contains(&"family/child-safe-general-v1"));
+    let alias_record = models
+        .iter()
+        .find(|model| model["id"] == "alias-chat")
+        .expect("alias model record should exist");
+    assert_eq!(alias_record["owned_by"], "llm-guard-proxy");
+    assert_eq!(alias_record["llm_guard_proxy_alias"], true);
+    assert_eq!(alias_record["alias_kind"], "upstream");
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn non_streaming_completion_with_fake_upstream() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream":false}"#,
+        )
+        .send()
+        .await
+        .expect("chat request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = shielded_final_json(response).await;
+    assert_eq!(json["choices"][0]["message"]["content"], "Hello");
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn streaming_with_shielded_buffering() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream":true}"#,
+        )
+        .send()
+        .await
+        .expect("streaming chat request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(content_type.contains("text/event-stream"));
+    let body = response.text().await.expect("stream body should be text");
+    let chunks = openai_sse_json_chunks(&body);
+    let content = chunks
+        .iter()
+        .filter_map(|chunk| chunk["choices"][0]["delta"]["content"].as_str())
+        .collect::<String>();
+    assert_eq!(content, "Hello");
+    assert!(body.contains("data: [DONE]"));
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn unknown_model_returns_structured_error() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[profiles.default]
+kind = "adult"
+allowed_models = ["test-chat"]
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"missing-model","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("unknown model request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = response_json(response).await;
+    assert_eq!(json["error"]["type"], "guard_blocked");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("model not allowed"))
+    );
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn child_profile_blocked_from_adult_alias() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[profiles.default]
+kind = "adult"
+allowed_models = ["adult-model"]
+
+[profiles.child]
+kind = "child"
+allowed_models = ["child-model"]
+
+[virtual_keys]
+enabled = true
+unknown_key_policy = "fail_closed"
+
+[virtual_keys.keys]
+child-key = "child"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .header("x-virtual-key", "child-key")
+        .body(r#"{"model":"adult-model","prompt":"ping","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("child profile request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = response_json(response).await;
+    assert_eq!(json["error"]["type"], "guard_blocked");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("model not allowed"))
+    );
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn budget_exhausted_returns_429() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[profiles.default]
+kind = "adult"
+allowed_models = ["test-chat"]
+daily_request_limit = 1
+
+[budget]
+enabled = true
+"#,
+    )
+    .await;
+
+    let allowed = send_budget_chat_request(&proxy, None).await;
+    assert_eq!(allowed.status(), StatusCode::OK);
+    let _body = allowed.text().await.expect("body should be text");
+    let _observed = fake.recv_next().await;
+
+    let blocked = send_budget_chat_request(&proxy, None).await;
+    assert_eq!(blocked.status(), StatusCode::TOO_MANY_REQUESTS);
+    let json = response_json(blocked).await;
+    assert_eq!(json["error"]["type"], "budget_exhausted");
+    assert_eq!(read_budget_count(&proxy.budget_sqlite_path, "default"), 1);
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn unknown_virtual_key_fails_closed() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &virtual_key_config("fail_closed"),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .header("x-virtual-key", "unknown-key")
+        .body(r#"{"model":"gpt-default","prompt":"ping","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("unknown virtual key request should complete");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let json = response_json(response).await;
+    assert_eq!(json["error"]["type"], "virtual_key_unauthorized");
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn workflow_guard_returns_allow_passes_request() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("workflow-guard-allow");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_guard_script(
+        &guard_root,
+        "workflow-guard-allow",
+        guard_result("allow", None),
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, true),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("guarded request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _json = shielded_final_json(response).await;
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn workflow_guard_returns_block_rejects_request() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("workflow-guard-block");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_guard_script(
+        &guard_root,
+        "workflow-guard-block",
+        guard_result("block", None),
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, true),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"blocked"}]}"#)
+        .send()
+        .await
+        .expect("guarded request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = response_json(response).await;
+    assert_eq!(json["error"]["type"], "guard_blocked");
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn malformed_guard_output_fails_closed() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("workflow-guard-malformed");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_literal_guard_script(&guard_root, "workflow-guard-malformed", "not json");
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, true),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("malformed guard request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = response_json(response).await;
+    assert_eq!(json["error"]["type"], "guard_blocked");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("malformed JSON"))
+    );
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn workflow_timeout_fails_closed() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("workflow-timeout-fails-closed");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_slow_guard_script(&guard_root, "workflow-timeout-fails-closed");
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &workflow_alias_config(&script, 20),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"family/child-safe-general-v1","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("timeout workflow request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = response_json(response).await;
+    assert_eq!(json["error"]["type"], "guard_blocked");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("timed out"))
+    );
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn large_stdout_capped() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("workflow-large-stdout");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_large_stdout_guard_script(&guard_root, "workflow-large-stdout");
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &workflow_alias_config_with_stdout_limit(&script, 120_000, 1_048_576),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"family/child-safe-general-v1","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("large stdout workflow request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let json = response_json(response).await;
+    assert_eq!(json["error"]["type"], "guard_blocked");
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("stdout exceeded"))
+    );
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn allowed_request_logged_in_audit() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"audit"}]}"#)
+        .send()
+        .await
+        .expect("audited request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _json = shielded_final_json(response).await;
+    let _observed = fake.recv_next().await;
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "succeeded");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(attempt_row.status, "succeeded");
+    assert_eq!(attempt_row.http_status, 200);
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn blocked_request_logged_in_audit() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("blocked-audit");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_guard_script(&guard_root, "blocked-audit", guard_result("block", None));
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, true),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"blocked"}]}"#)
+        .send()
+        .await
+        .expect("blocked audited request should complete");
+
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let _json = response_json(response).await;
+    assert_no_upstream_request(&mut fake).await;
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(request_row.http_status, 403);
+    assert!(
+        request_row
+            .error_reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("guard_blocked"))
+    );
+    assert_eq!(audit_row_count(&proxy.sqlite_path, "attempts"), 0);
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
+async fn api_keys_never_logged() {
+    let secret_virtual_key = "vk_child_def456";
+    let secret_authorization = "sk-auth-secret-issue-79";
+    let secret_query_key = "sk-query-secret-issue-79";
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &virtual_key_config("fail_closed"),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/completions?api_key={secret_query_key}",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, format!("Bearer {secret_authorization}"))
+        .header("x-api-key", "sk-header-secret-issue-79")
+        .header("x-virtual-key", secret_virtual_key)
+        .body(r#"{"model":"child-model","prompt":"ping","max_tokens":1}"#)
+        .send()
+        .await
+        .expect("secret audit request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response.text().await.expect("body should be text");
+    let _observed = fake.recv_next().await;
+    let audit_text = read_audit_text(&proxy.sqlite_path);
+    for secret in [
+        secret_virtual_key,
+        secret_authorization,
+        secret_query_key,
+        "sk-header-secret-issue-79",
+    ] {
+        assert!(
+            !audit_text.contains(secret),
+            "audit storage must not contain secret value {secret}"
+        );
+    }
+    assert!(audit_text.contains("child_safe"));
+}
+
+#[tokio::test]
+#[cfg(feature = "guard")]
 async fn request_counted_against_budget() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_extra_config(
@@ -12207,6 +12757,25 @@ fn write_slow_guard_script(root: &Path, name: &str) -> PathBuf {
 }
 
 #[cfg(feature = "guard")]
+fn write_literal_guard_script(root: &Path, name: &str, output: &str) -> PathBuf {
+    let path = root.join(format!("{name}.sh"));
+    let script = format!("#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{output}'\n");
+    fs::write(&path, script).expect("literal guard script should be written");
+    path
+}
+
+#[cfg(feature = "guard")]
+fn write_large_stdout_guard_script(root: &Path, name: &str) -> PathBuf {
+    let path = root.join(format!("{name}.sh"));
+    fs::write(
+        &path,
+        "#!/bin/sh\ncat >/dev/null\nhead -c 1048577 /dev/zero | tr '\\000' x\n",
+    )
+    .expect("large stdout guard script should be written");
+    path
+}
+
+#[cfg(feature = "guard")]
 fn guard_result(decision: &str, replacement_messages: Option<&str>) -> String {
     format!(
         r#"{{"decision":"{decision}","risk_level":"test","tags":[],"summary":"guard summary","replacement_messages":{replacement_messages},"audit":{{"evidence_spans":[],"notes":[]}}}}"#,
@@ -12253,6 +12822,31 @@ workflow_timeout_ms = {alias_timeout_ms}
 {}
 "#,
         workflow_config("child_safe_general_v1", script)
+    )
+}
+
+#[cfg(feature = "guard")]
+fn workflow_alias_config_with_stdout_limit(
+    script: &Path,
+    alias_timeout_ms: u64,
+    max_stdout_bytes: usize,
+) -> String {
+    format!(
+        r#"
+[[model_aliases]]
+id = "family/child-safe-general-v1"
+kind = "workflow"
+workflow_id = "child_safe_general_v1"
+workflow_timeout_ms = {alias_timeout_ms}
+
+[workflows.child_safe_general_v1]
+runtime_kind = "stdio"
+command = "sh"
+args = ["{script}"]
+timeout_ms = 10000
+max_stdout_bytes = {max_stdout_bytes}
+"#,
+        script = script.display()
     )
 }
 
@@ -12746,6 +13340,55 @@ fn read_last_request_metadata_json(sqlite_path: &Path) -> String {
             |row| row.get(0),
         )
         .expect("request row should exist")
+}
+
+#[cfg(feature = "guard")]
+fn audit_row_count(sqlite_path: &Path, table: &str) -> u64 {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    let count: i64 = connection
+        .query_row(&sql, [], |row| row.get(0))
+        .expect("audit count query should succeed");
+    u64::try_from(count).expect("audit count should be nonnegative")
+}
+
+#[cfg(feature = "guard")]
+fn read_audit_text(sqlite_path: &Path) -> String {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let mut text = String::new();
+    append_audit_table_text(&connection, "requests", &mut text);
+    append_audit_table_text(&connection, "attempts", &mut text);
+    text
+}
+
+#[cfg(feature = "guard")]
+fn append_audit_table_text(connection: &Connection, table: &str, text: &mut String) {
+    let sql = format!(
+        "SELECT request_metadata_json, response_metadata_json, COALESCE(error_reason, '') \
+         FROM {table} ORDER BY rowid"
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .expect("audit text query should prepare");
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("audit text query should execute");
+    for row in rows {
+        let (request_metadata, response_metadata, error_reason) =
+            row.expect("audit text row should decode");
+        text.push_str(&request_metadata);
+        text.push('\n');
+        text.push_str(&response_metadata);
+        text.push('\n');
+        text.push_str(&error_reason);
+        text.push('\n');
+    }
 }
 
 fn repeated_input_chat_body() -> String {

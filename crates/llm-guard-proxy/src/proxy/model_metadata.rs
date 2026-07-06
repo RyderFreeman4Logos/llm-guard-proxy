@@ -21,7 +21,11 @@ pub(super) fn enrich_models_body(
         return body;
     };
 
-    let mut changed = false;
+    #[cfg(feature = "guard")]
+    let alias_changed = append_model_aliases(config, models);
+    #[cfg(not(feature = "guard"))]
+    let alias_changed = false;
+    let mut changed = alias_changed;
     for model in models {
         if let Some(record) = model.as_object_mut() {
             let metadata = metadata_for_model_record(config, selected_metadata, record);
@@ -125,6 +129,58 @@ fn push_model_once(model: Value, seen: &mut HashSet<String>, models: &mut Vec<Va
     if seen.insert(model_id.to_owned()) {
         models.push(model);
     }
+}
+
+#[cfg(feature = "guard")]
+fn append_model_aliases(config: &AppConfig, models: &mut Vec<Value>) -> bool {
+    let mut seen = models
+        .iter()
+        .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect::<HashSet<_>>();
+    let mut changed = false;
+    for alias in &config.model_aliases {
+        if seen.insert(alias.id.clone()) {
+            models.push(model_alias_record(alias));
+            changed = true;
+        }
+    }
+    changed
+}
+
+#[cfg(feature = "guard")]
+fn model_alias_record(alias: &llm_guard_proxy_core::ModelAliasConfig) -> Value {
+    use llm_guard_proxy_core::AliasKind;
+    let mut record = Map::new();
+    record.insert(String::from("id"), Value::String(alias.id.clone()));
+    record.insert(String::from("object"), Value::String(String::from("model")));
+    record.insert(
+        String::from("owned_by"),
+        Value::String(String::from("llm-guard-proxy")),
+    );
+    record.insert(String::from("llm_guard_proxy_alias"), Value::Bool(true));
+    record.insert(
+        String::from("alias_kind"),
+        Value::String(alias.kind.as_str().to_owned()),
+    );
+    match alias.kind {
+        AliasKind::Upstream => {
+            if let Some(profile) = &alias.upstream_profile {
+                record.insert(
+                    String::from("upstream_profile"),
+                    Value::String(profile.clone()),
+                );
+            }
+        }
+        AliasKind::Workflow => {
+            if let Some(workflow_id) = &alias.workflow_id {
+                record.insert(
+                    String::from("workflow_id"),
+                    Value::String(workflow_id.clone()),
+                );
+            }
+        }
+    }
+    Value::Object(record)
 }
 
 fn metadata_for_model_record<'config>(
