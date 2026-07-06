@@ -1,78 +1,320 @@
+################################################################################
+# llm-guard-proxy example configuration — GB10 deployment                     #
+#                                                                              #
+# This file documents every feature the proxy supports. Lines marked            #
+# "# DEFAULT-ON" are compiled by default; those marked "# OPT-IN (guard)"       #
+# require building with `--features guard`.                                    #
+#                                                                              #
+# Uncomment and adjust the values you need. All commented-out sections          #
+# show safe defaults — you only need to uncomment to change them.               #
+################################################################################
+
+## ───────────────────────── Server ───────────────────────────────────────────
+## Network listener and admission-control settings.
+
 [server]
+# Bind address. Use 0.0.0.0 for all interfaces, or a Tailscale IP for
+# tailnet-only access.
 bind_host = "100.105.4.92"
+
+# Port the proxy listens on.
 port = 18009
+
+# Maximum concurrent upstream inference requests. Additional requests are
+# queued up to max_queued_generation_requests.
 max_in_flight_requests = 16
+
+# Maximum concurrent control-plane requests (health, metrics, config snapshot).
 max_control_plane_in_flight_requests = 128
+
+# Maximum request body size in bytes (64 MiB). Protects against memory
+# exhaustion from large payloads.
 max_request_body_bytes = 67108864
 
+# ── Generation queue ──────────────────────────────────────────────────────────
+# When max_in_flight_requests is reached, new requests enter a bounded queue.
+
+# server.max_queued_generation_requests = 32
+# server.generation_queue_timeout_ms = 300000      # 5 min
+# server.generation_queue_full_status = 429         # HTTP status when queue full
+# server.generation_queue_retry_after_secs = 10
+
+## ───────────────────────── Upstream (single) ────────────────────────────────
+## The default upstream inference endpoint. For multi-upstream routing, use
+## the [upstreams.*] topology below instead.
+
 [upstream]
+# Base URL of the vLLM / inference server (must include /v1).
 base_url = "http://100.105.4.92:18010/v1"
+
+# Total request timeout including streaming (10 min).
 request_timeout_ms = 600000
+
+# ── Upstream stall detection ─────────────────────────────────────────────────
+# Detects stalled upstream connections (idle without producing tokens).
+
+[upstream.stall]
+# enabled = true
+# idle_timeout_ms = 30000                 # Abort after 30s of no tokens
+# recovery_command = ""                   # Shell command to restart upstream
+# recovery_timeout_ms = 300000            # Max wait for recovery command
+# recovery_cooldown_ms = 10000            # Cooldown between recovery attempts
+# recovery_budget_window_ms = 600000      # Budget window for recovery attempts
+# recovery_max_per_window = 3             # Max recovery attempts per window
+
+# ── Upstream metadata discovery ──────────────────────────────────────────────
+# Automatically discovers model metadata from /v1/models.
 
 [upstream.metadata]
 discovery_enabled = true
-enrich_responses = true
-refresh_interval_secs = 60
+enrich_responses = true                    # Add model info to response metadata
+refresh_interval_secs = 60                 # Re-discover every 60s
+# context_length_override = 0             # Override detected context length (0 = auto)
+# max_model_len_override = 0              # Override detected max model length
+# input_token_safety_margin = 512         # Tokens reserved for response
+
+## ───────────────────────── Upstream topology (multi-upstream) ───────────────
+## Define multiple upstream profiles for routing, load balancing, and
+## per-profile configuration. When defined, [upstream] becomes the default
+## fallback.
+
+# [upstreams.topology]
+# profiles = ["adult"]
+
+# ── Profile: adult ────────────────────────────────────────────────────────────
+# Each profile can have its own upstream URL, model, and feature overrides.
+
+# [upstream_profiles.adult]
+# base_url = "http://100.105.4.92:18010/v1"
+# request_timeout_ms = 600000
+# max_in_flight_requests = 16
+# max_queued_generation_requests = 32
+
+# [upstream_profiles.adult.metadata]
+# discovery_enabled = true
+# enrich_responses = true
+# refresh_interval_secs = 60
+
+# ── Hot-restart protection (DEFAULT-ON feature) ──────────────────────────────
+# When the upstream service restarts (~10 min), client requests are preserved
+# and retried after the service is truly ready. Readiness is verified via a
+# real chat completion probe (POST /v1/chat/completions with max_tokens=1),
+# NOT just /v1/models — because /v1/models can return 200 before the model
+# is actually loaded and ready to generate tokens.
+#
+# This feature is compiled by default. Disable per-profile if not needed.
+
+# [upstream_profiles.adult.hot_restart]
+# enabled = true                                        # DEFAULT: true
+# probe_max_tokens = 1                                  # Minimal tokens for probe
+# probe_interval_secs = 5                               # Poll every 5s during restart
+# probe_timeout_secs = 600                              # Give up after 10 min (600s)
+# probe_messages = [{"role" = "user", "content" = "1+1=?"}]
+# probe_chat_template_kwargs = {"enable_thinking" = false}
+
+# ── Parameter override (DEFAULT-ON feature) ──────────────────────────────────
+# Force-override inference parameters on incoming requests. Useful for
+# clients that send unreasonable parameters (e.g., temperature=2.0) and
+# can't/won't change their settings.
+#
+# When enabled and a parameter is set (non-null):
+#   - The proxy REPLACES the client's value with the configured value
+#   - If the parameter is missing from the request, it is ADDED
+#   - Only explicitly-set parameters are overridden; others pass through
+
+# [upstream_profiles.adult.param_override]
+# enabled = true                                        # DEFAULT: true
+# temperature = 0.6                                     # Override temperature
+# top_p = 0.95                                          # Override top_p
+# top_k = 40                                            # Override top_k
+# max_tokens = 8192                                     # Override/cap max_tokens
+# frequency_penalty = 0.0                               # Override frequency_penalty
+# presence_penalty = 0.0                                # Override presence_penalty
+
+## ───────────────────────── Shielding ────────────────────────────────────────
+## Shielded retry: when an upstream response looks broken (empty, repeated
+## tokens, truncated), the proxy transparently retries.
 
 [shielding]
 enabled = true
 
+## ───────────────────────── Observability ───────────────────────────────────
+## Request/response logging, metrics, and health probes.
+
 [observability]
 enabled = true
 sqlite_path = "/home/obj/.local/state/llm-guard-proxy/observability.sqlite3"
-capture_raw_payloads = false
-metrics_enabled = true
-health_upstream_probe_enabled = true
-health_upstream_probe_timeout_ms = 500
-debug_summary_enabled = false
-debug_summary_max_records = 20
+capture_raw_payloads = false               # Log full request/response bodies
+metrics_enabled = true                     # Expose /metrics endpoint
+health_upstream_probe_enabled = true       # Check upstream in /health
+health_upstream_probe_timeout_ms = 500     # Health probe timeout
+debug_summary_enabled = false              # Detailed per-request summaries
+debug_summary_max_records = 20             # Max debug summary records
+# debug_summary_admin_token = ""           # Token required for debug access
 
 [observability.retention]
-max_bytes = 1073741824
-prune_to_bytes = 805306368
-max_records = 100000
-prune_to_records = 80000
+max_bytes = 1073741824                     # 1 GiB max storage
+prune_to_bytes = 805306368                 # Prune to 768 MiB
+max_records = 100000                       # Max records
+prune_to_records = 80000                   # Prune to 80k records
+
+## ───────────────────────── Evidence store ──────────────────────────────────
+## Persistent evidence/audit trail for requests and responses.
+
+[evidence]
+# enabled = false
+# include_raw_payloads = false            # Store full request/response bodies
+# include_request_headers = false         # Store request headers
+# sqlite_path = ""                        # SQLite database path
+# blob_cache_dir = ""                     # Directory for large blobs
+
+# max_bytes = 536870912                   # 512 MiB
+# prune_to_bytes = 402653184              # Prune to 384 MiB
+# max_records = 50000
+# prune_to_records = 40000
+
+# ── Evidence shadow mode ─────────────────────────────────────────────────────
+# Shadow retries: run a retry in parallel without affecting the client
+# response, for evidence collection.
+
+# [evidence.shadow]
+# enabled = false
+# keep_looping_attempt_running = false    # Keep the original (looping) attempt running
+# parallel_downgrade_attempts = 1         # Parallel shadow attempts
+# max_shadow_attempts_per_request = 1
+# max_global_shadow_in_flight = 4
+# shadow_attempt_timeout_ms = 300000      # 5 min
+
+## ───────────────────────── Thinking (reasoning budget) ─────────────────────
+## Controls extended-thinking / reasoning token budgets for models that
+## support them (e.g., Qwen3, DeepSeek-R1).
 
 [thinking]
 enabled = true
 force_disable = false
-budget_tokens = 32768
+budget_tokens = 32768                      # Max thinking tokens per request
+# thinking_token_budget = 32768           # Alias for budget_tokens
+# budget_accounting = "canonical"         # How budget is communicated to model
+# max_tokens = 0                          # Max output tokens (0 = unlimited)
+
 # AEON/Qwen vLLM ignores canonical thinking.budget_tokens on plain OpenAI
 # payloads; inject chat_template_kwargs when no caller schema exists.
 default_injection_schema = "chat_template_kwargs"
-preserve_answer_budget = true
-tool_request_policy = "passthrough"
+preserve_answer_budget = true              # Don't let thinking eat answer budget
+tool_request_policy = "passthrough"        # How thinking applies to tool calls
+
 # ForceThinking defaults to overriding caller no-thinking markers. Set to
 # "respect_no_thinking_markers" only when caller latency/compatibility control
 # is more important than enforcing the proxy's quality budget. The
 # "escape_hatch_only" mode honors llm_guard_proxy_disable_thinking=true only.
 no_thinking_marker_policy = "force"
 
+## ───────────────────────── Loop guard ──────────────────────────────────────
+## Detects and mitigates infinite loops in model outputs (repeated tokens,
+## suffix cycles, low-progress responses).
+
 [loop_guard]
 enabled = true
-normalized_input_window_secs = 120
-max_repeated_inputs = 1
-output_repeated_line_threshold = 24
-output_token_window_size = 12
+normalized_input_window_secs = 120         # Dedup window for identical inputs
+max_repeated_inputs = 1                    # Max identical inputs before blocking
+output_repeated_line_threshold = 24        # Lines before loop detection triggers
+output_token_window_size = 12              # Token window for pattern detection
 output_repeated_token_window_threshold = 32
-output_suffix_cycle_threshold = 32
-output_low_progress_min_bytes = 4096
+output_suffix_cycle_threshold = 32         # Suffix cycle detection threshold
+output_low_progress_min_bytes = 4096       # Min bytes for low-progress check
 output_low_progress_unique_ratio_percent = 15
-input_overlap_threshold_multiplier = 4
+
+# Semantic loop detection: compares reasoning content embeddings to detect
+# semantically repetitive thinking (even if exact text differs).
 reasoning_semantic_detection_enabled = true
 reasoning_semantic_similarity_threshold_percent = 55
 reasoning_semantic_window_token_count = 24
 reasoning_semantic_minimum_token_count = 8
 reasoning_semantic_history_window_count = 16
 
+input_overlap_threshold_multiplier = 4     # Input/output overlap sensitivity
+
+## ───────────────────────── Retry ───────────────────────────────────────────
+## Retry policy for failed upstream requests.
+
 [retry]
 enabled = true
-max_attempts = 5
-anti_loop_hint_enabled = true
+max_attempts = 5                           # Max retry attempts per request
+anti_loop_hint_enabled = true              # Inject anti-loop hints on retry
+
+# ── Shielded streaming retry ─────────────────────────────────────────────────
+# Retry streaming requests that fail mid-stream.
+
+# retry.shielded_streaming_enabled = true
+# retry.downstream_drop_policy = "drop_on_success"  # When to drop downstream conn
+
+# ── Retry ladder ──────────────────────────────────────────────────────────────
+# Escalating delay between retries.
+
+# [[retry.ladder]]
+# delay_ms = 1000
+# jitter_ms = 500
+
+# [[retry.ladder]]
+# delay_ms = 5000
+# jitter_ms = 2000
+
+## ───────────────────────── Heartbeat ───────────────────────────────────────
+## SSE heartbeat to keep client connections alive during long generations.
 
 [heartbeat]
-mode = "sse"
-interval_secs = 15
+mode = "sse"                               # SSE keepalive comments
+interval_secs = 15                         # Send heartbeat every 15s
+
+## ───────────────────────── Cloudflare ──────────────────────────────────────
+## Cloudflare integration for external access.
 
 [cloudflare]
 enabled = true
+
+## ───────────────────────── OPT-IN: Guard features ──────────────────────────
+## The following sections require building with `--features guard`.
+## They provide GWP (Guard Workflow Protocol) hooks, caller profiles,
+## model aliases, and stdio workflow execution.
+##
+## When the guard feature is disabled, these config sections are silently
+## ignored during parsing.
+
+# ── Caller profiles ──────────────────────────────────────────────────────────
+# Define named profiles with model allowlists and daily request limits.
+
+# [profiles.adult_safe]
+# kind = "standard"
+# allowed_models = ["Qwen3-235B-A22B-Instruct-2507", "Qwen3-30B-A3B-Instruct-2507"]
+# daily_request_limit = 0                   # 0 = unlimited
+
+# ── Model aliases ────────────────────────────────────────────────────────────
+# Map client-requested model names to actual upstream models or workflows.
+
+# [[model_aliases]]
+# pattern = "gpt-4"
+# target_kind = "model"
+# target_model = "Qwen3-235B-A22B-Instruct-2507"
+
+# [[model_aliases]]
+# pattern = "child-safe"
+# target_kind = "workflow"
+# workflow_id = "child_safe_general.v1"
+# workflow_timeout_ms = 120000             # 2 min timeout (max: 600000)
+
+# ── Workflow definitions ────────────────────────────────────────────────────
+# Stdio workflows: external scripts invoked by the proxy for guard checks
+# or multi-step model orchestration.
+
+# [workflows."child_safe_general.v1"]
+# kind = "stdio"
+# command = "/opt/llm-guard-proxy/workflows/child_safe_general.sh"
+# timeout_ms = 120000                      # Kill workflow after 2 min
+
+# ── Guard workflows ──────────────────────────────────────────────────────────
+# Pre-request and post-response guard hooks using GWP protocol.
+
+# [guard_workflows]
+# pre_request = "content_filter.v1"         # Run before forwarding to upstream
+# post_response = "output_check.v1"         # Run after receiving response
+# fail_closed_blocks = true                 # Block request if guard errors
