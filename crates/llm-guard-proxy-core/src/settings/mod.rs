@@ -12,11 +12,13 @@ mod reload;
 mod tests;
 
 pub use error::{ConfigError, ConfigParseError, ValidationError};
+#[cfg(feature = "guard")]
+pub use model::GuardWorkflowConfig;
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, DefaultInjectionSchema, DownstreamDropPolicy,
-    EvidenceConfig, EvidenceShadowConfig, GuardWorkflowConfig, HeartbeatConfig, HeartbeatMode,
-    ListenerConfig, LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy,
-    ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
+    EvidenceConfig, EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, ListenerConfig,
+    LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig,
+    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
     SelectedUpstreamProfile, ServerConfig, ShieldingConfig, ThinkingConfig, ThinkingMode,
     ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
     UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
@@ -98,9 +100,6 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "retry.shielded_streaming_enabled",
     "retry.downstream_drop_policy",
     "retry.ladder",
-    "profiles",
-    "workflows",
-    "guard_workflows",
     "upstream.stall.enabled",
     "upstream.stall.idle_timeout_ms",
     "upstream.stall.recovery_command",
@@ -139,6 +138,16 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstreams.thinking.no_thinking_marker_policy",
     "upstreams.thinking.default_injection_schema",
     "upstreams.thinking.apply_to_tool_requests",
+    #[cfg(feature = "guard")]
+    "profiles",
+    #[cfg(feature = "guard")]
+    "model_aliases",
+    #[cfg(feature = "guard")]
+    "workflows",
+    #[cfg(feature = "guard")]
+    "guard_workflows.pre_request",
+    #[cfg(feature = "guard")]
+    "guard_workflows.post_response",
 ];
 
 /// Fields read at process startup that require a restart when changed.
@@ -146,9 +155,10 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "server.bind_host",
     "server.port",
     "listeners.topology",
-    "model_aliases.topology",
     "upstream.base_url",
     "upstreams.topology",
+    #[cfg(feature = "guard")]
+    "model_aliases.topology",
     "observability.sqlite_path",
     "evidence.sqlite_path",
     "evidence.blob_cache_dir",

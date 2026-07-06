@@ -16,11 +16,13 @@ use super::{
     RESTART_REQUIRED_FIELDS, ThinkingMode, ToolRequestThinkingPolicy, UpstreamRouteReason,
     ValidationError, parse::parse_config_text, redact_upstream_base_url,
 };
+#[cfg(feature = "guard")]
 use crate::{
     AliasKind, AliasTarget, DEFAULT_PROFILE_NAME, ModelAliasResolver, ProfileConfig, ProfileKind,
     ShieldedBuffering, WorkflowRuntime,
 };
 
+#[cfg(feature = "guard")]
 const FULL_OVERRIDE_CONFIG: &str = r#"
 [server]
 port = 18100
@@ -237,8 +239,11 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
     assert!(config.cloudflare.enabled);
     assert!(config.upstream_profiles.is_empty());
-    assert!(config.model_aliases.is_empty());
-    assert!(config.workflows.is_empty());
+    #[cfg(feature = "guard")]
+    {
+        assert!(config.model_aliases.is_empty());
+        assert!(config.workflows.is_empty());
+    }
     assert_eq!(config.default_upstream_profile().name, "default");
 }
 
@@ -619,6 +624,7 @@ match_models = ["fast-local"]
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn parses_and_resolves_model_aliases_from_config() {
     let config = parse_config_text(
         r#"
@@ -665,6 +671,7 @@ args = ["workflows/content_review.py"]
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn validates_model_alias_requirements() {
     for (contents, field) in [
         (
@@ -723,6 +730,7 @@ kind = "workflow"
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn parses_workflow_config_with_defaults_and_overrides() {
     let config = parse_config_text(
         r#"
@@ -774,6 +782,7 @@ max_stdout_bytes = 2048
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn rejects_invalid_workflow_config() {
     for (contents, field) in [
         (
@@ -821,6 +830,7 @@ max_stdout_bytes = 0
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn rejects_invalid_workflow_runtime_kind() {
     let error = parse_config_text(
         r#"
@@ -837,6 +847,7 @@ command = "python"
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn rejects_invalid_model_alias_kind() {
     let error = parse_config_text(
         r#"
@@ -953,6 +964,8 @@ context_length_override = 0
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+#[cfg(feature = "guard")]
 fn parses_toml_with_defaults_and_overrides() {
     let config = parse_config_text(FULL_OVERRIDE_CONFIG).expect("config should parse");
 
@@ -1003,16 +1016,21 @@ fn parses_toml_with_defaults_and_overrides() {
         config.upstream.metadata.max_model_len_override,
         Some(256_000)
     );
+    #[cfg(feature = "guard")]
     assert_parsed_model_aliases(&config);
-    assert_eq!(
-        config.guard_workflows.pre_request.as_deref(),
-        Some("family.child_safe_general.v1")
-    );
-    assert_eq!(
-        config.guard_workflows.post_response.as_deref(),
-        Some("family.child_safe_general.v1")
-    );
-    assert!(!config.guard_workflows.fail_closed_blocks);
+    #[cfg(feature = "guard")]
+    {
+        assert_eq!(
+            config.guard_workflows.pre_request.as_deref(),
+            Some("family.child_safe_general.v1")
+        );
+        assert_eq!(
+            config.guard_workflows.post_response.as_deref(),
+            Some("family.child_safe_general.v1")
+        );
+        assert!(!config.guard_workflows.fail_closed_blocks);
+    }
+    #[cfg(feature = "guard")]
     assert_parsed_profiles(&config);
     assert_parsed_observability_overrides(&config);
     assert!(config.evidence.enabled);
@@ -1055,6 +1073,7 @@ fn parses_toml_with_defaults_and_overrides() {
     assert!(!config.cloudflare.enabled);
 }
 
+#[cfg(feature = "guard")]
 fn assert_parsed_profiles(config: &AppConfig) {
     assert_eq!(config.profiles.len(), 2);
     let child = config
@@ -1088,6 +1107,7 @@ fn assert_parsed_profiles(config: &AppConfig) {
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn implicit_default_profile_exists_when_none_configured() {
     let config = AppConfig::default();
 
@@ -1101,6 +1121,7 @@ fn implicit_default_profile_exists_when_none_configured() {
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn validates_caller_profile_requirements() {
     for (contents, field) in [
         (
@@ -1132,6 +1153,7 @@ daily_request_limit = 0
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn validates_empty_caller_profile_name() {
     let mut config = AppConfig::default();
     config
@@ -1146,6 +1168,7 @@ fn validates_empty_caller_profile_name() {
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn duplicate_caller_profile_sections_fail_to_parse() {
     let error = parse_config_text(
         r#"
@@ -1165,6 +1188,7 @@ kind = "adult"
 }
 
 #[test]
+#[cfg(feature = "guard")]
 fn validates_guard_workflow_references() {
     let config = parse_config_text(
         r#"
@@ -1181,6 +1205,7 @@ pre_request = "missing.guard"
     assert_eq!(error.field(), "guard_workflows.pre_request");
 }
 
+#[cfg(feature = "guard")]
 fn assert_parsed_model_aliases(config: &AppConfig) {
     assert_eq!(config.model_aliases.len(), 2);
     assert_eq!(config.model_aliases[0].id, "gpt-default");
@@ -1412,6 +1437,7 @@ mode = "observe-everything"
     assert!(error.message().contains("enforce"));
 }
 
+#[cfg(feature = "guard")]
 fn assert_parsed_upstream_stall_overrides(config: &AppConfig) {
     assert!(config.upstream_stall.enabled);
     assert_eq!(config.upstream_stall.idle_timeout_ms, 5_000);
@@ -1430,6 +1456,7 @@ fn assert_parsed_upstream_stall_overrides(config: &AppConfig) {
     assert_eq!(config.upstream_stall.recovery_max_per_window, 1);
 }
 
+#[cfg(feature = "guard")]
 fn assert_parsed_retry_overrides(config: &AppConfig) {
     assert_eq!(config.retry.max_attempts, 3);
     assert!(!config.retry.anti_loop_hint_enabled);
@@ -1440,6 +1467,7 @@ fn assert_parsed_retry_overrides(config: &AppConfig) {
     );
 }
 
+#[cfg(feature = "guard")]
 fn assert_parsed_observability_overrides(config: &AppConfig) {
     assert!(!config.observability.metrics_enabled.is_enabled());
     assert!(
@@ -2458,6 +2486,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"retry.shielded_streaming_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.downstream_drop_policy"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.ladder"));
+    #[cfg(feature = "guard")]
     assert!(RELOADABLE_FIELDS.contains(&"profiles"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.metrics_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"observability.debug_summary_enabled"));
@@ -2487,6 +2516,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstreams.topology"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"listeners.topology"));
+    #[cfg(feature = "guard")]
     assert!(RESTART_REQUIRED_FIELDS.contains(&"model_aliases.topology"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"observability.sqlite_path"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"evidence.sqlite_path"));
