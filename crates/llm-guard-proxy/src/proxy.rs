@@ -30,6 +30,12 @@ use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::HotRestartConfig;
 #[cfg(feature = "param-override")]
 use llm_guard_proxy_core::ParamOverrideConfig;
+#[cfg(feature = "guard")]
+use llm_guard_proxy_core::{
+    AliasTarget, DEFAULT_PROFILE_NAME, GWP_PROTOCOL_VERSION, GuardExecutor, GuardOutcome,
+    GwpDecision, GwpHook, GwpInvocation, GwpResult, GwpTraceMode, ModelAliasResolver,
+    ProfileConfig, StdioRuntime,
+};
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
     DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
@@ -40,8 +46,6 @@ use llm_guard_proxy_core::{
     ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode, UpstreamProfileConfig,
     UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
-#[cfg(feature = "guard")]
-use llm_guard_proxy_core::{DEFAULT_PROFILE_NAME, GuardExecutor, GuardOutcome, ProfileConfig};
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;
@@ -1781,6 +1785,22 @@ async fn forward_openai_request(
         prepare_openai_forward_request(state, &config, &method, &uri, &body, &mut request_metadata)
             .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     #[cfg(feature = "guard")]
+    if let Some(workflow_alias) = prepared_request.workflow_alias.clone() {
+        return handle_workflow_alias_request(WorkflowAliasRequestContext {
+            state,
+            config: &config,
+            request_id,
+            started_at_unix_ms,
+            requested_model: prepared_request.model_id.as_deref().unwrap_or_default(),
+            request_body: prepared_request.shielded_chat_plan.downstream_body.clone(),
+            caller_profile: prepared_request.caller_profile.clone(),
+            workflow_alias,
+            request_metadata,
+            in_flight_permit,
+        })
+        .await;
+    }
+    #[cfg(feature = "guard")]
     apply_pre_request_guard(&config, request_id, &mut prepared_request)
         .await
         .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
@@ -1966,11 +1986,20 @@ struct PreparedOpenAiRequest {
     model_id: Option<String>,
     #[cfg(feature = "guard")]
     caller_profile: ProfileConfig,
+    #[cfg(feature = "guard")]
+    workflow_alias: Option<ResolvedWorkflowAlias>,
     upstream_profile: UpstreamProfileConfig,
     route_reason: UpstreamRouteReason,
     upstream_url: Url,
     reqwest_method: reqwest::Method,
     shielded_chat_plan: ShieldedChatPlan,
+}
+
+#[cfg(feature = "guard")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedWorkflowAlias {
+    workflow_id: String,
+    timeout_ms: u64,
 }
 
 fn prepare_openai_forward_request(
@@ -1986,6 +2015,8 @@ fn prepare_openai_forward_request(
     let caller_profile = config
         .caller_profile_by_name(DEFAULT_PROFILE_NAME)
         .unwrap_or_else(|| config.default_caller_profile());
+    #[cfg(feature = "guard")]
+    let workflow_alias = workflow_alias_for_model(config, model_id.as_deref())?;
     let selected_profile =
         select_profile_for_request(config, &state.listener, method, uri, model_id.as_deref())?;
     let upstream_profile = selected_profile.profile;
@@ -2022,6 +2053,8 @@ fn prepare_openai_forward_request(
         model_id,
         #[cfg(feature = "guard")]
         caller_profile,
+        #[cfg(feature = "guard")]
+        workflow_alias,
         upstream_profile,
         route_reason,
         upstream_url,
@@ -2148,6 +2181,220 @@ fn insert_u32_override(
 ) {
     if let Some(value) = value {
         object.insert(field.to_owned(), serde_json::Value::Number(value.into()));
+    }
+}
+
+#[cfg(feature = "guard")]
+struct WorkflowAliasRequestContext<'request> {
+    state: &'request ProxyState,
+    config: &'request AppConfig,
+    request_id: &'request RequestId,
+    started_at_unix_ms: u64,
+    requested_model: &'request str,
+    request_body: Bytes,
+    caller_profile: ProfileConfig,
+    workflow_alias: ResolvedWorkflowAlias,
+    request_metadata: BTreeMap<String, String>,
+    in_flight_permit: InFlightPermit,
+}
+
+#[cfg(feature = "guard")]
+async fn handle_workflow_alias_request(
+    context: WorkflowAliasRequestContext<'_>,
+) -> Result<Response<Body>, ProxyError> {
+    let messages = chat_messages_from_body(&context.request_body).unwrap_or_default();
+    let invocation = GwpInvocation {
+        protocol_version: GWP_PROTOCOL_VERSION.to_owned(),
+        hook: GwpHook::PreRequestGuard,
+        request_id: context.request_id.to_string(),
+        profile: context.caller_profile.to_gwp_profile(DEFAULT_PROFILE_NAME),
+        model_alias: context.requested_model.to_owned(),
+        messages,
+        policy: serde_json::Value::Null,
+        budgets: json!({
+            "timeout_ms": context.workflow_alias.timeout_ms
+        }),
+        trace_mode: GwpTraceMode::Redacted,
+    };
+    let workflow_config = workflow_config_for_alias(context.config, &context.workflow_alias)?;
+    let workflow_id = context.workflow_alias.workflow_id.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        StdioRuntime::new(workflow_config).execute(&invocation)
+    })
+    .await
+    .map_err(|error| ProxyError::guard_blocked(format!("workflow worker failed: {error}")))?;
+
+    let workflow_output = workflow_alias_content_from_result(&workflow_id, result)?;
+    let body = workflow_alias_chat_completion_body(
+        context.request_id,
+        context.requested_model,
+        &workflow_output,
+    );
+    record_workflow_alias_success(
+        context.state,
+        context.request_id,
+        context.started_at_unix_ms,
+        context.requested_model,
+        &context.workflow_alias,
+        context.request_metadata,
+        body.len(),
+    );
+    drop(context.in_flight_permit);
+    Ok(json_response(StatusCode::OK, body))
+}
+
+#[cfg(feature = "guard")]
+fn workflow_config_for_alias(
+    config: &AppConfig,
+    workflow_alias: &ResolvedWorkflowAlias,
+) -> Result<llm_guard_proxy_core::WorkflowConfig, ProxyError> {
+    let mut workflow_config = config
+        .workflows
+        .get(&workflow_alias.workflow_id)
+        .cloned()
+        .ok_or_else(|| {
+            ProxyError::guard_blocked(format!(
+                "workflow alias references unconfigured workflow {:?}",
+                workflow_alias.workflow_id
+            ))
+        })?;
+    workflow_config.timeout_ms = workflow_alias.timeout_ms;
+    Ok(workflow_config)
+}
+
+#[cfg(feature = "guard")]
+fn workflow_alias_content_from_result(
+    workflow_id: &str,
+    result: GwpResult,
+) -> Result<String, ProxyError> {
+    match result.decision {
+        GwpDecision::Replace => workflow_replacement_content(result.replacement_messages)
+            .ok_or_else(|| {
+                ProxyError::guard_blocked(format!(
+                    "workflow alias {workflow_id:?} returned replace without assistant content"
+                ))
+            }),
+        GwpDecision::Block => Err(ProxyError::guard_blocked(result.summary)),
+        GwpDecision::Allow | GwpDecision::DeferToParent => Err(ProxyError::guard_blocked(format!(
+            "workflow alias {workflow_id:?} did not return replacement content: {}",
+            result.summary
+        ))),
+        GwpDecision::ErrorFailClosed => Err(ProxyError::guard_blocked(format!(
+            "workflow alias {workflow_id:?} failed closed: {}",
+            result.summary
+        ))),
+    }
+}
+
+#[cfg(feature = "guard")]
+fn workflow_replacement_content(messages: Option<Vec<serde_json::Value>>) -> Option<String> {
+    messages?.into_iter().find_map(|message| match message {
+        serde_json::Value::String(content) if !content.is_empty() => Some(content),
+        serde_json::Value::Object(object) => object
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .filter(|content| !content.is_empty())
+            .map(str::to_owned),
+        _ => None,
+    })
+}
+
+#[cfg(feature = "guard")]
+fn workflow_alias_chat_completion_body(
+    request_id: &RequestId,
+    requested_model: &str,
+    workflow_output: &str,
+) -> String {
+    json!({
+        "id": format!("chatcmpl-{request_id}"),
+        "object": "chat.completion",
+        "created": unix_time_secs(),
+        "model": requested_model,
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": workflow_output
+            },
+            "finish_reason": "stop"
+        }],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0
+        }
+    })
+    .to_string()
+}
+
+#[cfg(feature = "guard")]
+fn record_workflow_alias_success(
+    state: &ProxyState,
+    request_id: &RequestId,
+    started_at_unix_ms: u64,
+    requested_model: &str,
+    workflow_alias: &ResolvedWorkflowAlias,
+    mut request_metadata: BTreeMap<String, String>,
+    body_len: usize,
+) {
+    let finished_at_unix_ms = unix_time_millis();
+    request_metadata.insert(String::from("workflow_alias"), String::from("true"));
+    request_metadata.insert(
+        String::from("workflow_id"),
+        workflow_alias.workflow_id.clone(),
+    );
+    request_metadata.insert(
+        String::from("workflow_timeout_ms"),
+        workflow_alias.timeout_ms.to_string(),
+    );
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let request_record = RequestRecord {
+        request_id: request_id.clone(),
+        started_at_unix_ms,
+        finished_at_unix_ms: Some(finished_at_unix_ms),
+        downstream_mode: DownstreamMode::NonStreamJson,
+        upstream_mode: UpstreamMode::NotApplicable,
+        model_id: Some(requested_model.to_owned()),
+        input_fingerprint: None,
+        status: RequestStatus::Succeeded,
+        http_status: Some(StatusCode::OK.as_u16()),
+        error_reason: None,
+        abort_reason: None,
+        request_metadata,
+        response_metadata: response_metadata(
+            StatusCode::OK,
+            &headers,
+            usize_to_u64(body_len),
+            finished_at_unix_ms.saturating_sub(started_at_unix_ms),
+        ),
+        raw_payloads: RawPayloads::default(),
+    };
+    record_observability_many(&state.store, &request_record, &[]);
+}
+
+#[cfg(feature = "guard")]
+fn workflow_alias_for_model(
+    config: &AppConfig,
+    model: Option<&str>,
+) -> Result<Option<ResolvedWorkflowAlias>, ProxyError> {
+    let Some(model) = normalized_model_id(model) else {
+        return Ok(None);
+    };
+    let resolver = ModelAliasResolver::new(config.model_aliases.clone());
+    if !resolver.is_alias(model) {
+        return Ok(None);
+    }
+    match resolver.resolve(model) {
+        Ok(AliasTarget::Workflow {
+            workflow_id,
+            timeout_ms,
+        }) => Ok(Some(ResolvedWorkflowAlias {
+            workflow_id,
+            timeout_ms,
+        })),
+        Ok(AliasTarget::Upstream { .. }) => Ok(None),
+        Err(error) => Err(ProxyError::guard_blocked(error.to_string())),
     }
 }
 
@@ -2403,6 +2650,10 @@ fn select_allowed_upstream_profile(
     listener: &ListenerConfig,
     model: Option<&str>,
 ) -> Result<SelectedUpstreamProfile, ListenerUpstreamDenied> {
+    #[cfg(feature = "guard")]
+    if let Some(selected) = select_profile_from_model_alias(config, listener, model)? {
+        return Ok(selected);
+    }
     let selected = config.select_upstream_profile(model);
     if listener.allows_upstream(&selected.profile.name) {
         return Ok(selected);
@@ -2413,6 +2664,53 @@ fn select_allowed_upstream_profile(
         upstream_profile: selected.profile.name,
         model_id: denied_model_id_summary(model),
     })
+}
+
+#[cfg(feature = "guard")]
+fn select_profile_from_model_alias(
+    config: &AppConfig,
+    listener: &ListenerConfig,
+    model: Option<&str>,
+) -> Result<Option<SelectedUpstreamProfile>, ListenerUpstreamDenied> {
+    let Some(model) = normalized_model_id(model) else {
+        return Ok(None);
+    };
+    let resolver = ModelAliasResolver::new(config.model_aliases.clone());
+    if !resolver.is_alias(model) {
+        return Ok(None);
+    }
+    let target = match resolver.resolve(model) {
+        Ok(target) => target,
+        Err(_error) => return Ok(None),
+    };
+    match target {
+        AliasTarget::Upstream { profile_name } => {
+            let Some(profile) = config.upstream_profile_by_name(&profile_name) else {
+                return Ok(None);
+            };
+            if listener.allows_upstream(&profile.name) {
+                return Ok(Some(SelectedUpstreamProfile {
+                    profile,
+                    route_reason: UpstreamRouteReason::MatchedModel,
+                }));
+            }
+            Err(ListenerUpstreamDenied {
+                listener_name: listener.name.clone(),
+                listener_port: listener.port,
+                upstream_profile: profile.name,
+                model_id: denied_model_id_summary(Some(model)),
+            })
+        }
+        AliasTarget::Workflow { .. } => Ok(Some(SelectedUpstreamProfile {
+            profile: config.default_upstream_profile(),
+            route_reason: UpstreamRouteReason::MatchedModel,
+        })),
+    }
+}
+
+#[cfg(feature = "guard")]
+fn normalized_model_id(model: Option<&str>) -> Option<&str> {
+    model.map(str::trim).filter(|model| !model.is_empty())
 }
 
 fn denied_model_id_summary(model: Option<&str>) -> String {
@@ -8175,6 +8473,11 @@ fn unix_time_millis() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis());
     u64::try_from(millis).unwrap_or(u64::MAX)
+}
+
+#[cfg(feature = "guard")]
+fn unix_time_secs() -> u64 {
+    unix_time_millis() / 1_000
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
