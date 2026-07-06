@@ -32,9 +32,10 @@ use llm_guard_proxy_core::HotRestartConfig;
 use llm_guard_proxy_core::ParamOverrideConfig;
 #[cfg(feature = "guard")]
 use llm_guard_proxy_core::{
-    AliasTarget, BlockReason, DEFAULT_PROFILE_NAME, GWP_PROTOCOL_VERSION, GuardExecutor,
-    GuardOutcome, GwpDecision, GwpHook, GwpInvocation, GwpResult, GwpTraceMode, ModelAliasResolver,
-    ProfileCheckResult, ProfileConfig, StdioRuntime, UnknownKeyPolicy,
+    AliasTarget, BlockReason, BudgetError, BudgetStore, DEFAULT_PROFILE_NAME, GWP_PROTOCOL_VERSION,
+    GuardExecutor, GuardOutcome, GwpDecision, GwpHook, GwpInvocation, GwpResult, GwpTraceMode,
+    ModelAliasResolver, ProfileCheckResult, ProfileConfig, StdioRuntime, UnknownKeyPolicy,
+    current_budget_date,
 };
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
@@ -82,6 +83,8 @@ pub(crate) struct ProxyState {
     listener: ListenerConfig,
     store: ObservabilityStore,
     evidence_store: EvidenceStore,
+    #[cfg(feature = "guard")]
+    budget_store: Arc<BudgetStore>,
     client: Client,
     generation_requests: Arc<InFlightLimiter>,
     generation_body_routing_requests: Arc<InFlightLimiter>,
@@ -102,6 +105,7 @@ impl ProxyState {
         config_path: PathBuf,
         store: ObservabilityStore,
         evidence_store: EvidenceStore,
+        #[cfg(feature = "guard")] budget_store: Arc<BudgetStore>,
         client: Client,
     ) -> Self {
         Self {
@@ -115,6 +119,8 @@ impl ProxyState {
             },
             store,
             evidence_store,
+            #[cfg(feature = "guard")]
+            budget_store,
             client,
             generation_requests: Arc::new(InFlightLimiter::default()),
             generation_body_routing_requests: Arc::new(InFlightLimiter::default()),
@@ -2053,6 +2059,8 @@ fn prepare_openai_forward_request(
     #[cfg(feature = "guard")]
     enforce_caller_profile_policy(&caller_profile, model_id.as_deref())?;
     #[cfg(feature = "guard")]
+    enforce_caller_profile_budget(state, config, &caller_profile)?;
+    #[cfg(feature = "guard")]
     let workflow_alias = workflow_alias_for_model(config, model_id.as_deref())?;
     let selected_profile =
         select_profile_for_request(config, &state.listener, method, uri, model_id.as_deref())?;
@@ -2100,6 +2108,38 @@ fn prepare_openai_forward_request(
         reqwest_method,
         shielded_chat_plan,
     })
+}
+
+#[cfg(feature = "guard")]
+fn enforce_caller_profile_budget(
+    state: &ProxyState,
+    config: &AppConfig,
+    caller_profile: &ResolvedCallerProfile,
+) -> Result<(), ProxyError> {
+    let limit = caller_profile.config.daily_request_limit;
+    if !config.budget.enabled || limit == 0 {
+        return Ok(());
+    }
+    let date = current_budget_date(config.budget.reset_hour_utc);
+    let check = state
+        .budget_store
+        .check_and_increment(&caller_profile.name, &date, limit)
+        .map_err(|error| {
+            ProxyError::budget_store_failed(&error).with_request_metadata(BTreeMap::from([
+                (String::from("caller_profile"), caller_profile.name.clone()),
+                (String::from("budget_date"), date.clone()),
+                (String::from("budget_limit"), limit.to_string()),
+            ]))
+        })?;
+    if check.allowed {
+        return Ok(());
+    }
+    Err(ProxyError::budget_exceeded(
+        caller_profile.name.clone(),
+        date,
+        check.current_count,
+        check.limit,
+    ))
 }
 
 #[cfg(feature = "guard")]
@@ -8754,6 +8794,23 @@ enum ProxyError {
     VirtualKeyUnauthorized {
         request_metadata: Option<BTreeMap<String, String>>,
     },
+    #[cfg(feature = "guard")]
+    #[error(
+        "daily request budget exceeded for profile {profile}: count={current_count} limit={limit} date={date}"
+    )]
+    BudgetExceeded {
+        profile: String,
+        date: String,
+        current_count: u64,
+        limit: u64,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
+    #[cfg(feature = "guard")]
+    #[error("budget store failed: {reason}")]
+    BudgetStoreFailure {
+        reason: String,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
     #[error("upstream request failed: {failure}")]
     UpstreamTransport {
         failure: ReqwestFailureKind,
@@ -8842,6 +8899,34 @@ impl ProxyError {
         }
     }
 
+    #[cfg(feature = "guard")]
+    fn budget_exceeded(profile: String, date: String, current_count: u64, limit: u64) -> Self {
+        Self::BudgetExceeded {
+            request_metadata: Some(BTreeMap::from([
+                (String::from("caller_profile"), profile.clone()),
+                (String::from("budget_date"), date.clone()),
+                (String::from("budget_count"), current_count.to_string()),
+                (String::from("budget_limit"), limit.to_string()),
+                (
+                    String::from("budget_outcome"),
+                    String::from("limit_exceeded"),
+                ),
+            ])),
+            profile,
+            date,
+            current_count,
+            limit,
+        }
+    }
+
+    #[cfg(feature = "guard")]
+    fn budget_store_failed(reason: &BudgetError) -> Self {
+        Self::BudgetStoreFailure {
+            reason: reason.to_string(),
+            request_metadata: None,
+        }
+    }
+
     fn context_budget_exceeded(estimate: ContextBudgetEstimate) -> Self {
         Self::ContextBudgetExceeded {
             message: estimate.message(),
@@ -8861,6 +8946,10 @@ impl ProxyError {
             Self::Admission { failure, .. } => failure.status(),
             #[cfg(feature = "guard")]
             Self::VirtualKeyUnauthorized { .. } => StatusCode::UNAUTHORIZED,
+            #[cfg(feature = "guard")]
+            Self::BudgetExceeded { .. } => StatusCode::TOO_MANY_REQUESTS,
+            #[cfg(feature = "guard")]
+            Self::BudgetStoreFailure { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             #[cfg(feature = "guard")]
             Self::GuardBlocked { .. } => StatusCode::FORBIDDEN,
             Self::ListenerUpstreamDenied { .. } | Self::ContextBudgetExceeded { .. } => {
@@ -8882,6 +8971,10 @@ impl ProxyError {
             #[cfg(feature = "guard")]
             Self::VirtualKeyUnauthorized { .. } => "virtual_key_unauthorized",
             #[cfg(feature = "guard")]
+            Self::BudgetExceeded { .. } => "budget_exhausted",
+            #[cfg(feature = "guard")]
+            Self::BudgetStoreFailure { .. } => "budget_store_failed",
+            #[cfg(feature = "guard")]
             Self::GuardBlocked { .. } => "guard_blocked",
             Self::ContextBudgetExceeded { .. } => "invalid_request_error",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
@@ -8891,43 +8984,6 @@ impl ProxyError {
 
     fn request_metadata(&self) -> Option<&BTreeMap<String, String>> {
         match self {
-            Self::RequestBody {
-                request_metadata: Some(request_metadata),
-                ..
-            }
-            | Self::ConfigSnapshot {
-                request_metadata: Some(request_metadata),
-                ..
-            }
-            | Self::InvalidUpstreamUrl {
-                request_metadata: Some(request_metadata),
-                ..
-            }
-            | Self::InvalidMethod {
-                request_metadata: Some(request_metadata),
-                ..
-            }
-            | Self::Admission {
-                request_metadata: Some(request_metadata),
-                ..
-            }
-            | Self::ListenerUpstreamDenied {
-                request_metadata: Some(request_metadata),
-                ..
-            }
-            | Self::ContextBudgetExceeded {
-                request_metadata: Some(request_metadata),
-                ..
-            } => Some(request_metadata),
-            #[cfg(feature = "guard")]
-            Self::GuardBlocked {
-                request_metadata: Some(request_metadata),
-                ..
-            } => Some(request_metadata),
-            #[cfg(feature = "guard")]
-            Self::VirtualKeyUnauthorized {
-                request_metadata: Some(request_metadata),
-            } => Some(request_metadata),
             Self::UpstreamTransport {
                 observability: Some(observability),
                 ..
@@ -8936,52 +8992,58 @@ impl ProxyError {
                 observability: Some(observability),
                 ..
             } => Some(&observability.request_metadata),
-            Self::RequestBody {
-                request_metadata: None,
-                ..
-            }
-            | Self::ConfigSnapshot {
-                request_metadata: None,
-                ..
-            }
-            | Self::InvalidUpstreamUrl {
-                request_metadata: None,
-                ..
-            }
-            | Self::InvalidRequestPath(_)
-            | Self::InvalidMethod {
-                request_metadata: None,
-                ..
-            }
-            | Self::Admission {
-                request_metadata: None,
-                ..
-            }
-            | Self::ListenerUpstreamDenied {
-                request_metadata: None,
-                ..
-            }
-            | Self::ContextBudgetExceeded {
-                request_metadata: None,
-                ..
-            }
-            | Self::UpstreamTransport {
+            Self::UpstreamTransport {
                 observability: None,
                 ..
             }
             | Self::UpstreamBody {
                 observability: None,
                 ..
-            } => None,
+            }
+            | Self::InvalidRequestPath(_) => None,
+            _ => self.direct_request_metadata(),
+        }
+    }
+
+    fn direct_request_metadata(&self) -> Option<&BTreeMap<String, String>> {
+        match self {
+            Self::RequestBody {
+                request_metadata, ..
+            }
+            | Self::ConfigSnapshot {
+                request_metadata, ..
+            }
+            | Self::InvalidUpstreamUrl {
+                request_metadata, ..
+            }
+            | Self::InvalidMethod {
+                request_metadata, ..
+            }
+            | Self::Admission {
+                request_metadata, ..
+            }
+            | Self::ListenerUpstreamDenied {
+                request_metadata, ..
+            }
+            | Self::ContextBudgetExceeded {
+                request_metadata, ..
+            } => request_metadata.as_ref(),
             #[cfg(feature = "guard")]
             Self::GuardBlocked {
-                request_metadata: None,
-                ..
-            } => None,
+                request_metadata, ..
+            } => request_metadata.as_ref(),
             #[cfg(feature = "guard")]
-            Self::VirtualKeyUnauthorized {
-                request_metadata: None,
-            } => None,
+            Self::VirtualKeyUnauthorized { request_metadata } => request_metadata.as_ref(),
+            #[cfg(feature = "guard")]
+            Self::BudgetExceeded {
+                request_metadata, ..
+            }
+            | Self::BudgetStoreFailure {
+                request_metadata, ..
+            } => request_metadata.as_ref(),
+            Self::InvalidRequestPath(_)
+            | Self::UpstreamTransport { .. }
+            | Self::UpstreamBody { .. } => None,
         }
     }
 
@@ -9016,7 +9078,10 @@ impl ProxyError {
                 ..
             } => Vec::new(),
             #[cfg(feature = "guard")]
-            Self::GuardBlocked { .. } | Self::VirtualKeyUnauthorized { .. } => Vec::new(),
+            Self::GuardBlocked { .. }
+            | Self::VirtualKeyUnauthorized { .. }
+            | Self::BudgetExceeded { .. }
+            | Self::BudgetStoreFailure { .. } => Vec::new(),
         }
     }
 
@@ -9081,6 +9146,29 @@ impl ProxyError {
                     request_metadata: Some(merged),
                 }
             }
+            #[cfg(feature = "guard")]
+            Self::BudgetExceeded {
+                profile,
+                date,
+                current_count,
+                limit,
+                request_metadata: existing_metadata,
+            } => {
+                let mut merged = existing_metadata.unwrap_or_default();
+                merged.extend(request_metadata);
+                Self::BudgetExceeded {
+                    profile,
+                    date,
+                    current_count,
+                    limit,
+                    request_metadata: Some(merged),
+                }
+            }
+            #[cfg(feature = "guard")]
+            Self::BudgetStoreFailure { reason, .. } => Self::BudgetStoreFailure {
+                reason,
+                request_metadata: Some(request_metadata),
+            },
             error @ (Self::InvalidRequestPath(_)
             | Self::UpstreamTransport { .. }
             | Self::UpstreamBody { .. }) => error,
@@ -9118,7 +9206,10 @@ impl ProxyError {
             | Self::ListenerUpstreamDenied { .. }
             | Self::ContextBudgetExceeded { .. }) => error,
             #[cfg(feature = "guard")]
-            error @ (Self::GuardBlocked { .. } | Self::VirtualKeyUnauthorized { .. }) => error,
+            error @ (Self::GuardBlocked { .. }
+            | Self::VirtualKeyUnauthorized { .. }
+            | Self::BudgetExceeded { .. }
+            | Self::BudgetStoreFailure { .. }) => error,
         }
     }
 

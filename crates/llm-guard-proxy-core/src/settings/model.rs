@@ -55,6 +55,9 @@ pub struct AppConfig {
     /// Virtual key to caller profile mapping.
     #[cfg(feature = "guard")]
     pub virtual_keys: VirtualKeyConfig,
+    /// Daily request budget counter settings.
+    #[cfg(feature = "guard")]
+    pub budget: BudgetConfig,
     /// Configured guard workflows.
     #[cfg(feature = "guard")]
     pub workflows: HashMap<String, WorkflowConfig>,
@@ -97,6 +100,7 @@ impl AppConfig {
             self.validate_model_aliases()?;
             self.validate_profiles()?;
             self.validate_virtual_keys()?;
+            self.budget.validate()?;
             self.validate_workflows()?;
             self.validate_guard_workflows()?;
         }
@@ -372,13 +376,6 @@ impl AppConfig {
                     )?;
                 }
             }
-            if let Some(limit) = profile.daily_request_limit {
-                require(
-                    limit > 0,
-                    "profiles.daily_request_limit",
-                    "must be greater than zero when set",
-                )?;
-            }
             if let Some(guard_pack) = &profile.guard_pack {
                 require(
                     !guard_pack.trim().is_empty(),
@@ -632,6 +629,11 @@ impl AppConfig {
         {
             self.profiles.clone_from(&requested.profiles);
             self.virtual_keys.clone_from(&requested.virtual_keys);
+            self.budget.enabled = requested.budget.enabled;
+            self.budget
+                .reset_timezone
+                .clone_from(&requested.budget.reset_timezone);
+            self.budget.reset_hour_utc = requested.budget.reset_hour_utc;
             self.workflows.clone_from(&requested.workflows);
             self.guard_workflows.clone_from(&requested.guard_workflows);
         }
@@ -699,6 +701,13 @@ impl AppConfig {
             "evidence.blob_cache_dir",
             self.evidence.blob_cache_dir.display().to_string(),
             requested.evidence.blob_cache_dir.display().to_string(),
+        );
+        #[cfg(feature = "guard")]
+        push_change(
+            &mut changes,
+            "budget.sqlite_path",
+            self.budget.sqlite_path.clone(),
+            requested.budget.sqlite_path.clone(),
         );
         changes
     }
@@ -854,6 +863,53 @@ impl Default for VirtualKeyConfig {
             enabled: false,
             unknown_key_policy: UnknownKeyPolicy::UseDefaultProfile,
             keys: HashMap::new(),
+        }
+    }
+}
+
+/// Daily request budget counter settings.
+#[cfg(feature = "guard")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BudgetConfig {
+    /// Enables per-profile daily request counting and enforcement.
+    pub enabled: bool,
+    /// `SQLite` path for persisted budget counters.
+    pub sqlite_path: String,
+    /// Reset timezone. Only UTC is supported initially.
+    pub reset_timezone: String,
+    /// UTC hour when a new budget day starts.
+    pub reset_hour_utc: u32,
+}
+
+#[cfg(feature = "guard")]
+impl BudgetConfig {
+    fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            !self.sqlite_path.trim().is_empty(),
+            "budget.sqlite_path",
+            "must not be empty",
+        )?;
+        require(
+            self.reset_timezone == "UTC",
+            "budget.reset_timezone",
+            "only UTC is supported",
+        )?;
+        require(
+            self.reset_hour_utc <= 23,
+            "budget.reset_hour_utc",
+            "must be between 0 and 23",
+        )
+    }
+}
+
+#[cfg(feature = "guard")]
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sqlite_path: String::from("~/.local/state/llm-guard-proxy/budget.sqlite3"),
+            reset_timezone: String::from("UTC"),
+            reset_hour_utc: 0,
         }
     }
 }

@@ -12,8 +12,6 @@ mod reload;
 mod tests;
 
 pub use error::{ConfigError, ConfigParseError, ValidationError};
-#[cfg(feature = "guard")]
-pub use model::GuardWorkflowConfig;
 #[cfg(feature = "param-override")]
 pub use model::ParamOverrideConfig;
 pub use model::{
@@ -25,6 +23,8 @@ pub use model::{
     ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamRouteReason,
     UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
+#[cfg(feature = "guard")]
+pub use model::{BudgetConfig, GuardWorkflowConfig};
 #[cfg(feature = "guard")]
 pub use model::{UnknownKeyPolicy, VirtualKeyConfig};
 pub use reload::{
@@ -173,6 +173,12 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     #[cfg(feature = "guard")]
     "virtual_keys",
     #[cfg(feature = "guard")]
+    "budget.enabled",
+    #[cfg(feature = "guard")]
+    "budget.reset_timezone",
+    #[cfg(feature = "guard")]
+    "budget.reset_hour_utc",
+    #[cfg(feature = "guard")]
     "model_aliases",
     #[cfg(feature = "guard")]
     "workflows",
@@ -194,4 +200,6 @@ pub const RESTART_REQUIRED_FIELDS: &[&str] = &[
     "observability.sqlite_path",
     "evidence.sqlite_path",
     "evidence.blob_cache_dir",
+    #[cfg(feature = "guard")]
+    "budget.sqlite_path",
 ];
