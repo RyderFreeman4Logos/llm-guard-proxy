@@ -7,6 +7,8 @@ use crate::profile::{ProfileConfig, ProfileKind, ShieldedBuffering};
 #[cfg(feature = "guard")]
 use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
+#[cfg(feature = "param-override")]
+use super::ParamOverrideConfig;
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DefaultInjectionSchema,
     DownstreamDropPolicy, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
@@ -28,6 +30,8 @@ enum Section {
     UpstreamProfileMetadata(usize),
     UpstreamProfileHotRestart(usize),
     UpstreamProfileThinking(usize),
+    #[cfg(feature = "param-override")]
+    UpstreamProfileParamOverride(usize),
     #[cfg(feature = "guard")]
     ModelAlias(usize),
     #[cfg(feature = "guard")]
@@ -223,6 +227,16 @@ fn parse_section(
             },
             |index| Ok(Section::UpstreamProfileThinking(index)),
         ),
+        #[cfg(feature = "param-override")]
+        "upstreams.param_override" => current_upstream_profile.map_or_else(
+            || {
+                Err(ConfigParseError::new(
+                    line_number,
+                    "[upstreams.param_override] must follow a [[upstreams]] profile",
+                ))
+            },
+            |index| Ok(Section::UpstreamProfileParamOverride(index)),
+        ),
         #[cfg(feature = "guard")]
         "guard_workflows" => Ok(Section::GuardWorkflows),
         "shielding" => Ok(Section::Shielding),
@@ -307,6 +321,13 @@ fn assign_value(
         ),
         Section::UpstreamProfileThinking(index) => assign_thinking(
             &mut config.upstream_profiles[*index].thinking,
+            key,
+            value,
+            line_number,
+        ),
+        #[cfg(feature = "param-override")]
+        Section::UpstreamProfileParamOverride(index) => assign_param_override(
+            &mut config.upstream_profiles[*index].param_override,
             key,
             value,
             line_number,
@@ -699,6 +720,46 @@ fn assign_hot_restart(
             )?;
         }
         _ => return unknown_key("hot_restart", key, line_number),
+    }
+    Ok(())
+}
+
+#[cfg(feature = "param-override")]
+fn assign_param_override(
+    config: &mut ParamOverrideConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "temperature" => {
+            config.temperature = Some(parse_f64(value, line_number, "param_override.temperature")?);
+        }
+        "top_p" => {
+            config.top_p = Some(parse_f64(value, line_number, "param_override.top_p")?);
+        }
+        "top_k" => {
+            config.top_k = Some(parse_u32(value, line_number, "param_override.top_k")?);
+        }
+        "max_tokens" => {
+            config.max_tokens = Some(parse_u32(value, line_number, "param_override.max_tokens")?);
+        }
+        "frequency_penalty" => {
+            config.frequency_penalty = Some(parse_f64(
+                value,
+                line_number,
+                "param_override.frequency_penalty",
+            )?);
+        }
+        "presence_penalty" => {
+            config.presence_penalty = Some(parse_f64(
+                value,
+                line_number,
+                "param_override.presence_penalty",
+            )?);
+        }
+        _ => return unknown_key("upstreams.param_override", key, line_number),
     }
     Ok(())
 }
@@ -1496,6 +1557,22 @@ fn parse_u64(value: &str, line_number: usize, field: &str) -> Result<u64, Config
             format!("{field} is outside the supported range: {error}"),
         )
     })
+}
+
+#[cfg(feature = "param-override")]
+fn parse_f64(value: &str, line_number: usize, field: &str) -> Result<f64, ConfigParseError> {
+    let normalized = value.replace('_', "");
+    let number = normalized.parse::<f64>().map_err(|error| {
+        ConfigParseError::new(line_number, format!("{field} must be a number: {error}"))
+    })?;
+    if number.is_finite() {
+        Ok(number)
+    } else {
+        Err(ConfigParseError::new(
+            line_number,
+            format!("{field} must be a finite number"),
+        ))
+    }
 }
 
 fn unknown_key<T>(section: &str, key: &str, line_number: usize) -> Result<T, ConfigParseError> {

@@ -8,8 +8,9 @@ repository.workspace = true
 description = "Core types for llm-guard-proxy."
 
 [features]
-default = ["upstream-hot-restart"]
+default = ["upstream-hot-restart", "param-override"]
 upstream-hot-restart = []
+param-override = []
 guard = ["dep:nix"]
 
 [dependencies]

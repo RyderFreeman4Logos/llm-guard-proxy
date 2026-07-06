@@ -590,6 +590,41 @@ mode = "force_disable"
     config.validate().expect("profile config should validate");
 }
 
+#[cfg(feature = "param-override")]
+#[test]
+fn parses_upstream_profile_param_override() {
+    let config = parse_config_text(
+        r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "http://aeon.example/v1"
+match_models = ["aeon-ultimate"]
+
+[upstreams.param_override]
+enabled = true
+temperature = 0.6
+top_p = 0.95
+top_k = 40
+max_tokens = 2048
+frequency_penalty = 0.1
+presence_penalty = -0.2
+"#,
+    )
+    .expect("param override config should parse");
+
+    let override_config = &config.upstream_profiles[0].param_override;
+    assert!(override_config.enabled);
+    assert_eq!(override_config.temperature, Some(0.6));
+    assert_eq!(override_config.top_p, Some(0.95));
+    assert_eq!(override_config.top_k, Some(40));
+    assert_eq!(override_config.max_tokens, Some(2_048));
+    assert_eq!(override_config.frequency_penalty, Some(0.1));
+    assert_eq!(override_config.presence_penalty, Some(-0.2));
+    config
+        .validate()
+        .expect("param override config should validate");
+}
+
 #[test]
 fn parses_hot_restart_overrides_for_default_and_named_upstreams() {
     let config = parse_config_text(

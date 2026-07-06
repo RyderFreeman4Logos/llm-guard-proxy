@@ -4087,6 +4087,156 @@ async fn shielded_non_stream_chat_preserves_stream_options_while_forcing_usage()
     );
 }
 
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn override_temperature_replaces_client_value() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &param_override_profile_config(
+            &fake.base_url,
+            r"
+temperature = 0.6
+",
+        ),
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"temperature":1.5,"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(observed_body["temperature"], json!(0.6));
+    assert_eq!(observed_body["max_tokens"], 64);
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn override_adds_missing_parameter() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &param_override_profile_config(
+            &fake.base_url,
+            r"
+top_p = 0.95
+",
+        ),
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(observed_body["top_p"], json!(0.95));
+    assert_eq!(observed_body["max_tokens"], 64);
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn override_disabled_passes_through() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &param_override_profile_config(
+            &fake.base_url,
+            r"
+enabled = false
+temperature = 0.6
+",
+        ),
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"temperature":1.5,"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(observed_body["temperature"], json!(1.5));
+    assert_eq!(observed_body["max_tokens"], 64);
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn override_only_set_fields_affected() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &param_override_profile_config(
+            &fake.base_url,
+            r"
+temperature = 0.6
+",
+        ),
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"temperature":1.5,"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(observed_body["temperature"], json!(0.6));
+    assert_eq!(observed_body["max_tokens"], 64);
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn override_max_tokens_wins_after_thinking_policy() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "param-override-test"
+base_url = "{base_url}"
+match_models = ["test-chat"]
+
+[upstreams.thinking]
+mode = "force_thinking"
+
+[upstreams.param_override]
+max_tokens = 128
+"#,
+            base_url = fake.base_url,
+        ),
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
+    assert_eq!(observed_body["max_tokens"], 128);
+}
+
 #[tokio::test]
 async fn force_thinking_canonical_default_injects_thinking_budget_tokens() {
     let mut fake = FakeUpstream::spawn().await;
@@ -11406,6 +11556,24 @@ async fn post_chat_and_observe_body(
     let _aggregated = shielded_final_json(response).await;
     let observed = fake.recv_next().await;
     serde_json::from_slice(&observed.body).expect("upstream body should be JSON")
+}
+
+#[cfg(feature = "param-override")]
+fn param_override_profile_config(base_url: &str, param_override_body: &str) -> String {
+    format!(
+        r#"
+[[upstreams]]
+name = "param-override-test"
+base_url = "{base_url}"
+match_models = ["test-chat"]
+
+[upstreams.thinking]
+mode = "passthrough"
+
+[upstreams.param_override]
+{param_override_body}
+"#,
+    )
 }
 
 fn empty_get_request(uri: &'static str) -> Request<Body> {
