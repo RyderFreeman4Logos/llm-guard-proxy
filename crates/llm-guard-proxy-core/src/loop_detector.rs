@@ -2049,6 +2049,7 @@ mod tests {
             reasoning_semantic_minimum_token_count: 8,
             reasoning_semantic_history_window_count: 16,
             on_reasoning_loop: crate::settings::LoopFailurePolicy::default(),
+            embedding: crate::settings::LoopGuardEmbeddingConfig::default(),
         }
     }
 }

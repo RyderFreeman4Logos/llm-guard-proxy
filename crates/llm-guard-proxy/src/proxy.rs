@@ -1459,7 +1459,7 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
             AdmissionOutcome::Rejected(response) => return response,
         };
 
-    match forward_openai_request(
+    match Box::pin(forward_openai_request(
         &state,
         &request_id,
         started_at_unix_ms,
@@ -1468,7 +1468,7 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
         admission.permit_kind,
         admission.admission_metadata,
         admission.config.server.max_request_body_bytes,
-    )
+    ))
     .await
     {
         Ok(response) => response,
