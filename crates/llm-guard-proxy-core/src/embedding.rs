@@ -153,6 +153,166 @@ impl EmbeddingBackend for DisabledEmbeddingBackend {
     }
 }
 
+/// Outcome of pushing a window onto the [`EmbeddingQueue`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EmbeddingQueueResult {
+    /// The window was accepted and enqueued.
+    Accepted,
+    /// The window was skipped (queue overflow under a non-blocking policy, or
+    /// a duplicate of a window already present in the queue).
+    Skipped,
+    /// The queue is full and the configured policy is `block`. Callers on the
+    /// SSE hot path must wait for space before retrying; callers that cannot
+    /// block should treat this as a hard skip.
+    QueueFull,
+}
+
+/// Synchronous bounded queue that buffers streaming windows pending embedding.
+///
+/// The queue itself is synchronous (`std::collections::VecDeque`) because the
+/// core crate is `#![forbid(unsafe_code)]` and has no async runtime. The async
+/// batch worker that drains the queue lives in the proxy crate.
+///
+/// Overflow behavior is governed by the [`EmbeddingQueuePolicy`][policy] passed
+/// at construction:
+/// - `Skip` (default): silently drop the window and return [`Skipped`](EmbeddingQueueResult::Skipped).
+/// - `DeterministicOnly`: drop the window but signal the caller to fall back to
+///   deterministic hash-based detection (also reported as `Skipped`).
+/// - `Block`: refuse the push and return [`QueueFull`](EmbeddingQueueResult::QueueFull)
+///   so the caller can retry after space frees up.
+///
+/// Windows with a `(request_id, attempt_id, channel, window_seq)` tuple already
+/// present in the queue are treated as duplicates and skipped.
+#[derive(Clone, Debug)]
+pub struct EmbeddingQueue {
+    queue: std::collections::VecDeque<EmbeddingInput>,
+    capacity: usize,
+    policy: crate::settings::EmbeddingQueuePolicy,
+}
+
+impl EmbeddingQueue {
+    /// Creates a new queue with the given capacity and overflow policy.
+    ///
+    /// `capacity` is clamped to at least 1 so the queue is always usable.
+    #[must_use]
+    pub fn new(capacity: usize, policy: crate::settings::EmbeddingQueuePolicy) -> Self {
+        Self {
+            queue: std::collections::VecDeque::with_capacity(capacity.max(1)),
+            capacity: capacity.max(1),
+            policy,
+        }
+    }
+
+    /// Returns the maximum number of windows the queue can hold.
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    /// Returns the number of windows currently buffered.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Returns `true` if no windows are currently buffered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Returns the configured overflow policy.
+    #[must_use]
+    pub fn policy(&self) -> crate::settings::EmbeddingQueuePolicy {
+        self.policy
+    }
+
+    /// Attempts to enqueue a streaming window for embedding.
+    ///
+    /// Returns [`Accepted`](EmbeddingQueueResult::Accepted) if the window was
+    /// enqueued, [`Skipped`](EmbeddingQueueResult::Skipped) if it was dropped
+    /// (overflow under a non-blocking policy, or a duplicate), or
+    /// [`QueueFull`](EmbeddingQueueResult::QueueFull) if the queue is full and
+    /// the policy is `block`.
+    pub fn push(
+        &mut self,
+        request_id: impl Into<String>,
+        attempt_id: impl Into<String>,
+        channel: EmbeddingChannel,
+        window_seq: u64,
+        text_hash: u64,
+        text: impl Into<String>,
+    ) -> EmbeddingQueueResult {
+        let input = EmbeddingInput {
+            request_id: request_id.into(),
+            attempt_id: attempt_id.into(),
+            channel,
+            window_seq,
+            text_hash,
+            text: text.into(),
+        };
+        self.push_input(input)
+    }
+
+    /// Pushes a fully-constructed [`EmbeddingInput`].
+    ///
+    /// This is the low-level entry point used by [`push`](Self::push) and by
+    /// callers that already hold an `EmbeddingInput`.
+    pub fn push_input(&mut self, input: EmbeddingInput) -> EmbeddingQueueResult {
+        // Deduplicate by (request_id, attempt_id, channel, window_seq).
+        let already_present = self.queue.iter().any(|existing| {
+            existing.request_id == input.request_id
+                && existing.attempt_id == input.attempt_id
+                && existing.channel == input.channel
+                && existing.window_seq == input.window_seq
+        });
+        if already_present {
+            return EmbeddingQueueResult::Skipped;
+        }
+
+        if self.queue.len() >= self.capacity {
+            return match self.policy {
+                crate::settings::EmbeddingQueuePolicy::Block => EmbeddingQueueResult::QueueFull,
+                // Skip and DeterministicOnly both drop the window; the caller
+                // distinguishes them via the policy field when needed.
+                crate::settings::EmbeddingQueuePolicy::Skip
+                | crate::settings::EmbeddingQueuePolicy::DeterministicOnly => {
+                    EmbeddingQueueResult::Skipped
+                }
+            };
+        }
+
+        self.queue.push_back(input);
+        EmbeddingQueueResult::Accepted
+    }
+
+    /// Removes and returns up to `max` windows from the front of the queue,
+    /// draining them in FIFO order for batch embedding.
+    ///
+    /// Returns an empty vector if the queue is empty or `max` is `0`.
+    pub fn drain_batch(&mut self, max: usize) -> Vec<EmbeddingInput> {
+        if max == 0 {
+            return Vec::new();
+        }
+        let take = max.min(self.queue.len());
+        self.queue.drain(..take).collect()
+    }
+
+    /// Removes and returns all currently buffered windows.
+    ///
+    /// Convenience wrapper around [`drain_batch`](Self::drain_batch) for a full
+    /// flush (e.g. on shutdown).
+    pub fn drain_all(&mut self) -> Vec<EmbeddingInput> {
+        self.queue.drain(..).collect()
+    }
+
+    /// Peeks at the front window without removing it.
+    #[must_use]
+    pub fn front(&self) -> Option<&EmbeddingInput> {
+        self.queue.front()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,4 +388,232 @@ mod tests {
     // The disabled backend's embed_batch returns a boxed future. We cannot
     // poll it in core (#![forbid(unsafe_code)] blocks manual waker creation).
     // The async integration test lives in the proxy crate's test suite.
+
+    // ---- EmbeddingQueue tests ----
+
+    use crate::settings::EmbeddingQueuePolicy;
+
+    fn make_input(
+        request_id: &str,
+        attempt_id: &str,
+        channel: EmbeddingChannel,
+        window_seq: u64,
+    ) -> EmbeddingInput {
+        EmbeddingInput {
+            request_id: request_id.to_owned(),
+            attempt_id: attempt_id.to_owned(),
+            channel,
+            window_seq,
+            text_hash: window_seq,
+            text: format!("text-{window_seq}"),
+        }
+    }
+
+    #[test]
+    fn queue_push_and_len() {
+        let mut q = EmbeddingQueue::new(8, EmbeddingQueuePolicy::Skip);
+        assert!(q.is_empty());
+        assert_eq!(q.len(), 0);
+
+        let res = q.push("req-1", "att-1", EmbeddingChannel::Content, 0, 0, "hello");
+        assert_eq!(res, EmbeddingQueueResult::Accepted);
+        assert_eq!(q.len(), 1);
+        assert!(!q.is_empty());
+
+        let res = q.push("req-1", "att-1", EmbeddingChannel::Content, 1, 1, "world");
+        assert_eq!(res, EmbeddingQueueResult::Accepted);
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn queue_push_input_accepts() {
+        let mut q = EmbeddingQueue::new(4, EmbeddingQueuePolicy::Skip);
+        let input = make_input("r", "a", EmbeddingChannel::Reasoning, 5);
+        assert_eq!(q.push_input(input), EmbeddingQueueResult::Accepted);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn queue_capacity_clamped_to_one() {
+        let q = EmbeddingQueue::new(0, EmbeddingQueuePolicy::Skip);
+        assert_eq!(q.capacity(), 1);
+    }
+
+    #[test]
+    fn queue_overflow_skip_policy() {
+        let mut q = EmbeddingQueue::new(2, EmbeddingQueuePolicy::Skip);
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 0, 0, "x"),
+            EmbeddingQueueResult::Accepted
+        );
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 1, 1, "y"),
+            EmbeddingQueueResult::Accepted
+        );
+        // Queue is full; Skip policy drops the window.
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 2, 2, "z"),
+            EmbeddingQueueResult::Skipped
+        );
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn queue_overflow_deterministic_only_policy() {
+        let mut q = EmbeddingQueue::new(1, EmbeddingQueuePolicy::DeterministicOnly);
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 0, 0, "x"),
+            EmbeddingQueueResult::Accepted
+        );
+        assert_eq!(q.policy(), EmbeddingQueuePolicy::DeterministicOnly);
+        // DeterministicOnly also reports Skipped; caller inspects policy.
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 1, 1, "y"),
+            EmbeddingQueueResult::Skipped
+        );
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn queue_overflow_block_policy() {
+        let mut q = EmbeddingQueue::new(1, EmbeddingQueuePolicy::Block);
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 0, 0, "x"),
+            EmbeddingQueueResult::Accepted
+        );
+        // Block policy refuses the push when full.
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 1, 1, "y"),
+            EmbeddingQueueResult::QueueFull
+        );
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn queue_deduplicates_same_window_key() {
+        let mut q = EmbeddingQueue::new(8, EmbeddingQueuePolicy::Skip);
+        q.push("r", "a", EmbeddingChannel::Content, 3, 3, "dup");
+        // Same (request_id, attempt_id, channel, window_seq) -> skipped even with different text.
+        let res = q.push("r", "a", EmbeddingChannel::Content, 3, 3, "different-text");
+        assert_eq!(res, EmbeddingQueueResult::Skipped);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn queue_different_channels_are_distinct() {
+        let mut q = EmbeddingQueue::new(8, EmbeddingQueuePolicy::Skip);
+        q.push("r", "a", EmbeddingChannel::Content, 0, 0, "c");
+        let res = q.push("r", "a", EmbeddingChannel::Reasoning, 0, 0, "r");
+        assert_eq!(res, EmbeddingQueueResult::Accepted);
+        assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn queue_drain_batch_respects_max() {
+        let mut q = EmbeddingQueue::new(8, EmbeddingQueuePolicy::Skip);
+        for i in 0..5 {
+            q.push("r", "a", EmbeddingChannel::Content, i, i, "t");
+        }
+        let batch = q.drain_batch(3);
+        assert_eq!(batch.len(), 3);
+        assert_eq!(q.len(), 2);
+        // FIFO order preserved.
+        assert_eq!(batch[0].window_seq, 0);
+        assert_eq!(batch[2].window_seq, 2);
+    }
+
+    #[test]
+    fn queue_drain_batch_zero_returns_empty() {
+        let mut q = EmbeddingQueue::new(8, EmbeddingQueuePolicy::Skip);
+        q.push("r", "a", EmbeddingChannel::Content, 0, 0, "t");
+        assert!(q.drain_batch(0).is_empty());
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn queue_drain_all_empties_queue() {
+        let mut q = EmbeddingQueue::new(8, EmbeddingQueuePolicy::Skip);
+        for i in 0..4 {
+            q.push("r", "a", EmbeddingChannel::Content, i, i, "t");
+        }
+        let all = q.drain_all();
+        assert_eq!(all.len(), 4);
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn queue_front_peek() {
+        let mut q = EmbeddingQueue::new(8, EmbeddingQueuePolicy::Skip);
+        assert!(q.front().is_none());
+        q.push("r", "a", EmbeddingChannel::Content, 7, 7, "t");
+        let front = q.front().unwrap();
+        assert_eq!(front.window_seq, 7);
+        assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn queue_capacity_reported() {
+        let q = EmbeddingQueue::new(16, EmbeddingQueuePolicy::Block);
+        assert_eq!(q.capacity(), 16);
+        assert_eq!(q.policy(), EmbeddingQueuePolicy::Block);
+    }
+
+    #[test]
+    fn queue_fills_to_exactly_capacity_before_overflow() {
+        let cap = 3;
+        let mut q = EmbeddingQueue::new(cap, EmbeddingQueuePolicy::Skip);
+        for i in 0..cap {
+            assert_eq!(
+                q.push("r", "a", EmbeddingChannel::Content, i as u64, i as u64, "t"),
+                EmbeddingQueueResult::Accepted,
+                "window {i} should be accepted"
+            );
+        }
+        assert_eq!(q.len(), cap);
+        // Next push overflows.
+        assert_eq!(
+            q.push(
+                "r",
+                "a",
+                EmbeddingChannel::Content,
+                cap as u64,
+                cap as u64,
+                "t"
+            ),
+            EmbeddingQueueResult::Skipped
+        );
+    }
+
+    #[test]
+    fn queue_drain_then_refill_after_overflow() {
+        let mut q = EmbeddingQueue::new(1, EmbeddingQueuePolicy::Skip);
+        q.push("r", "a", EmbeddingChannel::Content, 0, 0, "t");
+        // Overflow.
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 1, 1, "t"),
+            EmbeddingQueueResult::Skipped
+        );
+        // Drain frees space.
+        q.drain_all();
+        // Now a new window can be accepted.
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 2, 2, "t"),
+            EmbeddingQueueResult::Accepted
+        );
+    }
+
+    #[test]
+    fn queue_block_policy_then_drain_allows_refill() {
+        let mut q = EmbeddingQueue::new(1, EmbeddingQueuePolicy::Block);
+        q.push("r", "a", EmbeddingChannel::Content, 0, 0, "t");
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 1, 1, "t"),
+            EmbeddingQueueResult::QueueFull
+        );
+        q.drain_all();
+        assert_eq!(
+            q.push("r", "a", EmbeddingChannel::Content, 1, 1, "t"),
+            EmbeddingQueueResult::Accepted
+        );
+    }
 }
