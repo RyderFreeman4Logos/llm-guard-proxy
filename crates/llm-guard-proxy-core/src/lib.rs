@@ -54,7 +54,7 @@ pub use gwp::{
 pub use loop_detector::{
     BoundedFeatureSummary, ChannelizedLoopDetector, DetectorEventKind, DetectorSummary,
     LoopDetector, LoopDetectorInput, LoopInputProfile, LoopReasonCode, LoopSeverity, LoopSignal,
-    StreamChannel, ToolCallFingerprintInput,
+    StreamChannel, ToolCallFingerprintInput, ToolFingerprint, ToolLoopDetector, ToolLoopSignal,
 };
 #[cfg(feature = "guard")]
 pub use model_alias::{
