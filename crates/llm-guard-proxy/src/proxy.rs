@@ -9,7 +9,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -60,7 +60,7 @@ use tokio::task::JoinHandle;
 use tokio::{
     net::TcpListener,
     process::Command,
-    sync::{Mutex as AsyncMutex, Notify, oneshot, watch},
+    sync::{Mutex as AsyncMutex, Notify, futures::OwnedNotified, oneshot},
     time::{Instant, Interval, MissedTickBehavior, timeout},
 };
 
@@ -509,65 +509,58 @@ impl ProxyState {
 
 #[derive(Debug)]
 struct ShutdownGate {
-    sender: watch::Sender<bool>,
+    closed: Arc<AtomicBool>,
+    notify: Arc<Notify>,
 }
 
 impl ShutdownGate {
     fn new() -> Self {
-        let (sender, _receiver) = watch::channel(false);
-        Self { sender }
+        Self {
+            closed: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
     }
 
     fn begin_shutdown(&self) {
-        let _ignored = self.sender.send(true);
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
     }
 
     fn is_shutting_down(&self) -> bool {
-        *self.sender.borrow()
+        self.closed.load(Ordering::SeqCst)
     }
 
     fn subscribe(&self) -> ShutdownSubscription {
+        let mut notified = Box::pin(Arc::clone(&self.notify).notified_owned());
+        let _already_notified = notified.as_mut().enable();
         ShutdownSubscription {
-            receiver: self.sender.subscribe(),
+            closed: Arc::clone(&self.closed),
+            notified,
         }
     }
 }
 
-#[derive(Debug)]
 struct ShutdownSubscription {
-    receiver: watch::Receiver<bool>,
+    closed: Arc<AtomicBool>,
+    notified: Pin<Box<OwnedNotified>>,
 }
 
 impl ShutdownSubscription {
     async fn cancelled(&mut self) {
-        if *self.receiver.borrow() {
+        if self.closed.load(Ordering::SeqCst) {
             return;
         }
-        while self.receiver.changed().await.is_ok() {
-            if *self.receiver.borrow() {
-                return;
-            }
-        }
+        self.notified.as_mut().await;
     }
 
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<()> {
-        if *self.receiver.borrow() {
+        if self.closed.load(Ordering::SeqCst) {
             return Poll::Ready(());
         }
 
-        let poll_result = {
-            let changed = self.receiver.changed();
-            futures_util::pin_mut!(changed);
-            changed.poll(cx)
-        };
-        match poll_result {
-            Poll::Ready(Ok(()) | Err(_)) => {
-                if *self.receiver.borrow() {
-                    Poll::Ready(())
-                } else {
-                    Poll::Pending
-                }
-            }
+        match self.notified.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(()),
             Poll::Pending => Poll::Pending,
         }
     }
@@ -4907,7 +4900,12 @@ async fn forward_buffered_models_response(
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
     let upstream_headers = response_parts.upstream_headers.clone();
-    let body = match read_upstream_body_bytes(upstream_response.bytes_stream()).await {
+    let body = match read_upstream_body_bytes_until_shutdown(
+        upstream_response.bytes_stream(),
+        response_parts.shutdown_subscription(),
+    )
+    .await
+    {
         Ok(body) => body,
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };

@@ -12740,6 +12740,55 @@ async fn graceful_shutdown_aborts_in_flight_response_body() {
 }
 
 #[tokio::test]
+async fn shutdown_wakes_parked_poll_based_response_body() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 1).await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("parked body shutdown listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("parked body shutdown address should be readable");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let state = proxy.state.clone();
+    let server = tokio::spawn(async move {
+        serve_until_shutdown(listener, state, async {
+            let _received = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let response = proxy
+        .client
+        .get(format!("http://{addr}/v1/embeddings?test=parked-body"))
+        .send()
+        .await
+        .expect("parked response request should get headers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("parked response should reach upstream before shutdown");
+    assert_eq!(observed.path_and_query, "/v1/embeddings?test=parked-body");
+
+    let mut body = response.bytes_stream();
+    let first = next_chunk(&mut body, STREAM_HEADER_TIMEOUT, "parked body first chunk").await;
+    assert_eq!(first, Bytes::from_static(LONG_JSON_FIRST_CHUNK));
+
+    shutdown_tx
+        .send(())
+        .expect("shutdown signal should be delivered");
+    timeout(STREAM_COMPLETION_TIMEOUT, server)
+        .await
+        .expect("server should exit even though upstream body never wakes again")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    wait_for_generation_metrics(&proxy, 0, 0, STREAM_COMPLETION_TIMEOUT).await;
+    drop(body);
+}
+
+#[tokio::test]
 async fn shutdown_cancels_pre_response_upstream_work() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 1).await;
@@ -14724,6 +14773,13 @@ async fn fake_upstream_handler(
             LONG_JSON_SECOND_CHUNK,
         );
     }
+    if path_and_query.contains("test=parked-body") {
+        return parked_stream_response(
+            "parked-body",
+            "application/json",
+            Bytes::from_static(LONG_JSON_FIRST_CHUNK),
+        );
+    }
     if endpoint == "/v1/chat/completions" && !body_requests_stream(&body) {
         if body_contains_text(&body, "hot-restart-never-ready") {
             return upstream_status_json_response(StatusCode::SERVICE_UNAVAILABLE);
@@ -15118,6 +15174,27 @@ fn json_response(label: &'static str, body: String) -> Response<Body> {
     response.headers_mut().insert(
         HeaderName::from_static("x-upstream-endpoint"),
         HeaderValue::from_str(label).expect("static label should be a valid header"),
+    );
+    response
+}
+
+fn parked_stream_response(
+    label: &'static str,
+    content_type: &'static str,
+    first: Bytes,
+) -> Response<Body> {
+    let body = Body::from_stream(
+        stream::once(async move { Ok::<Bytes, Infallible>(first) })
+            .chain(stream::pending::<Result<Bytes, Infallible>>()),
+    );
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_static(label),
     );
     response
 }
