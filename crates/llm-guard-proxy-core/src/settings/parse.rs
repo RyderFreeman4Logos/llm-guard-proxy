@@ -1045,6 +1045,17 @@ fn assign_observability(
                 "observability.health_upstream_probe_timeout_ms",
             )?;
         }
+        "health_chat_probe_enabled" => {
+            config.health_chat_probe_enabled =
+                ConfigToggle::from_bool(parse_bool(value, line_number)?);
+        }
+        "health_chat_probe_timeout_ms" => {
+            config.health_chat_probe_timeout_ms = parse_u64(
+                value,
+                line_number,
+                "observability.health_chat_probe_timeout_ms",
+            )?;
+        }
         "debug_summary_enabled" => {
             config.debug_summary_enabled = ConfigToggle::from_bool(parse_bool(value, line_number)?);
         }

@@ -103,6 +103,83 @@ pub(crate) struct ProxyState {
     repeat_inputs: Arc<RepeatInputCache>,
     shadow_attempts: Arc<InFlightLimiter>,
     malformed_response_counter: Arc<AtomicU64>,
+    upstream_failure_counters: Arc<UpstreamFailureCounters>,
+}
+
+/// Cause-bucketed monotonic counters for upstream 502 failures emitted to
+/// `/metrics` as `llm_guard_proxy_upstream_failure_total{cause="..."}`.
+#[derive(Debug, Default)]
+struct UpstreamFailureCounters {
+    connect_failed: AtomicU64,
+    timeout: AtomicU64,
+    body_error: AtomicU64,
+    transport_error: AtomicU64,
+}
+
+impl UpstreamFailureCounters {
+    fn increment(&self, cause: UpstreamFailureCause) {
+        match cause {
+            UpstreamFailureCause::ConnectFailed => &self.connect_failed,
+            UpstreamFailureCause::Timeout => &self.timeout,
+            UpstreamFailureCause::BodyError => &self.body_error,
+            UpstreamFailureCause::TransportError => &self.transport_error,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> UpstreamFailureSnapshot {
+        UpstreamFailureSnapshot {
+            connect_failed: self.connect_failed.load(Ordering::Relaxed),
+            timeout: self.timeout.load(Ordering::Relaxed),
+            body_error: self.body_error.load(Ordering::Relaxed),
+            transport_error: self.transport_error.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UpstreamFailureCause {
+    ConnectFailed,
+    Timeout,
+    BodyError,
+    TransportError,
+}
+
+impl UpstreamFailureCause {
+    const fn from_reqwest_failure(kind: ReqwestFailureKind) -> Self {
+        match kind {
+            ReqwestFailureKind::Connect => Self::ConnectFailed,
+            ReqwestFailureKind::Timeout => Self::Timeout,
+            ReqwestFailureKind::Body | ReqwestFailureKind::Decode => Self::BodyError,
+            ReqwestFailureKind::Request | ReqwestFailureKind::Other => Self::TransportError,
+        }
+    }
+
+    const fn code(self) -> &'static str {
+        match self {
+            Self::ConnectFailed => "upstream_connect_failed",
+            Self::Timeout => "upstream_timeout",
+            Self::BodyError => "upstream_body_error",
+            Self::TransportError => "upstream_transport_error",
+        }
+    }
+
+    const fn metric_label(self) -> &'static str {
+        match self {
+            Self::ConnectFailed => "connect_failed",
+            Self::Timeout => "timeout",
+            Self::BodyError => "body_error",
+            Self::TransportError => "transport_error",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct UpstreamFailureSnapshot {
+    connect_failed: u64,
+    timeout: u64,
+    body_error: u64,
+    transport_error: u64,
 }
 
 impl ProxyState {
@@ -140,6 +217,7 @@ impl ProxyState {
             repeat_inputs: Arc::new(RepeatInputCache::default()),
             shadow_attempts: Arc::new(InFlightLimiter::default()),
             malformed_response_counter: Arc::new(AtomicU64::new(0)),
+            upstream_failure_counters: Arc::new(UpstreamFailureCounters::default()),
         }
     }
 
@@ -818,6 +896,7 @@ pub(crate) fn router(state: ProxyState) -> Router {
 enum HealthUpstreamStatus {
     Disabled,
     Ready,
+    Degraded,
     Unavailable,
 }
 
@@ -826,13 +905,14 @@ impl HealthUpstreamStatus {
         match self {
             Self::Disabled => "not_checked",
             Self::Ready => "ready",
+            Self::Degraded => "degraded",
             Self::Unavailable => "unavailable",
         }
     }
 
     const fn http_status(self) -> StatusCode {
         match self {
-            Self::Disabled | Self::Ready => StatusCode::OK,
+            Self::Disabled | Self::Ready | Self::Degraded => StatusCode::OK,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
@@ -907,9 +987,15 @@ async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
                     let admission = state.admission_metrics_snapshot();
                     let malformed_responses =
                         state.malformed_response_counter.load(Ordering::Relaxed);
+                    let upstream_failures = state.upstream_failure_counters.snapshot();
                     text_response(
                         StatusCode::OK,
-                        render_metrics(&snapshot, &admission, malformed_responses),
+                        render_metrics(
+                            &snapshot,
+                            &admission,
+                            malformed_responses,
+                            upstream_failures,
+                        ),
                     )
                 }
                 Err(error) => proxy_error_response(
@@ -945,12 +1031,56 @@ async fn probe_upstream_readiness(state: &ProxyState, config: &AppConfig) -> Hea
         return HealthUpstreamStatus::Unavailable;
     };
     let timeout = Duration::from_millis(config.observability.health_upstream_probe_timeout_ms);
-    match tokio::time::timeout(timeout, state.client.get(url).send()).await {
-        Ok(Ok(response)) if response.status().is_success() => HealthUpstreamStatus::Ready,
-        Ok(Ok(response)) if response.status().as_u16() == StatusCode::UNAUTHORIZED.as_u16() => {
-            HealthUpstreamStatus::Ready
-        }
-        _ => HealthUpstreamStatus::Unavailable,
+    let models_ok = matches!(
+        tokio::time::timeout(timeout, state.client.get(url).send()).await,
+        Ok(Ok(response)) if response.status().is_success()
+            || response.status().as_u16() == StatusCode::UNAUTHORIZED.as_u16()
+    );
+    if !models_ok {
+        return HealthUpstreamStatus::Unavailable;
+    }
+    if config.observability.health_chat_probe_enabled.is_enabled()
+        && !probe_upstream_chat_completion(state, config).await
+    {
+        return HealthUpstreamStatus::Degraded;
+    }
+    HealthUpstreamStatus::Ready
+}
+
+/// Sends a minimal chat completion request to the upstream to verify that the
+/// generation path is healthy. Returns `true` when the upstream responds with a
+/// success status, `false` on any transport failure or non-success status.
+async fn probe_upstream_chat_completion(state: &ProxyState, config: &AppConfig) -> bool {
+    let uri = Uri::from_static("/v1/chat/completions");
+    let Ok(url) = build_upstream_url(&config.upstream.base_url, &uri) else {
+        return false;
+    };
+    // Use a minimal "ping" payload. The probe only needs to verify that the
+    // upstream chat-completion transport path responds; the upstream may reject
+    // an unknown model with a 4xx, which still indicates the endpoint is alive.
+    let body = serde_json::json!({
+        "model": "ping",
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 1,
+        "stream": false,
+    });
+    let capped_timeout_ms = config
+        .observability
+        .health_chat_probe_timeout_ms
+        .min(10_000);
+    let timeout = Duration::from_millis(capped_timeout_ms);
+    let request = state
+        .client
+        .post(url)
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.to_string())
+        .build();
+    let Ok(request) = request else {
+        return false;
+    };
+    match tokio::time::timeout(timeout, state.client.execute(request)).await {
+        Ok(Ok(response)) => response.status().is_success(),
+        _ => false,
     }
 }
 
@@ -1087,6 +1217,7 @@ fn render_metrics(
     snapshot: &ObservabilityMetricsSnapshot,
     admission: &AdmissionMetricsSnapshot,
     malformed_responses: u64,
+    upstream_failures: UpstreamFailureSnapshot,
 ) -> String {
     let mut output = String::new();
     push_admission_metrics(&mut output, admission);
@@ -1094,6 +1225,7 @@ fn render_metrics(
     push_attempt_metrics(&mut output, snapshot);
     push_retry_and_error_metrics(&mut output, snapshot);
     push_malformed_response_metrics(&mut output, malformed_responses);
+    push_upstream_failure_metrics(&mut output, upstream_failures);
     push_latency_metrics(&mut output, snapshot);
     push_heartbeat_metrics(&mut output, snapshot);
     push_storage_metrics(&mut output, snapshot);
@@ -1254,6 +1386,39 @@ fn push_malformed_response_metrics(output: &mut String, malformed_responses: u64
         "llm_guard_proxy_malformed_response_total",
         &[("kind", "missing_choices")],
         malformed_responses,
+    );
+}
+
+fn push_upstream_failure_metrics(output: &mut String, snapshot: UpstreamFailureSnapshot) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_upstream_failure_total",
+        "Upstream 502 failures classified by transport cause bucket.",
+        "counter",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_upstream_failure_total",
+        &[("cause", UpstreamFailureCause::ConnectFailed.metric_label())],
+        snapshot.connect_failed,
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_upstream_failure_total",
+        &[("cause", UpstreamFailureCause::Timeout.metric_label())],
+        snapshot.timeout,
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_upstream_failure_total",
+        &[("cause", UpstreamFailureCause::BodyError.metric_label())],
+        snapshot.body_error,
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_upstream_failure_total",
+        &[("cause", UpstreamFailureCause::TransportError.metric_label())],
+        snapshot.transport_error,
     );
 }
 
@@ -1503,7 +1668,11 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
             let finished_at_unix_ms = unix_time_millis();
             let error_type = error.error_type();
             let error_reason = error.to_string();
-            let response = proxy_error_response_from_error(&error);
+            if let Some(cause) = error.upstream_failure_cause() {
+                state.upstream_failure_counters.increment(cause);
+            }
+            let response =
+                proxy_error_response_from_error_with_diagnostics(&error, Some(&request_id));
             let request_metadata = error.request_metadata().cloned().unwrap_or_else(|| {
                 BTreeMap::from([(String::from("proxy_error"), error_type.to_owned())])
             });
@@ -9329,6 +9498,18 @@ fn proxy_error_response_with_code(
     code: Option<&str>,
     param: Option<&str>,
 ) -> Response<Body> {
+    proxy_error_response_with_diagnostics(status, error_type, message, code, param, None, None)
+}
+
+fn proxy_error_response_with_diagnostics(
+    status: StatusCode,
+    error_type: &str,
+    message: &str,
+    code: Option<&str>,
+    param: Option<&str>,
+    cause_code: Option<&str>,
+    request_id: Option<&RequestId>,
+) -> Response<Body> {
     let mut error = serde_json::Map::from_iter([
         (String::from("type"), json!(error_type)),
         (String::from("message"), json!(message)),
@@ -9338,6 +9519,17 @@ fn proxy_error_response_with_code(
     }
     if let Some(param) = param {
         error.insert(String::from("param"), json!(param));
+    }
+    if let Some(cause) = cause_code {
+        error.insert(String::from("cause"), json!(cause));
+        // Ensure a stable `code` is present for OpenAI-style clients that key
+        // off `code` rather than `cause`.
+        error
+            .entry(String::from("code"))
+            .or_insert_with(|| json!(cause));
+    }
+    if let Some(request_id) = request_id {
+        error.insert(String::from("request_id"), json!(request_id.as_str()));
     }
     let mut response = Response::new(Body::from(
         serde_json::Value::Object(serde_json::Map::from_iter([(
@@ -9350,10 +9542,23 @@ fn proxy_error_response_with_code(
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(request_id) = request_id
+        && let Ok(value) = HeaderValue::from_str(request_id.as_str())
+    {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
     response
 }
 
-fn proxy_error_response_from_error(error: &ProxyError) -> Response<Body> {
+fn proxy_error_response_from_error_with_diagnostics(
+    error: &ProxyError,
+    request_id: Option<&RequestId>,
+) -> Response<Body> {
+    let cause_code = error
+        .upstream_failure_cause()
+        .map(UpstreamFailureCause::code);
     match error {
         ProxyError::Admission { failure, .. } => admission_error_response(
             failure.status(),
@@ -9366,14 +9571,24 @@ fn proxy_error_response_from_error(error: &ProxyError) -> Response<Body> {
             param,
             code,
             ..
-        } => proxy_error_response_with_code(
+        } => proxy_error_response_with_diagnostics(
             error.status(),
             error.error_type(),
             message,
             Some(code),
             Some(param),
+            cause_code,
+            request_id,
         ),
-        _ => proxy_error_response(error.status(), error.error_type(), &error.to_string()),
+        _ => proxy_error_response_with_diagnostics(
+            error.status(),
+            error.error_type(),
+            &error.to_string(),
+            None,
+            None,
+            cause_code,
+            request_id,
+        ),
     }
 }
 
@@ -9643,6 +9858,19 @@ impl ProxyError {
             Self::ContextBudgetExceeded { .. } => "invalid_request_error",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
             Self::UpstreamBody { .. } => "upstream_body_error",
+        }
+    }
+
+    /// Returns the stable cause-bucket `code` for a 502 upstream failure, or
+    /// `None` for non-upstream errors. Used in the error JSON body and to select
+    /// the cause label for `llm_guard_proxy_upstream_failure_total`.
+    const fn upstream_failure_cause(&self) -> Option<UpstreamFailureCause> {
+        match self {
+            Self::UpstreamTransport { failure, .. } => {
+                Some(UpstreamFailureCause::from_reqwest_failure(*failure))
+            }
+            Self::UpstreamBody { .. } => Some(UpstreamFailureCause::BodyError),
+            _ => None,
         }
     }
 
