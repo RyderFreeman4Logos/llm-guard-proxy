@@ -6,6 +6,7 @@
 
 #[cfg(feature = "guard")]
 pub mod budget;
+pub mod context_rot;
 pub mod embedding;
 pub mod evidence;
 #[cfg(feature = "family")]
@@ -26,6 +27,11 @@ pub mod workflow;
 
 #[cfg(feature = "guard")]
 pub use budget::{BudgetCheck, BudgetError, BudgetStore, current_budget_date};
+pub use context_rot::{
+    ContextChunk, ContextRotConfig, ContextRotScorer, ContextRotSignal, DEFAULT_CONTENT_WEIGHT,
+    DEFAULT_ECHO_REPEAT_COUNT, DEFAULT_ECHO_SIMILARITY_THRESHOLD, DEFAULT_MAX_CONTEXT_CHUNKS,
+    DEFAULT_REASONING_WEIGHT, DEFAULT_TOOL_ARGS_WEIGHT, DEFAULT_TOOL_OUTPUT_ECHO_WEIGHT,
+};
 pub use embedding::{
     CONTENT_SIMILARITY_THRESHOLD, DisabledEmbeddingBackend, EmbeddingBackend, EmbeddingChannel,
     EmbeddingError, EmbeddingFuture, EmbeddingInput, EmbeddingQueue, EmbeddingQueueResult,
