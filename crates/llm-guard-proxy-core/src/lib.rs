@@ -77,10 +77,11 @@ pub use model_judge::{
 };
 pub use observability::{
     AttemptId, AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary,
-    DownstreamMode, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram,
-    ObservabilityError, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloadChunk,
-    RawPayloads, RequestId, RequestMetricCount, RequestRecord, RequestStatus,
-    RetentionPruningStats, RetentionUsage, StoreWrite, UpstreamErrorMetricCount, UpstreamMode,
+    DownstreamMode, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram, LiveRequestEntry,
+    LiveRequestRegistry, LiveRequestState, LiveRequestSummary, ObservabilityError,
+    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloadChunk, RawPayloads, RequestId,
+    RequestMetricCount, RequestRecord, RequestStatus, RetentionPruningStats, RetentionUsage,
+    StoreWrite, TimelineEvent, UpstreamErrorMetricCount, UpstreamMode,
 };
 #[cfg(feature = "guard")]
 pub use profile::{

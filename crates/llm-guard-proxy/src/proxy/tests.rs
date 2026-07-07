@@ -16367,3 +16367,87 @@ async fn health_chat_probe_reports_degraded_when_chat_fails() {
         "expected degraded or unavailable, got {upstream}"
     );
 }
+
+#[tokio::test]
+async fn debug_live_requests_disabled_by_default() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/requests", proxy.base_url))
+        .send()
+        .await
+        .expect("debug live requests request should complete");
+    // When debug_summary_enabled is disabled, the endpoint returns 403 Forbidden.
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn debug_live_requests_returns_empty_array_when_no_active_requests() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_observability_config(
+        &fake.base_url,
+        true,
+        r#"debug_summary_enabled = true
+debug_summary_admin_token = "admin-token"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/requests", proxy.base_url))
+        .header(AUTHORIZATION, "Bearer admin-token")
+        .send()
+        .await
+        .expect("debug live requests request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response.text().await.expect("body should be text");
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("body should be JSON");
+    assert_eq!(body["request_count"], 0);
+    assert!(body["requests"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn debug_live_request_detail_returns_404_for_unknown_id() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_observability_config(
+        &fake.base_url,
+        true,
+        r#"debug_summary_enabled = true
+debug_summary_admin_token = "admin-token"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/requests/nonexistent-id", proxy.base_url))
+        .header(AUTHORIZATION, "Bearer admin-token")
+        .send()
+        .await
+        .expect("debug live request detail request should complete");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn debug_live_requests_unauthorized_without_token() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_observability_config(
+        &fake.base_url,
+        true,
+        r#"debug_summary_enabled = true
+debug_summary_admin_token = "admin-token"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/debug/requests", proxy.base_url))
+        .send()
+        .await
+        .expect("debug live requests request should complete");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}

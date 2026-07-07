@@ -44,7 +44,8 @@ use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
     DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
     EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore, EvidenceStoreWrite, Health,
-    HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, LoopFailurePolicy, LoopGuardConfig,
+    HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, LiveRequestEntry,
+    LiveRequestRegistry, LiveRequestState, LiveRequestSummary, LoopFailurePolicy, LoopGuardConfig,
     MetadataConfig, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId,
     RequestRecord, RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME,
     SelectedUpstreamProfile, ShadowComparisonAttempt, ShadowSkipReason, ThinkingConfig,
@@ -104,6 +105,7 @@ pub(crate) struct ProxyState {
     shadow_attempts: Arc<InFlightLimiter>,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
+    live_registry: Arc<LiveRequestRegistry>,
 }
 
 /// Cause-bucketed monotonic counters for upstream 502 failures emitted to
@@ -218,6 +220,7 @@ impl ProxyState {
             shadow_attempts: Arc::new(InFlightLimiter::default()),
             malformed_response_counter: Arc::new(AtomicU64::new(0)),
             upstream_failure_counters: Arc::new(UpstreamFailureCounters::default()),
+            live_registry: Arc::new(LiveRequestRegistry::new()),
         }
     }
 
@@ -888,6 +891,8 @@ pub(crate) fn router(state: ProxyState) -> Router {
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
         .route("/config-summary", get(config_summary_handler))
+        .route("/debug/requests", get(debug_live_requests_handler))
+        .route("/debug/requests/{id}", get(debug_live_request_handler))
         .fallback(proxy_handler)
         .with_state(state)
 }
@@ -980,6 +985,8 @@ async fn health_handler(State(state): State<ProxyState>) -> Response<Body> {
 }
 
 async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
+    // Prune leaked live-registry entries older than 5 minutes as a safety net.
+    state.live_registry.prune_stale(5 * 60 * 1000);
     match state.config.snapshot() {
         Ok(config) if config.observability.metrics_enabled.is_enabled() => {
             match state.store.metrics_snapshot() {
@@ -1210,6 +1217,172 @@ fn render_debug_summary_json(limit: u32, summaries: &[DebugRequestSummary]) -> s
         "request_count": summaries.len(),
         "redaction": "raw prompts, raw outputs, and sensitive headers are omitted or redacted",
         "requests": requests,
+    })
+}
+
+/// `GET /debug/requests` — lists active (in-flight) requests as JSON.
+///
+/// Gated by `observability.debug_summary_enabled` and `debug_summary_admin_token`,
+/// exactly like `/debug/recent-requests`. Accepts an optional `?state=active`
+/// query param (no-op filter today; all live entries are active by definition).
+/// Output is metadata-only: no raw prompts or responses.
+async fn debug_live_requests_handler(
+    State(state): State<ProxyState>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let config = match state.config.snapshot() {
+        Ok(config) => config,
+        Err(error) => {
+            return proxy_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_snapshot_failed",
+                &error.to_string(),
+            );
+        }
+    };
+    if !config.observability.debug_summary_enabled.is_enabled() {
+        return proxy_error_response(
+            StatusCode::FORBIDDEN,
+            "debug_summary_disabled",
+            "live requests endpoint is disabled",
+        );
+    }
+    if !debug_summary_authorized(
+        request.headers(),
+        config.observability.debug_summary_admin_token.as_deref(),
+    ) {
+        return proxy_error_response(
+            StatusCode::UNAUTHORIZED,
+            "debug_summary_unauthorized",
+            "live requests authorization failed",
+        );
+    }
+    // Safety-net prune so leaked entries don't accumulate between metrics scrapes.
+    state.live_registry.prune_stale(5 * 60 * 1000);
+    let summaries = state.live_registry.list_active();
+    json_response(
+        StatusCode::OK,
+        render_live_requests_json(&summaries).to_string(),
+    )
+}
+
+/// `GET /debug/requests/{id}` — returns detail for a single live request,
+/// including its full stage timeline. Returns 404 if the request is unknown or
+/// already completed (live entries are removed on completion).
+async fn debug_live_request_handler(
+    State(state): State<ProxyState>,
+    request: Request<Body>,
+) -> Response<Body> {
+    let config = match state.config.snapshot() {
+        Ok(config) => config,
+        Err(error) => {
+            return proxy_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_snapshot_failed",
+                &error.to_string(),
+            );
+        }
+    };
+    if !config.observability.debug_summary_enabled.is_enabled() {
+        return proxy_error_response(
+            StatusCode::FORBIDDEN,
+            "debug_summary_disabled",
+            "live requests endpoint is disabled",
+        );
+    }
+    if !debug_summary_authorized(
+        request.headers(),
+        config.observability.debug_summary_admin_token.as_deref(),
+    ) {
+        return proxy_error_response(
+            StatusCode::UNAUTHORIZED,
+            "debug_summary_unauthorized",
+            "live requests authorization failed",
+        );
+    }
+    // Extract the request id from the last path segment.
+    let request_id = request
+        .uri()
+        .path()
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    if request_id.is_empty() {
+        return proxy_error_response(
+            StatusCode::NOT_FOUND,
+            "live_request_not_found",
+            "request id not provided",
+        );
+    }
+    match state.live_registry.get(&request_id) {
+        Some(entry) => json_response(
+            StatusCode::OK,
+            render_live_request_detail_json(&entry).to_string(),
+        ),
+        None => proxy_error_response(
+            StatusCode::NOT_FOUND,
+            "live_request_not_found",
+            "no active request with that id (it may have completed or been pruned)",
+        ),
+    }
+}
+
+fn render_live_requests_json(summaries: &[LiveRequestSummary]) -> serde_json::Value {
+    let requests: Vec<serde_json::Value> = summaries.iter().map(render_live_summary_json).collect();
+    json!({
+        "redaction": "metadata-only; no raw prompts or responses are exposed",
+        "request_count": summaries.len(),
+        "requests": requests,
+    })
+}
+
+fn render_live_summary_json(summary: &LiveRequestSummary) -> serde_json::Value {
+    json!({
+        "request_id": summary.request_id,
+        "state": summary.state,
+        "model": summary.model,
+        "profile": summary.profile,
+        "downstream_mode": summary.downstream_mode,
+        "elapsed_ms": summary.elapsed_ms,
+        "queue_wait_ms": summary.queue_wait_ms,
+        "first_token_latency_ms": summary.first_token_latency_ms,
+        "active_ladder_rung": summary.active_ladder_rung,
+        "active_attempt_index": summary.active_attempt_index,
+        "chunks_downstream": summary.chunks_downstream,
+        "bytes_downstream": summary.bytes_downstream,
+        "last_progress_at_ms": summary.last_progress_at_ms,
+    })
+}
+
+fn render_live_request_detail_json(entry: &LiveRequestEntry) -> serde_json::Value {
+    let timeline: Vec<serde_json::Value> = entry
+        .timeline
+        .iter()
+        .map(|event| json!({ "at_ms": event.at_ms, "event": event.event }))
+        .collect();
+    json!({
+        "request_id": entry.request_id,
+        "listener": entry.listener,
+        "profile": entry.profile,
+        "model": entry.model,
+        "upstream_target": entry.upstream_target,
+        "downstream_mode": entry.downstream_mode,
+        "state": entry.state.as_str(),
+        "created_at_ms": entry.created_at_ms,
+        "last_updated_at_ms": entry.last_updated_at_ms,
+        "queue_wait_ms": entry.queue_wait_ms,
+        "upstream_elapsed_ms": entry.upstream_elapsed_ms,
+        "first_token_latency_ms": entry.first_token_latency_ms,
+        "active_ladder_rung": entry.active_ladder_rung,
+        "active_attempt_index": entry.active_attempt_index,
+        "chunks_downstream": entry.chunks_downstream,
+        "bytes_downstream": entry.bytes_downstream,
+        "chunks_upstream": entry.chunks_upstream,
+        "bytes_upstream": entry.bytes_upstream,
+        "last_progress_at_ms": entry.last_progress_at_ms,
+        "timeline": timeline,
+        "redaction": "metadata-only; no raw prompts or responses are exposed",
     })
 }
 
@@ -1608,6 +1781,7 @@ fn proxy_handler(
     Box::pin(proxy_handler_inner(state, request))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Response<Body> {
     if request.method() == Method::GET && is_configured_debug_summary_request(&state, request.uri())
     {
@@ -1616,6 +1790,17 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
 
     let request_id = RequestId::generate();
     let started_at_unix_ms = unix_time_millis();
+    // Register the request in the live observability registry. We use
+    // "streaming" as the default mode; the forwarder will refine it if the
+    // request turns out to be non-streaming JSON.
+    state
+        .live_registry
+        .register(request_id.as_str(), "streaming");
+    state
+        .live_registry
+        .update_target(request_id.as_str(), Some(state.listener.name.clone()), None);
+    let live_request_id = request_id.clone();
+    let live_registry = Arc::clone(&state.live_registry);
     if let Err(error) = validate_openai_path(request.uri().path()) {
         let finished_at_unix_ms = unix_time_millis();
         let error_type = error.error_type();
@@ -1641,17 +1826,30 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
                 attempts: Vec::new(),
             },
         );
+        live_registry.update_state(live_request_id.as_str(), LiveRequestState::Failed);
+        live_registry.fail(live_request_id.as_str());
         return response;
     }
 
     let admission_request = AdmissionRequestMetadata::from_request(&request);
     let admission =
         match admit_request(&state, &request_id, started_at_unix_ms, admission_request).await {
-            AdmissionOutcome::Accepted(admission) => *admission,
-            AdmissionOutcome::Rejected(response) => return response,
+            AdmissionOutcome::Accepted(admission) => {
+                state
+                    .live_registry
+                    .update_state(request_id.as_str(), LiveRequestState::Admitted);
+                *admission
+            }
+            AdmissionOutcome::Rejected(response) => {
+                state
+                    .live_registry
+                    .update_state(request_id.as_str(), LiveRequestState::Failed);
+                state.live_registry.fail(request_id.as_str());
+                return response;
+            }
         };
 
-    match Box::pin(forward_openai_request(
+    let forward_result = Box::pin(forward_openai_request(
         &state,
         &request_id,
         started_at_unix_ms,
@@ -1661,9 +1859,15 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
         admission.admission_metadata,
         admission.config.server.max_request_body_bytes,
     ))
-    .await
-    {
-        Ok(response) => response,
+    .await;
+    match forward_result {
+        Ok(response) => {
+            state
+                .live_registry
+                .update_state(request_id.as_str(), LiveRequestState::Completed);
+            state.live_registry.complete(request_id.as_str());
+            response
+        }
         Err(error) => {
             let finished_at_unix_ms = unix_time_millis();
             let error_type = error.error_type();
@@ -1689,6 +1893,10 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
                     attempts: error.attempt_records(),
                 },
             );
+            state
+                .live_registry
+                .update_state(live_request_id.as_str(), LiveRequestState::Failed);
+            live_registry.fail(live_request_id.as_str());
             response
         }
     }

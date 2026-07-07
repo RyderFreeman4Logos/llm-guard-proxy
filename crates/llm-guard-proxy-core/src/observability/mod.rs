@@ -7,6 +7,7 @@
 
 mod error;
 mod ids;
+mod live_registry;
 mod model;
 mod redaction;
 mod store;
@@ -16,6 +17,9 @@ mod tests;
 
 pub use error::ObservabilityError;
 pub use ids::{AttemptId, RequestId};
+pub use live_registry::{
+    LiveRequestEntry, LiveRequestRegistry, LiveRequestState, LiveRequestSummary, TimelineEvent,
+};
 pub use model::{
     AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
     HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram, ObservabilityMetricsSnapshot,
