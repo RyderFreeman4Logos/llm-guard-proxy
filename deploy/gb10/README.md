@@ -244,3 +244,160 @@ wrapper service is disabled and stopped.
 The deployment also makes `/home/obj/.local` non-group-writable (`0755`) so the
 wrapper accepts the configured SQLite path under `/home/obj/.local/state`. Leave
 that permission in place while the wrapper uses this state path.
+
+## Evidence profiles
+
+Two ready-to-copy profiles control how much data the proxy retains for audit,
+debugging, and loop-detector improvement. Append the relevant block to the
+`[evidence]` section of `config.toml`.
+
+### Privacy-minimal production
+
+Maximum privacy. No raw payloads, no shadow attempts, no paired comparisons.
+Suitable for live serving where no offline detector tuning is expected.
+
+```toml
+[evidence]
+enabled = true
+include_raw_payloads = false
+include_request_headers = false
+
+[evidence.shadow]
+enabled = false
+
+[evidence.shadow.paired_comparison]
+enabled = false
+```
+
+### Quality-debug / loop-improvement
+
+Collects raw input/output/reasoning, runs shadow downgrade attempts, and
+produces paired comparison variants for offline detector calibration. **This
+mode runs extra model attempts and stores sensitive data — use only on trusted
+hosts with private storage.**
+
+```toml
+[evidence]
+enabled = true
+include_raw_payloads = true
+include_request_headers = true
+max_bytes = 10737418240        # 10 GiB evidence envelope
+prune_to_bytes = 8589934592
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = true
+parallel_downgrade_attempts = true
+max_shadow_attempts_per_request = 2
+max_global_shadow_in_flight = 4
+shadow_attempt_timeout_ms = 300000
+compare_attempts = ["bounded-thinking", "no-thinking", "cot-salvage"]
+
+[evidence.shadow.paired_comparison]
+enabled = true
+variants = ["max-thinking", "bounded-thinking", "no-thinking"]
+include_raw_input = true
+include_raw_output = true
+include_raw_reasoning = true
+sample_rate = 1.0
+max_bytes = 8589934592          # 8 GiB paired raw artifact retention
+max_age_days = 14
+```
+
+### Safety notes
+
+- **Raw payload and reasoning capture is sensitive.** Even with header
+  redaction, stored raw request/response bodies and chain-of-thought text
+  should be treated as confidential operator debug data. Keep SQLite and blob
+  directories at `0700` and do not expose debug endpoints beyond trusted
+  networks.
+- **Selected headers are redacted** for known sensitive keys (authorization,
+  api-key, etc.), but operators should still audit which headers are retained.
+- **Raw CoT is not released downstream** to the caller, but it **is** persisted
+  in the evidence store when `include_raw_reasoning = true`. This data never
+  leaves the evidence SQLite/blob storage and is pruned by retention limits.
+- **Shadow and paired comparison attempts consume GPU.** In quality-debug mode
+  the proxy intentionally runs extra model calls (bounded-thinking, no-thinking,
+  cot-salvage variants) alongside the primary request. These are evidence-only
+  and do not affect the client-visible response, but they do consume vLLM
+  capacity.
+- **`compare_attempts` vs `paired_comparison.variants`:** `compare_attempts`
+  controls shadow downgrade attempts that run alongside the primary request
+  (evidence only, no effect on client response). `paired_comparison.variants`
+  controls same-prompt alternatives that run after a successful primary request
+  for offline quality comparison. CoT-salvage is meaningful only for
+  loop-failure shadow continuation where a failed reasoning prefix exists; a
+  paired successful request will not produce a `cot-salvage` variant.
+
+### What affects client-visible quality vs evidence-only collection
+
+| Setting | Client-visible effect | Evidence/debug effect |
+|---------|----------------------|----------------------|
+| `evidence.enabled` | None | Enables persistent request/response audit trail |
+| `evidence.include_raw_payloads` | None | Stores full request/response bodies |
+| `evidence.shadow.enabled` | None | Runs extra model attempts for evidence |
+| `evidence.shadow.keep_looping_attempt_running` | None | Keeps looping attempt alive for shadow analysis instead of canceling |
+| `evidence.shadow.compare_attempts` | None | Runs downgrade variants for offline comparison |
+| `evidence.shadow.paired_comparison.enabled` | None | Runs same-prompt alternatives post-success |
+| `loop_guard.mode = "enforce"` | May abort and retry looping requests | Records loop signals |
+| `loop_guard.mode = "monitor"` | None (observe only) | Records loop signals without acting |
+| `thinking.force_disable` | Disables thinking for all requests | None |
+
+## Workspace build path (avoiding cargo-install dependency skew)
+
+For GB10 reviewed-main deployments with workspace crates and path dependencies,
+**prefer a local workspace checkout build** over `cargo install`-ing only the
+binary crate from GitHub. The binary crate depends on `llm-guard-proxy-core`
+via a path dependency; `cargo install` from a remote URL can resolve against a
+stale or incomplete version of the core crate, causing missing exports such as
+`llm_guard_proxy_core::embedding`, `LoopFailurePolicy`, or
+`ShadowComparisonAttempt`.
+
+### Recommended build sequence
+
+```bash
+# 1. Fetch and checkout the reviewed main branch
+cd ~/project/github/RyderFreeman4Logos/llm-guard-proxy
+git fetch origin
+git checkout main
+git pull origin main
+
+# 2. Build the release binary in the workspace context
+#    Use a persistent target dir to speed up incremental rebuilds
+CARGO_TARGET_DIR=/ssd/llm-guard-proxy-target \
+  cargo build --release -p llm-guard-proxy
+
+# 3. Atomically relink the service binary
+install -Dm755 \
+  /ssd/llm-guard-proxy-target/release/llm-guard-proxy \
+  /home/obj/.local/bin/llm-guard-proxy
+
+# 4. Reload systemd and restart
+systemctl --user daemon-reload
+systemctl --user restart llm-guard-proxy.service
+
+# 5. Verify
+# Confirm the running process is using the new binary
+readlink /proc/$(systemctl --user show -p MainPID --value llm-guard-proxy.service)/exe
+# Check health
+curl --fail --silent http://gb10:18009/health
+# Check model metadata
+curl --fail --silent http://gb10:18009/v1/models | jq '.data[] | {id, max_model_len}'
+# Run a representative chat completion (see Verification section above)
+```
+
+### Why not `mise cargo install`?
+
+The `mise use -g 'cargo:https://github.com/...@branch:main'` approach fetches
+only the binary crate and lets cargo resolve the core dependency independently.
+When the core crate has new public exports (types, traits, config fields), the
+resolver may pick an older cached version that lacks those exports, producing
+compile errors like:
+
+```text
+error[E0432]: unresolved import `llm_guard_proxy_core::embedding`
+error[E0433]: failed to resolve: use of undeclared type `LoopFailurePolicy`
+```
+
+Building from a local workspace checkout guarantees that the binary and core
+crates are compiled together from the same commit.
