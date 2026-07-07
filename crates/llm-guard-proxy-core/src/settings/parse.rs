@@ -62,6 +62,7 @@ enum Section {
     EvidenceShadowPairedComparison,
     Thinking,
     LoopGuard,
+    LoopGuardEmbedding,
     Retry,
     RetryLadder(usize),
     UpstreamStall,
@@ -284,6 +285,7 @@ fn parse_section(
         "evidence.shadow.paired_comparison" => Ok(Section::EvidenceShadowPairedComparison),
         "thinking" => Ok(Section::Thinking),
         "loop_guard" => Ok(Section::LoopGuard),
+        "loop_guard.embedding" => Ok(Section::LoopGuardEmbedding),
         "retry" => Ok(Section::Retry),
         "upstream.stall" => Ok(Section::UpstreamStall),
         "heartbeat" => Ok(Section::Heartbeat),
@@ -398,6 +400,9 @@ fn assign_value(
         ),
         Section::Thinking => assign_thinking(&mut config.thinking, key, value, line_number),
         Section::LoopGuard => assign_loop_guard(&mut config.loop_guard, key, value, line_number),
+        Section::LoopGuardEmbedding => {
+            assign_loop_guard_embedding(&mut config.loop_guard.embedding, key, value, line_number)
+        }
         Section::Retry => assign_retry(&mut config.retry, key, value, line_number),
         Section::RetryLadder(index) => {
             assign_retry_ladder(&mut config.retry.ladder[*index], key, value, line_number)
@@ -1500,6 +1505,106 @@ fn assign_loop_guard(
         _ => return unknown_key("loop_guard", key, line_number),
     }
     Ok(())
+}
+
+fn assign_loop_guard_embedding(
+    config: &mut super::LoopGuardEmbeddingConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "provider" => {
+            config.provider = parse_embedding_provider(value, line_number)?;
+        }
+        "endpoint" => config.endpoint = parse_string(value, line_number)?,
+        "model" => config.model = parse_string(value, line_number)?,
+        "api_key" => {
+            config.api_key = Some(parse_string(value, line_number)?);
+        }
+        "window_token_count" => {
+            config.window_token_count = parse_u32(
+                value,
+                line_number,
+                "loop_guard.embedding.window_token_count",
+            )?;
+        }
+        "window_stride_tokens" => {
+            config.window_stride_tokens = parse_u32(
+                value,
+                line_number,
+                "loop_guard.embedding.window_stride_tokens",
+            )?;
+        }
+        "minimum_token_count" => {
+            config.minimum_token_count = parse_u32(
+                value,
+                line_number,
+                "loop_guard.embedding.minimum_token_count",
+            )?;
+        }
+        "history_window_count" => {
+            config.history_window_count = parse_u32(
+                value,
+                line_number,
+                "loop_guard.embedding.history_window_count",
+            )?;
+        }
+        "batch_max_windows" => {
+            config.batch_max_windows =
+                parse_u32(value, line_number, "loop_guard.embedding.batch_max_windows")?;
+        }
+        "batch_max_wait_ms" => {
+            config.batch_max_wait_ms =
+                parse_u32(value, line_number, "loop_guard.embedding.batch_max_wait_ms")?;
+        }
+        "queue_max_windows" => {
+            config.queue_max_windows =
+                parse_u32(value, line_number, "loop_guard.embedding.queue_max_windows")?;
+        }
+        "on_queue_full" => {
+            config.on_queue_full = parse_embedding_queue_policy(value, line_number)?;
+        }
+        "vector_dim" => {
+            config.vector_dim = parse_u32(value, line_number, "loop_guard.embedding.vector_dim")?;
+        }
+        _ => return unknown_key("loop_guard.embedding", key, line_number),
+    }
+    Ok(())
+}
+
+fn parse_embedding_provider(
+    value: &str,
+    line_number: usize,
+) -> Result<super::EmbeddingProvider, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "disabled" => Ok(super::EmbeddingProvider::Disabled),
+        "openai_compatible" => Ok(super::EmbeddingProvider::OpenAiCompatible),
+        "tei" => Ok(super::EmbeddingProvider::Tei),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid loop_guard.embedding.provider {other:?}; expected \"disabled\", \"openai_compatible\", or \"tei\""
+            ),
+        )),
+    }
+}
+
+fn parse_embedding_queue_policy(
+    value: &str,
+    line_number: usize,
+) -> Result<super::EmbeddingQueuePolicy, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "skip" => Ok(super::EmbeddingQueuePolicy::Skip),
+        "deterministic_only" => Ok(super::EmbeddingQueuePolicy::DeterministicOnly),
+        "block" => Ok(super::EmbeddingQueuePolicy::Block),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid loop_guard.embedding.on_queue_full {other:?}; expected \"skip\", \"deterministic_only\", or \"block\""
+            ),
+        )),
+    }
 }
 
 fn parse_loop_guard_mode(

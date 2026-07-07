@@ -5,8 +5,9 @@
 //! retry, and request-shielding behavior behind core interfaces.
 
 #[cfg(feature = "guard")]
-mod budget;
-mod evidence;
+pub mod budget;
+pub mod embedding;
+pub mod evidence;
 #[cfg(feature = "family")]
 pub mod family;
 #[cfg(feature = "guard")]
@@ -25,6 +26,10 @@ pub mod workflow;
 
 #[cfg(feature = "guard")]
 pub use budget::{BudgetCheck, BudgetError, BudgetStore, current_budget_date};
+pub use embedding::{
+    DisabledEmbeddingBackend, EmbeddingBackend, EmbeddingChannel, EmbeddingError, EmbeddingFuture,
+    EmbeddingInput, EmbeddingVector,
+};
 pub use evidence::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceDatabaseStatus,
     EvidenceError, EvidenceExportArtifact, EvidenceExportPair, EvidenceGroupRecord,

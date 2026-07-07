@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod embedding_backend;
 mod proxy;
 
 use std::{ffi::OsString, fs, future::pending, path::PathBuf, process::ExitCode, time::Duration};

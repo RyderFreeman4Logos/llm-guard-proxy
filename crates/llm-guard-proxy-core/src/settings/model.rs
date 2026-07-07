@@ -2598,6 +2598,8 @@ pub struct LoopGuardConfig {
     pub reasoning_semantic_minimum_token_count: u32,
     /// Maximum completed semantic windows kept for bounded history comparison.
     pub reasoning_semantic_history_window_count: u32,
+    /// Embedding backend configuration for higher-recall semantic detection.
+    pub embedding: LoopGuardEmbeddingConfig,
 }
 
 impl LoopGuardConfig {
@@ -2710,6 +2712,86 @@ impl Default for LoopGuardConfig {
             reasoning_semantic_window_token_count: 24,
             reasoning_semantic_minimum_token_count: 8,
             reasoning_semantic_history_window_count: 16,
+            embedding: LoopGuardEmbeddingConfig::default(),
+        }
+    }
+}
+
+/// Embedding backend configuration for semantic loop detection.
+///
+/// When `provider` is `disabled`, the loop guard falls back to deterministic
+/// hash-based detection. When set to `openai_compatible` or `tei`, embedding
+/// vectors are fetched from a separate configurable endpoint.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoopGuardEmbeddingConfig {
+    /// Embedding backend type.
+    pub provider: EmbeddingProvider,
+    /// Endpoint URL for the embedding service (e.g. `http://host:port/v1/embeddings`).
+    pub endpoint: String,
+    /// Model name passed to the embedding service.
+    pub model: String,
+    /// Optional API key for the embedding service.
+    pub api_key: Option<String>,
+    /// Tokens per embedding window.
+    pub window_token_count: u32,
+    /// Stride between consecutive embedding windows.
+    pub window_stride_tokens: u32,
+    /// Skip windows shorter than this token count.
+    pub minimum_token_count: u32,
+    /// How many past windows to compare against.
+    pub history_window_count: u32,
+    /// Maximum windows per embedding batch request.
+    pub batch_max_windows: u32,
+    /// Maximum milliseconds to wait before sending a partial batch.
+    pub batch_max_wait_ms: u32,
+    /// Maximum windows allowed in the embedding queue.
+    pub queue_max_windows: u32,
+    /// Queue overflow policy.
+    pub on_queue_full: EmbeddingQueuePolicy,
+    /// MRL dimension truncation (0 = use full dimension).
+    pub vector_dim: u32,
+}
+
+/// Embedding backend provider type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum EmbeddingProvider {
+    /// No embedding calls; fall back to deterministic detection.
+    #[default]
+    Disabled,
+    /// OpenAI-compatible `/v1/embeddings` endpoint.
+    OpenAiCompatible,
+    /// Hugging Face TEI `/embed` endpoint.
+    Tei,
+}
+
+/// Queue overflow policy when the embedding queue is full.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub enum EmbeddingQueuePolicy {
+    /// Skip the window silently (default).
+    #[default]
+    Skip,
+    /// Fall back to deterministic-only detection for this request.
+    DeterministicOnly,
+    /// Block the hot path until queue space is available.
+    Block,
+}
+
+impl Default for LoopGuardEmbeddingConfig {
+    fn default() -> Self {
+        Self {
+            provider: EmbeddingProvider::Disabled,
+            endpoint: String::new(),
+            model: String::new(),
+            api_key: None,
+            window_token_count: 96,
+            window_stride_tokens: 48,
+            minimum_token_count: 16,
+            history_window_count: 64,
+            batch_max_windows: 64,
+            batch_max_wait_ms: 75,
+            queue_max_windows: 4096,
+            on_queue_full: EmbeddingQueuePolicy::Skip,
+            vector_dim: 256,
         }
     }
 }

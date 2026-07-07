@@ -18,7 +18,8 @@ axum = "0.8"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 llm-guard-proxy-core = { path = "../llm-guard-proxy-core" }
-reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "stream", "json"] }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
