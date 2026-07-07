@@ -31,13 +31,16 @@ max_control_plane_in_flight_requests = 128
 # exhaustion from large payloads.
 max_request_body_bytes = 67108864
 
+# Maximum graceful shutdown drain wait after SIGTERM starts cancellation.
+# shutdown_drain_timeout_ms = 30000
+
 # ── Generation queue ──────────────────────────────────────────────────────────
 # When max_in_flight_requests is reached, new requests enter a bounded queue.
 
-# server.max_queued_generation_requests = 32
-# server.generation_queue_timeout_ms = 300000      # 5 min
-# server.generation_queue_full_status = 429         # HTTP status when queue full
-# server.generation_queue_retry_after_secs = 10
+# max_queued_generation_requests = 32
+# generation_queue_timeout_ms = 300000      # 5 min
+# generation_queue_full_status = 429         # HTTP status when queue full
+# generation_queue_retry_after_secs = 10
 
 ## ───────────────────────── Upstream (single) ────────────────────────────────
 ## The default upstream inference endpoint. For multi-upstream routing, use

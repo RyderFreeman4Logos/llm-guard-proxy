@@ -46,6 +46,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "server.generation_queue_retry_after_secs",
     "server.max_control_plane_in_flight_requests",
     "server.max_request_body_bytes",
+    "server.shutdown_drain_timeout_ms",
     "shielding.enabled",
     "observability.enabled",
     "observability.capture_raw_payloads",

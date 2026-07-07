@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -415,6 +415,47 @@ fn admin_token_matcher_accepts_only_exact_values() {
     assert!(!admin_token_matches("admin-token-extra", "admin-token"));
     assert!(!admin_token_matches("admin-toke", "admin-token"));
     assert!(!admin_token_matches("", "admin-token"));
+}
+
+#[test]
+fn request_cleanup_log_line_is_bounded_and_payload_free() {
+    let mut request_metadata = BTreeMap::new();
+    request_metadata.insert(
+        String::from("authorization"),
+        String::from("opaque-auth-marker"),
+    );
+    let mut response_metadata = BTreeMap::new();
+    response_metadata.insert(
+        String::from("upstream_error"),
+        String::from("contains sk-live-secret"),
+    );
+    let request = RequestRecord {
+        request_id: RequestId::from_string("req-cleanup-log")
+            .expect("static request id should be valid"),
+        started_at_unix_ms: 1_000,
+        finished_at_unix_ms: Some(1_050),
+        downstream_mode: DownstreamMode::NonStreamJson,
+        upstream_mode: UpstreamMode::Streaming,
+        model_id: Some(String::from("secret-model-sk-live")),
+        input_fingerprint: Some(String::from("fingerprint-secret")),
+        status: RequestStatus::Aborted,
+        http_status: Some(200),
+        error_reason: Some(String::from("upstream_stream_error: sk-live-secret")),
+        abort_reason: Some(String::from("downstream_body_dropped_before_eof")),
+        request_metadata,
+        response_metadata,
+        raw_payloads: RawPayloads::default(),
+    };
+
+    let line = request_cleanup_log_line(&request, "downstream_disconnect", 7, false);
+
+    assert!(line.contains("request_id=req-cleanup-log"));
+    assert!(line.contains("terminal_reason=downstream_disconnect"));
+    assert!(line.contains("cleanup_latency_ms=7"));
+    assert!(line.contains("evidence_written=false"));
+    assert_safe_operational_text("request cleanup log", &line);
+    assert!(!line.contains("secret-model"));
+    assert!(!line.contains("fingerprint-secret"));
 }
 
 #[tokio::test]
@@ -8490,6 +8531,7 @@ anti_loop_hint_enabled = true
 "#,
     )
     .await;
+    proxy.state.reset_shielded_heartbeat_ticks_for_tests();
 
     let response = proxy_handler(
         State(proxy.state.clone()),
@@ -8506,12 +8548,27 @@ anti_loop_hint_enabled = true
     assert_eq!(prefix, Bytes::from_static(b" \n"));
     let heartbeat = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "retry heartbeat").await;
     assert_eq!(heartbeat, Bytes::from_static(b" \n"));
+    let heartbeat_ticks_before_drop = proxy.state.shielded_heartbeat_ticks_for_tests();
+    assert!(
+        heartbeat_ticks_before_drop > 0,
+        "test must observe at least one shielded heartbeat tick before drop"
+    );
     drop(body);
+    sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(
+        proxy.state.shielded_heartbeat_ticks_for_tests(),
+        heartbeat_ticks_before_drop,
+        "closed shielded liveness body must not keep ticking heartbeats"
+    );
 
     let first_attempt = fake.recv_next().await;
     let second_attempt = fake.recv_next().await;
     assert!(!body_contains_retry_hint(&first_attempt.body));
     assert!(body_contains_retry_hint(&second_attempt.body));
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "cancelled shielded request must not issue a third retry"
+    );
 
     let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
@@ -8533,6 +8590,7 @@ anti_loop_hint_enabled = true
         attempts[1].abort_reason.as_deref(),
         Some("downstream_body_dropped_before_eof")
     );
+    assert_forwarded_attempt_count_stays(&proxy.sqlite_path, 2).await;
 }
 
 #[tokio::test]
@@ -12932,7 +12990,7 @@ async fn shutdown_completes_after_disconnect_storm() {
         &upstream.base_url,
         true,
         4,
-        "max_queued_generation_requests = 8\ngeneration_queue_timeout_ms = 5000\n",
+        "max_queued_generation_requests = 8\ngeneration_queue_timeout_ms = 5000\nshutdown_drain_timeout_ms = 1000\n",
         r#"
 [heartbeat]
 mode = "json-whitespace"
@@ -12990,11 +13048,16 @@ interval_secs = 1
     shutdown_tx
         .send(())
         .expect("shutdown signal should be delivered");
+    let shutdown_started = tokio::time::Instant::now();
     timeout(STREAM_COMPLETION_TIMEOUT, server)
         .await
         .expect("server should exit after shutdown starts")
         .expect("server task should not panic")
         .expect("server should shut down cleanly");
+    assert!(
+        shutdown_started.elapsed() < Duration::from_millis(1_500),
+        "server should finish within the configured drain budget plus scheduler margin"
+    );
 
     for _ in 0..4 {
         let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
@@ -14097,6 +14160,19 @@ fn count_rows(connection: &Connection, sql: &str) -> u64 {
         .query_row(sql, [], |row| row.get(0))
         .expect("count query should succeed");
     u64::try_from(count).expect("count should be nonnegative")
+}
+
+async fn assert_forwarded_attempt_count_stays(sqlite_path: &Path, expected_count: u64) {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM attempts"),
+        expected_count
+    );
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM attempts"),
+        expected_count
+    );
 }
 
 async fn assert_shadow_timeout_count_stays(sqlite_path: &Path, expected_count: u64) {

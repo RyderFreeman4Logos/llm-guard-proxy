@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher},
     convert::Infallible,
     fmt,
-    future::Future,
+    future::{Future, IntoFuture},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     pin::Pin,
@@ -109,6 +109,8 @@ pub(crate) struct ProxyState {
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
     live_registry: Arc<LiveRequestRegistry>,
+    #[cfg(test)]
+    shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
 
 /// Cause-bucketed monotonic counters for upstream 502 failures emitted to
@@ -234,6 +236,8 @@ impl ProxyState {
             malformed_response_counter: Arc::new(AtomicU64::new(0)),
             upstream_failure_counters: Arc::new(UpstreamFailureCounters::default()),
             live_registry: Arc::new(LiveRequestRegistry::new()),
+            #[cfg(test)]
+            shielded_heartbeat_ticks: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -243,6 +247,16 @@ impl ProxyState {
         let mut state = self.clone();
         state.listener = listener;
         state
+    }
+
+    #[cfg(test)]
+    fn reset_shielded_heartbeat_ticks_for_tests(&self) {
+        self.shielded_heartbeat_ticks.store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn shielded_heartbeat_ticks_for_tests(&self) -> u64 {
+        self.shielded_heartbeat_ticks.load(Ordering::SeqCst)
     }
 
     async fn acquire_generation_permit(
@@ -575,13 +589,40 @@ pub(crate) async fn serve_until_shutdown(
     state: ProxyState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    let config = state.config.clone();
     let shutdown_gate = Arc::clone(&state.shutdown);
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async move {
-            shutdown.await;
-            shutdown_gate.begin_shutdown();
-        })
-        .await
+    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+    let server = axum::serve(listener, router(state)).with_graceful_shutdown(async move {
+        shutdown.await;
+        shutdown_gate.begin_shutdown();
+        let _ignored = shutdown_started_tx.send(());
+    });
+    let mut server = Box::pin(server.into_future());
+
+    tokio::select! {
+        result = server.as_mut() => result,
+        _ = shutdown_started_rx => {
+            let drain_timeout = current_shutdown_drain_timeout(&config);
+            match timeout(drain_timeout, server.as_mut()).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    eprintln!(
+                        "llm_guard_proxy_shutdown_drain_timeout timeout_ms={}",
+                        drain_timeout.as_millis()
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn current_shutdown_drain_timeout(config: &ConfigHandle) -> Duration {
+    let timeout_ms = config.snapshot().map_or_else(
+        |_error| AppConfig::default().server.shutdown_drain_timeout_ms,
+        |snapshot| snapshot.server.shutdown_drain_timeout_ms,
+    );
+    Duration::from_millis(timeout_ms)
 }
 
 #[derive(Debug, Default)]
@@ -2498,6 +2539,8 @@ async fn forward_openai_request(
                 shadow_evidence: ShadowEvidenceState::default(),
                 malformed_response_counter: state.malformed_response_counter.clone(),
                 upstream_failure_counters: state.upstream_failure_counters.clone(),
+                #[cfg(test)]
+                shielded_heartbeat_ticks: state.shielded_heartbeat_ticks.clone(),
             },
             in_flight_permit,
         )
@@ -5020,6 +5063,8 @@ struct ShieldedRetryRuntime {
     shadow_evidence: ShadowEvidenceState,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
+    #[cfg(test)]
+    shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug)]
@@ -5266,15 +5311,20 @@ fn shielded_liveness_stream_response(
         }
     });
     let aggregate = maybe_detach_shielded_aggregate(aggregate, &runtime.retry_policy);
-    let response_body = ShieldedLivenessBody::new(
-        aggregate,
-        runtime.liveness.mode,
-        if runtime.chat_kind == ShieldedChatKind::Stream {
+    let liveness_settings = ShieldedLivenessBodySettings {
+        mode: runtime.liveness.mode,
+        accepted_response_mode: if runtime.chat_kind == ShieldedChatKind::Stream {
             ShieldedAcceptedResponseMode::OpenAiSse
         } else {
             ShieldedAcceptedResponseMode::JsonCompletion
         },
-        runtime.liveness.heartbeat_interval_secs,
+        interval_secs: runtime.liveness.heartbeat_interval_secs,
+        #[cfg(test)]
+        shielded_heartbeat_ticks: runtime.shielded_heartbeat_ticks.clone(),
+    };
+    let response_body = ShieldedLivenessBody::new(
+        aggregate,
+        &liveness_settings,
         observer,
         in_flight_permit,
         runtime.shutdown.subscribe(),
@@ -7760,10 +7810,52 @@ impl ForwardedBodyObserver {
             &request_record,
             &attempts,
         );
+        log_request_cleanup(
+            &request_record,
+            completion.terminal_reason(),
+            unix_time_millis().saturating_sub(finished_at_unix_ms),
+            evidence_written,
+        );
         if evidence_written && let Some(runtime) = paired_shadow_runtime.as_ref() {
             maybe_schedule_paired_comparison_after_primary(runtime, &request_record, &attempts);
         }
     }
+}
+
+fn log_request_cleanup(
+    request: &RequestRecord,
+    terminal_reason: &'static str,
+    cleanup_latency_ms: u64,
+    evidence_written: bool,
+) {
+    eprintln!(
+        "{}",
+        request_cleanup_log_line(
+            request,
+            terminal_reason,
+            cleanup_latency_ms,
+            evidence_written
+        )
+    );
+}
+
+fn request_cleanup_log_line(
+    request: &RequestRecord,
+    terminal_reason: &'static str,
+    cleanup_latency_ms: u64,
+    evidence_written: bool,
+) -> String {
+    format!(
+        "llm_guard_proxy_request_cleanup request_id={} status={} terminal_reason={} cleanup_latency_ms={} http_status={} downstream_mode={} upstream_mode={} evidence_written={}",
+        request.request_id.as_str(),
+        request.status.as_str(),
+        terminal_reason,
+        cleanup_latency_ms,
+        request.http_status.unwrap_or(0),
+        request.downstream_mode.as_str(),
+        request.upstream_mode.as_str(),
+        evidence_written
+    )
 }
 
 fn final_attempt_record(
@@ -7912,6 +8004,15 @@ impl BodyCompletion {
             Self::DownstreamDropped => Some(String::from("downstream_body_dropped_before_eof")),
             Self::Shutdown => Some(String::from("server_shutdown")),
             Self::Succeeded | Self::UpstreamStreamError(_) => None,
+        }
+    }
+
+    const fn terminal_reason(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::UpstreamStreamError(_) => "upstream_stream_error",
+            Self::DownstreamDropped => "downstream_disconnect",
+            Self::Shutdown => "server_shutdown",
         }
     }
 }
@@ -8099,6 +8200,14 @@ enum ShieldedAcceptedResponseMode {
     OpenAiSse,
 }
 
+struct ShieldedLivenessBodySettings {
+    mode: ShieldedLivenessMode,
+    accepted_response_mode: ShieldedAcceptedResponseMode,
+    interval_secs: u64,
+    #[cfg(test)]
+    shielded_heartbeat_ticks: Arc<AtomicU64>,
+}
+
 struct ShieldedLivenessBody {
     aggregate: ShieldedAggregateFuture,
     direct_stream: Option<DirectRelayStream>,
@@ -8108,6 +8217,8 @@ struct ShieldedLivenessBody {
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: InFlightPermit,
     shutdown: ShutdownSubscription,
+    #[cfg(test)]
+    shielded_heartbeat_ticks: Arc<AtomicU64>,
     bytes_seen: u64,
     terminal_completion: Option<BodyCompletion>,
     json_prefix_pending: bool,
@@ -8116,28 +8227,28 @@ struct ShieldedLivenessBody {
 impl ShieldedLivenessBody {
     fn new(
         aggregate: ShieldedAggregateFuture,
-        mode: ShieldedLivenessMode,
-        accepted_response_mode: ShieldedAcceptedResponseMode,
-        interval_secs: u64,
+        settings: &ShieldedLivenessBodySettings,
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
         shutdown: ShutdownSubscription,
     ) -> Self {
-        let period = Duration::from_secs(interval_secs);
+        let period = Duration::from_secs(settings.interval_secs);
         let mut interval = tokio::time::interval_at(Instant::now() + period, period);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
             aggregate,
             direct_stream: None,
             interval,
-            mode,
-            accepted_response_mode,
+            mode: settings.mode,
+            accepted_response_mode: settings.accepted_response_mode,
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
             shutdown,
+            #[cfg(test)]
+            shielded_heartbeat_ticks: settings.shielded_heartbeat_ticks.clone(),
             bytes_seen: 0,
             terminal_completion: None,
-            json_prefix_pending: mode == ShieldedLivenessMode::JsonWhitespace,
+            json_prefix_pending: settings.mode == ShieldedLivenessMode::JsonWhitespace,
         }
     }
 
@@ -8287,7 +8398,11 @@ impl Stream for ShieldedLivenessBody {
         }
 
         match Pin::new(&mut this.interval).poll_tick(cx) {
-            Poll::Ready(_instant) => this.count_and_emit(heartbeat_chunk(this.mode)),
+            Poll::Ready(_instant) => {
+                #[cfg(test)]
+                this.shielded_heartbeat_ticks.fetch_add(1, Ordering::SeqCst);
+                this.count_and_emit(heartbeat_chunk(this.mode))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -9246,6 +9361,15 @@ fn record_queued_admission_cancel(record: QueuedAdmissionCancelRecord) {
         raw_payloads: RawPayloads::default(),
     };
     record_observability_many(&context.store, &request_record, &[]);
+    log_request_cleanup(
+        &request_record,
+        failed_request_terminal_reason(
+            request_record.status,
+            request_record.abort_reason.as_deref(),
+        ),
+        unix_time_millis().saturating_sub(finished_at_unix_ms),
+        false,
+    );
 }
 
 fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecord) {
@@ -9274,6 +9398,33 @@ fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecor
         raw_payloads: RawPayloads::default(),
     };
     record_observability_many(store, &request_record, &failure.attempts);
+    log_request_cleanup(
+        &request_record,
+        failed_request_terminal_reason(
+            request_record.status,
+            request_record.abort_reason.as_deref(),
+        ),
+        unix_time_millis().saturating_sub(failure.finished_at_unix_ms),
+        false,
+    );
+}
+
+fn failed_request_terminal_reason(
+    status: RequestStatus,
+    abort_reason: Option<&str>,
+) -> &'static str {
+    match (status, abort_reason) {
+        (RequestStatus::Aborted, Some("server_shutdown" | "server_shutdown_while_queued")) => {
+            "server_shutdown"
+        }
+        (
+            RequestStatus::Aborted,
+            Some("downstream_body_dropped_before_eof" | "downstream_disconnected_while_queued"),
+        ) => "downstream_disconnect",
+        (RequestStatus::Aborted, _) => "aborted",
+        (RequestStatus::Failed, _) => "failed",
+        (RequestStatus::Succeeded, _) => "succeeded",
+    }
 }
 
 fn copy_loop_response_metadata(

@@ -39,6 +39,7 @@ generation_queue_full_status = 429
 generation_queue_retry_after_secs = 30
 max_control_plane_in_flight_requests = 5
 max_request_body_bytes = 1048576
+shutdown_drain_timeout_ms = 25000
 
 [[listeners]]
 name = "embedding-legacy"
@@ -1156,6 +1157,7 @@ fn parses_toml_with_defaults_and_overrides() {
     assert_eq!(config.server.generation_queue_retry_after_secs, Some(30));
     assert_eq!(config.server.max_control_plane_in_flight_requests, 5);
     assert_eq!(config.server.max_request_body_bytes, 1_048_576);
+    assert_eq!(config.server.shutdown_drain_timeout_ms, 25_000);
     assert_eq!(config.listeners.len(), 2);
     assert_eq!(config.listeners[0].name, "embedding-legacy");
     assert_eq!(config.listeners[0].bind_host, "127.0.0.1");
@@ -2387,6 +2389,19 @@ fn validates_request_body_limit_bounds() {
         .validate()
         .expect_err("excessive request body limit should fail");
     assert_eq!(error.field(), "server.max_request_body_bytes");
+
+    config = AppConfig::default();
+    config.server.shutdown_drain_timeout_ms = 0;
+    let error = config
+        .validate()
+        .expect_err("zero shutdown drain timeout should fail");
+    assert_eq!(error.field(), "server.shutdown_drain_timeout_ms");
+
+    config.server.shutdown_drain_timeout_ms = 300_001;
+    let error = config
+        .validate()
+        .expect_err("excessive shutdown drain timeout should fail");
+    assert_eq!(error.field(), "server.shutdown_drain_timeout_ms");
 }
 
 #[test]
@@ -2631,6 +2646,7 @@ generation_queue_timeout_ms = 2000
 generation_queue_full_status = 503
 max_control_plane_in_flight_requests = 3
 max_request_body_bytes = 1048576
+shutdown_drain_timeout_ms = 30000
 
 [heartbeat]
 mode = "sse"
@@ -2660,6 +2676,7 @@ generation_queue_full_status = 429
 generation_queue_retry_after_secs = 30
 max_control_plane_in_flight_requests = 2
 max_request_body_bytes = 512
+shutdown_drain_timeout_ms = 15000
 
 [thinking]
 force_disable = true
@@ -2700,6 +2717,7 @@ reasoning_semantic_history_window_count = 20
     assert_eq!(snapshot.server.generation_queue_retry_after_secs, Some(30));
     assert_eq!(snapshot.server.max_control_plane_in_flight_requests, 2);
     assert_eq!(snapshot.server.max_request_body_bytes, 512);
+    assert_eq!(snapshot.server.shutdown_drain_timeout_ms, 15_000);
     assert!(snapshot.thinking.force_disable);
     assert_eq!(
         snapshot.thinking.no_thinking_marker_policy,
@@ -2991,6 +3009,7 @@ generation_queue_timeout_ms = 2000
 generation_queue_full_status = 503
 max_control_plane_in_flight_requests = 3
 max_request_body_bytes = 1048576
+shutdown_drain_timeout_ms = 30000
 
 [heartbeat]
 mode = "sse"
@@ -3015,6 +3034,7 @@ generation_queue_full_status = 429
 generation_queue_retry_after_secs = 30
 max_control_plane_in_flight_requests = 2
 max_request_body_bytes = 512
+shutdown_drain_timeout_ms = 15000
 
 [heartbeat]
 mode = "disabled"
@@ -3043,6 +3063,7 @@ interval_secs = 4
     assert_eq!(snapshot.server.generation_queue_retry_after_secs, Some(30));
     assert_eq!(snapshot.server.max_control_plane_in_flight_requests, 2);
     assert_eq!(snapshot.server.max_request_body_bytes, 512);
+    assert_eq!(snapshot.server.shutdown_drain_timeout_ms, 15_000);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 4);
 
@@ -3073,6 +3094,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"server.generation_queue_retry_after_secs"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_control_plane_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_request_body_bytes"));
+    assert!(RELOADABLE_FIELDS.contains(&"server.shutdown_drain_timeout_ms"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.mode"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.on_reasoning_loop"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.output_repeated_line_threshold"));
@@ -3130,6 +3152,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.generation_queue_full_status"));
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.generation_queue_retry_after_secs"));
     assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.max_control_plane_in_flight_requests"));
+    assert!(!RESTART_REQUIRED_FIELDS.contains(&"server.shutdown_drain_timeout_ms"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstream.base_url"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"upstreams.topology"));
     assert!(RESTART_REQUIRED_FIELDS.contains(&"listeners.topology"));
