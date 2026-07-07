@@ -113,6 +113,361 @@ impl EmbeddingVector {
     }
 }
 
+// ============================================================================
+// Semantic self-loop scoring (issue #107)
+// ============================================================================
+
+/// Default cosine similarity threshold for [`EmbeddingChannel::Reasoning`].
+///
+/// Reasoning text tends to paraphrase itself within a tighter band, so the
+/// bar for "same cluster" is slightly lower than for content/tool args.
+pub const REASONING_SIMILARITY_THRESHOLD: f32 = 0.88;
+/// Default cosine similarity threshold for [`EmbeddingChannel::Content`].
+pub const CONTENT_SIMILARITY_THRESHOLD: f32 = 0.90;
+/// Default cosine similarity threshold for [`EmbeddingChannel::ToolArgs`].
+pub const TOOL_ARGS_SIMILARITY_THRESHOLD: f32 = 0.92;
+
+/// Minimum number of same-channel observations before the scorer will emit a
+/// [`SemanticLoopSignal`]. Below this we don't have enough history to trust a
+/// cluster-density reading.
+pub const MIN_OBSERVATIONS_FOR_SIGNAL: usize = 2;
+
+/// Signal emitted by [`SemanticLoopScorer`] when recent embedding windows on a
+/// channel form a tight, low-novelty cluster — i.e. the model is semantically
+/// stuck repeating itself.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SemanticLoopSignal {
+    /// Channel that triggered the signal.
+    pub channel: EmbeddingChannel,
+    /// Aggregated risk score in `[0.0, 1.0]`. Higher means more likely a loop.
+    ///
+    /// Computed as `cluster_density * (1.0 - novelty_median)`, then clamped.
+    pub risk: f32,
+    /// Highest cosine similarity observed between the new vector and the
+    /// channel's recent history (`max_recent_sim`).
+    pub max_similarity: f32,
+    /// Fraction of the last `K` same-channel windows whose cosine similarity
+    /// to the new vector met or exceeded the similarity threshold.
+    pub cluster_density: f32,
+    /// Median novelty (`1.0 - cosine`) over the last `M` windows.
+    pub novelty_median: f32,
+}
+
+/// Configuration for a [`SemanticLoopScorer`].
+///
+/// `similarity_threshold` is a single default; callers that want per-channel
+/// thresholds can mutate the returned config or construct the scorer and then
+/// adjust [`SemanticLoopScorer::set_channel_threshold`].
+#[derive(Clone, Debug)]
+pub struct SemanticLoopConfig {
+    /// Cosine similarity at or above which two vectors are considered the same
+    /// semantic cluster (default channel threshold; per-channel overrides
+    /// apply via [`SemanticLoopScorer::set_channel_threshold`]).
+    pub similarity_threshold: f32,
+    /// Minimum fraction of recent windows that must cluster together before a
+    /// signal is emitted (e.g. `0.55`).
+    pub cluster_density_threshold: f32,
+    /// Median novelty (`1.0 - cosine`) over recent windows must be at or below
+    /// this for a signal (e.g. `0.08`).
+    pub low_novelty_median: f32,
+    /// Maximum number of recent embedding vectors retained per channel (the
+    /// ring-buffer bound).
+    pub history_window_count: usize,
+}
+
+impl Default for SemanticLoopConfig {
+    fn default() -> Self {
+        Self {
+            // Content channel's default; per-channel overrides live in the
+            // scorer (reasoning and tool args are adjusted up/down).
+            similarity_threshold: CONTENT_SIMILARITY_THRESHOLD,
+            cluster_density_threshold: 0.55,
+            low_novelty_median: 0.08,
+            history_window_count: 64,
+        }
+    }
+}
+
+impl SemanticLoopConfig {
+    /// Creates a config with the documented sensible defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// Scoring engine that detects semantic self-loops per channel using cosine
+/// similarity between recent embedding windows.
+///
+/// The scorer maintains a bounded ring buffer of recent
+/// [`EmbeddingVector`]s per [`EmbeddingChannel`]. Each new vector is compared
+/// against the channel's recent history to compute:
+///
+/// - `max_recent_sim`: the highest cosine similarity to any recent window.
+/// - `novelty`: `1.0 - max_recent_sim` (how new this content is).
+/// - `cluster_density`: the fraction of recent windows whose similarity meets
+///   the channel's threshold.
+///
+/// A [`SemanticLoopSignal`] is emitted when the channel's recent windows form
+/// a tight, low-novelty cluster — i.e. the model is paraphrasing itself rather
+/// than producing new content. This catches recurrence that the hash-based
+/// [`ChannelizedLoopDetector`](crate::ChannelizedLoopDetector) misses, because
+/// paraphrases rarely share token-set hashes.
+pub struct SemanticLoopScorer {
+    config: SemanticLoopConfig,
+    thresholds: ChannelThresholds,
+    reasoning: RingBuffer,
+    content: RingBuffer,
+    tool_args: RingBuffer,
+}
+
+impl SemanticLoopScorer {
+    /// Creates a new scorer from the given config, installing per-channel
+    /// default thresholds:
+    /// - Reasoning: `0.88`
+    /// - Content: `0.90`
+    /// - `ToolArgs`: `0.92`
+    #[must_use]
+    pub fn new(config: SemanticLoopConfig) -> Self {
+        let mut thresholds = ChannelThresholds::default();
+        thresholds.set(EmbeddingChannel::Reasoning, REASONING_SIMILARITY_THRESHOLD);
+        thresholds.set(EmbeddingChannel::Content, config.similarity_threshold);
+        thresholds.set(EmbeddingChannel::ToolArgs, TOOL_ARGS_SIMILARITY_THRESHOLD);
+        Self {
+            config,
+            thresholds,
+            reasoning: RingBuffer::default(),
+            content: RingBuffer::default(),
+            tool_args: RingBuffer::default(),
+        }
+    }
+
+    /// Returns the configured history window count (ring-buffer bound).
+    #[must_use]
+    pub fn history_window_count(&self) -> usize {
+        self.config.history_window_count
+    }
+
+    /// Overrides the similarity threshold for a specific channel.
+    pub fn set_channel_threshold(&mut self, channel: EmbeddingChannel, threshold: f32) {
+        self.thresholds.set(channel, threshold);
+    }
+
+    /// Returns the effective similarity threshold for a channel.
+    #[must_use]
+    pub fn channel_threshold(&self, channel: EmbeddingChannel) -> f32 {
+        self.thresholds.get(channel)
+    }
+
+    /// Returns the stored embedding history for a channel (oldest first).
+    #[must_use]
+    pub fn channel_history(&self, channel: EmbeddingChannel) -> &[EmbeddingVector] {
+        self.ring_for(channel).as_slice()
+    }
+
+    /// Observes a new embedding vector for a channel, updates the per-channel
+    /// ring buffer, and returns a [`SemanticLoopSignal`] if the channel is
+    /// judged to be in a semantic self-loop.
+    ///
+    /// The returned signal (if any) reflects the state *after* inserting
+    /// `vector` into the history.
+    pub fn observe_vector(
+        &mut self,
+        channel: EmbeddingChannel,
+        vector: &EmbeddingVector,
+    ) -> Option<SemanticLoopSignal> {
+        let threshold = self.thresholds.get(channel);
+        let cap = self.config.history_window_count;
+
+        let ring = self.ring_mut_for(channel);
+        // Compute cluster statistics *before* we insert the new vector, so the
+        // similarity/density readings compare the new window against prior
+        // history (a window is not similar to itself in this accounting).
+        let (max_similarity, cluster_density, novelty_median) =
+            Self::cluster_stats(ring, vector, threshold, cap);
+
+        ring.push(vector.clone(), cap);
+
+        // Need at least a couple of prior observations for the density/median
+        // readings to be meaningful. `max_similarity == None` also covers the
+        // degenerate (zero-length / all-zero) vector case, where every cosine
+        // comparison is undefined.
+        let sufficient_history = ring.len() >= MIN_OBSERVATIONS_FOR_SIGNAL;
+        let max_sim = max_similarity?;
+
+        if !sufficient_history {
+            return None;
+        }
+
+        let density = cluster_density.unwrap_or(0.0);
+        let novelty = novelty_median.unwrap_or(1.0);
+
+        let is_loop = density >= self.config.cluster_density_threshold
+            && novelty <= self.config.low_novelty_median;
+
+        if !is_loop {
+            return None;
+        }
+
+        let risk = (density * (1.0 - novelty)).clamp(0.0, 1.0);
+
+        Some(SemanticLoopSignal {
+            channel,
+            risk,
+            max_similarity: max_sim,
+            cluster_density: density,
+            novelty_median: novelty,
+        })
+    }
+
+    /// Computes `max_recent_sim`, `cluster_density`, and `novelty_median` for
+    /// `vector` against the most recent `cap` entries of `history`.
+    ///
+    /// Returns `(max_sim, density, median)` where each component is `None`
+    /// when `history` is empty or every cosine comparison is undefined.
+    fn cluster_stats(
+        history: &RingBuffer,
+        vector: &EmbeddingVector,
+        threshold: f32,
+        cap: usize,
+    ) -> (Option<f32>, Option<f32>, Option<f32>) {
+        if history.buf.is_empty() {
+            return (None, None, None);
+        }
+
+        // Only compare against the last `cap` historical windows.
+        let start = history.buf.len().saturating_sub(cap);
+        let recent = &history.buf[start..];
+
+        let mut max_sim = f32::NEG_INFINITY;
+        let mut similarities: Vec<f32> = Vec::with_capacity(recent.len());
+        let mut defined = 0usize;
+
+        for prev in recent {
+            if let Some(sim) = vector.cosine_similarity(prev) {
+                defined += 1;
+                max_sim = max_sim.max(sim);
+                similarities.push(sim);
+            }
+        }
+
+        if defined == 0 {
+            return (None, None, None);
+        }
+
+        let max_sim = if max_sim.is_finite() {
+            Some(max_sim)
+        } else {
+            None
+        };
+
+        // Cluster density: fraction of *defined* comparisons meeting threshold.
+        // Counts are bounded by `recent.len()` (tiny), so the usize→f32 cast
+        // cannot lose precision in practice; allow the lint locally.
+        #[allow(clippy::cast_precision_loss)]
+        let above = similarities.iter().filter(|&&s| s >= threshold).count() as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let density = above / defined as f32;
+
+        // Novelty = 1.0 - cosine; median over recent windows.
+        let mut novelties: Vec<f32> = similarities.iter().map(|&s| 1.0 - s).collect();
+        novelties.sort_unstable_by(f32::total_cmp);
+        let median = Self::median(&novelties);
+
+        (max_sim, Some(density), Some(median))
+    }
+
+    /// Returns the median of a non-empty, pre-sorted slice.
+    fn median(sorted: &[f32]) -> f32 {
+        let n = sorted.len();
+        if n == 0 {
+            return 1.0;
+        }
+        if n % 2 == 1 {
+            sorted[n / 2]
+        } else {
+            f32::midpoint(sorted[n / 2 - 1], sorted[n / 2])
+        }
+    }
+
+    fn ring_mut_for(&mut self, channel: EmbeddingChannel) -> &mut RingBuffer {
+        match channel {
+            EmbeddingChannel::Reasoning => &mut self.reasoning,
+            EmbeddingChannel::Content => &mut self.content,
+            EmbeddingChannel::ToolArgs => &mut self.tool_args,
+        }
+    }
+
+    fn ring_for(&self, channel: EmbeddingChannel) -> &RingBuffer {
+        match channel {
+            EmbeddingChannel::Reasoning => &self.reasoning,
+            EmbeddingChannel::Content => &self.content,
+            EmbeddingChannel::ToolArgs => &self.tool_args,
+        }
+    }
+}
+
+/// Per-channel cosine similarity thresholds.
+#[derive(Clone, Debug)]
+struct ChannelThresholds {
+    reasoning: f32,
+    content: f32,
+    tool_args: f32,
+}
+
+impl Default for ChannelThresholds {
+    fn default() -> Self {
+        Self {
+            reasoning: REASONING_SIMILARITY_THRESHOLD,
+            content: CONTENT_SIMILARITY_THRESHOLD,
+            tool_args: TOOL_ARGS_SIMILARITY_THRESHOLD,
+        }
+    }
+}
+
+impl ChannelThresholds {
+    const fn get(&self, channel: EmbeddingChannel) -> f32 {
+        match channel {
+            EmbeddingChannel::Reasoning => self.reasoning,
+            EmbeddingChannel::Content => self.content,
+            EmbeddingChannel::ToolArgs => self.tool_args,
+        }
+    }
+
+    fn set(&mut self, channel: EmbeddingChannel, value: f32) {
+        match channel {
+            EmbeddingChannel::Reasoning => self.reasoning = value,
+            EmbeddingChannel::Content => self.content = value,
+            EmbeddingChannel::ToolArgs => self.tool_args = value,
+        }
+    }
+}
+
+/// Bounded per-channel ring buffer of recent embedding vectors.
+#[derive(Clone, Debug, Default)]
+struct RingBuffer {
+    buf: Vec<EmbeddingVector>,
+}
+
+impl RingBuffer {
+    /// Appends a vector, evicting the oldest entry when at capacity.
+    fn push(&mut self, vector: EmbeddingVector, cap: usize) {
+        let cap = cap.max(1);
+        if self.buf.len() >= cap {
+            self.buf.remove(0);
+        }
+        self.buf.push(vector);
+    }
+
+    fn len(&self) -> usize {
+        self.buf.len()
+    }
+
+    fn as_slice(&self) -> &[EmbeddingVector] {
+        &self.buf
+    }
+}
+
 /// Type alias for the boxed future returned by [`EmbeddingBackend::embed_batch`].
 pub type EmbeddingFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Vec<EmbeddingVector>, EmbeddingError>> + Send + 'a>>;
@@ -614,6 +969,234 @@ mod tests {
         assert_eq!(
             q.push("r", "a", EmbeddingChannel::Content, 1, 1, "t"),
             EmbeddingQueueResult::Accepted
+        );
+    }
+
+    // ---- SemanticLoopScorer tests (issue #107) ----
+
+    fn vec_from(seq: u64, comps: &[f32]) -> EmbeddingVector {
+        EmbeddingVector {
+            window_seq: seq,
+            components: comps.to_vec(),
+        }
+    }
+
+    fn content_config(history: usize) -> SemanticLoopConfig {
+        SemanticLoopConfig {
+            similarity_threshold: 0.90,
+            cluster_density_threshold: 0.55,
+            low_novelty_median: 0.08,
+            history_window_count: history,
+        }
+    }
+
+    #[test]
+    fn semantic_loop_identical_vectors_produce_high_risk() {
+        let mut scorer = SemanticLoopScorer::new(content_config(8));
+        let v = vec_from(0, &[1.0, 2.0, 3.0, 4.0]);
+
+        // First observation: no history yet -> no signal.
+        assert!(
+            scorer
+                .observe_vector(EmbeddingChannel::Content, &v)
+                .is_none()
+        );
+
+        // Second identical observation: max_sim == 1.0, density == 1.0,
+        // novelty_median == 0.0 -> loop.
+        let sig = scorer
+            .observe_vector(EmbeddingChannel::Content, &v)
+            .expect("identical vector should trigger a signal");
+
+        assert_eq!(sig.channel, EmbeddingChannel::Content);
+        assert!(
+            (sig.max_similarity - 1.0).abs() < 1e-5,
+            "got {}",
+            sig.max_similarity
+        );
+        assert!(
+            (sig.cluster_density - 1.0).abs() < 1e-5,
+            "got {}",
+            sig.cluster_density
+        );
+        assert!(
+            sig.novelty_median.abs() < 1e-5,
+            "got {}",
+            sig.novelty_median
+        );
+        // risk = density * (1 - novelty_median) ~= 1.0
+        assert!(sig.risk > 0.99, "risk should be near 1.0, got {}", sig.risk);
+    }
+
+    #[test]
+    fn semantic_loop_dissimilar_vectors_produce_no_signal() {
+        let mut scorer = SemanticLoopScorer::new(content_config(8));
+        // Orthogonal vectors: cosine == 0 -> novelty == 1.0, density == 0.
+        scorer.observe_vector(EmbeddingChannel::Content, &vec_from(0, &[1.0, 0.0, 0.0]));
+        let sig = scorer.observe_vector(EmbeddingChannel::Content, &vec_from(1, &[0.0, 1.0, 0.0]));
+        assert!(sig.is_none(), "orthogonal vectors should not loop");
+    }
+
+    #[test]
+    fn semantic_loop_cluster_density_correctly_computed() {
+        // Threshold 0.90. Three historical vectors: two identical to the probe,
+        // one orthogonal. density should be 2/3 ~= 0.666 >= 0.55.
+        let mut scorer = SemanticLoopScorer::new(content_config(8));
+        let probe = vec_from(99, &[1.0, 1.0, 1.0]);
+        let same = vec_from(0, &[1.0, 1.0, 1.0]);
+        let ortho = vec_from(1, &[0.0, 0.0, 1.0]);
+
+        // Seed history.
+        scorer.observe_vector(EmbeddingChannel::Content, &same);
+        scorer.observe_vector(EmbeddingChannel::Content, &ortho);
+        scorer.observe_vector(EmbeddingChannel::Content, &same);
+
+        let sig = scorer
+            .observe_vector(EmbeddingChannel::Content, &probe)
+            .expect("should fire: density 2/3 with low novelty median from the identical pair");
+
+        // density = 2/3 (two identical out of three defined comparisons)
+        assert!(
+            (sig.cluster_density - (2.0 / 3.0)).abs() < 1e-5,
+            "density got {}",
+            sig.cluster_density
+        );
+    }
+
+    #[test]
+    fn semantic_loop_channel_specific_thresholds_respected() {
+        // Build a scorer and confirm default thresholds differ per channel.
+        let scorer = SemanticLoopScorer::new(SemanticLoopConfig::default());
+        assert!((scorer.channel_threshold(EmbeddingChannel::Reasoning) - 0.88).abs() < 1e-6);
+        assert!((scorer.channel_threshold(EmbeddingChannel::Content) - 0.90).abs() < 1e-6);
+        assert!((scorer.channel_threshold(EmbeddingChannel::ToolArgs) - 0.92).abs() < 1e-6);
+
+        // A pair of near-identical vectors that are above the reasoning
+        // threshold (0.88) but below content (0.90) and tool args (0.92).
+        // cosine([1,0,0],[1,0.5,0]) = 1/sqrt(1.25) ~= 0.8944
+        let a = vec_from(0, &[1.0, 0.0, 0.0]);
+        let b = vec_from(1, &[1.0, 0.5, 0.0]);
+
+        // Reasoning: 0.8944 >= 0.88 -> density 1.0, novelty ~0.1056.
+        // But novelty_median ~0.1056 > low_novelty_median 0.08 -> NO signal.
+        let mut r = SemanticLoopScorer::new(SemanticLoopConfig {
+            similarity_threshold: 0.90,
+            cluster_density_threshold: 0.55,
+            low_novelty_median: 0.08,
+            history_window_count: 8,
+        });
+        r.observe_vector(EmbeddingChannel::Reasoning, &a);
+        let sig = r.observe_vector(EmbeddingChannel::Reasoning, &b);
+        // Cosine ~0.894 -> novelty ~0.106 > 0.08 threshold, so no loop.
+        assert!(sig.is_none(), "reasoning pair below novelty bar");
+
+        // ToolArgs threshold is 0.92: same pair is far below it -> density 0.
+        let mut t = SemanticLoopScorer::new(SemanticLoopConfig::default());
+        t.observe_vector(EmbeddingChannel::ToolArgs, &a);
+        let sig = t.observe_vector(EmbeddingChannel::ToolArgs, &b);
+        assert!(sig.is_none(), "tool args pair below similarity threshold");
+    }
+
+    #[test]
+    fn semantic_loop_history_bounded_correctly() {
+        let cap = 4;
+        let mut scorer = SemanticLoopScorer::new(content_config(cap));
+
+        // Use explicit f32 literals to avoid usize→f32 precision-loss lints.
+        let vals: [(u64, f32); 7] = [
+            (0, 0.0),
+            (1, 1.0),
+            (2, 2.0),
+            (3, 3.0),
+            (4, 4.0),
+            (5, 5.0),
+            (6, 6.0),
+        ];
+        for (seq, i_f) in vals {
+            scorer.observe_vector(
+                EmbeddingChannel::Content,
+                &vec_from(seq, &[i_f + 1.0, i_f + 2.0]),
+            );
+        }
+
+        let history = scorer.channel_history(EmbeddingChannel::Content);
+        assert_eq!(
+            history.len(),
+            cap,
+            "history must be bounded by history_window_count"
+        );
+        // Oldest entries evicted; the surviving window_seqs are the last `cap`.
+        let seqs: Vec<u64> = history.iter().map(|v| v.window_seq).collect();
+        assert_eq!(seqs, vec![3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn semantic_loop_history_independent_per_channel() {
+        let mut scorer = SemanticLoopScorer::new(content_config(8));
+        scorer.observe_vector(EmbeddingChannel::Reasoning, &vec_from(0, &[1.0, 0.0]));
+        scorer.observe_vector(EmbeddingChannel::Content, &vec_from(0, &[1.0, 0.0]));
+        scorer.observe_vector(EmbeddingChannel::Content, &vec_from(1, &[0.0, 1.0]));
+
+        assert_eq!(scorer.channel_history(EmbeddingChannel::Reasoning).len(), 1);
+        assert_eq!(scorer.channel_history(EmbeddingChannel::Content).len(), 2);
+        assert_eq!(scorer.channel_history(EmbeddingChannel::ToolArgs).len(), 0);
+    }
+
+    #[test]
+    fn semantic_loop_single_observation_no_signal() {
+        let mut scorer = SemanticLoopScorer::new(content_config(8));
+        // First observation never fires (no history to compare against).
+        assert!(
+            scorer
+                .observe_vector(EmbeddingChannel::Content, &vec_from(0, &[1.0, 2.0]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn semantic_loop_degenerate_vector_no_signal() {
+        let mut scorer = SemanticLoopScorer::new(content_config(8));
+        // Zero vectors: cosine_similarity returns None -> no readings.
+        scorer.observe_vector(EmbeddingChannel::Content, &vec_from(0, &[0.0, 0.0]));
+        let sig = scorer.observe_vector(EmbeddingChannel::Content, &vec_from(1, &[0.0, 0.0]));
+        assert!(
+            sig.is_none(),
+            "degenerate vectors must not produce a signal"
+        );
+    }
+
+    #[test]
+    fn semantic_loop_signal_fields_populated() {
+        let mut scorer = SemanticLoopScorer::new(content_config(8));
+        let v = vec_from(0, &[2.0, 3.0, 1.0]);
+        scorer.observe_vector(EmbeddingChannel::Content, &v);
+        let sig = scorer
+            .observe_vector(EmbeddingChannel::Content, &v)
+            .unwrap();
+        assert_eq!(sig.channel, EmbeddingChannel::Content);
+        assert!(sig.risk >= 0.0 && sig.risk <= 1.0);
+        assert!(sig.max_similarity >= 0.0 && sig.max_similarity <= 1.0);
+        assert!(sig.cluster_density >= 0.0 && sig.cluster_density <= 1.0);
+        assert!(sig.novelty_median >= 0.0);
+    }
+
+    #[test]
+    fn semantic_loop_set_channel_threshold_overrides() {
+        let mut scorer = SemanticLoopScorer::new(SemanticLoopConfig::default());
+        // Lower the content threshold so a borderline pair now clusters.
+        scorer.set_channel_threshold(EmbeddingChannel::Content, 0.80);
+        assert!((scorer.channel_threshold(EmbeddingChannel::Content) - 0.80).abs() < 1e-6);
+
+        // cosine ~0.894 >= 0.80, novelty ~0.106 > 0.08 low_novelty -> still no.
+        // But if we also raise low_novelty_median, it should fire.
+        scorer.config.low_novelty_median = 0.20;
+        let a = vec_from(0, &[1.0, 0.0, 0.0]);
+        let b = vec_from(1, &[1.0, 0.5, 0.0]);
+        scorer.observe_vector(EmbeddingChannel::Content, &a);
+        let sig = scorer.observe_vector(EmbeddingChannel::Content, &b);
+        assert!(
+            sig.is_some(),
+            "lowered threshold and raised novelty bar should fire"
         );
     }
 }
