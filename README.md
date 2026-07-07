@@ -337,6 +337,8 @@ Reloadable fields:
 - `observability.metrics_enabled`
 - `observability.health_upstream_probe_enabled`
 - `observability.health_upstream_probe_timeout_ms`
+- `observability.health_chat_probe_enabled`
+- `observability.health_chat_probe_timeout_ms`
 - `observability.debug_summary_enabled`
 - `observability.debug_summary_admin_token`
 - `observability.debug_summary_max_records`

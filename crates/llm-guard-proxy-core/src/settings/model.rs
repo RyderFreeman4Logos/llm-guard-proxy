@@ -662,6 +662,10 @@ impl AppConfig {
             requested.observability.health_upstream_probe_enabled;
         self.observability.health_upstream_probe_timeout_ms =
             requested.observability.health_upstream_probe_timeout_ms;
+        self.observability.health_chat_probe_enabled =
+            requested.observability.health_chat_probe_enabled;
+        self.observability.health_chat_probe_timeout_ms =
+            requested.observability.health_chat_probe_timeout_ms;
         self.observability.debug_summary_enabled = requested.observability.debug_summary_enabled;
         self.observability
             .debug_summary_admin_token
@@ -1751,6 +1755,10 @@ pub struct ObservabilityConfig {
     pub health_upstream_probe_enabled: ConfigToggle,
     /// Maximum time spent probing upstream readiness from `/health`.
     pub health_upstream_probe_timeout_ms: u64,
+    /// Enables an additional `/v1/chat/completions` readiness probe from `/health`.
+    pub health_chat_probe_enabled: ConfigToggle,
+    /// Maximum time spent probing upstream chat completion readiness from `/health`.
+    pub health_chat_probe_timeout_ms: u64,
     /// Enables the gated recent-request debug summary endpoint.
     pub debug_summary_enabled: ConfigToggle,
     /// Optional bearer/admin token required for the debug summary endpoint.
@@ -1776,6 +1784,16 @@ impl ObservabilityConfig {
         require(
             self.health_upstream_probe_timeout_ms <= 30_000,
             "observability.health_upstream_probe_timeout_ms",
+            "must be less than or equal to 30000",
+        )?;
+        require(
+            self.health_chat_probe_timeout_ms > 0,
+            "observability.health_chat_probe_timeout_ms",
+            "must be greater than zero",
+        )?;
+        require(
+            self.health_chat_probe_timeout_ms <= 30_000,
+            "observability.health_chat_probe_timeout_ms",
             "must be less than or equal to 30000",
         )?;
         require(
@@ -1808,6 +1826,8 @@ impl Default for ObservabilityConfig {
             metrics_enabled: ConfigToggle::Enabled,
             health_upstream_probe_enabled: ConfigToggle::Enabled,
             health_upstream_probe_timeout_ms: 500,
+            health_chat_probe_enabled: ConfigToggle::Disabled,
+            health_chat_probe_timeout_ms: 10_000,
             debug_summary_enabled: ConfigToggle::Disabled,
             debug_summary_admin_token: None,
             debug_summary_max_records: 20,

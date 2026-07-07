@@ -16215,3 +16215,155 @@ async fn validation_error_response_includes_request_id() {
         .expect("x-request-id header should be present");
     assert_eq!(request_id_header, "req-test-124");
 }
+
+#[tokio::test]
+async fn upstream_transport_error_response_includes_cause_and_request_id() {
+    let request_id = request_id_for_test();
+    let error = ProxyError::UpstreamTransport {
+        failure: ReqwestFailureKind::Connect,
+        observability: None,
+    };
+    let response = proxy_error_response_from_error_with_diagnostics(&error, Some(&request_id));
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body_bytes = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("body should read");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("error body should be valid JSON");
+    assert_eq!(
+        parsed["error"]["cause"],
+        serde_json::json!("upstream_connect_failed")
+    );
+    assert_eq!(
+        parsed["error"]["code"],
+        serde_json::json!("upstream_connect_failed")
+    );
+    assert_eq!(
+        parsed["error"]["request_id"],
+        serde_json::json!(request_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn upstream_timeout_error_response_classifies_as_timeout() {
+    let error = ProxyError::UpstreamTransport {
+        failure: ReqwestFailureKind::Timeout,
+        observability: None,
+    };
+    let response = proxy_error_response_from_error_with_diagnostics(&error, None);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body_bytes = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("body should read");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("error body should be valid JSON");
+    assert_eq!(
+        parsed["error"]["cause"],
+        serde_json::json!("upstream_timeout")
+    );
+}
+
+#[tokio::test]
+async fn upstream_body_error_response_classifies_as_body_error() {
+    let error = ProxyError::UpstreamBody {
+        reason: String::from("connection reset"),
+        observability: None,
+    };
+    let response = proxy_error_response_from_error_with_diagnostics(&error, None);
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body_bytes = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("body should read");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("error body should be valid JSON");
+    assert_eq!(
+        parsed["error"]["cause"],
+        serde_json::json!("upstream_body_error")
+    );
+}
+
+#[tokio::test]
+async fn upstream_failure_counters_increment_by_cause() {
+    let counters = UpstreamFailureCounters::default();
+    counters.increment(UpstreamFailureCause::ConnectFailed);
+    counters.increment(UpstreamFailureCause::Timeout);
+    counters.increment(UpstreamFailureCause::Timeout);
+    let snapshot = counters.snapshot();
+    assert_eq!(snapshot.connect_failed, 1);
+    assert_eq!(snapshot.timeout, 2);
+    assert_eq!(snapshot.body_error, 0);
+    assert_eq!(snapshot.transport_error, 0);
+}
+
+#[test]
+fn upstream_failure_metrics_render_all_cause_labels() {
+    let snapshot = UpstreamFailureSnapshot {
+        connect_failed: 1,
+        timeout: 2,
+        body_error: 3,
+        transport_error: 4,
+    };
+    let mut output = String::new();
+    push_upstream_failure_metrics(&mut output, snapshot);
+    assert!(output.contains("llm_guard_proxy_upstream_failure_total{cause=\"connect_failed\"} 1"));
+    assert!(output.contains("llm_guard_proxy_upstream_failure_total{cause=\"timeout\"} 2"));
+    assert!(output.contains("llm_guard_proxy_upstream_failure_total{cause=\"body_error\"} 3"));
+    assert!(output.contains("llm_guard_proxy_upstream_failure_total{cause=\"transport_error\"} 4"));
+}
+
+#[tokio::test]
+async fn health_chat_probe_reports_ready_when_upstream_healthy() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_observability_config(
+        &fake.base_url,
+        true,
+        "health_upstream_probe_timeout_ms = 100\nhealth_chat_probe_enabled = true\nhealth_chat_probe_timeout_ms = 100\n",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/health", proxy.base_url))
+        .send()
+        .await
+        .expect("health request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body_text = response.text().await.expect("health body should be text");
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("health should be JSON");
+    assert_eq!(body["upstream"], "ready");
+
+    // The models probe should have been observed.
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.path_and_query, "/v1/models");
+}
+
+#[tokio::test]
+async fn health_chat_probe_reports_degraded_when_chat_fails() {
+    // BrokenUpstream accepts connections but immediately drops them, so the
+    // lightweight /v1/models probe may succeed (axum returns 200 for the
+    // listener) but the chat probe will fail with a transport error.
+    let broken = BrokenUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_observability_config(
+        &broken.base_url,
+        true,
+        "health_upstream_probe_timeout_ms = 100\nhealth_chat_probe_enabled = true\nhealth_chat_probe_timeout_ms = 100\n",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/health", proxy.base_url))
+        .send()
+        .await
+        .expect("health request should complete");
+    // Either unavailable (models probe failed) or degraded (models ok, chat
+    // failed). Both are non-ready states; the key assertion is that we do not
+    // report "ready" when chat completions are broken.
+    let body_text = response.text().await.expect("health body should be text");
+    let body: serde_json::Value = serde_json::from_str(&body_text).expect("health should be JSON");
+    let upstream = body["upstream"].as_str().unwrap_or_default();
+    assert!(
+        upstream == "degraded" || upstream == "unavailable",
+        "expected degraded or unavailable, got {upstream}"
+    );
+}

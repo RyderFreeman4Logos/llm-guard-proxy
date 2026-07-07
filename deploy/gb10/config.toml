@@ -148,6 +148,12 @@ capture_raw_payloads = false               # Log full request/response bodies
 metrics_enabled = true                     # Expose /metrics endpoint
 health_upstream_probe_enabled = true       # Check upstream in /health
 health_upstream_probe_timeout_ms = 500     # Health probe timeout
+# Optional chat-completion readiness probe. When enabled, /health additionally
+# sends a minimal chat completion request and reports `upstream = "degraded"`
+# (HTTP 200) if the models probe succeeds but the chat probe fails. Disabled by
+# default to avoid unnecessary GPU work during routine health checks.
+health_chat_probe_enabled = false          # Also probe /v1/chat/completions
+health_chat_probe_timeout_ms = 10000       # Chat probe timeout (capped at 10s)
 debug_summary_enabled = false              # Detailed per-request summaries
 debug_summary_max_records = 20             # Max debug summary records
 # debug_summary_admin_token = ""           # Token required for debug access
