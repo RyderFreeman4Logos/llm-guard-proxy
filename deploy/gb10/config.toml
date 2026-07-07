@@ -185,6 +185,29 @@ prune_to_records = 80000                   # Prune to 80k records
 # max_global_shadow_in_flight = 4
 # shadow_attempt_timeout_ms = 300000      # 5 min
 
+# ── Paired shadow comparison (#100) ─────────────────────────────────────────
+# Runs paired same-prompt attempts under selected thinking policies
+# (e.g., max-thinking vs no-thinking) and records enough raw artifacts for
+# offline quality comparison.
+#
+# ALL raw capture is OFF by default. Enable each kind explicitly.
+# Raw reasoning is separately gated even when raw output is enabled.
+# Shadow attempts do NOT alter the client-visible response.
+
+# [evidence.shadow.paired_comparison]
+# enabled = false                          # Opt-in only
+# variants = ["max-thinking", "no-thinking"]  # Thinking variants to compare
+# include_raw_input = false                # Store raw input (off by default)
+# include_raw_output = false               # Store raw output (off by default)
+# include_raw_reasoning = false            # Store raw CoT (separately gated)
+# sample_rate = 0.0                        # 0.0 = no sampling, 1.0 = all
+# max_raw_input_bytes = 131072             # 128 KiB per raw input artifact
+# max_raw_output_bytes = 131072            # 128 KiB per raw output artifact
+# max_raw_reasoning_bytes = 131072         # 128 KiB per raw reasoning artifact
+# max_retention_records = 10000            # Prune raw content above this count
+# max_retention_bytes = 1073741824         # 1 GiB total raw content
+# retention_days = 7                       # Expire raw content after N days
+
 ## ───────────────────────── Thinking (reasoning budget) ─────────────────────
 ## Controls extended-thinking / reasoning token budgets for models that
 ## support them (e.g., Qwen3, DeepSeek-R1).
@@ -233,6 +256,40 @@ reasoning_semantic_minimum_token_count = 8
 reasoning_semantic_history_window_count = 16
 
 input_overlap_threshold_multiplier = 4     # Input/output overlap sensitivity
+
+# ── Quality-first loop failure policy (#98) ───────────────────────────────────
+# When a reasoning-loop is detected, choose how to recover instead of always
+# falling back to the retry ladder (which forces no-thinking too aggressively).
+#
+# "retry_ladder"              — Preserve existing behavior: abort and continue
+#                               through the retry ladder (default).
+# "truncate_cot_then_answer"  — Keep a bounded pre-loop private prefix of the
+#                               reasoning, then ask for a final answer without
+#                               continuing the loop. Preserves answer quality.
+# "bounded_answer_from_cot"   — Use private CoT internally for answer synthesis
+#                               without exposing raw CoT downstream.
+
+# loop_guard.on_reasoning_loop = "retry_ladder"
+
+# ── Embedding endpoint for semantic loop detection ───────────────────────────
+# The semantic detector above uses normalized token/ngram Jaccard windows by
+# default. For higher-recall semantic paraphrase loop detection, point this at
+# a separate embedding service (e.g., Qwen3-Embedding on GB10).
+#
+# If the embedding service is unavailable, the proxy falls back to the
+# deterministic detector and records embedding_status=unavailable.
+
+# [loop_guard.embedding]
+# provider = "openai_compatible"            # openai_compatible, tei, disabled
+# endpoint = "http://100.105.4.92:18012/v1/embeddings"  # separate embedding svc
+# model = "Qwen/Qwen3-Embedding-0.6B"       # embedding model name
+# window_token_count = 96                   # Tokens per embedding window
+# window_stride_tokens = 48                 # Stride between windows
+# minimum_token_count = 16                  # Skip windows shorter than this
+# history_window_count = 64                 # How many past windows to compare
+# batch_max_windows = 64                    # Max windows per embedding batch
+# batch_max_wait_ms = 75                    # Max wait to fill a batch
+# vector_dim = 256                          # MRL dimension reduction (0 = full)
 
 ## ───────────────────────── Retry ───────────────────────────────────────────
 ## Retry policy for failed upstream requests.
@@ -318,3 +375,70 @@ enabled = true
 # pre_request = "content_filter.v1"         # Run before forwarding to upstream
 # post_response = "output_check.v1"         # Run after receiving response
 # fail_closed_blocks = true                 # Block request if guard errors
+
+# ════════════════════════════════════════════════════════════════════════════
+# FUTURE: Model-judge loop guard (not yet implemented)
+# ════════════════════════════════════════════════════════════════════════════
+# The design bundle (2026-07-07) proposes an optional no-thinking model judge
+# that runs on top of the existing loop guard. It would use the same local
+# model with thinking disabled to classify ambiguous loops and generate a
+# bounded clean_reasoning_state for retry.
+#
+# This feature is NOT yet implemented. The config below is the proposed shape
+# from the design docs, included here for reference and feedback.
+# When implemented, it MUST be disabled by default and hot-reloadable.
+
+# [judge]
+# enabled = false                          # Disabled by default
+# mode = "disabled"                        # disabled, monitor, enforce
+# profile = "latency_first"               # latency_first, quality_first
+# force_disable_thinking = true            # Judge always runs no-thinking
+# temperature = 0.0                        # Deterministic judge output
+# top_p = 1.0
+# max_tokens_detect = 256                  # Max tokens for loop classification
+# max_tokens_salvage = 768                 # Max tokens for clean-state salvage
+# max_prompt_tokens_detect = 4096          # Max prompt tokens for judge input
+# max_prompt_tokens_salvage = 8192         # Max prompt tokens for salvage input
+# max_in_flight = 0                        # Concurrent judge jobs (0 = disabled)
+# queue_max = 0                            # Max queued judge jobs
+# cancel_stale_jobs = true                 # Cancel superseded judge jobs
+# cache_by_snapshot_hash = true            # Skip duplicate snapshot evaluations
+# global_request_wall_clock_budget_ms = 1800000  # 30 min hard ceiling
+# per_detect_timeout_ms = 30000            # Per-judge-call timeout
+# per_salvage_timeout_ms = 90000           # Per-salvage-call timeout
+# max_judge_rounds_per_attempt = 0         # Max judge invocations per attempt
+# max_judge_rounds_per_request = 0         # Max judge invocations per request
+
+# ── Judge model endpoint ─────────────────────────────────────────────────────
+# The judge can use the same upstream as the primary model, or a separate
+# endpoint if spare compute is available.
+
+# judge.upstream_base_url = ""             # Empty = same as primary upstream
+# judge.model = ""                         # Empty = same as primary model
+
+# ── Judge trigger thresholds ─────────────────────────────────────────────────
+
+# [judge.trigger]
+# min_generated_tokens = 1024              # Don't judge before this many tokens
+# risk_threshold_watch = 0.35              # Start monitoring at this risk
+# risk_threshold_judge = 0.50              # Invoke judge at this risk
+# risk_threshold_abort_without_judge = 0.90  # Abort without waiting for judge
+# judge_every_tokens = 1024                # Re-judge interval (normal risk)
+# accelerated_judge_every_tokens = 512     # Re-judge interval (high risk)
+
+# ── Judge policy (enforce mode) ──────────────────────────────────────────────
+
+# [judge.policy]
+# abort_if_confidence_ge = 0.78            # Abort reasoning-only loop threshold
+# abort_visible_or_tool_if_confidence_ge = 0.65  # Lower threshold for visible/tool
+# salvage_before_retry = true              # Generate clean-state before retry
+# default_retry = "bounded-thinking"       # First retry strategy
+# fallback_retry = "no-thinking"           # Fallback if default also loops
+
+# ── Judge observability ──────────────────────────────────────────────────────
+
+# [judge.observability]
+# include_short_reason = true              # Record judge's one-sentence reason
+# include_clean_state_hash = true          # Hash of clean-state for dedup
+# include_raw_snapshots = false            # Raw loop snapshots (sensitive!)
+# include_raw_clean_state = false          # Raw clean-state text (sensitive!)
