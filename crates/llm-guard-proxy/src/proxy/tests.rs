@@ -379,6 +379,19 @@ interval_secs = 1
         assert_eq!(drop_event.label, "cancellable-chat-sse");
     }
     wait_for_generation_metrics(&proxy, 0, 0, STREAM_COMPLETION_TIMEOUT).await;
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_current_retained_request_terminals",
+            &[
+                ("status", "aborted"),
+                ("terminal_reason", "downstream_disconnect"),
+                ("http_status_class", "2xx"),
+            ],
+        ),
+        4
+    );
 }
 
 #[tokio::test]
@@ -13009,7 +13022,6 @@ interval_secs = 1
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn queued_generation_requests_cancelled_by_shutdown_are_observable() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_admission_config(
@@ -13019,38 +13031,8 @@ async fn queued_generation_requests_cancelled_by_shutdown_are_observable() {
         "max_queued_generation_requests = 1\ngeneration_queue_timeout_ms = 5000\n",
     )
     .await;
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("queued shutdown listener should bind");
-    let addr = listener
-        .local_addr()
-        .expect("queued shutdown address should be readable");
-    let (shutdown_tx, shutdown_rx) = oneshot::channel();
-    let state = proxy.state.clone();
-    let server = tokio::spawn(async move {
-        serve_until_shutdown(listener, state, async {
-            let _received = shutdown_rx.await;
-        })
-        .await
-    });
-
-    let active_response = proxy
-        .client
-        .get(format!(
-            "http://{addr}/v1/embeddings?test=long-json&slot=shutdown-active"
-        ))
-        .send()
-        .await
-        .expect("active shutdown request should get headers");
-    assert_eq!(active_response.status(), StatusCode::OK);
-    let active_observed = fake
-        .recv_within(STREAM_HEADER_TIMEOUT)
-        .await
-        .expect("active shutdown request should reach upstream");
-    assert_eq!(
-        active_observed.path_and_query,
-        "/v1/embeddings?test=long-json&slot=shutdown-active"
-    );
+    let (addr, shutdown_tx, server) = spawn_shutdown_server(proxy.state.clone()).await;
+    let active_response = start_active_shutdown_request(&proxy, &mut fake, addr).await;
 
     let queued = tokio::spawn({
         let client = proxy.client.clone();
@@ -13128,6 +13110,54 @@ async fn queued_generation_requests_cancelled_by_shutdown_are_observable() {
     );
     assert_no_upstream_request(&mut fake).await;
     drop(active_response);
+}
+
+async fn spawn_shutdown_server(
+    state: ProxyState,
+) -> (
+    std::net::SocketAddr,
+    oneshot::Sender<()>,
+    tokio::task::JoinHandle<std::io::Result<()>>,
+) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("shutdown listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("shutdown address should be readable");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        serve_until_shutdown(listener, state, async {
+            let _received = shutdown_rx.await;
+        })
+        .await
+    });
+    (addr, shutdown_tx, server)
+}
+
+async fn start_active_shutdown_request(
+    proxy: &ProxyFixture,
+    fake: &mut FakeUpstream,
+    addr: std::net::SocketAddr,
+) -> reqwest::Response {
+    let active_response = proxy
+        .client
+        .get(format!(
+            "http://{addr}/v1/embeddings?test=long-json&slot=shutdown-active"
+        ))
+        .send()
+        .await
+        .expect("active shutdown request should get headers");
+    assert_eq!(active_response.status(), StatusCode::OK);
+    let active_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("active shutdown request should reach upstream");
+    assert_eq!(
+        active_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=shutdown-active"
+    );
+    active_response
 }
 
 #[tokio::test]
