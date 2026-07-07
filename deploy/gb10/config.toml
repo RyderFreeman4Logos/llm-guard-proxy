@@ -312,7 +312,7 @@ anti_loop_hint_enabled = true              # Inject anti-loop hints on retry
 # Retry streaming requests that fail mid-stream.
 
 # shielded_streaming_enabled = true
-# downstream_drop_policy = "drop_on_success"  # When to drop downstream conn
+# downstream_drop_policy = "cancel"  # cancel or detach after downstream drop
 
 # ── Retry ladder ──────────────────────────────────────────────────────────────
 # Escalating delay between retries.

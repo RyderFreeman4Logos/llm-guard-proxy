@@ -8358,12 +8358,12 @@ impl Stream for ShieldedLivenessBody {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.shutdown.poll_shutdown(cx).is_ready() {
-            this.record_once(&BodyCompletion::Shutdown);
-            return Poll::Ready(None);
-        }
         if let Some(completion) = this.terminal_completion.take() {
             this.record_once(&completion);
+            return Poll::Ready(None);
+        }
+        if this.shutdown.poll_shutdown(cx).is_ready() {
+            this.record_once(&BodyCompletion::Shutdown);
             return Poll::Ready(None);
         }
 

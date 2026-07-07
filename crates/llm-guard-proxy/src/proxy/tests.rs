@@ -8672,6 +8672,59 @@ anti_loop_hint_enabled = true
 }
 
 #[tokio::test]
+async fn shielded_liveness_shutdown_after_terminal_chunk_preserves_success_completion() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "json-whitespace"
+interval_secs = 1
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"shutdown-after-terminal"}]}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let prefix = next_chunk(
+        &mut body,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "terminal JSON prefix",
+    )
+    .await;
+    assert_eq!(prefix, Bytes::from_static(b" \n"));
+    let final_chunk = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "terminal JSON body").await;
+    let final_json: serde_json::Value =
+        serde_json::from_slice(&final_chunk).expect("terminal JSON body should parse");
+    assert_eq!(final_json["id"], "chatcmpl-shielded");
+
+    proxy.state.shutdown.begin_shutdown();
+    let stream_end = timeout(SHIELDED_HEARTBEAT_TIMEOUT, body.next())
+        .await
+        .expect("body EOF should arrive before timeout");
+    assert!(stream_end.is_none());
+
+    let _observed = fake.recv_next().await;
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "succeeded");
+    assert_eq!(request_row.abort_reason, None);
+    assert_eq!(attempt_row.status, "succeeded");
+    assert_eq!(attempt_row.abort_reason, None);
+}
+
+#[tokio::test]
 async fn repeated_input_selects_json_whitespace_and_body_stays_parseable() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
