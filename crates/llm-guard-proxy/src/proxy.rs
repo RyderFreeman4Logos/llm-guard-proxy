@@ -174,6 +174,15 @@ impl UpstreamFailureCause {
             Self::TransportError => "transport_error",
         }
     }
+
+    fn from_code(code: &str) -> Self {
+        match code {
+            "upstream_connect_failed" | "connect_failure" | "connect_failed" => Self::ConnectFailed,
+            "upstream_timeout" | "timeout" => Self::Timeout,
+            "upstream_body_error" | "body_error" => Self::BodyError,
+            _ => Self::TransportError,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -2271,6 +2280,7 @@ async fn forward_openai_request(
                 shadow_attempts: state.shadow_attempts.clone(),
                 shadow_evidence: ShadowEvidenceState::default(),
                 malformed_response_counter: state.malformed_response_counter.clone(),
+                upstream_failure_counters: state.upstream_failure_counters.clone(),
             },
             in_flight_permit,
         )
@@ -4722,6 +4732,7 @@ struct ShieldedRetryRuntime {
     shadow_attempts: Arc<InFlightLimiter>,
     shadow_evidence: ShadowEvidenceState,
     malformed_response_counter: Arc<AtomicU64>,
+    upstream_failure_counters: Arc<UpstreamFailureCounters>,
 }
 
 #[derive(Clone, Debug)]
@@ -6992,7 +7003,19 @@ fn shielded_retry_error_response(
     failure: ShieldedFailureOutcome,
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
-    let body = proxy_error_json_body(failure.error_type, &failure.error_message);
+    let request_id = runtime.request_id.clone();
+    let cause_code = classify_shielded_error_cause(&failure.error_message);
+    let body = proxy_error_json_body_with_diagnostics(
+        failure.error_type,
+        &failure.error_message,
+        cause_code,
+        Some(&request_id),
+    );
+    if let Some(cause) = cause_code {
+        runtime
+            .upstream_failure_counters
+            .increment(UpstreamFailureCause::from_code(cause));
+    }
     let mut response_headers = json_response_headers(body.len());
     if let Some(retry_after_secs) = failure.retry_after_secs
         && let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string())
@@ -7952,6 +7975,48 @@ fn proxy_error_json_body(error_type: &str, message: &str) -> Bytes {
         })
         .to_string(),
     )
+}
+
+fn proxy_error_json_body_with_diagnostics(
+    error_type: &str,
+    message: &str,
+    cause_code: Option<&str>,
+    request_id: Option<&RequestId>,
+) -> Bytes {
+    let mut error = serde_json::Map::from_iter([
+        (String::from("type"), json!(error_type)),
+        (String::from("message"), json!(message)),
+    ]);
+    if let Some(cause) = cause_code {
+        error.insert(String::from("cause"), json!(cause));
+        error
+            .entry(String::from("code"))
+            .or_insert_with(|| json!(cause));
+    }
+    if let Some(rid) = request_id {
+        error.insert(String::from("request_id"), json!(rid.as_str()));
+    }
+    Bytes::from(
+        serde_json::Value::Object(serde_json::Map::from_iter([(
+            String::from("error"),
+            serde_json::Value::Object(error),
+        )]))
+        .to_string(),
+    )
+}
+
+fn classify_shielded_error_cause(message: &str) -> Option<&'static str> {
+    if message.contains("connect_failure") || message.contains("connection") {
+        Some("upstream_connect_failed")
+    } else if message.contains("timeout") || message.contains("timed out") {
+        Some("upstream_timeout")
+    } else if message.contains("body") || message.contains("decode") {
+        Some("upstream_body_error")
+    } else if message.contains("upstream") {
+        Some("upstream_transport_error")
+    } else {
+        None
+    }
 }
 
 fn forwarded_request_headers(headers: &HeaderMap) -> HeaderMap {
