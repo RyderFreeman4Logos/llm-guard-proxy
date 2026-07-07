@@ -27,8 +27,10 @@ pub mod workflow;
 #[cfg(feature = "guard")]
 pub use budget::{BudgetCheck, BudgetError, BudgetStore, current_budget_date};
 pub use embedding::{
-    DisabledEmbeddingBackend, EmbeddingBackend, EmbeddingChannel, EmbeddingError, EmbeddingFuture,
-    EmbeddingInput, EmbeddingQueue, EmbeddingQueueResult, EmbeddingVector,
+    CONTENT_SIMILARITY_THRESHOLD, DisabledEmbeddingBackend, EmbeddingBackend, EmbeddingChannel,
+    EmbeddingError, EmbeddingFuture, EmbeddingInput, EmbeddingQueue, EmbeddingQueueResult,
+    EmbeddingVector, MIN_OBSERVATIONS_FOR_SIGNAL, REASONING_SIMILARITY_THRESHOLD,
+    SemanticLoopConfig, SemanticLoopScorer, SemanticLoopSignal, TOOL_ARGS_SIMILARITY_THRESHOLD,
 };
 pub use evidence::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceDatabaseStatus,
