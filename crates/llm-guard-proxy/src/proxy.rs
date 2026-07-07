@@ -60,7 +60,7 @@ use tokio::task::JoinHandle;
 use tokio::{
     net::TcpListener,
     process::Command,
-    sync::{Mutex as AsyncMutex, Notify, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, oneshot, watch},
     time::{Instant, Interval, MissedTickBehavior, timeout},
 };
 
@@ -103,6 +103,7 @@ pub(crate) struct ProxyState {
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
     shadow_attempts: Arc<InFlightLimiter>,
+    shutdown: Arc<ShutdownGate>,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
     live_registry: Arc<LiveRequestRegistry>,
@@ -227,6 +228,7 @@ impl ProxyState {
             hot_restart_recovery: Arc::new(HotRestartCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
             shadow_attempts: Arc::new(InFlightLimiter::default()),
+            shutdown: Arc::new(ShutdownGate::new()),
             malformed_response_counter: Arc::new(AtomicU64::new(0)),
             upstream_failure_counters: Arc::new(UpstreamFailureCounters::default()),
             live_registry: Arc::new(LiveRequestRegistry::new()),
@@ -272,6 +274,9 @@ impl ProxyState {
             .config
             .snapshot()
             .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+        if self.shutdown.is_shutting_down() {
+            return Err(AdmissionFailure::ShuttingDown);
+        }
         if let Some(permit) = limiter.try_acquire(config.server.max_in_flight_requests) {
             return Ok(GenerationAdmission::acquired(
                 config,
@@ -310,6 +315,10 @@ impl ProxyState {
             QueuedAdmissionCancelRecorder::new(record_context, queued_at, timeout_ms);
         let deadline = queued_at + Duration::from_millis(timeout_ms);
         loop {
+            if self.shutdown.is_shutting_down() {
+                cancel_recorder.disarm();
+                return Err(AdmissionFailure::ShuttingDown);
+            }
             let config = match self.config.snapshot() {
                 Ok(config) => config,
                 Err(error) => {
@@ -349,6 +358,9 @@ impl ProxyState {
             .config
             .snapshot()
             .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+        if self.shutdown.is_shutting_down() {
+            return Err(AdmissionFailure::ShuttingDown);
+        }
         let selected_profile = select_allowed_upstream_profile(&config, &self.listener, model_id)
             .map_err(AdmissionFailure::ListenerUpstreamDenied)?;
         let limiter = self.generation_limiter_for_profile(&selected_profile.profile);
@@ -400,6 +412,10 @@ impl ProxyState {
             QueuedAdmissionCancelRecorder::new(record_context, queued_at, timeout_ms);
         let deadline = queued_at + Duration::from_millis(timeout_ms);
         loop {
+            if self.shutdown.is_shutting_down() {
+                cancel_recorder.disarm();
+                return Err(AdmissionFailure::ShuttingDown);
+            }
             let config = match self.config.snapshot() {
                 Ok(config) => config,
                 Err(error) => {
@@ -487,6 +503,61 @@ impl ProxyState {
     }
 }
 
+#[derive(Debug)]
+struct ShutdownGate {
+    sender: watch::Sender<bool>,
+}
+
+impl ShutdownGate {
+    fn new() -> Self {
+        let (sender, _receiver) = watch::channel(false);
+        Self { sender }
+    }
+
+    fn begin_shutdown(&self) {
+        let _ignored = self.sender.send(true);
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    fn subscribe(&self) -> ShutdownSubscription {
+        ShutdownSubscription {
+            receiver: self.sender.subscribe(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ShutdownSubscription {
+    receiver: watch::Receiver<bool>,
+}
+
+impl ShutdownSubscription {
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if *self.receiver.borrow() {
+            return Poll::Ready(());
+        }
+
+        let poll_result = {
+            let changed = self.receiver.changed();
+            futures_util::pin_mut!(changed);
+            changed.poll(cx)
+        };
+        match poll_result {
+            Poll::Ready(Ok(()) | Err(_)) => {
+                if *self.receiver.borrow() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// Serves the proxy until the supplied shutdown future resolves.
 ///
 /// Axum stops accepting new connections after shutdown starts and waits for
@@ -496,8 +567,12 @@ pub(crate) async fn serve_until_shutdown(
     state: ProxyState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    let shutdown_gate = Arc::clone(&state.shutdown);
     axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
+        .with_graceful_shutdown(async move {
+            shutdown.await;
+            shutdown_gate.begin_shutdown();
+        })
         .await
 }
 
@@ -706,6 +781,8 @@ enum AdmissionFailure {
     ControlPlaneLimitExceeded {
         max_control_plane_in_flight_requests: usize,
     },
+    #[error("proxy is shutting down")]
+    ShuttingDown,
     #[error("{0}")]
     ListenerUpstreamDenied(ListenerUpstreamDenied),
 }
@@ -719,9 +796,9 @@ impl AdmissionFailure {
                 Ok(status) => status,
                 Err(_error) => StatusCode::SERVICE_UNAVAILABLE,
             },
-            Self::GenerationQueueTimeout { .. } | Self::ControlPlaneLimitExceeded { .. } => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::GenerationQueueTimeout { .. }
+            | Self::ControlPlaneLimitExceeded { .. }
+            | Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -734,6 +811,7 @@ impl AdmissionFailure {
             Self::ControlPlaneLimitExceeded { .. } => {
                 "proxy_control_plane_in_flight_limit_exceeded"
             }
+            Self::ShuttingDown => "proxy_shutting_down",
         }
     }
 
@@ -747,9 +825,9 @@ impl AdmissionFailure {
                     .unwrap_or(ADMISSION_RETRY_AFTER_SECS)
                     .to_string(),
             ),
-            Self::GenerationQueueTimeout { .. } | Self::ControlPlaneLimitExceeded { .. } => {
-                Some(ADMISSION_RETRY_AFTER_SECS.to_string())
-            }
+            Self::GenerationQueueTimeout { .. }
+            | Self::ControlPlaneLimitExceeded { .. }
+            | Self::ShuttingDown => Some(ADMISSION_RETRY_AFTER_SECS.to_string()),
         }
     }
 
@@ -786,6 +864,9 @@ impl AdmissionFailure {
             Self::ConfigSnapshot(_)
             | Self::ListenerUpstreamDenied(_)
             | Self::ControlPlaneLimitExceeded { .. } => BTreeMap::new(),
+            Self::ShuttingDown => {
+                BTreeMap::from([(String::from("admission_outcome"), String::from("shutdown"))])
+            }
         }
     }
 }
@@ -2278,6 +2359,7 @@ async fn forward_openai_request(
                 #[cfg(feature = "upstream-hot-restart")]
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
+                shutdown: Arc::clone(&state.shutdown),
                 shadow_evidence: ShadowEvidenceState::default(),
                 malformed_response_counter: state.malformed_response_counter.clone(),
                 upstream_failure_counters: state.upstream_failure_counters.clone(),
@@ -3502,6 +3584,7 @@ async fn forward_generic_openai_request(
         upstream_headers: upstream_headers.clone(),
         request_metadata: context.request_metadata,
         attempt_request_metadata,
+        shutdown: Arc::clone(&context.state.shutdown),
     };
     forward_upstream_response(
         ResponseDispatch {
@@ -3600,11 +3683,14 @@ async fn forward_merged_models_response(
         upstream_headers: upstream_headers.clone(),
         request_metadata: context.request_metadata,
         attempt_request_metadata: BTreeMap::new(),
+        shutdown: Arc::clone(&context.state.shutdown),
     };
+    let shutdown = response_parts.shutdown_subscription();
     let mut observer = response_parts.into_observer();
     observer.completed_attempt_records = attempt_records;
     observer.final_attempt = None;
-    let response_body = ObservedBufferedBody::new(body, observer, context.in_flight_permit);
+    let response_body =
+        ObservedBufferedBody::new(body, observer, context.in_flight_permit, shutdown);
     Ok(downstream_response(
         upstream_status,
         &upstream_headers,
@@ -4140,9 +4226,14 @@ async fn forward_upstream_response(
 
     let request_path = dispatch.uri.path().to_owned();
     let request_id = response_parts.request_id.clone();
+    let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
-    let response_body =
-        ObservedUpstreamBody::new(upstream_response.bytes_stream(), observer, in_flight_permit);
+    let response_body = ObservedUpstreamBody::new(
+        upstream_response.bytes_stream(),
+        observer,
+        in_flight_permit,
+        shutdown,
+    );
     let response = downstream_response(
         upstream_status,
         &upstream_headers,
@@ -4534,9 +4625,14 @@ struct ForwardedResponseParts {
     upstream_headers: HeaderMap,
     request_metadata: BTreeMap<String, String>,
     attempt_request_metadata: BTreeMap<String, String>,
+    shutdown: Arc<ShutdownGate>,
 }
 
 impl ForwardedResponseParts {
+    fn shutdown_subscription(&self) -> ShutdownSubscription {
+        self.shutdown.subscribe()
+    }
+
     fn into_observer(self) -> ForwardedBodyObserver {
         let downstream_mode = downstream_mode_from_headers(&self.upstream_headers);
         self.into_observer_with(downstream_mode, BTreeMap::new(), RawPayloads::default())
@@ -4626,8 +4722,9 @@ async fn forward_buffered_models_response(
     };
     let body = filter_models_body_for_listener(config, listener, body);
     let body = model_metadata::enrich_models_body(config, metadata_config, body);
+    let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
-    let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit);
+    let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit, shutdown);
 
     Ok(downstream_response(
         upstream_status,
@@ -4730,6 +4827,7 @@ struct ShieldedRetryRuntime {
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     shadow_attempts: Arc<InFlightLimiter>,
+    shutdown: Arc<ShutdownGate>,
     shadow_evidence: ShadowEvidenceState,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
@@ -4895,86 +4993,12 @@ async fn forward_shielded_chat_with_retries(
         ShieldedBeginOutcome::Aggregatable {
             started,
             prior_attempt_records,
-        } => {
-            let upstream_status = started.info.upstream_status;
-            let upstream_content_type = started
-                .info
-                .upstream_headers
-                .get(CONTENT_TYPE)
-                .map(header_value);
-            let response_headers = shielded_chat_stream_response_headers(
-                &started.info.upstream_headers,
-                runtime.liveness.mode,
-            );
-            let extra_metadata =
-                shielded_liveness_response_metadata(&runtime.liveness, upstream_content_type);
-            let attempt_progress = Arc::new(Mutex::new(ShieldedAttemptProgress {
-                extra_response_metadata: extra_metadata.clone(),
-                completed_attempt_records: prior_attempt_records.clone(),
-                current_attempt: Some(
-                    started
-                        .info
-                        .clone()
-                        .into_final_context(extra_metadata.clone(), RawPayloads::default()),
-                ),
-            }));
-            let observer = shielded_retry_observer(
-                &runtime,
-                ShieldedRetryObserverInput {
-                    downstream_mode: runtime.liveness.mode.downstream_mode(),
-                    downstream_status: upstream_status,
-                    downstream_headers: response_headers.clone(),
-                    upstream_mode: UpstreamMode::Streaming,
-                    extra_response_metadata: extra_metadata,
-                    raw_payloads: RawPayloads::default(),
-                    completed_attempt_records: prior_attempt_records.clone(),
-                    final_attempt: None,
-                    attempt_progress: Some(attempt_progress.clone()),
-                },
-            );
-            let aggregate_runtime = runtime.clone();
-            let aggregate = Box::pin(async move {
-                match run_shielded_attempts(
-                    aggregate_runtime,
-                    Some(started),
-                    prior_attempt_records,
-                    false,
-                    Some(attempt_progress),
-                )
-                .await
-                {
-                    ShieldedRunOutcome::Accepted(outcome) => {
-                        Ok(ShieldedAggregateOutcome::Accepted(outcome))
-                    }
-                    ShieldedRunOutcome::DirectRelay(outcome) => {
-                        Ok(ShieldedAggregateOutcome::DirectRelay(outcome))
-                    }
-                    ShieldedRunOutcome::Failed(failure) => Err(failure),
-                    ShieldedRunOutcome::TerminalForward(terminal) => Err(terminal_forward_failure(
-                        terminal,
-                        "non-retryable upstream response after shielded retry",
-                    )),
-                }
-            });
-            let aggregate = maybe_detach_shielded_aggregate(aggregate, &runtime.retry_policy);
-            let response_body = ShieldedLivenessBody::new(
-                aggregate,
-                runtime.liveness.mode,
-                if runtime.chat_kind == ShieldedChatKind::Stream {
-                    ShieldedAcceptedResponseMode::OpenAiSse
-                } else {
-                    ShieldedAcceptedResponseMode::JsonCompletion
-                },
-                runtime.liveness.heartbeat_interval_secs,
-                observer,
-                in_flight_permit,
-            );
-            Ok(response_with_headers(
-                upstream_status,
-                response_headers,
-                Body::from_stream(response_body),
-            ))
-        }
+        } => Ok(shielded_liveness_stream_response(
+            &runtime,
+            started,
+            prior_attempt_records,
+            in_flight_permit,
+        )),
         ShieldedBeginOutcome::Failed(failure) => Ok(shielded_retry_error_response(
             &runtime,
             failure,
@@ -4984,6 +5008,93 @@ async fn forward_shielded_chat_with_retries(
             shielded_retry_terminal_forward_response(&runtime, terminal, in_flight_permit).await,
         ),
     }
+}
+
+fn shielded_liveness_stream_response(
+    runtime: &ShieldedRetryRuntime,
+    started: ShieldedStartedAttempt,
+    prior_attempt_records: Vec<AttemptRecord>,
+    in_flight_permit: InFlightPermit,
+) -> Response<Body> {
+    let upstream_status = started.info.upstream_status;
+    let upstream_content_type = started
+        .info
+        .upstream_headers
+        .get(CONTENT_TYPE)
+        .map(header_value);
+    let response_headers = shielded_chat_stream_response_headers(
+        &started.info.upstream_headers,
+        runtime.liveness.mode,
+    );
+    let extra_metadata =
+        shielded_liveness_response_metadata(&runtime.liveness, upstream_content_type);
+    let attempt_progress = Arc::new(Mutex::new(ShieldedAttemptProgress {
+        extra_response_metadata: extra_metadata.clone(),
+        completed_attempt_records: prior_attempt_records.clone(),
+        current_attempt: Some(
+            started
+                .info
+                .clone()
+                .into_final_context(extra_metadata.clone(), RawPayloads::default()),
+        ),
+    }));
+    let observer = shielded_retry_observer(
+        runtime,
+        ShieldedRetryObserverInput {
+            downstream_mode: runtime.liveness.mode.downstream_mode(),
+            downstream_status: upstream_status,
+            downstream_headers: response_headers.clone(),
+            upstream_mode: UpstreamMode::Streaming,
+            extra_response_metadata: extra_metadata,
+            raw_payloads: RawPayloads::default(),
+            completed_attempt_records: prior_attempt_records.clone(),
+            final_attempt: None,
+            attempt_progress: Some(attempt_progress.clone()),
+        },
+    );
+    let aggregate_runtime = runtime.clone();
+    let aggregate = Box::pin(async move {
+        match run_shielded_attempts(
+            aggregate_runtime,
+            Some(started),
+            prior_attempt_records,
+            false,
+            Some(attempt_progress),
+        )
+        .await
+        {
+            ShieldedRunOutcome::Accepted(outcome) => {
+                Ok(ShieldedAggregateOutcome::Accepted(outcome))
+            }
+            ShieldedRunOutcome::DirectRelay(outcome) => {
+                Ok(ShieldedAggregateOutcome::DirectRelay(outcome))
+            }
+            ShieldedRunOutcome::Failed(failure) => Err(failure),
+            ShieldedRunOutcome::TerminalForward(terminal) => Err(terminal_forward_failure(
+                terminal,
+                "non-retryable upstream response after shielded retry",
+            )),
+        }
+    });
+    let aggregate = maybe_detach_shielded_aggregate(aggregate, &runtime.retry_policy);
+    let response_body = ShieldedLivenessBody::new(
+        aggregate,
+        runtime.liveness.mode,
+        if runtime.chat_kind == ShieldedChatKind::Stream {
+            ShieldedAcceptedResponseMode::OpenAiSse
+        } else {
+            ShieldedAcceptedResponseMode::JsonCompletion
+        },
+        runtime.liveness.heartbeat_interval_secs,
+        observer,
+        in_flight_permit,
+        runtime.shutdown.subscribe(),
+    );
+    response_with_headers(
+        upstream_status,
+        response_headers,
+        Body::from_stream(response_body),
+    )
 }
 
 async fn immediate_shielded_retry_response(
@@ -6990,7 +7101,12 @@ fn shielded_retry_success_response(
             attempt_progress: None,
         },
     );
-    let response_body = ObservedBufferedBody::new(outcome.body, observer, in_flight_permit);
+    let response_body = ObservedBufferedBody::new(
+        outcome.body,
+        observer,
+        in_flight_permit,
+        runtime.shutdown.subscribe(),
+    );
     response_with_headers(
         upstream_status,
         response_headers,
@@ -7038,8 +7154,13 @@ fn shielded_retry_error_response(
         },
     );
     let completion = BodyCompletion::UpstreamStreamError(failure.error_message);
-    let response_body =
-        ObservedBufferedBody::new_with_completion(body, observer, in_flight_permit, completion);
+    let response_body = ObservedBufferedBody::new_with_completion(
+        body,
+        observer,
+        in_flight_permit,
+        completion,
+        runtime.shutdown.subscribe(),
+    );
     let mut response = Response::new(Body::from_stream(response_body));
     *response.status_mut() = downstream_status;
     *response.headers_mut() = response_headers;
@@ -7079,6 +7200,7 @@ async fn shielded_retry_terminal_forward_response(
         terminal.started.response.bytes_stream(),
         observer,
         in_flight_permit,
+        runtime.shutdown.subscribe(),
     );
     let response = downstream_response(
         upstream_status,
@@ -7127,6 +7249,7 @@ async fn shielded_retry_direct_relay_response(
         outcome.started.response.bytes_stream(),
         observer,
         in_flight_permit,
+        runtime.shutdown.subscribe(),
     );
     let response = downstream_response(
         upstream_status,
@@ -7455,6 +7578,7 @@ enum BodyCompletion {
     Succeeded,
     UpstreamStreamError(String),
     DownstreamDropped,
+    Shutdown,
 }
 
 impl BodyCompletion {
@@ -7462,7 +7586,7 @@ impl BodyCompletion {
         match self {
             Self::Succeeded => RequestStatus::Succeeded,
             Self::UpstreamStreamError(_) => RequestStatus::Failed,
-            Self::DownstreamDropped => RequestStatus::Aborted,
+            Self::DownstreamDropped | Self::Shutdown => RequestStatus::Aborted,
         }
     }
 
@@ -7470,20 +7594,21 @@ impl BodyCompletion {
         match self {
             Self::Succeeded => AttemptStatus::Succeeded,
             Self::UpstreamStreamError(_) => AttemptStatus::Failed,
-            Self::DownstreamDropped => AttemptStatus::Aborted,
+            Self::DownstreamDropped | Self::Shutdown => AttemptStatus::Aborted,
         }
     }
 
     fn error_reason(&self) -> Option<String> {
         match self {
             Self::UpstreamStreamError(error) => Some(format!("upstream_stream_error: {error}")),
-            Self::Succeeded | Self::DownstreamDropped => None,
+            Self::Succeeded | Self::DownstreamDropped | Self::Shutdown => None,
         }
     }
 
     fn abort_reason(&self) -> Option<String> {
         match self {
             Self::DownstreamDropped => Some(String::from("downstream_body_dropped_before_eof")),
+            Self::Shutdown => Some(String::from("server_shutdown")),
             Self::Succeeded | Self::UpstreamStreamError(_) => None,
         }
     }
@@ -7493,6 +7618,7 @@ struct ObservedUpstreamBody {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: InFlightPermit,
+    shutdown: ShutdownSubscription,
     bytes_seen: u64,
     terminal_completion: BodyCompletion,
 }
@@ -7502,12 +7628,14 @@ impl ObservedUpstreamBody {
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
+        shutdown: ShutdownSubscription,
     ) -> Self {
         Self::new_with_completion(
             stream,
             observer,
             in_flight_permit,
             BodyCompletion::Succeeded,
+            shutdown,
         )
     }
 
@@ -7516,11 +7644,13 @@ impl ObservedUpstreamBody {
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
         terminal_completion: BodyCompletion,
+        shutdown: ShutdownSubscription,
     ) -> Self {
         Self {
             inner: Box::pin(stream),
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
+            shutdown,
             bytes_seen: 0,
             terminal_completion,
         }
@@ -7538,6 +7668,10 @@ impl Stream for ObservedUpstreamBody {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.shutdown.poll_shutdown(cx).is_ready() {
+            this.record_once(&BodyCompletion::Shutdown);
+            return Poll::Ready(None);
+        }
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -7571,13 +7705,25 @@ struct ObservedBufferedBody {
     body: Option<Bytes>,
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: InFlightPermit,
+    shutdown: ShutdownSubscription,
     bytes_seen: u64,
     terminal_completion: BodyCompletion,
 }
 
 impl ObservedBufferedBody {
-    fn new(body: Bytes, observer: ForwardedBodyObserver, in_flight_permit: InFlightPermit) -> Self {
-        Self::new_with_completion(body, observer, in_flight_permit, BodyCompletion::Succeeded)
+    fn new(
+        body: Bytes,
+        observer: ForwardedBodyObserver,
+        in_flight_permit: InFlightPermit,
+        shutdown: ShutdownSubscription,
+    ) -> Self {
+        Self::new_with_completion(
+            body,
+            observer,
+            in_flight_permit,
+            BodyCompletion::Succeeded,
+            shutdown,
+        )
     }
 
     fn new_with_completion(
@@ -7585,11 +7731,13 @@ impl ObservedBufferedBody {
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
         terminal_completion: BodyCompletion,
+        shutdown: ShutdownSubscription,
     ) -> Self {
         Self {
             body: (!body.is_empty()).then_some(body),
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
+            shutdown,
             bytes_seen: 0,
             terminal_completion,
         }
@@ -7605,8 +7753,12 @@ impl ObservedBufferedBody {
 impl Stream for ObservedBufferedBody {
     type Item = Result<Bytes, Infallible>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.shutdown.poll_shutdown(cx).is_ready() {
+            this.record_once(&BodyCompletion::Shutdown);
+            return Poll::Ready(None);
+        }
         if let Some(body) = this.body.take() {
             let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
             this.bytes_seen = this.bytes_seen.saturating_add(body_len);
@@ -7652,6 +7804,7 @@ struct ShieldedLivenessBody {
     accepted_response_mode: ShieldedAcceptedResponseMode,
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: InFlightPermit,
+    shutdown: ShutdownSubscription,
     bytes_seen: u64,
     terminal_completion: Option<BodyCompletion>,
     json_prefix_pending: bool,
@@ -7665,6 +7818,7 @@ impl ShieldedLivenessBody {
         interval_secs: u64,
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
+        shutdown: ShutdownSubscription,
     ) -> Self {
         let period = Duration::from_secs(interval_secs);
         let mut interval = tokio::time::interval_at(Instant::now() + period, period);
@@ -7677,6 +7831,7 @@ impl ShieldedLivenessBody {
             accepted_response_mode,
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
+            shutdown,
             bytes_seen: 0,
             terminal_completion: None,
             json_prefix_pending: mode == ShieldedLivenessMode::JsonWhitespace,
@@ -7771,6 +7926,10 @@ impl Stream for ShieldedLivenessBody {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.shutdown.poll_shutdown(cx).is_ready() {
+            this.record_once(&BodyCompletion::Shutdown);
+            return Poll::Ready(None);
+        }
         if let Some(completion) = this.terminal_completion.take() {
             this.record_once(&completion);
             return Poll::Ready(None);

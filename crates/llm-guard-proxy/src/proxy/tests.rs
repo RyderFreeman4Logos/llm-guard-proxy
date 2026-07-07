@@ -283,6 +283,100 @@ async fn metrics_expose_generation_active_and_queued_gauges() {
 }
 
 #[tokio::test]
+async fn connection_storm_disconnects_do_not_hide_control_plane() {
+    let mut upstream = CancellableUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_full_options(
+        &upstream.base_url,
+        true,
+        4,
+        "max_queued_generation_requests = 8\ngeneration_queue_timeout_ms = 5000\n",
+        r#"
+[heartbeat]
+mode = "json-whitespace"
+interval_secs = 1
+"#,
+        "",
+        "",
+    )
+    .await;
+
+    let mut downstreams = Vec::new();
+    for index in 0..4 {
+        let response = timeout(
+            STREAM_COMPLETION_TIMEOUT,
+            proxy
+                .client
+                .post(format!(
+                    "{}/v1/chat/completions?test=connection-storm-{index}",
+                    proxy.base_url
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"storm"}]}"#)
+                .send(),
+        )
+        .await
+        .expect("storm response headers should be bounded")
+        .expect("storm response should receive headers");
+        assert_eq!(response.status(), StatusCode::OK);
+        downstreams.push(response.bytes_stream());
+    }
+
+    for downstream in &mut downstreams {
+        let prefix = next_chunk(downstream, SHIELDED_HEARTBEAT_TIMEOUT, "storm JSON prefix").await;
+        assert_eq!(prefix, Bytes::from_static(b" \n"));
+    }
+
+    let metrics = timeout(STREAM_HEADER_TIMEOUT, fetch_metrics(&proxy))
+        .await
+        .expect("metrics should not hide behind generation storm");
+    assert_eq!(
+        metric_value(&metrics, "llm_guard_proxy_generation_active"),
+        4
+    );
+
+    let health = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy
+            .client
+            .get(format!("{}/health", proxy.base_url))
+            .send(),
+    )
+    .await
+    .expect("health should not time out behind generation storm")
+    .expect("health request should complete");
+    assert!(health.status().is_success());
+    let health_body = timeout(STREAM_HEADER_TIMEOUT, health.text())
+        .await
+        .expect("health body should be bounded")
+        .expect("health body should read");
+    assert!(!health_body.is_empty(), "health returned 0 bytes");
+
+    let models = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy
+            .client
+            .get(format!("{}/v1/models", proxy.base_url))
+            .send(),
+    )
+    .await
+    .expect("models should not time out behind generation storm")
+    .expect("models request should complete");
+    assert!(models.status().is_success());
+    let models_body = timeout(STREAM_HEADER_TIMEOUT, models.text())
+        .await
+        .expect("models body should be bounded")
+        .expect("models body should read");
+    assert!(!models_body.is_empty(), "models returned 0 bytes");
+
+    drop(downstreams);
+    for _ in 0..4 {
+        let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+        assert_eq!(drop_event.label, "cancellable-chat-sse");
+    }
+    wait_for_generation_metrics(&proxy, 0, 0, STREAM_COMPLETION_TIMEOUT).await;
+}
+
+#[tokio::test]
 async fn debug_summary_is_disabled_by_default() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -12594,7 +12688,7 @@ async fn in_flight_limit_hot_reload_updates_admission_capacity() {
 }
 
 #[tokio::test]
-async fn graceful_shutdown_waits_for_in_flight_response_body() {
+async fn graceful_shutdown_aborts_in_flight_response_body() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 1).await;
     let listener = TcpListener::bind("127.0.0.1:0")
@@ -12628,18 +12722,112 @@ async fn graceful_shutdown_waits_for_in_flight_response_body() {
     shutdown_tx
         .send(())
         .expect("shutdown signal should be delivered");
-    sleep(Duration::from_millis(100)).await;
-    assert!(
-        !server.is_finished(),
-        "graceful shutdown should wait for the in-flight response body"
-    );
-
-    drop(response);
-    timeout(Duration::from_secs(2), server)
+    timeout(STREAM_COMPLETION_TIMEOUT, server)
         .await
-        .expect("server should exit after response is dropped")
+        .expect("server should exit after shutdown cancels the in-flight body")
         .expect("server task should not panic")
         .expect("server should shut down cleanly");
+
+    let admission = proxy.state.admission_metrics_snapshot();
+    assert_eq!(admission.generation.active, 0);
+    assert_eq!(admission.generation.queued, 0);
+    drop(response);
+}
+
+#[tokio::test]
+async fn shutdown_completes_after_disconnect_storm() {
+    let mut upstream = CancellableUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_full_options(
+        &upstream.base_url,
+        true,
+        4,
+        "max_queued_generation_requests = 8\ngeneration_queue_timeout_ms = 5000\n",
+        r#"
+[heartbeat]
+mode = "json-whitespace"
+interval_secs = 1
+"#,
+        "",
+        "",
+    )
+    .await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("shutdown storm listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("shutdown storm address should be readable");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let state = proxy.state.clone();
+    let server = tokio::spawn(async move {
+        serve_until_shutdown(listener, state, async {
+            let _received = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let mut downstreams = Vec::new();
+    for index in 0..4 {
+        let response = timeout(
+            STREAM_COMPLETION_TIMEOUT,
+            proxy
+                .client
+                .post(format!(
+                    "http://{addr}/v1/chat/completions?test=connection-storm-{index}"
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"storm"}]}"#)
+                .send(),
+        )
+        .await
+        .expect("shutdown storm response headers should be bounded")
+        .expect("shutdown storm response should receive headers");
+        assert_eq!(response.status(), StatusCode::OK);
+        downstreams.push(response.bytes_stream());
+    }
+
+    for downstream in &mut downstreams {
+        let prefix = next_chunk(
+            downstream,
+            SHIELDED_HEARTBEAT_TIMEOUT,
+            "shutdown storm prefix",
+        )
+        .await;
+        assert_eq!(prefix, Bytes::from_static(b" \n"));
+    }
+
+    shutdown_tx
+        .send(())
+        .expect("shutdown signal should be delivered");
+    timeout(STREAM_COMPLETION_TIMEOUT, server)
+        .await
+        .expect("server should exit after shutdown starts")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    for _ in 0..4 {
+        let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+        assert_eq!(drop_event.label, "cancellable-chat-sse");
+    }
+    let admission = proxy.state.admission_metrics_snapshot();
+    assert_eq!(admission.generation.active, 0);
+    assert_eq!(admission.generation.queued, 0);
+    let rejected = proxy_handler(
+        State(proxy.state.clone()),
+        json_post_request("/v1/completions", br#"{"model":"test","prompt":"late"}"#),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let rejected_body = to_bytes(rejected.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("shutdown rejection body should read");
+    let rejected_body =
+        String::from_utf8(rejected_body.to_vec()).expect("shutdown body should be utf-8");
+    assert!(
+        rejected_body.contains("proxy_shutting_down"),
+        "shutdown rejection should identify admission failure: {rejected_body}"
+    );
+    drop(downstreams);
 }
 
 #[tokio::test]
@@ -14167,6 +14355,10 @@ async fn cancellable_upstream_handler(
         .await
         .expect("cancellable upstream observation should send");
 
+    if path_and_query.starts_with("/v1/models") {
+        return json_response("models", MODEL_METADATA_BODY.to_owned());
+    }
+
     if path_and_query.contains("test=loop-twice-then-cancellable-success")
         && body_requests_stream(&body)
         && next_cancellable_attempt_count(&state, &path_and_query) <= 2
@@ -14175,6 +14367,12 @@ async fn cancellable_upstream_handler(
     }
 
     if body_requests_stream(&body) {
+        if path_and_query.contains("test=connection-storm") {
+            return cancellable_chat_sse_response_with_delay(
+                state.drop_sender,
+                STREAM_COMPLETION_TIMEOUT,
+            );
+        }
         cancellable_chat_sse_response(state.drop_sender)
     } else {
         cancellable_chat_json_response(state.drop_sender)
@@ -14635,6 +14833,13 @@ fn json_response(label: &'static str, body: String) -> Response<Body> {
 }
 
 fn cancellable_chat_sse_response(drop_sender: mpsc::Sender<UpstreamDropEvent>) -> Response<Body> {
+    cancellable_chat_sse_response_with_delay(drop_sender, STREAM_DELAY)
+}
+
+fn cancellable_chat_sse_response_with_delay(
+    drop_sender: mpsc::Sender<UpstreamDropEvent>,
+    delay_after_first: Duration,
+) -> Response<Body> {
     let chunks = vec![
         sse_json(&chat_completion_first_chunk()),
         sse_json(&chat_completion_second_chunk(false)),
@@ -14646,6 +14851,7 @@ fn cancellable_chat_sse_response(drop_sender: mpsc::Sender<UpstreamDropEvent>) -
         "text/event-stream",
         chunks,
         drop_sender,
+        delay_after_first,
     )
 }
 
@@ -14661,6 +14867,7 @@ fn cancellable_chat_json_response(drop_sender: mpsc::Sender<UpstreamDropEvent>) 
         "application/json",
         chunks,
         drop_sender,
+        STREAM_DELAY,
     )
 }
 
@@ -14669,12 +14876,13 @@ fn cancellable_stream_response(
     content_type: &'static str,
     chunks: Vec<Bytes>,
     drop_sender: mpsc::Sender<UpstreamDropEvent>,
+    delay_after_first: Duration,
 ) -> Response<Body> {
     let body = Body::from_stream(CancellableResponseStream::new(
         label,
         chunks,
         drop_sender,
-        STREAM_DELAY,
+        delay_after_first,
     ));
     let mut response = Response::new(body);
     *response.status_mut() = StatusCode::OK;
@@ -15951,6 +16159,29 @@ async fn fetch_metrics(proxy: &ProxyFixture) -> String {
         .expect("metrics request should complete");
     assert_eq!(response.status(), StatusCode::OK);
     response.text().await.expect("metrics should be text")
+}
+
+async fn wait_for_generation_metrics(
+    proxy: &ProxyFixture,
+    expected_active: u64,
+    expected_queued: u64,
+    wait: Duration,
+) {
+    timeout(wait, async {
+        loop {
+            let metrics = fetch_metrics(proxy).await;
+            let active = metric_value(&metrics, "llm_guard_proxy_generation_active");
+            let queued = metric_value(&metrics, "llm_guard_proxy_generation_queued");
+            if active == expected_active && queued == expected_queued {
+                return;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!("generation metrics did not reach active={expected_active} queued={expected_queued}")
+    });
 }
 
 fn assert_metric_type(body: &str, metric_name: &str, metric_type: &str) {
