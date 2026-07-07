@@ -14,8 +14,9 @@ mod tests;
 
 pub use error::EvidenceError;
 pub use model::{
-    EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord,
-    EvidencePruningStats, EvidenceRetentionUsage, EvidenceShadowRecord, EvidenceStoreWrite,
-    ShadowSkipReason,
+    EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceDatabaseStatus,
+    EvidenceExportArtifact, EvidenceExportPair, EvidenceGroupRecord, EvidencePruningStats,
+    EvidenceRawArtifactKind, EvidenceRetentionUsage, EvidenceShadowRecord, EvidenceStoreWrite,
+    EvidenceSummaryRow, ShadowSkipReason,
 };
 pub use store::EvidenceStore;

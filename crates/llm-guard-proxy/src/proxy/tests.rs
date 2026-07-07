@@ -3462,6 +3462,159 @@ anti_loop_hint_enabled = true
     assert_shadow_raw_chunks_redacted(&connection);
 }
 
+#[tokio::test]
+async fn paired_shadow_sample_zero_records_no_shadow_attempts() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = false
+max_shadow_attempts_per_request = 2
+max_global_shadow_in_flight = 2
+shadow_attempt_timeout_ms = 2000
+
+[evidence.shadow.paired_comparison]
+enabled = true
+variants = ["max-thinking", "no-thinking"]
+include_raw_input = true
+include_raw_output = true
+sample_rate = 0.0
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    let _primary = fake.recv_next().await;
+    assert!(
+        fake.recv_within(Duration::from_millis(150)).await.is_none(),
+        "sample_rate=0 must not issue paired shadow attempts"
+    );
+
+    let connection = Connection::open(&proxy.evidence_sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE role = 'shadow_continued'",
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM evidence_raw_artifacts"),
+        0
+    );
+}
+
+#[tokio::test]
+async fn paired_shadow_records_raw_input_output_without_changing_client_response() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_evidence_config(
+        &fake.base_url,
+        r#"
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = false
+max_shadow_attempts_per_request = 2
+max_global_shadow_in_flight = 2
+shadow_attempt_timeout_ms = 2000
+
+[evidence.shadow.paired_comparison]
+enabled = true
+variants = ["max-thinking", "no-thinking"]
+include_raw_input = true
+include_raw_output = true
+include_raw_reasoning = false
+sample_rate = 1.0
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=paired-shadow",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let upstream_requests = recv_n_upstream_requests(&mut fake, 3).await;
+    assert_eq!(
+        upstream_requests
+            .iter()
+            .filter(|request| body_thinking_budget(&request.body) == Some(0))
+            .count(),
+        1
+    );
+    wait_for_evidence_role_status_count(
+        &proxy.evidence_sqlite_path,
+        "shadow_continued",
+        "accepted",
+        2,
+    )
+    .await;
+
+    let connection = Connection::open(&proxy.evidence_sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE role = 'primary' AND shown_to_downstream = 1",
+        ),
+        1
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE role = 'shadow_continued' AND shown_to_downstream = 0",
+        ),
+        2
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_raw_artifacts WHERE variant_name IN ('max-thinking', 'no-thinking') AND artifact_kind IN ('input', 'output') AND content_text IS NOT NULL",
+        ),
+        4
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_raw_artifacts WHERE artifact_kind = 'reasoning'",
+        ),
+        0
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE role = 'shadow_continued' AND raw_reasoning IS NOT NULL",
+        ),
+        0
+    );
+}
+
 fn assert_shadow_raw_attempt_redacts_and_preserves_stream_payloads(connection: &Connection) {
     let (request_metadata_json, raw_input, raw_output, raw_reasoning, raw_tool_calls): (
         String,

@@ -144,6 +144,20 @@ max_global_shadow_in_flight = 3
 shadow_attempt_timeout_ms = 100
 compare_attempts = ["max-thinking", "bounded-thinking", "no-thinking", "cot-salvage"]
 
+[evidence.shadow.paired_comparison]
+enabled = true
+variants = ["max-thinking", "no-thinking"]
+include_raw_input = true
+include_raw_output = true
+include_raw_reasoning = false
+sample_rate = 0.5
+max_raw_input_bytes = 4096
+max_raw_output_bytes = 8192
+max_raw_reasoning_bytes = 1024
+max_retention_records = 123
+max_retention_bytes = 456789
+retention_days = 3
+
 [thinking]
 force_disable = true
 tool_request_policy = "passthrough"
@@ -429,6 +443,25 @@ fn assert_default_evidence_config(config: &AppConfig) {
     assert_eq!(config.evidence.shadow.max_global_shadow_in_flight, 2);
     assert_eq!(config.evidence.shadow.shadow_attempt_timeout_ms, 7_200_000);
     assert!(config.evidence.shadow.compare_attempts.is_empty());
+    let paired = &config.evidence.shadow.paired_comparison;
+    assert!(!paired.enabled);
+    assert_eq!(
+        paired.variants,
+        vec![
+            ShadowComparisonAttempt::MaxThinking,
+            ShadowComparisonAttempt::NoThinking,
+        ]
+    );
+    assert!(!paired.include_raw_input);
+    assert!(!paired.include_raw_output);
+    assert!(!paired.include_raw_reasoning);
+    assert!((paired.sample_rate - 0.0_f64).abs() < f64::EPSILON);
+    assert_eq!(paired.max_raw_input_bytes, 131_072);
+    assert_eq!(paired.max_raw_output_bytes, 131_072);
+    assert_eq!(paired.max_raw_reasoning_bytes, 131_072);
+    assert_eq!(paired.max_retention_records, 10_000);
+    assert_eq!(paired.max_retention_bytes, 1_073_741_824);
+    assert_eq!(paired.retention_days, 7);
 }
 
 #[test]
@@ -1221,6 +1254,25 @@ fn parses_toml_with_defaults_and_overrides() {
             ShadowComparisonAttempt::CotSalvage,
         ]
     );
+    let paired = &config.evidence.shadow.paired_comparison;
+    assert!(paired.enabled);
+    assert_eq!(
+        paired.variants,
+        vec![
+            ShadowComparisonAttempt::MaxThinking,
+            ShadowComparisonAttempt::NoThinking,
+        ]
+    );
+    assert!(paired.include_raw_input);
+    assert!(paired.include_raw_output);
+    assert!(!paired.include_raw_reasoning);
+    assert!((paired.sample_rate - 0.5_f64).abs() < f64::EPSILON);
+    assert_eq!(paired.max_raw_input_bytes, 4_096);
+    assert_eq!(paired.max_raw_output_bytes, 8_192);
+    assert_eq!(paired.max_raw_reasoning_bytes, 1_024);
+    assert_eq!(paired.max_retention_records, 123);
+    assert_eq!(paired.max_retention_bytes, 456_789);
+    assert_eq!(paired.retention_days, 3);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::JsonWhitespace);
     assert_eq!(config.heartbeat.interval_secs, 5);
     assert_eq!(config.loop_guard.mode, LoopGuardMode::Monitor);
@@ -1965,6 +2017,22 @@ compare_attempts = ["max-thinking", "raw-cot"]
             .contains("invalid evidence.shadow.compare_attempts entry")
     );
     assert!(error.message().contains("cot-salvage"));
+}
+
+#[test]
+fn rejects_invalid_paired_comparison_sample_rate() {
+    let error = parse_config_text(
+        "
+[evidence.shadow.paired_comparison]
+sample_rate = 1.5
+",
+    )
+    .expect_err("invalid paired comparison sample rate should fail");
+
+    assert_eq!(
+        error.message(),
+        "validation failed for evidence.shadow.paired_comparison.sample_rate: must be a finite number between 0.0 and 1.0"
+    );
 }
 
 #[cfg(feature = "guard")]
@@ -3042,6 +3110,12 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.keep_looping_attempt_running"));
     assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.max_global_shadow_in_flight"));
     assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.compare_attempts"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.paired_comparison.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.paired_comparison.variants"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.paired_comparison.include_raw_input"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.paired_comparison.include_raw_output"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.paired_comparison.include_raw_reasoning"));
+    assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.paired_comparison.sample_rate"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_command"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_timeout_ms"));

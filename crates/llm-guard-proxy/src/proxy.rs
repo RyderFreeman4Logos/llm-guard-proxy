@@ -75,6 +75,7 @@ const RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE: Duration = Duration::from_millis(5
 const COT_SALVAGE_PREFIX_MAX_BYTES: usize = 4_096;
 const COT_SALVAGE_THINKING_BUDGET_TOKENS: u32 = 1_024;
 const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
+const PAIRED_SAMPLE_DENOMINATOR: u64 = 1_000_000;
 #[cfg(feature = "guard")]
 const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
 
@@ -4139,6 +4140,7 @@ impl ForwardedResponseParts {
             store: self.store,
             evidence_store: self.evidence_store,
             shadow_evidence: ShadowEvidenceState::default(),
+            paired_shadow_runtime: None,
             request_id: self.request_id,
             started_at_unix_ms: self.started_at_unix_ms,
             upstream_mode: self.upstream_mode,
@@ -6691,6 +6693,7 @@ fn shielded_retry_observer(
         store: runtime.store.clone(),
         evidence_store: runtime.evidence_store.clone(),
         shadow_evidence: runtime.shadow_evidence.clone(),
+        paired_shadow_runtime: Some(runtime.clone()),
         request_id: runtime.request_id.clone(),
         started_at_unix_ms: runtime.started_at_unix_ms,
         downstream_mode: input.downstream_mode,
@@ -6778,6 +6781,7 @@ struct ForwardedBodyObserver {
     store: ObservabilityStore,
     evidence_store: EvidenceStore,
     shadow_evidence: ShadowEvidenceState,
+    paired_shadow_runtime: Option<ShieldedRetryRuntime>,
     request_id: RequestId,
     started_at_unix_ms: u64,
     downstream_mode: DownstreamMode,
@@ -6800,6 +6804,7 @@ impl ForwardedBodyObserver {
         let finished_at_unix_ms = unix_time_millis();
         let mut attempts = self.completed_attempt_records;
         let mut final_attempt = self.final_attempt;
+        let paired_shadow_runtime = self.paired_shadow_runtime;
         if matches!(completion, BodyCompletion::DownstreamDropped) {
             if let Some(progress) = &self.attempt_progress {
                 let progress = shielded_attempt_progress(progress);
@@ -6851,7 +6856,7 @@ impl ForwardedBodyObserver {
             raw_payloads: self.raw_payloads,
         };
         record_observability_many(&self.store, &request_record, &attempts);
-        record_evidence_many(
+        let evidence_written = record_evidence_many(
             EvidenceRecordContext {
                 config: &self.config,
                 store: &self.evidence_store,
@@ -6860,6 +6865,9 @@ impl ForwardedBodyObserver {
             &request_record,
             &attempts,
         );
+        if evidence_written && let Some(runtime) = paired_shadow_runtime.as_ref() {
+            maybe_schedule_paired_comparison_after_primary(runtime, &request_record, &attempts);
+        }
     }
 }
 
@@ -8229,16 +8237,16 @@ fn record_evidence_many(
     context: EvidenceRecordContext<'_>,
     request: &RequestRecord,
     attempts: &[AttemptRecord],
-) {
+) -> bool {
     let settings = match context.config.snapshot() {
         Ok(settings) => settings,
         Err(error) => {
             eprintln!("failed to read evidence settings: {error}");
-            return;
+            return false;
         }
     };
     if !settings.evidence.enabled {
-        return;
+        return false;
     }
 
     let group_id = request.request_id.as_str().to_owned();
@@ -8265,9 +8273,13 @@ fn record_evidence_many(
                     Ok(EvidenceStoreWrite::Written | EvidenceStoreWrite::Disabled) | Err(_) => {}
                 }
             }
+            true
         }
-        Ok(EvidenceStoreWrite::Disabled) => {}
-        Err(error) => eprintln!("failed to write evidence ledger: {error}"),
+        Ok(EvidenceStoreWrite::Disabled) => false,
+        Err(error) => {
+            eprintln!("failed to write evidence ledger: {error}");
+            false
+        }
     }
 }
 
@@ -8360,11 +8372,93 @@ fn evidence_detector_features(metadata: &BTreeMap<String, String>) -> BTreeMap<S
                         | "cot_salvage_reasoning_prefix_bytes"
                         | "cot_salvage_thinking_budget_tokens"
                         | "shadow_compare_attempt"
+                        | "shadow_paired_comparison"
+                        | "variant_name"
                         | "shadow_terminal_status"
                 )
         })
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
+}
+
+fn maybe_schedule_paired_comparison_after_primary(
+    runtime: &ShieldedRetryRuntime,
+    request: &RequestRecord,
+    attempts: &[AttemptRecord],
+) {
+    let settings = match runtime.config.snapshot() {
+        Ok(settings) => settings,
+        Err(error) => {
+            eprintln!("failed to read paired shadow evidence settings: {error}");
+            return;
+        }
+    };
+    let paired = &settings.evidence.shadow.paired_comparison;
+    if !settings.evidence.enabled
+        || !paired.enabled
+        || paired.sample_rate <= 0.0
+        || paired.variants.is_empty()
+    {
+        return;
+    }
+    if !paired_sample_matches(runtime.request_id.as_str(), paired.sample_rate) {
+        return;
+    }
+    let Some(source) = attempts.iter().find(|attempt| {
+        attempt.attempt_number == 1
+            && attempt.status == AttemptStatus::Succeeded
+            && attempt_shown_to_downstream(request, attempt)
+    }) else {
+        return;
+    };
+    for variant in &paired.variants {
+        if let Some(plan) = paired_shadow_comparison_attempt_plan(runtime, source, *variant) {
+            schedule_shadow_attempt(runtime, source, &settings, plan);
+        }
+    }
+}
+
+fn paired_sample_matches(request_id: &str, sample_rate: f64) -> bool {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    if sample_rate >= 1.0 {
+        return true;
+    }
+    if sample_rate <= 0.0 {
+        return false;
+    }
+    let hash = request_id
+        .as_bytes()
+        .iter()
+        .fold(FNV_OFFSET_BASIS, |current, byte| {
+            (current ^ u64::from(*byte)).wrapping_mul(FNV_PRIME)
+        });
+    let threshold = paired_sample_threshold(sample_rate);
+    threshold > 0 && hash % PAIRED_SAMPLE_DENOMINATOR < threshold
+}
+
+fn paired_sample_threshold(sample_rate: f64) -> u64 {
+    let rendered = format!("{sample_rate:.6}");
+    let mut parts = rendered.split('.');
+    let Some(whole) = parts.next() else {
+        return 0;
+    };
+    if whole == "1" {
+        return PAIRED_SAMPLE_DENOMINATOR;
+    }
+    if whole != "0" {
+        return 0;
+    }
+    let fraction = parts.next().unwrap_or_default();
+    let mut digits = String::with_capacity(6);
+    digits.push_str(fraction);
+    while digits.len() < 6 {
+        digits.push('0');
+    }
+    digits.truncate(6);
+    digits
+        .parse::<u64>()
+        .map_or(0, |value| value.min(PAIRED_SAMPLE_DENOMINATOR))
 }
 
 fn maybe_schedule_shadow_continuation(
@@ -8553,6 +8647,50 @@ fn shadow_comparison_attempt_plan(
         String::from("shadow_compare_attempt"),
         comparison.as_str().to_owned(),
     );
+    request_metadata.insert(
+        String::from("attempt_thinking_mode"),
+        thinking.effective_mode().as_str().to_owned(),
+    );
+    request_metadata.insert(
+        String::from("attempt_thinking_budget_tokens"),
+        thinking.budget_tokens.to_string(),
+    );
+    request_metadata.insert(
+        String::from("attempt_thinking_max_tokens"),
+        thinking
+            .max_tokens
+            .map_or_else(|| String::from("unset"), |value| value.to_string()),
+    );
+    Some(ShadowAttemptPlan {
+        upstream_body,
+        request_metadata,
+        comparison_attempt: Some(comparison),
+    })
+}
+
+fn paired_shadow_comparison_attempt_plan(
+    runtime: &ShieldedRetryRuntime,
+    source: &AttemptRecord,
+    comparison: ShadowComparisonAttempt,
+) -> Option<ShadowAttemptPlan> {
+    if comparison == ShadowComparisonAttempt::CotSalvage {
+        return None;
+    }
+    let thinking = shadow_comparison_thinking(comparison, &runtime.upstream_profile.thinking);
+    let upstream_body = apply_param_override_to_body_or_original(
+        prepared_shadow_body(runtime, &thinking),
+        &runtime.upstream_profile,
+    );
+    let mut request_metadata = source.request_metadata.clone();
+    request_metadata.insert(
+        String::from("shadow_compare_attempt"),
+        comparison.as_str().to_owned(),
+    );
+    request_metadata.insert(
+        String::from("shadow_paired_comparison"),
+        String::from("true"),
+    );
+    request_metadata.insert(String::from("variant_name"), comparison.as_str().to_owned());
     request_metadata.insert(
         String::from("attempt_thinking_mode"),
         thinking.effective_mode().as_str().to_owned(),

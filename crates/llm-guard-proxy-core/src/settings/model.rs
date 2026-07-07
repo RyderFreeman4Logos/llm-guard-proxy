@@ -1817,7 +1817,7 @@ impl Default for ObservabilityConfig {
 }
 
 /// Opt-in evidence storage and raw payload capture settings.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EvidenceConfig {
     /// Enables the shadow evidence ledger.
     pub enabled: bool,
@@ -1930,7 +1930,7 @@ impl Default for EvidenceConfig {
 }
 
 /// Shadow continuation resource limits for evidence collection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EvidenceShadowConfig {
     /// Enables evidence-only shadow bookkeeping after loop signals.
     pub enabled: bool,
@@ -1946,6 +1946,8 @@ pub struct EvidenceShadowConfig {
     pub shadow_attempt_timeout_ms: u64,
     /// Same-prompt alternative attempts recorded for offline quality tuning.
     pub compare_attempts: Vec<ShadowComparisonAttempt>,
+    /// Opt-in paired comparison for max-thinking versus no-thinking evidence.
+    pub paired_comparison: EvidencePairedComparisonConfig,
 }
 
 impl EvidenceShadowConfig {
@@ -1969,7 +1971,8 @@ impl EvidenceShadowConfig {
             self.compare_attempts.len() <= 10,
             "evidence.shadow.compare_attempts",
             "must contain no more than 10 entries",
-        )
+        )?;
+        self.paired_comparison.validate()
     }
 }
 
@@ -1983,6 +1986,104 @@ impl Default for EvidenceShadowConfig {
             max_global_shadow_in_flight: 2,
             shadow_attempt_timeout_ms: 7_200_000,
             compare_attempts: Vec::new(),
+            paired_comparison: EvidencePairedComparisonConfig::default(),
+        }
+    }
+}
+
+/// Opt-in same-prompt paired shadow comparison settings.
+#[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct EvidencePairedComparisonConfig {
+    /// Enables paired shadow comparison after the primary client-visible attempt.
+    pub enabled: bool,
+    /// Thinking variants to compare for the same prompt.
+    pub variants: Vec<ShadowComparisonAttempt>,
+    /// Stores redacted raw input artifacts when enabled.
+    pub include_raw_input: bool,
+    /// Stores redacted raw output artifacts when enabled.
+    pub include_raw_output: bool,
+    /// Stores redacted raw reasoning artifacts when enabled.
+    pub include_raw_reasoning: bool,
+    /// Fraction of eligible requests that schedule paired shadow attempts.
+    pub sample_rate: f64,
+    /// Maximum stored bytes for one raw input artifact.
+    pub max_raw_input_bytes: u64,
+    /// Maximum stored bytes for one raw output artifact.
+    pub max_raw_output_bytes: u64,
+    /// Maximum stored bytes for one raw reasoning artifact.
+    pub max_raw_reasoning_bytes: u64,
+    /// Maximum retained raw artifact rows before pruning content.
+    pub max_retention_records: u64,
+    /// Maximum retained raw artifact content bytes before pruning content.
+    pub max_retention_bytes: u64,
+    /// Raw artifact content age limit in days.
+    pub retention_days: u64,
+}
+
+impl EvidencePairedComparisonConfig {
+    fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            self.variants.len() <= 10,
+            "evidence.shadow.paired_comparison.variants",
+            "must contain no more than 10 entries",
+        )?;
+        require(
+            self.sample_rate.is_finite() && (0.0..=1.0).contains(&self.sample_rate),
+            "evidence.shadow.paired_comparison.sample_rate",
+            "must be a finite number between 0.0 and 1.0",
+        )?;
+        require(
+            self.max_raw_input_bytes > 0,
+            "evidence.shadow.paired_comparison.max_raw_input_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.max_raw_output_bytes > 0,
+            "evidence.shadow.paired_comparison.max_raw_output_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.max_raw_reasoning_bytes > 0,
+            "evidence.shadow.paired_comparison.max_raw_reasoning_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.max_retention_records > 0,
+            "evidence.shadow.paired_comparison.max_retention_records",
+            "must be greater than zero",
+        )?;
+        require(
+            self.max_retention_bytes > 0,
+            "evidence.shadow.paired_comparison.max_retention_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.retention_days > 0,
+            "evidence.shadow.paired_comparison.retention_days",
+            "must be greater than zero",
+        )
+    }
+}
+
+impl Default for EvidencePairedComparisonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            variants: vec![
+                ShadowComparisonAttempt::MaxThinking,
+                ShadowComparisonAttempt::NoThinking,
+            ],
+            include_raw_input: false,
+            include_raw_output: false,
+            include_raw_reasoning: false,
+            sample_rate: 0.0,
+            max_raw_input_bytes: 131_072,
+            max_raw_output_bytes: 131_072,
+            max_raw_reasoning_bytes: 131_072,
+            max_retention_records: 10_000,
+            max_retention_bytes: 1_073_741_824,
+            retention_days: 7,
         }
     }
 }

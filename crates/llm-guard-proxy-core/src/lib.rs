@@ -26,9 +26,10 @@ pub mod workflow;
 #[cfg(feature = "guard")]
 pub use budget::{BudgetCheck, BudgetError, BudgetStore, current_budget_date};
 pub use evidence::{
-    EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceError,
-    EvidenceGroupRecord, EvidencePruningStats, EvidenceRetentionUsage, EvidenceShadowRecord,
-    EvidenceStore, EvidenceStoreWrite, ShadowSkipReason,
+    EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceDatabaseStatus,
+    EvidenceError, EvidenceExportArtifact, EvidenceExportPair, EvidenceGroupRecord,
+    EvidencePruningStats, EvidenceRawArtifactKind, EvidenceRetentionUsage, EvidenceShadowRecord,
+    EvidenceStore, EvidenceStoreWrite, EvidenceSummaryRow, ShadowSkipReason,
 };
 #[cfg(feature = "family")]
 pub use family::{
@@ -70,14 +71,15 @@ pub use settings::ParamOverrideConfig;
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
     DEFAULT_CONFIG_RELATIVE_PATH, DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig,
-    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
-    LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig, MissingConfigPolicy,
-    NoThinkingMarkerPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
-    ReloadOutcome, ReloadWatcher, RestartRequiredChange, RetentionConfig, RetryConfig,
-    RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt,
-    ShieldingConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
-    UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig, ValidationError,
-    default_config_path, redact_upstream_base_url, validate_upstream_base_url,
+    EvidencePairedComparisonConfig, EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode,
+    HotRestartConfig, ListenerConfig, LoopFailurePolicy, LoopGuardConfig, LoopGuardMode,
+    MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy, ObservabilityConfig,
+    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher,
+    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
+    SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
+    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, ValidationError, default_config_path,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 pub use settings::{BudgetConfig, UnknownKeyPolicy, VirtualKeyConfig};
