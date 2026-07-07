@@ -7383,14 +7383,16 @@ enabled = false
     )
     .await;
 
+    // Use /v1/completions (not subject to choices validation, which buffers
+    // the body) so the downstream-drop cancellation path is exercised.
     let response = proxy
         .client
-        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .post(format!("{}/v1/completions", proxy.base_url))
         .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .body(r#"{"model":"test-completion","prompt":"ping"}"#)
         .send()
         .await
-        .expect("non-stream chat request should receive response headers");
+        .expect("non-stream completion request should receive response headers");
 
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
@@ -7402,7 +7404,7 @@ enabled = false
     );
     let observed = upstream.recv_request().await;
     assert_eq!(observed.method, Method::POST);
-    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+    assert_eq!(observed.path_and_query, "/v1/completions");
     let observed_body: serde_json::Value =
         serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
     assert_ne!(observed_body["stream"], true);
@@ -8072,7 +8074,7 @@ async fn shielded_chat_preserves_malformed_stream_for_upstream_validation() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.text().await.expect("body should be text"),
-        r#"{"id":"chatcmpl-test","object":"chat.completion"}"#
+        r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#
     );
     let observed = fake.recv_next().await;
     assert_eq!(observed.body, body);
@@ -8102,7 +8104,7 @@ async fn shielded_chat_preserves_malformed_stream_options_for_upstream_validatio
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(
         response.text().await.expect("body should be text"),
-        r#"{"id":"chatcmpl-test","object":"chat.completion"}"#
+        r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#
     );
     let observed = fake.recv_next().await;
     assert_eq!(observed.body, body);
@@ -9012,7 +9014,7 @@ enabled = false
     assert_eq!(second.status(), StatusCode::OK);
     assert_eq!(
         second.text().await.expect("second body should be text"),
-        r#"{"id":"chatcmpl-test","object":"chat.completion"}"#
+        r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#
     );
     let second_observed = fake.recv_next().await;
     assert_eq!(second_observed.body, body);
@@ -14335,7 +14337,7 @@ fn fake_upstream_endpoint_response(
         "/v1/models" => ("models", r#"{"object":"list","data":[]}"#),
         "/v1/chat/completions" => (
             "chat-completions",
-            r#"{"id":"chatcmpl-test","object":"chat.completion"}"#,
+            r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
         ),
         "/v1/completions" => (
             "completions",
@@ -14650,7 +14652,9 @@ fn cancellable_chat_sse_response(drop_sender: mpsc::Sender<UpstreamDropEvent>) -
 fn cancellable_chat_json_response(drop_sender: mpsc::Sender<UpstreamDropEvent>) -> Response<Body> {
     let chunks = vec![
         Bytes::from_static(br#"{"id":"chatcmpl-cancellable","#),
-        Bytes::from_static(br#""object":"chat.completion"}"#),
+        Bytes::from_static(
+            br#""object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+        ),
     ];
     cancellable_stream_response(
         "cancellable-chat-json",
@@ -16017,4 +16021,197 @@ async fn send_raw_proxy_get(base_url: &str, request_target: &str) -> String {
     })
     .await
     .expect("blocking raw proxy request should finish")
+}
+
+// ---------------------------------------------------------------------------
+// Issue #124: non-stream chat completion response shape validation
+// ---------------------------------------------------------------------------
+
+fn build_json_chat_response(status: StatusCode, body: &str) -> Response<Body> {
+    let mut response = Response::new(Body::from(body.to_owned()));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
+}
+
+fn build_streaming_chat_response(status: StatusCode) -> Response<Body> {
+    let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n";
+    let mut response = Response::new(Body::from(body.to_owned()));
+    *response.status_mut() = status;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response
+}
+
+fn request_id_for_test() -> RequestId {
+    RequestId::from_string("req-test-124").expect("request id should be valid")
+}
+
+#[tokio::test]
+async fn validation_passes_through_valid_choices() {
+    let counter = AtomicU64::new(0);
+    let request_id = request_id_for_test();
+    let body = r#"{"id":"chatcmpl-1","choices":[{"index":0,"message":{"role":"assistant","content":"hello"}}]}"#;
+    let response = build_json_chat_response(StatusCode::OK, body);
+    let result = validate_non_stream_chat_completion_response(
+        response,
+        "/v1/chat/completions",
+        &request_id,
+        &counter,
+    )
+    .await;
+    assert_eq!(result.status(), StatusCode::OK);
+    let body_bytes = to_bytes(result.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("body should read");
+    assert!(body_bytes.windows(7).any(|w| w == b"choices"));
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn validation_converts_missing_choices_to_502() {
+    let counter = AtomicU64::new(0);
+    let request_id = request_id_for_test();
+    let body = r#"{"id":"chatcmpl-1","object":"chat.completion"}"#;
+    let response = build_json_chat_response(StatusCode::OK, body);
+    let result = validate_non_stream_chat_completion_response(
+        response,
+        "/v1/chat/completions",
+        &request_id,
+        &counter,
+    )
+    .await;
+    assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+    let body_bytes = to_bytes(result.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("body should read");
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&body_bytes).expect("error body should be valid JSON");
+    assert_eq!(
+        parsed["error"]["code"],
+        serde_json::json!("malformed_response")
+    );
+    assert_eq!(parsed["error"]["type"], serde_json::json!("upstream_error"));
+    assert!(
+        parsed["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("choices"))
+    );
+}
+
+#[tokio::test]
+async fn validation_converts_null_choices_to_502() {
+    let counter = AtomicU64::new(0);
+    let request_id = request_id_for_test();
+    let body = r#"{"id":"chatcmpl-1","choices":null}"#;
+    let response = build_json_chat_response(StatusCode::OK, body);
+    let result = validate_non_stream_chat_completion_response(
+        response,
+        "/v1/chat/completions",
+        &request_id,
+        &counter,
+    )
+    .await;
+    assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn validation_converts_invalid_json_to_502() {
+    let counter = AtomicU64::new(0);
+    let request_id = request_id_for_test();
+    let body = "not valid json at all {{{";
+    let mut response = Response::new(Body::from(body.to_owned()));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let result = validate_non_stream_chat_completion_response(
+        response,
+        "/v1/chat/completions",
+        &request_id,
+        &counter,
+    )
+    .await;
+    assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(counter.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn validation_passes_through_non_2xx() {
+    let counter = AtomicU64::new(0);
+    let request_id = request_id_for_test();
+    let body = r#"{"error":"rate limited"}"#;
+    let response = build_json_chat_response(StatusCode::TOO_MANY_REQUESTS, body);
+    let result = validate_non_stream_chat_completion_response(
+        response,
+        "/v1/chat/completions",
+        &request_id,
+        &counter,
+    )
+    .await;
+    assert_eq!(result.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn validation_passes_through_streaming_response() {
+    let counter = AtomicU64::new(0);
+    let request_id = request_id_for_test();
+    let response = build_streaming_chat_response(StatusCode::OK);
+    let result = validate_non_stream_chat_completion_response(
+        response,
+        "/v1/chat/completions",
+        &request_id,
+        &counter,
+    )
+    .await;
+    assert_eq!(result.status(), StatusCode::OK);
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        result.headers().get(CONTENT_TYPE).unwrap(),
+        HeaderValue::from_static("text/event-stream")
+    );
+}
+
+#[tokio::test]
+async fn validation_passes_through_non_chat_endpoint() {
+    let counter = AtomicU64::new(0);
+    let request_id = request_id_for_test();
+    let body = r#"{"object":"list","data":[]}"#;
+    let response = build_json_chat_response(StatusCode::OK, body);
+    let result = validate_non_stream_chat_completion_response(
+        response,
+        "/v1/embeddings",
+        &request_id,
+        &counter,
+    )
+    .await;
+    assert_eq!(result.status(), StatusCode::OK);
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn validation_error_response_includes_request_id() {
+    let counter = AtomicU64::new(0);
+    let request_id = request_id_for_test();
+    let body = r#"{"id":"chatcmpl-1"}"#;
+    let response = build_json_chat_response(StatusCode::OK, body);
+    let result = validate_non_stream_chat_completion_response(
+        response,
+        "/chat/completions",
+        &request_id,
+        &counter,
+    )
+    .await;
+    assert_eq!(result.status(), StatusCode::BAD_GATEWAY);
+    let request_id_header = result
+        .headers()
+        .get("x-request-id")
+        .expect("x-request-id header should be present");
+    assert_eq!(request_id_header, "req-test-124");
 }
