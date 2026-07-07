@@ -7,14 +7,17 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicU64, Ordering},
+    },
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Router,
-    body::{Body, Bytes, to_bytes},
+    body::{Body, Bytes, HttpBody, to_bytes},
     extract::State,
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
@@ -99,6 +102,7 @@ pub(crate) struct ProxyState {
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
     shadow_attempts: Arc<InFlightLimiter>,
+    malformed_response_counter: Arc<AtomicU64>,
 }
 
 impl ProxyState {
@@ -135,6 +139,7 @@ impl ProxyState {
             hot_restart_recovery: Arc::new(HotRestartCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
             shadow_attempts: Arc::new(InFlightLimiter::default()),
+            malformed_response_counter: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -900,7 +905,12 @@ async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
             match state.store.metrics_snapshot() {
                 Ok(snapshot) => {
                     let admission = state.admission_metrics_snapshot();
-                    text_response(StatusCode::OK, render_metrics(&snapshot, &admission))
+                    let malformed_responses =
+                        state.malformed_response_counter.load(Ordering::Relaxed);
+                    text_response(
+                        StatusCode::OK,
+                        render_metrics(&snapshot, &admission, malformed_responses),
+                    )
                 }
                 Err(error) => proxy_error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -1076,12 +1086,14 @@ fn render_debug_summary_json(limit: u32, summaries: &[DebugRequestSummary]) -> s
 fn render_metrics(
     snapshot: &ObservabilityMetricsSnapshot,
     admission: &AdmissionMetricsSnapshot,
+    malformed_responses: u64,
 ) -> String {
     let mut output = String::new();
     push_admission_metrics(&mut output, admission);
     push_request_metrics(&mut output, snapshot);
     push_attempt_metrics(&mut output, snapshot);
     push_retry_and_error_metrics(&mut output, snapshot);
+    push_malformed_response_metrics(&mut output, malformed_responses);
     push_latency_metrics(&mut output, snapshot);
     push_heartbeat_metrics(&mut output, snapshot);
     push_storage_metrics(&mut output, snapshot);
@@ -1228,6 +1240,21 @@ fn push_retry_and_error_metrics(output: &mut String, snapshot: &ObservabilityMet
             row.count,
         );
     }
+}
+
+fn push_malformed_response_metrics(output: &mut String, malformed_responses: u64) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_malformed_response_total",
+        "Non-stream chat completion responses converted to 502 due to a missing or invalid choices field.",
+        "counter",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_malformed_response_total",
+        &[("kind", "missing_choices")],
+        malformed_responses,
+    );
 }
 
 fn push_latency_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
@@ -1866,6 +1893,7 @@ async fn forward_openai_request(
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
                 shadow_evidence: ShadowEvidenceState::default(),
+                malformed_response_counter: state.malformed_response_counter.clone(),
             },
             in_flight_permit,
         )
@@ -3095,6 +3123,7 @@ async fn forward_generic_openai_request(
             config: context.config,
             listener: &context.state.listener,
             metadata_config: &context.upstream_profile.metadata,
+            malformed_response_counter: &context.state.malformed_response_counter,
         },
         response_parts,
         upstream_response,
@@ -3369,6 +3398,7 @@ struct ResponseDispatch<'request> {
     config: &'request AppConfig,
     listener: &'request ListenerConfig,
     metadata_config: &'request MetadataConfig,
+    malformed_response_counter: &'request AtomicU64,
 }
 
 struct ShieldedChatPlan {
@@ -3721,14 +3751,23 @@ async fn forward_upstream_response(
         .await;
     }
 
+    let request_path = dispatch.uri.path().to_owned();
+    let request_id = response_parts.request_id.clone();
     let observer = response_parts.into_observer();
     let response_body =
         ObservedUpstreamBody::new(upstream_response.bytes_stream(), observer, in_flight_permit);
-    Ok(downstream_response(
+    let response = downstream_response(
         upstream_status,
         &upstream_headers,
         Body::from_stream(response_body),
-    ))
+    );
+    Ok(validate_non_stream_chat_completion_response(
+        response,
+        &request_path,
+        &request_id,
+        dispatch.malformed_response_counter,
+    )
+    .await)
 }
 
 async fn read_body_bytes(body: Body, max_request_body_bytes: usize) -> Result<Bytes, ProxyError> {
@@ -4305,6 +4344,7 @@ struct ShieldedRetryRuntime {
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     shadow_attempts: Arc<InFlightLimiter>,
     shadow_evidence: ShadowEvidenceState,
+    malformed_response_counter: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Debug)]
@@ -4553,7 +4593,7 @@ async fn forward_shielded_chat_with_retries(
             in_flight_permit,
         )),
         ShieldedBeginOutcome::TerminalForward(terminal) => Ok(
-            shielded_retry_terminal_forward_response(&runtime, terminal, in_flight_permit),
+            shielded_retry_terminal_forward_response(&runtime, terminal, in_flight_permit).await,
         ),
     }
 }
@@ -4567,13 +4607,13 @@ async fn immediate_shielded_retry_response(
             shielded_retry_success_response(runtime, outcome, in_flight_permit)
         }
         ShieldedRunOutcome::DirectRelay(outcome) => {
-            shielded_retry_direct_relay_response(runtime, outcome, in_flight_permit)
+            shielded_retry_direct_relay_response(runtime, outcome, in_flight_permit).await
         }
         ShieldedRunOutcome::Failed(failure) => {
             shielded_retry_error_response(runtime, failure, in_flight_permit)
         }
         ShieldedRunOutcome::TerminalForward(terminal) => {
-            shielded_retry_terminal_forward_response(runtime, terminal, in_flight_permit)
+            shielded_retry_terminal_forward_response(runtime, terminal, in_flight_permit).await
         }
     }
 }
@@ -6520,6 +6560,16 @@ fn shielded_retry_success_response(
     let body_len = outcome.body.len();
     let upstream_headers = outcome.final_attempt.upstream_headers.clone();
     let upstream_status = outcome.final_attempt.upstream_status;
+    let request_path = runtime.downstream_uri.path().to_owned();
+    if upstream_status.is_success()
+        && is_chat_completion_path(&request_path)
+        && !response_has_valid_choices(&outcome.body)
+    {
+        runtime
+            .malformed_response_counter
+            .fetch_add(1, Ordering::Relaxed);
+        return malformed_choices_error_response(&runtime.request_id);
+    }
     let upstream_content_type = upstream_headers.get(CONTENT_TYPE).map(header_value);
     let response_headers = shielded_chat_response_headers(&upstream_headers, body_len);
     let mut extra_metadata = outcome.response_metadata.clone();
@@ -6596,13 +6646,16 @@ fn shielded_retry_error_response(
     response
 }
 
-fn shielded_retry_terminal_forward_response(
+async fn shielded_retry_terminal_forward_response(
     runtime: &ShieldedRetryRuntime,
     terminal: ShieldedTerminalForward,
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     let upstream_status = terminal.started.info.upstream_status;
     let upstream_headers = terminal.started.info.upstream_headers.clone();
+    let request_path = runtime.downstream_uri.path().to_owned();
+    let request_id = runtime.request_id.clone();
+    let malformed_counter = runtime.malformed_response_counter.clone();
     let final_attempt = terminal
         .started
         .info
@@ -6627,20 +6680,30 @@ fn shielded_retry_terminal_forward_response(
         observer,
         in_flight_permit,
     );
-    downstream_response(
+    let response = downstream_response(
         upstream_status,
         &upstream_headers,
         Body::from_stream(response_body),
+    );
+    validate_non_stream_chat_completion_response(
+        response,
+        &request_path,
+        &request_id,
+        &malformed_counter,
     )
+    .await
 }
 
-fn shielded_retry_direct_relay_response(
+async fn shielded_retry_direct_relay_response(
     runtime: &ShieldedRetryRuntime,
     outcome: ShieldedDirectRelayOutcome,
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     let upstream_status = outcome.started.info.upstream_status;
     let upstream_headers = outcome.started.info.upstream_headers.clone();
+    let request_path = runtime.downstream_uri.path().to_owned();
+    let request_id = runtime.request_id.clone();
+    let malformed_counter = runtime.malformed_response_counter.clone();
     let final_attempt = outcome
         .started
         .info
@@ -6665,11 +6728,18 @@ fn shielded_retry_direct_relay_response(
         observer,
         in_flight_permit,
     );
-    downstream_response(
+    let response = downstream_response(
         upstream_status,
         &upstream_headers,
         Body::from_stream(response_body),
+    );
+    validate_non_stream_chat_completion_response(
+        response,
+        &request_path,
+        &request_id,
+        &malformed_counter,
     )
+    .await
 }
 
 struct ShieldedRetryObserverInput {
@@ -8017,6 +8087,95 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .is_some_and(|value| value.to_ascii_lowercase().contains("text/event-stream"))
+}
+
+const MALFORMED_CHOICES_MESSAGE: &str =
+    "upstream returned a malformed response: missing or invalid 'choices' field";
+
+fn is_chat_completion_path(path: &str) -> bool {
+    path == "/v1/chat/completions" || path == "/chat/completions"
+}
+
+fn is_application_json_response(headers: &HeaderMap) -> bool {
+    headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let lower = value.to_ascii_lowercase();
+            lower.contains("application/json") || lower.starts_with("application/")
+        })
+}
+
+fn malformed_choices_error_response(request_id: &RequestId) -> Response<Body> {
+    let body = json!({
+        "error": {
+            "message": MALFORMED_CHOICES_MESSAGE,
+            "type": "upstream_error",
+            "code": "malformed_response"
+        }
+    })
+    .to_string();
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::BAD_GATEWAY;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Ok(value) = HeaderValue::from_str(request_id.as_str()) {
+        response
+            .headers_mut()
+            .insert(HeaderName::from_static("x-request-id"), value);
+    }
+    response
+}
+
+fn response_has_valid_choices(body: &Bytes) -> bool {
+    match serde_json::from_slice::<serde_json::Value>(body) {
+        Ok(value) => value
+            .get("choices")
+            .is_some_and(serde_json::Value::is_array),
+        Err(_) => false,
+    }
+}
+
+/// Validates a non-stream chat completion response at the final downstream
+/// boundary. If the response is a 2xx for a non-stream `/v1/chat/completions`
+/// (or `/chat/completions`) request with a JSON body that lacks a valid
+/// `choices` array, it is replaced with an OpenAI-compatible 502 error.
+/// Streaming responses, non-2xx responses, and non-chat endpoints pass through
+/// unchanged.
+async fn validate_non_stream_chat_completion_response(
+    response: Response<Body>,
+    request_path: &str,
+    request_id: &RequestId,
+    malformed_counter: &AtomicU64,
+) -> Response<Body> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    if !status.is_success()
+        || !is_chat_completion_path(request_path)
+        || is_event_stream(&headers)
+        || !is_application_json_response(&headers)
+    {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let Ok(body_bytes) = to_bytes(body, MAX_PROXY_BODY_BYTES).await else {
+        malformed_counter.fetch_add(1, Ordering::Relaxed);
+        return malformed_choices_error_response(request_id);
+    };
+    if !response_has_valid_choices(&body_bytes) {
+        malformed_counter.fetch_add(1, Ordering::Relaxed);
+        return malformed_choices_error_response(request_id);
+    }
+    let mut reconstructed = Response::from_parts(parts, Body::from(body_bytes));
+    if let Ok(content_length) =
+        HeaderValue::from_str(&reconstructed.body().size_hint().lower().to_string())
+    {
+        reconstructed
+            .headers_mut()
+            .insert(CONTENT_LENGTH, content_length);
+    }
+    reconstructed
 }
 
 fn validate_openai_path(path: &str) -> Result<(), OpenAiPathError> {
