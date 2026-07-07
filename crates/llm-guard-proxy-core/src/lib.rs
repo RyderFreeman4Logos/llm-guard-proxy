@@ -21,6 +21,7 @@ mod model_alias;
 mod observability;
 #[cfg(feature = "guard")]
 pub mod profile;
+pub mod risk_combiner;
 mod settings;
 #[cfg(feature = "guard")]
 pub mod workflow;
@@ -79,6 +80,7 @@ pub use profile::{
     BlockReason, DEFAULT_PROFILE_NAME, ProfileCheckResult, ProfileConfig, ProfileKind,
     ShieldedBuffering,
 };
+pub use risk_combiner::{CombinedRisk, DetectorKind, DetectorSignal, RiskCombiner};
 #[cfg(feature = "param-override")]
 pub use settings::ParamOverrideConfig;
 pub use settings::{
