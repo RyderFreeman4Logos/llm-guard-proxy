@@ -278,7 +278,7 @@ input_overlap_threshold_multiplier = 4     # Input/output overlap sensitivity
 # "bounded_answer_from_cot"   — Use private CoT internally for answer synthesis
 #                               without exposing raw CoT downstream.
 
-# loop_guard.on_reasoning_loop = "retry_ladder"
+# on_reasoning_loop = "retry_ladder"
 
 # ── Embedding endpoint for semantic loop detection ───────────────────────────
 # The semantic detector above uses normalized token/ngram Jaccard windows by
@@ -311,8 +311,8 @@ anti_loop_hint_enabled = true              # Inject anti-loop hints on retry
 # ── Shielded streaming retry ─────────────────────────────────────────────────
 # Retry streaming requests that fail mid-stream.
 
-# retry.shielded_streaming_enabled = true
-# retry.downstream_drop_policy = "drop_on_success"  # When to drop downstream conn
+# shielded_streaming_enabled = true
+# downstream_drop_policy = "drop_on_success"  # When to drop downstream conn
 
 # ── Retry ladder ──────────────────────────────────────────────────────────────
 # Escalating delay between retries.
@@ -422,8 +422,8 @@ enabled = true
 # The judge can use the same upstream as the primary model, or a separate
 # endpoint if spare compute is available.
 
-# judge.upstream_base_url = ""             # Empty = same as primary upstream
-# judge.model = ""                         # Empty = same as primary model
+# upstream_base_url = ""                   # Empty = same as primary upstream
+# model = ""                               # Empty = same as primary model
 
 # ── Judge trigger thresholds ─────────────────────────────────────────────────
 

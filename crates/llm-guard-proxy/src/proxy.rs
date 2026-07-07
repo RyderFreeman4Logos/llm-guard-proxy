@@ -2536,6 +2536,7 @@ async fn forward_openai_request(
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
                 shutdown: Arc::clone(&state.shutdown),
+                downstream_drop_signal: DownstreamDropSignal::default(),
                 shadow_evidence: ShadowEvidenceState::default(),
                 malformed_response_counter: state.malformed_response_counter.clone(),
                 upstream_failure_counters: state.upstream_failure_counters.clone(),
@@ -5060,11 +5061,27 @@ struct ShieldedRetryRuntime {
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     shadow_attempts: Arc<InFlightLimiter>,
     shutdown: Arc<ShutdownGate>,
+    downstream_drop_signal: DownstreamDropSignal,
     shadow_evidence: ShadowEvidenceState,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
     #[cfg(test)]
     shielded_heartbeat_ticks: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DownstreamDropSignal {
+    dropped: Arc<AtomicBool>,
+}
+
+impl DownstreamDropSignal {
+    fn mark_dropped(&self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+
+    fn is_dropped(&self) -> bool {
+        self.dropped.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -5328,6 +5345,7 @@ fn shielded_liveness_stream_response(
         observer,
         in_flight_permit,
         runtime.shutdown.subscribe(),
+        runtime.downstream_drop_signal.clone(),
     );
     response_with_headers(
         upstream_status,
@@ -5411,11 +5429,7 @@ async fn shielded_start_failure_step(
     attempt_records: &mut Vec<AttemptRecord>,
 ) -> ShieldedStartFailureStep {
     let next_retry_cause = failure.retry_cause;
-    let can_retry = next_retry_cause.is_some_and(|_cause| {
-        runtime
-            .retry_policy
-            .allows_retry_after(failure.attempt_number)
-    });
+    let can_retry = should_retry_after_shielded_failure(runtime, &failure);
     #[cfg(feature = "upstream-hot-restart")]
     let (failure, can_retry, terminal) = {
         let mut failure = failure;
@@ -5522,12 +5536,12 @@ async fn shielded_retryable_status_step(
     cause: ShieldedRetryCause,
     attempt_records: &mut Vec<AttemptRecord>,
 ) -> ShieldedAttemptStep {
-    let can_retry = runtime.retry_policy.allows_retry_after(info.attempt_number);
     let failure = status_failure(
         info,
         cause,
         "retryable upstream status before shielded stream",
     );
+    let can_retry = should_retry_after_shielded_failure(runtime, &failure);
     #[cfg(feature = "upstream-hot-restart")]
     let (failure, can_retry, terminal) = {
         let mut failure = failure;
@@ -5877,6 +5891,7 @@ fn should_retry_after_shielded_failure(
 ) -> bool {
     !is_server_shutdown_failure(failure)
         && failure.retry_cause.is_some()
+        && !runtime.downstream_drop_signal.is_dropped()
         && runtime
             .retry_policy
             .allows_retry_after(failure.attempt_number)
@@ -8217,6 +8232,7 @@ struct ShieldedLivenessBody {
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: InFlightPermit,
     shutdown: ShutdownSubscription,
+    downstream_drop_signal: DownstreamDropSignal,
     #[cfg(test)]
     shielded_heartbeat_ticks: Arc<AtomicU64>,
     bytes_seen: u64,
@@ -8231,6 +8247,7 @@ impl ShieldedLivenessBody {
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
         shutdown: ShutdownSubscription,
+        downstream_drop_signal: DownstreamDropSignal,
     ) -> Self {
         let period = Duration::from_secs(settings.interval_secs);
         let mut interval = tokio::time::interval_at(Instant::now() + period, period);
@@ -8244,6 +8261,7 @@ impl ShieldedLivenessBody {
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
             shutdown,
+            downstream_drop_signal,
             #[cfg(test)]
             shielded_heartbeat_ticks: settings.shielded_heartbeat_ticks.clone(),
             bytes_seen: 0,
@@ -8412,7 +8430,8 @@ impl Drop for ShieldedLivenessBody {
     fn drop(&mut self) {
         if let Some(completion) = self.terminal_completion.take() {
             self.record_once(&completion);
-        } else {
+        } else if self.observer.is_some() {
+            self.downstream_drop_signal.mark_dropped();
             self.record_once(&BodyCompletion::DownstreamDropped);
         }
     }
@@ -9614,6 +9633,9 @@ fn maybe_schedule_paired_comparison_after_primary(
     request: &RequestRecord,
     attempts: &[AttemptRecord],
 ) {
+    if runtime.downstream_drop_signal.is_dropped() {
+        return;
+    }
     let settings = match runtime.config.snapshot() {
         Ok(settings) => settings,
         Err(error) => {
@@ -9694,6 +9716,9 @@ fn maybe_schedule_shadow_continuation(
     failure: &ShieldedAttemptFailure,
     source: &AttemptRecord,
 ) {
+    if runtime.downstream_drop_signal.is_dropped() {
+        return;
+    }
     if failure.retry_cause != Some(ShieldedRetryCause::LoopDetected) {
         return;
     }
@@ -9735,7 +9760,7 @@ fn schedule_shadow_attempt(
     settings: &AppConfig,
     plan: ShadowAttemptPlan,
 ) {
-    if runtime.shutdown.is_shutting_down() {
+    if runtime.shutdown.is_shutting_down() || runtime.downstream_drop_signal.is_dropped() {
         return;
     }
     let shadow = &settings.evidence.shadow;

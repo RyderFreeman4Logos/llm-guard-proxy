@@ -7691,6 +7691,84 @@ idle_timeout_ms = 200
 }
 
 #[tokio::test]
+async fn shielded_non_stream_detach_drop_does_not_start_retry_after_disconnect() {
+    let mut upstream = CancellableUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "json-whitespace"
+
+[evidence]
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = true
+max_shadow_attempts_per_request = 2
+max_global_shadow_in_flight = 2
+shadow_attempt_timeout_ms = 1000
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 3
+anti_loop_hint_enabled = true
+downstream_drop_policy = "detach"
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+thinking_token_budget = 8192
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=delayed-loop-then-cancellable-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("shielded chat request should receive response headers");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let first_attempt = upstream.recv_request().await;
+    assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
+    let mut downstream = response.bytes_stream();
+    let heartbeat = next_chunk(
+        &mut downstream,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "detach JSON prefix before retry cancellation",
+    )
+    .await;
+    assert_eq!(heartbeat, Bytes::from_static(b" \n"));
+    drop(downstream);
+
+    assert!(
+        upstream
+            .recv_request_optional_within(Duration::from_millis(500))
+            .await
+            .is_none(),
+        "detached downstream drops may let the current attempt finish, but must not advance the retry ladder or shadow evidence attempts"
+    );
+}
+
+#[tokio::test]
 async fn shielded_thinking_policy_respects_explicit_disable_marker() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -14519,6 +14597,10 @@ impl CancellableUpstream {
             .expect("cancellable upstream should capture a request")
     }
 
+    async fn recv_request_optional_within(&mut self, wait: Duration) -> Option<ObservedRequest> {
+        timeout(wait, self.receiver.recv()).await.ok().flatten()
+    }
+
     async fn recv_drop_within(&mut self, wait: Duration) -> UpstreamDropEvent {
         timeout(wait, self.drop_receiver.recv())
             .await
@@ -14810,6 +14892,17 @@ async fn cancellable_upstream_handler(
         && next_cancellable_attempt_count(&state, &path_and_query) <= 2
     {
         return repeated_reasoning_line_sse_response(200);
+    }
+
+    if path_and_query.contains("test=delayed-loop-then-cancellable-success")
+        && body_requests_stream(&body)
+        && next_cancellable_attempt_count(&state, &path_and_query) == 1
+    {
+        return cancellable_repeated_reasoning_line_sse_response(
+            state.drop_sender,
+            200,
+            Duration::from_millis(100),
+        );
     }
 
     if body_requests_stream(&body) {
@@ -15540,6 +15633,26 @@ fn repeated_reasoning_line_sse_response(repetitions: usize) -> Response<Body> {
     )
 }
 
+fn cancellable_repeated_reasoning_line_sse_response(
+    drop_sender: mpsc::Sender<UpstreamDropEvent>,
+    repetitions: usize,
+    delay_after_first: Duration,
+) -> Response<Body> {
+    let mut deltas = Vec::with_capacity(repetitions);
+    for _ in 0..repetitions {
+        deltas.push(serde_json::json!({
+            "reasoning_content": "reasoning loop line\n",
+        }));
+    }
+    cancellable_stream_response(
+        "cancellable-loop-reasoning-sse",
+        "text/event-stream",
+        delta_vec_sse_chunks(deltas),
+        drop_sender,
+        delay_after_first,
+    )
+}
+
 fn reasoning_then_leading_newline_content_sse_response() -> Response<Body> {
     delta_fragments_sse_response(
         "chat-completions-reasoning-leading-newlines-sse",
@@ -15625,6 +15738,10 @@ fn delta_fragments_sse_response<const N: usize>(
 }
 
 fn delta_vec_sse_response(label: &'static str, deltas: Vec<serde_json::Value>) -> Response<Body> {
+    chat_completion_vec_stream_response(label, delta_vec_sse_chunks(deltas))
+}
+
+fn delta_vec_sse_chunks(deltas: Vec<serde_json::Value>) -> Vec<Bytes> {
     let mut chunks = Vec::with_capacity(deltas.len().saturating_add(3));
     chunks.push(sse_json(&serde_json::json!({
         "id": "chatcmpl-shielded",
@@ -15664,7 +15781,7 @@ fn delta_vec_sse_response(label: &'static str, deltas: Vec<serde_json::Value>) -
         }]
     })));
     chunks.push(Bytes::from_static(b"data: [DONE]\n\n"));
-    chat_completion_vec_stream_response(label, chunks)
+    chunks
 }
 
 fn repeated_delta_sse_response(
