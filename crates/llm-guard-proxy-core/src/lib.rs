@@ -28,7 +28,7 @@ pub mod workflow;
 pub use budget::{BudgetCheck, BudgetError, BudgetStore, current_budget_date};
 pub use embedding::{
     DisabledEmbeddingBackend, EmbeddingBackend, EmbeddingChannel, EmbeddingError, EmbeddingFuture,
-    EmbeddingInput, EmbeddingVector,
+    EmbeddingInput, EmbeddingQueue, EmbeddingQueueResult, EmbeddingVector,
 };
 pub use evidence::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceDatabaseStatus,
