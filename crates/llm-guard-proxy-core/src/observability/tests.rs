@@ -317,6 +317,67 @@ fn writes_success_and_failure_request_and_attempt_rows() {
 }
 
 #[test]
+fn metrics_snapshot_buckets_request_terminal_reasons() {
+    let fixture = StoreFixture::new("terminal-reason-metrics");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+
+    let shutdown = RequestRecord {
+        status: RequestStatus::Aborted,
+        http_status: None,
+        abort_reason: Some(String::from("server_shutdown_while_queued")),
+        ..request_record("req-shutdown", RequestStatus::Aborted, 1_000)
+    };
+    let disconnect = RequestRecord {
+        status: RequestStatus::Aborted,
+        http_status: None,
+        abort_reason: Some(String::from("downstream_disconnected_while_queued")),
+        ..request_record("req-disconnect", RequestStatus::Aborted, 2_000)
+    };
+    let unknown = RequestRecord {
+        status: RequestStatus::Aborted,
+        http_status: None,
+        abort_reason: Some(String::from("operator provided sensitive diagnostic")),
+        ..request_record("req-unknown", RequestStatus::Aborted, 3_000)
+    };
+
+    store
+        .record_request(&shutdown)
+        .expect("shutdown request write");
+    store
+        .record_request(&disconnect)
+        .expect("disconnect request write");
+    store
+        .record_request(&unknown)
+        .expect("unknown request write");
+
+    let snapshot = store.metrics_snapshot().expect("metrics snapshot");
+    assert!(snapshot.request_terminal_counts.iter().any(|row| {
+        row.status == "aborted"
+            && row.terminal_reason == "server_shutdown"
+            && row.http_status_class == "none"
+            && row.count == 1
+    }));
+    assert!(snapshot.request_terminal_counts.iter().any(|row| {
+        row.status == "aborted"
+            && row.terminal_reason == "downstream_disconnect"
+            && row.http_status_class == "none"
+            && row.count == 1
+    }));
+    assert!(snapshot.request_terminal_counts.iter().any(|row| {
+        row.status == "aborted"
+            && row.terminal_reason == "other_abort"
+            && row.http_status_class == "none"
+            && row.count == 1
+    }));
+    assert!(
+        !snapshot
+            .request_terminal_counts
+            .iter()
+            .any(|row| row.terminal_reason.contains("sensitive"))
+    );
+}
+
+#[test]
 fn updating_request_preserves_existing_attempt_rows() {
     let fixture = StoreFixture::new("request-update-preserves-attempts");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);

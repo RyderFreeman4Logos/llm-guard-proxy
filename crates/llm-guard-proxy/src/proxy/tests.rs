@@ -143,6 +143,11 @@ async fn metrics_expose_retained_gauges_without_secrets() {
     assert_metric_type(&body, "llm_guard_proxy_generation_profile_active", "gauge");
     assert_metric_type(&body, "llm_guard_proxy_generation_profile_queued", "gauge");
     assert_metric_type(&body, "llm_guard_proxy_current_retained_requests", "gauge");
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_current_retained_request_terminals",
+        "gauge",
+    );
     assert_metric_type(&body, "llm_guard_proxy_current_retained_attempts", "gauge");
     assert_metric_type(&body, "llm_guard_proxy_current_retained_retries", "gauge");
     assert_metric_type(
@@ -12831,6 +12836,128 @@ interval_secs = 1
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn queued_generation_requests_cancelled_by_shutdown_are_observable() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_queued_generation_requests = 1\ngeneration_queue_timeout_ms = 5000\n",
+    )
+    .await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("queued shutdown listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("queued shutdown address should be readable");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let state = proxy.state.clone();
+    let server = tokio::spawn(async move {
+        serve_until_shutdown(listener, state, async {
+            let _received = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let active_response = proxy
+        .client
+        .get(format!(
+            "http://{addr}/v1/embeddings?test=long-json&slot=shutdown-active"
+        ))
+        .send()
+        .await
+        .expect("active shutdown request should get headers");
+    assert_eq!(active_response.status(), StatusCode::OK);
+    let active_observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("active shutdown request should reach upstream");
+    assert_eq!(
+        active_observed.path_and_query,
+        "/v1/embeddings?test=long-json&slot=shutdown-active"
+    );
+
+    let queued = tokio::spawn({
+        let client = proxy.client.clone();
+        async move {
+            client
+                .post(format!("http://{addr}/v1/completions?slot=shutdown-queued"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(r#"{"model":"test","prompt":"queued shutdown"}"#)
+                .send()
+                .await
+        }
+    });
+    sleep(Duration::from_millis(50)).await;
+    let admission = proxy.state.admission_metrics_snapshot();
+    assert_eq!(admission.generation.active, 1);
+    assert_eq!(admission.generation.queued, 1);
+
+    shutdown_tx
+        .send(())
+        .expect("shutdown signal should be delivered");
+    timeout(STREAM_COMPLETION_TIMEOUT, server)
+        .await
+        .expect("server should exit after queued shutdown cancellation")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    let queued_response = timeout(STREAM_COMPLETION_TIMEOUT, queued)
+        .await
+        .expect("queued request task should finish after shutdown")
+        .expect("queued request task should join")
+        .expect("queued request should receive shutdown response");
+    assert_eq!(queued_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let queued_body = queued_response
+        .text()
+        .await
+        .expect("queued shutdown response body should read");
+    assert!(
+        queued_body.contains("proxy_generation_queue_cancelled"),
+        "queued shutdown response should identify cancellation: {queued_body}"
+    );
+
+    wait_for_generation_metrics(&proxy, 0, 0, STREAM_COMPLETION_TIMEOUT).await;
+    let cancel_record = read_aborted_request_metadata_by_path(&proxy, "/v1/completions");
+    assert_eq!(cancel_record.http_status, Some(503));
+    assert_eq!(
+        cancel_record.abort_reason.as_deref(),
+        Some("server_shutdown_while_queued")
+    );
+    assert_eq!(
+        cancel_record.request_metadata["admission_outcome"],
+        "queue_cancelled_shutdown"
+    );
+    assert_eq!(cancel_record.request_metadata["path"], "/v1/completions");
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_current_retained_request_terminals",
+            &[
+                ("status", "aborted"),
+                ("terminal_reason", "server_shutdown"),
+                ("http_status_class", "5xx"),
+            ],
+        ),
+        1
+    );
+    assert_eq!(
+        metric_value(&metrics, "llm_guard_proxy_generation_active"),
+        0
+    );
+    assert_eq!(
+        metric_value(&metrics, "llm_guard_proxy_generation_queued"),
+        0
+    );
+    assert_no_upstream_request(&mut fake).await;
+    drop(active_response);
+}
+
+#[tokio::test]
 async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
     let proxy = ProxyFixture::spawn("http://127.0.0.1:1/v1", true).await;
     let uri = Uri::from_static("/v1/models?limit=2");
@@ -12856,9 +12983,11 @@ async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
             request_id,
             started_at_unix_ms: 1_000,
             finished_at_unix_ms: 1_050,
+            status: RequestStatus::Failed,
             http_status: error.status().as_u16(),
             error_type,
             error_reason,
+            abort_reason: None,
             request_metadata,
             attempts: Vec::new(),
         },
@@ -13156,6 +13285,7 @@ fn read_single_request_and_attempt_metadata(
 }
 
 struct AbortedRequestMetadata {
+    http_status: Option<i64>,
     abort_reason: Option<String>,
     request_metadata: serde_json::Value,
 }
@@ -13178,9 +13308,46 @@ fn read_latest_aborted_request_metadata(proxy: &ProxyFixture) -> AbortedRequestM
     let request_metadata =
         serde_json::from_str(&request_metadata_json).expect("request metadata should parse");
     AbortedRequestMetadata {
+        http_status,
         abort_reason,
         request_metadata,
     }
+}
+
+fn read_aborted_request_metadata_by_path(
+    proxy: &ProxyFixture,
+    path: &str,
+) -> AbortedRequestMetadata {
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let mut statement = connection
+        .prepare(
+            "SELECT http_status, abort_reason, request_metadata_json \
+             FROM requests WHERE status = 'aborted' ORDER BY rowid DESC",
+        )
+        .expect("aborted request query should prepare");
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .expect("aborted request query should run");
+    for row in rows {
+        let (http_status, abort_reason, request_metadata_json) =
+            row.expect("aborted request row should decode");
+        let request_metadata: serde_json::Value =
+            serde_json::from_str(&request_metadata_json).expect("request metadata should parse");
+        if request_metadata["path"].as_str() == Some(path) {
+            return AbortedRequestMetadata {
+                http_status,
+                abort_reason,
+                request_metadata,
+            };
+        }
+    }
+    panic!("aborted request row for path {path:?} should exist");
 }
 
 async fn post_chat_and_observe_body(
@@ -16220,6 +16387,24 @@ fn metric_value(body: &str, metric_name: &str) -> u64 {
         .find_map(|line| line.strip_prefix(&prefix))
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or_else(|| panic!("metrics body missing numeric metric {metric_name:?}: {body}"))
+}
+
+fn labelled_metric_value(body: &str, metric_name: &str, labels: &[(&str, &str)]) -> u64 {
+    let prefix = format!("{metric_name}{{");
+    body.lines()
+        .find(|line| {
+            line.starts_with(&prefix)
+                && labels
+                    .iter()
+                    .all(|(name, value)| line.contains(&format!(r#"{name}="{value}""#)))
+        })
+        .and_then(|line| {
+            line.rsplit_once(' ')
+                .and_then(|(_labels, value)| value.parse().ok())
+        })
+        .unwrap_or_else(|| {
+            panic!("metrics body missing labelled metric {metric_name:?} {labels:?}: {body}")
+        })
 }
 
 async fn send_raw_proxy_get(base_url: &str, request_target: &str) -> String {

@@ -275,7 +275,7 @@ impl ProxyState {
             .snapshot()
             .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
         if self.shutdown.is_shutting_down() {
-            return Err(AdmissionFailure::ShuttingDown);
+            return Err(AdmissionFailure::ShuttingDown { queued: None });
         }
         if let Some(permit) = limiter.try_acquire(config.server.max_in_flight_requests) {
             return Ok(GenerationAdmission::acquired(
@@ -316,8 +316,9 @@ impl ProxyState {
         let deadline = queued_at + Duration::from_millis(timeout_ms);
         loop {
             if self.shutdown.is_shutting_down() {
-                cancel_recorder.disarm();
-                return Err(AdmissionFailure::ShuttingDown);
+                return Err(AdmissionFailure::ShuttingDown {
+                    queued: cancel_recorder.shutdown_cancellation(),
+                });
             }
             let config = match self.config.snapshot() {
                 Ok(config) => config,
@@ -359,7 +360,7 @@ impl ProxyState {
             .snapshot()
             .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
         if self.shutdown.is_shutting_down() {
-            return Err(AdmissionFailure::ShuttingDown);
+            return Err(AdmissionFailure::ShuttingDown { queued: None });
         }
         let selected_profile = select_allowed_upstream_profile(&config, &self.listener, model_id)
             .map_err(AdmissionFailure::ListenerUpstreamDenied)?;
@@ -413,8 +414,9 @@ impl ProxyState {
         let deadline = queued_at + Duration::from_millis(timeout_ms);
         loop {
             if self.shutdown.is_shutting_down() {
-                cancel_recorder.disarm();
-                return Err(AdmissionFailure::ShuttingDown);
+                return Err(AdmissionFailure::ShuttingDown {
+                    queued: cancel_recorder.shutdown_cancellation(),
+                });
             }
             let config = match self.config.snapshot() {
                 Ok(config) => config,
@@ -691,6 +693,15 @@ impl QueuedAdmissionCancelRecorder {
     fn disarm(&mut self) {
         self.record = None;
     }
+
+    fn shutdown_cancellation(&mut self) -> Option<QueuedAdmissionCancellation> {
+        self.record.take().map(|record| {
+            QueuedAdmissionCancellation::from_record(
+                &record,
+                QueueCancellationReason::ServerShutdown,
+            )
+        })
+    }
 }
 
 impl Drop for QueuedAdmissionCancelRecorder {
@@ -706,6 +717,45 @@ struct QueuedAdmissionCancelRecord {
     context: AdmissionRecordContext,
     queued_at: Instant,
     timeout_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QueuedAdmissionCancellation {
+    reason: QueueCancellationReason,
+    queue_wait_ms: u64,
+    generation_queue_timeout_ms: u64,
+}
+
+impl QueuedAdmissionCancellation {
+    fn from_record(record: &QueuedAdmissionCancelRecord, reason: QueueCancellationReason) -> Self {
+        Self {
+            reason,
+            queue_wait_ms: duration_millis_u64(record.queued_at.elapsed()),
+            generation_queue_timeout_ms: record.timeout_ms,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueCancellationReason {
+    DownstreamDisconnected,
+    ServerShutdown,
+}
+
+impl QueueCancellationReason {
+    const fn admission_outcome(self) -> &'static str {
+        match self {
+            Self::DownstreamDisconnected => "queue_cancelled",
+            Self::ServerShutdown => "queue_cancelled_shutdown",
+        }
+    }
+
+    const fn abort_reason(self) -> &'static str {
+        match self {
+            Self::DownstreamDisconnected => "downstream_disconnected_while_queued",
+            Self::ServerShutdown => "server_shutdown_while_queued",
+        }
+    }
 }
 
 fn admission_counts(current: &Mutex<AdmissionCounts>) -> MutexGuard<'_, AdmissionCounts> {
@@ -782,7 +832,9 @@ enum AdmissionFailure {
         max_control_plane_in_flight_requests: usize,
     },
     #[error("proxy is shutting down")]
-    ShuttingDown,
+    ShuttingDown {
+        queued: Option<QueuedAdmissionCancellation>,
+    },
     #[error("{0}")]
     ListenerUpstreamDenied(ListenerUpstreamDenied),
 }
@@ -798,7 +850,7 @@ impl AdmissionFailure {
             },
             Self::GenerationQueueTimeout { .. }
             | Self::ControlPlaneLimitExceeded { .. }
-            | Self::ShuttingDown => StatusCode::SERVICE_UNAVAILABLE,
+            | Self::ShuttingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -811,7 +863,38 @@ impl AdmissionFailure {
             Self::ControlPlaneLimitExceeded { .. } => {
                 "proxy_control_plane_in_flight_limit_exceeded"
             }
-            Self::ShuttingDown => "proxy_shutting_down",
+            Self::ShuttingDown {
+                queued: Some(_), ..
+            } => "proxy_generation_queue_cancelled",
+            Self::ShuttingDown { queued: None } => "proxy_shutting_down",
+        }
+    }
+
+    const fn request_status(&self) -> RequestStatus {
+        match self {
+            Self::ShuttingDown {
+                queued: Some(_), ..
+            } => RequestStatus::Aborted,
+            Self::ConfigSnapshot(_)
+            | Self::GenerationQueueFull { .. }
+            | Self::GenerationQueueTimeout { .. }
+            | Self::ControlPlaneLimitExceeded { .. }
+            | Self::ShuttingDown { queued: None }
+            | Self::ListenerUpstreamDenied(_) => RequestStatus::Failed,
+        }
+    }
+
+    const fn abort_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::ShuttingDown {
+                queued: Some(queued),
+            } => Some(queued.reason.abort_reason()),
+            Self::ConfigSnapshot(_)
+            | Self::GenerationQueueFull { .. }
+            | Self::GenerationQueueTimeout { .. }
+            | Self::ControlPlaneLimitExceeded { .. }
+            | Self::ShuttingDown { queued: None }
+            | Self::ListenerUpstreamDenied(_) => None,
         }
     }
 
@@ -827,7 +910,7 @@ impl AdmissionFailure {
             ),
             Self::GenerationQueueTimeout { .. }
             | Self::ControlPlaneLimitExceeded { .. }
-            | Self::ShuttingDown => Some(ADMISSION_RETRY_AFTER_SECS.to_string()),
+            | Self::ShuttingDown { .. } => Some(ADMISSION_RETRY_AFTER_SECS.to_string()),
         }
     }
 
@@ -864,7 +947,23 @@ impl AdmissionFailure {
             Self::ConfigSnapshot(_)
             | Self::ListenerUpstreamDenied(_)
             | Self::ControlPlaneLimitExceeded { .. } => BTreeMap::new(),
-            Self::ShuttingDown => {
+            Self::ShuttingDown {
+                queued: Some(queued),
+            } => BTreeMap::from([
+                (
+                    String::from("admission_outcome"),
+                    queued.reason.admission_outcome().to_owned(),
+                ),
+                (
+                    String::from("queue_wait_ms"),
+                    queued.queue_wait_ms.to_string(),
+                ),
+                (
+                    String::from("generation_queue_timeout_ms"),
+                    queued.generation_queue_timeout_ms.to_string(),
+                ),
+            ]),
+            Self::ShuttingDown { queued: None } => {
                 BTreeMap::from([(String::from("admission_outcome"), String::from("shutdown"))])
             }
         }
@@ -1485,6 +1584,7 @@ fn render_metrics(
     let mut output = String::new();
     push_admission_metrics(&mut output, admission);
     push_request_metrics(&mut output, snapshot);
+    push_request_terminal_metrics(&mut output, snapshot);
     push_attempt_metrics(&mut output, snapshot);
     push_retry_and_error_metrics(&mut output, snapshot);
     push_malformed_response_metrics(&mut output, malformed_responses);
@@ -1565,6 +1665,27 @@ fn push_request_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnap
                 ("status", &row.status),
                 ("downstream_mode", &row.downstream_mode),
                 ("upstream_mode", &row.upstream_mode),
+                ("http_status_class", &row.http_status_class),
+            ],
+            row.count,
+        );
+    }
+}
+
+fn push_request_terminal_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_current_retained_request_terminals",
+        "Currently retained proxy request rows by bounded terminal reason.",
+        "gauge",
+    );
+    for row in &snapshot.request_terminal_counts {
+        push_metric_line(
+            output,
+            "llm_guard_proxy_current_retained_request_terminals",
+            &[
+                ("status", &row.status),
+                ("terminal_reason", &row.terminal_reason),
                 ("http_status_class", &row.http_status_class),
             ],
             row.count,
@@ -1909,9 +2030,11 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
                 request_id,
                 started_at_unix_ms,
                 finished_at_unix_ms,
+                status: RequestStatus::Failed,
                 http_status: error.status().as_u16(),
                 error_type,
                 error_reason,
+                abort_reason: None,
                 request_metadata,
                 attempts: Vec::new(),
             },
@@ -1976,9 +2099,11 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
                     request_id,
                     started_at_unix_ms,
                     finished_at_unix_ms,
+                    status: error.request_status(),
                     http_status: error.status().as_u16(),
                     error_type,
                     error_reason,
+                    abort_reason: error.abort_reason(),
                     request_metadata,
                     attempts: error.attempt_records(),
                 },
@@ -2051,9 +2176,11 @@ async fn admit_request(
                     request_id: request_id.clone(),
                     started_at_unix_ms,
                     finished_at_unix_ms: unix_time_millis(),
+                    status: RequestStatus::Failed,
                     http_status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                     error_type,
                     error_reason,
+                    abort_reason: None,
                     request_metadata: {
                         let mut metadata = request.pre_upstream_metadata(None);
                         add_listener_metadata(&mut metadata, &state.listener);
@@ -2176,9 +2303,11 @@ fn reject_admission(
             request_id: request_id.clone(),
             started_at_unix_ms,
             finished_at_unix_ms: unix_time_millis(),
+            status: error.request_status(),
             http_status: error.status().as_u16(),
             error_type,
             error_reason,
+            abort_reason: error.abort_reason(),
             request_metadata: {
                 let mut metadata = request.pre_upstream_metadata(shielding_enabled);
                 add_listener_metadata(&mut metadata, &state.listener);
@@ -7398,7 +7527,10 @@ impl ForwardedBodyObserver {
         let mut attempts = self.completed_attempt_records;
         let mut final_attempt = self.final_attempt;
         let paired_shadow_runtime = self.paired_shadow_runtime;
-        if matches!(completion, BodyCompletion::DownstreamDropped) {
+        if matches!(
+            completion,
+            BodyCompletion::DownstreamDropped | BodyCompletion::Shutdown
+        ) {
             if let Some(progress) = &self.attempt_progress {
                 let progress = shielded_attempt_progress(progress);
                 attempts = progress.completed_attempt_records.clone();
@@ -8884,9 +9016,11 @@ struct FailedRequestRecord {
     request_id: RequestId,
     started_at_unix_ms: u64,
     finished_at_unix_ms: u64,
+    status: RequestStatus,
     http_status: u16,
     error_type: &'static str,
     error_reason: String,
+    abort_reason: Option<&'static str>,
     request_metadata: BTreeMap<String, String>,
     attempts: Vec<AttemptRecord>,
 }
@@ -8896,12 +9030,13 @@ fn record_queued_admission_cancel(record: QueuedAdmissionCancelRecord) {
     let finished_at_unix_ms = unix_time_millis();
     let queue_wait_ms = duration_millis_u64(record.queued_at.elapsed());
     let error_type = "proxy_generation_queue_cancelled";
-    let abort_reason = "downstream_disconnected_while_queued";
+    let reason = QueueCancellationReason::DownstreamDisconnected;
+    let abort_reason = reason.abort_reason();
     let mut request_metadata = context.request_metadata;
     request_metadata.extend(BTreeMap::from([
         (
             String::from("admission_outcome"),
-            String::from("queue_cancelled"),
+            reason.admission_outcome().to_owned(),
         ),
         (String::from("queue_wait_ms"), queue_wait_ms.to_string()),
         (
@@ -8948,10 +9083,10 @@ fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecor
         upstream_mode: UpstreamMode::NotApplicable,
         model_id: None,
         input_fingerprint: None,
-        status: RequestStatus::Failed,
+        status: failure.status,
         http_status: Some(failure.http_status),
         error_reason: Some(format!("{}: {}", failure.error_type, failure.error_reason)),
-        abort_reason: None,
+        abort_reason: failure.abort_reason.map(str::to_owned),
         request_metadata: failure.request_metadata,
         response_metadata,
         raw_payloads: RawPayloads::default(),
@@ -10290,6 +10425,46 @@ impl ProxyError {
             Self::ContextBudgetExceeded { .. } => "invalid_request_error",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
             Self::UpstreamBody { .. } => "upstream_body_error",
+        }
+    }
+
+    const fn request_status(&self) -> RequestStatus {
+        match self {
+            Self::Admission { failure, .. } => failure.request_status(),
+            Self::RequestBody { .. }
+            | Self::ConfigSnapshot { .. }
+            | Self::InvalidUpstreamUrl { .. }
+            | Self::InvalidRequestPath(_)
+            | Self::InvalidMethod { .. }
+            | Self::ListenerUpstreamDenied { .. }
+            | Self::UpstreamTransport { .. }
+            | Self::UpstreamBody { .. }
+            | Self::ContextBudgetExceeded { .. } => RequestStatus::Failed,
+            #[cfg(feature = "guard")]
+            Self::GuardBlocked { .. }
+            | Self::VirtualKeyUnauthorized { .. }
+            | Self::BudgetExceeded { .. }
+            | Self::BudgetStoreFailure { .. } => RequestStatus::Failed,
+        }
+    }
+
+    const fn abort_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Admission { failure, .. } => failure.abort_reason(),
+            Self::RequestBody { .. }
+            | Self::ConfigSnapshot { .. }
+            | Self::InvalidUpstreamUrl { .. }
+            | Self::InvalidRequestPath(_)
+            | Self::InvalidMethod { .. }
+            | Self::ListenerUpstreamDenied { .. }
+            | Self::UpstreamTransport { .. }
+            | Self::UpstreamBody { .. }
+            | Self::ContextBudgetExceeded { .. } => None,
+            #[cfg(feature = "guard")]
+            Self::GuardBlocked { .. }
+            | Self::VirtualKeyUnauthorized { .. }
+            | Self::BudgetExceeded { .. }
+            | Self::BudgetStoreFailure { .. } => None,
         }
     }
 

@@ -80,8 +80,9 @@ pub use observability::{
     DownstreamMode, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram, LiveRequestEntry,
     LiveRequestRegistry, LiveRequestState, LiveRequestSummary, ObservabilityError,
     ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloadChunk, RawPayloads, RequestId,
-    RequestMetricCount, RequestRecord, RequestStatus, RetentionPruningStats, RetentionUsage,
-    StoreWrite, TimelineEvent, UpstreamErrorMetricCount, UpstreamMode,
+    RequestMetricCount, RequestRecord, RequestStatus, RequestTerminalMetricCount,
+    RetentionPruningStats, RetentionUsage, StoreWrite, TimelineEvent, UpstreamErrorMetricCount,
+    UpstreamMode,
 };
 #[cfg(feature = "guard")]
 pub use profile::{
