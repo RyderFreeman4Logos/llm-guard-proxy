@@ -25,6 +25,17 @@ const LOOP_FEATURE_VALUE_MAX_CHARS: usize = 96;
 const FNV64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+/// Minimum occurrences of one tool fingerprint within the window before a
+/// [`LoopReasonCode::ToolFingerprintRepeat`] signal fires.
+const TOOL_FINGERPRINT_REPEAT_THRESHOLD: u32 = 3;
+/// Minimum occurrences of one tool output hash before a
+/// [`LoopReasonCode::ToolOutputBlockedEcho`] signal fires.
+const TOOL_OUTPUT_BLOCKED_THRESHOLD: u32 = 2;
+/// Length of a two-fingerprint alternation cycle (A-B-A-B).
+const TOOL_ALTERNATION_CYCLE_LENGTH: usize = 4;
+/// Risk score assigned to a completed two-fingerprint alternation cycle.
+const TOOL_ALTERNATION_RISK: f64 = 0.75;
+
 /// Independent stream channel observed by the loop detector.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamChannel {
@@ -127,6 +138,12 @@ pub enum LoopReasonCode {
     ToolFingerprintRepeated,
     /// Tool arguments did not parse as complete JSON at completion time.
     ToolArgumentsInvalidJson,
+    /// A single tool fingerprint repeated past its window threshold.
+    ToolFingerprintRepeat,
+    /// Two distinct tool fingerprints alternating in a fixed cycle.
+    ToolAlternationCycle,
+    /// The same tool output hash repeated (blocked/unchanged output).
+    ToolOutputBlockedEcho,
 }
 
 impl LoopReasonCode {
@@ -143,6 +160,9 @@ impl LoopReasonCode {
             Self::ToolArgumentsRepeatedJson => "tool_arguments_repeated_json",
             Self::ToolFingerprintRepeated => "tool_fingerprint_repeated",
             Self::ToolArgumentsInvalidJson => "tool_arguments_invalid_json",
+            Self::ToolFingerprintRepeat => "tool_fingerprint_repeat",
+            Self::ToolAlternationCycle => "tool_alternation_cycle",
+            Self::ToolOutputBlockedEcho => "tool_output_blocked_echo",
         }
     }
 
@@ -244,6 +264,316 @@ pub struct ToolCallFingerprintInput<'a> {
     pub tool_name: &'a str,
     /// Completed tool arguments. The detector stores only hashes and parse status.
     pub arguments: &'a str,
+}
+
+/// Normalized fingerprint of one completed tool call.
+///
+/// The `canonical_args_hash` folds file paths, line ranges, and similar
+/// volatile fields so that semantically equivalent calls collapse to the same
+/// fingerprint. The `fingerprint_hash` combines the tool name with the
+/// canonical argument hash so two different tools sharing the same arguments
+/// still produce distinct fingerprints.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ToolFingerprint {
+    /// Tool or function name. Stored for diagnostics only.
+    pub tool_name: String,
+    /// Hash of tool arguments after canonicalization (file paths/ranges normalized).
+    pub canonical_args_hash: u64,
+    /// Hash of `tool_name + canonical_args_hash`.
+    pub fingerprint_hash: u64,
+}
+
+impl ToolFingerprint {
+    /// Builds a fingerprint from a tool name and raw argument JSON, normalizing
+    /// paths and ranges before hashing. If `arguments` is not valid JSON the
+    /// raw bytes are hashed directly so the call is still observable.
+    #[must_use]
+    pub fn from_call(tool_name: &str, arguments: &str) -> Self {
+        let canonical_args_hash = canonical_tool_arguments_hash(arguments);
+        let fingerprint_hash =
+            stable_hash_u64s([stable_hash(tool_name.as_bytes()), canonical_args_hash]);
+        Self {
+            tool_name: tool_name.to_owned(),
+            canonical_args_hash,
+            fingerprint_hash,
+        }
+    }
+
+    /// Builds a fingerprint from pre-computed hashes. The `tool_name` is stored
+    /// verbatim for diagnostics.
+    #[must_use]
+    pub fn from_hashes(tool_name: String, canonical_args_hash: u64, fingerprint_hash: u64) -> Self {
+        Self {
+            tool_name,
+            canonical_args_hash,
+            fingerprint_hash,
+        }
+    }
+}
+
+/// One tool-loop detection signal emitted by [`ToolLoopDetector`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ToolLoopSignal {
+    /// Stable reason code identifying which detector fired.
+    pub reason_code: LoopReasonCode,
+    /// Fingerprint hash that triggered the signal, or `0` for output-based
+    /// signals that are not tied to a single fingerprint.
+    pub fingerprint_hash: u64,
+    /// How many times the fingerprint/output repeated within the window.
+    pub repeat_count: u32,
+    /// Risk score in the range `0.0..=1.0`.
+    pub risk: f64,
+}
+
+/// Dedicated detector for semantic tool loops: repeated fingerprints,
+/// alternating two-tool cycles, and blocked (unchanged) tool output.
+///
+/// This complements [`ChannelizedLoopDetector`], which already tracks
+/// hash-based tool-argument repetition. [`ToolLoopDetector`] catches semantic
+/// loops such as the same file range read repeatedly, the same command rerun,
+/// or two tools alternating in a fixed cycle (A-B-A-B).
+#[derive(Debug)]
+pub struct ToolLoopDetector {
+    max_history: usize,
+    fingerprints: VecDeque<u64>,
+    fingerprint_counts: BTreeMap<u64, u32>,
+    output_counts: BTreeMap<u64, u32>,
+    signals: Vec<ToolLoopSignal>,
+}
+
+impl ToolLoopDetector {
+    /// Creates a detector that retains at most `max_history` recent
+    /// fingerprints for alternation detection.
+    #[must_use]
+    pub fn new(max_history: usize) -> Self {
+        Self {
+            max_history,
+            fingerprints: VecDeque::new(),
+            fingerprint_counts: BTreeMap::new(),
+            output_counts: BTreeMap::new(),
+            signals: Vec::new(),
+        }
+    }
+
+    /// Observes one completed tool-call fingerprint and returns any newly
+    /// emitted signals.
+    #[allow(clippy::needless_pass_by_value)]
+    pub fn observe_fingerprint(&mut self, fingerprint: ToolFingerprint) -> Vec<ToolLoopSignal> {
+        self.push_fingerprint(fingerprint.fingerprint_hash);
+
+        let mut emitted = Vec::new();
+
+        if let Some(count) = self
+            .fingerprint_counts
+            .get(&fingerprint.fingerprint_hash)
+            .copied()
+        {
+            if count >= TOOL_FINGERPRINT_REPEAT_THRESHOLD {
+                let risk = fingerprint_repeat_risk(count);
+                let signal = ToolLoopSignal {
+                    reason_code: LoopReasonCode::ToolFingerprintRepeat,
+                    fingerprint_hash: fingerprint.fingerprint_hash,
+                    repeat_count: count,
+                    risk,
+                };
+                emitted.push(signal.clone());
+                self.signals.push(signal);
+            }
+        }
+
+        if let Some(signal) = self.detect_alternation() {
+            emitted.push(signal.clone());
+            self.signals.push(signal);
+        }
+
+        emitted
+    }
+
+    /// Observes one tool output hash and returns a signal when the same output
+    /// repeats (blocked/unchanged output).
+    pub fn observe_tool_output(&mut self, output_hash: u64) -> Vec<ToolLoopSignal> {
+        let count = self
+            .output_counts
+            .entry(output_hash)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+
+        if *count >= TOOL_OUTPUT_BLOCKED_THRESHOLD {
+            let risk = output_blocked_risk(*count);
+            let signal = ToolLoopSignal {
+                reason_code: LoopReasonCode::ToolOutputBlockedEcho,
+                fingerprint_hash: 0,
+                repeat_count: *count,
+                risk,
+            };
+            self.signals.push(signal.clone());
+            return vec![signal];
+        }
+
+        Vec::new()
+    }
+
+    /// Returns all accumulated signals.
+    #[must_use]
+    pub fn signals(&self) -> &[ToolLoopSignal] {
+        &self.signals
+    }
+
+    fn push_fingerprint(&mut self, fingerprint_hash: u64) {
+        self.fingerprints.push_back(fingerprint_hash);
+        while self.fingerprints.len() > self.max_history {
+            if let Some(evicted) = self.fingerprints.pop_front() {
+                if let Some(count) = self.fingerprint_counts.get_mut(&evicted) {
+                    *count = count.saturating_sub(1);
+                    if *count == 0 {
+                        self.fingerprint_counts.remove(&evicted);
+                    }
+                }
+            }
+        }
+        self.fingerprint_counts
+            .entry(fingerprint_hash)
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+    }
+
+    fn detect_alternation(&self) -> Option<ToolLoopSignal> {
+        if self.fingerprints.len() < TOOL_ALTERNATION_CYCLE_LENGTH {
+            return None;
+        }
+        let n = self.fingerprints.len();
+        // Check the last 4 entries for an A-B-A-B pattern with A != B.
+        let first = self.fingerprints[n - 4];
+        let second = self.fingerprints[n - 3];
+        let third = self.fingerprints[n - 2];
+        let fourth = self.fingerprints[n - 1];
+        if first == third && second == fourth && first != second {
+            Some(ToolLoopSignal {
+                reason_code: LoopReasonCode::ToolAlternationCycle,
+                fingerprint_hash: first,
+                repeat_count: 2,
+                risk: TOOL_ALTERNATION_RISK,
+            })
+        } else {
+            None
+        }
+    }
+}
+
+fn fingerprint_repeat_risk(count: u32) -> f64 {
+    // 3 repeats -> 0.6, then +0.1 per extra repeat, capped at 1.0.
+    let extra = count.saturating_sub(TOOL_FINGERPRINT_REPEAT_THRESHOLD);
+    (0.6 + f64::from(extra) * 0.1).min(1.0)
+}
+
+fn output_blocked_risk(count: u32) -> f64 {
+    // 2 repeats -> 0.5, then +0.15 per extra repeat, capped at 1.0.
+    let extra = count.saturating_sub(TOOL_OUTPUT_BLOCKED_THRESHOLD);
+    (0.5 + f64::from(extra) * 0.15).min(1.0)
+}
+
+/// Computes a canonical hash of tool arguments, normalizing file paths, line
+/// ranges, and other volatile fields so semantically equivalent calls collapse
+/// to the same hash. Falls back to a raw byte hash if `arguments` is not valid
+/// JSON.
+fn canonical_tool_arguments_hash(arguments: &str) -> u64 {
+    let Ok(value) = serde_json::from_str::<Value>(arguments) else {
+        return stable_hash(arguments.as_bytes());
+    };
+    let mut canonical = String::new();
+    write_canonical_tool_json(&value, &mut canonical);
+    stable_hash(canonical.as_bytes())
+}
+
+/// Canonical JSON writer that additionally normalizes tool-specific volatile
+/// fields (paths, line ranges, offsets) so repeated reads of the same logical
+/// range collapse to identical hashes.
+fn write_canonical_tool_json(value: &Value, output: &mut String) {
+    match value {
+        Value::Null => output.push_str("null"),
+        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        Value::Number(number) => output.push_str(&number.to_string()),
+        Value::String(value) => {
+            let normalized = normalize_tool_argument_string(value);
+            output.push_str(
+                &serde_json::to_string(&normalized).unwrap_or_else(|_error| String::from("\"\"")),
+            );
+        }
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                write_canonical_tool_json(value, output);
+            }
+            output.push(']');
+        }
+        Value::Object(object) => {
+            output.push('{');
+            let mut entries = object.iter().collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.0.cmp(right.0));
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index > 0 {
+                    output.push(',');
+                }
+                output.push_str(
+                    &serde_json::to_string(key).unwrap_or_else(|_error| String::from("\"\"")),
+                );
+                output.push(':');
+                write_canonical_tool_json(value, output);
+            }
+            output.push('}');
+        }
+    }
+}
+
+/// Normalizes a tool argument string value by collapsing volatile path/range
+/// fragments. Absolute paths become `<path>`, line/column numbers become
+/// `<range>`.
+fn normalize_tool_argument_string(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // Absolute or relative filesystem paths containing separators.
+    if (trimmed.starts_with('/')
+        || trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with('~')
+        || trimmed.contains('\\'))
+        && !trimmed.contains(' ')
+    {
+        return String::from("<path>");
+    }
+
+    // Bare line/range patterns like "12", "12-34", "12:34", "L12-L34".
+    if is_line_range_pattern(trimmed) {
+        return String::from("<range>");
+    }
+
+    trimmed.to_owned()
+}
+
+/// Returns true when `value` looks like a line/column range token.
+fn is_line_range_pattern(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    // All characters must be digits or one of the range separators.
+    if !value
+        .chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '-' | ':' | ',' | 'L'))
+    {
+        return false;
+    }
+    // Must contain at least one digit and at least one separator or leading L.
+    value.chars().any(|c| c.is_ascii_digit())
+        && (value.contains('-')
+            || value.contains(':')
+            || value.contains(',')
+            || value.contains('L'))
 }
 
 /// Content-free detector signal.
@@ -2027,6 +2357,197 @@ mod tests {
         assert_eq!(
             signals[0].feature_summary.fields()["input_overlap_applied"],
             "true"
+        );
+    }
+
+    #[test]
+    fn tool_loop_detector_same_fingerprint_repeated_triggers_signal() {
+        let mut detector = ToolLoopDetector::new(16);
+        let fp = ToolFingerprint::from_hashes(String::from("read"), 10, 100);
+
+        let s1 = detector.observe_fingerprint(fp.clone());
+        let s2 = detector.observe_fingerprint(fp.clone());
+        let s3 = detector.observe_fingerprint(fp.clone());
+
+        assert!(s1.is_empty());
+        assert!(s2.is_empty());
+        assert_eq!(s3.len(), 1);
+        assert_eq!(s3[0].reason_code, LoopReasonCode::ToolFingerprintRepeat);
+        assert_eq!(s3[0].fingerprint_hash, 100);
+        assert_eq!(s3[0].repeat_count, 3);
+        assert!(s3[0].risk >= 0.6);
+    }
+
+    #[test]
+    fn tool_loop_detector_different_fingerprints_do_not_trigger_repeat() {
+        let mut detector = ToolLoopDetector::new(16);
+        let a = ToolFingerprint::from_hashes(String::from("read"), 1, 11);
+        let b = ToolFingerprint::from_hashes(String::from("read"), 2, 22);
+        let c = ToolFingerprint::from_hashes(String::from("read"), 3, 33);
+
+        let signals_a = detector.observe_fingerprint(a);
+        let signals_b = detector.observe_fingerprint(b);
+        let signals_c = detector.observe_fingerprint(c);
+
+        let all = [signals_a, signals_b, signals_c].concat();
+        assert!(
+            !all.iter()
+                .any(|s| s.reason_code == LoopReasonCode::ToolFingerprintRepeat),
+            "distinct fingerprints must not trigger repeat signal"
+        );
+    }
+
+    #[test]
+    fn tool_loop_detector_alternation_pattern_detected() {
+        let mut detector = ToolLoopDetector::new(16);
+        let a = ToolFingerprint::from_hashes(String::from("read"), 1, 11);
+        let b = ToolFingerprint::from_hashes(String::from("grep"), 2, 22);
+
+        detector.observe_fingerprint(a.clone());
+        detector.observe_fingerprint(b.clone());
+        detector.observe_fingerprint(a.clone());
+        let signals = detector.observe_fingerprint(b.clone());
+
+        assert!(
+            signals
+                .iter()
+                .any(|s| s.reason_code == LoopReasonCode::ToolAlternationCycle),
+            "A-B-A-B must trigger alternation signal"
+        );
+    }
+
+    #[test]
+    fn tool_loop_detector_no_alternation_for_aaaa() {
+        let mut detector = ToolLoopDetector::new(16);
+        let a = ToolFingerprint::from_hashes(String::from("read"), 1, 11);
+
+        detector.observe_fingerprint(a.clone());
+        detector.observe_fingerprint(a.clone());
+        let signals = detector.observe_fingerprint(a.clone());
+        detector.observe_fingerprint(a.clone());
+
+        assert!(
+            !signals
+                .iter()
+                .any(|s| s.reason_code == LoopReasonCode::ToolAlternationCycle),
+            "A-A-A must not trigger alternation"
+        );
+    }
+
+    #[test]
+    fn tool_loop_detector_blocked_output_echo_detected() {
+        let mut detector = ToolLoopDetector::new(16);
+        let output_hash = 4242_u64;
+
+        let first = detector.observe_tool_output(output_hash);
+        let second = detector.observe_tool_output(output_hash);
+
+        assert!(first.is_empty());
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].reason_code, LoopReasonCode::ToolOutputBlockedEcho);
+        assert_eq!(second[0].repeat_count, 2);
+        assert!(second[0].risk >= 0.5);
+    }
+
+    #[test]
+    fn tool_loop_detector_different_outputs_do_not_trigger() {
+        let mut detector = ToolLoopDetector::new(16);
+
+        let s1 = detector.observe_tool_output(1);
+        let s2 = detector.observe_tool_output(2);
+        let s3 = detector.observe_tool_output(3);
+
+        let all = [s1, s2, s3].concat();
+        assert!(
+            !all.iter()
+                .any(|s| s.reason_code == LoopReasonCode::ToolOutputBlockedEcho),
+            "distinct outputs must not trigger blocked signal"
+        );
+    }
+
+    #[test]
+    fn tool_loop_detector_history_is_bounded() {
+        let mut detector = ToolLoopDetector::new(4);
+
+        // Push 6 distinct fingerprints; only the last 4 should remain.
+        for i in 1..=6_u64 {
+            let fp = ToolFingerprint::from_hashes(String::from("t"), i, i * 10);
+            detector.observe_fingerprint(fp);
+        }
+
+        // The fingerprint hash 10 (i=1) was evicted; re-observing it should
+        // count as 1, not 2, so it must not trigger a repeat signal.
+        let fp_reobserved = ToolFingerprint::from_hashes(String::from("t"), 1, 10);
+        let signals = detector.observe_fingerprint(fp_reobserved);
+        assert!(
+            !signals
+                .iter()
+                .any(|s| s.reason_code == LoopReasonCode::ToolFingerprintRepeat),
+            "evicted fingerprint must not carry over its count"
+        );
+    }
+
+    #[test]
+    fn tool_loop_detector_signals_accumulates() {
+        let mut detector = ToolLoopDetector::new(16);
+        let fp = ToolFingerprint::from_hashes(String::from("read"), 10, 100);
+
+        for _ in 0..3 {
+            detector.observe_fingerprint(fp.clone());
+        }
+
+        assert_eq!(detector.signals().len(), 1);
+        assert_eq!(
+            detector.signals()[0].reason_code,
+            LoopReasonCode::ToolFingerprintRepeat
+        );
+    }
+
+    #[test]
+    fn tool_fingerprint_from_call_normalizes_paths() {
+        // Two reads of different absolute paths should collapse to the same
+        // canonical hash after path normalization.
+        let a = ToolFingerprint::from_call("read_file", r#"{"path":"/home/user/src/main.rs"}"#);
+        let b = ToolFingerprint::from_call("read_file", r#"{"path":"/tmp/work/src/main.rs"}"#);
+
+        assert_eq!(
+            a.canonical_args_hash, b.canonical_args_hash,
+            "paths should normalize to the same canonical hash"
+        );
+        assert_eq!(a.fingerprint_hash, b.fingerprint_hash);
+    }
+
+    #[test]
+    fn tool_fingerprint_from_call_distinct_tool_names_diverge() {
+        let a = ToolFingerprint::from_call("read", r#"{"path":"/x.rs"}"#);
+        let b = ToolFingerprint::from_call("write", r#"{"path":"/x.rs"}"#);
+
+        assert_ne!(
+            a.fingerprint_hash, b.fingerprint_hash,
+            "different tool names must produce different fingerprints"
+        );
+    }
+
+    #[test]
+    fn tool_fingerprint_from_call_invalid_json_still_hashes() {
+        let fp = ToolFingerprint::from_call("shell", "not valid json {");
+        // Should still produce a deterministic non-zero hash.
+        assert_ne!(fp.canonical_args_hash, 0);
+    }
+
+    #[test]
+    fn new_loop_reason_codes_have_stable_labels() {
+        assert_eq!(
+            LoopReasonCode::ToolFingerprintRepeat.as_str(),
+            "tool_fingerprint_repeat"
+        );
+        assert_eq!(
+            LoopReasonCode::ToolAlternationCycle.as_str(),
+            "tool_alternation_cycle"
+        );
+        assert_eq!(
+            LoopReasonCode::ToolOutputBlockedEcho.as_str(),
+            "tool_output_blocked_echo"
         );
     }
 
