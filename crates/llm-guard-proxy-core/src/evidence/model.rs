@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde::Serialize;
+
 use crate::{AttemptId, RawPayloads, RequestId};
 
 /// Role of an upstream attempt inside one correlated evidence group.
@@ -199,4 +201,97 @@ pub struct EvidencePruningStats {
     pub pruned_chunks: u64,
     /// Last pruning time in Unix milliseconds, if pruning has happened.
     pub last_pruned_at_unix_ms: Option<u64>,
+}
+
+/// Stable raw artifact kind labels used by paired comparison exports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EvidenceRawArtifactKind {
+    /// Raw prompt/request body.
+    Input,
+    /// Raw model answer/output.
+    Output,
+    /// Raw model reasoning payload.
+    Reasoning,
+    /// Raw tool-call payload.
+    ToolCalls,
+}
+
+impl EvidenceRawArtifactKind {
+    /// Returns the stable storage label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+            Self::Reasoning => "reasoning",
+            Self::ToolCalls => "tool_calls",
+        }
+    }
+}
+
+/// Evidence database capability status for CLI diagnostics.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct EvidenceDatabaseStatus {
+    /// Whether the database file exists.
+    pub exists: bool,
+    /// `SQLite` `user_version`, when readable.
+    pub schema_version: Option<i64>,
+    /// Whether raw paired comparison tables and legacy raw columns are present.
+    pub supports_raw_paired_comparison: bool,
+    /// Whether the legacy raw columns exist on evidence attempts.
+    pub has_attempt_raw_columns: bool,
+    /// Whether the raw artifact metadata table exists.
+    pub has_raw_artifact_table: bool,
+}
+
+/// Count of raw artifact rows for one role/variant/kind tuple.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EvidenceSummaryRow {
+    /// Evidence attempt role.
+    pub role: String,
+    /// Shadow variant name, or `primary` when not a shadow comparison variant.
+    pub variant_name: String,
+    /// Artifact kind.
+    pub artifact_kind: String,
+    /// Number of artifact metadata rows.
+    pub artifact_count: u64,
+    /// Number of rows that still retain raw content.
+    pub content_present_count: u64,
+    /// Total currently retained content bytes.
+    pub bytes_stored: u64,
+}
+
+/// One exported raw artifact for a paired-comparison variant.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EvidenceExportArtifact {
+    /// Attempt id that produced this artifact.
+    pub attempt_id: String,
+    /// Evidence attempt role.
+    pub role: String,
+    /// Redacted and possibly truncated artifact content.
+    pub content: String,
+    /// Original byte length before truncation.
+    pub bytes_original: u64,
+    /// Stored byte length after truncation.
+    pub bytes_stored: u64,
+    /// Whether the stored content was truncated.
+    pub truncated: bool,
+    /// Whether secret redaction changed the content.
+    pub redacted: bool,
+    /// `SHA-256` hash of stored content for deduplication.
+    pub sha256: String,
+}
+
+/// One exported pair row grouped by request and artifact kind.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct EvidenceExportPair {
+    /// Evidence group id.
+    pub group_id: String,
+    /// Proxy request id.
+    pub request_id: String,
+    /// Artifact kind shared by every variant in this row.
+    pub artifact_kind: String,
+    /// Artifact payloads keyed by configured variant name.
+    pub variants: BTreeMap<String, EvidenceExportArtifact>,
 }

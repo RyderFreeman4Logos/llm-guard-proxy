@@ -59,6 +59,7 @@ enum Section {
     ObservabilityRetention,
     Evidence,
     EvidenceShadow,
+    EvidenceShadowPairedComparison,
     Thinking,
     LoopGuard,
     Retry,
@@ -280,6 +281,7 @@ fn parse_section(
         "observability.retention" => Ok(Section::ObservabilityRetention),
         "evidence" => Ok(Section::Evidence),
         "evidence.shadow" => Ok(Section::EvidenceShadow),
+        "evidence.shadow.paired_comparison" => Ok(Section::EvidenceShadowPairedComparison),
         "thinking" => Ok(Section::Thinking),
         "loop_guard" => Ok(Section::LoopGuard),
         "retry" => Ok(Section::Retry),
@@ -388,6 +390,12 @@ fn assign_value(
         Section::EvidenceShadow => {
             assign_evidence_shadow(&mut config.evidence.shadow, key, value, line_number)
         }
+        Section::EvidenceShadowPairedComparison => assign_evidence_paired_comparison(
+            &mut config.evidence.shadow.paired_comparison,
+            key,
+            value,
+            line_number,
+        ),
         Section::Thinking => assign_thinking(&mut config.thinking, key, value, line_number),
         Section::LoopGuard => assign_loop_guard(&mut config.loop_guard, key, value, line_number),
         Section::Retry => assign_retry(&mut config.retry, key, value, line_number),
@@ -1148,9 +1156,92 @@ fn assign_evidence_shadow(
             )?;
         }
         "compare_attempts" => {
-            config.compare_attempts = parse_shadow_compare_attempts(value, line_number)?;
+            config.compare_attempts = parse_shadow_compare_attempts(
+                value,
+                line_number,
+                "evidence.shadow.compare_attempts",
+            )?;
         }
         _ => return unknown_key("evidence.shadow", key, line_number),
+    }
+    Ok(())
+}
+
+fn assign_evidence_paired_comparison(
+    config: &mut super::EvidencePairedComparisonConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "variants" => {
+            config.variants = parse_shadow_compare_attempts(
+                value,
+                line_number,
+                "evidence.shadow.paired_comparison.variants",
+            )?;
+        }
+        "include_raw_input" => config.include_raw_input = parse_bool(value, line_number)?,
+        "include_raw_output" => config.include_raw_output = parse_bool(value, line_number)?,
+        "include_raw_reasoning" => config.include_raw_reasoning = parse_bool(value, line_number)?,
+        "sample_rate" => {
+            let rate = parse_f64(
+                value,
+                line_number,
+                "evidence.shadow.paired_comparison.sample_rate",
+            )?;
+            if !(0.0..=1.0).contains(&rate) || !rate.is_finite() {
+                return Err(ConfigParseError::new(
+                    line_number,
+                    "validation failed for evidence.shadow.paired_comparison.sample_rate: must be a finite number between 0.0 and 1.0",
+                ));
+            }
+            config.sample_rate = rate;
+        }
+        "max_raw_input_bytes" => {
+            config.max_raw_input_bytes = parse_u64(
+                value,
+                line_number,
+                "evidence.shadow.paired_comparison.max_raw_input_bytes",
+            )?;
+        }
+        "max_raw_output_bytes" => {
+            config.max_raw_output_bytes = parse_u64(
+                value,
+                line_number,
+                "evidence.shadow.paired_comparison.max_raw_output_bytes",
+            )?;
+        }
+        "max_raw_reasoning_bytes" => {
+            config.max_raw_reasoning_bytes = parse_u64(
+                value,
+                line_number,
+                "evidence.shadow.paired_comparison.max_raw_reasoning_bytes",
+            )?;
+        }
+        "max_retention_records" => {
+            config.max_retention_records = parse_u64(
+                value,
+                line_number,
+                "evidence.shadow.paired_comparison.max_retention_records",
+            )?;
+        }
+        "max_retention_bytes" => {
+            config.max_retention_bytes = parse_u64(
+                value,
+                line_number,
+                "evidence.shadow.paired_comparison.max_retention_bytes",
+            )?;
+        }
+        "retention_days" => {
+            config.retention_days = parse_u64(
+                value,
+                line_number,
+                "evidence.shadow.paired_comparison.retention_days",
+            )?;
+        }
+        _ => return unknown_key("evidence.shadow.paired_comparison", key, line_number),
     }
     Ok(())
 }
@@ -1158,16 +1249,18 @@ fn assign_evidence_shadow(
 fn parse_shadow_compare_attempts(
     value: &str,
     line_number: usize,
+    field: &'static str,
 ) -> Result<Vec<ShadowComparisonAttempt>, ConfigParseError> {
     parse_string_array(value, line_number)?
         .into_iter()
-        .map(|value| parse_shadow_compare_attempt(&value, line_number))
+        .map(|value| parse_shadow_compare_attempt(&value, line_number, field))
         .collect()
 }
 
 fn parse_shadow_compare_attempt(
     value: &str,
     line_number: usize,
+    field: &'static str,
 ) -> Result<ShadowComparisonAttempt, ConfigParseError> {
     match value.trim() {
         "max-thinking" => Ok(ShadowComparisonAttempt::MaxThinking),
@@ -1177,7 +1270,7 @@ fn parse_shadow_compare_attempt(
         other => Err(ConfigParseError::new(
             line_number,
             format!(
-                "invalid evidence.shadow.compare_attempts entry {other:?}; expected \"max-thinking\", \"bounded-thinking\", \"no-thinking\", or \"cot-salvage\""
+                "invalid {field} entry {other:?}; expected \"max-thinking\", \"bounded-thinking\", \"no-thinking\", or \"cot-salvage\""
             ),
         )),
     }

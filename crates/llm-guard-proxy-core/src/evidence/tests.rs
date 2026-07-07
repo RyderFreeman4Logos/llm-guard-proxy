@@ -12,7 +12,7 @@ use rusqlite::Connection;
 
 use super::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord,
-    EvidenceStore, EvidenceStoreWrite, ShadowSkipReason,
+    EvidenceRawArtifactKind, EvidenceStore, EvidenceStoreWrite, ShadowSkipReason,
 };
 use crate::{AttemptId, ConfigManager, RawPayloadChunk, RawPayloads, RequestId, RequestStatus};
 
@@ -100,6 +100,114 @@ fn content_free_evidence_records_correlated_attempts_without_raw_payloads() {
         "SELECT COUNT(*) FROM evidence_attempts WHERE raw_input IS NOT NULL OR raw_output IS NOT NULL OR raw_reasoning IS NOT NULL OR raw_tool_calls IS NOT NULL",
     );
     assert_eq!(raw_count, 0);
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM evidence_raw_artifacts"),
+        0
+    );
+}
+
+#[test]
+fn paired_raw_artifacts_record_input_output_without_reasoning() {
+    let fixture = EvidenceFixture::new("paired-raw-artifacts");
+    let manager = fixture.manager_with_extra(
+        true,
+        false,
+        false,
+        100,
+        None,
+        "
+[evidence.shadow.paired_comparison]
+enabled = true
+include_raw_input = true
+include_raw_output = true
+include_raw_reasoning = false
+sample_rate = 1.0
+max_raw_input_bytes = 8
+max_raw_output_bytes = 7
+max_raw_reasoning_bytes = 8
+",
+    );
+    let store = EvidenceStore::open(manager.handle());
+    let group_id = "group-paired-raw";
+    let mut max_thinking = paired_shadow_attempt(group_id, "max-thinking");
+    max_thinking.raw_payloads = RawPayloads {
+        input: Some(String::from("same-prompt")),
+        output: Some(String::from("max answer")),
+        reasoning: Some(String::from("max reasoning should not persist")),
+        tool_calls: None,
+        chunks: Vec::new(),
+    };
+    let mut no_thinking = paired_shadow_attempt(group_id, "no-thinking");
+    no_thinking.raw_payloads = RawPayloads {
+        input: Some(String::from("same-prompt")),
+        output: Some(String::from("no answer")),
+        reasoning: Some(String::from("no reasoning should not persist")),
+        tool_calls: None,
+        chunks: Vec::new(),
+    };
+
+    store
+        .record_group(&group_record(group_id, 1_000), &[max_thinking, no_thinking])
+        .expect("paired raw evidence should write");
+
+    let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+    let rows = read_raw_artifacts(&connection);
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.variant_name == "max-thinking")
+            .count(),
+        2
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.variant_name == "no-thinking")
+            .count(),
+        2
+    );
+    assert!(rows.iter().all(|row| row.artifact_kind != "reasoning"));
+    assert!(
+        rows.iter()
+            .filter(|row| row.artifact_kind == "input")
+            .all(|row| row.content_text == "same-pro" && row.truncated == 1)
+    );
+    assert!(
+        rows.iter()
+            .filter(|row| row.artifact_kind == "output")
+            .all(|row| row.bytes_stored <= 7 && row.sha256.len() == 64)
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE raw_input IS NOT NULL AND raw_output IS NOT NULL AND raw_reasoning IS NULL",
+        ),
+        2
+    );
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM evidence_chunks"),
+        4
+    );
+    let status =
+        EvidenceStore::database_status(&fixture.sqlite_path).expect("database status should read");
+    assert!(status.supports_raw_paired_comparison);
+    let summary = EvidenceStore::summary(&fixture.sqlite_path).expect("summary should read");
+    assert_eq!(summary.len(), 4);
+    let pairs = EvidenceStore::export_pairs(
+        &fixture.sqlite_path,
+        &[String::from("max-thinking"), String::from("no-thinking")],
+        &[
+            EvidenceRawArtifactKind::Input,
+            EvidenceRawArtifactKind::Output,
+        ],
+    )
+    .expect("paired export should read");
+    assert_eq!(pairs.len(), 2);
+    assert!(
+        pairs
+            .iter()
+            .all(|pair| pair.variants.contains_key("max-thinking")
+                && pair.variants.contains_key("no-thinking"))
+    );
 }
 
 #[test]
@@ -255,6 +363,91 @@ fn retention_prunes_complete_oldest_groups_and_chunks() {
     );
 }
 
+#[test]
+fn retention_prunes_expired_raw_artifact_content_without_deleting_metadata() {
+    let fixture = EvidenceFixture::new("raw-retention");
+    let manager = fixture.manager_with_extra(
+        true,
+        false,
+        false,
+        100,
+        None,
+        "
+[evidence.shadow.paired_comparison]
+enabled = true
+include_raw_input = true
+include_raw_output = false
+include_raw_reasoning = false
+sample_rate = 1.0
+max_retention_records = 100
+max_retention_bytes = 1000000
+retention_days = 1
+",
+    );
+    let store = EvidenceStore::open(manager.handle());
+    let mut first_attempt = paired_shadow_attempt("group-expired-raw-1", "max-thinking");
+    first_attempt.raw_payloads.input = Some(String::from("expired raw input"));
+    store
+        .record_group(
+            &group_record("group-expired-raw-1", 1_000),
+            &[first_attempt],
+        )
+        .expect("first raw evidence should write");
+    {
+        let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+        connection
+            .execute(
+                "UPDATE evidence_raw_artifacts SET created_at_unix_ms = 0",
+                [],
+            )
+            .expect("test should age raw artifacts");
+    }
+
+    let mut second_attempt = paired_shadow_attempt("group-expired-raw-2", "no-thinking");
+    second_attempt.raw_payloads.input = Some(String::from("fresh raw input"));
+    store
+        .record_group(
+            &group_record("group-expired-raw-2", 2_000),
+            &[second_attempt],
+        )
+        .expect("second raw evidence should write and prune expired raw content");
+
+    let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM evidence_groups"),
+        2
+    );
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM evidence_attempts"),
+        2
+    );
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM evidence_raw_artifacts"),
+        2
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_raw_artifacts WHERE content_text IS NOT NULL",
+        ),
+        1
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE group_id = 'group-expired-raw-1' AND raw_input IS NULL",
+        ),
+        1
+    );
+    assert_eq!(
+        count_rows(
+            &connection,
+            "SELECT COUNT(*) FROM evidence_attempts WHERE group_id = 'group-expired-raw-2' AND raw_input IS NOT NULL",
+        ),
+        1
+    );
+}
+
 fn read_chunks(connection: &Connection) -> Vec<(String, i64, String)> {
     let mut statement = connection
         .prepare(
@@ -349,6 +542,64 @@ fn attempt_record(
     }
 }
 
+fn paired_shadow_attempt(group_id: &str, variant_name: &str) -> EvidenceAttemptRecord {
+    let mut attempt = attempt_record(
+        group_id,
+        1,
+        EvidenceAttemptRole::ShadowContinued,
+        EvidenceAttemptStatus::Accepted,
+        false,
+    );
+    attempt.attempt_id = AttemptId::from_string(format!("attempt-{group_id}-{variant_name}"))
+        .expect("paired attempt id should build");
+    attempt.request_metadata.insert(
+        String::from("shadow_paired_comparison"),
+        String::from("true"),
+    );
+    attempt
+        .request_metadata
+        .insert(String::from("variant_name"), variant_name.to_owned());
+    attempt.request_metadata.insert(
+        String::from("shadow_compare_attempt"),
+        variant_name.to_owned(),
+    );
+    attempt
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RawArtifactRow {
+    variant_name: String,
+    artifact_kind: String,
+    content_text: String,
+    bytes_stored: i64,
+    truncated: i64,
+    sha256: String,
+}
+
+fn read_raw_artifacts(connection: &Connection) -> Vec<RawArtifactRow> {
+    let mut statement = connection
+        .prepare(
+            "SELECT COALESCE(variant_name, ''), artifact_kind, COALESCE(content_text, ''), \
+             bytes_stored, truncated, sha256 \
+             FROM evidence_raw_artifacts ORDER BY variant_name, artifact_kind",
+        )
+        .expect("raw artifact query should prepare");
+    statement
+        .query_map([], |row| {
+            Ok(RawArtifactRow {
+                variant_name: row.get(0)?,
+                artifact_kind: row.get(1)?,
+                content_text: row.get(2)?,
+                bytes_stored: row.get(3)?,
+                truncated: row.get(4)?,
+                sha256: row.get(5)?,
+            })
+        })
+        .expect("raw artifact query should execute")
+        .map(|row| row.expect("raw artifact row should decode"))
+        .collect()
+}
+
 fn evidence_attempt_roles(connection: &Connection) -> Vec<(String, i64, String)> {
     let mut statement = connection
         .prepare(
@@ -398,6 +649,25 @@ impl EvidenceFixture {
         max_records: u64,
         prune_to_records: Option<u64>,
     ) -> ConfigManager {
+        self.manager_with_extra(
+            evidence_enabled,
+            include_raw_payloads,
+            include_request_headers,
+            max_records,
+            prune_to_records,
+            "",
+        )
+    }
+
+    fn manager_with_extra(
+        &self,
+        evidence_enabled: bool,
+        include_raw_payloads: bool,
+        include_request_headers: bool,
+        max_records: u64,
+        prune_to_records: Option<u64>,
+        extra_config: &str,
+    ) -> ConfigManager {
         let prune_to_records_entry = prune_to_records
             .map(|value| format!("prune_to_records = {value}\n"))
             .unwrap_or_default();
@@ -415,9 +685,11 @@ max_bytes = {TEST_MAX_BYTES}
 prune_to_bytes = {TEST_PRUNE_TO_BYTES}
 max_records = {max_records}
 {prune_to_records_entry}
+{extra_config}
 "#,
                 sqlite_path = self.sqlite_path.display(),
                 blob_cache_dir = self.blob_cache_dir.display(),
+                extra_config = extra_config,
             ),
         )
         .expect("config should be written");
