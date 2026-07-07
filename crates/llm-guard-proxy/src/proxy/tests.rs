@@ -12832,6 +12832,10 @@ async fn shutdown_cancels_pre_response_upstream_work() {
         Ok((status, body)) => {
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
             assert!(
+                !body.is_empty(),
+                "pre-response shutdown 503 body should not be empty"
+            );
+            assert!(
                 body.contains("proxy_shutting_down"),
                 "pre-response shutdown response should identify cancellation: {body}"
             );

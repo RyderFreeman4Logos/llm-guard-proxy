@@ -8057,10 +8057,6 @@ impl Stream for ObservedBufferedBody {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if this.shutdown.poll_shutdown(cx).is_ready() {
-            this.record_once(&BodyCompletion::Shutdown);
-            return Poll::Ready(None);
-        }
         if let Some(body) = this.body.take() {
             let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
             this.bytes_seen = this.bytes_seen.saturating_add(body_len);
@@ -8068,6 +8064,11 @@ impl Stream for ObservedBufferedBody {
                 std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded);
             this.record_once(&completion);
             return Poll::Ready(Some(Ok(body)));
+        }
+
+        if this.shutdown.poll_shutdown(cx).is_ready() {
+            this.record_once(&BodyCompletion::Shutdown);
+            return Poll::Ready(None);
         }
 
         let completion =
