@@ -5780,7 +5780,7 @@ async fn run_shielded_attempts(
             Err(mut failure) => {
                 let next_retry_cause = failure.retry_cause;
                 let mut can_retry = should_retry_after_shielded_failure(&runtime, &failure);
-                let next_cot_salvage = if can_retry {
+                let next_cot_salvage = if can_retry && cot_salvage.is_none() {
                     cot_salvage_context_for_failure(&runtime, &failure)
                 } else {
                     None
