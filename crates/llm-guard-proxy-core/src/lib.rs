@@ -22,6 +22,7 @@ pub mod model_judge;
 mod observability;
 #[cfg(feature = "guard")]
 pub mod profile;
+pub mod replay;
 pub mod risk_combiner;
 mod settings;
 #[cfg(feature = "guard")]
@@ -85,6 +86,10 @@ pub use observability::{
 pub use profile::{
     BlockReason, DEFAULT_PROFILE_NAME, ProfileCheckResult, ProfileConfig, ProfileKind,
     ShieldedBuffering,
+};
+pub use replay::{
+    CalibrationResult, RecordDetectionResult, ReplayChannel, ReplayConfig, ReplayRecord,
+    ReplayRunner, SEVERITY_HARD, SEVERITY_MILD, SEVERITY_NONE, SourceCalibration, SseEvent,
 };
 pub use risk_combiner::{CombinedRisk, DetectorKind, DetectorSignal, RiskCombiner};
 #[cfg(feature = "param-override")]
