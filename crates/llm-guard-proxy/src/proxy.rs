@@ -80,6 +80,8 @@ const COT_SALVAGE_PREFIX_MAX_BYTES: usize = 4_096;
 const COT_SALVAGE_THINKING_BUDGET_TOKENS: u32 = 1_024;
 const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
 const PAIRED_SAMPLE_DENOMINATOR: u64 = 1_000_000;
+const SERVER_SHUTDOWN_ABORT_REASON: &str = "server_shutdown";
+const PROXY_SHUTTING_DOWN_ERROR_TYPE: &str = "proxy_shutting_down";
 #[cfg(feature = "guard")]
 const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
 
@@ -537,6 +539,17 @@ struct ShutdownSubscription {
 }
 
 impl ShutdownSubscription {
+    async fn cancelled(&mut self) {
+        if *self.receiver.borrow() {
+            return;
+        }
+        while self.receiver.changed().await.is_ok() {
+            if *self.receiver.borrow() {
+                return;
+            }
+        }
+    }
+
     fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         if *self.receiver.borrow() {
             return Poll::Ready(());
@@ -2553,9 +2566,10 @@ async fn read_body_and_admit_generation(
         request.shielding_enabled_hint,
     );
     add_listener_metadata(&mut pre_body_request_metadata, &state.listener);
-    let body = read_body_bytes(body, max_request_body_bytes)
-        .await
-        .map_err(|error| error.with_request_metadata(pre_body_request_metadata))?;
+    let body =
+        read_body_bytes_until_shutdown(body, max_request_body_bytes, state.shutdown.subscribe())
+            .await
+            .map_err(|error| error.with_request_metadata(pre_body_request_metadata))?;
     let mut body_read_request_metadata = base_request_metadata(
         request.method,
         request.uri,
@@ -3694,6 +3708,7 @@ async fn forward_generic_openai_request(
         attempt_started_at_unix_ms,
         request_metadata: &context.request_metadata,
         attempt_request_metadata: &attempt_request_metadata,
+        shutdown: context.state.shutdown.subscribe(),
     })
     .await?;
     let upstream_status = upstream_response.status();
@@ -3872,12 +3887,18 @@ async fn fetch_models_upstream_group(
         attempt_started_at_unix_ms,
         request_metadata: &context.request_metadata,
         attempt_request_metadata: &attempt_request_metadata,
+        shutdown: context.state.shutdown.subscribe(),
     })
     .await?;
     let upstream_mode = upstream_mode_from_headers(upstream_response.headers());
     let upstream_status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
-    let body = match read_upstream_body_bytes(upstream_response.bytes_stream()).await {
+    let body = match read_upstream_body_bytes_until_shutdown(
+        upstream_response.bytes_stream(),
+        context.state.shutdown.subscribe(),
+    )
+    .await
+    {
         Ok(body) => body,
         Err(error) => {
             return Err(upstream_body_error_with_observability(
@@ -3959,18 +3980,20 @@ struct UpstreamAttemptContext<'request> {
     attempt_started_at_unix_ms: u64,
     request_metadata: &'request BTreeMap<String, String>,
     attempt_request_metadata: &'request BTreeMap<String, String>,
+    shutdown: ShutdownSubscription,
 }
 
 async fn send_first_upstream_attempt(
     context: UpstreamAttemptContext<'_>,
 ) -> Result<reqwest::Response, ProxyError> {
-    match send_upstream_request(
+    match send_upstream_request_until_shutdown(
         context.client,
         context.method,
         context.upstream_url,
         context.downstream_headers,
         context.upstream_body,
         context.upstream_timeout,
+        context.shutdown,
     )
     .await
     {
@@ -4383,6 +4406,18 @@ async fn read_body_bytes(body: Body, max_request_body_bytes: usize) -> Result<By
         .map_err(|error| ProxyError::request_body(error.to_string()))
 }
 
+async fn read_body_bytes_until_shutdown(
+    body: Body,
+    max_request_body_bytes: usize,
+    mut shutdown: ShutdownSubscription,
+) -> Result<Bytes, ProxyError> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Err(ProxyError::server_shutdown()),
+        result = read_body_bytes(body, max_request_body_bytes) => result,
+    }
+}
+
 async fn read_upstream_body_bytes(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
 ) -> Result<Bytes, ProxyError> {
@@ -4407,6 +4442,17 @@ async fn read_upstream_body_bytes(
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+async fn read_upstream_body_bytes_until_shutdown(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
+    mut shutdown: ShutdownSubscription,
+) -> Result<Bytes, ProxyError> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Err(ProxyError::server_shutdown()),
+        result = read_upstream_body_bytes(stream) => result,
+    }
 }
 
 fn should_enrich_models_response(method: &Method, uri: &Uri, metadata: &MetadataConfig) -> bool {
@@ -4681,6 +4727,22 @@ async fn send_upstream_request(
                 observability: None,
             }
         })
+}
+
+async fn send_upstream_request_until_shutdown(
+    client: &Client,
+    method: reqwest::Method,
+    upstream_url: Url,
+    downstream_headers: &HeaderMap,
+    body: Bytes,
+    timeout: Duration,
+    mut shutdown: ShutdownSubscription,
+) -> Result<reqwest::Response, ProxyError> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Err(ProxyError::server_shutdown()),
+        result = send_upstream_request(client, method, upstream_url, downstream_headers, body, timeout) => result,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -5323,11 +5385,7 @@ async fn shielded_start_failure_step(
     };
     attempt_records.push(attempt_failure_record(
         &failure,
-        if can_retry {
-            AttemptStatus::Retried
-        } else {
-            AttemptStatus::Failed
-        },
+        shielded_failed_attempt_status(can_retry, &failure),
         if can_retry { next_retry_cause } else { None },
         &runtime.retry_policy,
     ));
@@ -5525,16 +5583,21 @@ async fn aggregate_shielded_attempt(
 ) -> Result<ShieldedAggregatedAttempt, ShieldedAttemptFailure> {
     let request_id = runtime.request_id.as_str().to_owned();
     let request_model_id = runtime.model_id.clone();
-    match shielded_chat::aggregate_stream(
+    let aggregate = shielded_chat::aggregate_stream(
         started.response.bytes_stream(),
         started.info.started_at_unix_ms,
         &request_id,
         request_model_id.as_deref(),
         runtime.loop_context.clone(),
         runtime.upstream_stall_policy.idle_timeout(),
-    )
-    .await
-    {
+    );
+    let mut shutdown = runtime.shutdown.subscribe();
+    let result = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Err(shutdown_shielded_attempt_failure(&started.info)),
+        result = aggregate => result,
+    };
+    match result {
         Ok(aggregated) => Ok(ShieldedAggregatedAttempt {
             final_attempt: started.info.into_final_context(
                 aggregated.response_metadata.clone(),
@@ -5658,7 +5721,7 @@ async fn run_shielded_attempts(
                 failure.response_metadata.extend(recovery_gate.metadata);
                 let attempt_record = attempt_failure_record(
                     &failure,
-                    retry_attempt_status(can_retry),
+                    shielded_failed_attempt_status(can_retry, &failure),
                     retry_cause_for_attempt_record(can_retry, next_retry_cause),
                     &runtime.retry_policy,
                 );
@@ -5736,12 +5799,21 @@ fn no_thinking_direct_relay_metadata() -> BTreeMap<String, String> {
     ])
 }
 
-const fn retry_attempt_status(can_retry: bool) -> AttemptStatus {
+fn shielded_failed_attempt_status(
+    can_retry: bool,
+    failure: &ShieldedAttemptFailure,
+) -> AttemptStatus {
     if can_retry {
         AttemptStatus::Retried
+    } else if is_server_shutdown_failure(failure) {
+        AttemptStatus::Aborted
     } else {
         AttemptStatus::Failed
     }
+}
+
+fn is_server_shutdown_failure(failure: &ShieldedAttemptFailure) -> bool {
+    failure.abort_reason.as_deref() == Some(SERVER_SHUTDOWN_ABORT_REASON)
 }
 
 const fn retry_cause_for_attempt_record(
@@ -5755,7 +5827,8 @@ fn should_retry_after_shielded_failure(
     runtime: &ShieldedRetryRuntime,
     failure: &ShieldedAttemptFailure,
 ) -> bool {
-    failure.retry_cause.is_some()
+    !is_server_shutdown_failure(failure)
+        && failure.retry_cause.is_some()
         && runtime
             .retry_policy
             .allows_retry_after(failure.attempt_number)
@@ -6471,13 +6544,14 @@ async fn start_shielded_attempt(
         &attempt_plan,
         cot_salvage,
     );
-    match send_upstream_request(
+    match send_upstream_request_until_shutdown(
         &runtime.client,
         runtime.method.clone(),
         runtime.upstream_url.clone(),
         &runtime.downstream_headers,
         upstream_body,
         runtime.upstream_timeout,
+        runtime.shutdown.subscribe(),
     )
     .await
     {
@@ -6502,44 +6576,78 @@ async fn start_shielded_attempt(
                 response,
             })
         }
-        Err(error) => {
-            let finished_at_unix_ms = unix_time_millis();
-            let retry_cause = transport_retry_cause(&error);
-            let mut response_metadata = failed_response_metadata(
-                attempt_started_at_unix_ms,
-                finished_at_unix_ms,
-                error.error_type(),
-            );
-            response_metadata.insert(
-                String::from("upstream_response_received"),
-                String::from("false"),
-            );
-            Err(ShieldedAttemptFailure {
+        Err(error) => Err(shielded_start_transport_failure(
+            ShieldedStartFailureInput {
+                runtime,
                 attempt_id,
-                request_id: runtime.request_id.clone(),
                 attempt_number,
-                started_at_unix_ms: attempt_started_at_unix_ms,
-                finished_at_unix_ms,
-                upstream_mode: UpstreamMode::NotApplicable,
-                http_status: None,
-                #[cfg(feature = "upstream-hot-restart")]
-                transport_failure: match &error {
-                    ProxyError::UpstreamTransport { failure, .. } => Some(*failure),
-                    _ => None,
-                },
-                error_type: error.error_type(),
-                error_message: error.to_string(),
-                retry_cause,
-                abort_reason: None,
+                attempt_started_at_unix_ms,
                 request_metadata,
-                response_metadata,
-                raw_payloads: RawPayloads {
-                    input: raw_request_body,
-                    ..RawPayloads::default()
-                },
-                upstream_body: evidence_upstream_body,
-            })
-        }
+                raw_request_body,
+                evidence_upstream_body,
+                error,
+            },
+        )),
+    }
+}
+
+struct ShieldedStartFailureInput<'runtime> {
+    runtime: &'runtime ShieldedRetryRuntime,
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    attempt_started_at_unix_ms: u64,
+    request_metadata: BTreeMap<String, String>,
+    raw_request_body: Option<String>,
+    evidence_upstream_body: Bytes,
+    error: ProxyError,
+}
+
+fn shielded_start_transport_failure(
+    input: ShieldedStartFailureInput<'_>,
+) -> ShieldedAttemptFailure {
+    let finished_at_unix_ms = unix_time_millis();
+    let retry_cause = if matches!(input.error, ProxyError::Shutdown { .. }) {
+        None
+    } else {
+        transport_retry_cause(&input.error)
+    };
+    let abort_reason = input.error.abort_reason().map(str::to_owned);
+    let mut response_metadata = failed_response_metadata(
+        input.attempt_started_at_unix_ms,
+        finished_at_unix_ms,
+        input.error.error_type(),
+    );
+    response_metadata.insert(
+        String::from("upstream_response_received"),
+        String::from("false"),
+    );
+    if let Some(reason) = &abort_reason {
+        response_metadata.insert(String::from("abort_reason"), reason.clone());
+    }
+    ShieldedAttemptFailure {
+        attempt_id: input.attempt_id,
+        request_id: input.runtime.request_id.clone(),
+        attempt_number: input.attempt_number,
+        started_at_unix_ms: input.attempt_started_at_unix_ms,
+        finished_at_unix_ms,
+        upstream_mode: UpstreamMode::NotApplicable,
+        http_status: None,
+        #[cfg(feature = "upstream-hot-restart")]
+        transport_failure: match &input.error {
+            ProxyError::UpstreamTransport { failure, .. } => Some(*failure),
+            _ => None,
+        },
+        error_type: input.error.error_type(),
+        error_message: input.error.to_string(),
+        retry_cause,
+        abort_reason,
+        request_metadata: input.request_metadata,
+        response_metadata,
+        raw_payloads: RawPayloads {
+            input: input.raw_request_body,
+            ..RawPayloads::default()
+        },
+        upstream_body: input.evidence_upstream_body,
     }
 }
 
@@ -6902,6 +7010,45 @@ fn aggregation_failure(
     }
 }
 
+fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAttemptFailure {
+    let finished_at_unix_ms = unix_time_millis();
+    let mut response_metadata = failed_response_metadata(
+        info.started_at_unix_ms,
+        finished_at_unix_ms,
+        PROXY_SHUTTING_DOWN_ERROR_TYPE,
+    );
+    response_metadata.insert(
+        String::from("upstream_response_received"),
+        String::from("true"),
+    );
+    response_metadata.insert(
+        String::from("abort_reason"),
+        SERVER_SHUTDOWN_ABORT_REASON.to_owned(),
+    );
+    ShieldedAttemptFailure {
+        attempt_id: info.attempt_id.clone(),
+        request_id: info.request_id.clone(),
+        attempt_number: info.attempt_number,
+        started_at_unix_ms: info.started_at_unix_ms,
+        finished_at_unix_ms,
+        upstream_mode: info.upstream_mode,
+        http_status: Some(info.upstream_status.as_u16()),
+        #[cfg(feature = "upstream-hot-restart")]
+        transport_failure: None,
+        error_type: PROXY_SHUTTING_DOWN_ERROR_TYPE,
+        error_message: String::from("proxy is shutting down"),
+        retry_cause: None,
+        abort_reason: Some(SERVER_SHUTDOWN_ABORT_REASON.to_owned()),
+        request_metadata: info.request_metadata.clone(),
+        response_metadata,
+        raw_payloads: RawPayloads {
+            input: info.raw_request_body.clone(),
+            ..RawPayloads::default()
+        },
+        upstream_body: info.upstream_body.clone(),
+    }
+}
+
 fn cot_salvage_context_for_failure(
     runtime: &ShieldedRetryRuntime,
     failure: &ShieldedAttemptFailure,
@@ -7122,24 +7269,41 @@ fn shielded_failure_outcome(
     policy: &ShieldedRetryPolicy,
 ) -> ShieldedFailureOutcome {
     let mut response_metadata = failure.response_metadata.clone();
+    let abort_reason = failure.abort_reason.clone();
+    let request_status = if is_server_shutdown_failure(&failure) {
+        RequestStatus::Aborted
+    } else {
+        RequestStatus::Failed
+    };
     response_metadata.extend(retry_chain_metadata(
         &attempt_records,
         policy,
-        RequestStatus::Failed.as_str(),
+        request_status.as_str(),
     ));
+    if let Some(reason) = &abort_reason {
+        response_metadata.insert(String::from("abort_reason"), reason.clone());
+    }
     let error_type = structured_shielded_error_type(&failure);
+    let downstream_status = if is_server_shutdown_failure(&failure) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
     ShieldedFailureOutcome {
         error_type,
         error_message: failure.error_message,
         response_metadata,
         attempt_records,
         upstream_mode: failure.upstream_mode,
-        downstream_status: StatusCode::BAD_GATEWAY,
+        downstream_status,
         retry_after_secs: None,
     }
 }
 
 fn structured_shielded_error_type(failure: &ShieldedAttemptFailure) -> &'static str {
+    if is_server_shutdown_failure(failure) {
+        return PROXY_SHUTTING_DOWN_ERROR_TYPE;
+    }
     if matches!(failure.retry_cause, Some(ShieldedRetryCause::LoopDetected))
         || failure.abort_reason.as_deref() == Some("loop_guard")
     {
@@ -7261,6 +7425,10 @@ fn shielded_retry_error_response(
             .upstream_failure_counters
             .increment(UpstreamFailureCause::from_code(cause));
     }
+    let is_shutdown_failure = failure
+        .response_metadata
+        .get("abort_reason")
+        .is_some_and(|reason| reason == SERVER_SHUTDOWN_ABORT_REASON);
     let mut response_headers = json_response_headers(body.len());
     if let Some(retry_after_secs) = failure.retry_after_secs
         && let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string())
@@ -7282,7 +7450,11 @@ fn shielded_retry_error_response(
             attempt_progress: None,
         },
     );
-    let completion = BodyCompletion::UpstreamStreamError(failure.error_message);
+    let completion = if is_shutdown_failure {
+        BodyCompletion::Shutdown
+    } else {
+        BodyCompletion::UpstreamStreamError(failure.error_message)
+    };
     let response_body = ObservedBufferedBody::new_with_completion(
         body,
         observer,
@@ -9012,6 +9184,17 @@ fn failed_attempt_record(input: FailedAttemptRecordInput<'_>) -> AttemptRecord {
     }
 }
 
+fn shutdown_attempt_record(mut record: AttemptRecord) -> AttemptRecord {
+    record.status = AttemptStatus::Aborted;
+    record.retry_reason = None;
+    record.abort_reason = Some(SERVER_SHUTDOWN_ABORT_REASON.to_owned());
+    record.response_metadata.insert(
+        String::from("abort_reason"),
+        SERVER_SHUTDOWN_ABORT_REASON.to_owned(),
+    );
+    record
+}
+
 struct FailedRequestRecord {
     request_id: RequestId,
     started_at_unix_ms: u64,
@@ -9402,6 +9585,9 @@ fn schedule_shadow_attempt(
     settings: &AppConfig,
     plan: ShadowAttemptPlan,
 ) {
+    if runtime.shutdown.is_shutting_down() {
+        return;
+    }
     let shadow = &settings.evidence.shadow;
     if shadow.max_global_shadow_in_flight == 0 {
         push_shadow_skipped_record(
@@ -9462,6 +9648,7 @@ fn schedule_shadow_attempt(
         upstream_timeout: runtime.upstream_timeout,
         evidence_store: runtime.evidence_store.clone(),
         shadow_evidence: runtime.shadow_evidence.clone(),
+        shutdown: Arc::clone(&runtime.shutdown),
         request_id: runtime.request_id.clone(),
         group_id: runtime.request_id.as_str().to_owned(),
         attempt_id,
@@ -9663,6 +9850,7 @@ struct ShadowContinuationTask {
     upstream_timeout: Duration,
     evidence_store: EvidenceStore,
     shadow_evidence: ShadowEvidenceState,
+    shutdown: Arc<ShutdownGate>,
     request_id: RequestId,
     group_id: String,
     attempt_id: AttemptId,
@@ -9687,28 +9875,48 @@ async fn run_shadow_continuation(task: ShadowContinuationTask) -> ShadowContinua
     let shadow_evidence = task.shadow_evidence.clone();
     let started_at_unix_ms = unix_time_millis();
     let timeout_ms = task.shadow_attempt_timeout_ms;
-    let outcome = timeout(
-        Duration::from_millis(timeout_ms),
-        run_shadow_continuation_request(&task, started_at_unix_ms),
-    )
-    .await;
-    let attempt = match outcome {
-        Ok(attempt) => attempt,
-        Err(_elapsed) => build_shadow_terminal_record(
+    let mut shutdown = task.shutdown.subscribe();
+    let attempt = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => build_shadow_terminal_record(
             &task,
             ShadowTerminalInput {
                 started_at_unix_ms,
                 finished_at_unix_ms: unix_time_millis(),
-                status: EvidenceAttemptStatus::ShadowTimeout,
+                status: EvidenceAttemptStatus::Aborted,
                 http_status: None,
                 response_headers: HeaderMap::new(),
-                response_metadata: BTreeMap::new(),
+                response_metadata: BTreeMap::from([(
+                    String::from("abort_reason"),
+                    SERVER_SHUTDOWN_ABORT_REASON.to_owned(),
+                )]),
                 raw_payloads: RawPayloads::default(),
                 response_body_bytes: 0,
-                error_reason: Some(String::from("shadow continuation timed out")),
-                abort_reason: Some(String::from("shadow_timeout")),
+                error_reason: Some(String::from("shadow continuation cancelled by server shutdown")),
+                abort_reason: Some(SERVER_SHUTDOWN_ABORT_REASON.to_owned()),
             },
         ),
+        outcome = timeout(
+            Duration::from_millis(timeout_ms),
+            run_shadow_continuation_request(&task, started_at_unix_ms),
+        ) => match outcome {
+            Ok(attempt) => attempt,
+            Err(_elapsed) => build_shadow_terminal_record(
+                &task,
+                ShadowTerminalInput {
+                    started_at_unix_ms,
+                    finished_at_unix_ms: unix_time_millis(),
+                    status: EvidenceAttemptStatus::ShadowTimeout,
+                    http_status: None,
+                    response_headers: HeaderMap::new(),
+                    response_metadata: BTreeMap::new(),
+                    raw_payloads: RawPayloads::default(),
+                    response_body_bytes: 0,
+                    error_reason: Some(String::from("shadow continuation timed out")),
+                    abort_reason: Some(String::from("shadow_timeout")),
+                },
+            ),
+        },
     };
     ShadowContinuationRecord {
         evidence_store,
@@ -10229,6 +10437,11 @@ enum ProxyError {
         failure: ListenerUpstreamDenied,
         request_metadata: Option<BTreeMap<String, String>>,
     },
+    #[error("proxy is shutting down")]
+    Shutdown {
+        request_metadata: Option<BTreeMap<String, String>>,
+        attempts: Vec<AttemptRecord>,
+    },
     #[cfg(feature = "guard")]
     #[error("guard workflow blocked request: {reason}")]
     GuardBlocked {
@@ -10320,6 +10533,13 @@ impl ProxyError {
         }
     }
 
+    fn server_shutdown() -> Self {
+        Self::Shutdown {
+            request_metadata: None,
+            attempts: Vec::new(),
+        }
+    }
+
     fn upstream_body(reason: String) -> Self {
         Self::UpstreamBody {
             reason,
@@ -10390,6 +10610,7 @@ impl ProxyError {
             | Self::InvalidMethod { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRequestPath(error) => error.status(),
             Self::Admission { failure, .. } => failure.status(),
+            Self::Shutdown { .. } => StatusCode::SERVICE_UNAVAILABLE,
             #[cfg(feature = "guard")]
             Self::VirtualKeyUnauthorized { .. } => StatusCode::UNAUTHORIZED,
             #[cfg(feature = "guard")]
@@ -10414,6 +10635,7 @@ impl ProxyError {
             Self::InvalidMethod { .. } => "invalid_method",
             Self::Admission { failure, .. } => failure.error_type(),
             Self::ListenerUpstreamDenied { .. } => "listener_upstream_not_allowed",
+            Self::Shutdown { .. } => PROXY_SHUTTING_DOWN_ERROR_TYPE,
             #[cfg(feature = "guard")]
             Self::VirtualKeyUnauthorized { .. } => "virtual_key_unauthorized",
             #[cfg(feature = "guard")]
@@ -10431,6 +10653,7 @@ impl ProxyError {
     const fn request_status(&self) -> RequestStatus {
         match self {
             Self::Admission { failure, .. } => failure.request_status(),
+            Self::Shutdown { .. } => RequestStatus::Aborted,
             Self::RequestBody { .. }
             | Self::ConfigSnapshot { .. }
             | Self::InvalidUpstreamUrl { .. }
@@ -10451,6 +10674,7 @@ impl ProxyError {
     const fn abort_reason(&self) -> Option<&'static str> {
         match self {
             Self::Admission { failure, .. } => failure.abort_reason(),
+            Self::Shutdown { .. } => Some(SERVER_SHUTDOWN_ABORT_REASON),
             Self::RequestBody { .. }
             | Self::ConfigSnapshot { .. }
             | Self::InvalidUpstreamUrl { .. }
@@ -10524,6 +10748,9 @@ impl ProxyError {
             | Self::ListenerUpstreamDenied {
                 request_metadata, ..
             }
+            | Self::Shutdown {
+                request_metadata, ..
+            }
             | Self::ContextBudgetExceeded {
                 request_metadata, ..
             } => request_metadata.as_ref(),
@@ -10560,6 +10787,7 @@ impl ProxyError {
                 attempts.push(observability.attempt_record.clone());
                 attempts
             }
+            Self::Shutdown { attempts, .. } => attempts.clone(),
             Self::RequestBody { .. }
             | Self::ConfigSnapshot { .. }
             | Self::InvalidUpstreamUrl { .. }
@@ -10614,6 +10842,10 @@ impl ProxyError {
             Self::ListenerUpstreamDenied { failure, .. } => Self::ListenerUpstreamDenied {
                 failure,
                 request_metadata: Some(request_metadata),
+            },
+            Self::Shutdown { attempts, .. } => Self::Shutdown {
+                request_metadata: Some(request_metadata),
+                attempts,
             },
             #[cfg(feature = "guard")]
             Self::GuardBlocked { reason, .. } => Self::GuardBlocked {
@@ -10696,6 +10928,10 @@ impl ProxyError {
                     completed_attempt_records: Vec::new(),
                 })),
             },
+            Self::Shutdown { .. } => Self::Shutdown {
+                request_metadata: Some(request_metadata),
+                attempts: vec![shutdown_attempt_record(attempt_record)],
+            },
             error @ (Self::RequestBody { .. }
             | Self::ConfigSnapshot { .. }
             | Self::InvalidUpstreamUrl { .. }
@@ -10739,6 +10975,16 @@ impl ProxyError {
                 Self::UpstreamBody {
                     reason,
                     observability: Some(observability),
+                }
+            }
+            Self::Shutdown {
+                request_metadata,
+                mut attempts,
+            } => {
+                attempts.splice(0..0, completed_attempt_records);
+                Self::Shutdown {
+                    request_metadata,
+                    attempts,
                 }
             }
             error => error,

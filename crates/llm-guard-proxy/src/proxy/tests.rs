@@ -12740,6 +12740,126 @@ async fn graceful_shutdown_aborts_in_flight_response_body() {
 }
 
 #[tokio::test]
+async fn shutdown_cancels_pre_response_upstream_work() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_max_in_flight_requests(&fake.base_url, true, 1).await;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("pre-response shutdown listener should bind");
+    let addr = listener
+        .local_addr()
+        .expect("pre-response shutdown address should be readable");
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let state = proxy.state.clone();
+    let server = tokio::spawn(async move {
+        serve_until_shutdown(listener, state, async {
+            let _received = shutdown_rx.await;
+        })
+        .await
+    });
+
+    let request = tokio::spawn({
+        let client = proxy.client.clone();
+        async move { send_pre_response_shutdown_request(client, addr).await }
+    });
+
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("pre-response request should reach upstream before shutdown");
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=pre-response-hang"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("shutdown signal should be delivered");
+    let response_result = timeout(STREAM_COMPLETION_TIMEOUT, request)
+        .await
+        .expect("pre-response request should complete after shutdown")
+        .expect("pre-response request task should join");
+    match response_result {
+        Ok((status, body)) => {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert!(
+                body.contains("proxy_shutting_down"),
+                "pre-response shutdown response should identify cancellation: {body}"
+            );
+        }
+        Err(error) => assert!(
+            !error.is_empty(),
+            "pre-response shutdown should fail fast or return 503"
+        ),
+    }
+    timeout(STREAM_COMPLETION_TIMEOUT, server)
+        .await
+        .expect("server should exit after pre-response shutdown cancellation")
+        .expect("server task should not panic")
+        .expect("server should shut down cleanly");
+
+    wait_for_generation_metrics(&proxy, 0, 0, STREAM_COMPLETION_TIMEOUT).await;
+    let request_row = read_aborted_request_metadata_by_path(&proxy, "/v1/chat/completions");
+    assert_eq!(request_row.http_status, Some(503));
+    assert_eq!(request_row.abort_reason.as_deref(), Some("server_shutdown"));
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "aborted");
+    assert_eq!(attempts[0].retry_reason, None);
+    assert_eq!(attempts[0].abort_reason.as_deref(), Some("server_shutdown"));
+    assert_eq!(
+        attempts[0].response_metadata["abort_reason"].as_str(),
+        Some("server_shutdown")
+    );
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        metric_value(&metrics, "llm_guard_proxy_generation_active"),
+        0
+    );
+    assert_eq!(
+        metric_value(&metrics, "llm_guard_proxy_generation_queued"),
+        0
+    );
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_current_retained_request_terminals",
+            &[
+                ("status", "aborted"),
+                ("terminal_reason", "server_shutdown"),
+                ("http_status_class", "5xx"),
+            ],
+        ),
+        1
+    );
+}
+
+async fn send_pre_response_shutdown_request(
+    client: Client,
+    addr: std::net::SocketAddr,
+) -> Result<(StatusCode, String), String> {
+    let response = match client
+        .post(format!(
+            "http://{addr}/v1/chat/completions?test=pre-response-hang"
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"shutdown"}]}"#)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => return Err(error.to_string()),
+    };
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .expect("pre-response shutdown response body should read");
+    Ok((status, body))
+}
+
+#[tokio::test]
 async fn shutdown_completes_after_disconnect_storm() {
     let mut upstream = CancellableUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_full_options(
@@ -14618,6 +14738,9 @@ async fn fake_upstream_handler(
                     .to_owned(),
             );
         }
+    }
+    if path_and_query.contains("test=pre-response-hang") {
+        sleep(STREAM_COMPLETION_TIMEOUT.saturating_mul(5)).await;
     }
 
     fake_upstream_endpoint_response(&endpoint, &path_and_query, &state, &body)
