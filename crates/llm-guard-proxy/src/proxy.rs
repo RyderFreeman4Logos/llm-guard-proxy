@@ -2,14 +2,14 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher},
     convert::Infallible,
     fmt,
-    future::Future,
+    future::{Future, IntoFuture},
     hash::{Hash, Hasher},
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -60,7 +60,7 @@ use tokio::task::JoinHandle;
 use tokio::{
     net::TcpListener,
     process::Command,
-    sync::{Mutex as AsyncMutex, Notify, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, futures::OwnedNotified, oneshot},
     time::{Instant, Interval, MissedTickBehavior, timeout},
 };
 
@@ -80,6 +80,8 @@ const COT_SALVAGE_PREFIX_MAX_BYTES: usize = 4_096;
 const COT_SALVAGE_THINKING_BUDGET_TOKENS: u32 = 1_024;
 const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
 const PAIRED_SAMPLE_DENOMINATOR: u64 = 1_000_000;
+const SERVER_SHUTDOWN_ABORT_REASON: &str = "server_shutdown";
+const PROXY_SHUTTING_DOWN_ERROR_TYPE: &str = "proxy_shutting_down";
 #[cfg(feature = "guard")]
 const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
 
@@ -103,9 +105,12 @@ pub(crate) struct ProxyState {
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
     shadow_attempts: Arc<InFlightLimiter>,
+    shutdown: Arc<ShutdownGate>,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
     live_registry: Arc<LiveRequestRegistry>,
+    #[cfg(test)]
+    shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
 
 /// Cause-bucketed monotonic counters for upstream 502 failures emitted to
@@ -227,9 +232,12 @@ impl ProxyState {
             hot_restart_recovery: Arc::new(HotRestartCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
             shadow_attempts: Arc::new(InFlightLimiter::default()),
+            shutdown: Arc::new(ShutdownGate::new()),
             malformed_response_counter: Arc::new(AtomicU64::new(0)),
             upstream_failure_counters: Arc::new(UpstreamFailureCounters::default()),
             live_registry: Arc::new(LiveRequestRegistry::new()),
+            #[cfg(test)]
+            shielded_heartbeat_ticks: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -239,6 +247,16 @@ impl ProxyState {
         let mut state = self.clone();
         state.listener = listener;
         state
+    }
+
+    #[cfg(test)]
+    fn reset_shielded_heartbeat_ticks_for_tests(&self) {
+        self.shielded_heartbeat_ticks.store(0, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn shielded_heartbeat_ticks_for_tests(&self) -> u64 {
+        self.shielded_heartbeat_ticks.load(Ordering::SeqCst)
     }
 
     async fn acquire_generation_permit(
@@ -272,6 +290,9 @@ impl ProxyState {
             .config
             .snapshot()
             .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+        if self.shutdown.is_shutting_down() {
+            return Err(AdmissionFailure::ShuttingDown { queued: None });
+        }
         if let Some(permit) = limiter.try_acquire(config.server.max_in_flight_requests) {
             return Ok(GenerationAdmission::acquired(
                 config,
@@ -309,7 +330,13 @@ impl ProxyState {
         let mut cancel_recorder =
             QueuedAdmissionCancelRecorder::new(record_context, queued_at, timeout_ms);
         let deadline = queued_at + Duration::from_millis(timeout_ms);
+        let mut shutdown = self.shutdown.subscribe();
         loop {
+            if self.shutdown.is_shutting_down() {
+                return Err(AdmissionFailure::ShuttingDown {
+                    queued: cancel_recorder.shutdown_cancellation(),
+                });
+            }
             let config = match self.config.snapshot() {
                 Ok(config) => config,
                 Err(error) => {
@@ -333,9 +360,14 @@ impl ProxyState {
                 });
             }
 
-            limiter
-                .wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL))
-                .await;
+            tokio::select! {
+                () = limiter.wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL)) => {}
+                () = shutdown.cancelled() => {
+                    return Err(AdmissionFailure::ShuttingDown {
+                        queued: cancel_recorder.shutdown_cancellation(),
+                    });
+                }
+            }
         }
     }
 
@@ -349,6 +381,9 @@ impl ProxyState {
             .config
             .snapshot()
             .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+        if self.shutdown.is_shutting_down() {
+            return Err(AdmissionFailure::ShuttingDown { queued: None });
+        }
         let selected_profile = select_allowed_upstream_profile(&config, &self.listener, model_id)
             .map_err(AdmissionFailure::ListenerUpstreamDenied)?;
         let limiter = self.generation_limiter_for_profile(&selected_profile.profile);
@@ -399,7 +434,13 @@ impl ProxyState {
         let mut cancel_recorder =
             QueuedAdmissionCancelRecorder::new(record_context, queued_at, timeout_ms);
         let deadline = queued_at + Duration::from_millis(timeout_ms);
+        let mut shutdown = self.shutdown.subscribe();
         loop {
+            if self.shutdown.is_shutting_down() {
+                return Err(AdmissionFailure::ShuttingDown {
+                    queued: cancel_recorder.shutdown_cancellation(),
+                });
+            }
             let config = match self.config.snapshot() {
                 Ok(config) => config,
                 Err(error) => {
@@ -437,9 +478,14 @@ impl ProxyState {
                 });
             }
 
-            limiter
-                .wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL))
-                .await;
+            tokio::select! {
+                () = limiter.wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL)) => {}
+                () = shutdown.cancelled() => {
+                    return Err(AdmissionFailure::ShuttingDown {
+                        queued: cancel_recorder.shutdown_cancellation(),
+                    });
+                }
+            }
         }
     }
 
@@ -487,6 +533,65 @@ impl ProxyState {
     }
 }
 
+#[derive(Debug)]
+struct ShutdownGate {
+    closed: Arc<AtomicBool>,
+    notify: Arc<Notify>,
+}
+
+impl ShutdownGate {
+    fn new() -> Self {
+        Self {
+            closed: Arc::new(AtomicBool::new(false)),
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    fn begin_shutdown(&self) {
+        if !self.closed.swap(true, Ordering::SeqCst) {
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn is_shutting_down(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    fn subscribe(&self) -> ShutdownSubscription {
+        let mut notified = Box::pin(Arc::clone(&self.notify).notified_owned());
+        let _already_notified = notified.as_mut().enable();
+        ShutdownSubscription {
+            closed: Arc::clone(&self.closed),
+            notified,
+        }
+    }
+}
+
+struct ShutdownSubscription {
+    closed: Arc<AtomicBool>,
+    notified: Pin<Box<OwnedNotified>>,
+}
+
+impl ShutdownSubscription {
+    async fn cancelled(&mut self) {
+        if self.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        self.notified.as_mut().await;
+    }
+
+    fn poll_shutdown(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            return Poll::Ready(());
+        }
+
+        match self.notified.as_mut().poll(cx) {
+            Poll::Ready(()) => Poll::Ready(()),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 /// Serves the proxy until the supplied shutdown future resolves.
 ///
 /// Axum stops accepting new connections after shutdown starts and waits for
@@ -496,9 +601,40 @@ pub(crate) async fn serve_until_shutdown(
     state: ProxyState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown)
-        .await
+    let config = state.config.clone();
+    let shutdown_gate = Arc::clone(&state.shutdown);
+    let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
+    let server = axum::serve(listener, router(state)).with_graceful_shutdown(async move {
+        shutdown.await;
+        shutdown_gate.begin_shutdown();
+        let _ignored = shutdown_started_tx.send(());
+    });
+    let mut server = Box::pin(server.into_future());
+
+    tokio::select! {
+        result = server.as_mut() => result,
+        _ = shutdown_started_rx => {
+            let drain_timeout = current_shutdown_drain_timeout(&config);
+            match timeout(drain_timeout, server.as_mut()).await {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    eprintln!(
+                        "llm_guard_proxy_shutdown_drain_timeout timeout_ms={}",
+                        drain_timeout.as_millis()
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
+}
+
+fn current_shutdown_drain_timeout(config: &ConfigHandle) -> Duration {
+    let timeout_ms = config.snapshot().map_or_else(
+        |_error| AppConfig::default().server.shutdown_drain_timeout_ms,
+        |snapshot| snapshot.server.shutdown_drain_timeout_ms,
+    );
+    Duration::from_millis(timeout_ms)
 }
 
 #[derive(Debug, Default)]
@@ -616,6 +752,15 @@ impl QueuedAdmissionCancelRecorder {
     fn disarm(&mut self) {
         self.record = None;
     }
+
+    fn shutdown_cancellation(&mut self) -> Option<QueuedAdmissionCancellation> {
+        self.record.take().map(|record| {
+            QueuedAdmissionCancellation::from_record(
+                &record,
+                QueueCancellationReason::ServerShutdown,
+            )
+        })
+    }
 }
 
 impl Drop for QueuedAdmissionCancelRecorder {
@@ -631,6 +776,45 @@ struct QueuedAdmissionCancelRecord {
     context: AdmissionRecordContext,
     queued_at: Instant,
     timeout_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct QueuedAdmissionCancellation {
+    reason: QueueCancellationReason,
+    queue_wait_ms: u64,
+    generation_queue_timeout_ms: u64,
+}
+
+impl QueuedAdmissionCancellation {
+    fn from_record(record: &QueuedAdmissionCancelRecord, reason: QueueCancellationReason) -> Self {
+        Self {
+            reason,
+            queue_wait_ms: duration_millis_u64(record.queued_at.elapsed()),
+            generation_queue_timeout_ms: record.timeout_ms,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum QueueCancellationReason {
+    DownstreamDisconnected,
+    ServerShutdown,
+}
+
+impl QueueCancellationReason {
+    const fn admission_outcome(self) -> &'static str {
+        match self {
+            Self::DownstreamDisconnected => "queue_cancelled",
+            Self::ServerShutdown => "queue_cancelled_shutdown",
+        }
+    }
+
+    const fn abort_reason(self) -> &'static str {
+        match self {
+            Self::DownstreamDisconnected => "downstream_disconnected_while_queued",
+            Self::ServerShutdown => "server_shutdown_while_queued",
+        }
+    }
 }
 
 fn admission_counts(current: &Mutex<AdmissionCounts>) -> MutexGuard<'_, AdmissionCounts> {
@@ -706,6 +890,10 @@ enum AdmissionFailure {
     ControlPlaneLimitExceeded {
         max_control_plane_in_flight_requests: usize,
     },
+    #[error("proxy is shutting down")]
+    ShuttingDown {
+        queued: Option<QueuedAdmissionCancellation>,
+    },
     #[error("{0}")]
     ListenerUpstreamDenied(ListenerUpstreamDenied),
 }
@@ -719,9 +907,9 @@ impl AdmissionFailure {
                 Ok(status) => status,
                 Err(_error) => StatusCode::SERVICE_UNAVAILABLE,
             },
-            Self::GenerationQueueTimeout { .. } | Self::ControlPlaneLimitExceeded { .. } => {
-                StatusCode::SERVICE_UNAVAILABLE
-            }
+            Self::GenerationQueueTimeout { .. }
+            | Self::ControlPlaneLimitExceeded { .. }
+            | Self::ShuttingDown { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -734,6 +922,38 @@ impl AdmissionFailure {
             Self::ControlPlaneLimitExceeded { .. } => {
                 "proxy_control_plane_in_flight_limit_exceeded"
             }
+            Self::ShuttingDown {
+                queued: Some(_), ..
+            } => "proxy_generation_queue_cancelled",
+            Self::ShuttingDown { queued: None } => "proxy_shutting_down",
+        }
+    }
+
+    const fn request_status(&self) -> RequestStatus {
+        match self {
+            Self::ShuttingDown {
+                queued: Some(_), ..
+            } => RequestStatus::Aborted,
+            Self::ConfigSnapshot(_)
+            | Self::GenerationQueueFull { .. }
+            | Self::GenerationQueueTimeout { .. }
+            | Self::ControlPlaneLimitExceeded { .. }
+            | Self::ShuttingDown { queued: None }
+            | Self::ListenerUpstreamDenied(_) => RequestStatus::Failed,
+        }
+    }
+
+    const fn abort_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::ShuttingDown {
+                queued: Some(queued),
+            } => Some(queued.reason.abort_reason()),
+            Self::ConfigSnapshot(_)
+            | Self::GenerationQueueFull { .. }
+            | Self::GenerationQueueTimeout { .. }
+            | Self::ControlPlaneLimitExceeded { .. }
+            | Self::ShuttingDown { queued: None }
+            | Self::ListenerUpstreamDenied(_) => None,
         }
     }
 
@@ -747,9 +967,9 @@ impl AdmissionFailure {
                     .unwrap_or(ADMISSION_RETRY_AFTER_SECS)
                     .to_string(),
             ),
-            Self::GenerationQueueTimeout { .. } | Self::ControlPlaneLimitExceeded { .. } => {
-                Some(ADMISSION_RETRY_AFTER_SECS.to_string())
-            }
+            Self::GenerationQueueTimeout { .. }
+            | Self::ControlPlaneLimitExceeded { .. }
+            | Self::ShuttingDown { .. } => Some(ADMISSION_RETRY_AFTER_SECS.to_string()),
         }
     }
 
@@ -786,6 +1006,25 @@ impl AdmissionFailure {
             Self::ConfigSnapshot(_)
             | Self::ListenerUpstreamDenied(_)
             | Self::ControlPlaneLimitExceeded { .. } => BTreeMap::new(),
+            Self::ShuttingDown {
+                queued: Some(queued),
+            } => BTreeMap::from([
+                (
+                    String::from("admission_outcome"),
+                    queued.reason.admission_outcome().to_owned(),
+                ),
+                (
+                    String::from("queue_wait_ms"),
+                    queued.queue_wait_ms.to_string(),
+                ),
+                (
+                    String::from("generation_queue_timeout_ms"),
+                    queued.generation_queue_timeout_ms.to_string(),
+                ),
+            ]),
+            Self::ShuttingDown { queued: None } => {
+                BTreeMap::from([(String::from("admission_outcome"), String::from("shutdown"))])
+            }
         }
     }
 }
@@ -1404,6 +1643,7 @@ fn render_metrics(
     let mut output = String::new();
     push_admission_metrics(&mut output, admission);
     push_request_metrics(&mut output, snapshot);
+    push_request_terminal_metrics(&mut output, snapshot);
     push_attempt_metrics(&mut output, snapshot);
     push_retry_and_error_metrics(&mut output, snapshot);
     push_malformed_response_metrics(&mut output, malformed_responses);
@@ -1484,6 +1724,27 @@ fn push_request_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnap
                 ("status", &row.status),
                 ("downstream_mode", &row.downstream_mode),
                 ("upstream_mode", &row.upstream_mode),
+                ("http_status_class", &row.http_status_class),
+            ],
+            row.count,
+        );
+    }
+}
+
+fn push_request_terminal_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_current_retained_request_terminals",
+        "Currently retained proxy request rows by bounded terminal reason.",
+        "gauge",
+    );
+    for row in &snapshot.request_terminal_counts {
+        push_metric_line(
+            output,
+            "llm_guard_proxy_current_retained_request_terminals",
+            &[
+                ("status", &row.status),
+                ("terminal_reason", &row.terminal_reason),
                 ("http_status_class", &row.http_status_class),
             ],
             row.count,
@@ -1828,9 +2089,11 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
                 request_id,
                 started_at_unix_ms,
                 finished_at_unix_ms,
+                status: RequestStatus::Failed,
                 http_status: error.status().as_u16(),
                 error_type,
                 error_reason,
+                abort_reason: None,
                 request_metadata,
                 attempts: Vec::new(),
             },
@@ -1895,9 +2158,11 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
                     request_id,
                     started_at_unix_ms,
                     finished_at_unix_ms,
+                    status: error.request_status(),
                     http_status: error.status().as_u16(),
                     error_type,
                     error_reason,
+                    abort_reason: error.abort_reason(),
                     request_metadata,
                     attempts: error.attempt_records(),
                 },
@@ -1970,9 +2235,11 @@ async fn admit_request(
                     request_id: request_id.clone(),
                     started_at_unix_ms,
                     finished_at_unix_ms: unix_time_millis(),
+                    status: RequestStatus::Failed,
                     http_status: StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
                     error_type,
                     error_reason,
+                    abort_reason: None,
                     request_metadata: {
                         let mut metadata = request.pre_upstream_metadata(None);
                         add_listener_metadata(&mut metadata, &state.listener);
@@ -2095,9 +2362,11 @@ fn reject_admission(
             request_id: request_id.clone(),
             started_at_unix_ms,
             finished_at_unix_ms: unix_time_millis(),
+            status: error.request_status(),
             http_status: error.status().as_u16(),
             error_type,
             error_reason,
+            abort_reason: error.abort_reason(),
             request_metadata: {
                 let mut metadata = request.pre_upstream_metadata(shielding_enabled);
                 add_listener_metadata(&mut metadata, &state.listener);
@@ -2278,9 +2547,13 @@ async fn forward_openai_request(
                 #[cfg(feature = "upstream-hot-restart")]
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
+                shutdown: Arc::clone(&state.shutdown),
+                downstream_drop_signal: DownstreamDropSignal::default(),
                 shadow_evidence: ShadowEvidenceState::default(),
                 malformed_response_counter: state.malformed_response_counter.clone(),
                 upstream_failure_counters: state.upstream_failure_counters.clone(),
+                #[cfg(test)]
+                shielded_heartbeat_ticks: state.shielded_heartbeat_ticks.clone(),
             },
             in_flight_permit,
         )
@@ -2342,9 +2615,10 @@ async fn read_body_and_admit_generation(
         request.shielding_enabled_hint,
     );
     add_listener_metadata(&mut pre_body_request_metadata, &state.listener);
-    let body = read_body_bytes(body, max_request_body_bytes)
-        .await
-        .map_err(|error| error.with_request_metadata(pre_body_request_metadata))?;
+    let body =
+        read_body_bytes_until_shutdown(body, max_request_body_bytes, state.shutdown.subscribe())
+            .await
+            .map_err(|error| error.with_request_metadata(pre_body_request_metadata))?;
     let mut body_read_request_metadata = base_request_metadata(
         request.method,
         request.uri,
@@ -3483,6 +3757,7 @@ async fn forward_generic_openai_request(
         attempt_started_at_unix_ms,
         request_metadata: &context.request_metadata,
         attempt_request_metadata: &attempt_request_metadata,
+        shutdown: context.state.shutdown.subscribe(),
     })
     .await?;
     let upstream_status = upstream_response.status();
@@ -3502,6 +3777,7 @@ async fn forward_generic_openai_request(
         upstream_headers: upstream_headers.clone(),
         request_metadata: context.request_metadata,
         attempt_request_metadata,
+        shutdown: Arc::clone(&context.state.shutdown),
     };
     forward_upstream_response(
         ResponseDispatch {
@@ -3600,11 +3876,14 @@ async fn forward_merged_models_response(
         upstream_headers: upstream_headers.clone(),
         request_metadata: context.request_metadata,
         attempt_request_metadata: BTreeMap::new(),
+        shutdown: Arc::clone(&context.state.shutdown),
     };
+    let shutdown = response_parts.shutdown_subscription();
     let mut observer = response_parts.into_observer();
     observer.completed_attempt_records = attempt_records;
     observer.final_attempt = None;
-    let response_body = ObservedBufferedBody::new(body, observer, context.in_flight_permit);
+    let response_body =
+        ObservedBufferedBody::new(body, observer, context.in_flight_permit, shutdown);
     Ok(downstream_response(
         upstream_status,
         &upstream_headers,
@@ -3657,12 +3936,18 @@ async fn fetch_models_upstream_group(
         attempt_started_at_unix_ms,
         request_metadata: &context.request_metadata,
         attempt_request_metadata: &attempt_request_metadata,
+        shutdown: context.state.shutdown.subscribe(),
     })
     .await?;
     let upstream_mode = upstream_mode_from_headers(upstream_response.headers());
     let upstream_status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
-    let body = match read_upstream_body_bytes(upstream_response.bytes_stream()).await {
+    let body = match read_upstream_body_bytes_until_shutdown(
+        upstream_response.bytes_stream(),
+        context.state.shutdown.subscribe(),
+    )
+    .await
+    {
         Ok(body) => body,
         Err(error) => {
             return Err(upstream_body_error_with_observability(
@@ -3744,18 +4029,20 @@ struct UpstreamAttemptContext<'request> {
     attempt_started_at_unix_ms: u64,
     request_metadata: &'request BTreeMap<String, String>,
     attempt_request_metadata: &'request BTreeMap<String, String>,
+    shutdown: ShutdownSubscription,
 }
 
 async fn send_first_upstream_attempt(
     context: UpstreamAttemptContext<'_>,
 ) -> Result<reqwest::Response, ProxyError> {
-    match send_upstream_request(
+    match send_upstream_request_until_shutdown(
         context.client,
         context.method,
         context.upstream_url,
         context.downstream_headers,
         context.upstream_body,
         context.upstream_timeout,
+        context.shutdown,
     )
     .await
     {
@@ -4140,9 +4427,14 @@ async fn forward_upstream_response(
 
     let request_path = dispatch.uri.path().to_owned();
     let request_id = response_parts.request_id.clone();
+    let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
-    let response_body =
-        ObservedUpstreamBody::new(upstream_response.bytes_stream(), observer, in_flight_permit);
+    let response_body = ObservedUpstreamBody::new(
+        upstream_response.bytes_stream(),
+        observer,
+        in_flight_permit,
+        shutdown,
+    );
     let response = downstream_response(
         upstream_status,
         &upstream_headers,
@@ -4161,6 +4453,18 @@ async fn read_body_bytes(body: Body, max_request_body_bytes: usize) -> Result<By
     to_bytes(body, max_request_body_bytes)
         .await
         .map_err(|error| ProxyError::request_body(error.to_string()))
+}
+
+async fn read_body_bytes_until_shutdown(
+    body: Body,
+    max_request_body_bytes: usize,
+    mut shutdown: ShutdownSubscription,
+) -> Result<Bytes, ProxyError> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Err(ProxyError::server_shutdown()),
+        result = read_body_bytes(body, max_request_body_bytes) => result,
+    }
 }
 
 async fn read_upstream_body_bytes(
@@ -4187,6 +4491,17 @@ async fn read_upstream_body_bytes(
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+async fn read_upstream_body_bytes_until_shutdown(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
+    mut shutdown: ShutdownSubscription,
+) -> Result<Bytes, ProxyError> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Err(ProxyError::server_shutdown()),
+        result = read_upstream_body_bytes(stream) => result,
+    }
 }
 
 fn should_enrich_models_response(method: &Method, uri: &Uri, metadata: &MetadataConfig) -> bool {
@@ -4463,6 +4778,22 @@ async fn send_upstream_request(
         })
 }
 
+async fn send_upstream_request_until_shutdown(
+    client: &Client,
+    method: reqwest::Method,
+    upstream_url: Url,
+    downstream_headers: &HeaderMap,
+    body: Bytes,
+    timeout: Duration,
+    mut shutdown: ShutdownSubscription,
+) -> Result<reqwest::Response, ProxyError> {
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Err(ProxyError::server_shutdown()),
+        result = send_upstream_request(client, method, upstream_url, downstream_headers, body, timeout) => result,
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ReqwestFailureKind {
     Timeout,
@@ -4534,9 +4865,14 @@ struct ForwardedResponseParts {
     upstream_headers: HeaderMap,
     request_metadata: BTreeMap<String, String>,
     attempt_request_metadata: BTreeMap<String, String>,
+    shutdown: Arc<ShutdownGate>,
 }
 
 impl ForwardedResponseParts {
+    fn shutdown_subscription(&self) -> ShutdownSubscription {
+        self.shutdown.subscribe()
+    }
+
     fn into_observer(self) -> ForwardedBodyObserver {
         let downstream_mode = downstream_mode_from_headers(&self.upstream_headers);
         self.into_observer_with(downstream_mode, BTreeMap::new(), RawPayloads::default())
@@ -4620,14 +4956,20 @@ async fn forward_buffered_models_response(
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
     let upstream_headers = response_parts.upstream_headers.clone();
-    let body = match read_upstream_body_bytes(upstream_response.bytes_stream()).await {
+    let body = match read_upstream_body_bytes_until_shutdown(
+        upstream_response.bytes_stream(),
+        response_parts.shutdown_subscription(),
+    )
+    .await
+    {
         Ok(body) => body,
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
     let body = filter_models_body_for_listener(config, listener, body);
     let body = model_metadata::enrich_models_body(config, metadata_config, body);
+    let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
-    let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit);
+    let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit, shutdown);
 
     Ok(downstream_response(
         upstream_status,
@@ -4730,9 +5072,28 @@ struct ShieldedRetryRuntime {
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     shadow_attempts: Arc<InFlightLimiter>,
+    shutdown: Arc<ShutdownGate>,
+    downstream_drop_signal: DownstreamDropSignal,
     shadow_evidence: ShadowEvidenceState,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
+    #[cfg(test)]
+    shielded_heartbeat_ticks: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DownstreamDropSignal {
+    dropped: Arc<AtomicBool>,
+}
+
+impl DownstreamDropSignal {
+    fn mark_dropped(&self) {
+        self.dropped.store(true, Ordering::SeqCst);
+    }
+
+    fn is_dropped(&self) -> bool {
+        self.dropped.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -4895,86 +5256,12 @@ async fn forward_shielded_chat_with_retries(
         ShieldedBeginOutcome::Aggregatable {
             started,
             prior_attempt_records,
-        } => {
-            let upstream_status = started.info.upstream_status;
-            let upstream_content_type = started
-                .info
-                .upstream_headers
-                .get(CONTENT_TYPE)
-                .map(header_value);
-            let response_headers = shielded_chat_stream_response_headers(
-                &started.info.upstream_headers,
-                runtime.liveness.mode,
-            );
-            let extra_metadata =
-                shielded_liveness_response_metadata(&runtime.liveness, upstream_content_type);
-            let attempt_progress = Arc::new(Mutex::new(ShieldedAttemptProgress {
-                extra_response_metadata: extra_metadata.clone(),
-                completed_attempt_records: prior_attempt_records.clone(),
-                current_attempt: Some(
-                    started
-                        .info
-                        .clone()
-                        .into_final_context(extra_metadata.clone(), RawPayloads::default()),
-                ),
-            }));
-            let observer = shielded_retry_observer(
-                &runtime,
-                ShieldedRetryObserverInput {
-                    downstream_mode: runtime.liveness.mode.downstream_mode(),
-                    downstream_status: upstream_status,
-                    downstream_headers: response_headers.clone(),
-                    upstream_mode: UpstreamMode::Streaming,
-                    extra_response_metadata: extra_metadata,
-                    raw_payloads: RawPayloads::default(),
-                    completed_attempt_records: prior_attempt_records.clone(),
-                    final_attempt: None,
-                    attempt_progress: Some(attempt_progress.clone()),
-                },
-            );
-            let aggregate_runtime = runtime.clone();
-            let aggregate = Box::pin(async move {
-                match run_shielded_attempts(
-                    aggregate_runtime,
-                    Some(started),
-                    prior_attempt_records,
-                    false,
-                    Some(attempt_progress),
-                )
-                .await
-                {
-                    ShieldedRunOutcome::Accepted(outcome) => {
-                        Ok(ShieldedAggregateOutcome::Accepted(outcome))
-                    }
-                    ShieldedRunOutcome::DirectRelay(outcome) => {
-                        Ok(ShieldedAggregateOutcome::DirectRelay(outcome))
-                    }
-                    ShieldedRunOutcome::Failed(failure) => Err(failure),
-                    ShieldedRunOutcome::TerminalForward(terminal) => Err(terminal_forward_failure(
-                        terminal,
-                        "non-retryable upstream response after shielded retry",
-                    )),
-                }
-            });
-            let aggregate = maybe_detach_shielded_aggregate(aggregate, &runtime.retry_policy);
-            let response_body = ShieldedLivenessBody::new(
-                aggregate,
-                runtime.liveness.mode,
-                if runtime.chat_kind == ShieldedChatKind::Stream {
-                    ShieldedAcceptedResponseMode::OpenAiSse
-                } else {
-                    ShieldedAcceptedResponseMode::JsonCompletion
-                },
-                runtime.liveness.heartbeat_interval_secs,
-                observer,
-                in_flight_permit,
-            );
-            Ok(response_with_headers(
-                upstream_status,
-                response_headers,
-                Body::from_stream(response_body),
-            ))
-        }
+        } => Ok(shielded_liveness_stream_response(
+            &runtime,
+            started,
+            prior_attempt_records,
+            in_flight_permit,
+        )),
         ShieldedBeginOutcome::Failed(failure) => Ok(shielded_retry_error_response(
             &runtime,
             failure,
@@ -4984,6 +5271,99 @@ async fn forward_shielded_chat_with_retries(
             shielded_retry_terminal_forward_response(&runtime, terminal, in_flight_permit).await,
         ),
     }
+}
+
+fn shielded_liveness_stream_response(
+    runtime: &ShieldedRetryRuntime,
+    started: ShieldedStartedAttempt,
+    prior_attempt_records: Vec<AttemptRecord>,
+    in_flight_permit: InFlightPermit,
+) -> Response<Body> {
+    let upstream_status = started.info.upstream_status;
+    let upstream_content_type = started
+        .info
+        .upstream_headers
+        .get(CONTENT_TYPE)
+        .map(header_value);
+    let response_headers = shielded_chat_stream_response_headers(
+        &started.info.upstream_headers,
+        runtime.liveness.mode,
+    );
+    let extra_metadata =
+        shielded_liveness_response_metadata(&runtime.liveness, upstream_content_type);
+    let attempt_progress = Arc::new(Mutex::new(ShieldedAttemptProgress {
+        extra_response_metadata: extra_metadata.clone(),
+        completed_attempt_records: prior_attempt_records.clone(),
+        current_attempt: Some(
+            started
+                .info
+                .clone()
+                .into_final_context(extra_metadata.clone(), RawPayloads::default()),
+        ),
+    }));
+    let observer = shielded_retry_observer(
+        runtime,
+        ShieldedRetryObserverInput {
+            downstream_mode: runtime.liveness.mode.downstream_mode(),
+            downstream_status: upstream_status,
+            downstream_headers: response_headers.clone(),
+            upstream_mode: UpstreamMode::Streaming,
+            extra_response_metadata: extra_metadata,
+            raw_payloads: RawPayloads::default(),
+            completed_attempt_records: prior_attempt_records.clone(),
+            final_attempt: None,
+            attempt_progress: Some(attempt_progress.clone()),
+        },
+    );
+    let aggregate_runtime = runtime.clone();
+    let aggregate = Box::pin(async move {
+        match run_shielded_attempts(
+            aggregate_runtime,
+            Some(started),
+            prior_attempt_records,
+            false,
+            Some(attempt_progress),
+        )
+        .await
+        {
+            ShieldedRunOutcome::Accepted(outcome) => {
+                Ok(ShieldedAggregateOutcome::Accepted(outcome))
+            }
+            ShieldedRunOutcome::DirectRelay(outcome) => {
+                Ok(ShieldedAggregateOutcome::DirectRelay(outcome))
+            }
+            ShieldedRunOutcome::Failed(failure) => Err(failure),
+            ShieldedRunOutcome::TerminalForward(terminal) => Err(terminal_forward_failure(
+                terminal,
+                "non-retryable upstream response after shielded retry",
+            )),
+        }
+    });
+    let aggregate = maybe_detach_shielded_aggregate(aggregate, &runtime.retry_policy);
+    let liveness_settings = ShieldedLivenessBodySettings {
+        mode: runtime.liveness.mode,
+        accepted_response_mode: if runtime.chat_kind == ShieldedChatKind::Stream {
+            ShieldedAcceptedResponseMode::OpenAiSse
+        } else {
+            ShieldedAcceptedResponseMode::JsonCompletion
+        },
+        interval_secs: runtime.liveness.heartbeat_interval_secs,
+        #[cfg(test)]
+        shielded_heartbeat_ticks: runtime.shielded_heartbeat_ticks.clone(),
+    };
+    let response_body = ShieldedLivenessBody::new(
+        aggregate,
+        &liveness_settings,
+        observer,
+        in_flight_permit,
+        runtime.shutdown.subscribe(),
+        runtime.downstream_drop_signal.clone(),
+    );
+    response_with_headers(
+        upstream_status,
+        response_headers,
+        Body::from_stream(response_body),
+    )
 }
 
 async fn immediate_shielded_retry_response(
@@ -5061,11 +5441,7 @@ async fn shielded_start_failure_step(
     attempt_records: &mut Vec<AttemptRecord>,
 ) -> ShieldedStartFailureStep {
     let next_retry_cause = failure.retry_cause;
-    let can_retry = next_retry_cause.is_some_and(|_cause| {
-        runtime
-            .retry_policy
-            .allows_retry_after(failure.attempt_number)
-    });
+    let can_retry = should_retry_after_shielded_failure(runtime, &failure);
     #[cfg(feature = "upstream-hot-restart")]
     let (failure, can_retry, terminal) = {
         let mut failure = failure;
@@ -5083,11 +5459,7 @@ async fn shielded_start_failure_step(
     };
     attempt_records.push(attempt_failure_record(
         &failure,
-        if can_retry {
-            AttemptStatus::Retried
-        } else {
-            AttemptStatus::Failed
-        },
+        shielded_failed_attempt_status(can_retry, &failure),
         if can_retry { next_retry_cause } else { None },
         &runtime.retry_policy,
     ));
@@ -5176,12 +5548,12 @@ async fn shielded_retryable_status_step(
     cause: ShieldedRetryCause,
     attempt_records: &mut Vec<AttemptRecord>,
 ) -> ShieldedAttemptStep {
-    let can_retry = runtime.retry_policy.allows_retry_after(info.attempt_number);
     let failure = status_failure(
         info,
         cause,
         "retryable upstream status before shielded stream",
     );
+    let can_retry = should_retry_after_shielded_failure(runtime, &failure);
     #[cfg(feature = "upstream-hot-restart")]
     let (failure, can_retry, terminal) = {
         let mut failure = failure;
@@ -5285,16 +5657,21 @@ async fn aggregate_shielded_attempt(
 ) -> Result<ShieldedAggregatedAttempt, ShieldedAttemptFailure> {
     let request_id = runtime.request_id.as_str().to_owned();
     let request_model_id = runtime.model_id.clone();
-    match shielded_chat::aggregate_stream(
+    let aggregate = shielded_chat::aggregate_stream(
         started.response.bytes_stream(),
         started.info.started_at_unix_ms,
         &request_id,
         request_model_id.as_deref(),
         runtime.loop_context.clone(),
         runtime.upstream_stall_policy.idle_timeout(),
-    )
-    .await
-    {
+    );
+    let mut shutdown = runtime.shutdown.subscribe();
+    let result = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Err(shutdown_shielded_attempt_failure(&started.info)),
+        result = aggregate => result,
+    };
+    match result {
         Ok(aggregated) => Ok(ShieldedAggregatedAttempt {
             final_attempt: started.info.into_final_context(
                 aggregated.response_metadata.clone(),
@@ -5418,7 +5795,7 @@ async fn run_shielded_attempts(
                 failure.response_metadata.extend(recovery_gate.metadata);
                 let attempt_record = attempt_failure_record(
                     &failure,
-                    retry_attempt_status(can_retry),
+                    shielded_failed_attempt_status(can_retry, &failure),
                     retry_cause_for_attempt_record(can_retry, next_retry_cause),
                     &runtime.retry_policy,
                 );
@@ -5496,12 +5873,21 @@ fn no_thinking_direct_relay_metadata() -> BTreeMap<String, String> {
     ])
 }
 
-const fn retry_attempt_status(can_retry: bool) -> AttemptStatus {
+fn shielded_failed_attempt_status(
+    can_retry: bool,
+    failure: &ShieldedAttemptFailure,
+) -> AttemptStatus {
     if can_retry {
         AttemptStatus::Retried
+    } else if is_server_shutdown_failure(failure) {
+        AttemptStatus::Aborted
     } else {
         AttemptStatus::Failed
     }
+}
+
+fn is_server_shutdown_failure(failure: &ShieldedAttemptFailure) -> bool {
+    failure.abort_reason.as_deref() == Some(SERVER_SHUTDOWN_ABORT_REASON)
 }
 
 const fn retry_cause_for_attempt_record(
@@ -5515,7 +5901,9 @@ fn should_retry_after_shielded_failure(
     runtime: &ShieldedRetryRuntime,
     failure: &ShieldedAttemptFailure,
 ) -> bool {
-    failure.retry_cause.is_some()
+    !is_server_shutdown_failure(failure)
+        && failure.retry_cause.is_some()
+        && !runtime.downstream_drop_signal.is_dropped()
         && runtime
             .retry_policy
             .allows_retry_after(failure.attempt_number)
@@ -6231,13 +6619,14 @@ async fn start_shielded_attempt(
         &attempt_plan,
         cot_salvage,
     );
-    match send_upstream_request(
+    match send_upstream_request_until_shutdown(
         &runtime.client,
         runtime.method.clone(),
         runtime.upstream_url.clone(),
         &runtime.downstream_headers,
         upstream_body,
         runtime.upstream_timeout,
+        runtime.shutdown.subscribe(),
     )
     .await
     {
@@ -6262,44 +6651,78 @@ async fn start_shielded_attempt(
                 response,
             })
         }
-        Err(error) => {
-            let finished_at_unix_ms = unix_time_millis();
-            let retry_cause = transport_retry_cause(&error);
-            let mut response_metadata = failed_response_metadata(
-                attempt_started_at_unix_ms,
-                finished_at_unix_ms,
-                error.error_type(),
-            );
-            response_metadata.insert(
-                String::from("upstream_response_received"),
-                String::from("false"),
-            );
-            Err(ShieldedAttemptFailure {
+        Err(error) => Err(shielded_start_transport_failure(
+            ShieldedStartFailureInput {
+                runtime,
                 attempt_id,
-                request_id: runtime.request_id.clone(),
                 attempt_number,
-                started_at_unix_ms: attempt_started_at_unix_ms,
-                finished_at_unix_ms,
-                upstream_mode: UpstreamMode::NotApplicable,
-                http_status: None,
-                #[cfg(feature = "upstream-hot-restart")]
-                transport_failure: match &error {
-                    ProxyError::UpstreamTransport { failure, .. } => Some(*failure),
-                    _ => None,
-                },
-                error_type: error.error_type(),
-                error_message: error.to_string(),
-                retry_cause,
-                abort_reason: None,
+                attempt_started_at_unix_ms,
                 request_metadata,
-                response_metadata,
-                raw_payloads: RawPayloads {
-                    input: raw_request_body,
-                    ..RawPayloads::default()
-                },
-                upstream_body: evidence_upstream_body,
-            })
-        }
+                raw_request_body,
+                evidence_upstream_body,
+                error,
+            },
+        )),
+    }
+}
+
+struct ShieldedStartFailureInput<'runtime> {
+    runtime: &'runtime ShieldedRetryRuntime,
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    attempt_started_at_unix_ms: u64,
+    request_metadata: BTreeMap<String, String>,
+    raw_request_body: Option<String>,
+    evidence_upstream_body: Bytes,
+    error: ProxyError,
+}
+
+fn shielded_start_transport_failure(
+    input: ShieldedStartFailureInput<'_>,
+) -> ShieldedAttemptFailure {
+    let finished_at_unix_ms = unix_time_millis();
+    let retry_cause = if matches!(input.error, ProxyError::Shutdown { .. }) {
+        None
+    } else {
+        transport_retry_cause(&input.error)
+    };
+    let abort_reason = input.error.abort_reason().map(str::to_owned);
+    let mut response_metadata = failed_response_metadata(
+        input.attempt_started_at_unix_ms,
+        finished_at_unix_ms,
+        input.error.error_type(),
+    );
+    response_metadata.insert(
+        String::from("upstream_response_received"),
+        String::from("false"),
+    );
+    if let Some(reason) = &abort_reason {
+        response_metadata.insert(String::from("abort_reason"), reason.clone());
+    }
+    ShieldedAttemptFailure {
+        attempt_id: input.attempt_id,
+        request_id: input.runtime.request_id.clone(),
+        attempt_number: input.attempt_number,
+        started_at_unix_ms: input.attempt_started_at_unix_ms,
+        finished_at_unix_ms,
+        upstream_mode: UpstreamMode::NotApplicable,
+        http_status: None,
+        #[cfg(feature = "upstream-hot-restart")]
+        transport_failure: match &input.error {
+            ProxyError::UpstreamTransport { failure, .. } => Some(*failure),
+            _ => None,
+        },
+        error_type: input.error.error_type(),
+        error_message: input.error.to_string(),
+        retry_cause,
+        abort_reason,
+        request_metadata: input.request_metadata,
+        response_metadata,
+        raw_payloads: RawPayloads {
+            input: input.raw_request_body,
+            ..RawPayloads::default()
+        },
+        upstream_body: input.evidence_upstream_body,
     }
 }
 
@@ -6662,6 +7085,45 @@ fn aggregation_failure(
     }
 }
 
+fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAttemptFailure {
+    let finished_at_unix_ms = unix_time_millis();
+    let mut response_metadata = failed_response_metadata(
+        info.started_at_unix_ms,
+        finished_at_unix_ms,
+        PROXY_SHUTTING_DOWN_ERROR_TYPE,
+    );
+    response_metadata.insert(
+        String::from("upstream_response_received"),
+        String::from("true"),
+    );
+    response_metadata.insert(
+        String::from("abort_reason"),
+        SERVER_SHUTDOWN_ABORT_REASON.to_owned(),
+    );
+    ShieldedAttemptFailure {
+        attempt_id: info.attempt_id.clone(),
+        request_id: info.request_id.clone(),
+        attempt_number: info.attempt_number,
+        started_at_unix_ms: info.started_at_unix_ms,
+        finished_at_unix_ms,
+        upstream_mode: info.upstream_mode,
+        http_status: Some(info.upstream_status.as_u16()),
+        #[cfg(feature = "upstream-hot-restart")]
+        transport_failure: None,
+        error_type: PROXY_SHUTTING_DOWN_ERROR_TYPE,
+        error_message: String::from("proxy is shutting down"),
+        retry_cause: None,
+        abort_reason: Some(SERVER_SHUTDOWN_ABORT_REASON.to_owned()),
+        request_metadata: info.request_metadata.clone(),
+        response_metadata,
+        raw_payloads: RawPayloads {
+            input: info.raw_request_body.clone(),
+            ..RawPayloads::default()
+        },
+        upstream_body: info.upstream_body.clone(),
+    }
+}
+
 fn cot_salvage_context_for_failure(
     runtime: &ShieldedRetryRuntime,
     failure: &ShieldedAttemptFailure,
@@ -6882,24 +7344,41 @@ fn shielded_failure_outcome(
     policy: &ShieldedRetryPolicy,
 ) -> ShieldedFailureOutcome {
     let mut response_metadata = failure.response_metadata.clone();
+    let abort_reason = failure.abort_reason.clone();
+    let request_status = if is_server_shutdown_failure(&failure) {
+        RequestStatus::Aborted
+    } else {
+        RequestStatus::Failed
+    };
     response_metadata.extend(retry_chain_metadata(
         &attempt_records,
         policy,
-        RequestStatus::Failed.as_str(),
+        request_status.as_str(),
     ));
+    if let Some(reason) = &abort_reason {
+        response_metadata.insert(String::from("abort_reason"), reason.clone());
+    }
     let error_type = structured_shielded_error_type(&failure);
+    let downstream_status = if is_server_shutdown_failure(&failure) {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::BAD_GATEWAY
+    };
     ShieldedFailureOutcome {
         error_type,
         error_message: failure.error_message,
         response_metadata,
         attempt_records,
         upstream_mode: failure.upstream_mode,
-        downstream_status: StatusCode::BAD_GATEWAY,
+        downstream_status,
         retry_after_secs: None,
     }
 }
 
 fn structured_shielded_error_type(failure: &ShieldedAttemptFailure) -> &'static str {
+    if is_server_shutdown_failure(failure) {
+        return PROXY_SHUTTING_DOWN_ERROR_TYPE;
+    }
     if matches!(failure.retry_cause, Some(ShieldedRetryCause::LoopDetected))
         || failure.abort_reason.as_deref() == Some("loop_guard")
     {
@@ -6990,7 +7469,12 @@ fn shielded_retry_success_response(
             attempt_progress: None,
         },
     );
-    let response_body = ObservedBufferedBody::new(outcome.body, observer, in_flight_permit);
+    let response_body = ObservedBufferedBody::new(
+        outcome.body,
+        observer,
+        in_flight_permit,
+        runtime.shutdown.subscribe(),
+    );
     response_with_headers(
         upstream_status,
         response_headers,
@@ -7016,6 +7500,10 @@ fn shielded_retry_error_response(
             .upstream_failure_counters
             .increment(UpstreamFailureCause::from_code(cause));
     }
+    let is_shutdown_failure = failure
+        .response_metadata
+        .get("abort_reason")
+        .is_some_and(|reason| reason == SERVER_SHUTDOWN_ABORT_REASON);
     let mut response_headers = json_response_headers(body.len());
     if let Some(retry_after_secs) = failure.retry_after_secs
         && let Ok(value) = HeaderValue::from_str(&retry_after_secs.to_string())
@@ -7037,9 +7525,18 @@ fn shielded_retry_error_response(
             attempt_progress: None,
         },
     );
-    let completion = BodyCompletion::UpstreamStreamError(failure.error_message);
-    let response_body =
-        ObservedBufferedBody::new_with_completion(body, observer, in_flight_permit, completion);
+    let completion = if is_shutdown_failure {
+        BodyCompletion::Shutdown
+    } else {
+        BodyCompletion::UpstreamStreamError(failure.error_message)
+    };
+    let response_body = ObservedBufferedBody::new_with_completion(
+        body,
+        observer,
+        in_flight_permit,
+        completion,
+        runtime.shutdown.subscribe(),
+    );
     let mut response = Response::new(Body::from_stream(response_body));
     *response.status_mut() = downstream_status;
     *response.headers_mut() = response_headers;
@@ -7079,6 +7576,7 @@ async fn shielded_retry_terminal_forward_response(
         terminal.started.response.bytes_stream(),
         observer,
         in_flight_permit,
+        runtime.shutdown.subscribe(),
     );
     let response = downstream_response(
         upstream_status,
@@ -7127,6 +7625,7 @@ async fn shielded_retry_direct_relay_response(
         outcome.started.response.bytes_stream(),
         observer,
         in_flight_permit,
+        runtime.shutdown.subscribe(),
     );
     let response = downstream_response(
         upstream_status,
@@ -7275,7 +7774,10 @@ impl ForwardedBodyObserver {
         let mut attempts = self.completed_attempt_records;
         let mut final_attempt = self.final_attempt;
         let paired_shadow_runtime = self.paired_shadow_runtime;
-        if matches!(completion, BodyCompletion::DownstreamDropped) {
+        if matches!(
+            completion,
+            BodyCompletion::DownstreamDropped | BodyCompletion::Shutdown
+        ) {
             if let Some(progress) = &self.attempt_progress {
                 let progress = shielded_attempt_progress(progress);
                 attempts = progress.completed_attempt_records.clone();
@@ -7335,10 +7837,52 @@ impl ForwardedBodyObserver {
             &request_record,
             &attempts,
         );
+        log_request_cleanup(
+            &request_record,
+            completion.terminal_reason(),
+            unix_time_millis().saturating_sub(finished_at_unix_ms),
+            evidence_written,
+        );
         if evidence_written && let Some(runtime) = paired_shadow_runtime.as_ref() {
             maybe_schedule_paired_comparison_after_primary(runtime, &request_record, &attempts);
         }
     }
+}
+
+fn log_request_cleanup(
+    request: &RequestRecord,
+    terminal_reason: &'static str,
+    cleanup_latency_ms: u64,
+    evidence_written: bool,
+) {
+    eprintln!(
+        "{}",
+        request_cleanup_log_line(
+            request,
+            terminal_reason,
+            cleanup_latency_ms,
+            evidence_written
+        )
+    );
+}
+
+fn request_cleanup_log_line(
+    request: &RequestRecord,
+    terminal_reason: &'static str,
+    cleanup_latency_ms: u64,
+    evidence_written: bool,
+) -> String {
+    format!(
+        "llm_guard_proxy_request_cleanup request_id={} status={} terminal_reason={} cleanup_latency_ms={} http_status={} downstream_mode={} upstream_mode={} evidence_written={}",
+        request.request_id.as_str(),
+        request.status.as_str(),
+        terminal_reason,
+        cleanup_latency_ms,
+        request.http_status.unwrap_or(0),
+        request.downstream_mode.as_str(),
+        request.upstream_mode.as_str(),
+        evidence_written
+    )
 }
 
 fn final_attempt_record(
@@ -7455,6 +7999,7 @@ enum BodyCompletion {
     Succeeded,
     UpstreamStreamError(String),
     DownstreamDropped,
+    Shutdown,
 }
 
 impl BodyCompletion {
@@ -7462,7 +8007,7 @@ impl BodyCompletion {
         match self {
             Self::Succeeded => RequestStatus::Succeeded,
             Self::UpstreamStreamError(_) => RequestStatus::Failed,
-            Self::DownstreamDropped => RequestStatus::Aborted,
+            Self::DownstreamDropped | Self::Shutdown => RequestStatus::Aborted,
         }
     }
 
@@ -7470,21 +8015,31 @@ impl BodyCompletion {
         match self {
             Self::Succeeded => AttemptStatus::Succeeded,
             Self::UpstreamStreamError(_) => AttemptStatus::Failed,
-            Self::DownstreamDropped => AttemptStatus::Aborted,
+            Self::DownstreamDropped | Self::Shutdown => AttemptStatus::Aborted,
         }
     }
 
     fn error_reason(&self) -> Option<String> {
         match self {
             Self::UpstreamStreamError(error) => Some(format!("upstream_stream_error: {error}")),
-            Self::Succeeded | Self::DownstreamDropped => None,
+            Self::Succeeded | Self::DownstreamDropped | Self::Shutdown => None,
         }
     }
 
     fn abort_reason(&self) -> Option<String> {
         match self {
             Self::DownstreamDropped => Some(String::from("downstream_body_dropped_before_eof")),
+            Self::Shutdown => Some(String::from("server_shutdown")),
             Self::Succeeded | Self::UpstreamStreamError(_) => None,
+        }
+    }
+
+    const fn terminal_reason(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::UpstreamStreamError(_) => "upstream_stream_error",
+            Self::DownstreamDropped => "downstream_disconnect",
+            Self::Shutdown => "server_shutdown",
         }
     }
 }
@@ -7493,6 +8048,7 @@ struct ObservedUpstreamBody {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: InFlightPermit,
+    shutdown: ShutdownSubscription,
     bytes_seen: u64,
     terminal_completion: BodyCompletion,
 }
@@ -7502,12 +8058,14 @@ impl ObservedUpstreamBody {
         stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
+        shutdown: ShutdownSubscription,
     ) -> Self {
         Self::new_with_completion(
             stream,
             observer,
             in_flight_permit,
             BodyCompletion::Succeeded,
+            shutdown,
         )
     }
 
@@ -7516,11 +8074,13 @@ impl ObservedUpstreamBody {
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
         terminal_completion: BodyCompletion,
+        shutdown: ShutdownSubscription,
     ) -> Self {
         Self {
             inner: Box::pin(stream),
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
+            shutdown,
             bytes_seen: 0,
             terminal_completion,
         }
@@ -7538,6 +8098,10 @@ impl Stream for ObservedUpstreamBody {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        if this.shutdown.poll_shutdown(cx).is_ready() {
+            this.record_once(&BodyCompletion::Shutdown);
+            return Poll::Ready(None);
+        }
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -7571,13 +8135,25 @@ struct ObservedBufferedBody {
     body: Option<Bytes>,
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: InFlightPermit,
+    shutdown: ShutdownSubscription,
     bytes_seen: u64,
     terminal_completion: BodyCompletion,
 }
 
 impl ObservedBufferedBody {
-    fn new(body: Bytes, observer: ForwardedBodyObserver, in_flight_permit: InFlightPermit) -> Self {
-        Self::new_with_completion(body, observer, in_flight_permit, BodyCompletion::Succeeded)
+    fn new(
+        body: Bytes,
+        observer: ForwardedBodyObserver,
+        in_flight_permit: InFlightPermit,
+        shutdown: ShutdownSubscription,
+    ) -> Self {
+        Self::new_with_completion(
+            body,
+            observer,
+            in_flight_permit,
+            BodyCompletion::Succeeded,
+            shutdown,
+        )
     }
 
     fn new_with_completion(
@@ -7585,11 +8161,13 @@ impl ObservedBufferedBody {
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
         terminal_completion: BodyCompletion,
+        shutdown: ShutdownSubscription,
     ) -> Self {
         Self {
             body: (!body.is_empty()).then_some(body),
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
+            shutdown,
             bytes_seen: 0,
             terminal_completion,
         }
@@ -7605,7 +8183,7 @@ impl ObservedBufferedBody {
 impl Stream for ObservedBufferedBody {
     type Item = Result<Bytes, Infallible>;
 
-    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
         if let Some(body) = this.body.take() {
             let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
@@ -7614,6 +8192,11 @@ impl Stream for ObservedBufferedBody {
                 std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded);
             this.record_once(&completion);
             return Poll::Ready(Some(Ok(body)));
+        }
+
+        if this.shutdown.poll_shutdown(cx).is_ready() {
+            this.record_once(&BodyCompletion::Shutdown);
+            return Poll::Ready(None);
         }
 
         let completion =
@@ -7644,6 +8227,14 @@ enum ShieldedAcceptedResponseMode {
     OpenAiSse,
 }
 
+struct ShieldedLivenessBodySettings {
+    mode: ShieldedLivenessMode,
+    accepted_response_mode: ShieldedAcceptedResponseMode,
+    interval_secs: u64,
+    #[cfg(test)]
+    shielded_heartbeat_ticks: Arc<AtomicU64>,
+}
+
 struct ShieldedLivenessBody {
     aggregate: ShieldedAggregateFuture,
     direct_stream: Option<DirectRelayStream>,
@@ -7652,6 +8243,10 @@ struct ShieldedLivenessBody {
     accepted_response_mode: ShieldedAcceptedResponseMode,
     observer: Option<ForwardedBodyObserver>,
     _in_flight_permit: InFlightPermit,
+    shutdown: ShutdownSubscription,
+    downstream_drop_signal: DownstreamDropSignal,
+    #[cfg(test)]
+    shielded_heartbeat_ticks: Arc<AtomicU64>,
     bytes_seen: u64,
     terminal_completion: Option<BodyCompletion>,
     json_prefix_pending: bool,
@@ -7660,26 +8255,30 @@ struct ShieldedLivenessBody {
 impl ShieldedLivenessBody {
     fn new(
         aggregate: ShieldedAggregateFuture,
-        mode: ShieldedLivenessMode,
-        accepted_response_mode: ShieldedAcceptedResponseMode,
-        interval_secs: u64,
+        settings: &ShieldedLivenessBodySettings,
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
+        shutdown: ShutdownSubscription,
+        downstream_drop_signal: DownstreamDropSignal,
     ) -> Self {
-        let period = Duration::from_secs(interval_secs);
+        let period = Duration::from_secs(settings.interval_secs);
         let mut interval = tokio::time::interval_at(Instant::now() + period, period);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
             aggregate,
             direct_stream: None,
             interval,
-            mode,
-            accepted_response_mode,
+            mode: settings.mode,
+            accepted_response_mode: settings.accepted_response_mode,
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
+            shutdown,
+            downstream_drop_signal,
+            #[cfg(test)]
+            shielded_heartbeat_ticks: settings.shielded_heartbeat_ticks.clone(),
             bytes_seen: 0,
             terminal_completion: None,
-            json_prefix_pending: mode == ShieldedLivenessMode::JsonWhitespace,
+            json_prefix_pending: settings.mode == ShieldedLivenessMode::JsonWhitespace,
         }
     }
 
@@ -7775,6 +8374,10 @@ impl Stream for ShieldedLivenessBody {
             this.record_once(&completion);
             return Poll::Ready(None);
         }
+        if this.shutdown.poll_shutdown(cx).is_ready() {
+            this.record_once(&BodyCompletion::Shutdown);
+            return Poll::Ready(None);
+        }
 
         if this.json_prefix_pending {
             this.json_prefix_pending = false;
@@ -7825,7 +8428,11 @@ impl Stream for ShieldedLivenessBody {
         }
 
         match Pin::new(&mut this.interval).poll_tick(cx) {
-            Poll::Ready(_instant) => this.count_and_emit(heartbeat_chunk(this.mode)),
+            Poll::Ready(_instant) => {
+                #[cfg(test)]
+                this.shielded_heartbeat_ticks.fetch_add(1, Ordering::SeqCst);
+                this.count_and_emit(heartbeat_chunk(this.mode))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -7835,7 +8442,8 @@ impl Drop for ShieldedLivenessBody {
     fn drop(&mut self) {
         if let Some(completion) = self.terminal_completion.take() {
             self.record_once(&completion);
-        } else {
+        } else if self.observer.is_some() {
+            self.downstream_drop_signal.mark_dropped();
             self.record_once(&BodyCompletion::DownstreamDropped);
         }
     }
@@ -8721,13 +9329,26 @@ fn failed_attempt_record(input: FailedAttemptRecordInput<'_>) -> AttemptRecord {
     }
 }
 
+fn shutdown_attempt_record(mut record: AttemptRecord) -> AttemptRecord {
+    record.status = AttemptStatus::Aborted;
+    record.retry_reason = None;
+    record.abort_reason = Some(SERVER_SHUTDOWN_ABORT_REASON.to_owned());
+    record.response_metadata.insert(
+        String::from("abort_reason"),
+        SERVER_SHUTDOWN_ABORT_REASON.to_owned(),
+    );
+    record
+}
+
 struct FailedRequestRecord {
     request_id: RequestId,
     started_at_unix_ms: u64,
     finished_at_unix_ms: u64,
+    status: RequestStatus,
     http_status: u16,
     error_type: &'static str,
     error_reason: String,
+    abort_reason: Option<&'static str>,
     request_metadata: BTreeMap<String, String>,
     attempts: Vec<AttemptRecord>,
 }
@@ -8737,12 +9358,13 @@ fn record_queued_admission_cancel(record: QueuedAdmissionCancelRecord) {
     let finished_at_unix_ms = unix_time_millis();
     let queue_wait_ms = duration_millis_u64(record.queued_at.elapsed());
     let error_type = "proxy_generation_queue_cancelled";
-    let abort_reason = "downstream_disconnected_while_queued";
+    let reason = QueueCancellationReason::DownstreamDisconnected;
+    let abort_reason = reason.abort_reason();
     let mut request_metadata = context.request_metadata;
     request_metadata.extend(BTreeMap::from([
         (
             String::from("admission_outcome"),
-            String::from("queue_cancelled"),
+            reason.admission_outcome().to_owned(),
         ),
         (String::from("queue_wait_ms"), queue_wait_ms.to_string()),
         (
@@ -8770,6 +9392,15 @@ fn record_queued_admission_cancel(record: QueuedAdmissionCancelRecord) {
         raw_payloads: RawPayloads::default(),
     };
     record_observability_many(&context.store, &request_record, &[]);
+    log_request_cleanup(
+        &request_record,
+        failed_request_terminal_reason(
+            request_record.status,
+            request_record.abort_reason.as_deref(),
+        ),
+        unix_time_millis().saturating_sub(finished_at_unix_ms),
+        false,
+    );
 }
 
 fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecord) {
@@ -8789,15 +9420,42 @@ fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecor
         upstream_mode: UpstreamMode::NotApplicable,
         model_id: None,
         input_fingerprint: None,
-        status: RequestStatus::Failed,
+        status: failure.status,
         http_status: Some(failure.http_status),
         error_reason: Some(format!("{}: {}", failure.error_type, failure.error_reason)),
-        abort_reason: None,
+        abort_reason: failure.abort_reason.map(str::to_owned),
         request_metadata: failure.request_metadata,
         response_metadata,
         raw_payloads: RawPayloads::default(),
     };
     record_observability_many(store, &request_record, &failure.attempts);
+    log_request_cleanup(
+        &request_record,
+        failed_request_terminal_reason(
+            request_record.status,
+            request_record.abort_reason.as_deref(),
+        ),
+        unix_time_millis().saturating_sub(failure.finished_at_unix_ms),
+        false,
+    );
+}
+
+fn failed_request_terminal_reason(
+    status: RequestStatus,
+    abort_reason: Option<&str>,
+) -> &'static str {
+    match (status, abort_reason) {
+        (RequestStatus::Aborted, Some("server_shutdown" | "server_shutdown_while_queued")) => {
+            "server_shutdown"
+        }
+        (
+            RequestStatus::Aborted,
+            Some("downstream_body_dropped_before_eof" | "downstream_disconnected_while_queued"),
+        ) => "downstream_disconnect",
+        (RequestStatus::Aborted, _) => "aborted",
+        (RequestStatus::Failed, _) => "failed",
+        (RequestStatus::Succeeded, _) => "succeeded",
+    }
 }
 
 fn copy_loop_response_metadata(
@@ -8987,6 +9645,9 @@ fn maybe_schedule_paired_comparison_after_primary(
     request: &RequestRecord,
     attempts: &[AttemptRecord],
 ) {
+    if runtime.downstream_drop_signal.is_dropped() {
+        return;
+    }
     let settings = match runtime.config.snapshot() {
         Ok(settings) => settings,
         Err(error) => {
@@ -9067,6 +9728,9 @@ fn maybe_schedule_shadow_continuation(
     failure: &ShieldedAttemptFailure,
     source: &AttemptRecord,
 ) {
+    if runtime.downstream_drop_signal.is_dropped() {
+        return;
+    }
     if failure.retry_cause != Some(ShieldedRetryCause::LoopDetected) {
         return;
     }
@@ -9108,6 +9772,9 @@ fn schedule_shadow_attempt(
     settings: &AppConfig,
     plan: ShadowAttemptPlan,
 ) {
+    if runtime.shutdown.is_shutting_down() || runtime.downstream_drop_signal.is_dropped() {
+        return;
+    }
     let shadow = &settings.evidence.shadow;
     if shadow.max_global_shadow_in_flight == 0 {
         push_shadow_skipped_record(
@@ -9168,6 +9835,7 @@ fn schedule_shadow_attempt(
         upstream_timeout: runtime.upstream_timeout,
         evidence_store: runtime.evidence_store.clone(),
         shadow_evidence: runtime.shadow_evidence.clone(),
+        shutdown: Arc::clone(&runtime.shutdown),
         request_id: runtime.request_id.clone(),
         group_id: runtime.request_id.as_str().to_owned(),
         attempt_id,
@@ -9369,6 +10037,7 @@ struct ShadowContinuationTask {
     upstream_timeout: Duration,
     evidence_store: EvidenceStore,
     shadow_evidence: ShadowEvidenceState,
+    shutdown: Arc<ShutdownGate>,
     request_id: RequestId,
     group_id: String,
     attempt_id: AttemptId,
@@ -9393,28 +10062,48 @@ async fn run_shadow_continuation(task: ShadowContinuationTask) -> ShadowContinua
     let shadow_evidence = task.shadow_evidence.clone();
     let started_at_unix_ms = unix_time_millis();
     let timeout_ms = task.shadow_attempt_timeout_ms;
-    let outcome = timeout(
-        Duration::from_millis(timeout_ms),
-        run_shadow_continuation_request(&task, started_at_unix_ms),
-    )
-    .await;
-    let attempt = match outcome {
-        Ok(attempt) => attempt,
-        Err(_elapsed) => build_shadow_terminal_record(
+    let mut shutdown = task.shutdown.subscribe();
+    let attempt = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => build_shadow_terminal_record(
             &task,
             ShadowTerminalInput {
                 started_at_unix_ms,
                 finished_at_unix_ms: unix_time_millis(),
-                status: EvidenceAttemptStatus::ShadowTimeout,
+                status: EvidenceAttemptStatus::Aborted,
                 http_status: None,
                 response_headers: HeaderMap::new(),
-                response_metadata: BTreeMap::new(),
+                response_metadata: BTreeMap::from([(
+                    String::from("abort_reason"),
+                    SERVER_SHUTDOWN_ABORT_REASON.to_owned(),
+                )]),
                 raw_payloads: RawPayloads::default(),
                 response_body_bytes: 0,
-                error_reason: Some(String::from("shadow continuation timed out")),
-                abort_reason: Some(String::from("shadow_timeout")),
+                error_reason: Some(String::from("shadow continuation cancelled by server shutdown")),
+                abort_reason: Some(SERVER_SHUTDOWN_ABORT_REASON.to_owned()),
             },
         ),
+        outcome = timeout(
+            Duration::from_millis(timeout_ms),
+            run_shadow_continuation_request(&task, started_at_unix_ms),
+        ) => match outcome {
+            Ok(attempt) => attempt,
+            Err(_elapsed) => build_shadow_terminal_record(
+                &task,
+                ShadowTerminalInput {
+                    started_at_unix_ms,
+                    finished_at_unix_ms: unix_time_millis(),
+                    status: EvidenceAttemptStatus::ShadowTimeout,
+                    http_status: None,
+                    response_headers: HeaderMap::new(),
+                    response_metadata: BTreeMap::new(),
+                    raw_payloads: RawPayloads::default(),
+                    response_body_bytes: 0,
+                    error_reason: Some(String::from("shadow continuation timed out")),
+                    abort_reason: Some(String::from("shadow_timeout")),
+                },
+            ),
+        },
     };
     ShadowContinuationRecord {
         evidence_store,
@@ -9935,6 +10624,11 @@ enum ProxyError {
         failure: ListenerUpstreamDenied,
         request_metadata: Option<BTreeMap<String, String>>,
     },
+    #[error("proxy is shutting down")]
+    Shutdown {
+        request_metadata: Option<BTreeMap<String, String>>,
+        attempts: Vec<AttemptRecord>,
+    },
     #[cfg(feature = "guard")]
     #[error("guard workflow blocked request: {reason}")]
     GuardBlocked {
@@ -10026,6 +10720,13 @@ impl ProxyError {
         }
     }
 
+    fn server_shutdown() -> Self {
+        Self::Shutdown {
+            request_metadata: None,
+            attempts: Vec::new(),
+        }
+    }
+
     fn upstream_body(reason: String) -> Self {
         Self::UpstreamBody {
             reason,
@@ -10096,6 +10797,7 @@ impl ProxyError {
             | Self::InvalidMethod { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRequestPath(error) => error.status(),
             Self::Admission { failure, .. } => failure.status(),
+            Self::Shutdown { .. } => StatusCode::SERVICE_UNAVAILABLE,
             #[cfg(feature = "guard")]
             Self::VirtualKeyUnauthorized { .. } => StatusCode::UNAUTHORIZED,
             #[cfg(feature = "guard")]
@@ -10120,6 +10822,7 @@ impl ProxyError {
             Self::InvalidMethod { .. } => "invalid_method",
             Self::Admission { failure, .. } => failure.error_type(),
             Self::ListenerUpstreamDenied { .. } => "listener_upstream_not_allowed",
+            Self::Shutdown { .. } => PROXY_SHUTTING_DOWN_ERROR_TYPE,
             #[cfg(feature = "guard")]
             Self::VirtualKeyUnauthorized { .. } => "virtual_key_unauthorized",
             #[cfg(feature = "guard")]
@@ -10131,6 +10834,48 @@ impl ProxyError {
             Self::ContextBudgetExceeded { .. } => "invalid_request_error",
             Self::UpstreamTransport { .. } => "upstream_transport_error",
             Self::UpstreamBody { .. } => "upstream_body_error",
+        }
+    }
+
+    const fn request_status(&self) -> RequestStatus {
+        match self {
+            Self::Admission { failure, .. } => failure.request_status(),
+            Self::Shutdown { .. } => RequestStatus::Aborted,
+            Self::RequestBody { .. }
+            | Self::ConfigSnapshot { .. }
+            | Self::InvalidUpstreamUrl { .. }
+            | Self::InvalidRequestPath(_)
+            | Self::InvalidMethod { .. }
+            | Self::ListenerUpstreamDenied { .. }
+            | Self::UpstreamTransport { .. }
+            | Self::UpstreamBody { .. }
+            | Self::ContextBudgetExceeded { .. } => RequestStatus::Failed,
+            #[cfg(feature = "guard")]
+            Self::GuardBlocked { .. }
+            | Self::VirtualKeyUnauthorized { .. }
+            | Self::BudgetExceeded { .. }
+            | Self::BudgetStoreFailure { .. } => RequestStatus::Failed,
+        }
+    }
+
+    const fn abort_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::Admission { failure, .. } => failure.abort_reason(),
+            Self::Shutdown { .. } => Some(SERVER_SHUTDOWN_ABORT_REASON),
+            Self::RequestBody { .. }
+            | Self::ConfigSnapshot { .. }
+            | Self::InvalidUpstreamUrl { .. }
+            | Self::InvalidRequestPath(_)
+            | Self::InvalidMethod { .. }
+            | Self::ListenerUpstreamDenied { .. }
+            | Self::UpstreamTransport { .. }
+            | Self::UpstreamBody { .. }
+            | Self::ContextBudgetExceeded { .. } => None,
+            #[cfg(feature = "guard")]
+            Self::GuardBlocked { .. }
+            | Self::VirtualKeyUnauthorized { .. }
+            | Self::BudgetExceeded { .. }
+            | Self::BudgetStoreFailure { .. } => None,
         }
     }
 
@@ -10190,6 +10935,9 @@ impl ProxyError {
             | Self::ListenerUpstreamDenied {
                 request_metadata, ..
             }
+            | Self::Shutdown {
+                request_metadata, ..
+            }
             | Self::ContextBudgetExceeded {
                 request_metadata, ..
             } => request_metadata.as_ref(),
@@ -10226,6 +10974,7 @@ impl ProxyError {
                 attempts.push(observability.attempt_record.clone());
                 attempts
             }
+            Self::Shutdown { attempts, .. } => attempts.clone(),
             Self::RequestBody { .. }
             | Self::ConfigSnapshot { .. }
             | Self::InvalidUpstreamUrl { .. }
@@ -10280,6 +11029,10 @@ impl ProxyError {
             Self::ListenerUpstreamDenied { failure, .. } => Self::ListenerUpstreamDenied {
                 failure,
                 request_metadata: Some(request_metadata),
+            },
+            Self::Shutdown { attempts, .. } => Self::Shutdown {
+                request_metadata: Some(request_metadata),
+                attempts,
             },
             #[cfg(feature = "guard")]
             Self::GuardBlocked { reason, .. } => Self::GuardBlocked {
@@ -10362,6 +11115,10 @@ impl ProxyError {
                     completed_attempt_records: Vec::new(),
                 })),
             },
+            Self::Shutdown { .. } => Self::Shutdown {
+                request_metadata: Some(request_metadata),
+                attempts: vec![shutdown_attempt_record(attempt_record)],
+            },
             error @ (Self::RequestBody { .. }
             | Self::ConfigSnapshot { .. }
             | Self::InvalidUpstreamUrl { .. }
@@ -10405,6 +11162,16 @@ impl ProxyError {
                 Self::UpstreamBody {
                     reason,
                     observability: Some(observability),
+                }
+            }
+            Self::Shutdown {
+                request_metadata,
+                mut attempts,
+            } => {
+                attempts.splice(0..0, completed_attempt_records);
+                Self::Shutdown {
+                    request_metadata,
+                    attempts,
                 }
             }
             error => error,

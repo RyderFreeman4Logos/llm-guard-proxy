@@ -17,8 +17,8 @@ use super::{
     model::{
         AttemptMetricCount, AttemptRecord, DebugRequestSummary, HeartbeatModeMetricCount,
         HistogramBucket, LatencyHistogram, ObservabilityMetricsSnapshot, RawPayloads,
-        RequestMetricCount, RequestRecord, RetentionPruningStats, RetentionUsage, StoreWrite,
-        UpstreamErrorMetricCount,
+        RequestMetricCount, RequestRecord, RequestTerminalMetricCount, RetentionPruningStats,
+        RetentionUsage, StoreWrite, UpstreamErrorMetricCount,
     },
     redaction::{
         debug_safe_metadata_map, redacted_metadata_json, sanitize_optional_text,
@@ -821,6 +821,7 @@ fn read_metrics_snapshot(
 ) -> Result<ObservabilityMetricsSnapshot, ObservabilityError> {
     Ok(ObservabilityMetricsSnapshot {
         request_counts: read_request_metric_counts(connection)?,
+        request_terminal_counts: read_request_terminal_metric_counts(connection)?,
         attempt_counts: read_attempt_metric_counts(connection)?,
         retry_count: read_retry_count(connection)?,
         loop_abort_count: read_loop_abort_count(connection)?,
@@ -900,6 +901,71 @@ ORDER BY status, downstream_mode, upstream_mode, http_status
                     http_status_class,
                     count,
                 }
+            },
+        )
+        .collect())
+}
+
+fn read_request_terminal_metric_counts(
+    connection: &Connection,
+) -> Result<Vec<RequestTerminalMetricCount>, ObservabilityError> {
+    let mut statement = connection
+        .prepare(
+            r"
+SELECT status, abort_reason, http_status, COUNT(*)
+FROM requests
+GROUP BY status, abort_reason, http_status
+ORDER BY status, abort_reason, http_status
+",
+        )
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "prepare request terminal metric counts query",
+            source,
+        })?;
+    let mut rows = statement
+        .query([])
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "query request terminal metric counts",
+            source,
+        })?;
+    let mut counts = BTreeMap::<(String, String, String), u64>::new();
+    while let Some(row) = rows.next().map_err(|source| ObservabilityError::Sqlite {
+        action: "read request terminal metric count row",
+        source,
+    })? {
+        let status: String = row.get(0).map_err(|source| ObservabilityError::Sqlite {
+            action: "decode request terminal metric status",
+            source,
+        })?;
+        let abort_reason: Option<String> =
+            row.get(1).map_err(|source| ObservabilityError::Sqlite {
+                action: "decode request terminal metric abort reason",
+                source,
+            })?;
+        let http_status: Option<i64> = row.get(2).map_err(|source| ObservabilityError::Sqlite {
+            action: "decode request terminal metric HTTP status",
+            source,
+        })?;
+        let count: i64 = row.get(3).map_err(|source| ObservabilityError::Sqlite {
+            action: "decode request terminal metric count",
+            source,
+        })?;
+        let key = (
+            status.clone(),
+            request_terminal_reason(&status, abort_reason.as_deref()).to_owned(),
+            http_status_class(http_status),
+        );
+        let entry = counts.entry(key).or_default();
+        *entry = entry.saturating_add(nonnegative_i64_to_u64(count));
+    }
+    Ok(counts
+        .into_iter()
+        .map(
+            |((status, terminal_reason, http_status_class), count)| RequestTerminalMetricCount {
+                status,
+                terminal_reason,
+                http_status_class,
+                count,
             },
         )
         .collect())
@@ -1004,6 +1070,23 @@ SELECT
             source,
         })?;
     Ok(nonnegative_i64_to_u64(count))
+}
+
+fn request_terminal_reason(status: &str, abort_reason: Option<&str>) -> &'static str {
+    match abort_reason {
+        Some("downstream_body_dropped_before_eof" | "downstream_disconnected_while_queued") => {
+            "downstream_disconnect"
+        }
+        Some("server_shutdown" | "server_shutdown_while_queued") => "server_shutdown",
+        Some("loop_guard") => "loop_guard",
+        Some("upstream_stall") => "upstream_stall",
+        Some("hot_restart_timeout" | "hot_restart_error") => "hot_restart",
+        Some("shadow_timeout") => "shadow_timeout",
+        Some(_) => "other_abort",
+        None if status == "succeeded" => "succeeded",
+        None if status == "failed" => "failed",
+        None => "none",
+    }
 }
 
 fn read_upstream_error_counts(

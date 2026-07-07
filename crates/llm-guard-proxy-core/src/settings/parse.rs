@@ -868,6 +868,10 @@ fn assign_server(
             config.max_request_body_bytes =
                 parse_usize(value, line_number, "server.max_request_body_bytes")?;
         }
+        "shutdown_drain_timeout_ms" => {
+            config.shutdown_drain_timeout_ms =
+                parse_u64(value, line_number, "server.shutdown_drain_timeout_ms")?;
+        }
         _ => return unknown_key("server", key, line_number),
     }
     Ok(())

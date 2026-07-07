@@ -252,6 +252,19 @@ pub struct RequestMetricCount {
     pub count: u64,
 }
 
+/// Low-cardinality request terminal-reason metric row.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestTerminalMetricCount {
+    /// Final request status label.
+    pub status: String,
+    /// Bounded terminal reason bucket.
+    pub terminal_reason: String,
+    /// Downstream HTTP status class label.
+    pub http_status_class: String,
+    /// Row count.
+    pub count: u64,
+}
+
 /// Low-cardinality attempt-count metric row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AttemptMetricCount {
@@ -310,6 +323,8 @@ pub struct LatencyHistogram {
 pub struct ObservabilityMetricsSnapshot {
     /// Request rows grouped by low-cardinality lifecycle labels.
     pub request_counts: Vec<RequestMetricCount>,
+    /// Request rows grouped by bounded terminal reason labels.
+    pub request_terminal_counts: Vec<RequestTerminalMetricCount>,
     /// Attempt rows grouped by low-cardinality lifecycle labels.
     pub attempt_counts: Vec<AttemptMetricCount>,
     /// Attempts that were retried or recorded a retry reason.
