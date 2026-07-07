@@ -13222,7 +13222,7 @@ async fn queued_generation_requests_cancelled_by_shutdown_are_observable() {
         &fake.base_url,
         true,
         1,
-        "max_queued_generation_requests = 1\ngeneration_queue_timeout_ms = 5000\n",
+        "max_queued_generation_requests = 1\ngeneration_queue_timeout_ms = 5000\nshutdown_drain_timeout_ms = 25\n",
     )
     .await;
     let (addr, shutdown_tx, server) = spawn_shutdown_server(proxy.state.clone()).await;

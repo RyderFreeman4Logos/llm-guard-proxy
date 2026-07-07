@@ -330,6 +330,7 @@ impl ProxyState {
         let mut cancel_recorder =
             QueuedAdmissionCancelRecorder::new(record_context, queued_at, timeout_ms);
         let deadline = queued_at + Duration::from_millis(timeout_ms);
+        let mut shutdown = self.shutdown.subscribe();
         loop {
             if self.shutdown.is_shutting_down() {
                 return Err(AdmissionFailure::ShuttingDown {
@@ -359,9 +360,14 @@ impl ProxyState {
                 });
             }
 
-            limiter
-                .wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL))
-                .await;
+            tokio::select! {
+                () = limiter.wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL)) => {}
+                () = shutdown.cancelled() => {
+                    return Err(AdmissionFailure::ShuttingDown {
+                        queued: cancel_recorder.shutdown_cancellation(),
+                    });
+                }
+            }
         }
     }
 
@@ -428,6 +434,7 @@ impl ProxyState {
         let mut cancel_recorder =
             QueuedAdmissionCancelRecorder::new(record_context, queued_at, timeout_ms);
         let deadline = queued_at + Duration::from_millis(timeout_ms);
+        let mut shutdown = self.shutdown.subscribe();
         loop {
             if self.shutdown.is_shutting_down() {
                 return Err(AdmissionFailure::ShuttingDown {
@@ -471,9 +478,14 @@ impl ProxyState {
                 });
             }
 
-            limiter
-                .wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL))
-                .await;
+            tokio::select! {
+                () = limiter.wait_for_capacity(remaining.min(IN_FLIGHT_CAPACITY_RECHECK_INTERVAL)) => {}
+                () = shutdown.cancelled() => {
+                    return Err(AdmissionFailure::ShuttingDown {
+                        queued: cancel_recorder.shutdown_cancellation(),
+                    });
+                }
+            }
         }
     }
 
