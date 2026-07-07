@@ -18,6 +18,7 @@ pub mod gwp;
 mod loop_detector;
 #[cfg(feature = "guard")]
 mod model_alias;
+pub mod model_judge;
 mod observability;
 #[cfg(feature = "guard")]
 pub mod profile;
@@ -67,6 +68,11 @@ pub use loop_detector::{
 pub use model_alias::{
     AliasKind, AliasResolutionError, AliasTarget, DEFAULT_WORKFLOW_TIMEOUT_MS,
     MAX_WORKFLOW_TIMEOUT_MS, ModelAliasConfig, ModelAliasResolver,
+};
+pub use model_judge::{
+    AnswerCandidate, ChannelMetrics, ChannelSnapshot, CleanReasoningState, JudgePromptBuilder,
+    JudgeSeverity, JudgeSnapshot, LoopJudgeResult, LoopType, ProvenanceFact, RecommendedAction,
+    SnapshotChannels, TaskKind, ToolState, WindowSpan,
 };
 pub use observability::{
     AttemptId, AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary,
