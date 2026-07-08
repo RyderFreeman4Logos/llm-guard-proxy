@@ -4516,6 +4516,97 @@ thinking_mode = "force_disable"
 }
 
 #[tokio::test]
+async fn bounded_cot_salvage_is_one_shot_before_final_no_thinking_direct_relay() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+on_reasoning_loop = "bounded_answer_from_cot"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 4
+anti_loop_hint_enabled = true
+shielded_streaming_enabled = true
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking-deep"
+thinking_mode = "force_thinking"
+thinking_token_budget = 16384
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+thinking_token_budget = 8192
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-reasoning-hundreds",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream":true}"#,
+        )
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("stream body should be text");
+    assert!(!body.contains("event: error"));
+    assert!(!body.contains("llm_guard_loop_retry_exhausted"));
+
+    let first_attempt = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+    let third_attempt = fake.recv_next().await;
+    let fourth_attempt = fake.recv_next().await;
+    assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
+    assert_eq!(body_thinking_budget(&second_attempt.body), Some(1_024));
+    assert_eq!(body_thinking_budget(&third_attempt.body), Some(8_192));
+    assert_eq!(body_thinking_budget(&fourth_attempt.body), Some(0));
+
+    let second_body_text = String::from_utf8_lossy(&second_attempt.body);
+    let third_body_text = String::from_utf8_lossy(&third_attempt.body);
+    let fourth_body_text = String::from_utf8_lossy(&fourth_attempt.body);
+    assert!(second_body_text.contains("llm-guard-proxy CoT salvage retry hint"));
+    assert!(!third_body_text.contains("llm-guard-proxy CoT salvage retry hint"));
+    assert!(!fourth_body_text.contains("llm-guard-proxy CoT salvage retry hint"));
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 4);
+    assert_eq!(attempts[1].response_metadata["cot_salvage_used"], "true");
+    assert_eq!(attempts[2].response_metadata["cot_salvage_used"], "false");
+    assert_eq!(attempts[3].response_metadata["attempt_name"], "no-thinking");
+    assert_eq!(attempts[3].response_metadata["cot_salvage_used"], "false");
+    assert_eq!(
+        attempts[3].response_metadata["attempt_thinking_mode"],
+        "force_disable"
+    );
+    assert_eq!(
+        attempts[3].response_metadata["shielded_direct_streaming_relay"],
+        "true"
+    );
+}
+
+#[tokio::test]
 async fn retry_anti_loop_hint_stays_single_message_across_repeated_loop_retries() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(

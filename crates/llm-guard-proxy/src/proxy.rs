@@ -5699,6 +5699,7 @@ async fn run_shielded_attempts(
         .map_or(1, |attempt| attempt.info.attempt_number);
     let mut retry_cause = None;
     let mut cot_salvage = None;
+    let mut cot_salvage_attempted = false;
     loop {
         let started = if let Some(started) = current_attempt.take() {
             started
@@ -5780,11 +5781,12 @@ async fn run_shielded_attempts(
             Err(mut failure) => {
                 let next_retry_cause = failure.retry_cause;
                 let mut can_retry = should_retry_after_shielded_failure(&runtime, &failure);
-                let next_cot_salvage = if can_retry && cot_salvage.is_none() {
-                    cot_salvage_context_for_failure(&runtime, &failure)
-                } else {
-                    None
-                };
+                let next_cot_salvage =
+                    if can_retry && cot_salvage.is_none() && !cot_salvage_attempted {
+                        cot_salvage_context_for_failure(&runtime, &failure)
+                    } else {
+                        None
+                    };
                 let recovery_gate = recovery_gate_for_retryable_upstream_stall(
                     &runtime,
                     can_retry,
@@ -5805,6 +5807,9 @@ async fn run_shielded_attempts(
                 if can_retry {
                     attempt_number = failure.attempt_number.saturating_add(1);
                     retry_cause = next_retry_cause;
+                    if next_cot_salvage.is_some() {
+                        cot_salvage_attempted = true;
+                    }
                     cot_salvage = next_cot_salvage;
                     continue;
                 }
