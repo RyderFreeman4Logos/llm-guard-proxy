@@ -130,6 +130,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "loop_guard.embedding.vector_dim",
     "retry.enabled",
     "retry.max_attempts",
+    "retry.request_deadline_ms",
     "retry.anti_loop_hint_enabled",
     "retry.shielded_streaming_enabled",
     "retry.downstream_drop_policy",

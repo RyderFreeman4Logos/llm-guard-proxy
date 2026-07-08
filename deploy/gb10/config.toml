@@ -306,24 +306,37 @@ input_overlap_threshold_multiplier = 4     # Input/output overlap sensitivity
 [retry]
 enabled = true
 max_attempts = 5                           # Max retry attempts per request
+request_deadline_ms = 600000              # Total shielded retry wall-clock budget per request
 anti_loop_hint_enabled = true              # Inject anti-loop hints on retry
 
 # ── Shielded streaming retry ─────────────────────────────────────────────────
-# Retry streaming requests that fail mid-stream.
+# Retry streaming requests that fail mid-stream. The request_deadline_ms budget
+# is shared by all ladder attempts, including the final direct no-thinking relay.
 
 # shielded_streaming_enabled = true
 # downstream_drop_policy = "cancel"  # cancel or detach after downstream drop
 
 # ── Retry ladder ──────────────────────────────────────────────────────────────
-# Escalating delay between retries.
+# Escalating shielded retry quality ladder. Keep the no-thinking rung small so a
+# loop escape hatch cannot consume the caller's whole downstream timeout.
 
 # [[retry.ladder]]
-# delay_ms = 1000
-# jitter_ms = 500
+# name = "max-thinking"
+# thinking_mode = "force_thinking"
+# max_tokens = 50000
+# thinking_token_budget = 32768
 
 # [[retry.ladder]]
-# delay_ms = 5000
-# jitter_ms = 2000
+# name = "bounded-thinking"
+# thinking_mode = "force_thinking"
+# max_tokens = 50000
+# thinking_token_budget = 8192
+# anti_loop_hint = "Previous attempt became repetitive. Answer directly."
+
+# [[retry.ladder]]
+# name = "no-thinking"
+# thinking_mode = "force_disable"
+# max_tokens = 1024
 
 ## ───────────────────────── Heartbeat ───────────────────────────────────────
 ## SSE heartbeat to keep client connections alive during long generations.

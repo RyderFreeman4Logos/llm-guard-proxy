@@ -180,6 +180,7 @@ input_overlap_threshold_multiplier = 5
 
 [retry]
 max_attempts = 3
+request_deadline_ms = 450000
 anti_loop_hint_enabled = false
 shielded_streaming_enabled = true
 downstream_drop_policy = "detach"
@@ -269,6 +270,7 @@ fn defaults_match_issue_contract() {
     assert_default_loop_guard_fields(&config);
     assert!(config.retry.enabled);
     assert_eq!(config.retry.max_attempts, 5);
+    assert_eq!(config.retry.request_deadline_ms, 600_000);
     assert!(config.retry.anti_loop_hint_enabled);
     assert!(!config.retry.shielded_streaming_enabled);
     assert_eq!(
@@ -492,6 +494,7 @@ fn parses_retry_ladder_stream_shielding_and_drop_policy() {
 [retry]
 enabled = true
 max_attempts = 3
+request_deadline_ms = 123456
 anti_loop_hint_enabled = true
 shielded_streaming_enabled = true
 downstream_drop_policy = "detach"
@@ -519,6 +522,7 @@ max_tokens = 50000
     .expect("retry ladder config should parse");
 
     config.validate().expect("retry ladder should validate");
+    assert_eq!(config.retry.request_deadline_ms, 123_456);
     assert!(config.retry.shielded_streaming_enabled);
     assert_eq!(
         config.retry.downstream_drop_policy,
@@ -2059,6 +2063,7 @@ fn assert_parsed_upstream_stall_overrides(config: &AppConfig) {
 #[cfg(feature = "guard")]
 fn assert_parsed_retry_overrides(config: &AppConfig) {
     assert_eq!(config.retry.max_attempts, 3);
+    assert_eq!(config.retry.request_deadline_ms, 450_000);
     assert!(!config.retry.anti_loop_hint_enabled);
     assert!(config.retry.shielded_streaming_enabled);
     assert_eq!(
@@ -2224,6 +2229,18 @@ fn validates_retry_attempt_bounds() {
         .expect_err("retry attempts should be bounded");
 
     assert_eq!(error.field(), "retry.max_attempts");
+}
+
+#[test]
+fn validates_retry_request_deadline_ms() {
+    let mut config = AppConfig::default();
+    config.retry.request_deadline_ms = 0;
+
+    let error = config
+        .validate()
+        .expect_err("retry request deadline should reject zero");
+
+    assert_eq!(error.field(), "retry.request_deadline_ms");
 }
 
 #[test]
@@ -3106,6 +3123,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_window_token_count"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_minimum_token_count"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_history_window_count"));
+    assert!(RELOADABLE_FIELDS.contains(&"retry.request_deadline_ms"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.anti_loop_hint_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.shielded_streaming_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.downstream_drop_policy"));

@@ -329,6 +329,21 @@ max_age_days = 14
   loop-failure shadow continuation where a failed reasoning prefix exists; a
   paired successful request will not produce a `cot-salvage` variant.
 
+### Shielded retry runtime budget
+
+`upstream.request_timeout_ms` bounds a single upstream HTTP attempt. It does not
+bound the full shielded retry ladder. `retry.request_deadline_ms` is the
+request-level wall-clock budget shared across all shielded attempts and the
+final no-thinking direct relay. If the budget expires before the next attempt,
+the proxy returns a structured `llm_guard_request_deadline_exhausted` error
+without sending another upstream request. If it expires during the final direct
+relay, observability records `final_direct_relay_terminated` instead of
+`downstream_body_dropped_before_eof`.
+
+The Aeon-Bench-Pod logging proxy streaming buffering issue is separate: it can
+delay small SSE chunks and heartbeats for that runner, but this guard-side fix
+only bounds the guard retry ladder and relay lifetime.
+
 ### What affects client-visible quality vs evidence-only collection
 
 | Setting | Client-visible effect | Evidence/debug effect |
