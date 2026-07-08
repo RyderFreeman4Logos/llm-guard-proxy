@@ -1667,6 +1667,10 @@ fn assign_retry(
         "max_attempts" => {
             config.max_attempts = parse_u32(value, line_number, "retry.max_attempts")?;
         }
+        "request_deadline_ms" => {
+            config.request_deadline_ms =
+                parse_u64(value, line_number, "retry.request_deadline_ms")?;
+        }
         "anti_loop_hint_enabled" => {
             config.anti_loop_hint_enabled = parse_bool(value, line_number)?;
         }

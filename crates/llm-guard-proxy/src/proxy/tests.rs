@@ -7342,6 +7342,206 @@ thinking_mode = "force_disable"
 }
 
 #[tokio::test]
+async fn shielded_retry_streaming_final_no_thinking_direct_relay_deadline_terminates() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        FINAL_DIRECT_RELAY_DEADLINE_CONFIG,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=loop-three-then-slow-success",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"stream"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    assert!(
+        !released.contains("data: [DONE]"),
+        "deadline-terminated final relay must not masquerade as a complete SSE answer"
+    );
+
+    let first_attempt = fake.recv_next().await;
+    let second_attempt = fake.recv_next().await;
+    let third_attempt = fake.recv_next().await;
+    let fourth_attempt = fake.recv_next().await;
+    assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
+    assert_eq!(body_thinking_budget(&second_attempt.body), Some(1_024));
+    assert_eq!(body_thinking_budget(&third_attempt.body), Some(8_192));
+    assert_eq!(body_thinking_budget(&fourth_attempt.body), Some(0));
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "request-level deadline must not start a fifth attempt"
+    );
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "aborted");
+    assert_eq!(
+        request_row.abort_reason.as_deref(),
+        Some("final_direct_relay_terminated")
+    );
+    assert_eq!(
+        request_row.response_metadata["shielded_terminal_reason"],
+        "final_direct_relay_terminated"
+    );
+    assert_eq!(
+        request_row.response_metadata["retry_attempt_chain"],
+        "1:retried:loop_guard:loop_detected,2:retried:loop_guard:loop_detected,3:retried:loop_guard:loop_detected,4:aborted:final_direct_relay_terminated:none"
+    );
+    assert_eq!(attempts.len(), 4);
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[1].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[2].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[3].status, "aborted");
+    assert_eq!(
+        attempts[3].abort_reason.as_deref(),
+        Some("final_direct_relay_terminated")
+    );
+    assert_eq!(
+        attempts[3].response_metadata["shielded_direct_streaming_relay"],
+        "true"
+    );
+    assert_eq!(
+        attempts[3].response_metadata["shielded_direct_streaming_relay_deadline_bound"],
+        "true"
+    );
+    assert_eq!(
+        attempts[3].response_metadata["final_direct_relay_terminated"],
+        "true"
+    );
+    assert_eq!(
+        attempts[3].response_metadata["request_deadline_exhausted"],
+        "true"
+    );
+}
+
+const FINAL_DIRECT_RELAY_DEADLINE_CONFIG: &str = r#"
+[heartbeat]
+mode = "sse"
+interval_secs = 15
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 4
+request_deadline_ms = 200
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking-deep"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 1024
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+max_tokens = 128
+"#;
+
+#[tokio::test]
+async fn shielded_retry_streaming_request_deadline_exhaustion_stops_waiting() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "sse"
+interval_secs = 15
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 4
+request_deadline_ms = 100
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=slow-shielded",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"stream"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    assert!(released.contains("llm_guard_request_deadline_exhausted"));
+    assert!(!released.contains("data: [DONE]"));
+
+    let first_attempt = fake.recv_next().await;
+    assert_eq!(
+        first_attempt.path_and_query,
+        "/v1/chat/completions?test=slow-shielded"
+    );
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "deadline exhaustion must not start another upstream attempt"
+    );
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_ne!(
+        request_row.abort_reason.as_deref(),
+        Some("downstream_body_dropped_before_eof")
+    );
+    assert_eq!(
+        request_row.response_metadata["shielded_terminal_reason"],
+        "request_deadline_exhausted"
+    );
+    assert_eq!(
+        request_row.response_metadata["request_deadline_exhausted"],
+        "true"
+    );
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "1");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(
+        attempts[0].abort_reason.as_deref(),
+        Some("request_deadline_exhausted")
+    );
+    assert_eq!(
+        attempts[0].response_metadata["request_deadline_exhausted"],
+        "true"
+    );
+}
+
+#[tokio::test]
 async fn per_model_routing_selects_named_upstream_and_records_bounded_metadata() {
     let mut default = FakeUpstream::spawn().await;
     let mut aeon = FakeUpstream::spawn().await;
@@ -15394,11 +15594,12 @@ fn fake_streaming_chat_completion_response(
             repeated_reasoning_line_sse_response(200)
         });
     }
-    if path_and_query.contains("test=loop-twice-then-success") {
-        if next_fake_attempt_count(state, path_and_query) <= 2 {
-            return Some(repeated_reasoning_line_sse_response(200));
-        }
-        return Some(chat_completion_sse_response(body));
+    if let Some(response) = fake_loop_twice_then_success_response(path_and_query, state, body) {
+        return Some(response);
+    }
+    if let Some(response) = fake_loop_three_then_slow_success_response(path_and_query, state, body)
+    {
+        return Some(response);
     }
     if path_and_query.contains("test=tool-loop-then-content-success") {
         if next_fake_attempt_count(state, path_and_query) == 1 {
@@ -15448,6 +15649,34 @@ fn fake_streaming_chat_completion_response(
         return Some(repeated_input_copy_sse_response(12));
     }
     None
+}
+
+fn fake_loop_three_then_slow_success_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+    body: &Bytes,
+) -> Option<Response<Body>> {
+    if !path_and_query.contains("test=loop-three-then-slow-success") {
+        return None;
+    }
+    if next_fake_attempt_count(state, path_and_query) <= 3 {
+        return Some(repeated_reasoning_line_sse_response(200));
+    }
+    Some(slow_chat_completion_sse_response(body))
+}
+
+fn fake_loop_twice_then_success_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+    body: &Bytes,
+) -> Option<Response<Body>> {
+    if !path_and_query.contains("test=loop-twice-then-success") {
+        return None;
+    }
+    if next_fake_attempt_count(state, path_and_query) <= 2 {
+        return Some(repeated_reasoning_line_sse_response(200));
+    }
+    Some(chat_completion_sse_response(body))
 }
 
 fn fake_fixed_status_chat_completion_response(path_and_query: &str) -> Option<Response<Body>> {

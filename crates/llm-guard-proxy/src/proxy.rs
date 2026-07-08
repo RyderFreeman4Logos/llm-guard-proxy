@@ -61,7 +61,7 @@ use tokio::{
     net::TcpListener,
     process::Command,
     sync::{Mutex as AsyncMutex, Notify, futures::OwnedNotified, oneshot},
-    time::{Instant, Interval, MissedTickBehavior, timeout},
+    time::{Instant, Interval, MissedTickBehavior, Sleep, timeout},
 };
 
 mod model_metadata;
@@ -82,6 +82,9 @@ const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
 const PAIRED_SAMPLE_DENOMINATOR: u64 = 1_000_000;
 const SERVER_SHUTDOWN_ABORT_REASON: &str = "server_shutdown";
 const PROXY_SHUTTING_DOWN_ERROR_TYPE: &str = "proxy_shutting_down";
+const REQUEST_DEADLINE_ABORT_REASON: &str = "request_deadline_exhausted";
+const REQUEST_DEADLINE_ERROR_TYPE: &str = "llm_guard_request_deadline_exhausted";
+const FINAL_DIRECT_RELAY_TERMINATED_ABORT_REASON: &str = "final_direct_relay_terminated";
 #[cfg(feature = "guard")]
 const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
 
@@ -2512,6 +2515,7 @@ async fn forward_openai_request(
         Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
     if prepared_request.shielded_chat_plan.intercepted {
         add_retry_request_metadata(&mut request_metadata, &retry_policy);
+        let request_deadline = ShieldedRequestDeadline::new(retry_policy.request_deadline);
         return forward_shielded_chat_with_retries(
             ShieldedRetryRuntime {
                 client: state.client.clone(),
@@ -2542,6 +2546,7 @@ async fn forward_openai_request(
                 thinking_metadata: prepared_request.shielded_chat_plan.thinking_metadata,
                 loop_context: prepared_request.shielded_chat_plan.loop_context,
                 retry_policy,
+                request_deadline,
                 upstream_stall_policy,
                 upstream_stall_recovery: state.upstream_stall_recovery.clone(),
                 #[cfg(feature = "upstream-hot-restart")]
@@ -4199,6 +4204,7 @@ impl ShieldedLivenessMode {
 struct ShieldedRetryPolicy {
     enabled: bool,
     max_attempts: u32,
+    request_deadline: Duration,
     anti_loop_hint_enabled: bool,
     shielded_streaming_enabled: bool,
     downstream_drop_policy: DownstreamDropPolicy,
@@ -4222,6 +4228,7 @@ impl ShieldedRetryPolicy {
         Self {
             enabled: config.enabled,
             max_attempts,
+            request_deadline: Duration::from_millis(config.request_deadline_ms),
             anti_loop_hint_enabled: config.anti_loop_hint_enabled,
             shielded_streaming_enabled: config.shielded_streaming_enabled,
             downstream_drop_policy: config.downstream_drop_policy,
@@ -5067,6 +5074,7 @@ struct ShieldedRetryRuntime {
     thinking_metadata: BTreeMap<String, String>,
     loop_context: shielded_chat::LoopInspectionContext,
     retry_policy: ShieldedRetryPolicy,
+    request_deadline: ShieldedRequestDeadline,
     upstream_stall_policy: UpstreamStallPolicy,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     #[cfg(feature = "upstream-hot-restart")]
@@ -5093,6 +5101,29 @@ impl DownstreamDropSignal {
 
     fn is_dropped(&self) -> bool {
         self.dropped.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ShieldedRequestDeadline {
+    started_at: Instant,
+    max_duration: Duration,
+}
+
+impl ShieldedRequestDeadline {
+    fn new(max_duration: Duration) -> Self {
+        Self {
+            started_at: Instant::now(),
+            max_duration,
+        }
+    }
+
+    fn remaining(self) -> Option<Duration> {
+        self.max_duration.checked_sub(self.started_at.elapsed())
+    }
+
+    fn is_exhausted(self) -> bool {
+        self.remaining().is_none_or(|remaining| remaining.is_zero())
     }
 }
 
@@ -5167,6 +5198,7 @@ struct ShieldedDirectRelayOutcome {
     started: ShieldedStartedAttempt,
     prior_attempt_records: Vec<AttemptRecord>,
     response_metadata: BTreeMap<String, String>,
+    request_deadline: ShieldedRequestDeadline,
 }
 
 struct ShieldedAggregatedAttempt {
@@ -5609,6 +5641,13 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
     let mut retry_cause = None;
     let mut attempt_records = Vec::new();
     loop {
+        if runtime.request_deadline.is_exhausted() {
+            return ShieldedBeginOutcome::Failed(request_deadline_exhausted_outcome(
+                runtime,
+                attempt_number,
+                std::mem::take(&mut attempt_records),
+            ));
+        }
         let started = match start_shielded_attempt(runtime, attempt_number, retry_cause, None).await
         {
             Ok(started) => started,
@@ -5665,10 +5704,14 @@ async fn aggregate_shielded_attempt(
         runtime.loop_context.clone(),
         runtime.upstream_stall_policy.idle_timeout(),
     );
+    let Some(remaining_deadline) = runtime.request_deadline.remaining() else {
+        return Err(request_deadline_shielded_attempt_failure(&started.info));
+    };
     let mut shutdown = runtime.shutdown.subscribe();
     let result = tokio::select! {
         biased;
         () = shutdown.cancelled() => return Err(shutdown_shielded_attempt_failure(&started.info)),
+        () = tokio::time::sleep(remaining_deadline) => return Err(request_deadline_shielded_attempt_failure(&started.info)),
         result = aggregate => result,
     };
     match result {
@@ -5704,6 +5747,13 @@ async fn run_shielded_attempts(
         let started = if let Some(started) = current_attempt.take() {
             started
         } else {
+            if runtime.request_deadline.is_exhausted() {
+                return ShieldedRunOutcome::Failed(request_deadline_exhausted_outcome(
+                    &runtime,
+                    attempt_number,
+                    attempt_records,
+                ));
+            }
             match start_shielded_attempt(
                 &runtime,
                 attempt_number,
@@ -5767,6 +5817,7 @@ async fn run_shielded_attempts(
             return ShieldedRunOutcome::DirectRelay(direct_relay_no_thinking_stream_outcome(
                 started,
                 &attempt_records,
+                runtime.request_deadline,
             ));
         }
 
@@ -5839,11 +5890,13 @@ fn shielded_accepted_outcome(
 fn direct_relay_no_thinking_stream_outcome(
     started: ShieldedStartedAttempt,
     attempt_records: &[AttemptRecord],
+    request_deadline: ShieldedRequestDeadline,
 ) -> ShieldedDirectRelayOutcome {
     ShieldedDirectRelayOutcome {
         started,
         prior_attempt_records: attempt_records.to_vec(),
         response_metadata: no_thinking_direct_relay_metadata(),
+        request_deadline,
     }
 }
 
@@ -5869,6 +5922,10 @@ fn no_thinking_direct_relay_metadata() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             String::from("shielded_direct_streaming_relay"),
+            String::from("true"),
+        ),
+        (
+            String::from("shielded_direct_streaming_relay_deadline_bound"),
             String::from("true"),
         ),
         (
@@ -6624,13 +6681,19 @@ async fn start_shielded_attempt(
         &attempt_plan,
         cot_salvage,
     );
+    let upstream_timeout = runtime
+        .request_deadline
+        .remaining()
+        .map_or(Duration::ZERO, |remaining| {
+            runtime.upstream_timeout.min(remaining)
+        });
     match send_upstream_request_until_shutdown(
         &runtime.client,
         runtime.method.clone(),
         runtime.upstream_url.clone(),
         &runtime.downstream_headers,
         upstream_body,
-        runtime.upstream_timeout,
+        upstream_timeout,
         runtime.shutdown.subscribe(),
     )
     .await
@@ -6686,16 +6749,39 @@ fn shielded_start_transport_failure(
     input: ShieldedStartFailureInput<'_>,
 ) -> ShieldedAttemptFailure {
     let finished_at_unix_ms = unix_time_millis();
-    let retry_cause = if matches!(input.error, ProxyError::Shutdown { .. }) {
-        None
+    let request_deadline_exhausted = input.runtime.request_deadline.is_exhausted()
+        && matches!(
+            &input.error,
+            ProxyError::UpstreamTransport {
+                failure: ReqwestFailureKind::Timeout,
+                ..
+            }
+        );
+    let retry_cause =
+        if matches!(input.error, ProxyError::Shutdown { .. }) || request_deadline_exhausted {
+            None
+        } else {
+            transport_retry_cause(&input.error)
+        };
+    let abort_reason = if request_deadline_exhausted {
+        Some(String::from(REQUEST_DEADLINE_ABORT_REASON))
     } else {
-        transport_retry_cause(&input.error)
+        input.error.abort_reason().map(str::to_owned)
     };
-    let abort_reason = input.error.abort_reason().map(str::to_owned);
+    let error_type = if request_deadline_exhausted {
+        REQUEST_DEADLINE_ERROR_TYPE
+    } else {
+        input.error.error_type()
+    };
+    let error_message = if request_deadline_exhausted {
+        String::from("shielded request deadline exhausted before upstream response headers")
+    } else {
+        input.error.to_string()
+    };
     let mut response_metadata = failed_response_metadata(
         input.attempt_started_at_unix_ms,
         finished_at_unix_ms,
-        input.error.error_type(),
+        error_type,
     );
     response_metadata.insert(
         String::from("upstream_response_received"),
@@ -6703,6 +6789,13 @@ fn shielded_start_transport_failure(
     );
     if let Some(reason) = &abort_reason {
         response_metadata.insert(String::from("abort_reason"), reason.clone());
+        response_metadata.insert(String::from("shielded_terminal_reason"), reason.clone());
+    }
+    if request_deadline_exhausted {
+        response_metadata.insert(
+            String::from("request_deadline_exhausted"),
+            String::from("true"),
+        );
     }
     ShieldedAttemptFailure {
         attempt_id: input.attempt_id,
@@ -6717,8 +6810,8 @@ fn shielded_start_transport_failure(
             ProxyError::UpstreamTransport { failure, .. } => Some(*failure),
             _ => None,
         },
-        error_type: input.error.error_type(),
-        error_message: input.error.to_string(),
+        error_type,
+        error_message,
         retry_cause,
         abort_reason,
         request_metadata: input.request_metadata,
@@ -6902,6 +6995,10 @@ fn add_retry_attempt_metadata(
         policy.max_attempts.to_string(),
     );
     metadata.insert(
+        String::from("retry_request_deadline_ms"),
+        policy.request_deadline.as_millis().to_string(),
+    );
+    metadata.insert(
         String::from("retry_anti_loop_hint_enabled"),
         policy.anti_loop_hint_enabled.to_string(),
     );
@@ -6997,6 +7094,10 @@ fn add_retry_request_metadata(
     metadata.insert(
         String::from("retry_max_attempts"),
         policy.max_attempts.to_string(),
+    );
+    metadata.insert(
+        String::from("retry_request_deadline_ms"),
+        policy.request_deadline.as_millis().to_string(),
     );
     metadata.insert(
         String::from("retry_anti_loop_hint_enabled"),
@@ -7119,6 +7220,49 @@ fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAtte
         error_message: String::from("proxy is shutting down"),
         retry_cause: None,
         abort_reason: Some(SERVER_SHUTDOWN_ABORT_REASON.to_owned()),
+        request_metadata: info.request_metadata.clone(),
+        response_metadata,
+        raw_payloads: RawPayloads {
+            input: info.raw_request_body.clone(),
+            ..RawPayloads::default()
+        },
+        upstream_body: info.upstream_body.clone(),
+    }
+}
+
+fn request_deadline_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAttemptFailure {
+    let finished_at_unix_ms = unix_time_millis();
+    let mut response_metadata = failed_response_metadata(
+        info.started_at_unix_ms,
+        finished_at_unix_ms,
+        REQUEST_DEADLINE_ERROR_TYPE,
+    );
+    response_metadata.insert(
+        String::from("upstream_response_received"),
+        String::from("true"),
+    );
+    response_metadata.insert(
+        String::from("abort_reason"),
+        REQUEST_DEADLINE_ABORT_REASON.to_owned(),
+    );
+    response_metadata.insert(
+        String::from("request_deadline_exhausted"),
+        String::from("true"),
+    );
+    ShieldedAttemptFailure {
+        attempt_id: info.attempt_id.clone(),
+        request_id: info.request_id.clone(),
+        attempt_number: info.attempt_number,
+        started_at_unix_ms: info.started_at_unix_ms,
+        finished_at_unix_ms,
+        upstream_mode: info.upstream_mode,
+        http_status: Some(info.upstream_status.as_u16()),
+        #[cfg(feature = "upstream-hot-restart")]
+        transport_failure: None,
+        error_type: REQUEST_DEADLINE_ERROR_TYPE,
+        error_message: String::from("shielded request deadline exhausted"),
+        retry_cause: None,
+        abort_reason: Some(REQUEST_DEADLINE_ABORT_REASON.to_owned()),
         request_metadata: info.request_metadata.clone(),
         response_metadata,
         raw_payloads: RawPayloads {
@@ -7291,9 +7435,25 @@ fn attempt_failure_record(
         );
     } else if failure.retry_cause.is_some() {
         response_metadata.insert(String::from("retry_exhausted"), String::from("true"));
+        if failure.retry_cause == Some(ShieldedRetryCause::LoopDetected) {
+            response_metadata.insert(
+                String::from("retry_exhausted_reason"),
+                String::from("loop_retry_exhausted"),
+            );
+        }
     }
     if let Some(abort_reason) = &failure.abort_reason {
         response_metadata.insert(String::from("abort_reason"), abort_reason.clone());
+        response_metadata.insert(
+            String::from("attempt_terminal_reason"),
+            abort_reason.clone(),
+        );
+    } else if failure.retry_cause == Some(ShieldedRetryCause::LoopDetected) && retry_cause.is_none()
+    {
+        response_metadata.insert(
+            String::from("attempt_terminal_reason"),
+            String::from("loop_retry_exhausted"),
+        );
     }
     AttemptRecord {
         attempt_id: failure.attempt_id.clone(),
@@ -7320,6 +7480,7 @@ fn copy_attempt_request_metadata(
     for key in [
         "attempt_index",
         "attempt_name",
+        "retry_request_deadline_ms",
         "retry_previous_reason",
         "retry_anti_loop_hint_applied",
         "retry_shielded_streaming_enabled",
@@ -7362,6 +7523,12 @@ fn shielded_failure_outcome(
     ));
     if let Some(reason) = &abort_reason {
         response_metadata.insert(String::from("abort_reason"), reason.clone());
+        response_metadata.insert(String::from("shielded_terminal_reason"), reason.clone());
+    } else if failure.retry_cause == Some(ShieldedRetryCause::LoopDetected) {
+        response_metadata.insert(
+            String::from("shielded_terminal_reason"),
+            String::from("loop_retry_exhausted"),
+        );
     }
     let error_type = structured_shielded_error_type(&failure);
     let downstream_status = if is_server_shutdown_failure(&failure) {
@@ -7380,9 +7547,59 @@ fn shielded_failure_outcome(
     }
 }
 
+fn request_deadline_exhausted_outcome(
+    runtime: &ShieldedRetryRuntime,
+    unstarted_attempt_number: u32,
+    attempt_records: Vec<AttemptRecord>,
+) -> ShieldedFailureOutcome {
+    let mut response_metadata = BTreeMap::from([
+        (
+            String::from("request_deadline_exhausted"),
+            String::from("true"),
+        ),
+        (
+            String::from("retry_unstarted_attempt_number"),
+            unstarted_attempt_number.to_string(),
+        ),
+        (
+            String::from("retry_unstarted_reason"),
+            String::from(REQUEST_DEADLINE_ABORT_REASON),
+        ),
+        (
+            String::from("abort_reason"),
+            String::from(REQUEST_DEADLINE_ABORT_REASON),
+        ),
+        (
+            String::from("shielded_terminal_reason"),
+            String::from(REQUEST_DEADLINE_ABORT_REASON),
+        ),
+    ]);
+    response_metadata.extend(retry_chain_metadata(
+        &attempt_records,
+        &runtime.retry_policy,
+        RequestStatus::Failed.as_str(),
+    ));
+    ShieldedFailureOutcome {
+        error_type: REQUEST_DEADLINE_ERROR_TYPE,
+        error_message: String::from(
+            "shielded request deadline exhausted before next retry attempt",
+        ),
+        response_metadata,
+        attempt_records,
+        upstream_mode: UpstreamMode::NotApplicable,
+        downstream_status: StatusCode::BAD_GATEWAY,
+        retry_after_secs: None,
+    }
+}
+
 fn structured_shielded_error_type(failure: &ShieldedAttemptFailure) -> &'static str {
     if is_server_shutdown_failure(failure) {
         return PROXY_SHUTTING_DOWN_ERROR_TYPE;
+    }
+    if failure.abort_reason.as_deref() == Some(REQUEST_DEADLINE_ABORT_REASON)
+        || failure.error_type == REQUEST_DEADLINE_ERROR_TYPE
+    {
+        return REQUEST_DEADLINE_ERROR_TYPE;
     }
     if matches!(failure.retry_cause, Some(ShieldedRetryCause::LoopDetected))
         || failure.abort_reason.as_deref() == Some("loop_guard")
@@ -7409,6 +7626,7 @@ fn terminal_forward_failure(
     let disabled_policy = ShieldedRetryPolicy {
         enabled: false,
         max_attempts: 1,
+        request_deadline: Duration::from_millis(RetryConfig::default().request_deadline_ms),
         anti_loop_hint_enabled: false,
         shielded_streaming_enabled: false,
         downstream_drop_policy: DownstreamDropPolicy::Cancel,
@@ -7626,11 +7844,13 @@ async fn shielded_retry_direct_relay_response(
             attempt_progress: None,
         },
     );
-    let response_body = ObservedUpstreamBody::new(
+    let response_body = ObservedUpstreamBody::new_with_deadline(
         outcome.started.response.bytes_stream(),
         observer,
         in_flight_permit,
+        BodyCompletion::Succeeded,
         runtime.shutdown.subscribe(),
+        Some(outcome.request_deadline),
     );
     let response = downstream_response(
         upstream_status,
@@ -7815,6 +8035,9 @@ impl ForwardedBodyObserver {
                 &retry_observation.policy,
                 completion.request_status().as_str(),
             ));
+            response_metadata
+                .entry(String::from("shielded_terminal_reason"))
+                .or_insert_with(|| completion.metadata_reason().to_owned());
         }
         let request_record = RequestRecord {
             request_id: self.request_id,
@@ -7918,6 +8141,20 @@ fn final_attempt_record(
         String::from("attempt_outcome"),
         completion.attempt_status().as_str().to_owned(),
     );
+    response_metadata.insert(
+        String::from("attempt_terminal_reason"),
+        completion.metadata_reason().to_owned(),
+    );
+    if matches!(completion, BodyCompletion::FinalDirectRelayTerminated) {
+        response_metadata.insert(
+            String::from("final_direct_relay_terminated"),
+            String::from("true"),
+        );
+        response_metadata.insert(
+            String::from("request_deadline_exhausted"),
+            String::from("true"),
+        );
+    }
     AttemptRecord {
         attempt_id: attempt.attempt_id,
         request_id: request_id.clone(),
@@ -7949,6 +8186,10 @@ fn retry_chain_metadata(
         (
             String::from("retry_max_attempts"),
             policy.max_attempts.to_string(),
+        ),
+        (
+            String::from("retry_request_deadline_ms"),
+            policy.request_deadline.as_millis().to_string(),
         ),
         (
             String::from("retry_anti_loop_hint_enabled"),
@@ -8004,6 +8245,7 @@ enum BodyCompletion {
     Succeeded,
     UpstreamStreamError(String),
     DownstreamDropped,
+    FinalDirectRelayTerminated,
     Shutdown,
 }
 
@@ -8012,7 +8254,9 @@ impl BodyCompletion {
         match self {
             Self::Succeeded => RequestStatus::Succeeded,
             Self::UpstreamStreamError(_) => RequestStatus::Failed,
-            Self::DownstreamDropped | Self::Shutdown => RequestStatus::Aborted,
+            Self::DownstreamDropped | Self::FinalDirectRelayTerminated | Self::Shutdown => {
+                RequestStatus::Aborted
+            }
         }
     }
 
@@ -8020,13 +8264,18 @@ impl BodyCompletion {
         match self {
             Self::Succeeded => AttemptStatus::Succeeded,
             Self::UpstreamStreamError(_) => AttemptStatus::Failed,
-            Self::DownstreamDropped | Self::Shutdown => AttemptStatus::Aborted,
+            Self::DownstreamDropped | Self::FinalDirectRelayTerminated | Self::Shutdown => {
+                AttemptStatus::Aborted
+            }
         }
     }
 
     fn error_reason(&self) -> Option<String> {
         match self {
             Self::UpstreamStreamError(error) => Some(format!("upstream_stream_error: {error}")),
+            Self::FinalDirectRelayTerminated => Some(String::from(
+                "request_deadline_exhausted: final direct relay terminated",
+            )),
             Self::Succeeded | Self::DownstreamDropped | Self::Shutdown => None,
         }
     }
@@ -8034,6 +8283,9 @@ impl BodyCompletion {
     fn abort_reason(&self) -> Option<String> {
         match self {
             Self::DownstreamDropped => Some(String::from("downstream_body_dropped_before_eof")),
+            Self::FinalDirectRelayTerminated => {
+                Some(String::from(FINAL_DIRECT_RELAY_TERMINATED_ABORT_REASON))
+            }
             Self::Shutdown => Some(String::from("server_shutdown")),
             Self::Succeeded | Self::UpstreamStreamError(_) => None,
         }
@@ -8044,7 +8296,18 @@ impl BodyCompletion {
             Self::Succeeded => "succeeded",
             Self::UpstreamStreamError(_) => "upstream_stream_error",
             Self::DownstreamDropped => "downstream_disconnect",
+            Self::FinalDirectRelayTerminated => "final_direct_relay_terminated",
             Self::Shutdown => "server_shutdown",
+        }
+    }
+
+    const fn metadata_reason(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::UpstreamStreamError(_) => "upstream_stream_error",
+            Self::DownstreamDropped => "downstream_body_dropped_before_eof",
+            Self::FinalDirectRelayTerminated => FINAL_DIRECT_RELAY_TERMINATED_ABORT_REASON,
+            Self::Shutdown => SERVER_SHUTDOWN_ABORT_REASON,
         }
     }
 }
@@ -8056,6 +8319,7 @@ struct ObservedUpstreamBody {
     shutdown: ShutdownSubscription,
     bytes_seen: u64,
     terminal_completion: BodyCompletion,
+    deadline: Option<Pin<Box<Sleep>>>,
 }
 
 impl ObservedUpstreamBody {
@@ -8071,6 +8335,25 @@ impl ObservedUpstreamBody {
             in_flight_permit,
             BodyCompletion::Succeeded,
             shutdown,
+            None,
+        )
+    }
+
+    fn new_with_deadline(
+        stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+        observer: ForwardedBodyObserver,
+        in_flight_permit: InFlightPermit,
+        terminal_completion: BodyCompletion,
+        shutdown: ShutdownSubscription,
+        deadline: Option<ShieldedRequestDeadline>,
+    ) -> Self {
+        Self::new_with_completion(
+            stream,
+            observer,
+            in_flight_permit,
+            terminal_completion,
+            shutdown,
+            deadline,
         )
     }
 
@@ -8080,6 +8363,7 @@ impl ObservedUpstreamBody {
         in_flight_permit: InFlightPermit,
         terminal_completion: BodyCompletion,
         shutdown: ShutdownSubscription,
+        deadline: Option<ShieldedRequestDeadline>,
     ) -> Self {
         Self {
             inner: Box::pin(stream),
@@ -8088,6 +8372,10 @@ impl ObservedUpstreamBody {
             shutdown,
             bytes_seen: 0,
             terminal_completion,
+            deadline: deadline
+                .map(|deadline| deadline.remaining().unwrap_or(Duration::ZERO))
+                .map(tokio::time::sleep)
+                .map(Box::pin),
         }
     }
 
@@ -8105,6 +8393,12 @@ impl Stream for ObservedUpstreamBody {
         let this = self.get_mut();
         if this.shutdown.poll_shutdown(cx).is_ready() {
             this.record_once(&BodyCompletion::Shutdown);
+            return Poll::Ready(None);
+        }
+        if let Some(deadline) = &mut this.deadline
+            && deadline.as_mut().poll(cx).is_ready()
+        {
+            this.record_once(&BodyCompletion::FinalDirectRelayTerminated);
             return Poll::Ready(None);
         }
         match this.inner.as_mut().poll_next(cx) {
@@ -8243,6 +8537,7 @@ struct ShieldedLivenessBodySettings {
 struct ShieldedLivenessBody {
     aggregate: ShieldedAggregateFuture,
     direct_stream: Option<DirectRelayStream>,
+    direct_deadline: Option<Pin<Box<Sleep>>>,
     interval: Interval,
     mode: ShieldedLivenessMode,
     accepted_response_mode: ShieldedAcceptedResponseMode,
@@ -8272,6 +8567,7 @@ impl ShieldedLivenessBody {
         Self {
             aggregate,
             direct_stream: None,
+            direct_deadline: None,
             interval,
             mode: settings.mode,
             accepted_response_mode: settings.accepted_response_mode,
@@ -8341,6 +8637,11 @@ impl ShieldedLivenessBody {
             }
             observer.final_attempt = Some(final_attempt);
         }
+        let Some(remaining_deadline) = outcome.request_deadline.remaining() else {
+            self.terminal_completion = Some(BodyCompletion::FinalDirectRelayTerminated);
+            return;
+        };
+        self.direct_deadline = Some(Box::pin(tokio::time::sleep(remaining_deadline)));
         self.direct_stream = Some(Box::pin(outcome.started.response.bytes_stream()));
     }
 
@@ -8349,8 +8650,20 @@ impl ShieldedLivenessBody {
         cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Bytes, Infallible>>> {
         let Some(stream) = &mut self.direct_stream else {
+            if let Some(completion) = self.terminal_completion.take() {
+                self.record_once(&completion);
+                return Poll::Ready(None);
+            }
             return Poll::Pending;
         };
+        if let Some(deadline) = &mut self.direct_deadline
+            && deadline.as_mut().poll(cx).is_ready()
+        {
+            self.direct_deadline = None;
+            self.direct_stream = None;
+            self.record_once(&BodyCompletion::FinalDirectRelayTerminated);
+            return Poll::Ready(None);
+        }
         match stream.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => self.count_and_emit(bytes),
             Poll::Ready(Some(Err(error))) => {
@@ -8362,6 +8675,7 @@ impl ShieldedLivenessBody {
             }
             Poll::Ready(None) => {
                 self.direct_stream = None;
+                self.direct_deadline = None;
                 self.record_once(&BodyCompletion::Succeeded);
                 Poll::Ready(None)
             }

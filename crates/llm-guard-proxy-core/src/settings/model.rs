@@ -2837,6 +2837,8 @@ pub struct RetryConfig {
     pub enabled: bool,
     /// Total upstream attempts, including the first attempt.
     pub max_attempts: u32,
+    /// Total wall-clock budget for one shielded request across all retry attempts.
+    pub request_deadline_ms: u64,
     /// Adds a bounded deterministic anti-loop hint to retries after loop aborts.
     pub anti_loop_hint_enabled: bool,
     /// Routes downstream `stream=true` chat completions through shielded retry.
@@ -2860,6 +2862,11 @@ impl RetryConfig {
             "must be less than or equal to 10",
         )?;
         require(
+            self.request_deadline_ms > 0,
+            "retry.request_deadline_ms",
+            "must be greater than zero",
+        )?;
+        require(
             self.ladder.len() <= 10,
             "retry.ladder",
             "must contain at most 10 entries",
@@ -2876,6 +2883,7 @@ impl Default for RetryConfig {
         Self {
             enabled: true,
             max_attempts: 5,
+            request_deadline_ms: 600_000,
             anti_loop_hint_enabled: true,
             shielded_streaming_enabled: false,
             downstream_drop_policy: DownstreamDropPolicy::Cancel,
