@@ -65,6 +65,29 @@ request_timeout_ms = 600000
 # recovery_budget_window_ms = 600000      # Budget window for recovery attempts
 # recovery_max_per_window = 3             # Max recovery attempts per window
 
+# ── Local upstream recovery (OPT-IN command execution) ───────────────────────
+# Restarts a co-located upstream service after a stall/deadline-class failure,
+# waits for a real chat completion readiness probe, then replays the original
+# shielded request if the downstream connection is still alive.
+#
+# Safe default: disabled and no command is executed. restart_command is argv;
+# the proxy never runs it through a shell and never connects request content to
+# the command's stdin/stdout/stderr.
+
+# [upstream.local_recovery]
+# enabled = true                                                     # Enable local restart recovery
+# restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash.service"]  # argv restart command
+# restart_timeout_ms = 300000                                        # Max wait for restart command
+# readiness_endpoint = "/v1/chat/completions"                        # Real chat readiness endpoint
+# readiness_body = {"model":"aeon-ultimate","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}  # Probe payload; not recorded
+# readiness_request_timeout_ms = 30000                               # Max wait for one readiness POST
+# readiness_deadline_ms = 600000                                     # Total readiness wait after restart
+# readiness_interval_ms = 5000                                       # Delay between readiness probes
+# max_attempts_per_request = 1                                       # Per downstream request recovery cap
+# cooldown_ms = 300000                                               # Cooldown between completed recoveries
+# budget_window_ms = 900000                                          # Rolling recovery budget window
+# max_per_window = 2                                                 # Max recoveries per budget window
+
 # ── Upstream metadata discovery ──────────────────────────────────────────────
 # Automatically discovers model metadata from /v1/models.
 

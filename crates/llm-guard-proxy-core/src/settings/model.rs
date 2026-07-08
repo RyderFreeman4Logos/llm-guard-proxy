@@ -562,6 +562,7 @@ impl AppConfig {
             max_queued_generation_requests: None,
             metadata: self.upstream.metadata.clone(),
             hot_restart: self.upstream.hot_restart.clone(),
+            local_recovery: self.upstream.local_recovery.clone(),
             thinking: self.thinking.clone(),
             #[cfg(feature = "param-override")]
             param_override: ParamOverrideConfig::default(),
@@ -708,6 +709,7 @@ impl AppConfig {
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
         self.upstream.metadata = requested.upstream.metadata.clone();
         self.upstream.hot_restart = requested.upstream.hot_restart.clone();
+        self.upstream.local_recovery = requested.upstream.local_recovery.clone();
         if self.upstream_profiles_topology_matches(requested) {
             self.apply_reloadable_upstream_profile_fields(requested);
         }
@@ -814,6 +816,7 @@ impl AppConfig {
             active.max_queued_generation_requests = requested.max_queued_generation_requests;
             active.metadata = requested.metadata.clone();
             active.hot_restart = requested.hot_restart.clone();
+            active.local_recovery = requested.local_recovery.clone();
             active.thinking = requested.thinking.clone();
             apply_reloadable_param_override(active, requested);
         }
@@ -1260,6 +1263,8 @@ pub struct UpstreamConfig {
     pub metadata: MetadataConfig,
     /// Hot-restart detection and readiness probe policy.
     pub hot_restart: HotRestartConfig,
+    /// Opt-in local restart and chat readiness recovery policy.
+    pub local_recovery: LocalRecoveryConfig,
 }
 
 impl UpstreamConfig {
@@ -1277,7 +1282,9 @@ impl UpstreamConfig {
             timeout_secs: "upstream.hot_restart.probe_timeout_secs",
             messages: "upstream.hot_restart.probe_messages",
             chat_template_kwargs: "upstream.hot_restart.probe_chat_template_kwargs",
-        })
+        })?;
+        self.local_recovery
+            .validate(LocalRecoveryValidationFields::upstream())
     }
 
     /// Returns a display-safe upstream base URL.
@@ -1297,6 +1304,196 @@ impl Default for UpstreamConfig {
             request_timeout_ms: 120_000,
             metadata: MetadataConfig::default(),
             hot_restart: HotRestartConfig::default(),
+            local_recovery: LocalRecoveryConfig::default(),
+        }
+    }
+}
+
+/// Opt-in host-local recovery for one upstream service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalRecoveryConfig {
+    /// Enables restart and readiness recovery for this upstream.
+    pub enabled: bool,
+    /// Restart command executed as argv. Empty means no command is executed.
+    pub restart_command: Vec<String>,
+    /// Maximum milliseconds to wait for the restart command.
+    pub restart_timeout_ms: u64,
+    /// OpenAI-compatible endpoint used for the readiness POST.
+    pub readiness_endpoint: String,
+    /// JSON body sent to the readiness endpoint.
+    pub readiness_body: serde_json::Value,
+    /// Maximum milliseconds for one readiness request.
+    pub readiness_request_timeout_ms: u64,
+    /// Total milliseconds to wait for readiness after restart.
+    pub readiness_deadline_ms: u64,
+    /// Milliseconds between readiness attempts.
+    pub readiness_interval_ms: u64,
+    /// Maximum local recovery executions one downstream request may trigger.
+    pub max_attempts_per_request: u32,
+    /// Minimum milliseconds between completed recovery executions.
+    pub cooldown_ms: u64,
+    /// Rolling window used by the recovery execution budget.
+    pub budget_window_ms: u64,
+    /// Maximum recovery executions inside one budget window.
+    pub max_per_window: u32,
+}
+
+impl LocalRecoveryConfig {
+    fn validate(&self, fields: LocalRecoveryValidationFields) -> Result<(), ValidationError> {
+        require(
+            self.restart_command
+                .iter()
+                .all(|argument| !argument.trim().is_empty()),
+            fields.restart_command,
+            "must not contain empty argv entries",
+        )?;
+        require(
+            self.restart_timeout_ms > 0,
+            fields.restart_timeout_ms,
+            "must be greater than zero",
+        )?;
+        require(
+            self.readiness_endpoint.starts_with('/'),
+            fields.readiness_endpoint,
+            "must start with /",
+        )?;
+        require(
+            !self.readiness_endpoint.contains(char::is_whitespace),
+            fields.readiness_endpoint,
+            "must not contain whitespace",
+        )?;
+        require(
+            self.readiness_body.is_object(),
+            fields.readiness_body,
+            "must be a JSON object",
+        )?;
+        require(
+            self.readiness_request_timeout_ms > 0,
+            fields.readiness_request_timeout_ms,
+            "must be greater than zero",
+        )?;
+        require(
+            self.readiness_deadline_ms > 0,
+            fields.readiness_deadline_ms,
+            "must be greater than zero",
+        )?;
+        require(
+            self.readiness_interval_ms > 0,
+            fields.readiness_interval_ms,
+            "must be greater than zero",
+        )?;
+        require(
+            self.readiness_interval_ms <= self.readiness_deadline_ms,
+            fields.readiness_interval_ms,
+            "must be less than or equal to readiness_deadline_ms",
+        )?;
+        require(
+            self.max_attempts_per_request > 0,
+            fields.max_attempts_per_request,
+            "must be greater than zero",
+        )?;
+        require(
+            self.max_attempts_per_request <= 10,
+            fields.max_attempts_per_request,
+            "must be less than or equal to 10",
+        )?;
+        require(
+            self.cooldown_ms > 0,
+            fields.cooldown_ms,
+            "must be greater than zero",
+        )?;
+        require(
+            self.budget_window_ms > 0,
+            fields.budget_window_ms,
+            "must be greater than zero",
+        )?;
+        require(
+            self.budget_window_ms <= 86_400_000,
+            fields.budget_window_ms,
+            "must be less than or equal to 86400000",
+        )?;
+        require(
+            self.max_per_window > 0,
+            fields.max_per_window,
+            "must be greater than zero",
+        )?;
+        require(
+            self.max_per_window <= 100,
+            fields.max_per_window,
+            "must be less than or equal to 100",
+        )
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LocalRecoveryValidationFields {
+    restart_command: &'static str,
+    restart_timeout_ms: &'static str,
+    readiness_endpoint: &'static str,
+    readiness_body: &'static str,
+    readiness_request_timeout_ms: &'static str,
+    readiness_deadline_ms: &'static str,
+    readiness_interval_ms: &'static str,
+    max_attempts_per_request: &'static str,
+    cooldown_ms: &'static str,
+    budget_window_ms: &'static str,
+    max_per_window: &'static str,
+}
+
+impl LocalRecoveryValidationFields {
+    const fn upstream() -> Self {
+        Self {
+            restart_command: "upstream.local_recovery.restart_command",
+            restart_timeout_ms: "upstream.local_recovery.restart_timeout_ms",
+            readiness_endpoint: "upstream.local_recovery.readiness_endpoint",
+            readiness_body: "upstream.local_recovery.readiness_body",
+            readiness_request_timeout_ms: "upstream.local_recovery.readiness_request_timeout_ms",
+            readiness_deadline_ms: "upstream.local_recovery.readiness_deadline_ms",
+            readiness_interval_ms: "upstream.local_recovery.readiness_interval_ms",
+            max_attempts_per_request: "upstream.local_recovery.max_attempts_per_request",
+            cooldown_ms: "upstream.local_recovery.cooldown_ms",
+            budget_window_ms: "upstream.local_recovery.budget_window_ms",
+            max_per_window: "upstream.local_recovery.max_per_window",
+        }
+    }
+
+    const fn upstream_profile() -> Self {
+        Self {
+            restart_command: "upstreams.local_recovery.restart_command",
+            restart_timeout_ms: "upstreams.local_recovery.restart_timeout_ms",
+            readiness_endpoint: "upstreams.local_recovery.readiness_endpoint",
+            readiness_body: "upstreams.local_recovery.readiness_body",
+            readiness_request_timeout_ms: "upstreams.local_recovery.readiness_request_timeout_ms",
+            readiness_deadline_ms: "upstreams.local_recovery.readiness_deadline_ms",
+            readiness_interval_ms: "upstreams.local_recovery.readiness_interval_ms",
+            max_attempts_per_request: "upstreams.local_recovery.max_attempts_per_request",
+            cooldown_ms: "upstreams.local_recovery.cooldown_ms",
+            budget_window_ms: "upstreams.local_recovery.budget_window_ms",
+            max_per_window: "upstreams.local_recovery.max_per_window",
+        }
+    }
+}
+
+impl Default for LocalRecoveryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            restart_command: Vec::new(),
+            restart_timeout_ms: 300_000,
+            readiness_endpoint: String::from("/v1/chat/completions"),
+            readiness_body: json!({
+                "model": "aeon-ultimate",
+                "messages": [{"role": "user", "content": "1+1=?"}],
+                "chat_template_kwargs": {"enable_thinking": false},
+                "max_tokens": 1
+            }),
+            readiness_request_timeout_ms: 30_000,
+            readiness_deadline_ms: 600_000,
+            readiness_interval_ms: 5_000,
+            max_attempts_per_request: 1,
+            cooldown_ms: 300_000,
+            budget_window_ms: 900_000,
+            max_per_window: 2,
         }
     }
 }
@@ -1398,6 +1595,8 @@ pub struct UpstreamProfileConfig {
     pub metadata: MetadataConfig,
     /// Hot-restart detection and readiness probe policy.
     pub hot_restart: HotRestartConfig,
+    /// Opt-in local restart and chat readiness recovery policy.
+    pub local_recovery: LocalRecoveryConfig,
     /// Thinking budget policy for this profile.
     pub thinking: ThinkingConfig,
     /// Inference parameter override policy for this profile.
@@ -1467,6 +1666,8 @@ impl UpstreamProfileConfig {
             messages: "upstreams.hot_restart.probe_messages",
             chat_template_kwargs: "upstreams.hot_restart.probe_chat_template_kwargs",
         })?;
+        self.local_recovery
+            .validate(LocalRecoveryValidationFields::upstream_profile())?;
         self.thinking.validate("upstreams.thinking.max_tokens")?;
         #[cfg(feature = "param-override")]
         self.param_override.validate("upstreams.param_override")?;
@@ -1518,6 +1719,7 @@ impl Default for UpstreamProfileConfig {
             max_queued_generation_requests: None,
             metadata: upstream.metadata,
             hot_restart: upstream.hot_restart,
+            local_recovery: upstream.local_recovery,
             thinking: ThinkingConfig::default(),
             #[cfg(feature = "param-override")]
             param_override: ParamOverrideConfig::default(),

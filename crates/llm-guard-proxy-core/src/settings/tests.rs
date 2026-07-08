@@ -285,6 +285,12 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.upstream_stall.recovery_cooldown_ms, 300_000);
     assert_eq!(config.upstream_stall.recovery_budget_window_ms, 900_000);
     assert_eq!(config.upstream_stall.recovery_max_per_window, 2);
+    assert!(!config.upstream.local_recovery.enabled);
+    assert!(config.upstream.local_recovery.restart_command.is_empty());
+    assert_eq!(
+        config.upstream.local_recovery.readiness_endpoint,
+        "/v1/chat/completions"
+    );
     assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
     assert!(config.cloudflare.enabled);
     assert!(config.upstream_profiles.is_empty());
@@ -294,6 +300,109 @@ fn defaults_match_issue_contract() {
         assert!(config.workflows.is_empty());
     }
     assert_eq!(config.default_upstream_profile().name, "default");
+}
+
+#[test]
+fn local_recovery_config_defaults_are_safe_and_parse_per_upstream() {
+    let config = parse_config_text(
+        r#"
+[upstream.local_recovery]
+enabled = true
+restart_command = ["systemctl", "--user", "restart", "vllm-default.service"]
+restart_timeout_ms = 120000
+readiness_endpoint = "/v1/chat/completions"
+readiness_body = {"model":"default-chat","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}
+readiness_request_timeout_ms = 10000
+readiness_deadline_ms = 300000
+readiness_interval_ms = 2500
+max_attempts_per_request = 1
+cooldown_ms = 45000
+budget_window_ms = 180000
+max_per_window = 2
+
+[[upstreams]]
+name = "aeon"
+base_url = "http://aeon.example/v1"
+match_models = ["aeon-ultimate"]
+
+[upstreams.local_recovery]
+enabled = true
+restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash.service"]
+restart_timeout_ms = 60000
+readiness_body = {"model":"aeon-ultimate","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}
+readiness_request_timeout_ms = 5000
+readiness_deadline_ms = 120000
+readiness_interval_ms = 1000
+max_attempts_per_request = 2
+cooldown_ms = 30000
+budget_window_ms = 120000
+max_per_window = 1
+"#,
+    )
+    .expect("local recovery config should parse");
+
+    config
+        .validate()
+        .expect("local recovery config should validate");
+    let default_recovery = &config.upstream.local_recovery;
+    assert!(default_recovery.enabled);
+    assert_eq!(
+        default_recovery.restart_command,
+        vec![
+            String::from("systemctl"),
+            String::from("--user"),
+            String::from("restart"),
+            String::from("vllm-default.service"),
+        ]
+    );
+    assert_eq!(default_recovery.restart_timeout_ms, 120_000);
+    assert_eq!(default_recovery.readiness_request_timeout_ms, 10_000);
+    assert_eq!(default_recovery.readiness_deadline_ms, 300_000);
+    assert_eq!(default_recovery.readiness_interval_ms, 2_500);
+    assert_eq!(default_recovery.max_attempts_per_request, 1);
+    assert_eq!(default_recovery.cooldown_ms, 45_000);
+    assert_eq!(default_recovery.budget_window_ms, 180_000);
+    assert_eq!(default_recovery.max_per_window, 2);
+    assert_eq!(default_recovery.readiness_body["model"], "default-chat");
+    assert_eq!(
+        default_recovery.readiness_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+
+    let aeon = config
+        .upstream_profile_by_name("aeon")
+        .expect("aeon profile should parse");
+    let aeon_recovery = &aeon.local_recovery;
+    assert!(aeon_recovery.enabled);
+    assert_eq!(
+        aeon_recovery.restart_command,
+        vec![
+            String::from("systemctl"),
+            String::from("--user"),
+            String::from("restart"),
+            String::from("vllm-aeon-27b-dflash.service"),
+        ]
+    );
+    assert_eq!(aeon_recovery.max_attempts_per_request, 2);
+    assert_eq!(aeon_recovery.max_per_window, 1);
+    assert_eq!(aeon_recovery.readiness_body["model"], "aeon-ultimate");
+}
+
+#[test]
+fn local_recovery_config_rejects_invalid_values() {
+    let config = parse_config_text(
+        r#"
+[upstream.local_recovery]
+readiness_endpoint = "v1/chat/completions"
+"#,
+    )
+    .expect("relative readiness endpoint should parse before validation");
+    let error = config
+        .validate()
+        .expect_err("relative readiness endpoint should fail validation");
+
+    assert_eq!(error.field(), "upstream.local_recovery.readiness_endpoint");
+    assert_eq!(error.message(), "must start with /");
 }
 
 fn assert_default_loop_guard_fields(config: &AppConfig) {
