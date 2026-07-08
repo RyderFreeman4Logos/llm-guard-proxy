@@ -14,9 +14,9 @@ use super::ParamOverrideConfig;
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DefaultInjectionSchema,
     DownstreamDropPolicy, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
-    LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy,
-    ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig, ServerConfig,
-    ShadowComparisonAttempt, ShieldingConfig, ThinkingConfig, ThinkingMode,
+    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig,
+    NoThinkingMarkerPolicy, ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig,
+    ServerConfig, ShadowComparisonAttempt, ShieldingConfig, ThinkingConfig, ThinkingMode,
     ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamStallConfig,
 };
 #[cfg(feature = "guard")]
@@ -30,9 +30,11 @@ enum Section {
     Upstream,
     UpstreamMetadata,
     UpstreamHotRestart,
+    UpstreamLocalRecovery,
     UpstreamProfile(usize),
     UpstreamProfileMetadata(usize),
     UpstreamProfileHotRestart(usize),
+    UpstreamProfileLocalRecovery(usize),
     UpstreamProfileThinking(usize),
     #[cfg(feature = "param-override")]
     UpstreamProfileParamOverride(usize),
@@ -230,6 +232,7 @@ fn parse_section(
         "upstream" => Ok(Section::Upstream),
         "upstream.metadata" => Ok(Section::UpstreamMetadata),
         "upstream.hot_restart" => Ok(Section::UpstreamHotRestart),
+        "upstream.local_recovery" => Ok(Section::UpstreamLocalRecovery),
         "upstreams.metadata" => current_upstream_profile.map_or_else(
             || {
                 Err(ConfigParseError::new(
@@ -247,6 +250,15 @@ fn parse_section(
                 ))
             },
             |index| Ok(Section::UpstreamProfileHotRestart(index)),
+        ),
+        "upstreams.local_recovery" => current_upstream_profile.map_or_else(
+            || {
+                Err(ConfigParseError::new(
+                    line_number,
+                    "[upstreams.local_recovery] must follow a [[upstreams]] profile",
+                ))
+            },
+            |index| Ok(Section::UpstreamProfileLocalRecovery(index)),
         ),
         "upstreams.thinking" => current_upstream_profile.map_or_else(
             || {
@@ -333,6 +345,9 @@ fn assign_value(
     if let Some(result) = assign_family_value(config, section, key, value, line_number) {
         return result;
     }
+    if let Some(result) = assign_upstream_value(config, section, key, value, line_number) {
+        return result;
+    }
 
     match section {
         Section::Root => Err(ConfigParseError::new(
@@ -343,44 +358,6 @@ fn assign_value(
         Section::Listener(index) => {
             assign_listener(&mut config.listeners[*index], key, value, line_number)
         }
-        Section::Upstream => assign_upstream(&mut config.upstream, key, value, line_number),
-        Section::UpstreamMetadata => {
-            assign_metadata(&mut config.upstream.metadata, key, value, line_number)
-        }
-        Section::UpstreamHotRestart => {
-            assign_hot_restart(&mut config.upstream.hot_restart, key, value, line_number)
-        }
-        Section::UpstreamProfile(index) => assign_upstream_profile(
-            &mut config.upstream_profiles[*index],
-            key,
-            value,
-            line_number,
-        ),
-        Section::UpstreamProfileMetadata(index) => assign_metadata(
-            &mut config.upstream_profiles[*index].metadata,
-            key,
-            value,
-            line_number,
-        ),
-        Section::UpstreamProfileHotRestart(index) => assign_hot_restart(
-            &mut config.upstream_profiles[*index].hot_restart,
-            key,
-            value,
-            line_number,
-        ),
-        Section::UpstreamProfileThinking(index) => assign_thinking(
-            &mut config.upstream_profiles[*index].thinking,
-            key,
-            value,
-            line_number,
-        ),
-        #[cfg(feature = "param-override")]
-        Section::UpstreamProfileParamOverride(index) => assign_param_override(
-            &mut config.upstream_profiles[*index].param_override,
-            key,
-            value,
-            line_number,
-        ),
         Section::Shielding => assign_shielding(&mut config.shielding, key, value, line_number),
         Section::Observability => {
             assign_observability(&mut config.observability, key, value, line_number)
@@ -424,6 +401,94 @@ fn assign_value(
         Section::Family | Section::FamilyCategory(_) => {
             unreachable!("family sections are handled before this match")
         }
+        Section::Upstream
+        | Section::UpstreamMetadata
+        | Section::UpstreamHotRestart
+        | Section::UpstreamLocalRecovery
+        | Section::UpstreamProfile(_)
+        | Section::UpstreamProfileMetadata(_)
+        | Section::UpstreamProfileHotRestart(_)
+        | Section::UpstreamProfileLocalRecovery(_)
+        | Section::UpstreamProfileThinking(_) => {
+            unreachable!("upstream sections are handled before this match")
+        }
+        #[cfg(feature = "param-override")]
+        Section::UpstreamProfileParamOverride(_) => {
+            unreachable!("upstream profile param override is handled before this match")
+        }
+    }
+}
+
+fn assign_upstream_value(
+    config: &mut AppConfig,
+    section: &Section,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Option<Result<(), ConfigParseError>> {
+    match section {
+        Section::Upstream => Some(assign_upstream(
+            &mut config.upstream,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamMetadata => Some(assign_metadata(
+            &mut config.upstream.metadata,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamHotRestart => Some(assign_hot_restart(
+            &mut config.upstream.hot_restart,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamLocalRecovery => Some(assign_local_recovery(
+            &mut config.upstream.local_recovery,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamProfile(index) => Some(assign_upstream_profile(
+            &mut config.upstream_profiles[*index],
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamProfileMetadata(index) => Some(assign_metadata(
+            &mut config.upstream_profiles[*index].metadata,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamProfileHotRestart(index) => Some(assign_hot_restart(
+            &mut config.upstream_profiles[*index].hot_restart,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamProfileLocalRecovery(index) => Some(assign_local_recovery(
+            &mut config.upstream_profiles[*index].local_recovery,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamProfileThinking(index) => Some(assign_thinking(
+            &mut config.upstream_profiles[*index].thinking,
+            key,
+            value,
+            line_number,
+        )),
+        #[cfg(feature = "param-override")]
+        Section::UpstreamProfileParamOverride(index) => Some(assign_param_override(
+            &mut config.upstream_profiles[*index].param_override,
+            key,
+            value,
+            line_number,
+        )),
+        _ => None,
     }
 }
 
@@ -968,6 +1033,65 @@ fn assign_hot_restart(
             )?;
         }
         _ => return unknown_key("hot_restart", key, line_number),
+    }
+    Ok(())
+}
+
+fn assign_local_recovery(
+    config: &mut LocalRecoveryConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "restart_command" => {
+            config.restart_command = parse_string_array(value, line_number)?;
+        }
+        "restart_timeout_ms" => {
+            config.restart_timeout_ms =
+                parse_u64(value, line_number, "local_recovery.restart_timeout_ms")?;
+        }
+        "readiness_endpoint" => {
+            config.readiness_endpoint = parse_string(value, line_number)?;
+        }
+        "readiness_body" => {
+            config.readiness_body =
+                parse_json_value(value, line_number, "local_recovery.readiness_body")?;
+        }
+        "readiness_request_timeout_ms" => {
+            config.readiness_request_timeout_ms = parse_u64(
+                value,
+                line_number,
+                "local_recovery.readiness_request_timeout_ms",
+            )?;
+        }
+        "readiness_deadline_ms" => {
+            config.readiness_deadline_ms =
+                parse_u64(value, line_number, "local_recovery.readiness_deadline_ms")?;
+        }
+        "readiness_interval_ms" => {
+            config.readiness_interval_ms =
+                parse_u64(value, line_number, "local_recovery.readiness_interval_ms")?;
+        }
+        "max_attempts_per_request" => {
+            config.max_attempts_per_request = parse_u32(
+                value,
+                line_number,
+                "local_recovery.max_attempts_per_request",
+            )?;
+        }
+        "cooldown_ms" => {
+            config.cooldown_ms = parse_u64(value, line_number, "local_recovery.cooldown_ms")?;
+        }
+        "budget_window_ms" => {
+            config.budget_window_ms =
+                parse_u64(value, line_number, "local_recovery.budget_window_ms")?;
+        }
+        "max_per_window" => {
+            config.max_per_window = parse_u32(value, line_number, "local_recovery.max_per_window")?;
+        }
+        _ => return unknown_key("local_recovery", key, line_number),
     }
     Ok(())
 }

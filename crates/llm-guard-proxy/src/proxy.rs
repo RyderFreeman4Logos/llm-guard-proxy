@@ -45,12 +45,12 @@ use llm_guard_proxy_core::{
     DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
     EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore, EvidenceStoreWrite, Health,
     HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, LiveRequestEntry,
-    LiveRequestRegistry, LiveRequestState, LiveRequestSummary, LoopFailurePolicy, LoopGuardConfig,
-    MetadataConfig, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId,
-    RequestRecord, RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME,
-    SelectedUpstreamProfile, ShadowComparisonAttempt, ShadowSkipReason, ThinkingConfig,
-    ThinkingMode, UpstreamMode, UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig,
-    redact_upstream_base_url, validate_upstream_base_url,
+    LiveRequestRegistry, LiveRequestState, LiveRequestSummary, LocalRecoveryConfig,
+    LoopFailurePolicy, LoopGuardConfig, MetadataConfig, ObservabilityMetricsSnapshot,
+    ObservabilityStore, RawPayloads, RequestId, RequestRecord, RequestStatus, RetryConfig,
+    RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile, ShadowComparisonAttempt,
+    ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -104,6 +104,7 @@ pub(crate) struct ProxyState {
     generation_profile_requests: Arc<Mutex<HashMap<String, Arc<InFlightLimiter>>>>,
     control_plane_requests: Arc<InFlightLimiter>,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
+    local_recovery: Arc<LocalRecoveryCoordinatorSet>,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
@@ -231,6 +232,7 @@ impl ProxyState {
             generation_profile_requests: Arc::new(Mutex::new(HashMap::new())),
             control_plane_requests: Arc::new(InFlightLimiter::default()),
             upstream_stall_recovery: Arc::new(UpstreamStallRecoveryCoordinator::default()),
+            local_recovery: Arc::new(LocalRecoveryCoordinatorSet::default()),
             #[cfg(feature = "upstream-hot-restart")]
             hot_restart_recovery: Arc::new(HotRestartCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
@@ -2516,6 +2518,11 @@ async fn forward_openai_request(
     if prepared_request.shielded_chat_plan.intercepted {
         add_retry_request_metadata(&mut request_metadata, &retry_policy);
         let request_deadline = ShieldedRequestDeadline::new(retry_policy.request_deadline);
+        let local_recovery_policy =
+            LocalRecoveryPolicy::from_config(&prepared_request.upstream_profile.local_recovery);
+        let local_recovery = state
+            .local_recovery
+            .coordinator_for(&prepared_request.upstream_profile.name);
         return forward_shielded_chat_with_retries(
             ShieldedRetryRuntime {
                 client: state.client.clone(),
@@ -2549,6 +2556,10 @@ async fn forward_openai_request(
                 request_deadline,
                 upstream_stall_policy,
                 upstream_stall_recovery: state.upstream_stall_recovery.clone(),
+                local_recovery_policy,
+                local_recovery,
+                local_recovery_attempts: Arc::new(AtomicU64::new(0)),
+                local_recovery_deadline_replay_permits: Arc::new(AtomicU64::new(0)),
                 #[cfg(feature = "upstream-hot-restart")]
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
@@ -4332,6 +4343,45 @@ impl UpstreamStallPolicy {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LocalRecoveryPolicy {
+    enabled: bool,
+    restart_command: Vec<String>,
+    restart_timeout: Duration,
+    readiness_endpoint: String,
+    readiness_body: serde_json::Value,
+    readiness_request_timeout: Duration,
+    readiness_deadline: Duration,
+    readiness_interval: Duration,
+    max_attempts_per_request: u32,
+    cooldown: Duration,
+    budget_window: Duration,
+    max_per_window: u32,
+}
+
+impl LocalRecoveryPolicy {
+    fn from_config(config: &LocalRecoveryConfig) -> Self {
+        Self {
+            enabled: config.enabled,
+            restart_command: config.restart_command.clone(),
+            restart_timeout: Duration::from_millis(config.restart_timeout_ms),
+            readiness_endpoint: config.readiness_endpoint.clone(),
+            readiness_body: config.readiness_body.clone(),
+            readiness_request_timeout: Duration::from_millis(config.readiness_request_timeout_ms),
+            readiness_deadline: Duration::from_millis(config.readiness_deadline_ms),
+            readiness_interval: Duration::from_millis(config.readiness_interval_ms),
+            max_attempts_per_request: config.max_attempts_per_request,
+            cooldown: Duration::from_millis(config.cooldown_ms),
+            budget_window: Duration::from_millis(config.budget_window_ms),
+            max_per_window: config.max_per_window,
+        }
+    }
+
+    fn is_configured(&self) -> bool {
+        self.enabled && !self.restart_command.is_empty()
+    }
+}
+
 #[derive(Debug, Default)]
 struct UpstreamStallRecoveryCoordinator {
     state: AsyncMutex<UpstreamStallRecoveryState>,
@@ -4345,6 +4395,24 @@ struct UpstreamStallRecoveryState {
     window_started: Option<Instant>,
     runs_in_window: u32,
     last_result: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Default)]
+struct LocalRecoveryCoordinatorSet {
+    coordinators: Mutex<HashMap<String, Arc<UpstreamStallRecoveryCoordinator>>>,
+}
+
+impl LocalRecoveryCoordinatorSet {
+    fn coordinator_for(&self, profile: &str) -> Arc<UpstreamStallRecoveryCoordinator> {
+        let mut coordinators = match self.coordinators.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        coordinators
+            .entry(profile.to_owned())
+            .or_insert_with(|| Arc::new(UpstreamStallRecoveryCoordinator::default()))
+            .clone()
+    }
 }
 
 #[cfg(feature = "upstream-hot-restart")]
@@ -5077,6 +5145,10 @@ struct ShieldedRetryRuntime {
     request_deadline: ShieldedRequestDeadline,
     upstream_stall_policy: UpstreamStallPolicy,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
+    local_recovery_policy: LocalRecoveryPolicy,
+    local_recovery: Arc<UpstreamStallRecoveryCoordinator>,
+    local_recovery_attempts: Arc<AtomicU64>,
+    local_recovery_deadline_replay_permits: Arc<AtomicU64>,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     shadow_attempts: Arc<InFlightLimiter>,
@@ -5184,6 +5256,7 @@ fn shadow_evidence_inner(
 struct ShieldedStartedAttempt {
     info: ShieldedAttemptInfo,
     response: reqwest::Response,
+    ignores_request_deadline: bool,
 }
 
 struct ShieldedAcceptedOutcome {
@@ -5474,18 +5547,37 @@ async fn shielded_start_failure_step(
 ) -> ShieldedStartFailureStep {
     let next_retry_cause = failure.retry_cause;
     let can_retry = should_retry_after_shielded_failure(runtime, &failure);
+    let (failure, can_retry) = {
+        let mut failure = failure;
+        let mut can_retry = can_retry;
+        let local_recovery_gate =
+            local_recovery_gate_for_attempt_failure(runtime, can_retry, &failure).await;
+        if local_recovery_gate.applied {
+            can_retry = local_recovery_gate.permits_deadline_replay
+                || (can_retry && local_recovery_gate.permits_retry);
+            failure
+                .response_metadata
+                .extend(local_recovery_gate.metadata);
+        }
+        (failure, can_retry)
+    };
     #[cfg(feature = "upstream-hot-restart")]
     let (failure, can_retry, terminal) = {
         let mut failure = failure;
         let mut can_retry = can_retry;
         let mut terminal = None;
-        let hot_restart_gate =
-            hot_restart_gate_for_attempt_failure(runtime, can_retry, &failure).await;
-        can_retry = can_retry && hot_restart_gate.permits_retry;
-        failure.response_metadata.extend(hot_restart_gate.metadata);
-        if let Some(hot_restart_terminal) = hot_restart_gate.terminal {
-            failure.abort_reason = Some(hot_restart_terminal.abort_reason.to_owned());
-            terminal = Some(hot_restart_terminal);
+        if !failure
+            .response_metadata
+            .contains_key("local_recovery_status")
+        {
+            let hot_restart_gate =
+                hot_restart_gate_for_attempt_failure(runtime, can_retry, &failure).await;
+            can_retry = can_retry && hot_restart_gate.permits_retry;
+            failure.response_metadata.extend(hot_restart_gate.metadata);
+            if let Some(hot_restart_terminal) = hot_restart_gate.terminal {
+                failure.abort_reason = Some(hot_restart_terminal.abort_reason.to_owned());
+                terminal = Some(hot_restart_terminal);
+            }
         }
         (failure, can_retry, terminal)
     };
@@ -5586,18 +5678,37 @@ async fn shielded_retryable_status_step(
         "retryable upstream status before shielded stream",
     );
     let can_retry = should_retry_after_shielded_failure(runtime, &failure);
+    let (failure, can_retry) = {
+        let mut failure = failure;
+        let mut can_retry = can_retry;
+        let local_recovery_gate =
+            local_recovery_gate_for_status(runtime, can_retry, info.upstream_status).await;
+        if local_recovery_gate.applied {
+            can_retry = local_recovery_gate.permits_deadline_replay
+                || (can_retry && local_recovery_gate.permits_retry);
+            failure
+                .response_metadata
+                .extend(local_recovery_gate.metadata);
+        }
+        (failure, can_retry)
+    };
     #[cfg(feature = "upstream-hot-restart")]
     let (failure, can_retry, terminal) = {
         let mut failure = failure;
         let mut can_retry = can_retry;
         let mut terminal = None;
-        let hot_restart_gate =
-            hot_restart_gate_for_status(runtime, info.upstream_status, can_retry).await;
-        can_retry = can_retry && hot_restart_gate.permits_retry;
-        failure.response_metadata.extend(hot_restart_gate.metadata);
-        if let Some(hot_restart_terminal) = hot_restart_gate.terminal {
-            failure.abort_reason = Some(hot_restart_terminal.abort_reason.to_owned());
-            terminal = Some(hot_restart_terminal);
+        if !failure
+            .response_metadata
+            .contains_key("local_recovery_status")
+        {
+            let hot_restart_gate =
+                hot_restart_gate_for_status(runtime, info.upstream_status, can_retry).await;
+            can_retry = can_retry && hot_restart_gate.permits_retry;
+            failure.response_metadata.extend(hot_restart_gate.metadata);
+            if let Some(hot_restart_terminal) = hot_restart_gate.terminal {
+                failure.abort_reason = Some(hot_restart_terminal.abort_reason.to_owned());
+                terminal = Some(hot_restart_terminal);
+            }
         }
         (failure, can_retry, terminal)
     };
@@ -5641,14 +5752,22 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
     let mut retry_cause = None;
     let mut attempt_records = Vec::new();
     loop {
-        if runtime.request_deadline.is_exhausted() {
+        let ignores_request_deadline = consume_local_recovery_deadline_replay_permit(runtime);
+        if runtime.request_deadline.is_exhausted() && !ignores_request_deadline {
             return ShieldedBeginOutcome::Failed(request_deadline_exhausted_outcome(
                 runtime,
                 attempt_number,
                 std::mem::take(&mut attempt_records),
             ));
         }
-        let started = match start_shielded_attempt(runtime, attempt_number, retry_cause, None).await
+        let started = match start_shielded_attempt(
+            runtime,
+            attempt_number,
+            retry_cause,
+            None,
+            ignores_request_deadline,
+        )
+        .await
         {
             Ok(started) => started,
             Err(failure) => {
@@ -5704,8 +5823,13 @@ async fn aggregate_shielded_attempt(
         runtime.loop_context.clone(),
         runtime.upstream_stall_policy.idle_timeout(),
     );
-    let Some(remaining_deadline) = runtime.request_deadline.remaining() else {
-        return Err(request_deadline_shielded_attempt_failure(&started.info));
+    let remaining_deadline = if started.ignores_request_deadline {
+        runtime.upstream_timeout
+    } else {
+        let Some(remaining_deadline) = runtime.request_deadline.remaining() else {
+            return Err(request_deadline_shielded_attempt_failure(&started.info));
+        };
+        remaining_deadline
     };
     let mut shutdown = runtime.shutdown.subscribe();
     let result = tokio::select! {
@@ -5747,7 +5871,8 @@ async fn run_shielded_attempts(
         let started = if let Some(started) = current_attempt.take() {
             started
         } else {
-            if runtime.request_deadline.is_exhausted() {
+            let ignores_request_deadline = consume_local_recovery_deadline_replay_permit(&runtime);
+            if runtime.request_deadline.is_exhausted() && !ignores_request_deadline {
                 return ShieldedRunOutcome::Failed(request_deadline_exhausted_outcome(
                     &runtime,
                     attempt_number,
@@ -5759,6 +5884,7 @@ async fn run_shielded_attempts(
                 attempt_number,
                 retry_cause,
                 cot_salvage.as_ref(),
+                ignores_request_deadline,
             )
             .await
             {
@@ -5830,8 +5956,20 @@ async fn run_shielded_attempts(
                 return shielded_accepted_outcome(aggregated, attempt_records);
             }
             Err(mut failure) => {
+                if runtime.request_deadline.is_exhausted() {
+                    mark_request_deadline_attempt_failure(&mut failure);
+                }
                 let next_retry_cause = failure.retry_cause;
                 let mut can_retry = should_retry_after_shielded_failure(&runtime, &failure);
+                let local_recovery_gate =
+                    local_recovery_gate_for_attempt_failure(&runtime, can_retry, &failure).await;
+                if local_recovery_gate.applied {
+                    can_retry = local_recovery_gate.permits_deadline_replay
+                        || (can_retry && local_recovery_gate.permits_retry);
+                    failure
+                        .response_metadata
+                        .extend(local_recovery_gate.metadata);
+                }
                 let next_cot_salvage =
                     if can_retry && cot_salvage.is_none() && !cot_salvage_attempted {
                         cot_salvage_context_for_failure(&runtime, &failure)
@@ -6260,6 +6398,565 @@ fn hot_restart_recovery_metadata(configured: bool) -> BTreeMap<String, String> {
     )])
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalRecoveryCause {
+    UpstreamStall,
+    TransientStatus,
+    TransientTransport,
+    RequestDeadline,
+}
+
+impl LocalRecoveryCause {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::UpstreamStall => "upstream_stall",
+            Self::TransientStatus => "transient_status",
+            Self::TransientTransport => "transient_transport",
+            Self::RequestDeadline => "request_deadline",
+        }
+    }
+}
+
+struct LocalRecoveryGate {
+    metadata: BTreeMap<String, String>,
+    permits_retry: bool,
+    applied: bool,
+    permits_deadline_replay: bool,
+}
+
+async fn local_recovery_gate_for_attempt_failure(
+    runtime: &ShieldedRetryRuntime,
+    can_retry: bool,
+    failure: &ShieldedAttemptFailure,
+) -> LocalRecoveryGate {
+    let cause = if failure.abort_reason.as_deref() == Some(REQUEST_DEADLINE_ABORT_REASON) {
+        Some(LocalRecoveryCause::RequestDeadline)
+    } else {
+        local_recovery_transport_cause(failure)
+    };
+    local_recovery_gate(runtime, can_retry, cause).await
+}
+
+fn local_recovery_transport_cause(failure: &ShieldedAttemptFailure) -> Option<LocalRecoveryCause> {
+    if failure.retry_cause == Some(ShieldedRetryCause::TransientStream) {
+        return Some(LocalRecoveryCause::TransientTransport);
+    }
+    #[cfg(feature = "upstream-hot-restart")]
+    {
+        if matches!(
+            failure.transport_failure,
+            Some(ReqwestFailureKind::Timeout | ReqwestFailureKind::Connect)
+        ) {
+            return Some(LocalRecoveryCause::TransientTransport);
+        }
+    }
+    let _ = failure;
+    None
+}
+
+async fn local_recovery_gate_for_status(
+    runtime: &ShieldedRetryRuntime,
+    can_retry: bool,
+    status: reqwest::StatusCode,
+) -> LocalRecoveryGate {
+    let cause = if matches!(status.as_u16(), 502..=504) {
+        Some(LocalRecoveryCause::TransientStatus)
+    } else {
+        None
+    };
+    local_recovery_gate(runtime, can_retry, cause).await
+}
+
+async fn local_recovery_gate_for_upstream_stall(
+    runtime: &ShieldedRetryRuntime,
+    can_retry: bool,
+) -> LocalRecoveryGate {
+    local_recovery_gate(runtime, can_retry, Some(LocalRecoveryCause::UpstreamStall)).await
+}
+
+async fn local_recovery_gate(
+    runtime: &ShieldedRetryRuntime,
+    can_retry: bool,
+    cause: Option<LocalRecoveryCause>,
+) -> LocalRecoveryGate {
+    let Some(cause) = cause else {
+        return unapplied_local_recovery_gate();
+    };
+    if (!can_retry && cause != LocalRecoveryCause::RequestDeadline)
+        || (!runtime.local_recovery_policy.enabled
+            && runtime.local_recovery_policy.restart_command.is_empty())
+    {
+        return unapplied_local_recovery_gate();
+    }
+
+    if !runtime.local_recovery_policy.enabled {
+        return unapplied_local_recovery_gate();
+    }
+    if runtime.local_recovery_policy.restart_command.is_empty() {
+        return unapplied_local_recovery_gate();
+    }
+    let mut metadata = local_recovery_metadata(runtime, cause);
+    if runtime.downstream_drop_signal.is_dropped() {
+        return skipped_local_recovery_gate(metadata, "skipped_downstream_dropped", false);
+    }
+    let previous_attempts = runtime
+        .local_recovery_attempts
+        .fetch_add(1, Ordering::SeqCst);
+    if previous_attempts >= u64::from(runtime.local_recovery_policy.max_attempts_per_request) {
+        metadata.insert(
+            String::from("local_recovery_status"),
+            String::from("skipped_request_budget_exhausted"),
+        );
+        metadata.insert(
+            String::from("local_recovery_permits_retry"),
+            String::from("false"),
+        );
+        metadata.insert(
+            String::from("local_recovery_request_attempts_used"),
+            previous_attempts.to_string(),
+        );
+        return applied_local_recovery_gate(metadata, false, false);
+    }
+    metadata.insert(
+        String::from("local_recovery_request_attempts_used"),
+        previous_attempts.saturating_add(1).to_string(),
+    );
+
+    let recovery_metadata = run_local_recovery(runtime, cause).await;
+    metadata.extend(recovery_metadata);
+    let permits_retry = local_recovery_permits_retry(&metadata);
+    let permits_deadline_replay =
+        cause == LocalRecoveryCause::RequestDeadline && local_recovery_completed_ready(&metadata);
+    if permits_deadline_replay {
+        runtime
+            .local_recovery_deadline_replay_permits
+            .fetch_add(1, Ordering::SeqCst);
+    }
+    metadata.insert(
+        String::from("local_recovery_permits_retry"),
+        permits_retry.to_string(),
+    );
+    applied_local_recovery_gate(metadata, permits_retry, permits_deadline_replay)
+}
+
+fn unapplied_local_recovery_gate() -> LocalRecoveryGate {
+    LocalRecoveryGate {
+        metadata: BTreeMap::new(),
+        permits_retry: true,
+        applied: false,
+        permits_deadline_replay: false,
+    }
+}
+
+fn skipped_local_recovery_gate(
+    mut metadata: BTreeMap<String, String>,
+    status: &str,
+    permits_retry: bool,
+) -> LocalRecoveryGate {
+    metadata.insert(String::from("local_recovery_status"), status.to_owned());
+    metadata.insert(
+        String::from("local_recovery_permits_retry"),
+        permits_retry.to_string(),
+    );
+    applied_local_recovery_gate(metadata, permits_retry, false)
+}
+
+fn applied_local_recovery_gate(
+    metadata: BTreeMap<String, String>,
+    permits_retry: bool,
+    permits_deadline_replay: bool,
+) -> LocalRecoveryGate {
+    LocalRecoveryGate {
+        metadata,
+        permits_retry,
+        applied: true,
+        permits_deadline_replay,
+    }
+}
+
+fn local_recovery_metadata(
+    runtime: &ShieldedRetryRuntime,
+    cause: LocalRecoveryCause,
+) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            String::from("local_recovery_configured"),
+            runtime.local_recovery_policy.is_configured().to_string(),
+        ),
+        (
+            String::from("local_recovery_cause"),
+            cause.as_str().to_owned(),
+        ),
+        (
+            String::from("local_recovery_profile"),
+            runtime.upstream_profile.name.clone(),
+        ),
+    ])
+}
+
+fn local_recovery_permits_retry(metadata: &BTreeMap<String, String>) -> bool {
+    match metadata.get("local_recovery_status").map(String::as_str) {
+        Some("skipped_disabled" | "skipped_no_command" | "succeeded") => true,
+        Some("joined_inflight") => metadata
+            .get("local_recovery_joined_status")
+            .is_some_and(|status| status == "succeeded"),
+        _ => false,
+    }
+}
+
+fn local_recovery_completed_ready(metadata: &BTreeMap<String, String>) -> bool {
+    matches!(
+        metadata.get("local_recovery_status").map(String::as_str),
+        Some("succeeded")
+    ) || (metadata
+        .get("local_recovery_status")
+        .is_some_and(|status| status == "joined_inflight")
+        && metadata
+            .get("local_recovery_joined_status")
+            .is_some_and(|status| status == "succeeded"))
+}
+
+fn consume_local_recovery_deadline_replay_permit(runtime: &ShieldedRetryRuntime) -> bool {
+    runtime
+        .local_recovery_deadline_replay_permits
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |permits| {
+            permits.checked_sub(1)
+        })
+        .is_ok()
+}
+
+async fn run_local_recovery(
+    runtime: &ShieldedRetryRuntime,
+    cause: LocalRecoveryCause,
+) -> BTreeMap<String, String> {
+    let policy = &runtime.local_recovery_policy;
+    let coordinator = &runtime.local_recovery;
+    let mut state = coordinator.state.lock().await;
+    if state.running {
+        drop(state);
+        return wait_for_local_recovery_result(policy, coordinator, true).await;
+    }
+
+    let mut metadata = BTreeMap::new();
+    let now = Instant::now();
+    if let Some(last_finished) = state.last_finished {
+        let elapsed = now.saturating_duration_since(last_finished);
+        if elapsed < policy.cooldown {
+            metadata.insert(
+                String::from("local_recovery_status"),
+                String::from("skipped_cooldown"),
+            );
+            metadata.insert(
+                String::from("local_recovery_cooldown_remaining_ms"),
+                policy
+                    .cooldown
+                    .saturating_sub(elapsed)
+                    .as_millis()
+                    .to_string(),
+            );
+            return metadata;
+        }
+    }
+
+    let window_started = state.window_started.unwrap_or(now);
+    if now.saturating_duration_since(window_started) >= policy.budget_window {
+        state.window_started = Some(now);
+        state.runs_in_window = 0;
+    } else if state.runs_in_window >= policy.max_per_window {
+        metadata.insert(
+            String::from("local_recovery_status"),
+            String::from("skipped_budget_exhausted"),
+        );
+        metadata.insert(
+            String::from("local_recovery_budget_runs"),
+            state.runs_in_window.to_string(),
+        );
+        metadata.insert(
+            String::from("local_recovery_budget_max_per_window"),
+            policy.max_per_window.to_string(),
+        );
+        return metadata;
+    } else if state.window_started.is_none() {
+        state.window_started = Some(now);
+    }
+
+    state.running = true;
+    state.runs_in_window = state.runs_in_window.saturating_add(1);
+    drop(state);
+
+    let task_policy = policy.clone();
+    let task_coordinator = Arc::clone(coordinator);
+    let client = runtime.client.clone();
+    let base_url = runtime.upstream_profile.base_url.clone();
+    tokio::spawn(async move {
+        let mut metadata = BTreeMap::from([(
+            String::from("local_recovery_trigger_cause"),
+            cause.as_str().to_owned(),
+        )]);
+        metadata.extend(run_local_recovery_restart_command(&task_policy).await);
+        if metadata
+            .get("local_recovery_restart_status")
+            .is_some_and(|status| status == "succeeded")
+        {
+            metadata.extend(run_local_recovery_readiness(client, base_url, &task_policy).await);
+        }
+        if !metadata.contains_key("local_recovery_status") {
+            let status = match metadata
+                .get("local_recovery_readiness_status")
+                .map(String::as_str)
+            {
+                Some("ready") => "succeeded",
+                Some("timeout") => "readiness_timeout",
+                Some("error") => "readiness_error",
+                Some(_) => "readiness_not_ready",
+                None => "restart_failed",
+            };
+            metadata.insert(String::from("local_recovery_status"), status.to_owned());
+        }
+        finish_upstream_stall_recovery(&task_coordinator, metadata).await;
+    });
+
+    wait_for_local_recovery_result(policy, coordinator, false).await
+}
+
+async fn wait_for_local_recovery_result(
+    policy: &LocalRecoveryPolicy,
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+    joined_inflight: bool,
+) -> BTreeMap<String, String> {
+    let deadline = Instant::now()
+        + policy
+            .restart_timeout
+            .saturating_add(policy.readiness_deadline)
+            .saturating_add(Duration::from_secs(1));
+    loop {
+        let notified = coordinator.notify.notified();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+
+        let state = coordinator.state.lock().await;
+        if !state.running {
+            return completed_local_recovery_metadata(&state, joined_inflight);
+        }
+        drop(state);
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || timeout(remaining, notified).await.is_err() {
+            let state = coordinator.state.lock().await;
+            if !state.running {
+                return completed_local_recovery_metadata(&state, joined_inflight);
+            }
+            drop(state);
+
+            return BTreeMap::from([(
+                String::from("local_recovery_status"),
+                if joined_inflight {
+                    String::from("join_timeout")
+                } else {
+                    String::from("completion_timeout")
+                },
+            )]);
+        }
+    }
+}
+
+fn completed_local_recovery_metadata(
+    state: &UpstreamStallRecoveryState,
+    joined_inflight: bool,
+) -> BTreeMap<String, String> {
+    let Some(last_result) = &state.last_result else {
+        return BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("missing_result"),
+        )]);
+    };
+    if !joined_inflight {
+        return last_result.clone();
+    }
+    let mut joined = BTreeMap::from([(
+        String::from("local_recovery_status"),
+        String::from("joined_inflight"),
+    )]);
+    if let Some(status) = last_result.get("local_recovery_status") {
+        joined.insert(String::from("local_recovery_joined_status"), status.clone());
+    }
+    joined
+}
+
+async fn run_local_recovery_restart_command(
+    policy: &LocalRecoveryPolicy,
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::from([(
+        String::from("local_recovery_restart_ran"),
+        String::from("true"),
+    )]);
+    let program = &policy.restart_command[0];
+    let args = &policy.restart_command[1..];
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    configure_recovery_command(&mut command);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            metadata.insert(
+                String::from("local_recovery_restart_status"),
+                String::from("spawn_failed"),
+            );
+            metadata.insert(
+                String::from("local_recovery_restart_error"),
+                error.kind().to_string(),
+            );
+            metadata.insert(
+                String::from("local_recovery_status"),
+                String::from("spawn_failed"),
+            );
+            return metadata;
+        }
+    };
+    match timeout(policy.restart_timeout, child.wait()).await {
+        Ok(Ok(status)) => {
+            let restart_status = if status.success() {
+                "succeeded"
+            } else {
+                "exit_failure"
+            };
+            metadata.insert(
+                String::from("local_recovery_restart_status"),
+                restart_status.to_owned(),
+            );
+            if restart_status != "succeeded" {
+                metadata.insert(
+                    String::from("local_recovery_status"),
+                    restart_status.to_owned(),
+                );
+            }
+            if let Some(code) = status.code() {
+                metadata.insert(
+                    String::from("local_recovery_restart_exit_code"),
+                    code.to_string(),
+                );
+            }
+        }
+        Ok(Err(error)) => {
+            metadata.insert(
+                String::from("local_recovery_restart_status"),
+                String::from("wait_failed"),
+            );
+            metadata.insert(
+                String::from("local_recovery_restart_error"),
+                error.kind().to_string(),
+            );
+            metadata.insert(
+                String::from("local_recovery_status"),
+                String::from("wait_failed"),
+            );
+        }
+        Err(_elapsed) => {
+            metadata.insert(
+                String::from("local_recovery_restart_status"),
+                String::from("timeout_killed"),
+            );
+            metadata.insert(
+                String::from("local_recovery_status"),
+                String::from("timeout_killed"),
+            );
+            metadata.extend(terminate_timed_out_recovery_child(&mut child).await);
+        }
+    }
+    metadata
+}
+
+async fn run_local_recovery_readiness(
+    client: Client,
+    base_url: String,
+    policy: &LocalRecoveryPolicy,
+) -> BTreeMap<String, String> {
+    let deadline = Instant::now() + policy.readiness_deadline;
+    loop {
+        if Instant::now() >= deadline {
+            return BTreeMap::from([(
+                String::from("local_recovery_readiness_status"),
+                String::from("timeout"),
+            )]);
+        }
+        match send_local_recovery_readiness_probe(&client, &base_url, policy).await {
+            Ok(true) => {
+                return BTreeMap::from([(
+                    String::from("local_recovery_readiness_status"),
+                    String::from("ready"),
+                )]);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return BTreeMap::from([
+                        (
+                            String::from("local_recovery_readiness_status"),
+                            String::from("error"),
+                        ),
+                        (String::from("local_recovery_readiness_error"), error),
+                    ]);
+                }
+            }
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return BTreeMap::from([(
+                String::from("local_recovery_readiness_status"),
+                String::from("timeout"),
+            )]);
+        }
+        tokio::time::sleep(std::cmp::min(policy.readiness_interval, remaining)).await;
+    }
+}
+
+async fn send_local_recovery_readiness_probe(
+    client: &Client,
+    base_url: &str,
+    policy: &LocalRecoveryPolicy,
+) -> Result<bool, String> {
+    let uri = policy
+        .readiness_endpoint
+        .parse::<Uri>()
+        .map_err(|error| format!("readiness endpoint parse failed: {error}"))?;
+    let upstream_url = build_upstream_url(base_url, &uri).map_err(|error| error.to_string())?;
+    let response = client
+        .post(upstream_url)
+        .header(
+            HeaderName::from_static("x-llm-guard-proxy-probe"),
+            HeaderValue::from_static("local-recovery"),
+        )
+        .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .body(policy.readiness_body.to_string())
+        .timeout(policy.readiness_request_timeout)
+        .send()
+        .await
+        .map_err(|error| sanitized_reqwest_error(&error))?;
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| sanitized_reqwest_error(&error))?;
+    let value = serde_json::from_slice::<serde_json::Value>(&body)
+        .map_err(|error| format!("readiness response JSON decode failed: {error}"))?;
+    Ok(is_valid_chat_completion_probe_response(&value))
+}
+
+fn is_valid_chat_completion_probe_response(value: &serde_json::Value) -> bool {
+    value
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|choices| !choices.is_empty())
+}
+
 struct UpstreamStallRecoveryGate {
     metadata: BTreeMap<String, String>,
     permits_retry: bool,
@@ -6274,6 +6971,13 @@ async fn recovery_gate_for_retryable_upstream_stall(
         return UpstreamStallRecoveryGate {
             metadata: BTreeMap::new(),
             permits_retry: true,
+        };
+    }
+    let local_recovery_gate = local_recovery_gate_for_upstream_stall(runtime, can_retry).await;
+    if local_recovery_gate.applied {
+        return UpstreamStallRecoveryGate {
+            metadata: local_recovery_gate.metadata,
+            permits_retry: local_recovery_gate.permits_retry,
         };
     }
     let mut metadata = run_upstream_stall_recovery(
@@ -6656,6 +7360,7 @@ async fn start_shielded_attempt(
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
     cot_salvage: Option<&CotSalvageContext>,
+    ignores_request_deadline: bool,
 ) -> Result<ShieldedStartedAttempt, ShieldedAttemptFailure> {
     let attempt_id = AttemptId::for_request(&runtime.request_id, attempt_number);
     let attempt_started_at_unix_ms = unix_time_millis();
@@ -6681,12 +7386,16 @@ async fn start_shielded_attempt(
         &attempt_plan,
         cot_salvage,
     );
-    let upstream_timeout = runtime
-        .request_deadline
-        .remaining()
-        .map_or(Duration::ZERO, |remaining| {
-            runtime.upstream_timeout.min(remaining)
-        });
+    let upstream_timeout = if ignores_request_deadline {
+        runtime.upstream_timeout
+    } else {
+        runtime
+            .request_deadline
+            .remaining()
+            .map_or(Duration::ZERO, |remaining| {
+                runtime.upstream_timeout.min(remaining)
+            })
+    };
     match send_upstream_request_until_shutdown(
         &runtime.client,
         runtime.method.clone(),
@@ -6717,6 +7426,7 @@ async fn start_shielded_attempt(
                     upstream_body: evidence_upstream_body,
                 },
                 response,
+                ignores_request_deadline,
             })
         }
         Err(error) => Err(shielded_start_transport_failure(
@@ -7271,6 +7981,21 @@ fn request_deadline_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> Shie
         },
         upstream_body: info.upstream_body.clone(),
     }
+}
+
+fn mark_request_deadline_attempt_failure(failure: &mut ShieldedAttemptFailure) {
+    failure.error_type = REQUEST_DEADLINE_ERROR_TYPE;
+    failure.error_message = String::from("shielded request deadline exhausted");
+    failure.retry_cause = None;
+    failure.abort_reason = Some(REQUEST_DEADLINE_ABORT_REASON.to_owned());
+    failure.response_metadata.insert(
+        String::from("abort_reason"),
+        REQUEST_DEADLINE_ABORT_REASON.to_owned(),
+    );
+    failure.response_metadata.insert(
+        String::from("request_deadline_exhausted"),
+        String::from("true"),
+    );
 }
 
 fn cot_salvage_context_for_failure(

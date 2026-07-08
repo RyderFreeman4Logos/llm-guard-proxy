@@ -4816,6 +4816,515 @@ recovery_max_per_window = 1
 }
 
 #[tokio::test]
+async fn local_recovery_restart_command() {
+    assert!(!LocalRecoveryPolicy::from_config(&LocalRecoveryConfig::default()).is_configured());
+
+    let success_policy = LocalRecoveryPolicy {
+        enabled: true,
+        restart_command: vec![String::from("/bin/true")],
+        restart_timeout: Duration::from_secs(1),
+        readiness_endpoint: String::from("/v1/chat/completions"),
+        readiness_body: serde_json::json!({"messages":[{"role":"user","content":"ready"}],"max_tokens":1}),
+        readiness_request_timeout: Duration::from_millis(50),
+        readiness_deadline: Duration::from_millis(50),
+        readiness_interval: Duration::from_millis(10),
+        max_attempts_per_request: 1,
+        cooldown: Duration::from_millis(1),
+        budget_window: Duration::from_secs(60),
+        max_per_window: 1,
+    };
+    let success = run_local_recovery_restart_command(&success_policy).await;
+    assert_eq!(success["local_recovery_restart_status"], "succeeded");
+
+    let timeout_policy = LocalRecoveryPolicy {
+        restart_command: vec![String::from("/bin/sleep"), String::from("30")],
+        restart_timeout: Duration::from_millis(50),
+        ..success_policy
+    };
+    let timeout = run_local_recovery_restart_command(&timeout_policy).await;
+    assert_eq!(timeout["local_recovery_restart_status"], "timeout_killed");
+    assert_eq!(timeout["local_recovery_status"], "timeout_killed");
+}
+
+#[tokio::test]
+async fn local_recovery_replays_original_request() {
+    let mut fake = FakeUpstream::spawn().await;
+    let recovery_root = unique_test_dir("local-recovery-replay");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let recovery_marker = recovery_root.join("recovered");
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+
+[upstream.stall]
+enabled = true
+idle_timeout_ms = 50
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/touch", "{recovery_marker}"]
+restart_timeout_ms = 1000
+readiness_body = {{"model":"test-chat","messages":[{{"role":"user","content":"local recovery ready"}}],"max_tokens":1}}
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 100
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+"#,
+            recovery_marker = recovery_marker.display()
+        ),
+    )
+    .await;
+
+    let original_body = r#"{"model":"test-chat","messages":[{"role":"user","content":"original business request"}]}"#;
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=stall-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(original_body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    assert!(recovery_marker.exists());
+
+    let first = fake.recv_next().await;
+    let probe = fake.recv_next().await;
+    let replay = fake.recv_next().await;
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=stall-once-then-success"
+    );
+    assert_eq!(probe.path_and_query, "/v1/chat/completions");
+    assert!(body_contains_text(&probe.body, "local recovery ready"));
+    assert_eq!(
+        replay.path_and_query,
+        "/v1/chat/completions?test=stall-once-then-success"
+    );
+    assert_eq!(first.body, replay.body);
+    assert!(!body_contains_text(&replay.body, "local recovery ready"));
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(attempts[0].retry_reason.as_deref(), Some("upstream_stall"));
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_status"],
+        "succeeded"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_readiness_status"],
+        "ready"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_permits_retry"],
+        "true"
+    );
+    assert_eq!(attempts[1].status, "succeeded");
+
+    remove_dir_all(&recovery_root);
+}
+
+#[tokio::test]
+async fn local_recovery_chat_readiness() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+
+[upstream.stall]
+enabled = true
+idle_timeout_ms = 50
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/bin/true"]
+restart_timeout_ms = 1000
+readiness_body = {"model":"test-chat","messages":[{"role":"user","content":"hot-restart-never-ready"}],"max_tokens":1}
+readiness_request_timeout_ms = 100
+readiness_deadline_ms = 100
+readiness_interval_ms = 50
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+"#,
+    )
+    .await;
+
+    let models = proxy
+        .client
+        .get(format!("{}/models", fake.base_url))
+        .send()
+        .await
+        .expect("models request should complete");
+    assert_eq!(models.status(), StatusCode::OK);
+    let _models_body = models.text().await.expect("models body should read");
+    let models_probe = fake.recv_next().await;
+    assert_eq!(models_probe.path_and_query, "/v1/models");
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=stall-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _body = response.text().await.expect("error body should be text");
+    let first = fake.recv_next().await;
+    let readiness = fake.recv_next().await;
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=stall-once-then-success"
+    );
+    assert_eq!(readiness.path_and_query, "/v1/chat/completions");
+    while let Some(extra_probe) = fake.recv_within(Duration::from_millis(100)).await {
+        assert_eq!(extra_probe.path_and_query, "/v1/chat/completions");
+        assert!(body_contains_text(
+            &extra_probe.body,
+            "hot-restart-never-ready"
+        ));
+    }
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_status"],
+        "readiness_timeout"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_permits_retry"],
+        "false"
+    );
+}
+
+#[tokio::test]
+async fn local_recovery_replays_after_request_deadline_recovery() {
+    let mut fake = FakeUpstream::spawn().await;
+    let recovery_root = unique_test_dir("local-recovery-deadline-replay");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let recovery_marker = recovery_root.join("recovered");
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+request_deadline_ms = 100
+anti_loop_hint_enabled = false
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/touch", "{recovery_marker}"]
+restart_timeout_ms = 1000
+readiness_body = {{"model":"test-chat","messages":[{{"role":"user","content":"deadline recovery ready"}}],"max_tokens":1}}
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 100
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+"#,
+            recovery_marker = recovery_marker.display()
+        ),
+    )
+    .await;
+
+    let original_body = r#"{"model":"test-chat","messages":[{"role":"user","content":"deadline business request"}]}"#;
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=stall-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(original_body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    assert!(recovery_marker.exists());
+
+    let first = fake.recv_next().await;
+    let probe = fake.recv_next().await;
+    let replay = fake.recv_next().await;
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=stall-once-then-success"
+    );
+    assert_eq!(probe.path_and_query, "/v1/chat/completions");
+    assert!(body_contains_text(&probe.body, "deadline recovery ready"));
+    assert_eq!(
+        replay.path_and_query,
+        "/v1/chat/completions?test=stall-once-then-success"
+    );
+    assert_eq!(first.body, replay.body);
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(
+        attempts[0].abort_reason.as_deref(),
+        Some(REQUEST_DEADLINE_ABORT_REASON)
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_cause"],
+        "request_deadline"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_status"],
+        "succeeded"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_permits_retry"],
+        "true"
+    );
+    assert_eq!(attempts[1].status, "succeeded");
+
+    remove_dir_all(&recovery_root);
+}
+
+#[tokio::test]
+async fn local_recovery_failure_observability() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+
+[upstream.stall]
+enabled = true
+idle_timeout_ms = 50
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/bin/false"]
+restart_timeout_ms = 1000
+readiness_body = {"model":"test-chat","messages":[{"role":"user","content":"secret readiness prompt"}],"max_tokens":1}
+readiness_request_timeout_ms = 100
+readiness_deadline_ms = 100
+readiness_interval_ms = 50
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=stall-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .header(AUTHORIZATION, "Bearer sk-local-recovery-secret")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"secret business prompt"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let _body = response.text().await.expect("error body should be text");
+    let _first = fake.recv_next().await;
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    let metadata = &attempts[0].response_metadata;
+    assert_eq!(metadata["local_recovery_configured"], "true");
+    assert_eq!(metadata["local_recovery_status"], "exit_failure");
+    assert_eq!(metadata["local_recovery_cause"], "upstream_stall");
+    assert_eq!(metadata["local_recovery_profile"], "default");
+    assert_eq!(metadata["local_recovery_permits_retry"], "false");
+    let serialized_metadata =
+        serde_json::to_string(metadata).expect("metadata should serialize for leakage check");
+    assert!(!serialized_metadata.contains("secret business prompt"));
+    assert!(!serialized_metadata.contains("secret readiness prompt"));
+    assert!(!serialized_metadata.contains("sk-local-recovery-secret"));
+}
+
+#[tokio::test]
+async fn local_recovery_profile_singleflight() {
+    assert_local_recovery_coordinator_profiles_are_isolated();
+    let mut fake = FakeUpstream::spawn().await;
+    let recovery_root = unique_test_dir("local-recovery-singleflight");
+    remove_dir_all(&recovery_root);
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let (script_path, count_path) = write_singleflight_restart_script(&recovery_root);
+
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 3
+anti_loop_hint_enabled = false
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["{script_path}"]
+restart_timeout_ms = 1000
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 100
+cooldown_ms = 1
+budget_window_ms = 10000
+max_per_window = 1
+"#,
+            script_path = script_path.display()
+        ),
+    )
+    .await;
+
+    let first = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=hot-restart-concurrent",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"one"}]}"#)
+        .send();
+    let second = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=hot-restart-concurrent",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"two"}]}"#)
+        .send();
+
+    let (first, second) = tokio::join!(first, second);
+    let first = first.expect("first request should complete");
+    let second = second.expect("second request should complete");
+    assert_eq!(first.status(), StatusCode::OK);
+    assert_eq!(second.status(), StatusCode::OK);
+    let _first_body = first.text().await.expect("first body should read");
+    let _second_body = second.text().await.expect("second body should read");
+
+    assert_singleflight_upstream_requests(&mut fake).await;
+
+    let count = fs::read_to_string(&count_path).expect("restart count should be readable");
+    assert_eq!(count.lines().count(), 1);
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    let recovery_statuses = attempts
+        .iter()
+        .filter_map(|attempt| attempt.response_metadata.get("local_recovery_status"))
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(recovery_statuses.contains(&"succeeded"));
+    assert!(recovery_statuses.contains(&"joined_inflight"));
+
+    remove_dir_all(&recovery_root);
+}
+
+fn assert_local_recovery_coordinator_profiles_are_isolated() {
+    let coordinators = LocalRecoveryCoordinatorSet::default();
+    let first_default = coordinators.coordinator_for("default");
+    let second_default = coordinators.coordinator_for("default");
+    let other_profile = coordinators.coordinator_for("other");
+    assert!(Arc::ptr_eq(&first_default, &second_default));
+    assert!(!Arc::ptr_eq(&first_default, &other_profile));
+}
+
+fn write_singleflight_restart_script(recovery_root: &Path) -> (PathBuf, PathBuf) {
+    let count_path = recovery_root.join("count.txt");
+    let script_path = recovery_root.join("restart-once.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\necho run >> {}\nsleep 0.2\n",
+            count_path.display()
+        ),
+    )
+    .expect("restart script should be written");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+        .expect("restart script should be executable");
+    (script_path, count_path)
+}
+
+async fn assert_singleflight_upstream_requests(fake: &mut FakeUpstream) {
+    let mut observed = Vec::new();
+    for _ in 0..5 {
+        observed.push(fake.recv_next().await);
+    }
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+    let readiness_count = observed
+        .iter()
+        .filter(|request| {
+            request.path_and_query == "/v1/chat/completions"
+                && request
+                    .headers
+                    .get("x-llm-guard-proxy-probe")
+                    .is_some_and(|value| value == "local-recovery")
+        })
+        .count();
+    let business_count = observed
+        .iter()
+        .filter(|request| {
+            request.path_and_query == "/v1/chat/completions?test=hot-restart-concurrent"
+        })
+        .count();
+    assert_eq!(readiness_count, 1);
+    assert_eq!(business_count, 4);
+}
+
+#[tokio::test]
 async fn upstream_stall_recovery_is_single_flight_and_budget_limited() {
     let policy = UpstreamStallPolicy {
         enabled: true,
@@ -5292,6 +5801,86 @@ max_attempts = 3
     assert_eq!(
         attempts[0].response_metadata["hot_restart_recovery_status"],
         "ready"
+    );
+    assert_eq!(attempts[1].status, "succeeded");
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+#[tokio::test]
+async fn disabled_local_recovery_does_not_suppress_hot_restart() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[upstream.hot_restart]
+probe_interval_secs = 1
+probe_timeout_secs = 5
+
+[upstream.local_recovery]
+enabled = false
+restart_command = ["/bin/false"]
+
+[retry]
+max_attempts = 3
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=hot-restart-503-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let aggregated: serde_json::Value =
+        serde_json::from_str(&response.text().await.expect("body should be text"))
+            .expect("body should be JSON");
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let first = fake.recv_next().await;
+    let probe = fake
+        .recv_within(Duration::from_millis(500))
+        .await
+        .expect("hot-restart probe should run when local recovery is disabled");
+    let retry = fake
+        .recv_within(Duration::from_millis(500))
+        .await
+        .expect("original request should replay after hot-restart readiness");
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=hot-restart-503-then-success"
+    );
+    assert_eq!(probe.path_and_query, "/v1/chat/completions");
+    assert_eq!(
+        retry.path_and_query,
+        "/v1/chat/completions?test=hot-restart-503-then-success"
+    );
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(
+        attempts[0].response_metadata["hot_restart_recovery_status"],
+        "ready"
+    );
+    assert!(
+        attempts[0]
+            .response_metadata
+            .get("local_recovery_status")
+            .is_none()
     );
     assert_eq!(attempts[1].status, "succeeded");
 }
