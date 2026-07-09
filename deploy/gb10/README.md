@@ -344,6 +344,34 @@ The Aeon-Bench-Pod logging proxy streaming buffering issue is separate: it can
 delay small SSE chunks and heartbeats for that runner, but this guard-side fix
 only bounds the guard retry ladder and relay lifetime.
 
+### Benchmark 5xx/stall reliability checklist
+
+The diagnostic benchmark at
+`/tmp/gb10-aeon-final-quality-after-guard-fix-20260708-160518/aeon_quality.db`
+and archive SHA-256
+`0d0737e525cc4a7685188a027e4e4054c892c8903b68450827bdd14b07efffcb`
+is invalidated for quality conclusions. Use it only to reproduce guard failure
+classes before a clean rerun.
+
+| Failure class | Target entrypoints | Regression tests | Downstream surface | Observability fields |
+|---------------|-------------------|------------------|--------------------|----------------------|
+| HTTP 5xx | `start_shielded_attempt`, `status_failure`, `shielded_retry_error_response` | `shielded_retry_exhausted_5xx_records_status_failure_surface` | Non-OK JSON error with `error.type` and `error.cause = upstream_status_error` | `status_code`, `retry_attempt_chain`, `retry_reason`, metric `cause="status_error"` |
+| Connection refused/transport/body decode | `shielded_start_transport_failure`, `transport_retry_cause`, `ProxyError::upstream_failure_cause` | `shielded_retry_connection_refused_returns_structured_proxy_error` | Non-OK JSON error with bounded upstream cause; no raw upstream text passthrough | `retry_attempt_chain`, `retry_reason`, metric `cause="connect_failed"` or `body_error` |
+| SSE idle/stall | `shielded_chat::aggregate_stream`, `aggregation_failure`, `ShieldedLivenessBody` | `shielded_streaming_stall_failure_emits_valid_sse_error_and_metrics` | Retry success hides the failed attempt; retry exhaustion emits a valid SSE `event: error` without `[DONE]` | `upstream_stall_detected`, `abort_reason=upstream_stall`, metric `cause="timeout"` |
+| Request deadline exhausted | `ShieldedRequestDeadline`, `begin_shielded_retry`, `aggregate_shielded_attempt`, final direct relay | `shielded_retry_streaming_request_deadline_exhaustion_stops_waiting`, `shielded_retry_connect_hot_restart_wait_respects_request_deadline` | JSON/SSE error `llm_guard_request_deadline_exhausted`, or bounded direct relay termination after content release | `request_deadline_exhausted`, `shielded_terminal_reason`, `retry_attempt_count`, metric `cause="timeout"` |
+
+Smoke sequence before any clean final benchmark rerun:
+
+1. Rebuild and install only the guard binary from the reviewed workspace build.
+2. Restart the user service for `:18009`; do not change the upstream vLLM service.
+3. Check `http://127.0.0.1:18009/health` and `/v1/models`.
+4. Run chat completions in non-stream and stream modes through `:18009`.
+5. Run an explicit no-thinking opt-out request and verify the upstream body still preserves the opt-out.
+6. Run embeddings and rerank requests and verify they do not enter shielded chat retry.
+7. Replay one known failing benchmark prompt/case through the guard route.
+8. Inspect SQLite/debug/metrics records for bounded `error.type`, `retry_reason`, `abort_reason`, and `llm_guard_proxy_upstream_failure_total{cause=...}` labels.
+9. Start a clean final benchmark rerun only after all smoke checks pass.
+
 ### What affects client-visible quality vs evidence-only collection
 
 | Setting | Client-visible effect | Evidence/debug effect |

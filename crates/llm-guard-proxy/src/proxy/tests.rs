@@ -6146,6 +6146,241 @@ max_attempts = 2
 }
 
 #[tokio::test]
+async fn shielded_retry_exhausted_5xx_records_status_failure_surface() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=always-502",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"status-secret"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = response.text().await.expect("body should be text");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("error body should be valid JSON");
+    assert_eq!(parsed["error"]["type"], "llm_guard_upstream_error");
+    assert_eq!(parsed["error"]["cause"], "upstream_status_error");
+    assert!(parsed.get("choices").is_none());
+    assert!(!body.contains("status-secret"));
+
+    let observed = drain_upstream_requests(&mut fake, Duration::from_millis(100)).await;
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|request| request.path_and_query == "/v1/chat/completions?test=always-502")
+            .count(),
+        2
+    );
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(request_row.http_status, 502);
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "2");
+    assert_eq!(
+        request_row.response_metadata["retry_attempt_chain"],
+        "1:retried:none:transient_upstream_status,2:failed:none:none"
+    );
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(
+        attempts[0].retry_reason.as_deref(),
+        Some("transient_upstream_status")
+    );
+    assert_eq!(attempts[0].response_metadata["status_code"], "502");
+    assert_eq!(attempts[1].status, "failed");
+    assert_eq!(attempts[1].response_metadata["status_code"], "502");
+    assert_eq!(attempts[1].response_metadata["retry_exhausted"], "true");
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_upstream_failure_total",
+            &[("cause", "status_error")]
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn shielded_retry_connection_refused_returns_structured_proxy_error() {
+    let upstream_base_url = "http://127.0.0.1:1/v1";
+    let proxy = ProxyFixture::spawn_with_options(
+        upstream_base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+request_timeout_ms = 100
+
+[upstream.hot_restart]
+enabled = false
+
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+request_deadline_ms = 300
+"#,
+    )
+    .await;
+
+    let response = timeout(
+        Duration::from_secs(2),
+        proxy_handler(
+            State(proxy.state.clone()),
+            shielded_chat_request(
+                "/v1/chat/completions",
+                r#"{"model":"test-chat","messages":[{"role":"user","content":"connect-secret"}]}"#,
+            ),
+        ),
+    )
+    .await
+    .expect("proxy handler should complete before request deadline");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body_bytes = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("body should read");
+    let body = String::from_utf8(body_bytes.to_vec()).expect("body should be UTF-8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("error body should be valid JSON");
+    assert_eq!(parsed["error"]["type"], "llm_guard_upstream_error");
+    assert_eq!(parsed["error"]["cause"], "upstream_connect_failed");
+    assert!(parsed.get("choices").is_none());
+    assert!(!body.contains("connect-secret"));
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(request_row.http_status, 502);
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "2");
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(
+        attempts[0].retry_reason.as_deref(),
+        Some("transient_upstream_transport")
+    );
+    assert_eq!(attempts[1].status, "failed");
+    assert_eq!(attempts[1].response_metadata["retry_exhausted"], "true");
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_upstream_failure_total",
+            &[("cause", "connect_failed")]
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn shielded_retry_connect_hot_restart_wait_respects_request_deadline() {
+    let upstream_base_url = "http://127.0.0.1:1/v1";
+    let proxy = ProxyFixture::spawn_with_options(
+        upstream_base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+request_timeout_ms = 100
+
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 4
+request_deadline_ms = 200
+"#,
+    )
+    .await;
+
+    let response = timeout(
+        Duration::from_secs(2),
+        proxy_handler(
+            State(proxy.state.clone()),
+            shielded_chat_request(
+                "/v1/chat/completions",
+                r#"{"model":"test-chat","messages":[{"role":"user","content":"hot-restart-secret"}]}"#,
+            ),
+        ),
+    )
+    .await
+    .expect("proxy handler should complete before the test timeout");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body_bytes = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("body should read");
+    let body = String::from_utf8(body_bytes.to_vec()).expect("body should be UTF-8");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("error body should be valid JSON");
+    assert_eq!(
+        parsed["error"]["type"],
+        "llm_guard_request_deadline_exhausted"
+    );
+    assert_eq!(parsed["error"]["cause"], "upstream_timeout");
+    assert!(!body.contains("hot-restart-secret"));
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(request_row.http_status, 502);
+    assert_eq!(
+        request_row.response_metadata["request_deadline_exhausted"],
+        "true"
+    );
+    assert_eq!(
+        request_row.response_metadata["hot_restart_recovery_status"],
+        "request_deadline_exhausted"
+    );
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "1");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].abort_reason.as_deref(),
+        Some("request_deadline_exhausted")
+    );
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_upstream_failure_total",
+            &[("cause", "timeout")]
+        ),
+        1
+    );
+}
+
+#[tokio::test]
 async fn hot_reloaded_retry_max_attempts_reduces_subsequent_requests() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -8053,12 +8288,94 @@ max_tokens = 128
 "#;
 
 #[tokio::test]
-async fn shielded_retry_streaming_request_deadline_exhaustion_stops_waiting() {
+async fn shielded_streaming_stall_failure_emits_valid_sse_error_and_metrics() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
         true,
         AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "sse"
+interval_secs = 15
+
+[retry]
+max_attempts = 1
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+
+[upstream.stall]
+enabled = true
+idle_timeout_ms = 50
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=stall-once-then-success",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"stall-secret"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    assert!(released.contains("event: error"));
+    assert!(released.contains("llm_guard_attempt_timeout"));
+    assert!(!released.contains("data: [DONE]"));
+    assert!(!released.contains("stall-secret"));
+    let chunks = openai_sse_json_chunks(&released);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0]["error"]["type"], "llm_guard_attempt_timeout");
+
+    let first_attempt = fake.recv_next().await;
+    assert_eq!(
+        first_attempt.path_and_query,
+        "/v1/chat/completions?test=stall-once-then-success"
+    );
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "retry-exhausted stall failure must not start another upstream attempt"
+    );
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(
+        request_row.response_metadata["upstream_stall_detected"],
+        "true"
+    );
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "1");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(attempts[0].abort_reason.as_deref(), Some("upstream_stall"));
+    assert_eq!(
+        attempts[0].response_metadata["upstream_stall_detected"],
+        "true"
+    );
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_upstream_failure_total",
+            &[("cause", "timeout")]
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn shielded_retry_streaming_request_deadline_exhaustion_stops_waiting() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_full_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        "",
         r#"
 [heartbeat]
 mode = "sse"
@@ -8074,6 +8391,11 @@ request_deadline_ms = 100
 anti_loop_hint_enabled = false
 shielded_streaming_enabled = true
 "#,
+        r#"debug_summary_enabled = true
+debug_summary_admin_token = "admin-token"
+debug_summary_max_records = 5
+"#,
+        "",
     )
     .await;
 
@@ -8081,7 +8403,7 @@ shielded_streaming_enabled = true
         State(proxy.state.clone()),
         shielded_chat_request(
             "/v1/chat/completions?test=slow-shielded",
-            r#"{"model":"test-chat","messages":[{"role":"user","content":"stream"}],"stream":true}"#,
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"deadline-secret"}],"stream":true}"#,
         ),
     )
     .await;
@@ -8091,6 +8413,13 @@ shielded_streaming_enabled = true
     let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
     assert!(released.contains("llm_guard_request_deadline_exhausted"));
     assert!(!released.contains("data: [DONE]"));
+    assert!(!released.contains("deadline-secret"));
+    let chunks = openai_sse_json_chunks(&released);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0]["error"]["type"],
+        "llm_guard_request_deadline_exhausted"
+    );
 
     let first_attempt = fake.recv_next().await;
     assert_eq!(
@@ -8128,6 +8457,18 @@ shielded_streaming_enabled = true
         attempts[0].response_metadata["request_deadline_exhausted"],
         "true"
     );
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_upstream_failure_total",
+            &[("cause", "timeout")]
+        ),
+        1
+    );
+
+    assert_deadline_debug_summary(&proxy).await;
 }
 
 #[tokio::test]
@@ -16269,6 +16610,9 @@ fn fake_loop_twice_then_success_response(
 }
 
 fn fake_fixed_status_chat_completion_response(path_and_query: &str) -> Option<Response<Body>> {
+    if path_and_query.contains("test=always-502") {
+        return Some(upstream_status_json_response(StatusCode::BAD_GATEWAY));
+    }
     if path_and_query.contains("test=always-429") {
         return Some(upstream_status_json_response(StatusCode::TOO_MANY_REQUESTS));
     }
@@ -17724,6 +18068,14 @@ async fn assert_no_upstream_request(fake: &mut FakeUpstream) {
     );
 }
 
+async fn drain_upstream_requests(fake: &mut FakeUpstream, wait: Duration) -> Vec<ObservedRequest> {
+    let mut observed = Vec::new();
+    while let Some(request) = fake.recv_within(wait).await {
+        observed.push(request);
+    }
+    observed
+}
+
 fn assert_sensitive_query_absent(label: &str, text: &str) {
     for sensitive in [
         "sk-live",
@@ -17794,6 +18146,39 @@ async fn fetch_metrics(proxy: &ProxyFixture) -> String {
         .expect("metrics request should complete");
     assert_eq!(response.status(), StatusCode::OK);
     response.text().await.expect("metrics should be text")
+}
+
+async fn assert_deadline_debug_summary(proxy: &ProxyFixture) {
+    let response = proxy
+        .client
+        .get(format!("{}/debug/recent-requests?limit=5", proxy.base_url))
+        .header(AUTHORIZATION, "Bearer admin-token")
+        .send()
+        .await
+        .expect("debug summary request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.text().await.expect("debug summary should be text");
+    let summary: serde_json::Value =
+        serde_json::from_str(&body).expect("debug summary should be JSON");
+    let request = summary["requests"]
+        .as_array()
+        .and_then(|requests| {
+            requests.iter().find(|request| {
+                request["response_metadata"]["request_deadline_exhausted"].as_str() == Some("true")
+            })
+        })
+        .expect("debug summary should include the deadline request");
+
+    assert_eq!(
+        request["response_metadata"]["shielded_terminal_reason"].as_str(),
+        Some("request_deadline_exhausted")
+    );
+    assert_eq!(
+        request["response_metadata"]["retry_attempt_count"].as_str(),
+        Some("1")
+    );
+    assert!(!body.contains("deadline-secret"));
+    assert!(!body.contains("admin-token"));
 }
 
 async fn wait_for_generation_metrics(
@@ -18172,10 +18557,12 @@ async fn upstream_failure_counters_increment_by_cause() {
     counters.increment(UpstreamFailureCause::ConnectFailed);
     counters.increment(UpstreamFailureCause::Timeout);
     counters.increment(UpstreamFailureCause::Timeout);
+    counters.increment(UpstreamFailureCause::StatusError);
     let snapshot = counters.snapshot();
     assert_eq!(snapshot.connect_failed, 1);
     assert_eq!(snapshot.timeout, 2);
     assert_eq!(snapshot.body_error, 0);
+    assert_eq!(snapshot.status_error, 1);
     assert_eq!(snapshot.transport_error, 0);
 }
 
@@ -18185,14 +18572,16 @@ fn upstream_failure_metrics_render_all_cause_labels() {
         connect_failed: 1,
         timeout: 2,
         body_error: 3,
-        transport_error: 4,
+        status_error: 4,
+        transport_error: 5,
     };
     let mut output = String::new();
     push_upstream_failure_metrics(&mut output, snapshot);
     assert!(output.contains("llm_guard_proxy_upstream_failure_total{cause=\"connect_failed\"} 1"));
     assert!(output.contains("llm_guard_proxy_upstream_failure_total{cause=\"timeout\"} 2"));
     assert!(output.contains("llm_guard_proxy_upstream_failure_total{cause=\"body_error\"} 3"));
-    assert!(output.contains("llm_guard_proxy_upstream_failure_total{cause=\"transport_error\"} 4"));
+    assert!(output.contains("llm_guard_proxy_upstream_failure_total{cause=\"status_error\"} 4"));
+    assert!(output.contains("llm_guard_proxy_upstream_failure_total{cause=\"transport_error\"} 5"));
 }
 
 #[tokio::test]
