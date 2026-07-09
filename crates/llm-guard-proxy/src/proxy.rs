@@ -9752,6 +9752,11 @@ fn classify_shielded_failure_cause(
     if metadata.contains_key("status_code") || failure.error_type == "upstream_status_error" {
         return Some(UpstreamFailureCause::StatusError);
     }
+    if failure.error_type == "upstream_body_error"
+        || metadata_has(metadata, "error_type", "upstream_body_error")
+    {
+        return Some(UpstreamFailureCause::BodyError);
+    }
     classify_shielded_error_message_cause(&failure.error_message)
 }
 

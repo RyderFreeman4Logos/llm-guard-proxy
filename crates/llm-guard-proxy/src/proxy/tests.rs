@@ -6304,6 +6304,113 @@ request_deadline_ms = 300
 }
 
 #[tokio::test]
+async fn shielded_malformed_sse_body_decode_failure_is_body_error() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_full_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        "",
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 1
+anti_loop_hint_enabled = false
+"#,
+        r#"debug_summary_enabled = true
+debug_summary_admin_token = "admin-token"
+debug_summary_max_records = 5
+"#,
+        "",
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=malformed-sse-invalid-json",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"body-decode-secret"}]}"#,
+        )
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let body = response.text().await.expect("body should be text");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&body).expect("error body should be valid JSON");
+    assert_eq!(parsed["error"]["type"], "llm_guard_upstream_error");
+    assert_eq!(parsed["error"]["cause"], "upstream_body_error");
+    assert_eq!(parsed["error"]["code"], "upstream_body_error");
+    assert!(parsed.get("choices").is_none());
+    assert!(!body.contains("body-decode-secret"));
+
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=malformed-sse-invalid-json"
+    );
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "non-retryable malformed SSE must not start another upstream attempt"
+    );
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(request_row.http_status, 502);
+    assert!(
+        request_row
+            .error_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("upstream SSE data was not valid JSON")),
+        "request error reason should identify malformed upstream SSE body: {request_row:?}"
+    );
+    assert_eq!(
+        request_row.response_metadata["error_type"],
+        "upstream_body_error"
+    );
+    assert_eq!(request_row.response_metadata["retry_attempt_count"], "1");
+    assert_eq!(attempt_row.status, "failed");
+    assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(
+        attempt_row.response_metadata["error_type"],
+        "upstream_body_error"
+    );
+    assert_eq!(
+        attempt_row.response_metadata["upstream_response_received"],
+        "true"
+    );
+    assert_eq!(attempt_row.response_metadata["http_status_success"], "true");
+
+    assert_body_error_debug_summary(&proxy).await;
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_upstream_failure_total",
+            &[("cause", "body_error")]
+        ),
+        1
+    );
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_upstream_failure_total",
+            &[("cause", "transport_error")]
+        ),
+        0
+    );
+}
+
+#[tokio::test]
 async fn shielded_retry_connect_hot_restart_wait_respects_request_deadline() {
     let upstream_base_url = "http://127.0.0.1:1/v1";
     let proxy = ProxyFixture::spawn_with_options(
@@ -16494,7 +16601,15 @@ fn fake_chat_completion_response(
         return None;
     }
     fake_streaming_chat_completion_response(path_and_query, state, body)
+        .or_else(|| fake_malformed_chat_completion_response(path_and_query))
         .or_else(|| Some(chat_completion_sse_response(body)))
+}
+
+fn fake_malformed_chat_completion_response(path_and_query: &str) -> Option<Response<Body>> {
+    if path_and_query.contains("test=malformed-sse-invalid-json") {
+        return Some(malformed_json_chat_completion_sse_response());
+    }
+    None
 }
 
 fn fake_streaming_chat_completion_response(
@@ -17023,6 +17138,19 @@ fn stalled_chat_completion_sse_response() -> Response<Body> {
     response.headers_mut().insert(
         HeaderName::from_static("x-upstream-endpoint"),
         HeaderValue::from_static("chat-completions-stalled-sse"),
+    );
+    response
+}
+
+fn malformed_json_chat_completion_sse_response() -> Response<Body> {
+    let mut response = Response::new(Body::from("data: {\"choices\": [\n\n"));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_static("chat-completions-malformed-json-sse"),
     );
     response
 }
@@ -18170,7 +18298,7 @@ async fn fetch_metrics(proxy: &ProxyFixture) -> String {
     response.text().await.expect("metrics should be text")
 }
 
-async fn assert_deadline_debug_summary(proxy: &ProxyFixture) {
+async fn fetch_debug_summary(proxy: &ProxyFixture) -> (String, serde_json::Value) {
     let response = proxy
         .client
         .get(format!("{}/debug/recent-requests?limit=5", proxy.base_url))
@@ -18182,6 +18310,11 @@ async fn assert_deadline_debug_summary(proxy: &ProxyFixture) {
     let body = response.text().await.expect("debug summary should be text");
     let summary: serde_json::Value =
         serde_json::from_str(&body).expect("debug summary should be JSON");
+    (body, summary)
+}
+
+async fn assert_deadline_debug_summary(proxy: &ProxyFixture) {
+    let (body, summary) = fetch_debug_summary(proxy).await;
     let request = summary["requests"]
         .as_array()
         .and_then(|requests| {
@@ -18200,6 +18333,33 @@ async fn assert_deadline_debug_summary(proxy: &ProxyFixture) {
         Some("1")
     );
     assert!(!body.contains("deadline-secret"));
+    assert!(!body.contains("admin-token"));
+}
+
+async fn assert_body_error_debug_summary(proxy: &ProxyFixture) {
+    let (body, summary) = fetch_debug_summary(proxy).await;
+    let request = summary["requests"]
+        .as_array()
+        .and_then(|requests| {
+            requests.iter().find(|request| {
+                request["response_metadata"]["error_type"].as_str() == Some("upstream_body_error")
+            })
+        })
+        .expect("debug summary should include the body error request");
+
+    assert_eq!(
+        request["response_metadata"]["retry_attempt_count"].as_str(),
+        Some("1")
+    );
+    assert_eq!(
+        request["response_metadata"]["upstream_response_received"].as_str(),
+        Some("true")
+    );
+    assert_eq!(
+        request["response_metadata"]["http_status_success"].as_str(),
+        Some("true")
+    );
+    assert!(!body.contains("body-decode-secret"));
     assert!(!body.contains("admin-token"));
 }
 
@@ -18570,6 +18730,27 @@ async fn upstream_body_error_response_classifies_as_body_error() {
     assert_eq!(
         parsed["error"]["cause"],
         serde_json::json!("upstream_body_error")
+    );
+}
+
+#[test]
+fn shielded_failure_cause_prefers_structured_body_error_over_upstream_message() {
+    let failure = ShieldedFailureOutcome {
+        error_type: "llm_guard_upstream_error",
+        error_message: String::from("upstream SSE ended without chat completion choices"),
+        response_metadata: BTreeMap::from([(
+            String::from("error_type"),
+            String::from("upstream_body_error"),
+        )]),
+        attempt_records: Vec::new(),
+        upstream_mode: UpstreamMode::Streaming,
+        downstream_status: StatusCode::BAD_GATEWAY,
+        retry_after_secs: None,
+    };
+
+    assert_eq!(
+        classify_shielded_failure_cause(&failure),
+        Some(UpstreamFailureCause::BodyError)
     );
 }
 
