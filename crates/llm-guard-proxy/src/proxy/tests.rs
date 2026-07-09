@@ -887,6 +887,97 @@ async fn models_burst_above_old_control_plane_cap_succeeds_and_health_stays_resp
 }
 
 #[tokio::test]
+async fn score_endpoint_adapts_to_rerank_and_records_success() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/score?test=score-adapter-ok", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q","text_2":"d"}"#)
+        .send()
+        .await
+        .expect("score request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("score json");
+    assert_eq!(body["object"], "list");
+    assert_eq!(body["data"][0]["object"], "score");
+    assert_eq!(body["data"][0]["index"], 0);
+    assert!(body["data"][0]["score"].as_f64().is_some());
+
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("score should forward as rerank");
+    assert_eq!(observed.method, Method::POST);
+    assert_eq!(observed.path_and_query, "/v1/rerank?test=score-adapter-ok");
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("rerank body json");
+    assert_eq!(observed_body["query"], "q");
+    assert_eq!(observed_body["documents"], serde_json::json!(["d"]));
+    assert_eq!(observed_body["top_n"], 1);
+
+    // Drain EOF so buffered observer finalizes.
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "succeeded");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(attempt_row.status, "succeeded");
+    assert_eq!(attempt_row.http_status, 200);
+    let connection = rusqlite::Connection::open(&proxy.sqlite_path).expect("sqlite open");
+    let request_meta: String = connection
+        .query_row("SELECT request_metadata_json FROM requests", [], |row| {
+            row.get(0)
+        })
+        .expect("request metadata");
+    let meta: serde_json::Value = serde_json::from_str(&request_meta).expect("meta json");
+    assert_eq!(meta["score_via_rerank"], "true");
+}
+
+#[tokio::test]
+async fn score_endpoint_rejects_invalid_client_body() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/score", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q"}"#)
+        .send()
+        .await
+        .expect("score request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn score_endpoint_fails_closed_on_partial_rerank_results() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/score?test=score-partial", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q","text_2":["a","b"]}"#)
+        .send()
+        .await
+        .expect("score request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("partial score still reaches upstream");
+    assert!(observed.path_and_query.starts_with("/v1/rerank"));
+
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+    assert_eq!(attempt_row.status, "failed");
+    assert_eq!(attempt_row.http_status, 200);
+}
+
+#[tokio::test]
 async fn enriched_models_observability_records_success_after_body_consumption() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -16576,10 +16667,7 @@ fn fake_upstream_endpoint_response(
             "embeddings",
             r#"{"object":"list","data":[{"embedding":[0.0]}]}"#,
         ),
-        "/v1/rerank" => (
-            "rerank",
-            r#"{"object":"list","results":[{"index":0,"score":1.0}]}"#,
-        ),
+        "/v1/rerank" => return fake_rerank_response(path_and_query, body),
         _ => ("unknown", r#"{"error":"unsupported"}"#),
     };
     let status = if label == "unknown" {
@@ -16590,6 +16678,41 @@ fn fake_upstream_endpoint_response(
     let mut response = json_response(label, body.to_owned());
     *response.status_mut() = status;
     response
+}
+
+fn fake_rerank_response(path_and_query: &str, body: &Bytes) -> Response<Body> {
+    if path_and_query.contains("test=score-upstream-500") {
+        let mut response = json_response("rerank-error", r#"{"error":"upstream boom"}"#.to_owned());
+        *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        return response;
+    }
+    if path_and_query.contains("test=score-partial") {
+        return json_response(
+            "rerank-partial",
+            r#"{"id":"rerank-partial","model":"qwen3-reranker-8b","results":[{"index":0,"score":0.9}]}"#
+                .to_owned(),
+        );
+    }
+    let doc_count = serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("documents")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+        })
+        .unwrap_or(1)
+        .min(8);
+    let results: Vec<String> = (0..doc_count)
+        .map(|i| {
+            let score = 1.0 - f64::from(u32::try_from(i).unwrap_or(0)) * 0.1;
+            format!(r#"{{"index":{i},"score":{score}}}"#)
+        })
+        .collect();
+    let body = format!(
+        r#"{{"id":"rerank-test","model":"qwen3-reranker-8b","results":[{}]}}"#,
+        results.join(",")
+    );
+    json_response("rerank", body)
 }
 
 fn fake_chat_completion_response(
