@@ -65,6 +65,7 @@ use tokio::{
 };
 
 mod model_metadata;
+mod score_adapter;
 mod shielded_chat;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -2599,6 +2600,7 @@ async fn forward_openai_request(
         model_id: prepared_request.model_id,
         request_metadata,
         in_flight_permit,
+        score_via_rerank: prepared_request.score_via_rerank,
     })
     .await
 }
@@ -2726,6 +2728,8 @@ struct PreparedOpenAiRequest {
     upstream_url: Url,
     reqwest_method: reqwest::Method,
     shielded_chat_plan: ShieldedChatPlan,
+    /// Request was adapted from `/v1/score`; rewrite response from rerank shape.
+    score_via_rerank: bool,
 }
 
 #[cfg(feature = "guard")]
@@ -2780,15 +2784,30 @@ fn prepare_openai_forward_request(
     let upstream_profile = selected_profile.profile;
     let route_reason = selected_profile.route_reason;
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
-    let upstream_url = build_upstream_url(&upstream_profile.base_url, uri)?;
+    // Adapt vLLM `/v1/score` to upstream `/v1/rerank` for backends without `/v1/score`.
+    let score_via_rerank = score_adapter::is_score_request(method, uri);
+    let (forward_uri, adapted_body) = if score_via_rerank {
+        let adapted_body = score_adapter::score_body_to_rerank_body(body).map_err(|error| {
+            ProxyError::request_body(format!("score to rerank request rewrite failed: {error}"))
+        })?;
+        let adapted_uri = score_adapter::score_uri_to_rerank_uri(uri).map_err(|error| {
+            ProxyError::request_body(format!("score to rerank uri rewrite failed: {error}"))
+        })?;
+        request_metadata.insert(String::from("score_via_rerank"), String::from("true"));
+        (adapted_uri, adapted_body)
+    } else {
+        (uri.clone(), body.clone())
+    };
+    let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
     let reqwest_method = upstream_method(method)?;
-    let body = apply_param_override_if_configured(method, uri, body, &upstream_profile)?;
+    let body =
+        apply_param_override_if_configured(method, &forward_uri, &adapted_body, &upstream_profile)?;
     let mut shielded_chat_plan = plan_shielded_chat(
         state,
         config,
         &upstream_profile.thinking,
         method,
-        uri,
+        &forward_uri,
         &body,
     );
     apply_param_override_to_shielded_plan(&mut shielded_chat_plan, &upstream_profile)?;
@@ -2820,6 +2839,7 @@ fn prepare_openai_forward_request(
         upstream_url,
         reqwest_method,
         shielded_chat_plan,
+        score_via_rerank,
     })
 }
 
@@ -3734,6 +3754,40 @@ struct GenericForwardContext<'request> {
     model_id: Option<String>,
     request_metadata: BTreeMap<String, String>,
     in_flight_permit: InFlightPermit,
+    score_via_rerank: bool,
+}
+
+async fn rewrite_score_response_from_upstream(
+    upstream_response: reqwest::Response,
+    upstream_status: reqwest::StatusCode,
+    upstream_headers: &HeaderMap,
+    model_id: Option<&str>,
+    in_flight_permit: InFlightPermit,
+    stream_cancel: ShutdownSubscription,
+) -> Result<Response<Body>, ProxyError> {
+    let body_bytes =
+        read_upstream_body_bytes_until_shutdown(upstream_response.bytes_stream(), stream_cancel)
+            .await?;
+    let downstream_body = if upstream_status.is_success() {
+        score_adapter::rerank_response_to_score_response(&body_bytes, model_id).map_err(
+            |error| {
+                ProxyError::upstream_body(format!(
+                    "score from rerank response rewrite failed: {error}"
+                ))
+            },
+        )?
+    } else {
+        body_bytes
+    };
+    let mut headers = HeaderMap::new();
+    copy_response_headers(upstream_headers, &mut headers);
+    headers.remove(CONTENT_LENGTH);
+    let _permit = in_flight_permit;
+    Ok(response_with_headers(
+        upstream_status,
+        headers,
+        Body::from(downstream_body),
+    ))
 }
 
 async fn forward_generic_openai_request(
@@ -3782,6 +3836,17 @@ async fn forward_generic_openai_request(
     .await?;
     let upstream_status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
+    if context.score_via_rerank {
+        return rewrite_score_response_from_upstream(
+            upstream_response,
+            upstream_status,
+            &upstream_headers,
+            context.model_id.as_deref(),
+            context.in_flight_permit,
+            context.state.shutdown.subscribe(),
+        )
+        .await;
+    }
     let response_parts = ForwardedResponseParts {
         config: context.state.config.clone(),
         store: context.state.store.clone(),
