@@ -2601,6 +2601,7 @@ async fn forward_openai_request(
         request_metadata,
         in_flight_permit,
         score_via_rerank: prepared_request.score_via_rerank,
+        score_expected_count: prepared_request.score_expected_count,
     })
     .await
 }
@@ -2730,6 +2731,8 @@ struct PreparedOpenAiRequest {
     shielded_chat_plan: ShieldedChatPlan,
     /// Request was adapted from `/v1/score`; rewrite response from rerank shape.
     score_via_rerank: bool,
+    /// Expected score rows (document count) for fail-closed response validation.
+    score_expected_count: Option<usize>,
 }
 
 #[cfg(feature = "guard")]
@@ -2786,6 +2789,7 @@ fn prepare_openai_forward_request(
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
     // Adapt vLLM `/v1/score` to upstream `/v1/rerank` for backends without `/v1/score`.
     let score_via_rerank = score_adapter::is_score_request(method, uri);
+    let mut score_expected_count = None;
     let (forward_uri, adapted_body) = if score_via_rerank {
         let adapted_body = score_adapter::score_body_to_rerank_body(body).map_err(|error| {
             ProxyError::ContextBudgetExceeded {
@@ -2803,7 +2807,11 @@ fn prepare_openai_forward_request(
                 request_metadata: None,
             }
         })?;
+        score_expected_count = score_adapter::expected_result_count_from_rerank_body(&adapted_body);
         request_metadata.insert(String::from("score_via_rerank"), String::from("true"));
+        if let Some(count) = score_expected_count {
+            request_metadata.insert(String::from("score_expected_count"), count.to_string());
+        }
         (adapted_uri, adapted_body)
     } else {
         (uri.clone(), body.clone())
@@ -2850,6 +2858,7 @@ fn prepare_openai_forward_request(
         reqwest_method,
         shielded_chat_plan,
         score_via_rerank,
+        score_expected_count,
     })
 }
 
@@ -3765,6 +3774,7 @@ struct GenericForwardContext<'request> {
     request_metadata: BTreeMap<String, String>,
     in_flight_permit: InFlightPermit,
     score_via_rerank: bool,
+    score_expected_count: Option<usize>,
 }
 
 async fn rewrite_score_response_from_upstream(
@@ -3772,6 +3782,7 @@ async fn rewrite_score_response_from_upstream(
     upstream_response: reqwest::Response,
     in_flight_permit: InFlightPermit,
     model_id: Option<&str>,
+    expected_count: Option<usize>,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
     let upstream_headers = response_parts.upstream_headers.clone();
@@ -3785,11 +3796,11 @@ async fn rewrite_score_response_from_upstream(
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
     let body = if upstream_status.is_success() {
-        match score_adapter::rerank_response_to_score_response(&body, model_id) {
+        match score_adapter::rerank_response_to_score_response(&body, model_id, expected_count) {
             Ok(body) => body,
             Err(error) => {
                 return Err(
-                    response_parts.into_body_read_error(ProxyError::upstream_body(format!(
+                    response_parts.into_response_process_error(ProxyError::upstream_body(format!(
                         "score from rerank response rewrite failed: {error}"
                     ))),
                 );
@@ -3877,6 +3888,7 @@ async fn forward_generic_openai_request(
             upstream_response,
             context.in_flight_permit,
             context.model_id.as_deref(),
+            context.score_expected_count,
         )
         .await;
     }
@@ -5111,6 +5123,28 @@ impl ForwardedResponseParts {
             request_metadata: self.attempt_request_metadata,
             extra_response_metadata,
         });
+        error.with_observability(self.request_metadata, attempt_record)
+    }
+
+    fn into_response_process_error(self, error: ProxyError) -> ProxyError {
+        let finished_at_unix_ms = unix_time_millis();
+        let error_reason = error.to_string();
+        let mut extra_response_metadata = BTreeMap::new();
+        extra_response_metadata
+            .insert(String::from("response_process_error"), String::from("true"));
+        let mut attempt_record = failed_attempt_record(FailedAttemptRecordInput {
+            attempt_id: self.attempt_id,
+            attempt_number: 1,
+            request_id: self.request_id,
+            started_at_unix_ms: self.attempt_started_at_unix_ms,
+            finished_at_unix_ms,
+            error_type: error.error_type(),
+            error_reason: &error_reason,
+            request_metadata: self.attempt_request_metadata,
+            extra_response_metadata,
+        });
+        attempt_record.http_status = Some(self.upstream_status.as_u16());
+        attempt_record.upstream_mode = self.upstream_mode;
         error.with_observability(self.request_metadata, attempt_record)
     }
 }

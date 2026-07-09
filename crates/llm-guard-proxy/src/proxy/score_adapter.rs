@@ -88,9 +88,12 @@ pub(crate) fn score_body_to_rerank_body(body: &Bytes) -> Result<Bytes, String> {
 /// `{ "data": [ { "index": 0, "object": "score", "score": <f64> }, ... ] }`
 ///
 /// Fail-closed: any malformed entry or duplicate index rejects the whole body.
+/// Expected number of score rows (documents requested). When set, indices must
+/// be exactly `0..expected_count` (cardinality + domain).
 pub(crate) fn rerank_response_to_score_response(
     body: &Bytes,
     model: Option<&str>,
+    expected_count: Option<usize>,
 ) -> Result<Bytes, String> {
     let value: Value =
         serde_json::from_slice(body).map_err(|error| format!("invalid rerank JSON: {error}"))?;
@@ -137,6 +140,28 @@ pub(crate) fn rerank_response_to_score_response(
 
     // Stable score list ordered by original document index.
     scored.sort_by_key(|(index, _)| *index);
+    if let Some(expected) = expected_count {
+        if scored.len() != expected {
+            return Err(format!(
+                "rerank result count {} != expected {expected} for score adapter",
+                scored.len()
+            ));
+        }
+        for expect_i in 0..expected {
+            if !seen.contains(&expect_i) {
+                return Err(format!(
+                    "rerank result missing index {expect_i} for score adapter"
+                ));
+            }
+        }
+        for (index, _) in &scored {
+            if *index >= expected {
+                return Err(format!(
+                    "rerank result index {index} out of range for expected {expected}"
+                ));
+            }
+        }
+    }
     let data: Vec<Value> = scored
         .into_iter()
         .map(|(index, score)| {
@@ -164,6 +189,18 @@ pub(crate) fn rerank_response_to_score_response(
     serde_json::to_vec(&out)
         .map(Bytes::from)
         .map_err(|error| format!("serialize score response failed: {error}"))
+}
+
+/// Document count implied by a rewritten rerank request body (`top_n` or `documents.len()`).
+pub(crate) fn expected_result_count_from_rerank_body(body: &Bytes) -> Option<usize> {
+    let value: Value = serde_json::from_slice(body).ok()?;
+    if let Some(n) = value.get("top_n").and_then(Value::as_u64) {
+        return usize::try_from(n).ok();
+    }
+    value
+        .get("documents")
+        .and_then(Value::as_array)
+        .map(Vec::len)
 }
 
 /// Rewrite request URI path `/v1/score` → `/v1/rerank` while keeping query string.
@@ -212,7 +249,7 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"id":"rerank-1","model":"m","results":[{"index":1,"score":0.9},{"index":0,"score":0.1}]}"#,
         );
-        let out = rerank_response_to_score_response(&body, Some("m")).expect("convert");
+        let out = rerank_response_to_score_response(&body, Some("m"), Some(2)).expect("convert");
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["object"], "list");
         assert_eq!(v["data"][0]["index"], 0);
@@ -227,7 +264,7 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"results":[{"index":0,"score":0.9},{"index":"bad","score":0.2}]}"#,
         );
-        let err = rerank_response_to_score_response(&body, Some("m")).unwrap_err();
+        let err = rerank_response_to_score_response(&body, Some("m"), None).unwrap_err();
         assert!(
             err.contains("missing or invalid index"),
             "unexpected err: {err}"
@@ -238,14 +275,14 @@ mod tests {
     fn rejects_duplicate_indices() {
         let body =
             Bytes::from_static(br#"{"results":[{"index":0,"score":0.9},{"index":0,"score":0.2}]}"#);
-        let err = rerank_response_to_score_response(&body, Some("m")).unwrap_err();
+        let err = rerank_response_to_score_response(&body, Some("m"), None).unwrap_err();
         assert!(err.contains("duplicate index"), "unexpected err: {err}");
     }
 
     #[test]
     fn rejects_empty_results() {
         let body = Bytes::from_static(br#"{"results":[]}"#);
-        let err = rerank_response_to_score_response(&body, Some("m")).unwrap_err();
+        let err = rerank_response_to_score_response(&body, Some("m"), None).unwrap_err();
         assert!(err.contains("empty"), "unexpected err: {err}");
     }
 
@@ -254,5 +291,26 @@ mod tests {
         let uri: Uri = "/v1/score".parse().unwrap();
         let out = score_uri_to_rerank_uri(&uri).unwrap();
         assert_eq!(out.path(), "/v1/rerank");
+    }
+
+    #[test]
+    fn rejects_partial_results_when_expected_count_set() {
+        let body = Bytes::from_static(br#"{"results":[{"index":0,"score":0.9}]}"#);
+        let err = rerank_response_to_score_response(&body, Some("m"), Some(2)).unwrap_err();
+        assert!(
+            err.contains("count") || err.contains("missing index"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_index_when_expected_count_set() {
+        let body =
+            Bytes::from_static(br#"{"results":[{"index":0,"score":0.1},{"index":5,"score":0.9}]}"#);
+        let err = rerank_response_to_score_response(&body, Some("m"), Some(2)).unwrap_err();
+        assert!(
+            err.contains("out of range") || err.contains("missing index"),
+            "{err}"
+        );
     }
 }
