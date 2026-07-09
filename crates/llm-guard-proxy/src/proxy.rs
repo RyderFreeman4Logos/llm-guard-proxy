@@ -9387,7 +9387,23 @@ impl ShieldedLivenessBody {
         }
     }
 
-    fn start_direct_relay(&mut self, outcome: ShieldedDirectRelayOutcome) {
+    fn deadline_error_chunk(&self) -> Bytes {
+        self.error_chunk(
+            REQUEST_DEADLINE_ERROR_TYPE,
+            "shielded request deadline exhausted during final direct relay",
+        )
+    }
+
+    fn terminate_direct_relay_for_deadline(&mut self) -> Bytes {
+        self.upstream_failure_counters
+            .increment(UpstreamFailureCause::Timeout);
+        self.direct_deadline = None;
+        self.direct_stream = None;
+        self.terminal_completion = Some(BodyCompletion::FinalDirectRelayTerminated);
+        self.deadline_error_chunk()
+    }
+
+    fn start_direct_relay(&mut self, outcome: ShieldedDirectRelayOutcome) -> Option<Bytes> {
         let mut final_attempt = outcome
             .started
             .info
@@ -9410,11 +9426,11 @@ impl ShieldedLivenessBody {
             observer.final_attempt = Some(final_attempt);
         }
         let Some(remaining_deadline) = outcome.request_deadline.remaining() else {
-            self.terminal_completion = Some(BodyCompletion::FinalDirectRelayTerminated);
-            return;
+            return Some(self.terminate_direct_relay_for_deadline());
         };
         self.direct_deadline = Some(Box::pin(tokio::time::sleep(remaining_deadline)));
         self.direct_stream = Some(Box::pin(outcome.started.response.bytes_stream()));
+        None
     }
 
     fn poll_direct_stream(
@@ -9431,12 +9447,8 @@ impl ShieldedLivenessBody {
         if let Some(deadline) = &mut self.direct_deadline
             && deadline.as_mut().poll(cx).is_ready()
         {
-            self.upstream_failure_counters
-                .increment(UpstreamFailureCause::Timeout);
-            self.direct_deadline = None;
-            self.direct_stream = None;
-            self.record_once(&BodyCompletion::FinalDirectRelayTerminated);
-            return Poll::Ready(None);
+            let chunk = self.terminate_direct_relay_for_deadline();
+            return self.count_and_emit(chunk);
         }
         match stream.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => self.count_and_emit(bytes),
@@ -9505,7 +9517,9 @@ impl Stream for ShieldedLivenessBody {
                 return this.count_and_emit(chunk);
             }
             Poll::Ready(Ok(ShieldedAggregateOutcome::DirectRelay(outcome))) => {
-                this.start_direct_relay(outcome);
+                if let Some(chunk) = this.start_direct_relay(outcome) {
+                    return this.count_and_emit(chunk);
+                }
                 return this.poll_direct_stream(cx);
             }
             Poll::Ready(Err(failure)) => {

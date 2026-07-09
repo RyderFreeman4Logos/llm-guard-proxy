@@ -8189,8 +8189,20 @@ async fn shielded_retry_streaming_final_no_thinking_direct_relay_deadline_termin
     let mut body = response.into_body().into_data_stream();
     let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
     assert!(
+        !released.trim().is_empty(),
+        "deadline-terminated final relay must emit an SSE error instead of an empty 200 body"
+    );
+    assert!(released.contains("event: error"));
+    assert!(released.contains("llm_guard_request_deadline_exhausted"));
+    assert!(
         !released.contains("data: [DONE]"),
         "deadline-terminated final relay must not masquerade as a complete SSE answer"
+    );
+    let chunks = openai_sse_json_chunks(&released);
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(
+        chunks[0]["error"]["type"],
+        "llm_guard_request_deadline_exhausted"
     );
 
     let first_attempt = fake.recv_next().await;
@@ -8245,6 +8257,16 @@ async fn shielded_retry_streaming_final_no_thinking_direct_relay_deadline_termin
     assert_eq!(
         attempts[3].response_metadata["request_deadline_exhausted"],
         "true"
+    );
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_upstream_failure_total",
+            &[("cause", "timeout")]
+        ),
+        1
     );
 }
 
