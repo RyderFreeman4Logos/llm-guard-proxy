@@ -117,13 +117,14 @@ pub(crate) struct ProxyState {
     shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
 
-/// Cause-bucketed monotonic counters for upstream 502 failures emitted to
+/// Cause-bucketed monotonic counters for upstream failures emitted to
 /// `/metrics` as `llm_guard_proxy_upstream_failure_total{cause="..."}`.
 #[derive(Debug, Default)]
 struct UpstreamFailureCounters {
     connect_failed: AtomicU64,
     timeout: AtomicU64,
     body_error: AtomicU64,
+    status_error: AtomicU64,
     transport_error: AtomicU64,
 }
 
@@ -133,6 +134,7 @@ impl UpstreamFailureCounters {
             UpstreamFailureCause::ConnectFailed => &self.connect_failed,
             UpstreamFailureCause::Timeout => &self.timeout,
             UpstreamFailureCause::BodyError => &self.body_error,
+            UpstreamFailureCause::StatusError => &self.status_error,
             UpstreamFailureCause::TransportError => &self.transport_error,
         }
         .fetch_add(1, Ordering::Relaxed);
@@ -143,6 +145,7 @@ impl UpstreamFailureCounters {
             connect_failed: self.connect_failed.load(Ordering::Relaxed),
             timeout: self.timeout.load(Ordering::Relaxed),
             body_error: self.body_error.load(Ordering::Relaxed),
+            status_error: self.status_error.load(Ordering::Relaxed),
             transport_error: self.transport_error.load(Ordering::Relaxed),
         }
     }
@@ -153,6 +156,7 @@ enum UpstreamFailureCause {
     ConnectFailed,
     Timeout,
     BodyError,
+    StatusError,
     TransportError,
 }
 
@@ -171,6 +175,7 @@ impl UpstreamFailureCause {
             Self::ConnectFailed => "upstream_connect_failed",
             Self::Timeout => "upstream_timeout",
             Self::BodyError => "upstream_body_error",
+            Self::StatusError => "upstream_status_error",
             Self::TransportError => "upstream_transport_error",
         }
     }
@@ -180,16 +185,8 @@ impl UpstreamFailureCause {
             Self::ConnectFailed => "connect_failed",
             Self::Timeout => "timeout",
             Self::BodyError => "body_error",
+            Self::StatusError => "status_error",
             Self::TransportError => "transport_error",
-        }
-    }
-
-    fn from_code(code: &str) -> Self {
-        match code {
-            "upstream_connect_failed" | "connect_failure" | "connect_failed" => Self::ConnectFailed,
-            "upstream_timeout" | "timeout" => Self::Timeout,
-            "upstream_body_error" | "body_error" => Self::BodyError,
-            _ => Self::TransportError,
         }
     }
 }
@@ -199,6 +196,7 @@ struct UpstreamFailureSnapshot {
     connect_failed: u64,
     timeout: u64,
     body_error: u64,
+    status_error: u64,
     transport_error: u64,
 }
 
@@ -1841,7 +1839,7 @@ fn push_upstream_failure_metrics(output: &mut String, snapshot: UpstreamFailureS
     push_metric_header(
         output,
         "llm_guard_proxy_upstream_failure_total",
-        "Upstream 502 failures classified by transport cause bucket.",
+        "Shielded and forwarded upstream failures classified by bounded cause bucket.",
         "counter",
     );
     push_metric_line(
@@ -1861,6 +1859,12 @@ fn push_upstream_failure_metrics(output: &mut String, snapshot: UpstreamFailureS
         "llm_guard_proxy_upstream_failure_total",
         &[("cause", UpstreamFailureCause::BodyError.metric_label())],
         snapshot.body_error,
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_upstream_failure_total",
+        &[("cause", UpstreamFailureCause::StatusError.metric_label())],
+        snapshot.status_error,
     );
     push_metric_line(
         output,
@@ -4837,20 +4841,29 @@ async fn send_upstream_request(
     timeout: Duration,
 ) -> Result<reqwest::Response, ProxyError> {
     let headers = forwarded_request_headers(downstream_headers);
-    client
+    let send = client
         .request(method, upstream_url)
         .headers(headers)
         .body(body)
         .timeout(timeout)
-        .send()
-        .await
-        .map_err(|source| {
-            let failure = ReqwestFailureKind::from_error(&source);
-            ProxyError::UpstreamTransport {
-                failure,
+        .send();
+    tokio::time::timeout(timeout, send).await.map_or_else(
+        |_| {
+            Err(ProxyError::UpstreamTransport {
+                failure: ReqwestFailureKind::Timeout,
                 observability: None,
-            }
-        })
+            })
+        },
+        |result| {
+            result.map_err(|source| {
+                let failure = ReqwestFailureKind::from_error(&source);
+                ProxyError::UpstreamTransport {
+                    failure,
+                    observability: None,
+                }
+            })
+        },
+    )
 }
 
 async fn send_upstream_request_until_shutdown(
@@ -5453,6 +5466,7 @@ fn shielded_liveness_stream_response(
             ShieldedAcceptedResponseMode::JsonCompletion
         },
         interval_secs: runtime.liveness.heartbeat_interval_secs,
+        upstream_failure_counters: runtime.upstream_failure_counters.clone(),
         #[cfg(test)]
         shielded_heartbeat_ticks: runtime.shielded_heartbeat_ticks.clone(),
     };
@@ -6155,8 +6169,14 @@ async fn hot_restart_gate(runtime: &ShieldedRetryRuntime, applies: bool) -> HotR
             terminal: None,
         };
     }
-    let result = wait_for_hot_restart_recovery(runtime).await;
     let mut metadata = hot_restart_recovery_metadata(true);
+    let Some(remaining_deadline) = runtime.request_deadline.remaining() else {
+        return request_deadline_hot_restart_gate(metadata);
+    };
+    let result = match timeout(remaining_deadline, wait_for_hot_restart_recovery(runtime)).await {
+        Ok(result) => result,
+        Err(_elapsed) => return request_deadline_hot_restart_gate(metadata),
+    };
     match result {
         HotRestartResult::Ready => {
             metadata.insert(
@@ -6202,6 +6222,31 @@ async fn hot_restart_gate(runtime: &ShieldedRetryRuntime, applies: bool) -> HotR
                 }),
             }
         }
+    }
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+fn request_deadline_hot_restart_gate(mut metadata: BTreeMap<String, String>) -> HotRestartGate {
+    metadata.insert(
+        String::from("hot_restart_recovery_status"),
+        String::from(REQUEST_DEADLINE_ABORT_REASON),
+    );
+    metadata.insert(
+        String::from("request_deadline_exhausted"),
+        String::from("true"),
+    );
+    metadata.insert(
+        String::from("shielded_terminal_reason"),
+        String::from(REQUEST_DEADLINE_ABORT_REASON),
+    );
+    HotRestartGate {
+        metadata,
+        permits_retry: false,
+        terminal: Some(HotRestartTerminal {
+            status: StatusCode::BAD_GATEWAY,
+            retry_after_secs: None,
+            abort_reason: REQUEST_DEADLINE_ABORT_REASON,
+        }),
     }
 }
 
@@ -8436,17 +8481,16 @@ fn shielded_retry_error_response(
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     let request_id = runtime.request_id.clone();
-    let cause_code = classify_shielded_error_cause(&failure.error_message);
+    let cause = classify_shielded_failure_cause(&failure);
+    let cause_code = cause.map(UpstreamFailureCause::code);
     let body = proxy_error_json_body_with_diagnostics(
         failure.error_type,
         &failure.error_message,
         cause_code,
         Some(&request_id),
     );
-    if let Some(cause) = cause_code {
-        runtime
-            .upstream_failure_counters
-            .increment(UpstreamFailureCause::from_code(cause));
+    if let Some(cause) = cause {
+        runtime.upstream_failure_counters.increment(cause);
     }
     let is_shutdown_failure = failure
         .response_metadata
@@ -9255,6 +9299,7 @@ struct ShieldedLivenessBodySettings {
     mode: ShieldedLivenessMode,
     accepted_response_mode: ShieldedAcceptedResponseMode,
     interval_secs: u64,
+    upstream_failure_counters: Arc<UpstreamFailureCounters>,
     #[cfg(test)]
     shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
@@ -9270,6 +9315,7 @@ struct ShieldedLivenessBody {
     _in_flight_permit: InFlightPermit,
     shutdown: ShutdownSubscription,
     downstream_drop_signal: DownstreamDropSignal,
+    upstream_failure_counters: Arc<UpstreamFailureCounters>,
     #[cfg(test)]
     shielded_heartbeat_ticks: Arc<AtomicU64>,
     bytes_seen: u64,
@@ -9300,6 +9346,7 @@ impl ShieldedLivenessBody {
             _in_flight_permit: in_flight_permit,
             shutdown,
             downstream_drop_signal,
+            upstream_failure_counters: settings.upstream_failure_counters.clone(),
             #[cfg(test)]
             shielded_heartbeat_ticks: settings.shielded_heartbeat_ticks.clone(),
             bytes_seen: 0,
@@ -9340,7 +9387,23 @@ impl ShieldedLivenessBody {
         }
     }
 
-    fn start_direct_relay(&mut self, outcome: ShieldedDirectRelayOutcome) {
+    fn deadline_error_chunk(&self) -> Bytes {
+        self.error_chunk(
+            REQUEST_DEADLINE_ERROR_TYPE,
+            "shielded request deadline exhausted during final direct relay",
+        )
+    }
+
+    fn terminate_direct_relay_for_deadline(&mut self) -> Bytes {
+        self.upstream_failure_counters
+            .increment(UpstreamFailureCause::Timeout);
+        self.direct_deadline = None;
+        self.direct_stream = None;
+        self.terminal_completion = Some(BodyCompletion::FinalDirectRelayTerminated);
+        self.deadline_error_chunk()
+    }
+
+    fn start_direct_relay(&mut self, outcome: ShieldedDirectRelayOutcome) -> Option<Bytes> {
         let mut final_attempt = outcome
             .started
             .info
@@ -9363,11 +9426,11 @@ impl ShieldedLivenessBody {
             observer.final_attempt = Some(final_attempt);
         }
         let Some(remaining_deadline) = outcome.request_deadline.remaining() else {
-            self.terminal_completion = Some(BodyCompletion::FinalDirectRelayTerminated);
-            return;
+            return Some(self.terminate_direct_relay_for_deadline());
         };
         self.direct_deadline = Some(Box::pin(tokio::time::sleep(remaining_deadline)));
         self.direct_stream = Some(Box::pin(outcome.started.response.bytes_stream()));
+        None
     }
 
     fn poll_direct_stream(
@@ -9384,14 +9447,17 @@ impl ShieldedLivenessBody {
         if let Some(deadline) = &mut self.direct_deadline
             && deadline.as_mut().poll(cx).is_ready()
         {
-            self.direct_deadline = None;
-            self.direct_stream = None;
-            self.record_once(&BodyCompletion::FinalDirectRelayTerminated);
-            return Poll::Ready(None);
+            let chunk = self.terminate_direct_relay_for_deadline();
+            return self.count_and_emit(chunk);
         }
         match stream.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => self.count_and_emit(bytes),
             Poll::Ready(Some(Err(error))) => {
+                self.upstream_failure_counters.increment(
+                    UpstreamFailureCause::from_reqwest_failure(ReqwestFailureKind::from_error(
+                        &error,
+                    )),
+                );
                 let error_message = sanitized_reqwest_error(&error);
                 let chunk = self.error_chunk("llm_guard_upstream_error", &error_message);
                 self.terminal_completion = Some(BodyCompletion::UpstreamStreamError(error_message));
@@ -9451,10 +9517,15 @@ impl Stream for ShieldedLivenessBody {
                 return this.count_and_emit(chunk);
             }
             Poll::Ready(Ok(ShieldedAggregateOutcome::DirectRelay(outcome))) => {
-                this.start_direct_relay(outcome);
+                if let Some(chunk) = this.start_direct_relay(outcome) {
+                    return this.count_and_emit(chunk);
+                }
                 return this.poll_direct_stream(cx);
             }
             Poll::Ready(Err(failure)) => {
+                if let Some(cause) = classify_shielded_failure_cause(&failure) {
+                    this.upstream_failure_counters.increment(cause);
+                }
                 if let Some(observer) = &mut this.observer {
                     observer.completed_attempt_records = failure.attempt_records;
                     observer
@@ -9657,15 +9728,60 @@ fn proxy_error_json_body_with_diagnostics(
     )
 }
 
-fn classify_shielded_error_cause(message: &str) -> Option<&'static str> {
-    if message.contains("connect_failure") || message.contains("connection") {
-        Some("upstream_connect_failed")
-    } else if message.contains("timeout") || message.contains("timed out") {
-        Some("upstream_timeout")
+fn classify_shielded_failure_cause(
+    failure: &ShieldedFailureOutcome,
+) -> Option<UpstreamFailureCause> {
+    let metadata = &failure.response_metadata;
+    if failure.error_type == REQUEST_DEADLINE_ERROR_TYPE
+        || metadata_has(metadata, "request_deadline_exhausted", "true")
+        || metadata_has(metadata, "abort_reason", REQUEST_DEADLINE_ABORT_REASON)
+        || metadata_has(
+            metadata,
+            "shielded_terminal_reason",
+            REQUEST_DEADLINE_ABORT_REASON,
+        )
+    {
+        return Some(UpstreamFailureCause::Timeout);
+    }
+    if metadata_has(metadata, "upstream_stall_detected", "true")
+        || metadata_has(metadata, "abort_reason", "upstream_stall")
+        || metadata_has(metadata, "shielded_terminal_reason", "upstream_stall")
+    {
+        return Some(UpstreamFailureCause::Timeout);
+    }
+    if metadata.contains_key("status_code") || failure.error_type == "upstream_status_error" {
+        return Some(UpstreamFailureCause::StatusError);
+    }
+    if failure.error_type == "upstream_body_error"
+        || metadata_has(metadata, "error_type", "upstream_body_error")
+    {
+        return Some(UpstreamFailureCause::BodyError);
+    }
+    classify_shielded_error_message_cause(&failure.error_message)
+}
+
+fn metadata_has(metadata: &BTreeMap<String, String>, key: &str, expected: &str) -> bool {
+    metadata.get(key).is_some_and(|value| value == expected)
+}
+
+fn classify_shielded_error_message_cause(message: &str) -> Option<UpstreamFailureCause> {
+    let message = message.to_ascii_lowercase();
+    if message.contains("connect_failure")
+        || message.contains("connect failed")
+        || message.contains("connection")
+    {
+        Some(UpstreamFailureCause::ConnectFailed)
+    } else if message.contains("timeout")
+        || message.contains("timed out")
+        || message.contains("deadline")
+    {
+        Some(UpstreamFailureCause::Timeout)
+    } else if message.contains("status") && message.contains("http") {
+        Some(UpstreamFailureCause::StatusError)
     } else if message.contains("body") || message.contains("decode") {
-        Some("upstream_body_error")
+        Some(UpstreamFailureCause::BodyError)
     } else if message.contains("upstream") {
-        Some("upstream_transport_error")
+        Some(UpstreamFailureCause::TransportError)
     } else {
         None
     }
