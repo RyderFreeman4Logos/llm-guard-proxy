@@ -16,6 +16,47 @@ pub(crate) fn is_score_request(method: &Method, uri: &Uri) -> bool {
     *method == Method::POST && uri.path() == "/v1/score"
 }
 
+/// Whether this score body can be rewritten as a single `/v1/rerank` call.
+///
+/// Adaptable shapes: scalar `text_1` with string/array `text_2`, or already-rerank
+/// `query`+`documents`. Batched vLLM pairwise forms (`text_1` array) cannot map to
+/// one rerank query and must be forwarded as `/v1/score` for compatibility.
+pub(crate) fn can_adapt_score_body_to_rerank(body: &Bytes) -> Result<bool, String> {
+    let value: Value =
+        serde_json::from_slice(body).map_err(|error| format!("invalid score JSON: {error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| String::from("score body must be a JSON object"))?;
+    if object.contains_key("query") && object.contains_key("documents") {
+        return Ok(true);
+    }
+    let text_1 = object
+        .get("text_1")
+        .ok_or_else(|| String::from("score body missing text_1"))?;
+    let text_2 = object
+        .get("text_2")
+        .ok_or_else(|| String::from("score body missing text_2"))?;
+    if text_1.is_string() {
+        match text_2 {
+            Value::String(_) => Ok(true),
+            Value::Array(items) if !items.is_empty() && items.iter().all(Value::is_string) => {
+                Ok(true)
+            }
+            Value::Array(_) => Err(String::from("score text_2 array must be non-empty strings")),
+            _ => Err(String::from(
+                "score text_2 must be a string or array of strings",
+            )),
+        }
+    } else if text_1.is_array() {
+        // Valid batched vLLM score shape — cannot adapt to single-query rerank.
+        Ok(false)
+    } else {
+        Err(String::from(
+            "score text_1 must be a string or array of strings",
+        ))
+    }
+}
+
 /// Rewrite a vLLM `/v1/score` JSON body into a `/v1/rerank` body.
 ///
 /// Supported score shapes:
@@ -312,5 +353,18 @@ mod tests {
             err.contains("out of range") || err.contains("missing index"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn classifies_batch_score_as_non_adaptable() {
+        let body =
+            Bytes::from_static(br#"{"model":"m","text_1":["q1","q2"],"text_2":["d1","d2"]}"#);
+        assert!(!can_adapt_score_body_to_rerank(&body).unwrap());
+    }
+
+    #[test]
+    fn classifies_scalar_score_as_adaptable() {
+        let body = Bytes::from_static(br#"{"model":"m","text_1":"q","text_2":"d"}"#);
+        assert!(can_adapt_score_body_to_rerank(&body).unwrap());
     }
 }

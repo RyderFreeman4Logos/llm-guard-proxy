@@ -2760,6 +2760,69 @@ enum CallerProfileResolution {
     UnknownUseDefault,
 }
 
+struct AdaptedScoreRequest {
+    forward_uri: Uri,
+    adapted_body: Bytes,
+    score_via_rerank: bool,
+    score_expected_count: Option<usize>,
+}
+
+fn adapt_score_request_if_needed(
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    request_metadata: &mut BTreeMap<String, String>,
+) -> Result<AdaptedScoreRequest, ProxyError> {
+    if !score_adapter::is_score_request(method, uri) {
+        return Ok(AdaptedScoreRequest {
+            forward_uri: uri.clone(),
+            adapted_body: body.clone(),
+            score_via_rerank: false,
+            score_expected_count: None,
+        });
+    }
+    let invalid = |error: String| ProxyError::ContextBudgetExceeded {
+        message: format!("invalid score request: {error}"),
+        param: "body",
+        code: "invalid_score_request",
+        request_metadata: None,
+    };
+    let adapt = score_adapter::can_adapt_score_body_to_rerank(body).map_err(invalid)?;
+    if !adapt {
+        request_metadata.insert(String::from("score_via_rerank"), String::from("false"));
+        request_metadata.insert(
+            String::from("score_batch_passthrough"),
+            String::from("true"),
+        );
+        return Ok(AdaptedScoreRequest {
+            forward_uri: uri.clone(),
+            adapted_body: body.clone(),
+            score_via_rerank: false,
+            score_expected_count: None,
+        });
+    }
+    let adapted_body = score_adapter::score_body_to_rerank_body(body).map_err(invalid)?;
+    let forward_uri = score_adapter::score_uri_to_rerank_uri(uri).map_err(|error| {
+        ProxyError::ContextBudgetExceeded {
+            message: format!("invalid score request uri: {error}"),
+            param: "path",
+            code: "invalid_score_request",
+            request_metadata: None,
+        }
+    })?;
+    let score_expected_count = score_adapter::expected_result_count_from_rerank_body(&adapted_body);
+    request_metadata.insert(String::from("score_via_rerank"), String::from("true"));
+    if let Some(count) = score_expected_count {
+        request_metadata.insert(String::from("score_expected_count"), count.to_string());
+    }
+    Ok(AdaptedScoreRequest {
+        forward_uri,
+        adapted_body,
+        score_via_rerank: true,
+        score_expected_count,
+    })
+}
+
 fn prepare_openai_forward_request(
     state: &ProxyState,
     config: &AppConfig,
@@ -2787,35 +2850,11 @@ fn prepare_openai_forward_request(
     let upstream_profile = selected_profile.profile;
     let route_reason = selected_profile.route_reason;
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
-    // Adapt vLLM `/v1/score` to upstream `/v1/rerank` for backends without `/v1/score`.
-    let score_via_rerank = score_adapter::is_score_request(method, uri);
-    let mut score_expected_count = None;
-    let (forward_uri, adapted_body) = if score_via_rerank {
-        let adapted_body = score_adapter::score_body_to_rerank_body(body).map_err(|error| {
-            ProxyError::ContextBudgetExceeded {
-                message: format!("invalid score request: {error}"),
-                param: "body",
-                code: "invalid_score_request",
-                request_metadata: None,
-            }
-        })?;
-        let adapted_uri = score_adapter::score_uri_to_rerank_uri(uri).map_err(|error| {
-            ProxyError::ContextBudgetExceeded {
-                message: format!("invalid score request uri: {error}"),
-                param: "path",
-                code: "invalid_score_request",
-                request_metadata: None,
-            }
-        })?;
-        score_expected_count = score_adapter::expected_result_count_from_rerank_body(&adapted_body);
-        request_metadata.insert(String::from("score_via_rerank"), String::from("true"));
-        if let Some(count) = score_expected_count {
-            request_metadata.insert(String::from("score_expected_count"), count.to_string());
-        }
-        (adapted_uri, adapted_body)
-    } else {
-        (uri.clone(), body.clone())
-    };
+    let adapted_score = adapt_score_request_if_needed(method, uri, body, request_metadata)?;
+    let score_via_rerank = adapted_score.score_via_rerank;
+    let score_expected_count = adapted_score.score_expected_count;
+    let forward_uri = adapted_score.forward_uri;
+    let adapted_body = adapted_score.adapted_body;
     let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
     let reqwest_method = upstream_method(method)?;
     let body =

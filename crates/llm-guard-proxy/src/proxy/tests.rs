@@ -887,6 +887,60 @@ async fn models_burst_above_old_control_plane_cap_succeeds_and_health_stays_resp
 }
 
 #[tokio::test]
+async fn score_endpoint_passthrough_batched_text1() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/score?test=score-batch", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"qwen3-reranker-8b","text_1":["q1","q2"],"text_2":["d1","d2"]}"#)
+        .send()
+        .await
+        .expect("batch score should complete");
+    // Fake upstream has no /v1/score → 404, but path must remain score (not rewritten).
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("batch score should reach upstream as /v1/score");
+    assert_eq!(observed.method, Method::POST);
+    assert_eq!(observed.path_and_query, "/v1/score?test=score-batch");
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("body json");
+    assert_eq!(observed_body["text_1"][0], "q1");
+    assert_eq!(observed_body["text_2"][1], "d2");
+    let _ = response.status();
+}
+
+#[tokio::test]
+async fn score_endpoint_passthrough_non_success_rerank_status() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/score?test=score-upstream-500",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q","text_2":"d"}"#)
+        .send()
+        .await
+        .expect("score request should complete");
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.text().await.expect("body");
+    assert!(body.contains("upstream boom"), "{body}");
+
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("should forward to rerank");
+    assert!(observed.path_and_query.starts_with("/v1/rerank"));
+}
+
+#[tokio::test]
 async fn score_endpoint_adapts_to_rerank_and_records_success() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
