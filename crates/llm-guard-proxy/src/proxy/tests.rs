@@ -986,6 +986,13 @@ async fn score_endpoint_adapts_to_rerank_and_records_success() {
         .await
         .expect("score request should complete");
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
     let body: serde_json::Value = response.json().await.expect("score json");
     assert_eq!(body["object"], "list");
     assert_eq!(body["data"][0]["object"], "score");
@@ -1011,6 +1018,34 @@ async fn score_endpoint_adapts_to_rerank_and_records_success() {
     assert_eq!(request_row.http_status, 200);
     assert_eq!(attempt_row.status, "succeeded");
     assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(
+        request_row.response_metadata["response_header_content-type"],
+        "application/json"
+    );
+    assert!(
+        request_row
+            .response_metadata
+            .get("response_header_server")
+            .is_none()
+    );
+    assert!(
+        request_row
+            .response_metadata
+            .get("response_header_x-request-id")
+            .is_none()
+    );
+    assert_eq!(
+        attempt_row.response_metadata["response_header_content-type"],
+        "application/vnd.rerank+json"
+    );
+    assert_eq!(
+        attempt_row.response_metadata["response_header_server"],
+        "fake-rerank"
+    );
+    assert_eq!(
+        attempt_row.response_metadata["response_header_x-request-id"],
+        "rerank-request-123"
+    );
     let connection = rusqlite::Connection::open(&proxy.sqlite_path).expect("sqlite open");
     let request_meta: String = connection
         .query_row("SELECT request_metadata_json FROM requests", [], |row| {
@@ -16807,7 +16842,22 @@ fn fake_rerank_response(path_and_query: &str, body: &Bytes) -> Response<Body> {
         r#"{{"id":"rerank-test","model":"qwen3-reranker-8b","results":[{}]}}"#,
         results.join(",")
     );
-    json_response("rerank", body)
+    let mut response = json_response("rerank", body);
+    if path_and_query.contains("test=score-adapter-ok") {
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.rerank+json"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("server"),
+            HeaderValue::from_static("fake-rerank"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-request-id"),
+            HeaderValue::from_static("rerank-request-123"),
+        );
+    }
+    response
 }
 
 fn fake_chat_completion_response(

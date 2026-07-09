@@ -3860,7 +3860,7 @@ async fn rewrite_score_response_from_upstream(
         (body, response_parts.upstream_headers.clone())
     };
     let stream_cancel = response_parts.shutdown_subscription();
-    let observer = response_parts.into_observer();
+    let observer = response_parts.into_observer_with_downstream_headers(response_headers.clone());
     let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit, stream_cancel);
     Ok(downstream_response(
         upstream_status,
@@ -5117,12 +5117,32 @@ impl ForwardedResponseParts {
 
     fn into_observer(self) -> ForwardedBodyObserver {
         let downstream_mode = downstream_mode_from_headers(&self.upstream_headers);
-        self.into_observer_with(downstream_mode, BTreeMap::new(), RawPayloads::default())
+        let downstream_headers = self.upstream_headers.clone();
+        self.into_observer_with(
+            downstream_mode,
+            downstream_headers,
+            BTreeMap::new(),
+            RawPayloads::default(),
+        )
+    }
+
+    fn into_observer_with_downstream_headers(
+        self,
+        downstream_headers: HeaderMap,
+    ) -> ForwardedBodyObserver {
+        let downstream_mode = downstream_mode_from_headers(&downstream_headers);
+        self.into_observer_with(
+            downstream_mode,
+            downstream_headers,
+            BTreeMap::new(),
+            RawPayloads::default(),
+        )
     }
 
     fn into_observer_with(
         self,
         downstream_mode: DownstreamMode,
+        downstream_headers: HeaderMap,
         extra_response_metadata: BTreeMap<String, String>,
         raw_payloads: RawPayloads,
     ) -> ForwardedBodyObserver {
@@ -5151,7 +5171,7 @@ impl ForwardedResponseParts {
             model_id: self.model_id,
             input_fingerprint: self.input_fingerprint,
             downstream_status: self.upstream_status,
-            downstream_headers: self.upstream_headers,
+            downstream_headers,
             request_metadata: self.request_metadata,
             extra_response_metadata,
             raw_payloads,
