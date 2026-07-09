@@ -2732,7 +2732,7 @@ struct PreparedOpenAiRequest {
     /// Request was adapted from `/v1/score`; rewrite response from rerank shape.
     score_via_rerank: bool,
     /// Expected score rows (document count) for fail-closed response validation.
-    score_expected_count: Option<usize>,
+    score_expected_count: Option<score_adapter::ScoreExpectations>,
 }
 
 #[cfg(feature = "guard")]
@@ -2764,7 +2764,7 @@ struct AdaptedScoreRequest {
     forward_uri: Uri,
     adapted_body: Bytes,
     score_via_rerank: bool,
-    score_expected_count: Option<usize>,
+    score_expected_count: Option<score_adapter::ScoreExpectations>,
 }
 
 fn adapt_score_request_if_needed(
@@ -2810,10 +2810,17 @@ fn adapt_score_request_if_needed(
             request_metadata: None,
         }
     })?;
-    let score_expected_count = score_adapter::expected_result_count_from_rerank_body(&adapted_body);
+    let score_expected_count = score_adapter::score_expectations_from_rerank_body(&adapted_body);
     request_metadata.insert(String::from("score_via_rerank"), String::from("true"));
-    if let Some(count) = score_expected_count {
-        request_metadata.insert(String::from("score_expected_count"), count.to_string());
+    if let Some(expected) = score_expected_count {
+        request_metadata.insert(
+            String::from("score_expected_count"),
+            expected.result_count.to_string(),
+        );
+        request_metadata.insert(
+            String::from("score_document_count"),
+            expected.document_count.to_string(),
+        );
     }
     Ok(AdaptedScoreRequest {
         forward_uri,
@@ -3813,7 +3820,7 @@ struct GenericForwardContext<'request> {
     request_metadata: BTreeMap<String, String>,
     in_flight_permit: InFlightPermit,
     score_via_rerank: bool,
-    score_expected_count: Option<usize>,
+    score_expected_count: Option<score_adapter::ScoreExpectations>,
 }
 
 async fn rewrite_score_response_from_upstream(
@@ -3821,7 +3828,7 @@ async fn rewrite_score_response_from_upstream(
     upstream_response: reqwest::Response,
     in_flight_permit: InFlightPermit,
     model_id: Option<&str>,
-    expected_count: Option<usize>,
+    expected_count: Option<score_adapter::ScoreExpectations>,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
     let upstream_headers = response_parts.upstream_headers.clone();

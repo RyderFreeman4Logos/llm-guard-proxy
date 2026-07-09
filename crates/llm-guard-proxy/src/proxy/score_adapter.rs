@@ -129,12 +129,11 @@ pub(crate) fn score_body_to_rerank_body(body: &Bytes) -> Result<Bytes, String> {
 /// `{ "data": [ { "index": 0, "object": "score", "score": <f64> }, ... ] }`
 ///
 /// Fail-closed: any malformed entry or duplicate index rejects the whole body.
-/// Expected number of score rows (documents requested). When set, indices must
-/// be exactly `0..expected_count` (cardinality + domain).
+/// When `expected` is set, validate result cardinality and document-index domain.
 pub(crate) fn rerank_response_to_score_response(
     body: &Bytes,
     model: Option<&str>,
-    expected_count: Option<usize>,
+    expected: Option<ScoreExpectations>,
 ) -> Result<Bytes, String> {
     let value: Value =
         serde_json::from_slice(body).map_err(|error| format!("invalid rerank JSON: {error}"))?;
@@ -181,25 +180,30 @@ pub(crate) fn rerank_response_to_score_response(
 
     // Stable score list ordered by original document index.
     scored.sort_by_key(|(index, _)| *index);
-    if let Some(expected) = expected_count {
-        if scored.len() != expected {
+    if let Some(expected) = expected {
+        if scored.len() != expected.result_count {
             return Err(format!(
-                "rerank result count {} != expected {expected} for score adapter",
-                scored.len()
+                "rerank result count {} != expected top_n {} for score adapter",
+                scored.len(),
+                expected.result_count
             ));
         }
-        for expect_i in 0..expected {
-            if !seen.contains(&expect_i) {
+        for (index, _) in &scored {
+            if *index >= expected.document_count {
                 return Err(format!(
-                    "rerank result missing index {expect_i} for score adapter"
+                    "rerank result index {index} out of range for document_count {}",
+                    expected.document_count
                 ));
             }
         }
-        for (index, _) in &scored {
-            if *index >= expected {
-                return Err(format!(
-                    "rerank result index {index} out of range for expected {expected}"
-                ));
+        // When all documents are requested, require complete coverage of 0..n.
+        if expected.result_count == expected.document_count {
+            for expect_i in 0..expected.document_count {
+                if !seen.contains(&expect_i) {
+                    return Err(format!(
+                        "rerank result missing index {expect_i} for score adapter"
+                    ));
+                }
             }
         }
     }
@@ -232,16 +236,35 @@ pub(crate) fn rerank_response_to_score_response(
         .map_err(|error| format!("serialize score response failed: {error}"))
 }
 
-/// Document count implied by a rewritten rerank request body (`top_n` or `documents.len()`).
-pub(crate) fn expected_result_count_from_rerank_body(body: &Bytes) -> Option<usize> {
+/// Expectations derived from a rewritten rerank request body.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ScoreExpectations {
+    /// Number of results requested (`top_n`, defaulting to `documents.len()`).
+    pub result_count: usize,
+    /// Document array length; valid indices are `0..document_count`.
+    pub document_count: usize,
+}
+
+/// Parse score/rerank request expectations for fail-closed response validation.
+pub(crate) fn score_expectations_from_rerank_body(body: &Bytes) -> Option<ScoreExpectations> {
     let value: Value = serde_json::from_slice(body).ok()?;
-    if let Some(n) = value.get("top_n").and_then(Value::as_u64) {
-        return usize::try_from(n).ok();
-    }
-    value
+    let document_count = value
         .get("documents")
         .and_then(Value::as_array)
-        .map(Vec::len)
+        .map(Vec::len)?;
+    if document_count == 0 {
+        return None;
+    }
+    let result_count = value
+        .get("top_n")
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(document_count)
+        .clamp(1, document_count);
+    Some(ScoreExpectations {
+        result_count,
+        document_count,
+    })
 }
 
 /// Rewrite request URI path `/v1/score` → `/v1/rerank` while keeping query string.
@@ -290,7 +313,15 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"id":"rerank-1","model":"m","results":[{"index":1,"score":0.9},{"index":0,"score":0.1}]}"#,
         );
-        let out = rerank_response_to_score_response(&body, Some("m"), Some(2)).expect("convert");
+        let out = rerank_response_to_score_response(
+            &body,
+            Some("m"),
+            Some(ScoreExpectations {
+                result_count: 2,
+                document_count: 2,
+            }),
+        )
+        .expect("convert");
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["object"], "list");
         assert_eq!(v["data"][0]["index"], 0);
@@ -337,7 +368,15 @@ mod tests {
     #[test]
     fn rejects_partial_results_when_expected_count_set() {
         let body = Bytes::from_static(br#"{"results":[{"index":0,"score":0.9}]}"#);
-        let err = rerank_response_to_score_response(&body, Some("m"), Some(2)).unwrap_err();
+        let err = rerank_response_to_score_response(
+            &body,
+            Some("m"),
+            Some(ScoreExpectations {
+                result_count: 2,
+                document_count: 2,
+            }),
+        )
+        .unwrap_err();
         assert!(
             err.contains("count") || err.contains("missing index"),
             "{err}"
@@ -348,7 +387,15 @@ mod tests {
     fn rejects_out_of_range_index_when_expected_count_set() {
         let body =
             Bytes::from_static(br#"{"results":[{"index":0,"score":0.1},{"index":5,"score":0.9}]}"#);
-        let err = rerank_response_to_score_response(&body, Some("m"), Some(2)).unwrap_err();
+        let err = rerank_response_to_score_response(
+            &body,
+            Some("m"),
+            Some(ScoreExpectations {
+                result_count: 2,
+                document_count: 2,
+            }),
+        )
+        .unwrap_err();
         assert!(
             err.contains("out of range") || err.contains("missing index"),
             "{err}"
@@ -366,5 +413,22 @@ mod tests {
     fn classifies_scalar_score_as_adaptable() {
         let body = Bytes::from_static(br#"{"model":"m","text_1":"q","text_2":"d"}"#);
         assert!(can_adapt_score_body_to_rerank(&body).unwrap());
+    }
+
+    #[test]
+    fn accepts_top_n_less_than_documents() {
+        let body = Bytes::from_static(br#"{"results":[{"index":1,"score":0.9}]}"#);
+        let out = rerank_response_to_score_response(
+            &body,
+            Some("m"),
+            Some(ScoreExpectations {
+                result_count: 1,
+                document_count: 2,
+            }),
+        )
+        .expect("top_n=1 may return non-zero index");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["data"].as_array().unwrap().len(), 1);
+        assert_eq!(v["data"][0]["index"], 1);
     }
 }
