@@ -72,25 +72,22 @@ pub(crate) fn score_body_to_rerank_body(body: &Bytes) -> Result<Bytes, String> {
         out.insert(String::from("model"), model);
     }
     out.insert(String::from("query"), Value::String(query));
+    let top_n = documents.len();
     out.insert(String::from("documents"), Value::Array(documents));
     // Preserve original order for score mapping (index aligns with documents).
-    out.insert(String::from("top_n"), json!(documents_len_from_out(&out)));
+    out.insert(String::from("top_n"), json!(top_n));
 
     serde_json::to_vec(&Value::Object(out))
         .map(Bytes::from)
         .map_err(|error| format!("serialize rerank body failed: {error}"))
 }
 
-fn documents_len_from_out(out: &serde_json::Map<String, Value>) -> usize {
-    out.get("documents")
-        .and_then(Value::as_array)
-        .map_or(0, Vec::len)
-}
-
 /// Rewrite a `/v1/rerank` response into a vLLM-compatible `/v1/score` response.
 ///
 /// Expected score shape for healthcheck:
 /// `{ "data": [ { "index": 0, "object": "score", "score": <f64> }, ... ] }`
+///
+/// Fail-closed: any malformed entry or duplicate index rejects the whole body.
 pub(crate) fn rerank_response_to_score_response(
     body: &Bytes,
     model: Option<&str>,
@@ -98,34 +95,44 @@ pub(crate) fn rerank_response_to_score_response(
     let value: Value =
         serde_json::from_slice(body).map_err(|error| format!("invalid rerank JSON: {error}"))?;
 
-    // Collect (index, score) pairs from common shapes.
-    let mut scored: Vec<(usize, f64)> = Vec::new();
-    if let Some(items) = value
+    let items = value
         .get("results")
         .and_then(Value::as_array)
         .or_else(|| value.get("data").and_then(Value::as_array))
-    {
-        for item in items {
-            let index = item
-                .get("index")
-                .or_else(|| item.get("document_index"))
-                .and_then(Value::as_u64)
-                .and_then(|v| usize::try_from(v).ok());
-            let score = item
-                .get("score")
-                .or_else(|| item.get("relevance_score"))
-                .or_else(|| item.get("rerank_score"))
-                .and_then(Value::as_f64);
-            if let (Some(index), Some(score)) = (index, score) {
-                scored.push((index, score));
-            }
-        }
+        .ok_or_else(|| {
+            String::from("rerank response missing results/data scores for score adapter")
+        })?;
+    if items.is_empty() {
+        return Err(String::from(
+            "rerank response results/data is empty for score adapter",
+        ));
     }
 
-    if scored.is_empty() {
-        return Err(String::from(
-            "rerank response missing results/data scores for score adapter",
-        ));
+    let mut scored: Vec<(usize, f64)> = Vec::with_capacity(items.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for (entry_i, item) in items.iter().enumerate() {
+        let index = item
+            .get("index")
+            .or_else(|| item.get("document_index"))
+            .and_then(Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| {
+                format!("rerank result entry {entry_i} missing or invalid index for score adapter")
+            })?;
+        let score = item
+            .get("score")
+            .or_else(|| item.get("relevance_score"))
+            .or_else(|| item.get("rerank_score"))
+            .and_then(Value::as_f64)
+            .ok_or_else(|| {
+                format!("rerank result entry {entry_i} missing or invalid score for score adapter")
+            })?;
+        if !seen.insert(index) {
+            return Err(format!(
+                "rerank result has duplicate index {index} for score adapter"
+            ));
+        }
+        scored.push((index, score));
     }
 
     // Stable score list ordered by original document index.
@@ -213,6 +220,33 @@ mod tests {
         assert_eq!(v["data"][0]["object"], "score");
         assert_eq!(v["data"][1]["index"], 1);
         assert_eq!(v["data"][1]["score"], 0.9);
+    }
+
+    #[test]
+    fn rejects_malformed_result_entry() {
+        let body = Bytes::from_static(
+            br#"{"results":[{"index":0,"score":0.9},{"index":"bad","score":0.2}]}"#,
+        );
+        let err = rerank_response_to_score_response(&body, Some("m")).unwrap_err();
+        assert!(
+            err.contains("missing or invalid index"),
+            "unexpected err: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_indices() {
+        let body =
+            Bytes::from_static(br#"{"results":[{"index":0,"score":0.9},{"index":0,"score":0.2}]}"#);
+        let err = rerank_response_to_score_response(&body, Some("m")).unwrap_err();
+        assert!(err.contains("duplicate index"), "unexpected err: {err}");
+    }
+
+    #[test]
+    fn rejects_empty_results() {
+        let body = Bytes::from_static(br#"{"results":[]}"#);
+        let err = rerank_response_to_score_response(&body, Some("m")).unwrap_err();
+        assert!(err.contains("empty"), "unexpected err: {err}");
     }
 
     #[test]
