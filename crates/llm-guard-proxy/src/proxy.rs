@@ -3824,14 +3824,13 @@ struct GenericForwardContext<'request> {
 }
 
 async fn rewrite_score_response_from_upstream(
-    response_parts: ForwardedResponseParts,
+    mut response_parts: ForwardedResponseParts,
     upstream_response: reqwest::Response,
     in_flight_permit: InFlightPermit,
     model_id: Option<&str>,
     expected_count: Option<score_adapter::ScoreExpectations>,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
-    let upstream_headers = response_parts.upstream_headers.clone();
     let body = match read_upstream_body_bytes_until_shutdown(
         upstream_response.bytes_stream(),
         response_parts.shutdown_subscription(),
@@ -3841,9 +3840,15 @@ async fn rewrite_score_response_from_upstream(
         Ok(body) => body,
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
-    let body = if upstream_status.is_success() {
+    let (body, response_headers) = if upstream_status.is_success() {
         match score_adapter::rerank_response_to_score_response(&body, model_id, expected_count) {
-            Ok(body) => body,
+            Ok(body) => {
+                // Transformed body: never re-emit upstream content-encoding/validators.
+                let mut headers = HeaderMap::new();
+                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                response_parts.upstream_headers = headers.clone();
+                (body, headers)
+            }
             Err(error) => {
                 return Err(
                     response_parts.into_response_process_error(ProxyError::upstream_body(format!(
@@ -3853,14 +3858,14 @@ async fn rewrite_score_response_from_upstream(
             }
         }
     } else {
-        body
+        (body, response_parts.upstream_headers.clone())
     };
     let stream_cancel = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
     let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit, stream_cancel);
     Ok(downstream_response(
         upstream_status,
-        &upstream_headers,
+        &response_headers,
         Body::from_stream(response_body),
     ))
 }
@@ -3893,11 +3898,26 @@ async fn forward_generic_openai_request(
         &context.liveness,
         &context.thinking_metadata,
     );
+    let score_identity_headers = if context.score_via_rerank {
+        let mut headers = context.downstream_headers.clone();
+        headers.remove(axum::http::header::ACCEPT_ENCODING);
+        headers.insert(
+            axum::http::header::ACCEPT_ENCODING,
+            HeaderValue::from_static("identity"),
+        );
+        Some(headers)
+    } else {
+        None
+    };
+    let downstream_headers = match score_identity_headers.as_ref() {
+        Some(headers) => headers,
+        None => &context.downstream_headers,
+    };
     let upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
         client: &context.state.client,
         method: context.reqwest_method,
         upstream_url: context.upstream_url,
-        downstream_headers: &context.downstream_headers,
+        downstream_headers,
         upstream_body: context.upstream_body,
         upstream_timeout: context.upstream_timeout,
         attempt_id: attempt_id.clone(),
