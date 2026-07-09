@@ -941,6 +941,38 @@ async fn score_endpoint_passthrough_non_success_rerank_status() {
 }
 
 #[tokio::test]
+async fn score_endpoint_negotiates_identity_encoding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/score?test=score-identity", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .header(axum::http::header::ACCEPT_ENCODING, "gzip, deflate")
+        .header("content-md5", "stale-md5")
+        .header("digest", "SHA-256=stale")
+        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q","text_2":"d"}"#)
+        .send()
+        .await
+        .expect("score request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("should reach upstream");
+    assert!(observed.path_and_query.starts_with("/v1/rerank"));
+    let accept_encoding = observed
+        .headers
+        .get(axum::http::header::ACCEPT_ENCODING)
+        .and_then(|v| v.to_str().ok());
+    assert_eq!(accept_encoding, Some("identity"));
+    assert!(observed.headers.get("content-md5").is_none());
+    assert!(observed.headers.get("digest").is_none());
+}
+
+#[tokio::test]
 async fn score_endpoint_adapts_to_rerank_and_records_success() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;

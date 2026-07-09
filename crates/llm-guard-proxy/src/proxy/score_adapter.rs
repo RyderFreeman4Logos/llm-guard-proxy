@@ -113,7 +113,7 @@ pub(crate) fn score_body_to_rerank_body(body: &Bytes) -> Result<Bytes, String> {
     for (key, value) in object {
         if matches!(
             key.as_str(),
-            "text_1" | "text_2" | "query" | "documents" | "top_n" | "model"
+            "text_1" | "text_2" | "query" | "documents" | "model"
         ) {
             continue;
         }
@@ -455,5 +455,15 @@ mod tests {
         assert_eq!(v["truncate_prompt_tokens"], 128);
         assert_eq!(v["priority"], 1);
         assert_eq!(v["query"], "q");
+    }
+
+    #[test]
+    fn preserves_caller_top_n() {
+        let body =
+            Bytes::from_static(br#"{"model":"m","text_1":"q","text_2":["a","b"],"top_n":1}"#);
+        let out = score_body_to_rerank_body(&body).expect("convert");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["top_n"], 1);
+        assert_eq!(v["documents"].as_array().unwrap().len(), 2);
     }
 }
