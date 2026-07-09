@@ -3824,7 +3824,7 @@ struct GenericForwardContext<'request> {
 }
 
 async fn rewrite_score_response_from_upstream(
-    mut response_parts: ForwardedResponseParts,
+    response_parts: ForwardedResponseParts,
     upstream_response: reqwest::Response,
     in_flight_permit: InFlightPermit,
     model_id: Option<&str>,
@@ -3843,10 +3843,9 @@ async fn rewrite_score_response_from_upstream(
     let (body, response_headers) = if upstream_status.is_success() {
         match score_adapter::rerank_response_to_score_response(&body, model_id, expected_count) {
             Ok(body) => {
-                // Transformed body: never re-emit upstream content-encoding/validators.
-                let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-                response_parts.upstream_headers = headers.clone();
+                // Transformed body: clean downstream headers only; keep original
+                // upstream headers on response_parts for attempt observability.
+                let headers = transformed_score_response_headers();
                 (body, headers)
             }
             Err(error) => {
@@ -3899,13 +3898,9 @@ async fn forward_generic_openai_request(
         &context.thinking_metadata,
     );
     let score_identity_headers = if context.score_via_rerank {
-        let mut headers = context.downstream_headers.clone();
-        headers.remove(axum::http::header::ACCEPT_ENCODING);
-        headers.insert(
-            axum::http::header::ACCEPT_ENCODING,
-            HeaderValue::from_static("identity"),
-        );
-        Some(headers)
+        Some(sanitize_score_adapt_request_headers(
+            &context.downstream_headers,
+        ))
     } else {
         None
     };
@@ -9984,6 +9979,36 @@ fn classify_shielded_error_message_cause(message: &str) -> Option<UpstreamFailur
     } else {
         None
     }
+}
+
+fn sanitize_score_adapt_request_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = forwarded_request_headers(headers);
+    forwarded.remove(axum::http::header::ACCEPT_ENCODING);
+    forwarded.insert(
+        axum::http::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    // Body changed; drop representation-integrity headers bound to original payload.
+    for name in [
+        "content-encoding",
+        "content-md5",
+        "digest",
+        "content-digest",
+        "etag",
+        "if-match",
+        "if-none-match",
+    ] {
+        if let Ok(header_name) = HeaderName::try_from(name) {
+            forwarded.remove(header_name);
+        }
+    }
+    forwarded
+}
+
+fn transformed_score_response_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers
 }
 
 fn forwarded_request_headers(headers: &HeaderMap) -> HeaderMap {

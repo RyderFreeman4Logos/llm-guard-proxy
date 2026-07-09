@@ -109,6 +109,16 @@ pub(crate) fn score_body_to_rerank_body(body: &Bytes) -> Result<Bytes, String> {
     };
 
     let mut out = serde_json::Map::new();
+    // Preserve non-mapped score options (priority, truncate_prompt_tokens, additional_data, ...).
+    for (key, value) in object {
+        if matches!(
+            key.as_str(),
+            "text_1" | "text_2" | "query" | "documents" | "top_n" | "model"
+        ) {
+            continue;
+        }
+        out.insert(key.clone(), value.clone());
+    }
     if !model.is_null() {
         out.insert(String::from("model"), model);
     }
@@ -116,7 +126,10 @@ pub(crate) fn score_body_to_rerank_body(body: &Bytes) -> Result<Bytes, String> {
     let top_n = documents.len();
     out.insert(String::from("documents"), Value::Array(documents));
     // Preserve original order for score mapping (index aligns with documents).
-    out.insert(String::from("top_n"), json!(top_n));
+    // Caller-supplied top_n already preserved above when present.
+    if !out.contains_key("top_n") {
+        out.insert(String::from("top_n"), json!(top_n));
+    }
 
     serde_json::to_vec(&Value::Object(out))
         .map(Bytes::from)
@@ -430,5 +443,17 @@ mod tests {
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["data"].as_array().unwrap().len(), 1);
         assert_eq!(v["data"][0]["index"], 1);
+    }
+
+    #[test]
+    fn preserves_score_options() {
+        let body = Bytes::from_static(
+            br#"{"model":"m","text_1":"q","text_2":"d","truncate_prompt_tokens":128,"priority":1}"#,
+        );
+        let out = score_body_to_rerank_body(&body).expect("convert");
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["truncate_prompt_tokens"], 128);
+        assert_eq!(v["priority"], 1);
+        assert_eq!(v["query"], "q");
     }
 }
