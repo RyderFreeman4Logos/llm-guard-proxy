@@ -975,6 +975,15 @@ async fn score_endpoint_fails_closed_on_partial_rerank_results() {
     let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
     assert_eq!(attempt_row.status, "failed");
     assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(
+        attempt_row.response_metadata["upstream_response_received"],
+        "true"
+    );
+    assert_eq!(attempt_row.response_metadata["http_status_success"], "true");
+    assert_eq!(
+        attempt_row.response_metadata["response_process_error"],
+        "true"
+    );
 }
 
 #[tokio::test]

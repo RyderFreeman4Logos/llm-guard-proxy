@@ -5143,8 +5143,26 @@ impl ForwardedResponseParts {
             request_metadata: self.attempt_request_metadata,
             extra_response_metadata,
         });
+        // Response body was received and status known; distinguish from transport failures.
         attempt_record.http_status = Some(self.upstream_status.as_u16());
         attempt_record.upstream_mode = self.upstream_mode;
+        attempt_record.response_metadata.insert(
+            String::from("upstream_response_received"),
+            String::from("true"),
+        );
+        attempt_record.response_metadata.insert(
+            String::from("http_status_success"),
+            if self.upstream_status.is_success() {
+                String::from("true")
+            } else {
+                String::from("false")
+            },
+        );
+        copy_selected_header_metadata(
+            &mut attempt_record.response_metadata,
+            &self.upstream_headers,
+            "response",
+        );
         error.with_observability(self.request_metadata, attempt_record)
     }
 }
