@@ -71,6 +71,76 @@ async fn score_endpoint_passthrough_unknown_complete_shape() {
     assert!(metadata.get("score_batch_passthrough").is_none());
 }
 
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn score_endpoint_ignores_chat_param_overrides() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &param_override_profile_config(
+            &fake.base_url,
+            r"
+temperature = 0.6
+",
+        ),
+    )
+    .await;
+    let digits = "9".repeat(1_000);
+    let canonical =
+        format!(r#"{{"model":"test-chat","text_1":"q","text_2":"d","future":{digits}}}"#);
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/score?test=score-param-override",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(canonical)
+        .send()
+        .await
+        .expect("canonical score should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("score response should drain");
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("adapted score should reach rerank upstream");
+    assert!(observed.path_and_query.starts_with("/v1/rerank"));
+    let observed_text = std::str::from_utf8(&observed.body).expect("body should be utf-8");
+    assert!(observed_text.contains(&digits));
+    assert!(!observed_text.contains("temperature"));
+
+    let future = r#"{"model":"test-chat","left_input":"q","right_input":"d"}"#;
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/score?test=score-param-override-future",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(future)
+        .send()
+        .await
+        .expect("future score should complete");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    response
+        .bytes()
+        .await
+        .expect("future response should drain");
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("future score should reach score upstream");
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/score?test=score-param-override-future"
+    );
+    assert_eq!(observed.body.as_ref(), future.as_bytes());
+}
+
 #[tokio::test]
 async fn score_endpoint_passthrough_non_success_rerank_status() {
     let mut fake = FakeUpstream::spawn().await;
@@ -432,6 +502,11 @@ async fn score_endpoint_rejects_invalid_client_body() {
         r#"{"model":"qwen3-reranker-8b","left_input":"q","softmax":true}"#,
         r#"{"softmax":true,"activation":false}"#,
         r#"{"right_input":"d","use_activation":true}"#,
+        r#"{"left_input":"q","priority":1}"#,
+        r#"{"left_input":"q","truncate_prompt_tokens":8}"#,
+        r#"{"left_input":"q","mm_processor_kwargs":{}}"#,
+        r#"{"left_input":"q","top_n":1}"#,
+        r#"{"left_input":"q","additional_data":{}}"#,
         r#"{"queries":["q"],"typo":true}"#,
         r#"{"items":["d"],"typo":true}"#,
         r#"{"data_1":"q","typo":true}"#,

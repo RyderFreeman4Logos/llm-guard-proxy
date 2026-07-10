@@ -41,10 +41,12 @@ impl<'de> serde::Deserialize<'de> for RawScoreObject<'de> {
                 while let Some(key) = map.next_key::<String>()? {
                     let value = map.next_value::<&'de RawValue>()?;
                     if key == "top_n" {
-                        parse_pydantic_json_value(value).map_err(serde::de::Error::custom)?;
                         top_n.seen = true;
                         top_n.last_lax = parse_lax_top_n_raw(value);
-                    } else {
+                    } else if matches!(
+                        key.as_str(),
+                        "text_1" | "text_2" | "query" | "documents" | "model"
+                    ) {
                         let (parsed, needs_preservation) =
                             parse_pydantic_json_value(value).map_err(serde::de::Error::custom)?;
                         if needs_preservation {
@@ -53,6 +55,12 @@ impl<'de> serde::Deserialize<'de> for RawScoreObject<'de> {
                             preserved_fields.remove(&key);
                         }
                         object.insert(key, parsed);
+                    } else {
+                        // These fields use the same Pydantic schema after score→rerank
+                        // rewriting. Preserve the whole raw value so deeply nested extras
+                        // stay O(body size) and the target performs the canonical coercion.
+                        object.insert(key.clone(), Value::Null);
+                        preserved_fields.insert(key, value);
                     }
                 }
                 Ok(RawScoreObject {
@@ -111,6 +119,9 @@ pub(super) struct ParsedScoreValue<'a> {
 }
 
 pub(super) fn parse_score_value(body: &Bytes) -> Result<ParsedScoreValue<'_>, String> {
+    if contains_pydantic_invalid_integer(body) {
+        return Err(String::from("invalid score JSON integer"));
+    }
     match serde_json::from_slice::<Value>(body) {
         Ok(mut value)
             if !contains_non_serde_integer(body) && !contains_pydantic_json_float(body) =>
@@ -168,7 +179,6 @@ fn parse_score_value_from_raw<'a>(
             |error| format!("invalid score JSON: {error}"),
         )
     };
-    validate_pydantic_json_nesting(body).map_err(|()| default_message())?;
     let mut raw_object: RawScoreObject<'_> =
         serde_json::from_slice(body).map_err(|_| default_message())?;
     let is_canonical =
@@ -194,38 +204,6 @@ fn parse_score_value_from_raw<'a>(
         value: Value::Object(raw_object.object),
         preserved_fields: raw_object.preserved_fields,
     })
-}
-
-fn validate_pydantic_json_nesting(body: &[u8]) -> Result<(), ()> {
-    const MAX_CONTAINER_DEPTH: usize = 200;
-
-    let mut depth = 0_usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for &byte in body {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match byte {
-            b'"' => in_string = true,
-            b'{' | b'[' => {
-                depth += 1;
-                if depth > MAX_CONTAINER_DEPTH {
-                    return Err(());
-                }
-            }
-            b'}' | b']' => depth = depth.saturating_sub(1),
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 struct PydanticFallbackValue {
@@ -353,6 +331,17 @@ pub(super) fn contains_non_serde_integer(json: &[u8]) -> bool {
 fn contains_pydantic_json_float(json: &[u8]) -> bool {
     contains_json_number_matching(json, |token| {
         token.contains(&b'.') || token.contains(&b'e') || token.contains(&b'E')
+    })
+}
+
+fn contains_pydantic_invalid_integer(json: &[u8]) -> bool {
+    const MAX_NUMBER_INT_CHARACTERS: usize = 4_300;
+    contains_json_number_matching(json, |token| {
+        let magnitude = token.strip_prefix(b"-").unwrap_or(token);
+        !token.contains(&b'.')
+            && !token.contains(&b'e')
+            && !token.contains(&b'E')
+            && magnitude.len() > MAX_NUMBER_INT_CHARACTERS
     })
 }
 
@@ -571,13 +560,11 @@ fn classify_cleaned_number_int(value: &str, is_negative: bool) -> Option<LaxTopN
 
 fn classify_number_int(value: &str) -> Option<LaxTopN> {
     const MAX_NUMBER_INT_CHARACTERS: usize = 4_300;
-    if value.len() > MAX_NUMBER_INT_CHARACTERS {
-        return None;
-    }
     let (is_negative, magnitude) = value
         .strip_prefix('-')
         .map_or((false, value), |magnitude| (true, magnitude));
-    if magnitude.is_empty()
+    if magnitude.len() > MAX_NUMBER_INT_CHARACTERS
+        || magnitude.is_empty()
         || !magnitude.bytes().all(|byte| byte.is_ascii_digit())
         || (magnitude.len() > 1 && magnitude.starts_with('0'))
     {

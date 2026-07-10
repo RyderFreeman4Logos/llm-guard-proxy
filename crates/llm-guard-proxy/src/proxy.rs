@@ -2881,7 +2881,12 @@ fn prepare_openai_forward_request(
         &forward_uri,
         &body,
     );
-    apply_param_override_to_shielded_plan(&mut shielded_chat_plan, &upstream_profile)?;
+    apply_param_override_to_shielded_plan(
+        method,
+        &forward_uri,
+        &mut shielded_chat_plan,
+        &upstream_profile,
+    )?;
     add_shielded_request_metadata(
         request_metadata,
         shielded_chat_plan.intercepted,
@@ -3118,17 +3123,21 @@ fn profile_block_reason_message(reason: &BlockReason) -> String {
 }
 
 #[cfg(feature = "param-override")]
+fn param_override_applies(method: &Method, uri: &Uri, profile: &UpstreamProfileConfig) -> bool {
+    method == Method::POST
+        && uri.path() == "/v1/chat/completions"
+        && profile.param_override.enabled
+        && param_override_has_fields(&profile.param_override)
+}
+
+#[cfg(feature = "param-override")]
 fn apply_param_override_if_configured(
     method: &Method,
     uri: &Uri,
     body: &Bytes,
     profile: &UpstreamProfileConfig,
 ) -> Result<Bytes, ProxyError> {
-    if method != Method::POST
-        || uri.path() != "/v1/chat/completions"
-        || !profile.param_override.enabled
-        || !param_override_has_fields(&profile.param_override)
-    {
+    if !param_override_applies(method, uri, profile) {
         return Ok(body.clone());
     }
     apply_param_override_to_body(body, profile)
@@ -3136,9 +3145,14 @@ fn apply_param_override_if_configured(
 
 #[cfg(feature = "param-override")]
 fn apply_param_override_to_shielded_plan(
+    method: &Method,
+    uri: &Uri,
     plan: &mut ShieldedChatPlan,
     profile: &UpstreamProfileConfig,
 ) -> Result<(), ProxyError> {
+    if !param_override_applies(method, uri, profile) {
+        return Ok(());
+    }
     plan.downstream_body = apply_param_override_to_body(&plan.downstream_body, profile)?;
     plan.upstream_body = apply_param_override_to_body(&plan.upstream_body, profile)?;
     Ok(())
@@ -3146,6 +3160,8 @@ fn apply_param_override_to_shielded_plan(
 
 #[cfg(not(feature = "param-override"))]
 fn apply_param_override_to_shielded_plan(
+    _method: &Method,
+    _uri: &Uri,
     _plan: &mut ShieldedChatPlan,
     _profile: &UpstreamProfileConfig,
 ) -> Result<(), ProxyError> {

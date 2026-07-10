@@ -77,7 +77,9 @@ Checks performed:
   classify `/v1/embeddings` and `/v1/rerank` as upstream-unsupported when they
   return `404`.
 - Scalar text-only `POST /v1/score` requests are unconditionally adapted to
-  `/v1/rerank`; batch, multimodal, and future score shapes remain passthrough.
+  `/v1/rerank`; canonical batch and multimodal shapes plus complete future
+  variants remain passthrough, while legacy `query`/`documents` shapes are
+  forwarded to `/v1/rerank`.
   The smoke requires a complete adapted score response. Score request bodies
   are limited to 1 MiB before model extraction or JSON shape parsing to bound
   parser amplification.
