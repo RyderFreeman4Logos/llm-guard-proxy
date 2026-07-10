@@ -22,7 +22,8 @@ use axum::{
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
         header::{
-            ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, RETRY_AFTER,
+            ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST,
+            RETRY_AFTER,
         },
     },
     routing::get,
@@ -2674,7 +2675,7 @@ async fn read_body_and_admit_generation(
         });
     }
 
-    let model_id_for_admission = extract_model_id(&body);
+    let model_id_for_admission = extract_model_id(request.method, request.uri, &body);
     select_allowed_upstream_profile(&config, &state.listener, model_id_for_admission.as_deref())
         .map_err(|error| {
             ProxyError::listener_denied(error)
@@ -2731,7 +2732,7 @@ struct PreparedOpenAiRequest {
     shielded_chat_plan: ShieldedChatPlan,
     /// Request was adapted from `/v1/score`; rewrite response from rerank shape.
     score_via_rerank: bool,
-    /// Expected score rows (document count) for fail-closed response validation.
+    /// Expected result cardinality and document-index domain for response validation.
     score_expected_count: Option<score_adapter::ScoreExpectations>,
 }
 
@@ -2790,10 +2791,7 @@ fn adapt_score_request_if_needed(
     let adapt = score_adapter::can_adapt_score_body_to_rerank(body).map_err(invalid)?;
     if !adapt {
         request_metadata.insert(String::from("score_via_rerank"), String::from("false"));
-        request_metadata.insert(
-            String::from("score_batch_passthrough"),
-            String::from("true"),
-        );
+        request_metadata.insert(String::from("score_passthrough"), String::from("true"));
         return Ok(AdaptedScoreRequest {
             forward_uri: uri.clone(),
             adapted_body: body.clone(),
@@ -2841,7 +2839,7 @@ fn prepare_openai_forward_request(
 ) -> Result<PreparedOpenAiRequest, ProxyError> {
     #[cfg(not(feature = "guard"))]
     let _ = downstream_headers;
-    let model_id = extract_model_id(body);
+    let model_id = extract_model_id(method, uri, body);
     #[cfg(feature = "guard")]
     let caller_profile = resolve_caller_profile(config, downstream_headers)?;
     #[cfg(feature = "guard")]
@@ -3840,6 +3838,7 @@ async fn rewrite_score_response_from_upstream(
         Ok(body) => body,
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
+    let upstream_body_bytes = body.len();
     let (body, response_headers) = if upstream_status.is_success() {
         match score_adapter::rerank_response_to_score_response(&body, model_id, expected_count) {
             Ok(body) => {
@@ -3849,24 +3848,61 @@ async fn rewrite_score_response_from_upstream(
                 (body, headers)
             }
             Err(error) => {
-                return Err(
-                    response_parts.into_response_process_error(ProxyError::upstream_body(format!(
+                return Err(response_parts.into_response_process_error(
+                    ProxyError::upstream_body(format!(
                         "score from rerank response rewrite failed: {error}"
-                    ))),
-                );
+                    )),
+                    BTreeMap::from([(
+                        String::from("response_body_bytes"),
+                        upstream_body_bytes.to_string(),
+                    )]),
+                ));
             }
         }
     } else {
         (body, response_parts.upstream_headers.clone())
     };
     let stream_cancel = response_parts.shutdown_subscription();
-    let observer = response_parts.into_observer_with_downstream_headers(response_headers.clone());
+    let observer = response_parts.into_observer_with(
+        downstream_mode_from_headers(&response_headers),
+        response_headers.clone(),
+        BTreeMap::from([(
+            String::from("response_body_bytes"),
+            upstream_body_bytes.to_string(),
+        )]),
+        BTreeMap::new(),
+        RawPayloads::default(),
+    );
     let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit, stream_cancel);
     Ok(downstream_response(
         upstream_status,
         &response_headers,
         Body::from_stream(response_body),
     ))
+}
+
+fn prepare_generic_attempt_request(
+    context: &GenericForwardContext<'_>,
+) -> (Option<HeaderMap>, BTreeMap<String, String>) {
+    let override_headers = context
+        .score_via_rerank
+        .then(|| sanitize_score_adapt_request_headers(&context.downstream_headers));
+    let headers = override_headers
+        .as_ref()
+        .unwrap_or(&context.downstream_headers);
+    let mut metadata = attempt_request_metadata(&context.method, &context.uri, headers);
+    metadata.insert(
+        String::from("upstream_request_body_bytes"),
+        context.upstream_body.len().to_string(),
+    );
+    if context.score_via_rerank {
+        metadata.insert(String::from("path"), context.upstream_url.path().to_owned());
+        metadata.insert(
+            String::from("query_present"),
+            context.upstream_url.query().is_some().to_string(),
+        );
+    }
+    (override_headers, metadata)
 }
 
 async fn forward_generic_openai_request(
@@ -3882,8 +3918,12 @@ async fn forward_generic_openai_request(
 
     let attempt_id = AttemptId::for_request(context.request_id, 1);
     let attempt_started_at_unix_ms = unix_time_millis();
-    let mut attempt_request_metadata =
-        attempt_request_metadata(&context.method, &context.uri, &context.downstream_headers);
+    let (score_identity_headers, mut attempt_request_metadata) =
+        prepare_generic_attempt_request(&context);
+    let downstream_headers = match score_identity_headers.as_ref() {
+        Some(headers) => headers,
+        None => &context.downstream_headers,
+    };
     add_listener_metadata(&mut attempt_request_metadata, &context.state.listener);
     add_upstream_profile_metadata(
         &mut attempt_request_metadata,
@@ -3897,17 +3937,6 @@ async fn forward_generic_openai_request(
         &context.liveness,
         &context.thinking_metadata,
     );
-    let score_identity_headers = if context.score_via_rerank {
-        Some(sanitize_score_adapt_request_headers(
-            &context.downstream_headers,
-        ))
-    } else {
-        None
-    };
-    let downstream_headers = match score_identity_headers.as_ref() {
-        Some(headers) => headers,
-        None => &context.downstream_headers,
-    };
     let upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
         client: &context.state.client,
         method: context.reqwest_method,
@@ -5122,18 +5151,6 @@ impl ForwardedResponseParts {
             downstream_mode,
             downstream_headers,
             BTreeMap::new(),
-            RawPayloads::default(),
-        )
-    }
-
-    fn into_observer_with_downstream_headers(
-        self,
-        downstream_headers: HeaderMap,
-    ) -> ForwardedBodyObserver {
-        let downstream_mode = downstream_mode_from_headers(&downstream_headers);
-        self.into_observer_with(
-            downstream_mode,
-            downstream_headers,
             BTreeMap::new(),
             RawPayloads::default(),
         )
@@ -5143,6 +5160,7 @@ impl ForwardedResponseParts {
         self,
         downstream_mode: DownstreamMode,
         downstream_headers: HeaderMap,
+        attempt_response_metadata: BTreeMap<String, String>,
         extra_response_metadata: BTreeMap<String, String>,
         raw_payloads: RawPayloads,
     ) -> ForwardedBodyObserver {
@@ -5155,7 +5173,7 @@ impl ForwardedResponseParts {
             upstream_status: self.upstream_status,
             upstream_headers: self.upstream_headers.clone(),
             request_metadata: self.attempt_request_metadata,
-            extra_response_metadata: extra_response_metadata.clone(),
+            extra_response_metadata: attempt_response_metadata,
             raw_payloads: raw_payloads.clone(),
         };
         ForwardedBodyObserver {
@@ -5207,10 +5225,13 @@ impl ForwardedResponseParts {
         error.with_observability(self.request_metadata, attempt_record)
     }
 
-    fn into_response_process_error(self, error: ProxyError) -> ProxyError {
+    fn into_response_process_error(
+        self,
+        error: ProxyError,
+        mut extra_response_metadata: BTreeMap<String, String>,
+    ) -> ProxyError {
         let finished_at_unix_ms = unix_time_millis();
         let error_reason = error.to_string();
-        let mut extra_response_metadata = BTreeMap::new();
         extra_response_metadata
             .insert(String::from("response_process_error"), String::from("true"));
         let mut attempt_record = failed_attempt_record(FailedAttemptRecordInput {
@@ -10481,6 +10502,7 @@ fn copy_selected_header_metadata(
     for header in [
         CONTENT_TYPE,
         ACCEPT,
+        ACCEPT_ENCODING,
         AUTHORIZATION,
         HeaderName::from_static("x-api-key"),
         HeaderName::from_static("user-agent"),
@@ -10509,7 +10531,10 @@ fn header_value(value: &HeaderValue) -> String {
         .map_or_else(|_error| HEADER_VALUE_NOT_UTF8.to_owned(), str::to_owned)
 }
 
-fn extract_model_id(body: &Bytes) -> Option<String> {
+fn extract_model_id(method: &Method, uri: &Uri, body: &Bytes) -> Option<String> {
+    if score_adapter::is_score_request(method, uri) {
+        return score_adapter::model_id_from_score_body(body);
+    }
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {

@@ -886,227 +886,7 @@ async fn models_burst_above_old_control_plane_cap_succeeds_and_health_stays_resp
     drop(active_model_responses);
 }
 
-#[tokio::test]
-async fn score_endpoint_passthrough_batched_text1() {
-    let mut fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
-
-    let response = proxy
-        .client
-        .post(format!("{}/v1/score?test=score-batch", proxy.base_url))
-        .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"qwen3-reranker-8b","text_1":["q1","q2"],"text_2":["d1","d2"]}"#)
-        .send()
-        .await
-        .expect("batch score should complete");
-    // Fake upstream has no /v1/score → 404, but path must remain score (not rewritten).
-    let observed = fake
-        .recv_within(STREAM_HEADER_TIMEOUT)
-        .await
-        .expect("batch score should reach upstream as /v1/score");
-    assert_eq!(observed.method, Method::POST);
-    assert_eq!(observed.path_and_query, "/v1/score?test=score-batch");
-    let observed_body: serde_json::Value =
-        serde_json::from_slice(&observed.body).expect("body json");
-    assert_eq!(observed_body["text_1"][0], "q1");
-    assert_eq!(observed_body["text_2"][1], "d2");
-    let _ = response.status();
-}
-
-#[tokio::test]
-async fn score_endpoint_passthrough_non_success_rerank_status() {
-    let mut fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
-
-    let response = proxy
-        .client
-        .post(format!(
-            "{}/v1/score?test=score-upstream-500",
-            proxy.base_url
-        ))
-        .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q","text_2":"d"}"#)
-        .send()
-        .await
-        .expect("score request should complete");
-    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
-    let body = response.text().await.expect("body");
-    assert!(body.contains("upstream boom"), "{body}");
-
-    let observed = fake
-        .recv_within(STREAM_HEADER_TIMEOUT)
-        .await
-        .expect("should forward to rerank");
-    assert!(observed.path_and_query.starts_with("/v1/rerank"));
-}
-
-#[tokio::test]
-async fn score_endpoint_negotiates_identity_encoding() {
-    let mut fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
-
-    let response = proxy
-        .client
-        .post(format!("{}/v1/score?test=score-identity", proxy.base_url))
-        .header(CONTENT_TYPE, "application/json")
-        .header(axum::http::header::ACCEPT_ENCODING, "gzip, deflate")
-        .header("content-md5", "stale-md5")
-        .header("digest", "SHA-256=stale")
-        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q","text_2":"d"}"#)
-        .send()
-        .await
-        .expect("score request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-
-    let observed = fake
-        .recv_within(STREAM_HEADER_TIMEOUT)
-        .await
-        .expect("should reach upstream");
-    assert!(observed.path_and_query.starts_with("/v1/rerank"));
-    let accept_encoding = observed
-        .headers
-        .get(axum::http::header::ACCEPT_ENCODING)
-        .and_then(|v| v.to_str().ok());
-    assert_eq!(accept_encoding, Some("identity"));
-    assert!(observed.headers.get("content-md5").is_none());
-    assert!(observed.headers.get("digest").is_none());
-}
-
-#[tokio::test]
-async fn score_endpoint_adapts_to_rerank_and_records_success() {
-    let mut fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
-
-    let response = proxy
-        .client
-        .post(format!("{}/v1/score?test=score-adapter-ok", proxy.base_url))
-        .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q","text_2":"d"}"#)
-        .send()
-        .await
-        .expect("score request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok()),
-        Some("application/json")
-    );
-    let body: serde_json::Value = response.json().await.expect("score json");
-    assert_eq!(body["object"], "list");
-    assert_eq!(body["data"][0]["object"], "score");
-    assert_eq!(body["data"][0]["index"], 0);
-    assert!(body["data"][0]["score"].as_f64().is_some());
-
-    let observed = fake
-        .recv_within(STREAM_HEADER_TIMEOUT)
-        .await
-        .expect("score should forward as rerank");
-    assert_eq!(observed.method, Method::POST);
-    assert_eq!(observed.path_and_query, "/v1/rerank?test=score-adapter-ok");
-    let observed_body: serde_json::Value =
-        serde_json::from_slice(&observed.body).expect("rerank body json");
-    assert_eq!(observed_body["query"], "q");
-    assert_eq!(observed_body["documents"], serde_json::json!(["d"]));
-    assert_eq!(observed_body["top_n"], 1);
-
-    // Drain EOF so buffered observer finalizes.
-    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
-    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
-    assert_eq!(request_row.status, "succeeded");
-    assert_eq!(request_row.http_status, 200);
-    assert_eq!(attempt_row.status, "succeeded");
-    assert_eq!(attempt_row.http_status, 200);
-    assert_eq!(
-        request_row.response_metadata["response_header_content-type"],
-        "application/json"
-    );
-    assert!(
-        request_row
-            .response_metadata
-            .get("response_header_server")
-            .is_none()
-    );
-    assert!(
-        request_row
-            .response_metadata
-            .get("response_header_x-request-id")
-            .is_none()
-    );
-    assert_eq!(
-        attempt_row.response_metadata["response_header_content-type"],
-        "application/vnd.rerank+json"
-    );
-    assert_eq!(
-        attempt_row.response_metadata["response_header_server"],
-        "fake-rerank"
-    );
-    assert_eq!(
-        attempt_row.response_metadata["response_header_x-request-id"],
-        "rerank-request-123"
-    );
-    let connection = rusqlite::Connection::open(&proxy.sqlite_path).expect("sqlite open");
-    let request_meta: String = connection
-        .query_row("SELECT request_metadata_json FROM requests", [], |row| {
-            row.get(0)
-        })
-        .expect("request metadata");
-    let meta: serde_json::Value = serde_json::from_str(&request_meta).expect("meta json");
-    assert_eq!(meta["score_via_rerank"], "true");
-}
-
-#[tokio::test]
-async fn score_endpoint_rejects_invalid_client_body() {
-    let fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
-
-    let response = proxy
-        .client
-        .post(format!("{}/v1/score", proxy.base_url))
-        .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q"}"#)
-        .send()
-        .await
-        .expect("score request should complete");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-#[tokio::test]
-async fn score_endpoint_fails_closed_on_partial_rerank_results() {
-    let mut fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
-
-    let response = proxy
-        .client
-        .post(format!("{}/v1/score?test=score-partial", proxy.base_url))
-        .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q","text_2":["a","b"]}"#)
-        .send()
-        .await
-        .expect("score request should complete");
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-
-    let observed = fake
-        .recv_within(STREAM_HEADER_TIMEOUT)
-        .await
-        .expect("partial score still reaches upstream");
-    assert!(observed.path_and_query.starts_with("/v1/rerank"));
-
-    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
-    assert_eq!(attempt_row.status, "failed");
-    assert_eq!(attempt_row.http_status, 200);
-    assert_eq!(
-        attempt_row.response_metadata["upstream_response_received"],
-        "true"
-    );
-    assert_eq!(attempt_row.response_metadata["http_status_success"], "true");
-    assert_eq!(
-        attempt_row.response_metadata["response_process_error"],
-        "true"
-    );
-}
-
+mod score_endpoint;
 #[tokio::test]
 async fn enriched_models_observability_records_success_after_body_consumption() {
     let mut fake = FakeUpstream::spawn().await;
@@ -16825,10 +16605,16 @@ fn fake_rerank_response(path_and_query: &str, body: &Bytes) -> Response<Body> {
     }
     let doc_count = serde_json::from_slice::<serde_json::Value>(body)
         .ok()
-        .and_then(|v| {
-            v.get("documents")
-                .and_then(serde_json::Value::as_array)
-                .map(Vec::len)
+        .and_then(|value| {
+            let documents = value.get("documents")?;
+            match documents {
+                serde_json::Value::Array(items) => Some(items.len()),
+                serde_json::Value::Object(object) => object
+                    .get("content")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len),
+                _ => None,
+            }
         })
         .unwrap_or(1)
         .min(8);
