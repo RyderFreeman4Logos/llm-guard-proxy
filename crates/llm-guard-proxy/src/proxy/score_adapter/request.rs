@@ -5,6 +5,21 @@ use std::collections::BTreeMap;
 use axum::body::Bytes;
 use serde_json::{Value, value::RawValue};
 
+#[cfg(test)]
+thread_local! {
+    static PYDANTIC_VALUE_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_pydantic_value_parse_count() {
+    PYDANTIC_VALUE_PARSE_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn pydantic_value_parse_count() -> usize {
+    PYDANTIC_VALUE_PARSE_COUNT.get()
+}
+
 #[derive(Default)]
 struct RawTopNState {
     seen: bool,
@@ -37,6 +52,7 @@ impl<'de> serde::Deserialize<'de> for RawScoreObject<'de> {
             {
                 let mut object = serde_json::Map::new();
                 let mut top_n = RawTopNState::default();
+                let mut mapped_fields = BTreeMap::new();
                 let mut preserved_fields = BTreeMap::new();
                 while let Some(key) = map.next_key::<String>()? {
                     let value = map.next_value::<&'de RawValue>()?;
@@ -47,14 +63,9 @@ impl<'de> serde::Deserialize<'de> for RawScoreObject<'de> {
                         key.as_str(),
                         "text_1" | "text_2" | "query" | "documents" | "model"
                     ) {
-                        let (parsed, needs_preservation) =
-                            parse_pydantic_json_value(value).map_err(serde::de::Error::custom)?;
-                        if needs_preservation {
-                            preserved_fields.insert(key.clone(), value);
-                        } else {
-                            preserved_fields.remove(&key);
-                        }
-                        object.insert(key, parsed);
+                        // Match FastAPI's JSON-object last-key-wins behavior without
+                        // recursively materializing shadowed mapped values.
+                        mapped_fields.insert(key, value);
                     } else {
                         // These fields use the same Pydantic schema after score→rerank
                         // rewriting. Preserve the whole raw value so deeply nested extras
@@ -62,6 +73,14 @@ impl<'de> serde::Deserialize<'de> for RawScoreObject<'de> {
                         object.insert(key.clone(), Value::Null);
                         preserved_fields.insert(key, value);
                     }
+                }
+                for (key, value) in mapped_fields {
+                    let (parsed, needs_preservation) =
+                        parse_pydantic_json_value(value).map_err(serde::de::Error::custom)?;
+                    if needs_preservation {
+                        preserved_fields.insert(key.clone(), value);
+                    }
+                    object.insert(key, parsed);
                 }
                 Ok(RawScoreObject {
                     object,
@@ -268,6 +287,8 @@ impl<'de> serde::Deserialize<'de> for PydanticFallbackValue {
 }
 
 fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
+    #[cfg(test)]
+    PYDANTIC_VALUE_PARSE_COUNT.set(PYDANTIC_VALUE_PARSE_COUNT.get() + 1);
     let lexical = raw.get();
     if contains_non_serde_integer(lexical.as_bytes())
         || contains_pydantic_json_float(lexical.as_bytes())
@@ -507,7 +528,7 @@ pub(super) fn parse_lax_positive_top_n(value: &Value) -> Option<usize> {
 }
 
 pub(super) fn parse_lax_top_n_string(value: &str) -> Option<LaxTopN> {
-    if let Some(parsed) = classify_number_int(value) {
+    if let Some(parsed) = classify_string_number_int(value) {
         return Some(parsed);
     }
 
@@ -552,10 +573,18 @@ pub(super) fn parse_lax_top_n_string(value: &str) -> Option<LaxTopN> {
 
 fn classify_cleaned_number_int(value: &str, is_negative: bool) -> Option<LaxTopN> {
     if is_negative {
-        classify_number_int(&format!("-{value}"))
+        classify_string_number_int(&format!("-{value}"))
     } else {
-        classify_number_int(value)
+        classify_string_number_int(value)
     }
+}
+
+fn classify_string_number_int(value: &str) -> Option<LaxTopN> {
+    const MAX_STRING_INT_CHARACTERS: usize = 4_300;
+    if value.starts_with('-') && value.len() > MAX_STRING_INT_CHARACTERS {
+        return None;
+    }
+    classify_number_int(value)
 }
 
 fn classify_number_int(value: &str) -> Option<LaxTopN> {

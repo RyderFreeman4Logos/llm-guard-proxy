@@ -2514,7 +2514,7 @@ async fn forward_openai_request(
         .await;
     }
     #[cfg(feature = "guard")]
-    apply_pre_request_guard(&config, request_id, &mut prepared_request)
+    apply_pre_request_guard(&config, request_id, &method, &uri, &mut prepared_request)
         .await
         .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry, &config.loop_guard);
@@ -3122,10 +3122,14 @@ fn profile_block_reason_message(reason: &BlockReason) -> String {
     }
 }
 
+#[cfg(any(feature = "guard", feature = "param-override"))]
+fn is_chat_completions_request(method: &Method, uri: &Uri) -> bool {
+    method == Method::POST && uri.path() == "/v1/chat/completions"
+}
+
 #[cfg(feature = "param-override")]
 fn param_override_applies(method: &Method, uri: &Uri, profile: &UpstreamProfileConfig) -> bool {
-    method == Method::POST
-        && uri.path() == "/v1/chat/completions"
+    is_chat_completions_request(method, uri)
         && profile.param_override.enabled
         && param_override_has_fields(&profile.param_override)
 }
@@ -3475,9 +3479,11 @@ fn workflow_alias_for_model(
 async fn apply_pre_request_guard(
     config: &AppConfig,
     request_id: &RequestId,
+    method: &Method,
+    uri: &Uri,
     prepared_request: &mut PreparedOpenAiRequest,
 ) -> Result<(), ProxyError> {
-    if config.guard_workflows.pre_request.is_none() {
+    if !is_chat_completions_request(method, uri) || config.guard_workflows.pre_request.is_none() {
         return Ok(());
     }
     let Some(messages) =

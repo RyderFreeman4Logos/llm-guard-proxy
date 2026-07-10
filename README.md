@@ -93,6 +93,7 @@ Useful overrides:
 ```bash
 LLM_GUARD_PROXY_SMOKE_PORT=19009 just smoke-gb10
 LLM_GUARD_PROXY_SMOKE_MODEL=aeon-ultimate just smoke-gb10
+LLM_GUARD_PROXY_SMOKE_SCORE_MODEL=qwen3-reranker-8b just smoke-gb10
 LLM_GUARD_PROXY_SMOKE_UPSTREAM_BASE_URL=http://gb10:18009/v1 just smoke-gb10
 LLM_GUARD_PROXY_BIN=target/debug/llm-guard-proxy just smoke-gb10
 LLM_GUARD_PROXY_SMOKE_KEEP=1 just smoke-gb10

@@ -141,6 +141,93 @@ temperature = 0.6
     assert_eq!(observed.body.as_ref(), future.as_bytes());
 }
 
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn score_endpoint_ignores_blocking_chat_pre_request_guard() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("score-guard-block");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let script = write_guard_script(&guard_root, "block", guard_result("block", None));
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, true),
+    )
+    .await;
+    let body = r#"{"model":"test-chat","text_1":"q","text_2":"d","messages":[{"role":"user","content":"ignored score extra"}]}"#;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/score?test=score-guard-block",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .header("content-digest", "sha-256=:stale-original-body:")
+        .body(body)
+        .send()
+        .await
+        .expect("score request should bypass chat guard");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response body should drain");
+    let observed = fake.recv_next().await;
+    assert!(observed.path_and_query.starts_with("/v1/rerank"));
+    assert!(observed.headers.get("content-digest").is_none());
+}
+
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn score_endpoint_ignores_replacing_chat_pre_request_guard() {
+    let mut fake = FakeUpstream::spawn().await;
+    let guard_root = unique_test_dir("score-guard-replace");
+    fs::create_dir_all(&guard_root).expect("guard root should be created");
+    let replacement = r#"[{"role":"user","content":"guard replacement"}]"#;
+    let script = write_guard_script(
+        &guard_root,
+        "replace",
+        guard_result("replace", Some(replacement)),
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &guard_workflow_config(Some(&script), None, true),
+    )
+    .await;
+    let body = r#"{"model":"test-chat","left_input":"q","right_input":"d","messages":[{"role":"user","content":"ignored score extra"}]}"#;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/score?test=score-guard-replace",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .header("content-digest", "sha-256=:original-body:")
+        .body(body)
+        .send()
+        .await
+        .expect("future score should bypass chat guard");
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    response.bytes().await.expect("response body should drain");
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/score?test=score-guard-replace"
+    );
+    assert_eq!(observed.body.as_ref(), body.as_bytes());
+    assert_eq!(
+        observed
+            .headers
+            .get("content-digest")
+            .and_then(|value| value.to_str().ok()),
+        Some("sha-256=:original-body:")
+    );
+}
+
 #[tokio::test]
 async fn score_endpoint_passthrough_non_success_rerank_status() {
     let mut fake = FakeUpstream::spawn().await;
@@ -528,6 +615,19 @@ async fn score_endpoint_rejects_invalid_client_body() {
             .expect("score request should complete");
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
+    let oversized_negative_string = format!(
+        r#"{{"query":"q","documents":["d"],"top_n":"-{}"}}"#,
+        "9".repeat(4_300)
+    );
+    let response = proxy
+        .client
+        .post(format!("{}/v1/score", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(oversized_negative_string)
+        .send()
+        .await
+        .expect("oversized negative top_n string should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     assert_no_upstream_request(&mut fake).await;
 }
 

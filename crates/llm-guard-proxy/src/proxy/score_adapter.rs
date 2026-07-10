@@ -365,8 +365,8 @@ pub(crate) fn rerank_response_to_score_response(
                 format!("rerank result entry {entry_i} missing or invalid index for score adapter")
             })?;
         let score = item
-            .get("score")
-            .or_else(|| item.get("relevance_score"))
+            .get("relevance_score")
+            .or_else(|| item.get("score"))
             .or_else(|| item.get("rerank_score"))
             .and_then(Value::as_f64)
             .ok_or_else(|| {

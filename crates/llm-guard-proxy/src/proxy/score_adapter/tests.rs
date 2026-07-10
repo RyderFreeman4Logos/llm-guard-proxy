@@ -410,11 +410,11 @@ fn accepts_pydantic_valid_legacy_top_n_values() {
 #[test]
 fn pydantic_top_n_string_size_limit_applies_after_cleaning() {
     let max_digits = "9".repeat(4_300);
-    let max_negative_digits = "9".repeat(4_300);
+    let max_negative_digits = "9".repeat(4_299);
     assert!(parse_lax_top_n_string(&max_digits).is_some());
     assert!(parse_lax_top_n_string(&format!("9{max_digits}")).is_none());
     assert!(parse_lax_top_n_string(&format!("-{max_negative_digits}")).is_some());
-    assert!(parse_lax_top_n_string(&format!("-9{max_digits}")).is_none());
+    assert!(parse_lax_top_n_string(&format!("-{max_digits}")).is_none());
     assert!(parse_lax_top_n_string(&format!(" {max_digits} ")).is_some());
     assert!(parse_lax_top_n_string(&"0".repeat(4_301)).is_some());
 }
@@ -843,4 +843,43 @@ fn malformed_preferred_results_does_not_fall_back_to_data() {
         br#"{"model":"m","results":{"malformed":true},"data":[{"index":0,"score":0.75}]}"#,
     );
     assert!(rerank_response_to_score_response(&body, Some("m"), None).is_err());
+}
+
+#[test]
+fn shadowed_mapped_duplicate_materializes_only_the_last_occurrence() {
+    let shadowed = format!(
+        "{}{}0.0{}",
+        "[".repeat(190),
+        "0.0,".repeat(240_000),
+        "]".repeat(190)
+    );
+    let body = Bytes::from(format!(
+        r#"{{"text_1":"q","text_2":{shadowed},"text_2":"d"}}"#
+    ));
+    request::reset_pydantic_value_parse_count();
+    let out = score_body_to_rerank_body(&body).expect("last mapped duplicate is valid");
+    assert_eq!(
+        request::pydantic_value_parse_count(),
+        2,
+        "only the last text_1 and text_2 values should be materialized"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap()["documents"],
+        json!(["d"])
+    );
+}
+
+#[test]
+fn canonical_relevance_score_wins_over_compatibility_aliases() {
+    let body = Bytes::from_static(
+        br#"{"model":"m","results":[{"index":0,"relevance_score":0.9,"score":-0.5,"rerank_score":0.1}]}"#,
+    );
+    let out = rerank_response_to_score_response(&body, None, None).expect("convert");
+    let value: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(value["data"][0]["score"], 0.9);
+
+    let malformed = Bytes::from_static(
+        br#"{"model":"m","results":[{"index":0,"relevance_score":"invalid","score":0.5}]}"#,
+    );
+    assert!(rerank_response_to_score_response(&malformed, None, None).is_err());
 }
