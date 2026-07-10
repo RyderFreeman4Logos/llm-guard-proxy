@@ -106,6 +106,136 @@ async fn score_endpoint_passthrough_non_success_rerank_status() {
 }
 
 #[tokio::test]
+async fn score_endpoint_rejects_oversized_body_before_upstream_routing() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let request_body = format!(
+        r#"{{"model":"qwen3-reranker-8b","text_1":"q","text_2":"d","padding":"{}"}}"#,
+        "x".repeat(1024 * 1024)
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/score?test=score-oversized", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(request_body)
+        .send()
+        .await
+        .expect("oversized score request should receive an error response");
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = response.text().await.expect("error body should drain");
+    assert!(
+        body.contains("score request exceeded adapter limit"),
+        "{body}"
+    );
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), fake.recv_next())
+            .await
+            .is_err(),
+        "oversized score request must fail before upstream routing"
+    );
+}
+
+#[tokio::test]
+async fn score_endpoint_profile_limit_mode_caps_body_before_model_routing() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "allowed"
+base_url = "{0}"
+match_models = ["allowed-model"]
+max_in_flight_requests = 2
+
+[[upstreams]]
+name = "forbidden"
+base_url = "{0}"
+match_models = ["qwen3-reranker-8b"]
+max_in_flight_requests = 2
+
+[[listeners]]
+name = "score-restricted"
+bind_host = "127.0.0.1"
+port = 18003
+allowed_upstreams = ["allowed"]
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "score-restricted");
+    let request_body = format!(
+        r#"{{"model":"qwen3-reranker-8b","text_1":"q","text_2":"d","padding":"{}"}}"#,
+        "x".repeat(1024 * 1024)
+    );
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/score?test=score-profile-limit-oversized")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(request_body))
+        .expect("score request should build");
+
+    let response = proxy_handler(State(proxy.state.for_listener(listener)), request).await;
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("error body should drain");
+    assert!(
+        std::str::from_utf8(&body)
+            .expect("error body should be UTF-8")
+            .contains("score request exceeded adapter limit")
+    );
+}
+
+#[tokio::test]
+async fn score_endpoint_body_read_error_preserves_received_response_observability() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/score?test=score-body-read-error",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"qwen3-reranker-8b","text_1":"q","text_2":"d"}"#)
+        .send()
+        .await
+        .expect("score request should receive a proxy error");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    response
+        .bytes()
+        .await
+        .expect("proxy error response body should drain");
+
+    fake.recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("score request should reach rerank upstream");
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+    assert_eq!(attempt_row.status, "failed");
+    assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(
+        attempt_row.response_metadata["upstream_response_received"],
+        "true"
+    );
+    assert_eq!(attempt_row.response_metadata["http_status_success"], "true");
+    assert_eq!(
+        attempt_row.response_metadata["response_header_content-type"],
+        "application/vnd.rerank+json"
+    );
+    assert_eq!(
+        attempt_row.response_metadata["response_header_x-request-id"],
+        "rerank-body-error-123"
+    );
+}
+
+#[tokio::test]
 async fn score_endpoint_negotiates_identity_encoding() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;

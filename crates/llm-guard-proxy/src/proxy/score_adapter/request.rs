@@ -142,12 +142,7 @@ fn normalize_legacy_top_n_from_raw(body: &Bytes, value: &mut Value) -> Result<()
         && !object.contains_key("text_2")
         && object.contains_key("query")
         && object.contains_key("documents");
-    let needs_raw = object
-        .get("top_n")
-        .and_then(Value::as_number)
-        .and_then(serde_json::Number::as_f64)
-        .is_some_and(|value| value <= I64_MIN_AS_F64 || value >= I64_MAX_AS_F64);
-    if !is_legacy || !needs_raw {
+    if !is_legacy || !object.contains_key("top_n") {
         return Ok(());
     }
 
@@ -186,7 +181,7 @@ fn parse_score_value_from_raw<'a>(
     }
 
     if raw_object.top_n.seen {
-        let top_n = if is_canonical {
+        let top_n = if is_canonical || is_future {
             Value::Null
         } else {
             raw_object
@@ -328,7 +323,10 @@ fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
             if is_integer_token && classify_number_int(lexical).is_some() {
                 return Ok((Value::from(0), true));
             }
-            if is_pydantic_nonfinite_float(lexical) {
+            if let Some(value) = parse_pydantic_json_float(lexical) {
+                if value.is_finite() {
+                    return Ok((Value::from(value), false));
+                }
                 return Ok((Value::from(0), true));
             }
             if !lexical.starts_with(['{', '[']) {
@@ -412,8 +410,7 @@ fn parse_lax_top_n_raw(raw: &RawValue) -> Option<LaxTopN> {
             .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'-') =>
         {
             if lexical.contains(['.', 'e', 'E']) {
-                lexical
-                    .parse::<f64>()
+                lexical_core::parse::<f64>(lexical.as_bytes())
                     .ok()
                     .and_then(classify_lax_integral_float)
             } else {
@@ -431,16 +428,17 @@ fn lax_top_n_representative(top_n: LaxTopN) -> Value {
     }
 }
 
-fn is_pydantic_nonfinite_float(lexical: &str) -> bool {
+fn parse_pydantic_json_float(lexical: &str) -> Option<f64> {
     let starts_like_json_number = lexical
         .as_bytes()
         .first()
         .is_some_and(|byte| *byte == b'-' || byte.is_ascii_digit());
-    starts_like_json_number
+    (starts_like_json_number
         && lexical
             .bytes()
-            .any(|byte| matches!(byte, b'.' | b'e' | b'E'))
-        && lexical.parse::<f64>().is_ok_and(|value| !value.is_finite())
+            .any(|byte| matches!(byte, b'.' | b'e' | b'E')))
+    .then(|| lexical_core::parse::<f64>(lexical.as_bytes()).ok())
+    .flatten()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -556,13 +554,13 @@ fn classify_cleaned_number_int(value: &str, is_negative: bool) -> Option<LaxTopN
 }
 
 fn classify_number_int(value: &str) -> Option<LaxTopN> {
-    const MAX_NUMBER_INT_DIGITS: usize = 4_300;
+    const MAX_NUMBER_INT_CHARACTERS: usize = 4_300;
+    if value.len() > MAX_NUMBER_INT_CHARACTERS {
+        return None;
+    }
     let (is_negative, magnitude) = value
         .strip_prefix('-')
         .map_or((false, value), |magnitude| (true, magnitude));
-    if magnitude.len() > MAX_NUMBER_INT_DIGITS {
-        return None;
-    }
     if magnitude.is_empty()
         || !magnitude.bytes().all(|byte| byte.is_ascii_digit())
         || (magnitude.len() > 1 && magnitude.starts_with('0'))

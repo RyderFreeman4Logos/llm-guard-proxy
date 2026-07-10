@@ -16591,6 +16591,28 @@ fn fake_upstream_endpoint_response(
 }
 
 fn fake_rerank_response(path_and_query: &str, body: &Bytes) -> Response<Body> {
+    if path_and_query.contains("test=score-body-read-error") {
+        let stream = futures_util::stream::once(async {
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{"))
+        })
+        .chain(futures_util::stream::once(async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Err::<Bytes, std::io::Error>(std::io::Error::other(
+                "synthetic rerank body read failure",
+            ))
+        }));
+        let mut response = Response::new(Body::from_stream(stream));
+        *response.status_mut() = StatusCode::OK;
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/vnd.rerank+json"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-request-id"),
+            HeaderValue::from_static("rerank-body-error-123"),
+        );
+        return response;
+    }
     if path_and_query.contains("test=score-upstream-500") {
         let mut response = json_response("rerank-error", r#"{"error":"upstream boom"}"#.to_owned());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;

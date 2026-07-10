@@ -18,6 +18,9 @@ use serde_json::{Value, json, value::RawValue};
 
 mod request;
 
+/// Bound score parsing amplification before model extraction or shape classification.
+pub(crate) const MAX_SCORE_BODY_BYTES: usize = 1024 * 1024;
+
 pub(crate) use request::model_id_from_score_body;
 #[cfg(test)]
 use request::{contains_non_serde_integer, parse_lax_top_n_string};
@@ -306,13 +309,14 @@ pub(crate) fn rerank_response_to_score_response(
     let value: Value =
         serde_json::from_slice(body).map_err(|error| format!("invalid rerank JSON: {error}"))?;
 
-    let items = value
-        .get("results")
-        .and_then(Value::as_array)
-        .or_else(|| value.get("data").and_then(Value::as_array))
-        .ok_or_else(|| {
+    let items = match value.get("results") {
+        Some(results) => results.as_array().ok_or_else(|| {
+            String::from("rerank response results must be an array for score adapter")
+        })?,
+        None => value.get("data").and_then(Value::as_array).ok_or_else(|| {
             String::from("rerank response missing results/data scores for score adapter")
-        })?;
+        })?,
+    };
     if items.is_empty() {
         return Err(String::from(
             "rerank response results/data is empty for score adapter",

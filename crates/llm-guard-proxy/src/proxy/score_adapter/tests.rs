@@ -395,10 +395,11 @@ fn accepts_pydantic_valid_legacy_top_n_values() {
 #[test]
 fn pydantic_top_n_string_size_limit_applies_after_cleaning() {
     let max_digits = "9".repeat(4_300);
+    let max_negative_digits = "9".repeat(4_299);
     assert!(parse_lax_top_n_string(&max_digits).is_some());
     assert!(parse_lax_top_n_string(&format!("9{max_digits}")).is_none());
-    assert!(parse_lax_top_n_string(&format!("-{max_digits}")).is_some());
-    assert!(parse_lax_top_n_string(&format!("-9{max_digits}")).is_none());
+    assert!(parse_lax_top_n_string(&format!("-{max_negative_digits}")).is_some());
+    assert!(parse_lax_top_n_string(&format!("-{max_digits}")).is_none());
     assert!(parse_lax_top_n_string(&format!(" {max_digits} ")).is_some());
     assert!(parse_lax_top_n_string(&"0".repeat(4_301)).is_some());
 }
@@ -409,7 +410,7 @@ fn pydantic_arbitrary_precision_json_integer_top_n_is_preserved() {
         String::from("18446744073709551616"),
         String::from("-9223372036854775809"),
         "9".repeat(1_000),
-        format!("-{}", "9".repeat(4_300)),
+        format!("-{}", "9".repeat(4_299)),
     ] {
         let body = Bytes::from(format!(
             r#"{{"query":"q","documents":["a","b"],"top_n":{top_n}}}"#
@@ -420,7 +421,7 @@ fn pydantic_arbitrary_precision_json_integer_top_n_is_preserved() {
         );
     }
 
-    for oversized in ["9".repeat(4_301), format!("-{}", "9".repeat(4_301))] {
+    for oversized in ["9".repeat(4_301), format!("-{}", "9".repeat(4_300))] {
         let body = Bytes::from(format!(
             r#"{{"query":"q","documents":["a","b"],"top_n":{oversized}}}"#
         ));
@@ -624,7 +625,7 @@ fn ignores_caller_top_n_extra_for_canonical_score() {
 
 #[test]
 fn ignores_arbitrary_precision_top_n_extra_for_canonical_score() {
-    for top_n in ["9".repeat(1_000), format!("-{}", "9".repeat(4_300))] {
+    for top_n in ["9".repeat(1_000), format!("-{}", "9".repeat(4_299))] {
         let body = Bytes::from(format!(
             r#"{{"model":"m","text_1":"q","text_2":["a","b"],"top_n":{top_n}}}"#
         ));
@@ -773,4 +774,40 @@ fn serde_json_numeric_lexemes_remain_normalized_for_shared_fingerprints() {
     assert!(values.windows(2).all(|pair| pair[0] == pair[1]));
     let serialized: Vec<String> = values.iter().map(Value::to_string).collect();
     assert!(serialized.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+#[test]
+fn legacy_top_n_float_rounding_matches_pydantic_json() {
+    let rejected =
+        Bytes::from_static(br#"{"query":"q","documents":["d"],"top_n":-3329018154707461.354}"#);
+    assert!(can_adapt_score_body_to_rerank(&rejected).is_err());
+
+    let accepted = Bytes::from_static(
+        br#"{"query":"q","documents":["d"],"top_n":448842541752324.9858557669766563163561207}"#,
+    );
+    assert!(can_adapt_score_body_to_rerank(&accepted).unwrap());
+}
+
+#[test]
+fn accepts_pydantic_finite_float_boundary_in_canonical_extra() {
+    let body =
+        Bytes::from_static(br#"{"text_1":"q","text_2":"d","future":1.7976931348623158e308}"#);
+    assert!(can_adapt_score_body_to_rerank(&body).unwrap());
+    let out = score_body_to_rerank_body(&body).expect("Pydantic accepts finite f64 boundary");
+    let value: Value = serde_json::from_slice(&out).expect("adapted body is finite JSON");
+    assert_eq!(value["future"].as_f64(), Some(f64::MAX));
+}
+
+#[test]
+fn future_shape_does_not_apply_legacy_top_n_validation() {
+    let body = Bytes::from_static(br#"{"model":"m","queries":["q"],"items":["d"],"top_n":1e400}"#);
+    assert!(!can_adapt_score_body_to_rerank(&body).expect("future shape must remain opaque"));
+}
+
+#[test]
+fn malformed_preferred_results_does_not_fall_back_to_data() {
+    let body = Bytes::from_static(
+        br#"{"model":"m","results":{"malformed":true},"data":[{"index":0,"score":0.75}]}"#,
+    );
+    assert!(rerank_response_to_score_response(&body, Some("m"), None).is_err());
 }

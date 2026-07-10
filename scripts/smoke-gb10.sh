@@ -8,6 +8,7 @@ UPSTREAM_BASE_URL="${LLM_GUARD_PROXY_SMOKE_UPSTREAM_BASE_URL:-http://gb10:18009/
 BIND_HOST="${LLM_GUARD_PROXY_SMOKE_HOST:-127.0.0.1}"
 PORT="${LLM_GUARD_PROXY_SMOKE_PORT:-}"
 MODEL="${LLM_GUARD_PROXY_SMOKE_MODEL:-aeon-ultimate}"
+SCORE_MODEL="${LLM_GUARD_PROXY_SMOKE_SCORE_MODEL:-qwen3-reranker-8b}"
 REQUEST_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_REQUEST_TIMEOUT_SECS:-120}"
 CONNECT_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_CONNECT_TIMEOUT_SECS:-5}"
 READY_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_READY_TIMEOUT_SECS:-120}"
@@ -217,14 +218,16 @@ write_payloads() {
     local completions_payload="$3"
     local embeddings_payload="$4"
     local rerank_payload="$5"
+    local score_payload="$6"
 
-    python3 - "${MODEL}" "${chat_payload}" "${stream_payload}" \
-        "${completions_payload}" "${embeddings_payload}" "${rerank_payload}" <<'PY'
+    python3 - "${MODEL}" "${SCORE_MODEL}" "${chat_payload}" "${stream_payload}" \
+        "${completions_payload}" "${embeddings_payload}" "${rerank_payload}" \
+        "${score_payload}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-model, chat_path, stream_path, completions_path, embeddings_path, rerank_path = sys.argv[1:]
+model, score_model, chat_path, stream_path, completions_path, embeddings_path, rerank_path, score_path = sys.argv[1:]
 
 chat = {
     "model": model,
@@ -247,6 +250,7 @@ completions = {
 }
 embeddings = {"model": model, "input": "ping"}
 rerank = {"model": model, "query": "ping", "documents": ["pong"]}
+score = {"model": score_model, "text_1": "ping", "text_2": "pong"}
 
 for path, payload in [
     (chat_path, chat),
@@ -254,6 +258,7 @@ for path, payload in [
     (completions_path, completions),
     (embeddings_path, embeddings),
     (rerank_path, rerank),
+    (score_path, score),
 ]:
     Path(path).write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 PY
@@ -428,6 +433,74 @@ except Exception as error:
     raise SystemExit(f"{sys.argv[2]} returned 2xx with invalid JSON: {error}") from error
 PY
     fi
+}
+
+validate_score_response() {
+    python3 - "$1" <<'PY'
+import json
+import math
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+if not isinstance(payload, dict):
+    raise SystemExit("/v1/score response is not a JSON object")
+if not isinstance(payload.get("id"), str) or not payload["id"]:
+    raise SystemExit("/v1/score response id must be a non-empty string")
+if payload.get("object") != "list":
+    raise SystemExit("/v1/score response object must be 'list'")
+if isinstance(payload.get("created"), bool) or not isinstance(payload.get("created"), int):
+    raise SystemExit("/v1/score response created must be an integer")
+if not isinstance(payload.get("model"), str) or not payload["model"]:
+    raise SystemExit("/v1/score response model must be a non-empty string")
+data = payload.get("data")
+if not isinstance(data, list) or len(data) != 1:
+    raise SystemExit("/v1/score response data must contain exactly one score")
+entry = data[0]
+if not isinstance(entry, dict) or entry.get("object") != "score":
+    raise SystemExit("/v1/score data entry must be a score object")
+index = entry.get("index")
+if isinstance(index, bool) or not isinstance(index, int) or index != 0:
+    raise SystemExit("/v1/score data entry index must be integer 0")
+score = entry.get("score")
+if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+    raise SystemExit("/v1/score data entry score must be finite")
+usage = payload.get("usage")
+if not isinstance(usage, dict):
+    raise SystemExit("/v1/score response usage must be an object")
+for field in ("prompt_tokens", "total_tokens"):
+    value = usage.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SystemExit(f"/v1/score response usage.{field} must be a non-negative integer")
+completion_tokens = usage.get("completion_tokens", "missing")
+if completion_tokens == "missing" or (
+    completion_tokens is not None
+    and (
+        isinstance(completion_tokens, bool)
+        or not isinstance(completion_tokens, int)
+        or completion_tokens < 0
+    )
+):
+    raise SystemExit("/v1/score response usage.completion_tokens must be null or a non-negative integer")
+if "prompt_tokens_details" not in usage or not (
+    usage["prompt_tokens_details"] is None
+    or isinstance(usage["prompt_tokens_details"], dict)
+):
+    raise SystemExit("/v1/score response usage.prompt_tokens_details must be null or an object")
+prompt_tokens_details = usage["prompt_tokens_details"]
+if isinstance(prompt_tokens_details, dict) and "cached_tokens" in prompt_tokens_details:
+    cached_tokens = prompt_tokens_details["cached_tokens"]
+    if cached_tokens is not None and (
+        isinstance(cached_tokens, bool)
+        or not isinstance(cached_tokens, int)
+        or cached_tokens < 0
+    ):
+        raise SystemExit(
+            "/v1/score response usage.prompt_tokens_details.cached_tokens "
+            "must be null or a non-negative integer"
+        )
+print(f"scores={len(data)} model={payload['model']}")
+PY
 }
 
 validate_stream_response() {
@@ -645,8 +718,9 @@ stream_payload="${run_dir}/chat-stream.json"
 completions_payload="${run_dir}/completions.json"
 embeddings_payload="${run_dir}/embeddings.json"
 rerank_payload="${run_dir}/rerank.json"
+score_payload="${run_dir}/score.json"
 write_payloads "${chat_payload}" "${stream_payload}" "${completions_payload}" \
-    "${embeddings_payload}" "${rerank_payload}"
+    "${embeddings_payload}" "${rerank_payload}" "${score_payload}"
 
 forwarded_calls=0
 
@@ -697,6 +771,14 @@ do
             "${endpoint}" "${status}"
     fi
 done
+
+score_body="${run_dir}/score.body.json"
+score_headers="${run_dir}/score.headers"
+score_status="$(http_request POST "${base_url}/v1/score" "${score_payload}" "${score_body}" "${score_headers}" "score")"
+require_http_status "POST /v1/score" "${score_status}" "200"
+score_summary="$(validate_score_response "${score_body}")"
+forwarded_calls=$((forwarded_calls + 1))
+printf 'smoke-gb10: endpoint=/v1/score status=%s %s\n' "${score_status}" "${score_summary}"
 
 dot_body="${run_dir}/dot-segment.body.json"
 dot_headers="${run_dir}/dot-segment.headers"

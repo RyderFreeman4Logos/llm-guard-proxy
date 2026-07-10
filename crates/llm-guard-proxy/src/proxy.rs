@@ -2651,6 +2651,15 @@ async fn read_body_and_admit_generation(
         request.shielding_enabled_hint,
     );
     add_listener_metadata(&mut body_read_request_metadata, &state.listener);
+    if score_adapter::is_score_request(request.method, request.uri)
+        && body.len() > score_adapter::MAX_SCORE_BODY_BYTES
+    {
+        return Err(ProxyError::request_body(format!(
+            "score request exceeded adapter limit of {} bytes",
+            score_adapter::MAX_SCORE_BODY_BYTES
+        ))
+        .with_request_metadata(body_read_request_metadata));
+    }
     let config = state.config.snapshot().map_err(|error| {
         ProxyError::config_snapshot(error.to_string())
             .with_request_metadata(body_read_request_metadata.clone())
@@ -3836,7 +3845,15 @@ async fn rewrite_score_response_from_upstream(
     .await
     {
         Ok(body) => body,
-        Err(error) => return Err(response_parts.into_body_read_error(error)),
+        Err(error) => {
+            return Err(response_parts.into_response_process_error(
+                error,
+                BTreeMap::from([(
+                    String::from("response_body_read_error"),
+                    String::from("true"),
+                )]),
+            ));
+        }
     };
     let upstream_body_bytes = body.len();
     let (body, response_headers) = if upstream_status.is_success() {

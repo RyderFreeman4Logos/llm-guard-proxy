@@ -17,6 +17,7 @@ guard = ["llm-guard-proxy-core/guard"]
 axum = "0.8"
 bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+lexical-core = { version = "1", default-features = false, features = ["parse-floats"] }
 llm-guard-proxy-core = { path = "../llm-guard-proxy-core" }
 reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "stream", "json"] }
 serde = { version = "1", features = ["derive"] }
