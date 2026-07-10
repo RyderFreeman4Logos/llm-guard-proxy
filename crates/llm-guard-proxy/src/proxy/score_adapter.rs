@@ -13,8 +13,7 @@ use axum::{
     body::Bytes,
     http::{Method, Uri},
 };
-use serde::{Serializer as _, ser::SerializeMap};
-use serde_json::{Value, json, value::RawValue};
+use serde_json::{Value, json};
 
 mod request;
 
@@ -286,7 +285,7 @@ pub(crate) fn score_body_to_rerank_body(body: &Bytes) -> Result<Bytes, String> {
         }
         out.insert(key.clone(), value.clone());
         if let Some(raw) = parsed.preserved_fields.get(key) {
-            preserved_passthrough_fields.insert(key.clone(), *raw);
+            preserved_passthrough_fields.insert(key.clone(), raw.clone());
         }
     }
     if let Some(model) = model {
@@ -304,23 +303,29 @@ pub(crate) fn score_body_to_rerank_body(body: &Bytes) -> Result<Bytes, String> {
 
 fn serialize_rerank_object(
     object: &serde_json::Map<String, Value>,
-    preserved_fields: &BTreeMap<String, &RawValue>,
+    preserved_fields: &BTreeMap<String, String>,
 ) -> Result<Bytes, String> {
+    // Manual object encoding so FastAPI-compatible nonfinite extras (NaN/Infinity)
+    // can be forwarded as their original lexemes. `RawValue::from_string` rejects them.
     let mut output = Vec::new();
-    let mut serializer = serde_json::Serializer::new(&mut output);
-    let mut map = serializer
-        .serialize_map(Some(object.len()))
-        .map_err(|error| format!("serialize rerank body failed: {error}"))?;
+    output.push(b'{');
+    let mut first = true;
     for (key, value) in object {
-        if let Some(raw) = preserved_fields.get(key) {
-            map.serialize_entry(key, *raw)
-        } else {
-            map.serialize_entry(key, value)
+        if !first {
+            output.push(b',');
         }
-        .map_err(|error| format!("serialize rerank body failed: {error}"))?;
+        first = false;
+        serde_json::to_writer(&mut output, key)
+            .map_err(|error| format!("serialize rerank body failed: {error}"))?;
+        output.push(b':');
+        if let Some(raw) = preserved_fields.get(key) {
+            output.extend_from_slice(raw.as_bytes());
+        } else {
+            serde_json::to_writer(&mut output, value)
+                .map_err(|error| format!("serialize rerank body failed: {error}"))?;
+        }
     }
-    map.end()
-        .map_err(|error| format!("serialize rerank body failed: {error}"))?;
+    output.push(b'}');
     Ok(Bytes::from(output))
 }
 

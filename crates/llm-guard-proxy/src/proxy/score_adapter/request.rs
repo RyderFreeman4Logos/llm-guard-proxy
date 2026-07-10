@@ -26,13 +26,13 @@ struct RawTopNState {
     last_lax: Option<LaxTopN>,
 }
 
-struct RawScoreObject<'a> {
+struct RawScoreObject {
     object: serde_json::Map<String, Value>,
     top_n: RawTopNState,
-    preserved_fields: BTreeMap<String, &'a RawValue>,
+    preserved_fields: BTreeMap<String, String>,
 }
 
-impl<'de> serde::Deserialize<'de> for RawScoreObject<'de> {
+impl<'de> serde::Deserialize<'de> for RawScoreObject {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
@@ -40,7 +40,7 @@ impl<'de> serde::Deserialize<'de> for RawScoreObject<'de> {
         struct RawScoreObjectVisitor;
 
         impl<'de> serde::de::Visitor<'de> for RawScoreObjectVisitor {
-            type Value = RawScoreObject<'de>;
+            type Value = RawScoreObject;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("a JSON object")
@@ -65,20 +65,27 @@ impl<'de> serde::Deserialize<'de> for RawScoreObject<'de> {
                     ) {
                         // Match FastAPI's JSON-object last-key-wins behavior without
                         // recursively materializing shadowed mapped values.
-                        mapped_fields.insert(key, value);
+                        mapped_fields.insert(key, value.get().to_owned());
                     } else {
                         // These fields use the same Pydantic schema after score→rerank
                         // rewriting. Preserve the whole raw value so deeply nested extras
                         // stay O(body size) and the target performs the canonical coercion.
                         object.insert(key.clone(), Value::Null);
-                        preserved_fields.insert(key, value);
+                        preserved_fields.insert(key, value.get().to_owned());
                     }
                 }
-                for (key, value) in mapped_fields {
+                let is_canonical =
+                    mapped_fields.contains_key("text_1") || mapped_fields.contains_key("text_2");
+                for (key, lexical) in mapped_fields {
+                    // Canonical score fields take precedence; legacy query/documents
+                    // aliases are discarded and must not be recursively materialized.
+                    if is_canonical && matches!(key.as_str(), "query" | "documents") {
+                        continue;
+                    }
                     let (parsed, needs_preservation) =
-                        parse_pydantic_json_value(value).map_err(serde::de::Error::custom)?;
+                        parse_pydantic_json_lexical(&lexical).map_err(serde::de::Error::custom)?;
                     if needs_preservation {
-                        preserved_fields.insert(key.clone(), value);
+                        preserved_fields.insert(key.clone(), lexical);
                     }
                     object.insert(key, parsed);
                 }
@@ -132,18 +139,20 @@ impl<'de> serde::Deserialize<'de> for RawTopNOnly {
     }
 }
 
-pub(super) struct ParsedScoreValue<'a> {
+pub(super) struct ParsedScoreValue {
     pub(super) value: Value,
-    pub(super) preserved_fields: BTreeMap<String, &'a RawValue>,
+    pub(super) preserved_fields: BTreeMap<String, String>,
 }
 
-pub(super) fn parse_score_value(body: &Bytes) -> Result<ParsedScoreValue<'_>, String> {
+pub(super) fn parse_score_value(body: &Bytes) -> Result<ParsedScoreValue, String> {
     if contains_pydantic_invalid_integer(body) {
         return Err(String::from("invalid score JSON integer"));
     }
     match serde_json::from_slice::<Value>(body) {
         Ok(mut value)
-            if !contains_non_serde_integer(body) && !contains_pydantic_json_float(body) =>
+            if !contains_non_serde_integer(body)
+                && !contains_pydantic_json_float(body)
+                && !contains_json_nonfinite(body) =>
         {
             normalize_legacy_top_n_from_raw(body, &mut value)?;
             Ok(ParsedScoreValue {
@@ -188,18 +197,37 @@ fn normalize_legacy_top_n_from_raw(body: &Bytes, value: &mut Value) -> Result<()
     Ok(())
 }
 
-fn parse_score_value_from_raw<'a>(
-    body: &'a Bytes,
+fn parse_score_value_from_raw(
+    body: &Bytes,
     default_error: Option<&serde_json::Error>,
-) -> Result<ParsedScoreValue<'a>, String> {
+) -> Result<ParsedScoreValue, String> {
     let default_message = || {
         default_error.map_or_else(
             || String::from("invalid score JSON"),
             |error| format!("invalid score JSON: {error}"),
         )
     };
-    let mut raw_object: RawScoreObject<'_> =
-        serde_json::from_slice(body).map_err(|_| default_message())?;
+    let original = std::str::from_utf8(body).map_err(|_| default_message())?;
+    let sanitized_owned;
+    let parse_input = if contains_json_nonfinite(body) {
+        sanitized_owned = sanitize_json_nonfinite(original);
+        sanitized_owned.as_str()
+    } else {
+        original
+    };
+    let mut raw_object: RawScoreObject =
+        serde_json::from_str(parse_input).map_err(|_| default_message())?;
+    if !std::ptr::eq(parse_input, original) {
+        // Length-preserving nonfinite sanitization keeps structure offsets aligned, but
+        // preserved extras must round-trip the original FastAPI/Pydantic lexemes.
+        if let Ok(originals) = top_level_field_raws(original) {
+            for (key, raw) in &mut raw_object.preserved_fields {
+                if let Some(orig) = originals.get(key) {
+                    raw.clone_from(orig);
+                }
+            }
+        }
+    }
     let is_canonical =
         raw_object.object.contains_key("text_1") || raw_object.object.contains_key("text_2");
     let is_legacy = !is_canonical
@@ -253,7 +281,7 @@ impl<'de> serde::Deserialize<'de> for PydanticFallbackValue {
                 while let Some(key) = map.next_key::<String>()? {
                     let raw = map.next_value::<&'de RawValue>()?;
                     let (value, child_changed) =
-                        parse_pydantic_json_value(raw).map_err(serde::de::Error::custom)?;
+                        parse_pydantic_json_lexical(raw.get()).map_err(serde::de::Error::custom)?;
                     changed |= child_changed;
                     object.insert(key, value);
                 }
@@ -271,7 +299,7 @@ impl<'de> serde::Deserialize<'de> for PydanticFallbackValue {
                 let mut changed = false;
                 while let Some(raw) = sequence.next_element::<&'de RawValue>()? {
                     let (value, child_changed) =
-                        parse_pydantic_json_value(raw).map_err(serde::de::Error::custom)?;
+                        parse_pydantic_json_lexical(raw.get()).map_err(serde::de::Error::custom)?;
                     changed |= child_changed;
                     values.push(value);
                 }
@@ -286,10 +314,9 @@ impl<'de> serde::Deserialize<'de> for PydanticFallbackValue {
     }
 }
 
-fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
+fn parse_pydantic_json_lexical(lexical: &str) -> Result<(Value, bool), String> {
     #[cfg(test)]
     PYDANTIC_VALUE_PARSE_COUNT.set(PYDANTIC_VALUE_PARSE_COUNT.get() + 1);
-    let lexical = raw.get();
     if contains_non_serde_integer(lexical.as_bytes())
         || contains_pydantic_json_float(lexical.as_bytes())
     {
@@ -319,7 +346,6 @@ fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
     match serde_json::from_str::<Value>(lexical) {
         Ok(value) => Ok((value, false)),
         Err(default_error) => {
-            let lexical = raw.get();
             let is_integer_token = lexical
                 .as_bytes()
                 .first()
@@ -334,6 +360,9 @@ fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
                 }
                 return Ok((Value::from(0), true));
             }
+            if matches!(lexical, "NaN" | "Infinity" | "-Infinity") {
+                return Ok((Value::from(0), true));
+            }
             if !lexical.starts_with(['{', '[']) {
                 return Err(format!("invalid score JSON: {default_error}"));
             }
@@ -343,6 +372,270 @@ fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
             Ok((parsed.value, parsed.changed))
         }
     }
+}
+
+fn contains_json_nonfinite(json: &[u8]) -> bool {
+    find_json_nonfinite(json).is_some()
+}
+
+fn find_json_nonfinite(json: &[u8]) -> Option<(usize, &'static str)> {
+    let mut index = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < json.len() {
+        let byte = json[index];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if json[index..].starts_with(b"-Infinity")
+            && is_json_token_boundary(json, index.wrapping_sub(1))
+            && is_json_token_boundary(json, index + 9)
+        {
+            return Some((index, "-Infinity"));
+        }
+        if json[index..].starts_with(b"Infinity")
+            && is_json_token_boundary(json, index.wrapping_sub(1))
+            && is_json_token_boundary(json, index + 8)
+        {
+            return Some((index, "Infinity"));
+        }
+        if json[index..].starts_with(b"NaN")
+            && is_json_token_boundary(json, index.wrapping_sub(1))
+            && is_json_token_boundary(json, index + 3)
+        {
+            return Some((index, "NaN"));
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_json_token_boundary(json: &[u8], index: usize) -> bool {
+    if index == usize::MAX {
+        return true;
+    }
+    match json.get(index) {
+        None => true,
+        Some(byte) => !byte.is_ascii_alphanumeric() && *byte != b'_',
+    }
+}
+
+fn sanitize_json_nonfinite(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0_usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if in_string {
+            out.push(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if byte == b'"' {
+            out.push(byte);
+            in_string = true;
+            index += 1;
+            continue;
+        }
+        if bytes[index..].starts_with(b"-Infinity")
+            && is_json_token_boundary(bytes, index.wrapping_sub(1))
+            && is_json_token_boundary(bytes, index + 9)
+        {
+            out.extend_from_slice(b"-0.000000");
+            index += 9;
+            continue;
+        }
+        if bytes[index..].starts_with(b"Infinity")
+            && is_json_token_boundary(bytes, index.wrapping_sub(1))
+            && is_json_token_boundary(bytes, index + 8)
+        {
+            out.extend_from_slice(b"0.000000");
+            index += 8;
+            continue;
+        }
+        if bytes[index..].starts_with(b"NaN")
+            && is_json_token_boundary(bytes, index.wrapping_sub(1))
+            && is_json_token_boundary(bytes, index + 3)
+        {
+            out.extend_from_slice(b"0.0");
+            index += 3;
+            continue;
+        }
+        out.push(byte);
+        index += 1;
+    }
+    String::from_utf8(out).unwrap_or_else(|_| input.to_owned())
+}
+
+fn top_level_field_raws(json: &str) -> Result<BTreeMap<String, String>, String> {
+    let bytes = json.as_bytes();
+    let mut index = skip_ws(bytes, 0);
+    if bytes.get(index) != Some(&b'{') {
+        return Err(String::from("score body must be a JSON object"));
+    }
+    index += 1;
+    let mut fields = BTreeMap::new();
+    loop {
+        index = skip_ws(bytes, index);
+        match bytes.get(index) {
+            Some(&b'}') => break,
+            Some(&b',') => {
+                index += 1;
+                continue;
+            }
+            Some(&b'"') => {}
+            _ => return Err(String::from("invalid score JSON object key")),
+        }
+        let (key, after_key) = parse_json_string(json, index)?;
+        index = skip_ws(bytes, after_key);
+        if bytes.get(index) != Some(&b':') {
+            return Err(String::from("invalid score JSON object entry"));
+        }
+        index = skip_ws(bytes, index + 1);
+        let (raw, after_value) = capture_json_value(json, index)?;
+        fields.insert(key, raw);
+        index = after_value;
+    }
+    Ok(fields)
+}
+
+fn skip_ws(bytes: &[u8], mut index: usize) -> usize {
+    while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\n' | b'\r')) {
+        index += 1;
+    }
+    index
+}
+
+fn parse_json_string(json: &str, start: usize) -> Result<(String, usize), String> {
+    let bytes = json.as_bytes();
+    if bytes.get(start) != Some(&b'"') {
+        return Err(String::from("invalid score JSON string"));
+    }
+    let mut index = start + 1;
+    let mut escaped = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            let raw = &json[start..=index];
+            let value: String = serde_json::from_str(raw)
+                .map_err(|error| format!("invalid score JSON string: {error}"))?;
+            return Ok((value, index + 1));
+        }
+        index += 1;
+    }
+    Err(String::from("unterminated score JSON string"))
+}
+
+fn capture_json_value(json: &str, start: usize) -> Result<(String, usize), String> {
+    let bytes = json.as_bytes();
+    let Some(first) = bytes.get(start).copied() else {
+        return Err(String::from("invalid score JSON value"));
+    };
+    if first == b'"' {
+        let mut index = start + 1;
+        let mut escaped = false;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                return Ok((json[start..=index].to_owned(), index + 1));
+            }
+            index += 1;
+        }
+        return Err(String::from("unterminated score JSON string value"));
+    }
+    if first == b'{' || first == b'[' {
+        let opening = first;
+        let closing = if first == b'{' { b'}' } else { b']' };
+        let mut depth = 1_usize;
+        let mut index = start + 1;
+        let mut in_string = false;
+        let mut escaped = false;
+        while index < bytes.len() {
+            let byte = bytes[index];
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                index += 1;
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b if b == opening => depth += 1,
+                b if b == closing => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Ok((json[start..=index].to_owned(), index + 1));
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        return Err(String::from("unterminated score JSON container"));
+    }
+    if json[start..].starts_with("-Infinity") {
+        return Ok((String::from("-Infinity"), start + 9));
+    }
+    if json[start..].starts_with("Infinity") {
+        return Ok((String::from("Infinity"), start + 8));
+    }
+    if json[start..].starts_with("NaN") {
+        return Ok((String::from("NaN"), start + 3));
+    }
+    if json[start..].starts_with("null") {
+        return Ok((String::from("null"), start + 4));
+    }
+    if json[start..].starts_with("true") {
+        return Ok((String::from("true"), start + 4));
+    }
+    if json[start..].starts_with("false") {
+        return Ok((String::from("false"), start + 5));
+    }
+    if first == b'-' || first.is_ascii_digit() {
+        let mut index = start + 1;
+        while index < bytes.len()
+            && matches!(bytes[index], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+        {
+            index += 1;
+        }
+        return Ok((json[start..index].to_owned(), index));
+    }
+    Err(String::from("invalid score JSON value token"))
 }
 
 pub(super) fn contains_non_serde_integer(json: &[u8]) -> bool {

@@ -6411,6 +6411,7 @@ debug_summary_max_records = 5
     );
 }
 
+#[cfg(feature = "upstream-hot-restart")]
 #[tokio::test]
 async fn shielded_retry_connect_hot_restart_wait_respects_request_deadline() {
     let upstream_base_url = "http://127.0.0.1:1/v1";

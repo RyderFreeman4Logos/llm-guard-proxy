@@ -580,15 +580,17 @@ PY
 wait_for_readiness() {
     local base_url="$1"
     local deadline=$((SECONDS + READY_TIMEOUT_SECS))
-    local status
+    local config_status
+    local health_status
     while (( SECONDS < deadline )); do
         if ! kill -0 "${proxy_pid}" 2>/dev/null; then
             fail "proxy exited before readiness"
         fi
         set +e
-        status="$(curl --silent --show-error --max-time 2 --output /dev/null --write-out "%{http_code}" "${base_url}/config-summary" 2>/dev/null)"
+        config_status="$(curl --silent --show-error --max-time 2 --output /dev/null --write-out "%{http_code}" "${base_url}/config-summary" 2>/dev/null)"
+        health_status="$(curl --silent --show-error --max-time 2 --output /dev/null --write-out "%{http_code}" "${base_url}/health" 2>/dev/null)"
         set -e
-        if [[ "${status}" == "200" ]]; then
+        if [[ "${config_status}" == "200" && "${health_status}" == "200" ]]; then
             return 0
         fi
         sleep 0.25
@@ -686,8 +688,8 @@ EOF
 
 printf 'smoke-gb10: run_dir=%s\n' "${run_dir}"
 printf 'smoke-gb10: observability_db=%s\n' "${sqlite_path}"
-printf 'smoke-gb10: proxy_base_url=%s upstream_base_url=%s model=%s\n' \
-    "${base_url}" "${redacted_upstream_base_url}" "${MODEL}"
+printf 'smoke-gb10: proxy_base_url=%s upstream_base_url=%s model=%s score_model=%s\n' \
+    "${base_url}" "${redacted_upstream_base_url}" "${MODEL}" "${SCORE_MODEL}"
 
 # Own the server PID directly. Using `cargo run &` would make $! point at
 # Cargo's wrapper process, leaving the proxy child outside cleanup ownership.

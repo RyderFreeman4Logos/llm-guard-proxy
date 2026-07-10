@@ -446,13 +446,20 @@ fn pydantic_arbitrary_precision_json_integer_top_n_is_preserved() {
 
 #[test]
 fn preserves_pydantic_nonfinite_extra_float_lexical_form() {
-    let body = Bytes::from_static(br#"{"model":"m","text_1":"q","text_2":"d","future":1e400}"#);
-    assert!(can_adapt_score_body_to_rerank(&body).unwrap());
-    let out = score_body_to_rerank_body(&body).expect("Pydantic accepts ignored extra float");
-    let out = std::str::from_utf8(&out).expect("serialized request is UTF-8");
-    assert!(out.contains(r#""future":1e400"#), "{out}");
-    assert!(out.contains(r#""query":"q""#), "{out}");
-    assert!(out.contains(r#""documents":["d"]"#), "{out}");
+    for token in ["1e400", "NaN", "Infinity", "-Infinity"] {
+        let body = Bytes::from(format!(
+            r#"{{"model":"m","text_1":"q","text_2":"d","future":{token}}}"#
+        ));
+        assert!(can_adapt_score_body_to_rerank(&body).unwrap(), "{token}");
+        let out = score_body_to_rerank_body(&body).expect("Pydantic accepts ignored extra float");
+        let out = std::str::from_utf8(&out).expect("serialized request is UTF-8");
+        assert!(
+            out.contains(&format!(r#""future":{token}"#)),
+            "token={token} out={out}"
+        );
+        assert!(out.contains(r#""query":"q""#), "{out}");
+        assert!(out.contains(r#""documents":["d"]"#), "{out}");
+    }
 }
 
 #[test]
@@ -780,7 +787,7 @@ fn unknown_extra_is_preserved_without_recursive_materialization() {
     ));
     let parsed = request::parse_score_value(&body).unwrap();
     assert_eq!(
-        parsed.preserved_fields.get("future").map(|raw| raw.get()),
+        parsed.preserved_fields.get("future").map(String::as_str),
         Some(raw_extra.as_str())
     );
 }
@@ -850,12 +857,13 @@ fn shadowed_mapped_duplicate_materializes_only_the_last_occurrence() {
     let shadowed = format!(
         "{}{}0.0{}",
         "[".repeat(190),
-        "0.0,".repeat(240_000),
+        "0.0,".repeat(245_655),
         "]".repeat(190)
     );
     let body = Bytes::from(format!(
         r#"{{"text_1":"q","text_2":{shadowed},"text_2":"d"}}"#
     ));
+    assert_eq!(body.len(), 960 * 1_024, "fixture must be exactly 960 KiB");
     request::reset_pydantic_value_parse_count();
     let out = score_body_to_rerank_body(&body).expect("last mapped duplicate is valid");
     assert_eq!(
@@ -867,6 +875,30 @@ fn shadowed_mapped_duplicate_materializes_only_the_last_occurrence() {
         serde_json::from_slice::<Value>(&out).unwrap()["documents"],
         json!(["d"])
     );
+}
+
+#[test]
+fn canonical_request_does_not_materialize_discarded_legacy_aliases() {
+    let discarded = format!(
+        "{}{}0.0{}",
+        "[".repeat(190),
+        "0.0,".repeat(240_000),
+        "]".repeat(190)
+    );
+    let body = Bytes::from(format!(
+        r#"{{"model":"m","text_1":"q","text_2":"d","query":{discarded}}}"#
+    ));
+    assert_eq!(body.len(), 960_431, "fixture must match the reviewer repro");
+    request::reset_pydantic_value_parse_count();
+    let out = score_body_to_rerank_body(&body).expect("canonical fields win over aliases");
+    assert_eq!(
+        request::pydantic_value_parse_count(),
+        3,
+        "only model, text_1, and text_2 should be materialized"
+    );
+    let value: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(value["query"], "q");
+    assert_eq!(value["documents"], json!(["d"]));
 }
 
 #[test]
