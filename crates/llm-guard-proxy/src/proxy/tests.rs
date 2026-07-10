@@ -16594,6 +16594,10 @@ fn fake_rerank_response(path_and_query: &str, body: &Bytes) -> Response<Body> {
     if path_and_query.contains("test=score-upstream-500") {
         let mut response = json_response("rerank-error", r#"{"error":"upstream boom"}"#.to_owned());
         *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/problem+json"),
+        );
         return response;
     }
     if path_and_query.contains("test=score-partial") {

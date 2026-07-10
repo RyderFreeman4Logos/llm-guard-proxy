@@ -328,6 +328,9 @@ fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
             if is_integer_token && classify_number_int(lexical).is_some() {
                 return Ok((Value::from(0), true));
             }
+            if is_pydantic_nonfinite_float(lexical) {
+                return Ok((Value::from(0), true));
+            }
             if !lexical.starts_with(['{', '[']) {
                 return Err(format!("invalid score JSON: {default_error}"));
             }
@@ -426,6 +429,18 @@ fn lax_top_n_representative(top_n: LaxTopN) -> Value {
         LaxTopN::NonPositive => Value::from(0),
         LaxTopN::Positive(value) => Value::from(value),
     }
+}
+
+fn is_pydantic_nonfinite_float(lexical: &str) -> bool {
+    let starts_like_json_number = lexical
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| *byte == b'-' || byte.is_ascii_digit());
+    starts_like_json_number
+        && lexical
+            .bytes()
+            .any(|byte| matches!(byte, b'.' | b'e' | b'E'))
+        && lexical.parse::<f64>().is_ok_and(|value| !value.is_finite())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -541,13 +556,13 @@ fn classify_cleaned_number_int(value: &str, is_negative: bool) -> Option<LaxTopN
 }
 
 fn classify_number_int(value: &str) -> Option<LaxTopN> {
-    const MAX_NUMBER_INT_BYTES: usize = 4_300;
-    if value.len() > MAX_NUMBER_INT_BYTES {
-        return None;
-    }
+    const MAX_NUMBER_INT_DIGITS: usize = 4_300;
     let (is_negative, magnitude) = value
         .strip_prefix('-')
         .map_or((false, value), |magnitude| (true, magnitude));
+    if magnitude.len() > MAX_NUMBER_INT_DIGITS {
+        return None;
+    }
     if magnitude.is_empty()
         || !magnitude.bytes().all(|byte| byte.is_ascii_digit())
         || (magnitude.len() > 1 && magnitude.starts_with('0'))

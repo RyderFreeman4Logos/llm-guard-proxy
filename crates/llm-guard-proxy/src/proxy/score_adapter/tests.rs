@@ -81,6 +81,27 @@ fn converts_rerank_response_to_score() {
 }
 
 #[test]
+fn converts_compatible_data_response_aliases_to_score() {
+    let body = Bytes::from_static(
+        br#"{"model":"m","data":[{"document_index":1,"relevance_score":0.9},{"index":0,"rerank_score":0.1}]}"#,
+    );
+    let out = rerank_response_to_score_response(
+        &body,
+        Some("m"),
+        Some(ScoreExpectations {
+            result_count: 2,
+            document_count: 2,
+        }),
+    )
+    .expect("compatible aliases should convert");
+    let value: Value = serde_json::from_slice(&out).expect("score response JSON");
+    assert_eq!(value["data"][0]["index"], 0);
+    assert_eq!(value["data"][0]["score"], 0.1);
+    assert_eq!(value["data"][1]["index"], 1);
+    assert_eq!(value["data"][1]["score"], 0.9);
+}
+
+#[test]
 fn preserves_created_and_normalizes_rerank_usage() {
     let body = Bytes::from_static(
         br#"{"id":"rerank-1","created":123,"model":"m","usage":{"prompt_tokens":7,"total_tokens":9,"completion_tokens":null,"prompt_tokens_details":{"cached_tokens":2,"private_upstream_metadata":"must-not-leak"}},"results":[{"index":0,"score":0.1}]}"#,
@@ -275,6 +296,7 @@ fn classifies_unknown_and_multimodal_score_shapes_as_passthrough() {
     for body in [
         br#"{"model":"m","queries":["q"],"documents":["d"]}"#.as_slice(),
         br#"{"model":"m","queries":["q"],"items":["d"]}"#.as_slice(),
+        br#"{"model":"m","query":{"content":[{"type":"text","text":"q"}]},"items":["d"]}"#.as_slice(),
         br#"{"model":"m","data_1":"q","data_2":"d"}"#.as_slice(),
         br#"{"text_1":"q","text_2":{"content":[{"type":"text","text":"d"}]}}"#.as_slice(),
         br#"{"model":"m","text_1":"q","text_2":{"content":[{"type":"image_url","image_url":{"url":"https://example.invalid/a.png"}}]}}"#.as_slice(),
@@ -298,6 +320,14 @@ fn classifies_arbitrary_precision_future_shape_as_passthrough() {
 #[test]
 fn classifies_complete_legacy_rerank_shape_as_adaptable() {
     let body = Bytes::from_static(br#"{"model":"m","query":"q","documents":["a","b"]}"#);
+    assert!(can_adapt_score_body_to_rerank(&body).unwrap());
+}
+
+#[test]
+fn classifies_multimodal_query_legacy_shape_as_adaptable() {
+    let body = Bytes::from_static(
+        br#"{"model":"m","query":{"content":[{"type":"text","text":"q"}]},"documents":["a","b"]}"#,
+    );
     assert!(can_adapt_score_body_to_rerank(&body).unwrap());
 }
 
@@ -367,7 +397,8 @@ fn pydantic_top_n_string_size_limit_applies_after_cleaning() {
     let max_digits = "9".repeat(4_300);
     assert!(parse_lax_top_n_string(&max_digits).is_some());
     assert!(parse_lax_top_n_string(&format!("9{max_digits}")).is_none());
-    assert!(parse_lax_top_n_string(&format!("-{max_digits}")).is_none());
+    assert!(parse_lax_top_n_string(&format!("-{max_digits}")).is_some());
+    assert!(parse_lax_top_n_string(&format!("-9{max_digits}")).is_none());
     assert!(parse_lax_top_n_string(&format!(" {max_digits} ")).is_some());
     assert!(parse_lax_top_n_string(&"0".repeat(4_301)).is_some());
 }
@@ -378,6 +409,7 @@ fn pydantic_arbitrary_precision_json_integer_top_n_is_preserved() {
         String::from("18446744073709551616"),
         String::from("-9223372036854775809"),
         "9".repeat(1_000),
+        format!("-{}", "9".repeat(4_300)),
     ] {
         let body = Bytes::from(format!(
             r#"{{"query":"q","documents":["a","b"],"top_n":{top_n}}}"#
@@ -388,11 +420,34 @@ fn pydantic_arbitrary_precision_json_integer_top_n_is_preserved() {
         );
     }
 
-    let oversized = "9".repeat(4_301);
-    let body = Bytes::from(format!(
-        r#"{{"query":"q","documents":["a","b"],"top_n":{oversized}}}"#
-    ));
-    assert!(can_adapt_score_body_to_rerank(&body).is_err());
+    for oversized in ["9".repeat(4_301), format!("-{}", "9".repeat(4_301))] {
+        let body = Bytes::from(format!(
+            r#"{{"query":"q","documents":["a","b"],"top_n":{oversized}}}"#
+        ));
+        assert!(can_adapt_score_body_to_rerank(&body).is_err());
+    }
+}
+
+#[test]
+fn preserves_pydantic_nonfinite_extra_float_lexical_form() {
+    let body = Bytes::from_static(br#"{"model":"m","text_1":"q","text_2":"d","future":1e400}"#);
+    assert!(can_adapt_score_body_to_rerank(&body).unwrap());
+    let out = score_body_to_rerank_body(&body).expect("Pydantic accepts ignored extra float");
+    let out = std::str::from_utf8(&out).expect("serialized request is UTF-8");
+    assert!(out.contains(r#""future":1e400"#), "{out}");
+    assert!(out.contains(r#""query":"q""#), "{out}");
+    assert!(out.contains(r#""documents":["d"]"#), "{out}");
+}
+
+#[test]
+fn ignores_pydantic_nonfinite_top_n_extra_for_canonical_score() {
+    let body =
+        Bytes::from_static(br#"{"model":"m","text_1":"q","text_2":["a","b"],"top_n":1e400}"#);
+    assert!(can_adapt_score_body_to_rerank(&body).unwrap());
+    let out = score_body_to_rerank_body(&body).expect("canonical top_n is an ignored extra");
+    let value: Value = serde_json::from_slice(&out).expect("mapped body is finite JSON");
+    assert_eq!(value["top_n"], 2);
+    assert_eq!(value["documents"], json!(["a", "b"]));
 }
 
 #[test]
@@ -569,14 +624,15 @@ fn ignores_caller_top_n_extra_for_canonical_score() {
 
 #[test]
 fn ignores_arbitrary_precision_top_n_extra_for_canonical_score() {
-    let body = Bytes::from(format!(
-        r#"{{"model":"m","text_1":"q","text_2":["a","b"],"top_n":{}}}"#,
-        "9".repeat(1_000)
-    ));
-    assert!(can_adapt_score_body_to_rerank(&body).unwrap());
-    let out = score_body_to_rerank_body(&body).expect("convert");
-    let value: Value = serde_json::from_slice(&out).unwrap();
-    assert_eq!(value["top_n"], 2);
+    for top_n in ["9".repeat(1_000), format!("-{}", "9".repeat(4_300))] {
+        let body = Bytes::from(format!(
+            r#"{{"model":"m","text_1":"q","text_2":["a","b"],"top_n":{top_n}}}"#
+        ));
+        assert!(can_adapt_score_body_to_rerank(&body).unwrap());
+        let out = score_body_to_rerank_body(&body).expect("convert");
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["top_n"], 2);
+    }
 }
 
 #[test]

@@ -88,6 +88,13 @@ async fn score_endpoint_passthrough_non_success_rerank_status() {
         .await
         .expect("score request should complete");
     assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/problem+json")
+    );
     let body = response.text().await.expect("body");
     assert!(body.contains("upstream boom"), "{body}");
 
@@ -108,8 +115,13 @@ async fn score_endpoint_negotiates_identity_encoding() {
         .post(format!("{}/v1/score?test=score-identity", proxy.base_url))
         .header(CONTENT_TYPE, "application/json")
         .header(axum::http::header::ACCEPT_ENCODING, "gzip, deflate")
+        .header("content-encoding", "gzip")
         .header("content-md5", "stale-md5")
         .header("digest", "SHA-256=stale")
+        .header("content-digest", "sha-256=:stale:")
+        .header("etag", "stale-etag")
+        .header("if-match", "stale-etag")
+        .header("if-none-match", "stale-etag")
         .body(r#"{"model":"qwen3-reranker-8b","text_1":"q","text_2":"d"}"#)
         .send()
         .await
@@ -126,8 +138,13 @@ async fn score_endpoint_negotiates_identity_encoding() {
         .get(axum::http::header::ACCEPT_ENCODING)
         .and_then(|v| v.to_str().ok());
     assert_eq!(accept_encoding, Some("identity"));
+    assert!(observed.headers.get("content-encoding").is_none());
     assert!(observed.headers.get("content-md5").is_none());
     assert!(observed.headers.get("digest").is_none());
+    assert!(observed.headers.get("content-digest").is_none());
+    assert!(observed.headers.get("etag").is_none());
+    assert!(observed.headers.get("if-match").is_none());
+    assert!(observed.headers.get("if-none-match").is_none());
     response
         .bytes()
         .await
@@ -470,6 +487,58 @@ async fn score_endpoint_accepts_arbitrary_precision_legacy_top_n() {
         std::str::from_utf8(&observed.body).expect("rerank body UTF-8"),
         r#"{"query":"q","documents":["a","b"],"top_n":18446744073709551616}"#
     );
+}
+
+#[tokio::test]
+async fn score_endpoint_routes_raw_fallback_model_to_named_upstream() {
+    let mut default = FakeUpstream::spawn().await;
+    let mut named = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &default.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[upstream.metadata]
+discovery_enabled = false
+
+[[upstreams]]
+name = "score-route"
+base_url = "{}"
+match_models = ["score-model"]
+
+[upstreams.metadata]
+discovery_enabled = false
+"#,
+            named.base_url
+        ),
+    )
+    .await;
+    let body = format!(
+        r#"{{"model":"score-model","text_1":"q","text_2":"d","future":{}}}"#,
+        "9".repeat(1_000)
+    );
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/score", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("named score route should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response should drain");
+
+    let observed = named
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("named upstream should receive adapted score request");
+    assert_eq!(observed.path_and_query, "/v1/rerank");
+    let observed_body = std::str::from_utf8(&observed.body).expect("rerank body UTF-8");
+    assert!(observed_body.contains(r#""model":"score-model""#));
+    assert!(observed_body.contains(&format!(r#""future":{}"#, "9".repeat(1_000))));
+    assert_no_upstream_request(&mut default).await;
 }
 
 #[test]
