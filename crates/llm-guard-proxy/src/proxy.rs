@@ -10052,6 +10052,7 @@ fn sanitize_score_adapt_request_headers(headers: &HeaderMap) -> HeaderMap {
         "content-md5",
         "digest",
         "content-digest",
+        "repr-digest",
         "etag",
         "if-match",
         "if-none-match",

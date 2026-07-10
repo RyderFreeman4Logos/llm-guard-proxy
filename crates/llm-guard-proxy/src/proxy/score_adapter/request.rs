@@ -112,7 +112,9 @@ pub(super) struct ParsedScoreValue<'a> {
 
 pub(super) fn parse_score_value(body: &Bytes) -> Result<ParsedScoreValue<'_>, String> {
     match serde_json::from_slice::<Value>(body) {
-        Ok(mut value) if !contains_non_serde_integer(body) => {
+        Ok(mut value)
+            if !contains_non_serde_integer(body) && !contains_pydantic_json_float(body) =>
+        {
             normalize_legacy_top_n_from_raw(body, &mut value)?;
             Ok(ParsedScoreValue {
                 value,
@@ -174,14 +176,10 @@ fn parse_score_value_from_raw<'a>(
     let is_legacy = !is_canonical
         && raw_object.object.contains_key("query")
         && raw_object.object.contains_key("documents");
-    let is_future =
-        !is_canonical && !is_legacy && super::has_complete_future_score_shape(&raw_object.object);
-    if !is_canonical && !is_legacy && !is_future {
-        return Err(default_message());
-    }
+    let is_opaque_passthrough = !is_canonical && !is_legacy;
 
     if raw_object.top_n.seen {
-        let top_n = if is_canonical || is_future {
+        let top_n = if is_canonical || is_opaque_passthrough {
             Value::Null
         } else {
             raw_object
@@ -292,8 +290,10 @@ impl<'de> serde::Deserialize<'de> for PydanticFallbackValue {
 }
 
 fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
-    if contains_non_serde_integer(raw.get().as_bytes()) {
-        let lexical = raw.get();
+    let lexical = raw.get();
+    if contains_non_serde_integer(lexical.as_bytes())
+        || contains_pydantic_json_float(lexical.as_bytes())
+    {
         let is_integer_token = lexical
             .as_bytes()
             .first()
@@ -304,6 +304,12 @@ fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
                 .map(|_| (Value::from(0), true))
                 .ok_or_else(|| String::from("invalid score JSON integer"));
         }
+        if let Some(value) = parse_pydantic_json_float(lexical) {
+            if value.is_finite() {
+                return Ok((Value::from(value), false));
+            }
+            return Ok((Value::from(0), true));
+        }
         if lexical.starts_with(['{', '[']) {
             let parsed: PydanticFallbackValue = serde_json::from_str(lexical)
                 .map_err(|error| format!("invalid score JSON: {error}"))?;
@@ -311,7 +317,7 @@ fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
         }
     }
 
-    match serde_json::from_str::<Value>(raw.get()) {
+    match serde_json::from_str::<Value>(lexical) {
         Ok(value) => Ok((value, false)),
         Err(default_error) => {
             let lexical = raw.get();
@@ -341,6 +347,16 @@ fn parse_pydantic_json_value(raw: &RawValue) -> Result<(Value, bool), String> {
 }
 
 pub(super) fn contains_non_serde_integer(json: &[u8]) -> bool {
+    contains_json_number_matching(json, integer_exceeds_serde_range)
+}
+
+fn contains_pydantic_json_float(json: &[u8]) -> bool {
+    contains_json_number_matching(json, |token| {
+        token.contains(&b'.') || token.contains(&b'e') || token.contains(&b'E')
+    })
+}
+
+fn contains_json_number_matching(json: &[u8], predicate: impl Fn(&[u8]) -> bool) -> bool {
     let mut index = 0_usize;
     let mut in_string = false;
     let mut escaped = false;
@@ -371,7 +387,7 @@ pub(super) fn contains_non_serde_integer(json: &[u8]) -> bool {
             {
                 index += 1;
             }
-            if integer_exceeds_serde_range(&json[start..index]) {
+            if predicate(&json[start..index]) {
                 return true;
             }
             continue;

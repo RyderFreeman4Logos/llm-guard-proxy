@@ -78,10 +78,40 @@ fn classify_noncanonical_score_shape(
         _ if has_complete_future_score_shape(object) => Ok(false),
         (Some(_), None) => Err(String::from("score body missing documents")),
         (None, Some(_)) => Err(String::from("score body missing query")),
+        (None, None) if has_known_future_score_field(object) => Err(String::from(
+            "score body contains an incomplete known future score shape",
+        )),
+        (None, None) if has_complete_opaque_future_score_shape(object) => Ok(false),
         (None, None) => Err(String::from(
-            "score body requires text_1/text_2 or query/documents",
+            "score body requires a complete score input pair",
         )),
     }
+}
+
+fn has_known_future_score_field(object: &serde_json::Map<String, Value>) -> bool {
+    ["queries", "items", "data_1", "data_2"]
+        .iter()
+        .any(|key| object.contains_key(*key))
+}
+
+fn has_complete_opaque_future_score_shape(object: &serde_json::Map<String, Value>) -> bool {
+    const NON_INPUT_FIELDS: [&str; 9] = [
+        "model",
+        "top_n",
+        "priority",
+        "truncate_prompt_tokens",
+        "mm_processor_kwargs",
+        "additional_data",
+        "softmax",
+        "activation",
+        "use_activation",
+    ];
+    object
+        .keys()
+        .filter(|key| !NON_INPUT_FIELDS.contains(&key.as_str()))
+        .take(2)
+        .count()
+        == 2
 }
 
 fn has_complete_future_score_shape(object: &serde_json::Map<String, Value>) -> bool {

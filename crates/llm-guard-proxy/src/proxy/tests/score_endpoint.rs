@@ -34,7 +34,7 @@ async fn score_endpoint_passthrough_unknown_complete_shape() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
     let request_body = format!(
-        r#"{{"model":"qwen3-reranker-8b","queries":["q"],"items":["d"],"future":{}}}"#,
+        r#"{{"model":"qwen3-reranker-8b","left_input":"q","right_input":"d","future":{}}}"#,
         "9".repeat(1_000)
     );
 
@@ -249,6 +249,7 @@ async fn score_endpoint_negotiates_identity_encoding() {
         .header("content-md5", "stale-md5")
         .header("digest", "SHA-256=stale")
         .header("content-digest", "sha-256=:stale:")
+        .header("repr-digest", "sha-256=:stale:")
         .header("etag", "stale-etag")
         .header("if-match", "stale-etag")
         .header("if-none-match", "stale-etag")
@@ -272,6 +273,7 @@ async fn score_endpoint_negotiates_identity_encoding() {
     assert!(observed.headers.get("content-md5").is_none());
     assert!(observed.headers.get("digest").is_none());
     assert!(observed.headers.get("content-digest").is_none());
+    assert!(observed.headers.get("repr-digest").is_none());
     assert!(observed.headers.get("etag").is_none());
     assert!(observed.headers.get("if-match").is_none());
     assert!(observed.headers.get("if-none-match").is_none());
@@ -427,6 +429,9 @@ async fn score_endpoint_rejects_invalid_client_body() {
     for request_body in [
         r"{}",
         r#"{"foo":1}"#,
+        r#"{"model":"qwen3-reranker-8b","left_input":"q","softmax":true}"#,
+        r#"{"softmax":true,"activation":false}"#,
+        r#"{"right_input":"d","use_activation":true}"#,
         r#"{"queries":["q"],"typo":true}"#,
         r#"{"items":["d"],"typo":true}"#,
         r#"{"data_1":"q","typo":true}"#,

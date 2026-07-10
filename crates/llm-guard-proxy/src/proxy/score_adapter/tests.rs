@@ -241,6 +241,9 @@ fn rejects_incomplete_known_score_shapes() {
         br"{}".as_slice(),
         br#"{"model":"m"}"#.as_slice(),
         br#"{"foo":1}"#.as_slice(),
+        br#"{"model":"m","left_input":"q","softmax":true}"#.as_slice(),
+        br#"{"softmax":true,"activation":false}"#.as_slice(),
+        br#"{"right_input":"d","use_activation":true}"#.as_slice(),
         br#"{"queries":["q"],"typo":true}"#.as_slice(),
         br#"{"items":["d"],"typo":true}"#.as_slice(),
         br#"{"data_1":"q","typo":true}"#.as_slice(),
@@ -305,6 +308,13 @@ fn classifies_unknown_and_multimodal_score_shapes_as_passthrough() {
     ] {
         assert!(!can_adapt_score_body_to_rerank(&Bytes::copy_from_slice(body)).unwrap());
     }
+}
+
+#[test]
+fn classifies_unknown_complete_future_shape_as_passthrough() {
+    let body = Bytes::from_static(br#"{"model":"m","left_input":"q","right_input":"d"}"#);
+    assert!(!can_adapt_score_body_to_rerank(&body).unwrap());
+    assert_eq!(model_id_from_score_body(&body).as_deref(), Some("m"));
 }
 
 #[test]
@@ -605,6 +615,22 @@ fn preserves_score_options() {
     assert_eq!(v["truncate_prompt_tokens"], 128);
     assert_eq!(v["priority"], 1);
     assert_eq!(v["query"], "q");
+}
+
+#[test]
+fn preserves_pydantic_float_rounding_in_score_options() {
+    let body = Bytes::from_static(
+        br#"{"model":"m","text_1":"q","text_2":"d","priority":448842541752324.9858557669766563163561207,"truncate_prompt_tokens":448842541752324.9858557669766563163561207,"mm_processor_kwargs":{"threshold":448842541752324.9858557669766563163561207}}"#,
+    );
+    let out = score_body_to_rerank_body(&body).expect("convert Pydantic-compatible floats");
+    let value: Value = serde_json::from_slice(&out).unwrap();
+    let expected = 448_842_541_752_325.0_f64;
+    assert_eq!(value["priority"].as_f64(), Some(expected));
+    assert_eq!(value["truncate_prompt_tokens"].as_f64(), Some(expected));
+    assert_eq!(
+        value["mm_processor_kwargs"]["threshold"].as_f64(),
+        Some(expected)
+    );
 }
 
 #[test]
