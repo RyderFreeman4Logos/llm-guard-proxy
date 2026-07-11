@@ -279,6 +279,7 @@ fn defaults_match_issue_contract() {
     );
     assert!(config.retry.ladder.is_empty());
     assert!(!config.upstream_stall.enabled);
+    assert_eq!(config.upstream_stall.first_chunk_timeout_ms, 30_000);
     assert_eq!(config.upstream_stall.idle_timeout_ms, 30_000);
     assert!(config.upstream_stall.recovery_command.is_empty());
     assert_eq!(config.upstream_stall.recovery_timeout_ms, 300_000);
@@ -672,6 +673,24 @@ fn validates_enabled_upstream_stall_idle_timeout_precedes_request_timeout() {
         .expect_err("stall idle timeout should beat total upstream request timeout");
 
     assert_eq!(error.field(), "upstream.stall.idle_timeout_ms");
+    assert!(
+        error
+            .message()
+            .contains("less than upstream.request_timeout_ms")
+    );
+}
+
+#[test]
+fn validates_enabled_upstream_stall_first_chunk_timeout_precedes_request_timeout() {
+    let mut config = AppConfig::default();
+    config.upstream_stall.enabled = true;
+    config.upstream_stall.first_chunk_timeout_ms = config.upstream.request_timeout_ms;
+
+    let error = config
+        .validate()
+        .expect_err("stall first-chunk timeout should beat total upstream request timeout");
+
+    assert_eq!(error.field(), "upstream.stall.first_chunk_timeout_ms");
     assert!(
         error
             .message()
@@ -2153,6 +2172,7 @@ sample_rate = 1.5
 #[cfg(feature = "guard")]
 fn assert_parsed_upstream_stall_overrides(config: &AppConfig) {
     assert!(config.upstream_stall.enabled);
+    assert_eq!(config.upstream_stall.first_chunk_timeout_ms, 30_000);
     assert_eq!(config.upstream_stall.idle_timeout_ms, 5_000);
     assert_eq!(
         config.upstream_stall.recovery_command,
@@ -3266,6 +3286,8 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.paired_comparison.include_raw_reasoning"));
     assert!(RELOADABLE_FIELDS.contains(&"evidence.shadow.paired_comparison.sample_rate"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.enabled"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.first_chunk_timeout_ms"));
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.idle_timeout_ms"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_command"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_timeout_ms"));
     assert!(RELOADABLE_FIELDS.contains(&"upstream.stall.recovery_cooldown_ms"));

@@ -1891,6 +1891,10 @@ fn assign_upstream_stall(
 ) -> Result<(), ConfigParseError> {
     match key {
         "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "first_chunk_timeout_ms" => {
+            config.first_chunk_timeout_ms =
+                parse_u64(value, line_number, "upstream.stall.first_chunk_timeout_ms")?;
+        }
         "idle_timeout_ms" => {
             config.idle_timeout_ms =
                 parse_u64(value, line_number, "upstream.stall.idle_timeout_ms")?;

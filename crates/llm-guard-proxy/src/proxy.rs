@@ -4608,6 +4608,7 @@ fn cot_salvage_thinking(policy: LoopFailurePolicy, current: &ThinkingConfig) -> 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct UpstreamStallPolicy {
     enabled: bool,
+    first_chunk_timeout: Duration,
     idle_timeout: Duration,
     recovery_command: Vec<String>,
     recovery_timeout: Duration,
@@ -4620,6 +4621,7 @@ impl UpstreamStallPolicy {
     fn from_config(config: &UpstreamStallConfig) -> Self {
         Self {
             enabled: config.enabled,
+            first_chunk_timeout: Duration::from_millis(config.first_chunk_timeout_ms),
             idle_timeout: Duration::from_millis(config.idle_timeout_ms),
             recovery_command: config.recovery_command.clone(),
             recovery_timeout: Duration::from_millis(config.recovery_timeout_ms),
@@ -4629,13 +4631,22 @@ impl UpstreamStallPolicy {
         }
     }
 
-    const fn idle_timeout(&self) -> Option<Duration> {
+    const fn stream_timeouts(&self) -> Option<UpstreamStreamTimeouts> {
         if self.enabled {
-            Some(self.idle_timeout)
+            Some(UpstreamStreamTimeouts {
+                first_chunk: self.first_chunk_timeout,
+                inter_chunk: self.idle_timeout,
+            })
         } else {
             None
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UpstreamStreamTimeouts {
+    first_chunk: Duration,
+    inter_chunk: Duration,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6178,7 +6189,7 @@ async fn aggregate_shielded_attempt(
         &request_id,
         request_model_id.as_deref(),
         runtime.loop_context.clone(),
-        runtime.upstream_stall_policy.idle_timeout(),
+        runtime.upstream_stall_policy.stream_timeouts(),
     );
     let remaining_deadline = if started.ignores_request_deadline {
         runtime.upstream_timeout

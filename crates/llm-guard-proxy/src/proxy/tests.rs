@@ -4700,6 +4700,7 @@ anti_loop_hint_enabled = false
 
 [upstream.stall]
 enabled = true
+first_chunk_timeout_ms = 50
 idle_timeout_ms = 50
 recovery_command = ["/usr/bin/touch", "{recovery_marker}"]
 recovery_timeout_ms = 1000
@@ -4770,6 +4771,7 @@ anti_loop_hint_enabled = false
 
 [upstream.stall]
 enabled = true
+first_chunk_timeout_ms = 50
 idle_timeout_ms = 50
 recovery_command = ["/bin/false"]
 recovery_timeout_ms = 1000
@@ -4868,6 +4870,7 @@ anti_loop_hint_enabled = false
 
 [upstream.stall]
 enabled = true
+first_chunk_timeout_ms = 50
 idle_timeout_ms = 50
 
 [upstream.local_recovery]
@@ -4960,6 +4963,7 @@ anti_loop_hint_enabled = false
 
 [upstream.stall]
 enabled = true
+first_chunk_timeout_ms = 50
 idle_timeout_ms = 50
 
 [upstream.local_recovery]
@@ -5142,6 +5146,7 @@ anti_loop_hint_enabled = false
 
 [upstream.stall]
 enabled = true
+first_chunk_timeout_ms = 50
 idle_timeout_ms = 50
 
 [upstream.local_recovery]
@@ -5329,6 +5334,7 @@ async fn assert_singleflight_upstream_requests(fake: &mut FakeUpstream) {
 async fn upstream_stall_recovery_is_single_flight_and_budget_limited() {
     let policy = UpstreamStallPolicy {
         enabled: true,
+        first_chunk_timeout: Duration::from_millis(50),
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![String::from("/bin/sleep"), String::from("0.2")],
         recovery_timeout: Duration::from_secs(2),
@@ -5366,6 +5372,7 @@ async fn upstream_stall_recovery_is_single_flight_and_budget_limited() {
 async fn upstream_stall_recovery_joiners_do_not_hang_after_leader_cancellation() {
     let policy = UpstreamStallPolicy {
         enabled: true,
+        first_chunk_timeout: Duration::from_millis(50),
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![String::from("/bin/sleep"), String::from("0.2")],
         recovery_timeout: Duration::from_secs(2),
@@ -5404,6 +5411,7 @@ async fn upstream_stall_recovery_joiners_do_not_hang_after_leader_cancellation()
 async fn upstream_stall_recovery_joiner_uses_completed_state_after_lost_notification() {
     let policy = UpstreamStallPolicy {
         enabled: true,
+        first_chunk_timeout: Duration::from_millis(50),
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![String::from("/bin/true")],
         recovery_timeout: Duration::from_millis(1),
@@ -5473,6 +5481,7 @@ async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
 
     let policy = UpstreamStallPolicy {
         enabled: true,
+        first_chunk_timeout: Duration::from_millis(50),
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![script_path.display().to_string()],
         // Startup allowance is separate from the timeout behavior under test:
@@ -5523,6 +5532,7 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process
 
     let policy = UpstreamStallPolicy {
         enabled: true,
+        first_chunk_timeout: Duration::from_millis(50),
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![script_path.display().to_string()],
         recovery_timeout: Duration::from_secs(2),
@@ -5569,6 +5579,7 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_befor
 
     let policy = UpstreamStallPolicy {
         enabled: true,
+        first_chunk_timeout: Duration::from_millis(50),
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![script_path.display().to_string()],
         recovery_timeout: Duration::from_secs(2),
@@ -8455,6 +8466,7 @@ shielded_streaming_enabled = true
 
 [upstream.stall]
 enabled = true
+first_chunk_timeout_ms = 50
 idle_timeout_ms = 50
 "#,
     )
@@ -8514,6 +8526,120 @@ idle_timeout_ms = 50
             &[("cause", "timeout")]
         ),
         1
+    );
+}
+
+#[tokio::test]
+async fn delayed_first_chunk_within_first_chunk_timeout_succeeds() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "sse"
+interval_secs = 15
+
+[retry]
+max_attempts = 1
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+
+[upstream.stall]
+enabled = true
+first_chunk_timeout_ms = 1000
+idle_timeout_ms = 50
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=delayed-first-chunk-then-success",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"delayed-first"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    assert!(released.contains("Hello") || released.contains("Hel"));
+    assert!(!released.contains("event: error"));
+    assert!(released.contains("data: [DONE]"));
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "succeeded");
+    assert_ne!(
+        request_row.response_metadata["upstream_stall_detected"],
+        "true"
+    );
+
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=delayed-first-chunk-then-success"
+    );
+}
+
+#[tokio::test]
+async fn inter_chunk_stall_after_first_chunk_returns_stall_error() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "sse"
+interval_secs = 15
+
+[retry]
+max_attempts = 1
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+
+[upstream.stall]
+enabled = true
+first_chunk_timeout_ms = 1000
+idle_timeout_ms = 50
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=inter-chunk-stall-after-first",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"inter-chunk-secret"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    assert!(released.contains("event: error"));
+    assert!(released.contains("llm_guard_attempt_timeout"));
+    assert!(!released.contains("data: [DONE]"));
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(
+        request_row.response_metadata["upstream_stall_detected"],
+        "true"
+    );
+    assert_eq!(
+        request_row.response_metadata["upstream_stall_idle_timeout_ms"],
+        "50"
+    );
+
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=inter-chunk-stall-after-first"
     );
 }
 
@@ -9080,6 +9206,7 @@ downstream_drop_policy = "detach"
 
 [upstream.stall]
 enabled = true
+first_chunk_timeout_ms = 200
 idle_timeout_ms = 200
 "#,
     )
@@ -16716,49 +16843,10 @@ fn fake_streaming_chat_completion_response(
     state: &FakeUpstreamState,
     body: &Bytes,
 ) -> Option<Response<Body>> {
-    if path_and_query.contains("test=compat-function-call") {
-        return Some(chat_completion_compat_function_call_sse_response(body));
-    }
-    if path_and_query.contains("test=compat-refusal") {
-        return Some(chat_completion_compat_refusal_sse_response(body));
-    }
-    if path_and_query.contains("test=compat-extensions") {
-        return Some(chat_completion_extension_fields_sse_response(body));
-    }
-    if path_and_query.contains("test=slow-shielded") {
-        return Some(slow_chat_completion_sse_response(body));
-    }
-    if path_and_query.contains("test=loop-once-then-slow-success") {
-        return Some(if body_contains_retry_hint(body) {
-            slow_chat_completion_sse_response(body)
-        } else {
-            repeated_reasoning_line_sse_response(200)
-        });
-    }
-    if path_and_query.contains("test=loop-once-shadow-raw-then-success") {
-        if body_contains_retry_hint(body) {
-            return Some(chat_completion_sse_response(body));
-        }
-        if next_fake_attempt_count(state, path_and_query) == 1 {
-            return Some(repeated_reasoning_line_sse_response(200));
-        }
-        return Some(chat_completion_sse_response(body));
-    }
-    if path_and_query.contains("test=loop-once-shadow-timeout-then-success") {
-        if body_contains_retry_hint(body) {
-            return Some(chat_completion_sse_response(body));
-        }
-        if next_fake_attempt_count(state, path_and_query) == 1 {
-            return Some(repeated_reasoning_line_sse_response(200));
-        }
-        return Some(stalled_chat_completion_sse_response());
-    }
-    if path_and_query.contains("test=loop-once-then-success") {
-        return Some(if body_contains_retry_hint(body) {
-            chat_completion_sse_response(body)
-        } else {
-            repeated_reasoning_line_sse_response(200)
-        });
+    if let Some(response) =
+        fake_compat_and_loop_once_chat_completion_response(path_and_query, state, body)
+    {
+        return Some(response);
     }
     if let Some(response) = fake_loop_twice_then_success_response(path_and_query, state, body) {
         return Some(response);
@@ -16787,32 +16875,13 @@ fn fake_streaming_chat_completion_response(
     if let Some(response) = fake_hot_restart_chat_completion_response(path_and_query, state, body) {
         return Some(response);
     }
-    if path_and_query.contains("test=stall-once-then-success") {
-        if next_fake_attempt_count(state, path_and_query) == 1 {
-            return Some(stalled_chat_completion_sse_response());
-        }
-        return Some(chat_completion_sse_response(body));
+    if let Some(response) =
+        fake_stall_recovery_chat_completion_response(path_and_query, state, body)
+    {
+        return Some(response);
     }
-    if path_and_query.contains("test=loop-reasoning-hundreds") {
-        return Some(repeated_reasoning_line_sse_response(200));
-    }
-    if path_and_query.contains("test=reasoning-leading-newlines") {
-        return Some(reasoning_then_leading_newline_content_sse_response());
-    }
-    if path_and_query.contains("test=loop-reasoning-six") {
-        return Some(repeated_reasoning_line_sse_response(6));
-    }
-    if path_and_query.contains("test=semantic-reasoning-varied") {
-        return Some(semantic_reasoning_repetition_sse_response());
-    }
-    if path_and_query.contains("test=repeated-tool-fingerprint") {
-        return Some(repeated_tool_fingerprint_sse_response());
-    }
-    if path_and_query.contains("test=copy-input-under-threshold") {
-        return Some(repeated_input_copy_sse_response(11));
-    }
-    if path_and_query.contains("test=copy-input-over-threshold") {
-        return Some(repeated_input_copy_sse_response(12));
+    if let Some(response) = fake_loop_fixture_chat_completion_response(path_and_query) {
+        return Some(response);
     }
     None
 }
@@ -17237,6 +17306,179 @@ fn stalled_chat_completion_sse_response() -> Response<Body> {
     response.headers_mut().insert(
         HeaderName::from_static("x-upstream-endpoint"),
         HeaderValue::from_static("chat-completions-stalled-sse"),
+    );
+    response
+}
+
+fn fake_compat_and_loop_once_chat_completion_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+    body: &Bytes,
+) -> Option<Response<Body>> {
+    if path_and_query.contains("test=compat-function-call") {
+        return Some(chat_completion_compat_function_call_sse_response(body));
+    }
+    if path_and_query.contains("test=compat-refusal") {
+        return Some(chat_completion_compat_refusal_sse_response(body));
+    }
+    if path_and_query.contains("test=compat-extensions") {
+        return Some(chat_completion_extension_fields_sse_response(body));
+    }
+    if path_and_query.contains("test=slow-shielded") {
+        return Some(slow_chat_completion_sse_response(body));
+    }
+    if path_and_query.contains("test=loop-once-then-slow-success") {
+        return Some(if body_contains_retry_hint(body) {
+            slow_chat_completion_sse_response(body)
+        } else {
+            repeated_reasoning_line_sse_response(200)
+        });
+    }
+    if path_and_query.contains("test=loop-once-shadow-raw-then-success") {
+        if body_contains_retry_hint(body) {
+            return Some(chat_completion_sse_response(body));
+        }
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            return Some(repeated_reasoning_line_sse_response(200));
+        }
+        return Some(chat_completion_sse_response(body));
+    }
+    if path_and_query.contains("test=loop-once-shadow-timeout-then-success") {
+        if body_contains_retry_hint(body) {
+            return Some(chat_completion_sse_response(body));
+        }
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            return Some(repeated_reasoning_line_sse_response(200));
+        }
+        return Some(stalled_chat_completion_sse_response());
+    }
+    if path_and_query.contains("test=loop-once-then-success") {
+        return Some(if body_contains_retry_hint(body) {
+            chat_completion_sse_response(body)
+        } else {
+            repeated_reasoning_line_sse_response(200)
+        });
+    }
+    None
+}
+
+fn fake_loop_fixture_chat_completion_response(path_and_query: &str) -> Option<Response<Body>> {
+    if path_and_query.contains("test=loop-reasoning-hundreds") {
+        return Some(repeated_reasoning_line_sse_response(200));
+    }
+    if path_and_query.contains("test=reasoning-leading-newlines") {
+        return Some(reasoning_then_leading_newline_content_sse_response());
+    }
+    if path_and_query.contains("test=loop-reasoning-six") {
+        return Some(repeated_reasoning_line_sse_response(6));
+    }
+    if path_and_query.contains("test=semantic-reasoning-varied") {
+        return Some(semantic_reasoning_repetition_sse_response());
+    }
+    if path_and_query.contains("test=repeated-tool-fingerprint") {
+        return Some(repeated_tool_fingerprint_sse_response());
+    }
+    if path_and_query.contains("test=copy-input-under-threshold") {
+        return Some(repeated_input_copy_sse_response(11));
+    }
+    if path_and_query.contains("test=copy-input-over-threshold") {
+        return Some(repeated_input_copy_sse_response(12));
+    }
+    None
+}
+
+fn fake_stall_recovery_chat_completion_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+    body: &Bytes,
+) -> Option<Response<Body>> {
+    if path_and_query.contains("test=stall-once-then-success") {
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            return Some(stalled_chat_completion_sse_response());
+        }
+        return Some(chat_completion_sse_response(body));
+    }
+    if path_and_query.contains("test=delayed-first-chunk-then-success") {
+        return Some(delayed_first_chunk_chat_completion_sse_response(body));
+    }
+    if path_and_query.contains("test=inter-chunk-stall-after-first") {
+        return Some(inter_chunk_stalled_chat_completion_sse_response());
+    }
+    None
+}
+
+fn delayed_first_chunk_chat_completion_sse_response(body: &Bytes) -> Response<Body> {
+    let include_usage = body_requests_stream_usage(body);
+    let include_logprobs = body_requests_logprobs(body);
+    let chunks = vec![
+        sse_json(&chat_completion_first_chunk()),
+        sse_json(&chat_completion_second_chunk(include_logprobs)),
+        sse_json(&chat_completion_final_chunk(
+            include_usage,
+            include_logprobs,
+        )),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    // First chunk arrives after the inter-chunk timeout but before the first-chunk timeout.
+    chat_completion_delayed_start_stream_response_with_delay(
+        "chat-completions-delayed-first-chunk-sse",
+        chunks,
+        Duration::from_millis(150),
+    )
+}
+
+fn inter_chunk_stalled_chat_completion_sse_response() -> Response<Body> {
+    let first = sse_json(&chat_completion_first_chunk());
+    let body = Body::from_stream(stream::unfold(Some(first), |state| async move {
+        if let Some(first) = state {
+            // Emit first chunk immediately, then hang between chunks.
+            Some((Ok::<_, std::convert::Infallible>(first), None))
+        } else {
+            let () = std::future::pending().await;
+            None
+        }
+    }));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_static("chat-completions-inter-chunk-stalled-sse"),
+    );
+    response
+}
+
+fn chat_completion_delayed_start_stream_response_with_delay(
+    label: &'static str,
+    chunks: Vec<Bytes>,
+    first_chunk_delay: Duration,
+) -> Response<Body> {
+    let body = Body::from_stream(stream::unfold(
+        (0_usize, chunks, first_chunk_delay),
+        |(index, chunks, first_chunk_delay)| async move {
+            if index >= chunks.len() {
+                return None;
+            }
+            if index == 0 {
+                sleep(first_chunk_delay).await;
+            }
+            let chunk = chunks[index].clone();
+            Some((
+                Ok::<_, std::convert::Infallible>(chunk),
+                (index + 1, chunks, first_chunk_delay),
+            ))
+        },
+    ));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_str(label).expect("static label should be a valid header"),
     );
     response
 }
