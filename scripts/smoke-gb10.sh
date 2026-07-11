@@ -8,9 +8,11 @@ UPSTREAM_BASE_URL="${LLM_GUARD_PROXY_SMOKE_UPSTREAM_BASE_URL:-http://gb10:18009/
 BIND_HOST="${LLM_GUARD_PROXY_SMOKE_HOST:-127.0.0.1}"
 PORT="${LLM_GUARD_PROXY_SMOKE_PORT:-}"
 MODEL="${LLM_GUARD_PROXY_SMOKE_MODEL:-aeon-ultimate}"
+SCORE_MODEL="${LLM_GUARD_PROXY_SMOKE_SCORE_MODEL:-qwen3-reranker-8b}"
 REQUEST_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_REQUEST_TIMEOUT_SECS:-120}"
 CONNECT_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_CONNECT_TIMEOUT_SECS:-5}"
 READY_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_READY_TIMEOUT_SECS:-120}"
+HEALTH_PROBE_TIMEOUT_MS="${LLM_GUARD_PROXY_SMOKE_HEALTH_PROBE_TIMEOUT_MS:-2000}"
 KEEP_RUN_DIR="${LLM_GUARD_PROXY_SMOKE_KEEP:-0}"
 ADMIN_TOKEN="${LLM_GUARD_PROXY_SMOKE_ADMIN_TOKEN:-}"
 
@@ -217,14 +219,16 @@ write_payloads() {
     local completions_payload="$3"
     local embeddings_payload="$4"
     local rerank_payload="$5"
+    local score_payload="$6"
 
-    python3 - "${MODEL}" "${chat_payload}" "${stream_payload}" \
-        "${completions_payload}" "${embeddings_payload}" "${rerank_payload}" <<'PY'
+    python3 - "${MODEL}" "${SCORE_MODEL}" "${chat_payload}" "${stream_payload}" \
+        "${completions_payload}" "${embeddings_payload}" "${rerank_payload}" \
+        "${score_payload}" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-model, chat_path, stream_path, completions_path, embeddings_path, rerank_path = sys.argv[1:]
+model, score_model, chat_path, stream_path, completions_path, embeddings_path, rerank_path, score_path = sys.argv[1:]
 
 chat = {
     "model": model,
@@ -246,7 +250,8 @@ completions = {
     "max_tokens": 8,
 }
 embeddings = {"model": model, "input": "ping"}
-rerank = {"model": model, "query": "ping", "documents": ["pong"]}
+rerank = {"model": score_model, "query": "ping", "documents": ["pong"]}
+score = {"model": score_model, "text_1": "ping", "text_2": "pong"}
 
 for path, payload in [
     (chat_path, chat),
@@ -254,6 +259,7 @@ for path, payload in [
     (completions_path, completions),
     (embeddings_path, embeddings),
     (rerank_path, rerank),
+    (score_path, score),
 ]:
     Path(path).write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
 PY
@@ -430,6 +436,108 @@ PY
     fi
 }
 
+validate_rerank_response() {
+    python3 - "$1" <<'PY'
+import json
+import math
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+if not isinstance(payload, dict):
+    raise SystemExit("/v1/rerank response is not a JSON object")
+model = payload.get("model")
+if not isinstance(model, str) or not model:
+    raise SystemExit("/v1/rerank response model must be a non-empty string")
+results = payload.get("results", payload.get("data"))
+if not isinstance(results, list) or len(results) != 1:
+    raise SystemExit("/v1/rerank response results/data must contain exactly one result")
+result = results[0]
+if not isinstance(result, dict):
+    raise SystemExit("/v1/rerank result 0 must be an object")
+index = result.get("index", result.get("document_index"))
+if isinstance(index, bool) or not isinstance(index, int) or index != 0:
+    raise SystemExit("/v1/rerank result 0 must have index/document_index 0")
+score = result.get(
+    "relevance_score",
+    result.get("score", result.get("rerank_score")),
+)
+if isinstance(score, bool) or not isinstance(score, (int, float)):
+    raise SystemExit("/v1/rerank result 0 has invalid score")
+if not math.isfinite(float(score)):
+    raise SystemExit("/v1/rerank result 0 score must be finite")
+print(f"results=1 index=0 model={model}")
+PY
+}
+
+validate_score_response() {
+    python3 - "$1" <<'PY'
+import json
+import math
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+if not isinstance(payload, dict):
+    raise SystemExit("/v1/score response is not a JSON object")
+if not isinstance(payload.get("id"), str) or not payload["id"]:
+    raise SystemExit("/v1/score response id must be a non-empty string")
+if payload.get("object") != "list":
+    raise SystemExit("/v1/score response object must be 'list'")
+if isinstance(payload.get("created"), bool) or not isinstance(payload.get("created"), int):
+    raise SystemExit("/v1/score response created must be an integer")
+if not isinstance(payload.get("model"), str) or not payload["model"]:
+    raise SystemExit("/v1/score response model must be a non-empty string")
+data = payload.get("data")
+if not isinstance(data, list) or len(data) != 1:
+    raise SystemExit("/v1/score response data must contain exactly one score")
+entry = data[0]
+if not isinstance(entry, dict) or entry.get("object") != "score":
+    raise SystemExit("/v1/score data entry must be a score object")
+index = entry.get("index")
+if isinstance(index, bool) or not isinstance(index, int) or index != 0:
+    raise SystemExit("/v1/score data entry index must be integer 0")
+score = entry.get("score")
+if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
+    raise SystemExit("/v1/score data entry score must be finite")
+usage = payload.get("usage")
+if not isinstance(usage, dict):
+    raise SystemExit("/v1/score response usage must be an object")
+for field in ("prompt_tokens", "total_tokens"):
+    value = usage.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SystemExit(f"/v1/score response usage.{field} must be a non-negative integer")
+completion_tokens = usage.get("completion_tokens", "missing")
+if completion_tokens == "missing" or (
+    completion_tokens is not None
+    and (
+        isinstance(completion_tokens, bool)
+        or not isinstance(completion_tokens, int)
+        or completion_tokens < 0
+    )
+):
+    raise SystemExit("/v1/score response usage.completion_tokens must be null or a non-negative integer")
+if "prompt_tokens_details" not in usage or not (
+    usage["prompt_tokens_details"] is None
+    or isinstance(usage["prompt_tokens_details"], dict)
+):
+    raise SystemExit("/v1/score response usage.prompt_tokens_details must be null or an object")
+prompt_tokens_details = usage["prompt_tokens_details"]
+if isinstance(prompt_tokens_details, dict) and "cached_tokens" in prompt_tokens_details:
+    cached_tokens = prompt_tokens_details["cached_tokens"]
+    if cached_tokens is not None and (
+        isinstance(cached_tokens, bool)
+        or not isinstance(cached_tokens, int)
+        or cached_tokens < 0
+    ):
+        raise SystemExit(
+            "/v1/score response usage.prompt_tokens_details.cached_tokens "
+            "must be null or a non-negative integer"
+        )
+print(f"scores={len(data)} model={payload['model']}")
+PY
+}
+
 validate_stream_response() {
     python3 - "$1" "$2" <<'PY'
 import sys
@@ -507,20 +615,40 @@ PY
 wait_for_readiness() {
     local base_url="$1"
     local deadline=$((SECONDS + READY_TIMEOUT_SECS))
-    local status
+    local config_status="000"
+    local health_status="000"
     while (( SECONDS < deadline )); do
         if ! kill -0 "${proxy_pid}" 2>/dev/null; then
             fail "proxy exited before readiness"
         fi
         set +e
-        status="$(curl --silent --show-error --max-time 2 --output /dev/null --write-out "%{http_code}" "${base_url}/config-summary" 2>/dev/null)"
+        config_status="$(curl --silent --show-error --max-time 2 --output /dev/null --write-out "%{http_code}" "${base_url}/config-summary" 2>/dev/null)"
+        health_status="$(curl --silent --show-error --max-time 3 --output /dev/null --write-out "%{http_code}" "${base_url}/health" 2>/dev/null)"
         set -e
-        if [[ "${status}" == "200" ]]; then
+        if [[ "${config_status}" == "200" && "${health_status}" == "200" ]]; then
             return 0
         fi
         sleep 0.25
     done
-    fail "proxy did not become ready within ${READY_TIMEOUT_SECS}s"
+    fail "proxy did not become ready within ${READY_TIMEOUT_SECS}s; last config-summary=${config_status} health=${health_status}"
+}
+
+request_health_until_ready() {
+    local base_url="$1"
+    local response_body_path="$2"
+    local response_headers_path="$3"
+    local deadline=$((SECONDS + READY_TIMEOUT_SECS))
+    local status="000"
+
+    while (( SECONDS < deadline )); do
+        status="$(http_request GET "${base_url}/health" - "${response_body_path}" "${response_headers_path}" "health")"
+        if [[ "${status}" == "200" ]]; then
+            printf '%s' "${status}"
+            return 0
+        fi
+        sleep 0.25
+    done
+    fail "GET /health did not return 200 within ${READY_TIMEOUT_SECS}s; last status=${status}"
 }
 
 require_command python3
@@ -577,7 +705,7 @@ sqlite_path = $(toml_quote "${sqlite_path}")
 capture_raw_payloads = false
 metrics_enabled = true
 health_upstream_probe_enabled = true
-health_upstream_probe_timeout_ms = 500
+health_upstream_probe_timeout_ms = ${HEALTH_PROBE_TIMEOUT_MS}
 debug_summary_enabled = true
 debug_summary_admin_token = $(toml_quote "${ADMIN_TOKEN}")
 debug_summary_max_records = 20
@@ -613,8 +741,8 @@ EOF
 
 printf 'smoke-gb10: run_dir=%s\n' "${run_dir}"
 printf 'smoke-gb10: observability_db=%s\n' "${sqlite_path}"
-printf 'smoke-gb10: proxy_base_url=%s upstream_base_url=%s model=%s\n' \
-    "${base_url}" "${redacted_upstream_base_url}" "${MODEL}"
+printf 'smoke-gb10: proxy_base_url=%s upstream_base_url=%s model=%s score_model=%s\n' \
+    "${base_url}" "${redacted_upstream_base_url}" "${MODEL}" "${SCORE_MODEL}"
 
 # Own the server PID directly. Using `cargo run &` would make $! point at
 # Cargo's wrapper process, leaving the proxy child outside cleanup ownership.
@@ -634,8 +762,7 @@ printf 'smoke-gb10: endpoint=/config-summary status=%s %s\n' \
 
 health_body="${run_dir}/health.body.json"
 health_headers="${run_dir}/health.headers"
-health_status="$(http_request GET "${base_url}/health" - "${health_body}" "${health_headers}" "health")"
-require_http_status "GET /health" "${health_status}" "200"
+health_status="$(request_health_until_ready "${base_url}" "${health_body}" "${health_headers}")"
 health_summary="$(validate_health_response "${health_body}")"
 printf 'smoke-gb10: endpoint=/health status=%s %s\n' \
     "${health_status}" "${health_summary}"
@@ -645,8 +772,9 @@ stream_payload="${run_dir}/chat-stream.json"
 completions_payload="${run_dir}/completions.json"
 embeddings_payload="${run_dir}/embeddings.json"
 rerank_payload="${run_dir}/rerank.json"
+score_payload="${run_dir}/score.json"
 write_payloads "${chat_payload}" "${stream_payload}" "${completions_payload}" \
-    "${embeddings_payload}" "${rerank_payload}"
+    "${embeddings_payload}" "${rerank_payload}" "${score_payload}"
 
 forwarded_calls=0
 
@@ -678,8 +806,7 @@ printf 'smoke-gb10: endpoint=/v1/chat/completions mode=stream status=%s %s\n' \
 
 for probe in \
     "completions:/v1/completions:${completions_payload}" \
-    "embeddings:/v1/embeddings:${embeddings_payload}" \
-    "rerank:/v1/rerank:${rerank_payload}"
+    "embeddings:/v1/embeddings:${embeddings_payload}"
 do
     label="${probe%%:*}"
     rest="${probe#*:}"
@@ -697,6 +824,23 @@ do
             "${endpoint}" "${status}"
     fi
 done
+
+rerank_body="${run_dir}/rerank.body.json"
+rerank_headers="${run_dir}/rerank.headers"
+rerank_status="$(http_request POST "${base_url}/v1/rerank" "${rerank_payload}" "${rerank_body}" "${rerank_headers}" "rerank")"
+require_http_status "POST /v1/rerank" "${rerank_status}" "200"
+rerank_summary="$(validate_rerank_response "${rerank_body}")"
+forwarded_calls=$((forwarded_calls + 1))
+printf 'smoke-gb10: endpoint=/v1/rerank status=%s %s\n' \
+    "${rerank_status}" "${rerank_summary}"
+
+score_body="${run_dir}/score.body.json"
+score_headers="${run_dir}/score.headers"
+score_status="$(http_request POST "${base_url}/v1/score" "${score_payload}" "${score_body}" "${score_headers}" "score")"
+require_http_status "POST /v1/score" "${score_status}" "200"
+score_summary="$(validate_score_response "${score_body}")"
+forwarded_calls=$((forwarded_calls + 1))
+printf 'smoke-gb10: endpoint=/v1/score status=%s %s\n' "${score_status}" "${score_summary}"
 
 dot_body="${run_dir}/dot-segment.body.json"
 dot_headers="${run_dir}/dot-segment.headers"

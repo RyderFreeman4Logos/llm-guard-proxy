@@ -22,7 +22,8 @@ use axum::{
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri,
         header::{
-            ACCEPT, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST, RETRY_AFTER,
+            ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONNECTION, CONTENT_LENGTH, CONTENT_TYPE, HOST,
+            RETRY_AFTER,
         },
     },
     routing::get,
@@ -65,6 +66,7 @@ use tokio::{
 };
 
 mod model_metadata;
+mod score_adapter;
 mod shielded_chat;
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -2512,7 +2514,7 @@ async fn forward_openai_request(
         .await;
     }
     #[cfg(feature = "guard")]
-    apply_pre_request_guard(&config, request_id, &mut prepared_request)
+    apply_pre_request_guard(&config, request_id, &method, &uri, &mut prepared_request)
         .await
         .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry, &config.loop_guard);
@@ -2599,6 +2601,8 @@ async fn forward_openai_request(
         model_id: prepared_request.model_id,
         request_metadata,
         in_flight_permit,
+        score_via_rerank: prepared_request.score_via_rerank,
+        score_expected_count: prepared_request.score_expected_count,
     })
     .await
 }
@@ -2635,10 +2639,15 @@ async fn read_body_and_admit_generation(
         request.shielding_enabled_hint,
     );
     add_listener_metadata(&mut pre_body_request_metadata, &state.listener);
-    let body =
-        read_body_bytes_until_shutdown(body, max_request_body_bytes, state.shutdown.subscribe())
-            .await
-            .map_err(|error| error.with_request_metadata(pre_body_request_metadata))?;
+    let body = read_body_with_score_limit(
+        body,
+        max_request_body_bytes,
+        request.method,
+        request.uri,
+        state.shutdown.subscribe(),
+        pre_body_request_metadata,
+    )
+    .await?;
     let mut body_read_request_metadata = base_request_metadata(
         request.method,
         request.uri,
@@ -2671,7 +2680,7 @@ async fn read_body_and_admit_generation(
         });
     }
 
-    let model_id_for_admission = extract_model_id(&body);
+    let model_id_for_admission = extract_model_id(request.method, request.uri, &body);
     select_allowed_upstream_profile(&config, &state.listener, model_id_for_admission.as_deref())
         .map_err(|error| {
             ProxyError::listener_denied(error)
@@ -2713,6 +2722,41 @@ async fn read_body_and_admit_generation(
     })
 }
 
+async fn read_body_with_score_limit(
+    body: Body,
+    max_request_body_bytes: usize,
+    method: &Method,
+    uri: &Uri,
+    shutdown: ShutdownSubscription,
+    request_metadata: BTreeMap<String, String>,
+) -> Result<Bytes, ProxyError> {
+    let is_score_request = score_adapter::is_score_request(method, uri);
+    let score_limit_applies =
+        is_score_request && max_request_body_bytes >= score_adapter::MAX_SCORE_BODY_BYTES;
+    let body_limit = if is_score_request {
+        max_request_body_bytes.min(score_adapter::MAX_SCORE_BODY_BYTES)
+    } else {
+        max_request_body_bytes
+    };
+    read_body_bytes_until_shutdown(body, body_limit, shutdown)
+        .await
+        .map_err(|error| {
+            let score_body_limit_exceeded = matches!(
+                &error,
+                ProxyError::RequestBody { reason, .. } if reason.contains("length limit exceeded")
+            );
+            let error = if score_limit_applies && score_body_limit_exceeded {
+                ProxyError::request_body(format!(
+                    "score request exceeded adapter limit of {} bytes",
+                    score_adapter::MAX_SCORE_BODY_BYTES
+                ))
+            } else {
+                error
+            };
+            error.with_request_metadata(request_metadata)
+        })
+}
+
 struct PreparedOpenAiRequest {
     model_id: Option<String>,
     #[cfg(feature = "guard")]
@@ -2726,6 +2770,10 @@ struct PreparedOpenAiRequest {
     upstream_url: Url,
     reqwest_method: reqwest::Method,
     shielded_chat_plan: ShieldedChatPlan,
+    /// Request was adapted from `/v1/score`; rewrite response from rerank shape.
+    score_via_rerank: bool,
+    /// Expected result cardinality and document-index domain for response validation.
+    score_expected_count: Option<score_adapter::ScoreExpectations>,
 }
 
 #[cfg(feature = "guard")]
@@ -2753,6 +2801,129 @@ enum CallerProfileResolution {
     UnknownUseDefault,
 }
 
+struct AdaptedScoreRequest {
+    forward_uri: Uri,
+    adapted_body: Bytes,
+    score_via_rerank: bool,
+    score_expected_count: Option<score_adapter::ScoreExpectations>,
+}
+
+fn adapt_score_request_if_needed(
+    method: &Method,
+    uri: &Uri,
+    downstream_headers: &HeaderMap,
+    body: &Bytes,
+    request_metadata: &mut BTreeMap<String, String>,
+) -> Result<AdaptedScoreRequest, ProxyError> {
+    if !score_adapter::is_score_request(method, uri) {
+        return Ok(AdaptedScoreRequest {
+            forward_uri: uri.clone(),
+            adapted_body: body.clone(),
+            score_via_rerank: false,
+            score_expected_count: None,
+        });
+    }
+    let invalid = |error: String| ProxyError::ContextBudgetExceeded {
+        message: format!("invalid score request: {error}"),
+        param: "body",
+        code: "invalid_score_request",
+        request_metadata: None,
+    };
+    let adapt = score_adapter::can_adapt_score_body_to_rerank(body).map_err(invalid)?;
+    if !adapt {
+        request_metadata.insert(String::from("score_via_rerank"), String::from("false"));
+        request_metadata.insert(String::from("score_passthrough"), String::from("true"));
+        return Ok(AdaptedScoreRequest {
+            forward_uri: uri.clone(),
+            adapted_body: body.clone(),
+            score_via_rerank: false,
+            score_expected_count: None,
+        });
+    }
+    ensure_score_transform_headers_supported(downstream_headers, request_metadata)?;
+    let adapted_body = score_adapter::score_body_to_rerank_body(body).map_err(invalid)?;
+    let forward_uri = score_adapter::score_uri_to_rerank_uri(uri).map_err(|error| {
+        ProxyError::ContextBudgetExceeded {
+            message: format!("invalid score request uri: {error}"),
+            param: "path",
+            code: "invalid_score_request",
+            request_metadata: None,
+        }
+    })?;
+    let score_expected_count = score_adapter::score_expectations_from_rerank_body(&adapted_body);
+    request_metadata.insert(String::from("score_via_rerank"), String::from("true"));
+    if let Some(expected) = score_expected_count {
+        request_metadata.insert(
+            String::from("score_expected_count"),
+            expected.result_count.to_string(),
+        );
+        request_metadata.insert(
+            String::from("score_document_count"),
+            expected.document_count.to_string(),
+        );
+    }
+    Ok(AdaptedScoreRequest {
+        forward_uri,
+        adapted_body,
+        score_via_rerank: true,
+        score_expected_count,
+    })
+}
+
+fn ensure_score_transform_headers_supported(
+    downstream_headers: &HeaderMap,
+    request_metadata: &mut BTreeMap<String, String>,
+) -> Result<(), ProxyError> {
+    if downstream_headers.contains_key("signature")
+        || downstream_headers.contains_key("signature-input")
+        || !score_transform_authorization_supported(downstream_headers)
+    {
+        request_metadata.insert(
+            String::from("signed_request_transformation_rejected"),
+            String::from("true"),
+        );
+        return Err(ProxyError::ContextBudgetExceeded {
+            message: String::from(
+                "signed score requests cannot be transformed without invalidating the signature",
+            ),
+            param: "headers",
+            code: "signed_request_transformation_unsupported",
+            request_metadata: None,
+        });
+    }
+    Ok(())
+}
+
+fn score_transform_authorization_supported(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(AUTHORIZATION)
+        .iter()
+        .all(safe_proxy_authorization_value)
+}
+
+fn safe_proxy_authorization_value(value: &HeaderValue) -> bool {
+    let Ok(value) = value.to_str() else {
+        return false;
+    };
+    let trimmed = value.trim();
+    let mut parts = trimmed.splitn(2, char::is_whitespace);
+    let Some(scheme) = parts.next() else {
+        return false;
+    };
+    let Some(credentials) = parts.next().map(str::trim) else {
+        return false;
+    };
+    if credentials.is_empty()
+        || !credentials.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'-' | b'.' | b'_' | b'~' | b'+' | b'/' | b'=')
+        })
+    {
+        return false;
+    }
+    scheme.eq_ignore_ascii_case("bearer") || scheme.eq_ignore_ascii_case("basic")
+}
+
 fn prepare_openai_forward_request(
     state: &ProxyState,
     config: &AppConfig,
@@ -2762,36 +2933,49 @@ fn prepare_openai_forward_request(
     body: &Bytes,
     request_metadata: &mut BTreeMap<String, String>,
 ) -> Result<PreparedOpenAiRequest, ProxyError> {
-    #[cfg(not(feature = "guard"))]
-    let _ = downstream_headers;
-    let model_id = extract_model_id(body);
     #[cfg(feature = "guard")]
     let caller_profile = resolve_caller_profile(config, downstream_headers)?;
     #[cfg(feature = "guard")]
     add_caller_profile_metadata(request_metadata, &caller_profile);
+    let model_id = extract_model_id(method, uri, body);
     #[cfg(feature = "guard")]
     enforce_caller_profile_policy(&caller_profile, model_id.as_deref())?;
     #[cfg(feature = "guard")]
     enforce_caller_profile_budget(state, config, &caller_profile)?;
     #[cfg(feature = "guard")]
     let workflow_alias = workflow_alias_for_model(config, model_id.as_deref())?;
+    let adapted_score =
+        adapt_score_request_if_needed(method, uri, downstream_headers, body, request_metadata)?;
     let selected_profile =
         select_profile_for_request(config, &state.listener, method, uri, model_id.as_deref())?;
     let upstream_profile = selected_profile.profile;
     let route_reason = selected_profile.route_reason;
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
-    let upstream_url = build_upstream_url(&upstream_profile.base_url, uri)?;
+    let score_via_rerank = adapted_score.score_via_rerank;
+    let score_expected_count = adapted_score.score_expected_count;
+    let forward_uri = adapted_score.forward_uri;
+    let adapted_body = adapted_score.adapted_body;
+    let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
     let reqwest_method = upstream_method(method)?;
-    let body = apply_param_override_if_configured(method, uri, body, &upstream_profile)?;
-    let mut shielded_chat_plan = plan_shielded_chat(
+    #[cfg(feature = "param-override")]
+    let body =
+        apply_param_override_if_configured(method, &forward_uri, &adapted_body, &upstream_profile)?;
+    #[cfg(not(feature = "param-override"))]
+    let body = adapted_body;
+    let shielded_chat_plan = plan_shielded_chat(
         state,
         config,
         &upstream_profile.thinking,
         method,
-        uri,
+        &forward_uri,
         &body,
     );
-    apply_param_override_to_shielded_plan(&mut shielded_chat_plan, &upstream_profile)?;
+    #[cfg(feature = "param-override")]
+    let shielded_chat_plan = {
+        let mut plan = shielded_chat_plan;
+        apply_param_override_to_shielded_plan(method, &forward_uri, &mut plan, &upstream_profile)?;
+        plan
+    };
     add_shielded_request_metadata(
         request_metadata,
         shielded_chat_plan.intercepted,
@@ -2820,6 +3004,8 @@ fn prepare_openai_forward_request(
         upstream_url,
         reqwest_method,
         shielded_chat_plan,
+        score_via_rerank,
+        score_expected_count,
     })
 }
 
@@ -3025,6 +3211,18 @@ fn profile_block_reason_message(reason: &BlockReason) -> String {
     }
 }
 
+#[cfg(any(feature = "guard", feature = "param-override"))]
+fn is_chat_completions_request(method: &Method, uri: &Uri) -> bool {
+    method == Method::POST && uri.path() == "/v1/chat/completions"
+}
+
+#[cfg(feature = "param-override")]
+fn param_override_applies(method: &Method, uri: &Uri, profile: &UpstreamProfileConfig) -> bool {
+    is_chat_completions_request(method, uri)
+        && profile.param_override.enabled
+        && param_override_has_fields(&profile.param_override)
+}
+
 #[cfg(feature = "param-override")]
 fn apply_param_override_if_configured(
     method: &Method,
@@ -3032,11 +3230,7 @@ fn apply_param_override_if_configured(
     body: &Bytes,
     profile: &UpstreamProfileConfig,
 ) -> Result<Bytes, ProxyError> {
-    if method != Method::POST
-        || uri.path() != "/v1/chat/completions"
-        || !profile.param_override.enabled
-        || !param_override_has_fields(&profile.param_override)
-    {
+    if !param_override_applies(method, uri, profile) {
         return Ok(body.clone());
     }
     apply_param_override_to_body(body, profile)
@@ -3044,19 +3238,16 @@ fn apply_param_override_if_configured(
 
 #[cfg(feature = "param-override")]
 fn apply_param_override_to_shielded_plan(
+    method: &Method,
+    uri: &Uri,
     plan: &mut ShieldedChatPlan,
     profile: &UpstreamProfileConfig,
 ) -> Result<(), ProxyError> {
+    if !param_override_applies(method, uri, profile) {
+        return Ok(());
+    }
     plan.downstream_body = apply_param_override_to_body(&plan.downstream_body, profile)?;
     plan.upstream_body = apply_param_override_to_body(&plan.upstream_body, profile)?;
-    Ok(())
-}
-
-#[cfg(not(feature = "param-override"))]
-fn apply_param_override_to_shielded_plan(
-    _plan: &mut ShieldedChatPlan,
-    _profile: &UpstreamProfileConfig,
-) -> Result<(), ProxyError> {
     Ok(())
 }
 
@@ -3078,16 +3269,6 @@ fn apply_param_override_to_body(
         ProxyError::request_body(format!("request body rewrite failed: {error}"))
     })?;
     Ok(Bytes::from(rewritten))
-}
-
-#[cfg(not(feature = "param-override"))]
-fn apply_param_override_if_configured(
-    _method: &Method,
-    _uri: &Uri,
-    body: &Bytes,
-    _profile: &UpstreamProfileConfig,
-) -> Result<Bytes, ProxyError> {
-    Ok(body.clone())
 }
 
 #[cfg(feature = "param-override")]
@@ -3367,9 +3548,11 @@ fn workflow_alias_for_model(
 async fn apply_pre_request_guard(
     config: &AppConfig,
     request_id: &RequestId,
+    method: &Method,
+    uri: &Uri,
     prepared_request: &mut PreparedOpenAiRequest,
 ) -> Result<(), ProxyError> {
-    if config.guard_workflows.pre_request.is_none() {
+    if !is_chat_completions_request(method, uri) || config.guard_workflows.pre_request.is_none() {
         return Ok(());
     }
     let Some(messages) =
@@ -3734,6 +3917,100 @@ struct GenericForwardContext<'request> {
     model_id: Option<String>,
     request_metadata: BTreeMap<String, String>,
     in_flight_permit: InFlightPermit,
+    score_via_rerank: bool,
+    score_expected_count: Option<score_adapter::ScoreExpectations>,
+}
+
+async fn rewrite_score_response_from_upstream(
+    response_parts: ForwardedResponseParts,
+    upstream_response: reqwest::Response,
+    in_flight_permit: InFlightPermit,
+    model_id: Option<&str>,
+    expected_count: Option<score_adapter::ScoreExpectations>,
+) -> Result<Response<Body>, ProxyError> {
+    let upstream_status = response_parts.upstream_status;
+    let body = match read_upstream_body_bytes_until_shutdown(
+        upstream_response.bytes_stream(),
+        response_parts.shutdown_subscription(),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            return Err(response_parts.into_response_process_error(
+                error,
+                BTreeMap::from([(
+                    String::from("response_body_read_error"),
+                    String::from("true"),
+                )]),
+            ));
+        }
+    };
+    let upstream_body_bytes = body.len();
+    let (body, response_headers) = if upstream_status.is_success() {
+        match score_adapter::rerank_response_to_score_response(&body, model_id, expected_count) {
+            Ok(body) => {
+                // Transformed body: clean downstream headers only; keep original
+                // upstream headers on response_parts for attempt observability.
+                let headers = transformed_score_response_headers();
+                (body, headers)
+            }
+            Err(error) => {
+                return Err(response_parts.into_response_process_error(
+                    ProxyError::upstream_body(format!(
+                        "score from rerank response rewrite failed: {error}"
+                    )),
+                    BTreeMap::from([(
+                        String::from("response_body_bytes"),
+                        upstream_body_bytes.to_string(),
+                    )]),
+                ));
+            }
+        }
+    } else {
+        (body, response_parts.upstream_headers.clone())
+    };
+    let stream_cancel = response_parts.shutdown_subscription();
+    let observer = response_parts.into_observer_with(
+        downstream_mode_from_headers(&response_headers),
+        response_headers.clone(),
+        BTreeMap::from([(
+            String::from("response_body_bytes"),
+            upstream_body_bytes.to_string(),
+        )]),
+        BTreeMap::new(),
+        RawPayloads::default(),
+    );
+    let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit, stream_cancel);
+    Ok(downstream_response(
+        upstream_status,
+        &response_headers,
+        Body::from_stream(response_body),
+    ))
+}
+
+fn prepare_generic_attempt_request(
+    context: &GenericForwardContext<'_>,
+) -> (Option<HeaderMap>, BTreeMap<String, String>) {
+    let override_headers = context
+        .score_via_rerank
+        .then(|| sanitize_score_adapt_request_headers(&context.downstream_headers));
+    let headers = override_headers
+        .as_ref()
+        .unwrap_or(&context.downstream_headers);
+    let mut metadata = attempt_request_metadata(&context.method, &context.uri, headers);
+    metadata.insert(
+        String::from("upstream_request_body_bytes"),
+        context.upstream_body.len().to_string(),
+    );
+    if context.score_via_rerank {
+        metadata.insert(String::from("path"), context.upstream_url.path().to_owned());
+        metadata.insert(
+            String::from("query_present"),
+            context.upstream_url.query().is_some().to_string(),
+        );
+    }
+    (override_headers, metadata)
 }
 
 async fn forward_generic_openai_request(
@@ -3749,8 +4026,12 @@ async fn forward_generic_openai_request(
 
     let attempt_id = AttemptId::for_request(context.request_id, 1);
     let attempt_started_at_unix_ms = unix_time_millis();
-    let mut attempt_request_metadata =
-        attempt_request_metadata(&context.method, &context.uri, &context.downstream_headers);
+    let (score_identity_headers, mut attempt_request_metadata) =
+        prepare_generic_attempt_request(&context);
+    let downstream_headers = match score_identity_headers.as_ref() {
+        Some(headers) => headers,
+        None => &context.downstream_headers,
+    };
     add_listener_metadata(&mut attempt_request_metadata, &context.state.listener);
     add_upstream_profile_metadata(
         &mut attempt_request_metadata,
@@ -3768,7 +4049,7 @@ async fn forward_generic_openai_request(
         client: &context.state.client,
         method: context.reqwest_method,
         upstream_url: context.upstream_url,
-        downstream_headers: &context.downstream_headers,
+        downstream_headers,
         upstream_body: context.upstream_body,
         upstream_timeout: context.upstream_timeout,
         attempt_id: attempt_id.clone(),
@@ -3791,7 +4072,7 @@ async fn forward_generic_openai_request(
         attempt_id,
         attempt_started_at_unix_ms,
         upstream_mode: upstream_mode_from_headers(&upstream_headers),
-        model_id: context.model_id,
+        model_id: context.model_id.clone(),
         input_fingerprint: context.liveness.input_fingerprint.clone(),
         upstream_status,
         upstream_headers: upstream_headers.clone(),
@@ -3799,6 +4080,16 @@ async fn forward_generic_openai_request(
         attempt_request_metadata,
         shutdown: Arc::clone(&context.state.shutdown),
     };
+    if context.score_via_rerank {
+        return rewrite_score_response_from_upstream(
+            response_parts,
+            upstream_response,
+            context.in_flight_permit,
+            context.model_id.as_deref(),
+            context.score_expected_count,
+        )
+        .await;
+    }
     forward_upstream_response(
         ResponseDispatch {
             method: &context.method,
@@ -4963,12 +5254,21 @@ impl ForwardedResponseParts {
 
     fn into_observer(self) -> ForwardedBodyObserver {
         let downstream_mode = downstream_mode_from_headers(&self.upstream_headers);
-        self.into_observer_with(downstream_mode, BTreeMap::new(), RawPayloads::default())
+        let downstream_headers = self.upstream_headers.clone();
+        self.into_observer_with(
+            downstream_mode,
+            downstream_headers,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            RawPayloads::default(),
+        )
     }
 
     fn into_observer_with(
         self,
         downstream_mode: DownstreamMode,
+        downstream_headers: HeaderMap,
+        attempt_response_metadata: BTreeMap<String, String>,
         extra_response_metadata: BTreeMap<String, String>,
         raw_payloads: RawPayloads,
     ) -> ForwardedBodyObserver {
@@ -4981,7 +5281,7 @@ impl ForwardedResponseParts {
             upstream_status: self.upstream_status,
             upstream_headers: self.upstream_headers.clone(),
             request_metadata: self.attempt_request_metadata,
-            extra_response_metadata: extra_response_metadata.clone(),
+            extra_response_metadata: attempt_response_metadata,
             raw_payloads: raw_payloads.clone(),
         };
         ForwardedBodyObserver {
@@ -4997,7 +5297,7 @@ impl ForwardedResponseParts {
             model_id: self.model_id,
             input_fingerprint: self.input_fingerprint,
             downstream_status: self.upstream_status,
-            downstream_headers: self.upstream_headers,
+            downstream_headers,
             request_metadata: self.request_metadata,
             extra_response_metadata,
             raw_payloads,
@@ -5030,6 +5330,49 @@ impl ForwardedResponseParts {
             request_metadata: self.attempt_request_metadata,
             extra_response_metadata,
         });
+        error.with_observability(self.request_metadata, attempt_record)
+    }
+
+    fn into_response_process_error(
+        self,
+        error: ProxyError,
+        mut extra_response_metadata: BTreeMap<String, String>,
+    ) -> ProxyError {
+        let finished_at_unix_ms = unix_time_millis();
+        let error_reason = error.to_string();
+        extra_response_metadata
+            .insert(String::from("response_process_error"), String::from("true"));
+        let mut attempt_record = failed_attempt_record(FailedAttemptRecordInput {
+            attempt_id: self.attempt_id,
+            attempt_number: 1,
+            request_id: self.request_id,
+            started_at_unix_ms: self.attempt_started_at_unix_ms,
+            finished_at_unix_ms,
+            error_type: error.error_type(),
+            error_reason: &error_reason,
+            request_metadata: self.attempt_request_metadata,
+            extra_response_metadata,
+        });
+        // Response body was received and status known; distinguish from transport failures.
+        attempt_record.http_status = Some(self.upstream_status.as_u16());
+        attempt_record.upstream_mode = self.upstream_mode;
+        attempt_record.response_metadata.insert(
+            String::from("upstream_response_received"),
+            String::from("true"),
+        );
+        attempt_record.response_metadata.insert(
+            String::from("http_status_success"),
+            if self.upstream_status.is_success() {
+                String::from("true")
+            } else {
+                String::from("false")
+            },
+        );
+        copy_selected_header_metadata(
+            &mut attempt_record.response_metadata,
+            &self.upstream_headers,
+            "response",
+        );
         error.with_observability(self.request_metadata, attempt_record)
     }
 }
@@ -9787,6 +10130,37 @@ fn classify_shielded_error_message_cause(message: &str) -> Option<UpstreamFailur
     }
 }
 
+fn sanitize_score_adapt_request_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = forwarded_request_headers(headers);
+    forwarded.remove(axum::http::header::ACCEPT_ENCODING);
+    forwarded.insert(
+        axum::http::header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    // Body changed; drop representation-integrity headers bound to original payload.
+    for name in [
+        "content-encoding",
+        "content-md5",
+        "digest",
+        "content-digest",
+        "repr-digest",
+        "etag",
+        "if-match",
+        "if-none-match",
+    ] {
+        if let Ok(header_name) = HeaderName::try_from(name) {
+            forwarded.remove(header_name);
+        }
+    }
+    forwarded
+}
+
+fn transformed_score_response_headers() -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers
+}
+
 fn forwarded_request_headers(headers: &HeaderMap) -> HeaderMap {
     let connection_tokens = connection_header_tokens(headers);
     let mut forwarded = HeaderMap::new();
@@ -10237,6 +10611,7 @@ fn copy_selected_header_metadata(
     for header in [
         CONTENT_TYPE,
         ACCEPT,
+        ACCEPT_ENCODING,
         AUTHORIZATION,
         HeaderName::from_static("x-api-key"),
         HeaderName::from_static("user-agent"),
@@ -10265,7 +10640,10 @@ fn header_value(value: &HeaderValue) -> String {
         .map_or_else(|_error| HEADER_VALUE_NOT_UTF8.to_owned(), str::to_owned)
 }
 
-fn extract_model_id(body: &Bytes) -> Option<String> {
+fn extract_model_id(method: &Method, uri: &Uri, body: &Bytes) -> Option<String> {
+    if score_adapter::is_score_request(method, uri) {
+        return score_adapter::model_id_from_score_body(body);
+    }
     serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
