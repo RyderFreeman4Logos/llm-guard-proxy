@@ -5455,12 +5455,16 @@ async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
     let child_pid_path = test_dir.join("child.pid");
+    let ready_path = test_dir.join("child.ready");
     let script_path = test_dir.join("spawn-descendant.sh");
+    // Publish the descendant PID and ready marker before the long sleep so
+    // full-suite scheduler delay cannot race the recovery timeout.
     fs::write(
         &script_path,
         format!(
-            "#!/bin/sh\nsleep 30 &\necho \"$!\" > {}\nsleep 30\n",
-            child_pid_path.display()
+            "#!/bin/sh\nset -eu\nsleep 30 &\nchild_pid=$!\nprintf '%s\\n' \"$child_pid\" > {pid}\n: > {ready}\nsleep 30\n",
+            pid = child_pid_path.display(),
+            ready = ready_path.display()
         ),
     )
     .expect("test recovery script should be written");
@@ -5471,15 +5475,21 @@ async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
         enabled: true,
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![script_path.display().to_string()],
-        recovery_timeout: Duration::from_millis(100),
+        // Startup allowance is separate from the timeout behavior under test:
+        // scripts still sleep far longer than this bound so recovery must kill.
+        recovery_timeout: Duration::from_secs(2),
         recovery_cooldown: Duration::from_millis(1),
         recovery_budget_window: Duration::from_secs(60),
         recovery_max_per_window: 1,
     };
     let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
 
-    let metadata = run_upstream_stall_recovery(&policy, &coordinator).await;
-    let child_pid = read_pid_file(&child_pid_path).await;
+    // Observe readiness in parallel with recovery so suite-load kill cleanup
+    // cannot hide the PID file before the post-wait reader starts.
+    let (metadata, child_pid) = tokio::join!(
+        run_upstream_stall_recovery(&policy, &coordinator),
+        read_pid_file_after_ready(&child_pid_path, &ready_path)
+    );
 
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
@@ -5497,12 +5507,14 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
     let child_pid_path = test_dir.join("child.pid");
+    let ready_path = test_dir.join("child.ready");
     let script_path = test_dir.join("spawn-term-resistant-descendant.sh");
     fs::write(
         &script_path,
         format!(
-            "#!/bin/sh\nsh -c 'trap \"\" TERM; echo \"$$\" > {}; while :; do sleep 1; done' &\nsleep 30\n",
-            child_pid_path.display()
+            "#!/bin/sh\nset -eu\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > {pid}; : > {ready}; while :; do sleep 1; done' &\n# Parent waits for the descendant readiness handshake before sleeping so suite\n# load cannot kill the group before the PID under test exists.\nwhile [ ! -f {ready} ]; do sleep 0.01; done\nsleep 30\n",
+            pid = child_pid_path.display(),
+            ready = ready_path.display()
         ),
     )
     .expect("test recovery script should be written");
@@ -5513,15 +5525,17 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process
         enabled: true,
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![script_path.display().to_string()],
-        recovery_timeout: Duration::from_millis(100),
+        recovery_timeout: Duration::from_secs(2),
         recovery_cooldown: Duration::from_millis(1),
         recovery_budget_window: Duration::from_secs(60),
         recovery_max_per_window: 1,
     };
     let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
 
-    let metadata = run_upstream_stall_recovery(&policy, &coordinator).await;
-    let child_pid = read_pid_file(&child_pid_path).await;
+    let (metadata, child_pid) = tokio::join!(
+        run_upstream_stall_recovery(&policy, &coordinator),
+        read_pid_file_after_ready(&child_pid_path, &ready_path)
+    );
 
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
@@ -5539,12 +5553,14 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_befor
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
     let child_pid_path = test_dir.join("child.pid");
+    let ready_path = test_dir.join("child.ready");
     let script_path = test_dir.join("term-resistant-leader.sh");
     fs::write(
         &script_path,
         format!(
-            "#!/bin/sh\ntrap '' TERM\necho \"$$\" > {}\nwhile :; do sleep 1; done\n",
-            child_pid_path.display()
+            "#!/bin/sh\nset -eu\ntrap '' TERM\nprintf '%s\\n' \"$$\" > {pid}\n: > {ready}\nwhile :; do sleep 1; done\n",
+            pid = child_pid_path.display(),
+            ready = ready_path.display()
         ),
     )
     .expect("test recovery script should be written");
@@ -5555,15 +5571,17 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_befor
         enabled: true,
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![script_path.display().to_string()],
-        recovery_timeout: Duration::from_millis(100),
+        recovery_timeout: Duration::from_secs(2),
         recovery_cooldown: Duration::from_millis(1),
         recovery_budget_window: Duration::from_secs(60),
         recovery_max_per_window: 1,
     };
     let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
 
-    let metadata = run_upstream_stall_recovery(&policy, &coordinator).await;
-    let child_pid = read_pid_file(&child_pid_path).await;
+    let (metadata, child_pid) = tokio::join!(
+        run_upstream_stall_recovery(&policy, &coordinator),
+        read_pid_file_after_ready(&child_pid_path, &ready_path)
+    );
 
     if metadata
         .get("upstream_stall_recovery_status")
@@ -18238,17 +18256,25 @@ fn remove_dir_all(path: &Path) {
 }
 
 #[cfg(unix)]
-async fn read_pid_file(path: &Path) -> u32 {
-    for _ in 0..20 {
-        if let Ok(text) = fs::read_to_string(path) {
-            return text
-                .trim()
-                .parse::<u32>()
-                .expect("pid file should contain a child pid");
+async fn read_pid_file_after_ready(pid_path: &Path, ready_path: &Path) -> u32 {
+    // Suite-load scheduling can delay shell startup well beyond 200ms.
+    // Wait long enough for the readiness handshake, but fail closed with
+    // cleanup-friendly diagnostics if the fixture still never appears.
+    for _ in 0..500 {
+        if ready_path.exists() {
+            if let Ok(text) = fs::read_to_string(pid_path) {
+                if let Ok(pid) = text.trim().parse::<u32>() {
+                    return pid;
+                }
+            }
         }
         sleep(Duration::from_millis(10)).await;
     }
-    panic!("pid file was not written: {}", path.display());
+    panic!(
+        "pid readiness handshake failed: ready={} pid={}",
+        ready_path.display(),
+        pid_path.display()
+    );
 }
 
 #[cfg(unix)]
