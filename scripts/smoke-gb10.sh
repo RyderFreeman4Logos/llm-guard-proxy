@@ -12,6 +12,7 @@ SCORE_MODEL="${LLM_GUARD_PROXY_SMOKE_SCORE_MODEL:-qwen3-reranker-8b}"
 REQUEST_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_REQUEST_TIMEOUT_SECS:-120}"
 CONNECT_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_CONNECT_TIMEOUT_SECS:-5}"
 READY_TIMEOUT_SECS="${LLM_GUARD_PROXY_SMOKE_READY_TIMEOUT_SECS:-120}"
+HEALTH_PROBE_TIMEOUT_MS="${LLM_GUARD_PROXY_SMOKE_HEALTH_PROBE_TIMEOUT_MS:-2000}"
 KEEP_RUN_DIR="${LLM_GUARD_PROXY_SMOKE_KEEP:-0}"
 ADMIN_TOKEN="${LLM_GUARD_PROXY_SMOKE_ADMIN_TOKEN:-}"
 
@@ -249,7 +250,7 @@ completions = {
     "max_tokens": 8,
 }
 embeddings = {"model": model, "input": "ping"}
-rerank = {"model": model, "query": "ping", "documents": ["pong"]}
+rerank = {"model": score_model, "query": "ping", "documents": ["pong"]}
 score = {"model": score_model, "text_1": "ping", "text_2": "pong"}
 
 for path, payload in [
@@ -435,6 +436,40 @@ PY
     fi
 }
 
+validate_rerank_response() {
+    python3 - "$1" <<'PY'
+import json
+import math
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+if not isinstance(payload, dict):
+    raise SystemExit("/v1/rerank response is not a JSON object")
+model = payload.get("model")
+if not isinstance(model, str) or not model:
+    raise SystemExit("/v1/rerank response model must be a non-empty string")
+results = payload.get("results", payload.get("data"))
+if not isinstance(results, list) or len(results) != 1:
+    raise SystemExit("/v1/rerank response results/data must contain exactly one result")
+result = results[0]
+if not isinstance(result, dict):
+    raise SystemExit("/v1/rerank result 0 must be an object")
+index = result.get("index", result.get("document_index"))
+if isinstance(index, bool) or not isinstance(index, int) or index != 0:
+    raise SystemExit("/v1/rerank result 0 must have index/document_index 0")
+score = result.get(
+    "relevance_score",
+    result.get("score", result.get("rerank_score")),
+)
+if isinstance(score, bool) or not isinstance(score, (int, float)):
+    raise SystemExit("/v1/rerank result 0 has invalid score")
+if not math.isfinite(float(score)):
+    raise SystemExit("/v1/rerank result 0 score must be finite")
+print(f"results=1 index=0 model={model}")
+PY
+}
+
 validate_score_response() {
     python3 - "$1" <<'PY'
 import json
@@ -580,22 +615,40 @@ PY
 wait_for_readiness() {
     local base_url="$1"
     local deadline=$((SECONDS + READY_TIMEOUT_SECS))
-    local config_status
-    local health_status
+    local config_status="000"
+    local health_status="000"
     while (( SECONDS < deadline )); do
         if ! kill -0 "${proxy_pid}" 2>/dev/null; then
             fail "proxy exited before readiness"
         fi
         set +e
         config_status="$(curl --silent --show-error --max-time 2 --output /dev/null --write-out "%{http_code}" "${base_url}/config-summary" 2>/dev/null)"
-        health_status="$(curl --silent --show-error --max-time 2 --output /dev/null --write-out "%{http_code}" "${base_url}/health" 2>/dev/null)"
+        health_status="$(curl --silent --show-error --max-time 3 --output /dev/null --write-out "%{http_code}" "${base_url}/health" 2>/dev/null)"
         set -e
         if [[ "${config_status}" == "200" && "${health_status}" == "200" ]]; then
             return 0
         fi
         sleep 0.25
     done
-    fail "proxy did not become ready within ${READY_TIMEOUT_SECS}s"
+    fail "proxy did not become ready within ${READY_TIMEOUT_SECS}s; last config-summary=${config_status} health=${health_status}"
+}
+
+request_health_until_ready() {
+    local base_url="$1"
+    local response_body_path="$2"
+    local response_headers_path="$3"
+    local deadline=$((SECONDS + READY_TIMEOUT_SECS))
+    local status="000"
+
+    while (( SECONDS < deadline )); do
+        status="$(http_request GET "${base_url}/health" - "${response_body_path}" "${response_headers_path}" "health")"
+        if [[ "${status}" == "200" ]]; then
+            printf '%s' "${status}"
+            return 0
+        fi
+        sleep 0.25
+    done
+    fail "GET /health did not return 200 within ${READY_TIMEOUT_SECS}s; last status=${status}"
 }
 
 require_command python3
@@ -652,7 +705,7 @@ sqlite_path = $(toml_quote "${sqlite_path}")
 capture_raw_payloads = false
 metrics_enabled = true
 health_upstream_probe_enabled = true
-health_upstream_probe_timeout_ms = 500
+health_upstream_probe_timeout_ms = ${HEALTH_PROBE_TIMEOUT_MS}
 debug_summary_enabled = true
 debug_summary_admin_token = $(toml_quote "${ADMIN_TOKEN}")
 debug_summary_max_records = 20
@@ -709,8 +762,7 @@ printf 'smoke-gb10: endpoint=/config-summary status=%s %s\n' \
 
 health_body="${run_dir}/health.body.json"
 health_headers="${run_dir}/health.headers"
-health_status="$(http_request GET "${base_url}/health" - "${health_body}" "${health_headers}" "health")"
-require_http_status "GET /health" "${health_status}" "200"
+health_status="$(request_health_until_ready "${base_url}" "${health_body}" "${health_headers}")"
 health_summary="$(validate_health_response "${health_body}")"
 printf 'smoke-gb10: endpoint=/health status=%s %s\n' \
     "${health_status}" "${health_summary}"
@@ -754,8 +806,7 @@ printf 'smoke-gb10: endpoint=/v1/chat/completions mode=stream status=%s %s\n' \
 
 for probe in \
     "completions:/v1/completions:${completions_payload}" \
-    "embeddings:/v1/embeddings:${embeddings_payload}" \
-    "rerank:/v1/rerank:${rerank_payload}"
+    "embeddings:/v1/embeddings:${embeddings_payload}"
 do
     label="${probe%%:*}"
     rest="${probe#*:}"
@@ -773,6 +824,15 @@ do
             "${endpoint}" "${status}"
     fi
 done
+
+rerank_body="${run_dir}/rerank.body.json"
+rerank_headers="${run_dir}/rerank.headers"
+rerank_status="$(http_request POST "${base_url}/v1/rerank" "${rerank_payload}" "${rerank_body}" "${rerank_headers}" "rerank")"
+require_http_status "POST /v1/rerank" "${rerank_status}" "200"
+rerank_summary="$(validate_rerank_response "${rerank_body}")"
+forwarded_calls=$((forwarded_calls + 1))
+printf 'smoke-gb10: endpoint=/v1/rerank status=%s %s\n' \
+    "${rerank_status}" "${rerank_summary}"
 
 score_body="${run_dir}/score.body.json"
 score_headers="${run_dir}/score.headers"

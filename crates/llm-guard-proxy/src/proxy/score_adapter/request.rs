@@ -1,23 +1,51 @@
 //! Parse and validate score request JSON without losing Pydantic-compatible integers.
 
-use std::collections::BTreeMap;
+use std::{borrow::Cow, collections::BTreeMap};
 
 use axum::body::Bytes;
 use serde_json::{Value, value::RawValue};
 
+const MAX_NUMBER_INT_CHARACTERS: usize = 4_300;
+
 #[cfg(test)]
 thread_local! {
     static PYDANTIC_VALUE_PARSE_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RAW_LEXICAL_SCAN_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
-pub(super) fn reset_pydantic_value_parse_count() {
+pub(in crate::proxy) fn reset_pydantic_value_parse_count() {
     PYDANTIC_VALUE_PARSE_COUNT.set(0);
 }
 
 #[cfg(test)]
-pub(super) fn pydantic_value_parse_count() -> usize {
+pub(in crate::proxy) fn pydantic_value_parse_count() -> usize {
     PYDANTIC_VALUE_PARSE_COUNT.get()
+}
+
+#[cfg(test)]
+pub(super) fn reset_raw_lexical_scan_bytes() {
+    RAW_LEXICAL_SCAN_BYTES.set(0);
+}
+
+#[cfg(test)]
+pub(super) fn raw_lexical_scan_bytes() -> usize {
+    RAW_LEXICAL_SCAN_BYTES.get()
+}
+
+fn record_lexical_scan(bytes: usize) {
+    #[cfg(test)]
+    RAW_LEXICAL_SCAN_BYTES.set(RAW_LEXICAL_SCAN_BYTES.get().saturating_add(bytes));
+    #[cfg(not(test))]
+    let _ = bytes;
+}
+
+fn deserialize_lexical<'de, T>(lexical: &'de str) -> Result<T, serde_json::Error>
+where
+    T: serde::Deserialize<'de>,
+{
+    record_lexical_scan(lexical.len());
+    serde_json::from_str(lexical)
 }
 
 #[derive(Default)]
@@ -82,11 +110,13 @@ impl<'de> serde::Deserialize<'de> for RawScoreObject {
                     if is_canonical && matches!(key.as_str(), "query" | "documents") {
                         continue;
                     }
-                    let (parsed, needs_preservation) =
-                        parse_pydantic_json_lexical(&lexical).map_err(serde::de::Error::custom)?;
-                    if needs_preservation {
-                        preserved_fields.insert(key.clone(), lexical);
-                    }
+                    let parsed =
+                        if matches!(key.as_str(), "text_1" | "text_2" | "query" | "documents") {
+                            parse_score_input_lexical(&lexical)
+                        } else {
+                            parse_pydantic_json_lexical(&lexical)
+                        }
+                        .map_err(serde::de::Error::custom)?;
                     object.insert(key, parsed);
                 }
                 Ok(RawScoreObject {
@@ -101,68 +131,16 @@ impl<'de> serde::Deserialize<'de> for RawScoreObject {
     }
 }
 
-struct RawTopNOnly(RawTopNState);
-
-impl<'de> serde::Deserialize<'de> for RawTopNOnly {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct RawTopNOnlyVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for RawTopNOnlyVisitor {
-            type Value = RawTopNOnly;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a JSON object")
-            }
-
-            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
-            where
-                M: serde::de::MapAccess<'de>,
-            {
-                let mut top_n = RawTopNState::default();
-                while let Some(key) = map.next_key::<String>()? {
-                    if key == "top_n" {
-                        let value = map.next_value::<&'de RawValue>()?;
-                        top_n.seen = true;
-                        top_n.last_lax = parse_lax_top_n_raw(value);
-                    } else {
-                        map.next_value::<serde::de::IgnoredAny>()?;
-                    }
-                }
-                Ok(RawTopNOnly(top_n))
-            }
-        }
-
-        deserializer.deserialize_map(RawTopNOnlyVisitor)
-    }
-}
-
 pub(super) struct ParsedScoreValue {
     pub(super) value: Value,
     pub(super) preserved_fields: BTreeMap<String, String>,
 }
 
 pub(super) fn parse_score_value(body: &Bytes) -> Result<ParsedScoreValue, String> {
-    if contains_pydantic_invalid_integer(body) {
-        return Err(String::from("invalid score JSON integer"));
-    }
-    match serde_json::from_slice::<Value>(body) {
-        Ok(mut value)
-            if !contains_non_serde_integer(body)
-                && !contains_pydantic_json_float(body)
-                && !contains_json_nonfinite(body) =>
-        {
-            normalize_legacy_top_n_from_raw(body, &mut value)?;
-            Ok(ParsedScoreValue {
-                value,
-                preserved_fields: BTreeMap::new(),
-            })
-        }
-        Ok(_) => parse_score_value_from_raw(body, None),
-        Err(error) => parse_score_value_from_raw(body, Some(&error)),
-    }
+    let original = std::str::from_utf8(body).map_err(|_| String::from("invalid score JSON"))?;
+    let normalized = normalize_score_json(original)?;
+    let was_normalized = matches!(&normalized, Cow::Owned(_));
+    parse_score_value_from_raw(original, normalized.as_ref(), was_normalized)
 }
 
 pub(crate) fn model_id_from_score_body(body: &Bytes) -> Option<String> {
@@ -175,56 +153,25 @@ pub(crate) fn model_id_from_score_body(body: &Bytes) -> Option<String> {
     })
 }
 
-fn normalize_legacy_top_n_from_raw(body: &Bytes, value: &mut Value) -> Result<(), String> {
-    let Some(object) = value.as_object_mut() else {
-        return Ok(());
-    };
-    let is_legacy = !object.contains_key("text_1")
-        && !object.contains_key("text_2")
-        && object.contains_key("query")
-        && object.contains_key("documents");
-    if !is_legacy || !object.contains_key("top_n") {
-        return Ok(());
-    }
-
-    let raw_top_n: RawTopNOnly =
-        serde_json::from_slice(body).map_err(|error| format!("invalid score JSON: {error}"))?;
-    let top_n = raw_top_n
-        .0
-        .last_lax
-        .ok_or_else(|| String::from("score top_n must be a valid integer"))?;
-    object.insert(String::from("top_n"), lax_top_n_representative(top_n));
-    Ok(())
-}
-
 fn parse_score_value_from_raw(
-    body: &Bytes,
-    default_error: Option<&serde_json::Error>,
+    original: &str,
+    parse_input: &str,
+    was_normalized: bool,
 ) -> Result<ParsedScoreValue, String> {
-    let default_message = || {
-        default_error.map_or_else(
-            || String::from("invalid score JSON"),
-            |error| format!("invalid score JSON: {error}"),
-        )
-    };
-    let original = std::str::from_utf8(body).map_err(|_| default_message())?;
-    let sanitized_owned;
-    let parse_input = if contains_json_nonfinite(body) {
-        sanitized_owned = sanitize_json_nonfinite(original);
-        sanitized_owned.as_str()
-    } else {
-        original
-    };
     let mut raw_object: RawScoreObject =
-        serde_json::from_str(parse_input).map_err(|_| default_message())?;
-    if !std::ptr::eq(parse_input, original) {
-        // Length-preserving nonfinite sanitization keeps structure offsets aligned, but
+        deserialize_lexical(parse_input).map_err(|error| format!("invalid score JSON: {error}"))?;
+    if was_normalized {
+        // Length-preserving numeric normalization keeps structure offsets aligned, but
         // preserved extras must round-trip the original FastAPI/Pydantic lexemes.
         if let Ok(originals) = top_level_field_raws(original) {
             for (key, raw) in &mut raw_object.preserved_fields {
                 if let Some(orig) = originals.get(key) {
                     raw.clone_from(orig);
                 }
+            }
+            if let Some(top_n) = originals.get("top_n") {
+                raw_object.top_n.seen = true;
+                raw_object.top_n.last_lax = parse_lax_top_n_lexical(top_n);
             }
         }
     }
@@ -253,42 +200,53 @@ fn parse_score_value_from_raw(
     })
 }
 
-struct PydanticFallbackValue {
-    value: Value,
-    changed: bool,
-}
+struct RawObject(BTreeMap<String, String>);
 
-impl<'de> serde::Deserialize<'de> for PydanticFallbackValue {
+impl<'de> serde::Deserialize<'de> for RawObject {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        struct PydanticFallbackVisitor;
+        struct RawObjectVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for PydanticFallbackVisitor {
-            type Value = PydanticFallbackValue;
+        impl<'de> serde::de::Visitor<'de> for RawObjectVisitor {
+            type Value = RawObject;
 
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a JSON object or array containing a large integer")
+                formatter.write_str("a JSON object")
             }
 
             fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
             where
                 M: serde::de::MapAccess<'de>,
             {
-                let mut object = serde_json::Map::new();
-                let mut changed = false;
+                let mut fields = BTreeMap::new();
                 while let Some(key) = map.next_key::<String>()? {
                     let raw = map.next_value::<&'de RawValue>()?;
-                    let (value, child_changed) =
-                        parse_pydantic_json_lexical(raw.get()).map_err(serde::de::Error::custom)?;
-                    changed |= child_changed;
-                    object.insert(key, value);
+                    fields.insert(key, raw.get().to_owned());
                 }
-                Ok(PydanticFallbackValue {
-                    value: Value::Object(object),
-                    changed,
-                })
+                Ok(RawObject(fields))
+            }
+        }
+
+        deserializer.deserialize_map(RawObjectVisitor)
+    }
+}
+
+struct RawArray(Vec<String>);
+
+impl<'de> serde::Deserialize<'de> for RawArray {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct RawArrayVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for RawArrayVisitor {
+            type Value = RawArray;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON array")
             }
 
             fn visit_seq<S>(self, mut sequence: S) -> Result<Self::Value, S::Error>
@@ -296,92 +254,117 @@ impl<'de> serde::Deserialize<'de> for PydanticFallbackValue {
                 S: serde::de::SeqAccess<'de>,
             {
                 let mut values = Vec::new();
-                let mut changed = false;
                 while let Some(raw) = sequence.next_element::<&'de RawValue>()? {
-                    let (value, child_changed) =
-                        parse_pydantic_json_lexical(raw.get()).map_err(serde::de::Error::custom)?;
-                    changed |= child_changed;
-                    values.push(value);
+                    values.push(raw.get().to_owned());
                 }
-                Ok(PydanticFallbackValue {
-                    value: Value::Array(values),
-                    changed,
-                })
+                Ok(RawArray(values))
             }
         }
 
-        deserializer.deserialize_any(PydanticFallbackVisitor)
+        deserializer.deserialize_seq(RawArrayVisitor)
     }
 }
 
-fn parse_pydantic_json_lexical(lexical: &str) -> Result<(Value, bool), String> {
+fn parse_score_input_lexical(lexical: &str) -> Result<Value, String> {
+    if lexical.trim_start().starts_with('{') {
+        return parse_multimodal_object(lexical);
+    }
+    parse_pydantic_json_lexical(lexical)
+}
+
+fn parse_multimodal_object(lexical: &str) -> Result<Value, String> {
+    let RawObject(fields) =
+        deserialize_lexical(lexical).map_err(|error| format!("invalid score JSON: {error}"))?;
+    let mut object = serde_json::Map::new();
+    for (key, raw) in fields {
+        let value = if key == "content" {
+            parse_content_parts(&raw)?
+        } else {
+            Value::Null
+        };
+        object.insert(key, value);
+    }
+    Ok(Value::Object(object))
+}
+
+fn parse_content_parts(lexical: &str) -> Result<Value, String> {
+    let RawArray(parts) =
+        deserialize_lexical(lexical).map_err(|error| format!("invalid score JSON: {error}"))?;
+    parts
+        .into_iter()
+        .map(|part| parse_content_part(&part))
+        .collect::<Result<Vec<_>, _>>()
+        .map(Value::Array)
+}
+
+fn parse_content_part(lexical: &str) -> Result<Value, String> {
+    let RawObject(fields) =
+        deserialize_lexical(lexical).map_err(|error| format!("invalid score JSON: {error}"))?;
+    let mut object = serde_json::Map::new();
+    for (key, raw) in fields {
+        let value = match key.as_str() {
+            "type" | "text" | "uuid" => parse_required_value(&raw)?,
+            "image_url" | "video_url" => parse_url_object(&raw)?,
+            "image_embeds" => parse_image_embeds(&raw)?,
+            _ => Value::Null,
+        };
+        object.insert(key, value);
+    }
+    Ok(Value::Object(object))
+}
+
+fn parse_url_object(lexical: &str) -> Result<Value, String> {
+    if !lexical.trim_start().starts_with('{') {
+        return parse_required_value(lexical);
+    }
+    let RawObject(fields) =
+        deserialize_lexical(lexical).map_err(|error| format!("invalid score JSON: {error}"))?;
+    let mut object = serde_json::Map::new();
+    for (key, raw) in fields {
+        let value = if matches!(key.as_str(), "url" | "detail") {
+            parse_required_value(&raw)?
+        } else {
+            Value::Null
+        };
+        object.insert(key, value);
+    }
+    Ok(Value::Object(object))
+}
+
+fn parse_image_embeds(lexical: &str) -> Result<Value, String> {
+    if !lexical.trim_start().starts_with('{') {
+        return parse_required_value(lexical);
+    }
+    let RawObject(fields) =
+        deserialize_lexical(lexical).map_err(|error| format!("invalid score JSON: {error}"))?;
+    fields
+        .into_iter()
+        .map(|(key, raw)| parse_required_value(&raw).map(|value| (key, value)))
+        .collect::<Result<serde_json::Map<_, _>, _>>()
+        .map(Value::Object)
+}
+
+fn parse_required_value(lexical: &str) -> Result<Value, String> {
+    parse_pydantic_json_lexical(lexical)
+}
+
+fn parse_pydantic_json_lexical(lexical: &str) -> Result<Value, String> {
     #[cfg(test)]
     PYDANTIC_VALUE_PARSE_COUNT.set(PYDANTIC_VALUE_PARSE_COUNT.get() + 1);
-    if contains_non_serde_integer(lexical.as_bytes())
-        || contains_pydantic_json_float(lexical.as_bytes())
-    {
-        let is_integer_token = lexical
-            .as_bytes()
-            .first()
-            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'-')
-            && !lexical.contains(['.', 'e', 'E']);
-        if is_integer_token {
-            return classify_number_int(lexical)
-                .map(|_| (Value::from(0), true))
-                .ok_or_else(|| String::from("invalid score JSON integer"));
-        }
-        if let Some(value) = parse_pydantic_json_float(lexical) {
-            if value.is_finite() {
-                return Ok((Value::from(value), false));
-            }
-            return Ok((Value::from(0), true));
-        }
-        if lexical.starts_with(['{', '[']) {
-            let parsed: PydanticFallbackValue = serde_json::from_str(lexical)
-                .map_err(|error| format!("invalid score JSON: {error}"))?;
-            return Ok((parsed.value, parsed.changed));
-        }
-    }
-
-    match serde_json::from_str::<Value>(lexical) {
-        Ok(value) => Ok((value, false)),
-        Err(default_error) => {
-            let is_integer_token = lexical
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'-')
-                && !lexical.contains(['.', 'e', 'E']);
-            if is_integer_token && classify_number_int(lexical).is_some() {
-                return Ok((Value::from(0), true));
-            }
-            if let Some(value) = parse_pydantic_json_float(lexical) {
-                if value.is_finite() {
-                    return Ok((Value::from(value), false));
-                }
-                return Ok((Value::from(0), true));
-            }
-            if matches!(lexical, "NaN" | "Infinity" | "-Infinity") {
-                return Ok((Value::from(0), true));
-            }
-            if !lexical.starts_with(['{', '[']) {
-                return Err(format!("invalid score JSON: {default_error}"));
-            }
-
-            let parsed: PydanticFallbackValue = serde_json::from_str(lexical)
-                .map_err(|error| format!("invalid score JSON: {error}"))?;
-            Ok((parsed.value, parsed.changed))
-        }
-    }
+    deserialize_lexical(lexical).map_err(|error| format!("invalid score JSON: {error}"))
 }
 
-fn contains_json_nonfinite(json: &[u8]) -> bool {
-    find_json_nonfinite(json).is_some()
-}
-
-fn find_json_nonfinite(json: &[u8]) -> Option<(usize, &'static str)> {
+/// Validate score JSON resource bounds and normalize Pydantic-only numeric tokens once.
+///
+/// The returned owned string, when needed, has exactly the input length. Replaced number
+/// tokens become zero followed by JSON whitespace so raw top-level field offsets remain valid.
+fn normalize_score_json(input: &str) -> Result<Cow<'_, str>, String> {
+    let json = input.as_bytes();
+    let mut normalized: Option<Vec<u8>> = None;
     let mut index = 0_usize;
     let mut in_string = false;
     let mut escaped = false;
+    let mut closing_stack = Vec::with_capacity(super::MAX_SCORE_JSON_DEPTH);
     while index < json.len() {
         let byte = json[index];
         if in_string {
@@ -400,27 +383,142 @@ fn find_json_nonfinite(json: &[u8]) -> Option<(usize, &'static str)> {
             index += 1;
             continue;
         }
+        if matches!(byte, b'{' | b'[') {
+            closing_stack.push(if byte == b'{' { b'}' } else { b']' });
+            if closing_stack.len() > super::MAX_SCORE_JSON_DEPTH {
+                record_lexical_scan(index + 1);
+                return Err(format!(
+                    "score JSON exceeds maximum structure depth of {}",
+                    super::MAX_SCORE_JSON_DEPTH
+                ));
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'}' | b']') {
+            if closing_stack.pop() != Some(byte) {
+                record_lexical_scan(index + 1);
+                return Err(String::from("invalid score JSON container"));
+            }
+            index += 1;
+            continue;
+        }
         if json[index..].starts_with(b"-Infinity")
             && is_json_token_boundary(json, index.wrapping_sub(1))
             && is_json_token_boundary(json, index + 9)
         {
-            return Some((index, "-Infinity"));
+            normalize_number_token(&mut normalized, json, index, index + 9);
+            index += 9;
+            continue;
         }
         if json[index..].starts_with(b"Infinity")
             && is_json_token_boundary(json, index.wrapping_sub(1))
             && is_json_token_boundary(json, index + 8)
         {
-            return Some((index, "Infinity"));
+            normalize_number_token(&mut normalized, json, index, index + 8);
+            index += 8;
+            continue;
         }
         if json[index..].starts_with(b"NaN")
             && is_json_token_boundary(json, index.wrapping_sub(1))
             && is_json_token_boundary(json, index + 3)
         {
-            return Some((index, "NaN"));
+            normalize_number_token(&mut normalized, json, index, index + 3);
+            index += 3;
+            continue;
+        }
+        if byte.is_ascii_digit() || byte == b'-' {
+            let start = index;
+            let (end, is_float) = scan_json_number(json, start).inspect_err(|_error| {
+                record_lexical_scan(json.len());
+            })?;
+            index = end;
+            let token = &json[start..index];
+            if !is_float {
+                let magnitude = token.strip_prefix(b"-").unwrap_or(token);
+                if magnitude.len() > MAX_NUMBER_INT_CHARACTERS {
+                    record_lexical_scan(index);
+                    return Err(String::from("invalid score JSON integer"));
+                }
+                if integer_exceeds_serde_range(token) {
+                    normalize_number_token(&mut normalized, json, start, index);
+                }
+            } else if lexical_core::parse::<f64>(token).is_ok_and(|value| !value.is_finite()) {
+                normalize_number_token(&mut normalized, json, start, index);
+            }
+            continue;
         }
         index += 1;
     }
-    None
+    record_lexical_scan(json.len());
+    normalized.map_or(Ok(Cow::Borrowed(input)), |bytes| {
+        String::from_utf8(bytes)
+            .map(Cow::Owned)
+            .map_err(|_| String::from("invalid score JSON"))
+    })
+}
+
+fn scan_json_number(json: &[u8], start: usize) -> Result<(usize, bool), String> {
+    let mut index = start;
+    let mut is_float = false;
+    if json[index] == b'-' {
+        index += 1;
+    }
+
+    match json.get(index) {
+        Some(b'0') => {
+            index += 1;
+            if json.get(index).is_some_and(u8::is_ascii_digit) {
+                return Err(String::from("invalid score JSON number"));
+            }
+        }
+        Some(b'1'..=b'9') => {
+            index += 1;
+            while json.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+        }
+        _ => return Err(String::from("invalid score JSON number")),
+    }
+
+    if json.get(index) == Some(&b'.') {
+        is_float = true;
+        index += 1;
+        let fraction_start = index;
+        while json.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == fraction_start {
+            return Err(String::from("invalid score JSON number"));
+        }
+    }
+
+    if matches!(json.get(index), Some(b'e' | b'E')) {
+        is_float = true;
+        index += 1;
+        if matches!(json.get(index), Some(b'+' | b'-')) {
+            index += 1;
+        }
+        let exponent_start = index;
+        while json.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == exponent_start {
+            return Err(String::from("invalid score JSON number"));
+        }
+    }
+
+    if !is_json_value_end_boundary(json, index) {
+        return Err(String::from("invalid score JSON number"));
+    }
+    Ok((index, is_float))
+}
+
+fn is_json_value_end_boundary(json: &[u8], index: usize) -> bool {
+    matches!(
+        json.get(index),
+        None | Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}')
+    )
 }
 
 fn is_json_token_boundary(json: &[u8], index: usize) -> bool {
@@ -433,63 +531,25 @@ fn is_json_token_boundary(json: &[u8], index: usize) -> bool {
     }
 }
 
-fn sanitize_json_nonfinite(input: &str) -> String {
-    let bytes = input.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0_usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if in_string {
-            out.push(byte);
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-        if byte == b'"' {
-            out.push(byte);
-            in_string = true;
-            index += 1;
-            continue;
-        }
-        if bytes[index..].starts_with(b"-Infinity")
-            && is_json_token_boundary(bytes, index.wrapping_sub(1))
-            && is_json_token_boundary(bytes, index + 9)
-        {
-            out.extend_from_slice(b"-0.000000");
-            index += 9;
-            continue;
-        }
-        if bytes[index..].starts_with(b"Infinity")
-            && is_json_token_boundary(bytes, index.wrapping_sub(1))
-            && is_json_token_boundary(bytes, index + 8)
-        {
-            out.extend_from_slice(b"0.000000");
-            index += 8;
-            continue;
-        }
-        if bytes[index..].starts_with(b"NaN")
-            && is_json_token_boundary(bytes, index.wrapping_sub(1))
-            && is_json_token_boundary(bytes, index + 3)
-        {
-            out.extend_from_slice(b"0.0");
-            index += 3;
-            continue;
-        }
-        out.push(byte);
-        index += 1;
-    }
-    String::from_utf8(out).unwrap_or_else(|_| input.to_owned())
+fn normalize_number_token(
+    normalized: &mut Option<Vec<u8>>,
+    original: &[u8],
+    start: usize,
+    end: usize,
+) {
+    let output = normalized.get_or_insert_with(|| original.to_vec());
+    let zero_end = if original[start] == b'-' {
+        output[start + 1] = b'0';
+        start + 2
+    } else {
+        output[start] = b'0';
+        start + 1
+    };
+    output[zero_end..end].fill(b' ');
 }
 
 fn top_level_field_raws(json: &str) -> Result<BTreeMap<String, String>, String> {
+    record_lexical_scan(json.len());
     let bytes = json.as_bytes();
     let mut index = skip_ws(bytes, 0);
     if bytes.get(index) != Some(&b'{') {
@@ -574,9 +634,7 @@ fn capture_json_value(json: &str, start: usize) -> Result<(String, usize), Strin
         return Err(String::from("unterminated score JSON string value"));
     }
     if first == b'{' || first == b'[' {
-        let opening = first;
-        let closing = if first == b'{' { b'}' } else { b']' };
-        let mut depth = 1_usize;
+        let mut closing_stack = vec![if first == b'{' { b'}' } else { b']' }];
         let mut index = start + 1;
         let mut in_string = false;
         let mut escaped = false;
@@ -595,10 +653,13 @@ fn capture_json_value(json: &str, start: usize) -> Result<(String, usize), Strin
             }
             match byte {
                 b'"' => in_string = true,
-                b if b == opening => depth += 1,
-                b if b == closing => {
-                    depth -= 1;
-                    if depth == 0 {
+                b'{' => closing_stack.push(b'}'),
+                b'[' => closing_stack.push(b']'),
+                b'}' | b']' => {
+                    if closing_stack.pop() != Some(byte) {
+                        return Err(String::from("mismatched score JSON container"));
+                    }
+                    if closing_stack.is_empty() {
                         return Ok((json[start..=index].to_owned(), index + 1));
                     }
                 }
@@ -638,72 +699,7 @@ fn capture_json_value(json: &str, start: usize) -> Result<(String, usize), Strin
     Err(String::from("invalid score JSON value token"))
 }
 
-pub(super) fn contains_non_serde_integer(json: &[u8]) -> bool {
-    contains_json_number_matching(json, integer_exceeds_serde_range)
-}
-
-fn contains_pydantic_json_float(json: &[u8]) -> bool {
-    contains_json_number_matching(json, |token| {
-        token.contains(&b'.') || token.contains(&b'e') || token.contains(&b'E')
-    })
-}
-
-fn contains_pydantic_invalid_integer(json: &[u8]) -> bool {
-    const MAX_NUMBER_INT_CHARACTERS: usize = 4_300;
-    contains_json_number_matching(json, |token| {
-        let magnitude = token.strip_prefix(b"-").unwrap_or(token);
-        !token.contains(&b'.')
-            && !token.contains(&b'e')
-            && !token.contains(&b'E')
-            && magnitude.len() > MAX_NUMBER_INT_CHARACTERS
-    })
-}
-
-fn contains_json_number_matching(json: &[u8], predicate: impl Fn(&[u8]) -> bool) -> bool {
-    let mut index = 0_usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    while index < json.len() {
-        let byte = json[index];
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if byte == b'\\' {
-                escaped = true;
-            } else if byte == b'"' {
-                in_string = false;
-            }
-            index += 1;
-            continue;
-        }
-        if byte == b'"' {
-            in_string = true;
-            index += 1;
-            continue;
-        }
-        if byte.is_ascii_digit() || byte == b'-' {
-            let start = index;
-            index += 1;
-            while index < json.len()
-                && (json[index].is_ascii_digit()
-                    || matches!(json[index], b'.' | b'e' | b'E' | b'+' | b'-'))
-            {
-                index += 1;
-            }
-            if predicate(&json[start..index]) {
-                return true;
-            }
-            continue;
-        }
-        index += 1;
-    }
-    false
-}
-
 fn integer_exceeds_serde_range(token: &[u8]) -> bool {
-    if token.contains(&b'.') || token.contains(&b'e') || token.contains(&b'E') {
-        return false;
-    }
     let (negative, digits) = token
         .strip_prefix(b"-")
         .map_or((false, token), |digits| (true, digits));
@@ -716,7 +712,10 @@ fn integer_exceeds_serde_range(token: &[u8]) -> bool {
 }
 
 fn parse_lax_top_n_raw(raw: &RawValue) -> Option<LaxTopN> {
-    let lexical = raw.get();
+    parse_lax_top_n_lexical(raw.get())
+}
+
+fn parse_lax_top_n_lexical(lexical: &str) -> Option<LaxTopN> {
     match lexical {
         "false" => Some(LaxTopN::NonPositive),
         "true" => Some(LaxTopN::Positive(1)),
@@ -745,19 +744,6 @@ fn lax_top_n_representative(top_n: LaxTopN) -> Value {
         LaxTopN::NonPositive => Value::from(0),
         LaxTopN::Positive(value) => Value::from(value),
     }
-}
-
-fn parse_pydantic_json_float(lexical: &str) -> Option<f64> {
-    let starts_like_json_number = lexical
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| *byte == b'-' || byte.is_ascii_digit());
-    (starts_like_json_number
-        && lexical
-            .bytes()
-            .any(|byte| matches!(byte, b'.' | b'e' | b'E')))
-    .then(|| lexical_core::parse::<f64>(lexical.as_bytes()).ok())
-    .flatten()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -31,8 +31,16 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
-clippy:
+clippy: clippy-all-features clippy-feature-matrix
+
+clippy-all-features:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+clippy-feature-matrix:
+    cargo clippy -p llm-guard-proxy --all-targets --no-default-features -- -D warnings
+    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features guard -- -D warnings
+    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features param-override -- -D warnings
+    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features upstream-hot-restart -- -D warnings
 
 test:
     cargo test --workspace --all-features

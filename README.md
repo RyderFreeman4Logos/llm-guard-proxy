@@ -72,17 +72,20 @@ Checks performed:
   `chat_template_kwargs.enable_thinking=false` for low-token AEON/vLLM runs.
 - `POST /v1/chat/completions` with `stream=true` must return
   `text/event-stream` data.
-- `POST /v1/completions`, `POST /v1/embeddings`, and `POST /v1/rerank` are
-  probed and reported with the exact upstream status. Current GB10 observations
-  classify `/v1/embeddings` and `/v1/rerank` as upstream-unsupported when they
-  return `404`.
+- `POST /v1/completions` and `POST /v1/embeddings` are probed and reported with
+  the exact upstream status. `POST /v1/rerank` must succeed with the separately
+  configurable score model and return exactly one result for the one-document
+  smoke fixture: index `0` with a finite numeric score.
 - Scalar text-only `POST /v1/score` requests are unconditionally adapted to
   `/v1/rerank`; canonical batch and multimodal shapes plus complete future
   variants remain passthrough, while legacy `query`/`documents` shapes are
   forwarded to `/v1/rerank`.
   The smoke requires a complete adapted score response. Score request bodies
   are limited to 1 MiB before model extraction or JSON shape parsing to bound
-  parser amplification.
+  parser amplification. Transformable score requests carrying `Signature`,
+  `Signature-Input`, or non-`Bearer`/non-`Basic` `Authorization` credentials are
+  rejected locally because rewriting could invalidate signatures; passthrough
+  score shapes and direct rerank requests remain intact.
 - `GET /v1/../admin` is sent with `curl --path-as-is` and must be rejected by
   the proxy with `400` before any upstream attempt.
 - SQLite observability must contain one request row per smoke call, one attempt
@@ -94,6 +97,7 @@ Useful overrides:
 LLM_GUARD_PROXY_SMOKE_PORT=19009 just smoke-gb10
 LLM_GUARD_PROXY_SMOKE_MODEL=aeon-ultimate just smoke-gb10
 LLM_GUARD_PROXY_SMOKE_SCORE_MODEL=qwen3-reranker-8b just smoke-gb10
+LLM_GUARD_PROXY_SMOKE_HEALTH_PROBE_TIMEOUT_MS=2000 just smoke-gb10
 LLM_GUARD_PROXY_SMOKE_UPSTREAM_BASE_URL=http://gb10:18009/v1 just smoke-gb10
 LLM_GUARD_PROXY_BIN=target/debug/llm-guard-proxy just smoke-gb10
 LLM_GUARD_PROXY_SMOKE_KEEP=1 just smoke-gb10

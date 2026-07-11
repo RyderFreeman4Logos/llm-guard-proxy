@@ -19,11 +19,15 @@ mod request;
 
 /// Bound score parsing amplification before model extraction or shape classification.
 pub(crate) const MAX_SCORE_BODY_BYTES: usize = 1024 * 1024;
+/// Bound parser stack use below `serde_json`'s recursion limit; the root container is depth one.
+pub(crate) const MAX_SCORE_JSON_DEPTH: usize = 64;
 
 pub(crate) use request::model_id_from_score_body;
 #[cfg(test)]
-use request::{contains_non_serde_integer, parse_lax_top_n_string};
+use request::parse_lax_top_n_string;
 use request::{has_valid_lax_top_n, parse_lax_positive_top_n, parse_score_value};
+#[cfg(test)]
+pub(super) use request::{pydantic_value_parse_count, reset_pydantic_value_parse_count};
 
 /// Whether this request is a score endpoint that should be rewritten to rerank.
 #[must_use]

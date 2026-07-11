@@ -703,6 +703,53 @@ fn raw_fallback_rejects_each_pydantic_invalid_number_occurrence() {
 }
 
 #[test]
+fn rejects_malformed_json_numbers_before_normalization() {
+    let long_zero = "0".repeat(1_000);
+    let cases = [
+        ("ignored leading zero", String::from(r#""future":00"#)),
+        (
+            "ignored long leading zero",
+            format!(r#""future":{long_zero}"#),
+        ),
+        ("ignored repeated minus", String::from(r#""future":--1"#)),
+        ("known repeated signs", String::from(r#""top_n":-+1"#)),
+        ("ignored internal minus", String::from(r#""future":1-2"#)),
+        ("known internal plus", String::from(r#""top_n":1+2"#)),
+        ("ignored empty fraction", String::from(r#""future":1."#)),
+        ("known empty exponent", String::from(r#""top_n":1e"#)),
+        (
+            "ignored empty signed exponent",
+            String::from(r#""future":1e+"#),
+        ),
+        ("known repeated decimal", String::from(r#""top_n":1..2"#)),
+        (
+            "ignored repeated exponent",
+            String::from(r#""future":1e2e3"#),
+        ),
+        (
+            "ignored invalid token suffix",
+            String::from(r#""future":1true"#),
+        ),
+        (
+            "ignored nonfinite suffix",
+            String::from(r#""future":Infinityx"#),
+        ),
+    ];
+
+    for (name, field) in cases {
+        let body = Bytes::from(format!(r#"{{"text_1":"q","text_2":"d",{field}}}"#));
+        assert!(
+            can_adapt_score_body_to_rerank(&body).is_err(),
+            "case {name} must be rejected during compatibility detection"
+        );
+        assert!(
+            score_body_to_rerank_body(&body).is_err(),
+            "case {name} must not reach request adaptation"
+        );
+    }
+}
+
+#[test]
 fn pydantic_arbitrary_precision_extras_are_preserved_recursively() {
     for digits in ["9".repeat(1_000), "8".repeat(4_300)] {
         let body = Bytes::from(format!(
@@ -726,22 +773,6 @@ fn pydantic_integers_beyond_serde_ranges_are_preserved_exactly() {
     assert!(output.contains(r#""priority":18446744073709551617"#));
     assert!(output.contains(r#""minimum":-9223372036854775809"#));
     assert!(output.contains(r#""value":18446744073709551616"#));
-}
-
-#[test]
-fn serde_integer_boundaries_and_numeric_strings_do_not_force_preservation() {
-    assert!(!contains_non_serde_integer(
-        br#"{"positive":18446744073709551615,"negative":-9223372036854775808}"#
-    ));
-    assert!(!contains_non_serde_integer(
-        br#"{"text":"18446744073709551616"}"#
-    ));
-    assert!(contains_non_serde_integer(
-        br#"{"positive":18446744073709551616}"#
-    ));
-    assert!(contains_non_serde_integer(
-        br#"{"negative":-9223372036854775809}"#
-    ));
 }
 
 #[test]
@@ -776,11 +807,12 @@ fn legacy_nested_arbitrary_precision_extra_remains_passthrough() {
 
 #[test]
 fn unknown_extra_is_preserved_without_recursive_materialization() {
+    let depth = MAX_SCORE_JSON_DEPTH - 2;
     let raw_extra = format!(
         "{}{}0.0{}",
-        "[".repeat(190),
+        "[".repeat(depth),
         "0.0,".repeat(240_000),
-        "]".repeat(190)
+        "]".repeat(depth)
     );
     let body = Bytes::from(format!(
         r#"{{"text_1":"q","text_2":"d","future":{raw_extra}}}"#
@@ -795,10 +827,11 @@ fn unknown_extra_is_preserved_without_recursive_materialization() {
 #[test]
 fn deeply_nested_unknown_extra_matches_pydantic_passthrough() {
     let digits = "9".repeat(1_000);
+    let depth = MAX_SCORE_JSON_DEPTH - 1;
     let body = Bytes::from(format!(
         r#"{{"text_1":"q","text_2":"d","future":{}{digits}{}}}"#,
-        "[".repeat(500),
-        "]".repeat(500)
+        "[".repeat(depth),
+        "]".repeat(depth)
     ));
     assert!(can_adapt_score_body_to_rerank(&body).unwrap());
     let out = score_body_to_rerank_body(&body).unwrap();
@@ -854,11 +887,12 @@ fn malformed_preferred_results_does_not_fall_back_to_data() {
 
 #[test]
 fn shadowed_mapped_duplicate_materializes_only_the_last_occurrence() {
+    let depth = MAX_SCORE_JSON_DEPTH - 2;
     let shadowed = format!(
         "{}{}0.0{}",
-        "[".repeat(190),
-        "0.0,".repeat(245_655),
-        "]".repeat(190)
+        "[".repeat(depth),
+        "0.0,".repeat(245_719),
+        "]".repeat(depth)
     );
     let body = Bytes::from(format!(
         r#"{{"text_1":"q","text_2":{shadowed},"text_2":"d"}}"#
@@ -878,12 +912,82 @@ fn shadowed_mapped_duplicate_materializes_only_the_last_occurrence() {
 }
 
 #[test]
+fn ordinary_shadowed_mapped_duplicate_materializes_only_the_last_occurrence() {
+    let shadowed = format!("[{}0]", "0,null,".repeat(140_000));
+    let body = Bytes::from(format!(
+        r#"{{"text_1":"q","text_2":{shadowed},"text_2":"d"}}"#
+    ));
+    assert!(
+        body.len() > 950 * 1_024 && body.len() < MAX_SCORE_BODY_BYTES,
+        "fixture must exercise the near-limit ordinary JSON path"
+    );
+    request::reset_pydantic_value_parse_count();
+    request::reset_raw_lexical_scan_bytes();
+
+    let out = score_body_to_rerank_body(&body).expect("last mapped duplicate is valid");
+
+    assert_eq!(
+        request::pydantic_value_parse_count(),
+        2,
+        "only the surviving text_1 and text_2 values should be materialized"
+    );
+    assert!(
+        request::raw_lexical_scan_bytes() <= body.len().saturating_mul(4),
+        "top-level raw selection must remain linear"
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&out).unwrap()["documents"],
+        json!(["d"])
+    );
+}
+
+#[test]
+fn overdepth_known_fields_are_rejected_with_bounded_lexical_work() {
+    let depth = MAX_SCORE_JSON_DEPTH;
+    let padding = "x".repeat(980 * 1_024);
+    let nested_value = format!("{}0.0{}", "[".repeat(depth), "]".repeat(depth));
+    let model_body =
+        format!(r#"{{"padding":"{padding}","model":{nested_value},"text_1":"q","text_2":"d"}}"#);
+    let mut image_embeds_body = String::with_capacity(model_body.len() + 96);
+    image_embeds_body.push_str(r#"{"padding":""#);
+    image_embeds_body.push_str(&padding);
+    image_embeds_body.push_str(
+        r#"","text_1":"q","text_2":{"content":[{"type":"image_embeds","image_embeds":{"vector":"#,
+    );
+    image_embeds_body.push_str(&nested_value);
+    image_embeds_body.push_str("}}]}}");
+    let fixtures = [Bytes::from(model_body), Bytes::from(image_embeds_body)];
+
+    for (index, body) in fixtures.into_iter().enumerate() {
+        assert!(
+            body.len() > 950 * 1_024 && body.len() < MAX_SCORE_BODY_BYTES,
+            "fixture {index} must remain near the score limit"
+        );
+        request::reset_raw_lexical_scan_bytes();
+        let error = request::parse_score_value(&body)
+            .err()
+            .expect("overdepth known field must fail before materialization");
+        assert!(
+            error.contains("maximum structure depth"),
+            "fixture {index} returned unexpected error: {error}"
+        );
+        assert!(
+            request::raw_lexical_scan_bytes() <= body.len(),
+            "fixture {index} exceeded the single-pass rejection budget: scanned={} body={} depth={depth}",
+            request::raw_lexical_scan_bytes(),
+            body.len()
+        );
+    }
+}
+
+#[test]
 fn canonical_request_does_not_materialize_discarded_legacy_aliases() {
+    let depth = MAX_SCORE_JSON_DEPTH - 2;
     let discarded = format!(
         "{}{}0.0{}",
-        "[".repeat(190),
-        "0.0,".repeat(240_000),
-        "]".repeat(190)
+        "[".repeat(depth),
+        "0.0,".repeat(240_064),
+        "]".repeat(depth)
     );
     let body = Bytes::from(format!(
         r#"{{"model":"m","text_1":"q","text_2":"d","query":{discarded}}}"#
