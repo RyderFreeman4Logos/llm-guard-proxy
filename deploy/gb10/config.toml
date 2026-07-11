@@ -58,7 +58,8 @@ request_timeout_ms = 600000
 
 [upstream.stall]
 # enabled = true
-# idle_timeout_ms = 30000                 # Abort after 30s of no tokens
+# first_chunk_timeout_ms = 600000         # Allow long capacity-queue TTFT before first SSE chunk
+# idle_timeout_ms = 300000                # Abort after 300s with no tokens after first chunk
 # recovery_command = ""                   # Shell command to restart upstream
 # recovery_timeout_ms = 300000            # Max wait for recovery command
 # recovery_cooldown_ms = 10000            # Cooldown between recovery attempts

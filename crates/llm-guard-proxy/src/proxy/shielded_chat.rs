@@ -10,7 +10,9 @@ use llm_guard_proxy_core::{
 use serde_json::{Map, Number, Value, json};
 use tokio::time::timeout;
 
-use super::{MAX_PROXY_BODY_BYTES, sanitized_reqwest_error, unix_time_millis};
+use super::{
+    MAX_PROXY_BODY_BYTES, UpstreamStreamTimeouts, sanitized_reqwest_error, unix_time_millis,
+};
 
 mod loop_guard;
 pub(super) use loop_guard::{AggregationError, LoopInspectionContext};
@@ -1744,20 +1746,27 @@ pub(super) async fn aggregate_stream(
     request_id: &str,
     request_model_id: Option<&str>,
     loop_context: LoopInspectionContext,
-    upstream_idle_timeout: Option<Duration>,
+    upstream_stream_timeouts: Option<UpstreamStreamTimeouts>,
 ) -> Result<AggregatedChatCompletion, AggregationError> {
     let mut stream = Box::pin(stream);
     let mut buffer = BytesMut::new();
     let mut bytes_seen = 0_usize;
     let mut state = ChatAggregation::new(attempt_started_at_unix_ms, &loop_context);
+    let mut saw_first_chunk = false;
 
-    while let Some(chunk) = next_stream_chunk(&mut stream, upstream_idle_timeout).await? {
+    while let Some(chunk) = next_stream_chunk(
+        &mut stream,
+        stream_chunk_timeout(upstream_stream_timeouts, saw_first_chunk),
+    )
+    .await?
+    {
         let chunk = chunk.map_err(|error| {
             AggregationError::plain(format!(
                 "upstream SSE stream failed: {}",
                 sanitized_reqwest_error(&error)
             ))
         })?;
+        saw_first_chunk = true;
         if state.first_byte_latency_ms.is_none() {
             state.first_byte_latency_ms =
                 Some(unix_time_millis().saturating_sub(attempt_started_at_unix_ms));
@@ -1784,6 +1793,17 @@ pub(super) async fn aggregate_stream(
     }
 
     state.finish(request_id, request_model_id)
+}
+
+const fn stream_chunk_timeout(
+    timeouts: Option<UpstreamStreamTimeouts>,
+    saw_first_chunk: bool,
+) -> Option<Duration> {
+    match timeouts {
+        Some(timeouts) if saw_first_chunk => Some(timeouts.inter_chunk),
+        Some(timeouts) => Some(timeouts.first_chunk),
+        None => None,
+    }
 }
 
 async fn next_stream_chunk(

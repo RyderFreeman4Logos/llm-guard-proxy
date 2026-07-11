@@ -487,10 +487,20 @@ impl AppConfig {
                 "upstream.stall.idle_timeout_ms",
                 "must be less than upstream.request_timeout_ms when upstream stall recovery is enabled",
             )?;
+            require(
+                self.upstream_stall.first_chunk_timeout_ms < self.upstream.request_timeout_ms,
+                "upstream.stall.first_chunk_timeout_ms",
+                "must be less than upstream.request_timeout_ms when upstream stall recovery is enabled",
+            )?;
             for profile in &self.upstream_profiles {
                 require(
                     self.upstream_stall.idle_timeout_ms < profile.request_timeout_ms,
                     "upstream.stall.idle_timeout_ms",
+                    "must be less than every upstream profile request_timeout_ms when upstream stall recovery is enabled",
+                )?;
+                require(
+                    self.upstream_stall.first_chunk_timeout_ms < profile.request_timeout_ms,
+                    "upstream.stall.first_chunk_timeout_ms",
                     "must be less than every upstream profile request_timeout_ms when upstream stall recovery is enabled",
                 )?;
             }
@@ -3165,7 +3175,13 @@ impl RetryLadderConfig {
 pub struct UpstreamStallConfig {
     /// Enables shielded chat aggregation idle-timeout detection.
     pub enabled: bool,
-    /// Maximum milliseconds to wait for the next upstream SSE chunk.
+    /// Maximum milliseconds to wait for the first upstream SSE chunk.
+    ///
+    /// This covers legitimate capacity-queue time-to-first-token waits and is
+    /// intentionally separate from the post-start inter-chunk stall watchdog.
+    pub first_chunk_timeout_ms: u64,
+    /// Maximum milliseconds to wait for subsequent upstream SSE chunks after
+    /// the first byte has been observed.
     pub idle_timeout_ms: u64,
     /// Optional argv command run after a stall before retrying.
     ///
@@ -3187,6 +3203,11 @@ pub struct UpstreamStallConfig {
 
 impl UpstreamStallConfig {
     fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            self.first_chunk_timeout_ms > 0,
+            "upstream.stall.first_chunk_timeout_ms",
+            "must be greater than zero",
+        )?;
         require(
             self.idle_timeout_ms > 0,
             "upstream.stall.idle_timeout_ms",
@@ -3236,6 +3257,7 @@ impl Default for UpstreamStallConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            first_chunk_timeout_ms: 30_000,
             idle_timeout_ms: 30_000,
             recovery_command: Vec::new(),
             recovery_timeout_ms: 300_000,

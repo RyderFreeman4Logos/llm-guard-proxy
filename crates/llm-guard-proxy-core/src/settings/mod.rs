@@ -136,6 +136,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "retry.downstream_drop_policy",
     "retry.ladder",
     "upstream.stall.enabled",
+    "upstream.stall.first_chunk_timeout_ms",
     "upstream.stall.idle_timeout_ms",
     "upstream.stall.recovery_command",
     "upstream.stall.recovery_timeout_ms",
