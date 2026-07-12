@@ -25,6 +25,7 @@ const NON_SECRET_TOKEN_KEYS: &[&str] = &[
     "thinkinganswerbudgetfinalmaxtokens",
     "thinkinganswerbudgetfinalmaxcompletiontokens",
     "thinkinganswerbudgetfinalmaxoutputtokens",
+    "thinkinganswerbudgetfinalparametersmaxtokens",
     "attemptthinkingbudgettokens",
     "attemptthinkingmaxtokens",
     "outputtokenwindowsize",

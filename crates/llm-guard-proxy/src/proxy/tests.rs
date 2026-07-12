@@ -7205,6 +7205,186 @@ max_tokens = 128
     assert_eq!(defaulted["temperature"], 0.6);
 }
 
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn override_max_tokens_cap_matrix_covers_every_chat_forwarding_path() {
+    let mut case_index = 0_u64;
+    for shielding_enabled in [false, true] {
+        for shielded_streaming_enabled in [false, true] {
+            let mut fake = FakeUpstream::spawn().await;
+            let config = format!(
+                r"
+{}
+
+[shielding]
+enabled = {shielding_enabled}
+
+[retry]
+shielded_streaming_enabled = {shielded_streaming_enabled}
+",
+                param_override_profile_config(
+                    &fake.base_url,
+                    r"
+temperature = 0.6
+max_tokens = 128
+",
+                ),
+            );
+            let proxy = ProxyFixture::spawn_with_options(
+                &fake.base_url,
+                true,
+                AppConfig::default().server.max_in_flight_requests,
+                &config,
+            )
+            .await;
+
+            for stream in [false, true] {
+                for location in [
+                    OutputLimitLocation::Root,
+                    OutputLimitLocation::Nested,
+                    OutputLimitLocation::Absent,
+                ] {
+                    for input_value in [None, Some(64_u64), Some(100_000_u64)] {
+                        case_index = case_index.saturating_add(1);
+                        assert_param_override_cap_case(
+                            &proxy,
+                            &mut fake,
+                            ParamOverrideCapCase {
+                                case_index,
+                                shielding_enabled,
+                                shielded_streaming_enabled,
+                                stream,
+                                location,
+                                input_value,
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(case_index, 72);
+}
+
+#[cfg(feature = "param-override")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OutputLimitLocation {
+    Root,
+    Nested,
+    Absent,
+}
+
+#[cfg(feature = "param-override")]
+#[derive(Clone, Copy, Debug)]
+struct ParamOverrideCapCase {
+    case_index: u64,
+    shielding_enabled: bool,
+    shielded_streaming_enabled: bool,
+    stream: bool,
+    location: OutputLimitLocation,
+    input_value: Option<u64>,
+}
+
+#[cfg(feature = "param-override")]
+async fn assert_param_override_cap_case(
+    proxy: &ProxyFixture,
+    fake: &mut FakeUpstream,
+    case: ParamOverrideCapCase,
+) {
+    const CAP: u64 = 128;
+    let mut request = json!({
+        "model": "test-chat",
+        "messages": [{
+            "role": "user",
+            "content": format!("param-cap-matrix-{}", case.case_index),
+        }],
+        "stream": case.stream,
+        "temperature": 1.5,
+    });
+    let request_object = request
+        .as_object_mut()
+        .expect("matrix request should be an object");
+    match case.location {
+        OutputLimitLocation::Root => {
+            if let Some(value) = case.input_value {
+                request_object.insert(String::from("max_tokens"), json!(value));
+            }
+        }
+        OutputLimitLocation::Nested => {
+            let mut parameters = serde_json::Map::new();
+            if let Some(value) = case.input_value {
+                parameters.insert(String::from("max_tokens"), json!(value));
+            }
+            request_object.insert(
+                String::from("parameters"),
+                serde_json::Value::Object(parameters),
+            );
+        }
+        OutputLimitLocation::Absent => {}
+    }
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(request.to_string())
+        .send()
+        .await
+        .expect("matrix proxy request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = response
+        .bytes()
+        .await
+        .expect("matrix response body should be readable");
+    assert!(!response_body.is_empty());
+
+    let observed = fake.recv_next().await;
+    let observed_body = serde_json::from_slice::<serde_json::Value>(&observed.body)
+        .expect("matrix upstream body should be JSON");
+    let expected_root = if case.location == OutputLimitLocation::Root {
+        case.input_value.map_or(CAP, |value| value.min(CAP))
+    } else {
+        CAP
+    };
+    let label = format!(
+        "shielding={} shielded_streaming={} stream={} location={:?} input={:?}",
+        case.shielding_enabled,
+        case.shielded_streaming_enabled,
+        case.stream,
+        case.location,
+        case.input_value,
+    );
+    assert_eq!(observed_body["max_tokens"], expected_root, "{label}");
+    assert_eq!(observed_body["temperature"], 0.6, "{label}");
+
+    let expected_nested = (case.location == OutputLimitLocation::Nested)
+        .then(|| case.input_value.map_or(CAP, |value| value.min(CAP)));
+    assert_eq!(
+        observed_body
+            .get("parameters")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|parameters| parameters.get("max_tokens"))
+            .and_then(serde_json::Value::as_u64),
+        expected_nested,
+        "{label}",
+    );
+
+    if case.shielding_enabled {
+        let metadata = read_latest_attempt_request_metadata(proxy);
+        assert_eq!(
+            metadata["thinking_answer_budget_final_max_tokens"],
+            expected_root.to_string(),
+            "{label}",
+        );
+        assert_eq!(
+            metadata["thinking_answer_budget_final_parameters_max_tokens"],
+            expected_nested.map_or_else(|| String::from("absent"), |value| value.to_string()),
+            "{label}",
+        );
+    }
+}
+
 #[tokio::test]
 async fn force_thinking_canonical_default_injects_thinking_budget_tokens() {
     let mut fake = FakeUpstream::spawn().await;
@@ -16118,6 +16298,19 @@ fn read_single_request_and_attempt_metadata(
     let attempt_metadata =
         serde_json::from_str(&attempt_metadata_json).expect("attempt metadata should parse");
     (request_metadata, attempt_metadata)
+}
+
+#[cfg(feature = "param-override")]
+fn read_latest_attempt_request_metadata(proxy: &ProxyFixture) -> serde_json::Value {
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let metadata_json = connection
+        .query_row(
+            "SELECT request_metadata_json FROM attempts ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("latest attempt row should exist");
+    serde_json::from_str(&metadata_json).expect("latest attempt metadata should parse")
 }
 
 struct AbortedRequestMetadata {

@@ -3216,7 +3216,7 @@ fn is_chat_completions_request(method: &Method, uri: &Uri) -> bool {
 fn param_override_applies(method: &Method, uri: &Uri, profile: &UpstreamProfileConfig) -> bool {
     is_chat_completions_request(method, uri)
         && profile.param_override.enabled
-        && param_override_has_fields(&profile.param_override, true)
+        && param_override_has_fields(&profile.param_override)
 }
 
 #[cfg(feature = "param-override")]
@@ -3229,13 +3229,13 @@ fn apply_param_override_to_shielded_plan(
     if !param_override_applies(method, uri, profile) {
         return Ok(());
     }
-    if plan.thinking_policy_applied {
-        plan.upstream_body =
-            apply_param_override_to_body_without_max_tokens(&plan.upstream_body, profile)?;
-    } else {
-        plan.downstream_body = apply_param_override_to_body(&plan.downstream_body, profile)?;
-        plan.upstream_body = apply_param_override_to_body(&plan.upstream_body, profile)?;
-    }
+    let (upstream_body, cap_decision) = apply_param_override_to_body(&plan.upstream_body, profile)?;
+    plan.upstream_body = upstream_body;
+    shielded_chat::merge_final_answer_budget_metadata(
+        &plan.upstream_body,
+        &mut plan.thinking_metadata,
+        cap_decision,
+    );
     Ok(())
 }
 
@@ -3243,47 +3243,28 @@ fn apply_param_override_to_shielded_plan(
 fn apply_param_override_to_body(
     body: &Bytes,
     profile: &UpstreamProfileConfig,
-) -> Result<Bytes, ProxyError> {
-    apply_param_override_to_body_with_max_tokens(body, profile, true)
-}
-
-#[cfg(feature = "param-override")]
-fn apply_param_override_to_body_without_max_tokens(
-    body: &Bytes,
-    profile: &UpstreamProfileConfig,
-) -> Result<Bytes, ProxyError> {
-    apply_param_override_to_body_with_max_tokens(body, profile, false)
-}
-
-#[cfg(feature = "param-override")]
-fn apply_param_override_to_body_with_max_tokens(
-    body: &Bytes,
-    profile: &UpstreamProfileConfig,
-    override_max_tokens: bool,
-) -> Result<Bytes, ProxyError> {
-    if !profile.param_override.enabled
-        || !param_override_has_fields(&profile.param_override, override_max_tokens)
-    {
-        return Ok(body.clone());
+) -> Result<(Bytes, shielded_chat::AnswerBudgetDecision), ProxyError> {
+    if !profile.param_override.enabled || !param_override_has_fields(&profile.param_override) {
+        return Ok((body.clone(), shielded_chat::AnswerBudgetDecision::default()));
     }
     let mut value = serde_json::from_slice::<serde_json::Value>(body)
         .map_err(|error| ProxyError::request_body(format!("request body is not JSON: {error}")))?;
     let serde_json::Value::Object(object) = &mut value else {
-        return Ok(body.clone());
+        return Ok((body.clone(), shielded_chat::AnswerBudgetDecision::default()));
     };
-    apply_param_override_object(object, &profile.param_override, override_max_tokens);
+    let cap_decision = apply_param_override_object(object, &profile.param_override);
     let rewritten = serde_json::to_vec(&value).map_err(|error| {
         ProxyError::request_body(format!("request body rewrite failed: {error}"))
     })?;
-    Ok(Bytes::from(rewritten))
+    Ok((Bytes::from(rewritten), cap_decision))
 }
 
 #[cfg(feature = "param-override")]
-fn param_override_has_fields(config: &ParamOverrideConfig, include_max_tokens: bool) -> bool {
+fn param_override_has_fields(config: &ParamOverrideConfig) -> bool {
     config.temperature.is_some()
         || config.top_p.is_some()
         || config.top_k.is_some()
-        || (include_max_tokens && config.max_tokens.is_some())
+        || config.max_tokens.is_some()
         || config.frequency_penalty.is_some()
         || config.presence_penalty.is_some()
 }
@@ -3292,26 +3273,26 @@ fn param_override_has_fields(config: &ParamOverrideConfig, include_max_tokens: b
 fn apply_param_override_object(
     object: &mut serde_json::Map<String, serde_json::Value>,
     config: &ParamOverrideConfig,
-    override_max_tokens: bool,
-) {
-    insert_param_override_fields(object, config, override_max_tokens);
+) -> shielded_chat::AnswerBudgetDecision {
+    insert_param_override_fields(object, config);
     if let Some(serde_json::Value::Object(parameters)) = object.get_mut("parameters") {
-        insert_param_override_fields(parameters, config, override_max_tokens);
+        insert_param_override_fields(parameters, config);
     }
+    config
+        .max_tokens
+        .map_or_else(shielded_chat::AnswerBudgetDecision::default, |max_tokens| {
+            shielded_chat::apply_output_token_cap(object, u64::from(max_tokens))
+        })
 }
 
 #[cfg(feature = "param-override")]
 fn insert_param_override_fields(
     object: &mut serde_json::Map<String, serde_json::Value>,
     config: &ParamOverrideConfig,
-    override_max_tokens: bool,
 ) {
     insert_f64_override(object, "temperature", config.temperature);
     insert_f64_override(object, "top_p", config.top_p);
     insert_u32_override(object, "top_k", config.top_k);
-    if override_max_tokens {
-        insert_u32_override(object, "max_tokens", config.max_tokens);
-    }
     insert_f64_override(object, "frequency_penalty", config.frequency_penalty);
     insert_f64_override(object, "presence_penalty", config.presence_penalty);
 }
@@ -4428,8 +4409,6 @@ fn plan_shielded_chat(
         || thinking.clone(),
         |entry| retry_ladder_thinking(entry, thinking),
     );
-    let retry_initial_thinking =
-        thinking_with_param_override_total_cap(&retry_initial_thinking, upstream_profile);
     let (request, intercepted, kind) = if should_intercept_non_stream_chat(method, uri, config) {
         if let Some(non_stream_request) =
             shielded_chat::prepare_non_stream_request(body, &retry_initial_thinking)
@@ -4586,7 +4565,6 @@ impl ShieldedRetryPolicy {
         if let Some(cot_salvage) = cot_salvage {
             plan.thinking = cot_salvage_thinking(cot_salvage.policy, &plan.thinking);
         }
-        plan.thinking = thinking_with_param_override_total_cap(&plan.thinking, upstream_profile);
         plan
     }
 }
@@ -4610,32 +4588,6 @@ fn retry_ladder_thinking(
         thinking.budget_tokens = 0;
     }
     thinking
-}
-
-#[cfg(feature = "param-override")]
-fn thinking_with_param_override_total_cap(
-    thinking: &ThinkingConfig,
-    upstream_profile: &UpstreamProfileConfig,
-) -> ThinkingConfig {
-    let mut thinking = thinking.clone();
-    if upstream_profile.param_override.enabled
-        && let Some(override_cap) = upstream_profile.param_override.max_tokens
-    {
-        thinking.max_tokens = Some(
-            thinking
-                .max_tokens
-                .map_or(override_cap, |thinking_cap| thinking_cap.min(override_cap)),
-        );
-    }
-    thinking
-}
-
-#[cfg(not(feature = "param-override"))]
-fn thinking_with_param_override_total_cap(
-    thinking: &ThinkingConfig,
-    _upstream_profile: &UpstreamProfileConfig,
-) -> ThinkingConfig {
-    thinking.clone()
 }
 
 fn cot_salvage_thinking(policy: LoopFailurePolicy, current: &ThinkingConfig) -> ThinkingConfig {
@@ -8037,7 +7989,7 @@ fn shielded_attempt_body(
         }
         ShieldedChatKind::Generic => None,
     };
-    let (prepared_body, thinking_metadata) = prepared_request.map_or_else(
+    let (prepared_body, mut thinking_metadata) = prepared_request.map_or_else(
         || {
             (
                 runtime.upstream_body.clone(),
@@ -8057,11 +8009,12 @@ fn shielded_attempt_body(
             attempt_plan.anti_loop_hint.as_deref(),
         )
     {
-        return (
-            apply_shielded_param_override_to_body_or_original(body, &runtime.upstream_profile),
-            true,
-            thinking_metadata,
+        let body = apply_shielded_param_override_to_body_or_original(
+            body,
+            &runtime.upstream_profile,
+            &mut thinking_metadata,
         );
+        return (body, true, thinking_metadata);
     }
 
     let (prepared_body, anti_loop_hint_applied) = if attempt_number > 1
@@ -8081,20 +8034,29 @@ fn shielded_attempt_body(
     } else {
         (prepared_body, false)
     };
-    (
-        apply_shielded_param_override_to_body_or_original(prepared_body, &runtime.upstream_profile),
-        anti_loop_hint_applied,
-        thinking_metadata,
-    )
+    let prepared_body = apply_shielded_param_override_to_body_or_original(
+        prepared_body,
+        &runtime.upstream_profile,
+        &mut thinking_metadata,
+    );
+    (prepared_body, anti_loop_hint_applied, thinking_metadata)
 }
 
 #[cfg(feature = "param-override")]
 fn apply_shielded_param_override_to_body_or_original(
     body: Bytes,
     profile: &UpstreamProfileConfig,
+    thinking_metadata: &mut BTreeMap<String, String>,
 ) -> Bytes {
-    match apply_param_override_to_body_without_max_tokens(&body, profile) {
-        Ok(rewritten) => rewritten,
+    match apply_param_override_to_body(&body, profile) {
+        Ok((rewritten, cap_decision)) => {
+            shielded_chat::merge_final_answer_budget_metadata(
+                &rewritten,
+                thinking_metadata,
+                cap_decision,
+            );
+            rewritten
+        }
         Err(_error) => body,
     }
 }
@@ -8103,6 +8065,7 @@ fn apply_shielded_param_override_to_body_or_original(
 fn apply_shielded_param_override_to_body_or_original(
     body: Bytes,
     _profile: &UpstreamProfileConfig,
+    _thinking_metadata: &mut BTreeMap<String, String>,
 ) -> Bytes {
     body
 }
@@ -11513,11 +11476,8 @@ fn shadow_comparison_attempt_plan(
     source: &AttemptRecord,
     comparison: ShadowComparisonAttempt,
 ) -> Option<ShadowAttemptPlan> {
-    let thinking = thinking_with_param_override_total_cap(
-        &shadow_comparison_thinking(comparison, &runtime.upstream_profile.thinking),
-        &runtime.upstream_profile,
-    );
-    let prepared = prepared_shadow_body(runtime, &thinking);
+    let thinking = shadow_comparison_thinking(comparison, &runtime.upstream_profile.thinking);
+    let mut prepared = prepared_shadow_body(runtime, &thinking);
     let mut upstream_body = prepared.upstream_body;
     if comparison == ShadowComparisonAttempt::CotSalvage {
         let reasoning = failure.raw_payloads.reasoning.as_deref()?;
@@ -11534,8 +11494,11 @@ fn shadow_comparison_attempt_plan(
             None,
         )?;
     }
-    upstream_body =
-        apply_shielded_param_override_to_body_or_original(upstream_body, &runtime.upstream_profile);
+    upstream_body = apply_shielded_param_override_to_body_or_original(
+        upstream_body,
+        &runtime.upstream_profile,
+        &mut prepared.thinking_metadata,
+    );
     let mut request_metadata = source.request_metadata.clone();
     request_metadata.extend(prepared.thinking_metadata);
     request_metadata.insert(
@@ -11571,14 +11534,12 @@ fn paired_shadow_comparison_attempt_plan(
     if comparison == ShadowComparisonAttempt::CotSalvage {
         return None;
     }
-    let thinking = thinking_with_param_override_total_cap(
-        &shadow_comparison_thinking(comparison, &runtime.upstream_profile.thinking),
-        &runtime.upstream_profile,
-    );
-    let prepared = prepared_shadow_body(runtime, &thinking);
+    let thinking = shadow_comparison_thinking(comparison, &runtime.upstream_profile.thinking);
+    let mut prepared = prepared_shadow_body(runtime, &thinking);
     let upstream_body = apply_shielded_param_override_to_body_or_original(
         prepared.upstream_body,
         &runtime.upstream_profile,
+        &mut prepared.thinking_metadata,
     );
     let mut request_metadata = source.request_metadata.clone();
     request_metadata.extend(prepared.thinking_metadata);

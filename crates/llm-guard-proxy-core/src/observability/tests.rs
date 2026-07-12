@@ -483,6 +483,10 @@ fn redacts_authorization_and_api_key_like_values_before_persistence() {
             String::from("thinking_answer_budget_final_max_tokens"),
             String::from("32784"),
         ),
+        (
+            String::from("thinking_answer_budget_final_parameters_max_tokens"),
+            String::from("128"),
+        ),
     ]);
     request.raw_payloads = RawPayloads {
         input: Some(String::from(r#"{"api_key":"sk-fixture-secret"}"#)),
@@ -523,6 +527,9 @@ WHERE request_id = 'req-redaction'
     assert!(metadata_json.contains(r#""context_budget_total_estimate_tokens":"6""#));
     assert!(metadata_json.contains(r#""thinking_policy_max_tokens":"50000""#));
     assert!(metadata_json.contains(r#""thinking_answer_budget_final_max_tokens":"32784""#));
+    assert!(
+        metadata_json.contains(r#""thinking_answer_budget_final_parameters_max_tokens":"128""#)
+    );
     assert_eq!(raw_input.as_deref(), Some("[REDACTED]"));
     assert_eq!(
         raw_output.as_deref(),

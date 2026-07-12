@@ -274,7 +274,7 @@ struct NoThinkingMarkerDetection {
 }
 
 #[derive(Clone, Debug, Default)]
-struct AnswerBudgetDecision {
+pub(super) struct AnswerBudgetDecision {
     applied: bool,
     adjusted_fields: Vec<&'static str>,
     preserved_fields: Vec<&'static str>,
@@ -515,6 +515,7 @@ const BUDGET_NO_THINKING_MARKERS: &[NoThinkingMarkerPath] = &[
 ];
 
 const ANSWER_BUDGET_FIELDS: &[&str] = &["max_tokens", "max_completion_tokens", "max_output_tokens"];
+const PARAMETERS_MAX_TOKENS_FIELD: &str = "parameters.max_tokens";
 
 #[derive(Debug)]
 struct ThinkingPolicyOutcome {
@@ -1803,40 +1804,43 @@ fn apply_configured_total_cap(
     let Some(max_tokens) = thinking.max_tokens else {
         return decision;
     };
-    let max_tokens = u64::from(max_tokens);
+    let cap_decision = apply_output_token_limit(
+        object,
+        u64::from(max_tokens),
+        thinking.preserve_answer_budget,
+    );
+    merge_answer_budget_decision(&mut decision, cap_decision);
+    decision
+}
+
+/// Applies one clamp-or-default output cap to every supported parameter container.
+///
+/// Root OpenAI-compatible output fields share one default: when none is present,
+/// `max_tokens` is inserted. A present top-level `parameters` object receives the
+/// same treatment for its nested `max_tokens` field.
+#[cfg(feature = "param-override")]
+pub(super) fn apply_output_token_cap(
+    object: &mut Map<String, Value>,
+    max_tokens: u64,
+) -> AnswerBudgetDecision {
+    apply_output_token_limit(object, max_tokens, true)
+}
+
+fn apply_output_token_limit(
+    object: &mut Map<String, Value>,
+    max_tokens: u64,
+    preserve_lower: bool,
+) -> AnswerBudgetDecision {
+    let mut decision = AnswerBudgetDecision::default();
+    let mut root_field_present = false;
     for field in ANSWER_BUDGET_FIELDS {
         let Some(value) = object.get_mut(*field) else {
             continue;
         };
-        let Some(existing) = value.as_u64() else {
-            decision.malformed_fields.push(field);
-            continue;
-        };
-        let should_adjust = if thinking.preserve_answer_budget {
-            existing > max_tokens
-        } else {
-            existing != max_tokens
-        };
-        if should_adjust {
-            *value = Value::Number(Number::from(max_tokens));
-            decision
-                .preserved_fields
-                .retain(|preserved| preserved != field);
-            if !decision.adjusted_fields.contains(field) {
-                decision.adjusted_fields.push(field);
-            }
-            decision.applied = true;
-        } else if !decision.adjusted_fields.contains(field)
-            && !decision.overflow_fields.contains(field)
-            && !decision.preserved_fields.contains(field)
-        {
-            decision.preserved_fields.push(field);
-        }
+        root_field_present = true;
+        apply_output_token_limit_field(value, field, max_tokens, preserve_lower, &mut decision);
     }
-    if decision.adjusted_fields.is_empty()
-        && decision.preserved_fields.is_empty()
-        && decision.malformed_fields.is_empty()
-    {
+    if !root_field_present {
         object.insert(
             String::from("max_tokens"),
             Value::Number(Number::from(max_tokens)),
@@ -1844,7 +1848,135 @@ fn apply_configured_total_cap(
         decision.adjusted_fields.push("max_tokens");
         decision.applied = true;
     }
+
+    if let Some(Value::Object(parameters)) = object.get_mut("parameters") {
+        if let Some(value) = parameters.get_mut("max_tokens") {
+            apply_output_token_limit_field(
+                value,
+                PARAMETERS_MAX_TOKENS_FIELD,
+                max_tokens,
+                preserve_lower,
+                &mut decision,
+            );
+        } else {
+            parameters.insert(
+                String::from("max_tokens"),
+                Value::Number(Number::from(max_tokens)),
+            );
+            decision.adjusted_fields.push(PARAMETERS_MAX_TOKENS_FIELD);
+            decision.applied = true;
+        }
+    }
     decision
+}
+
+fn apply_output_token_limit_field(
+    value: &mut Value,
+    field: &'static str,
+    max_tokens: u64,
+    preserve_lower: bool,
+    decision: &mut AnswerBudgetDecision,
+) {
+    let Some(existing) = value.as_u64() else {
+        decision.malformed_fields.push(field);
+        return;
+    };
+    if (preserve_lower && existing <= max_tokens) || (!preserve_lower && existing == max_tokens) {
+        decision.preserved_fields.push(field);
+        return;
+    }
+    *value = Value::Number(Number::from(max_tokens));
+    decision.adjusted_fields.push(field);
+    decision.applied = true;
+}
+
+fn merge_answer_budget_decision(target: &mut AnswerBudgetDecision, incoming: AnswerBudgetDecision) {
+    target.applied |= incoming.applied;
+    merge_fields(&mut target.adjusted_fields, incoming.adjusted_fields);
+    let adjusted_fields = &target.adjusted_fields;
+    target
+        .preserved_fields
+        .retain(|field| !adjusted_fields.contains(field));
+    let incoming_preserved = incoming
+        .preserved_fields
+        .into_iter()
+        .filter(|field| !adjusted_fields.contains(field))
+        .collect::<Vec<_>>();
+    merge_fields(&mut target.preserved_fields, incoming_preserved);
+    merge_fields(&mut target.malformed_fields, incoming.malformed_fields);
+    merge_fields(&mut target.overflow_fields, incoming.overflow_fields);
+}
+
+fn merge_fields(target: &mut Vec<&'static str>, incoming: impl IntoIterator<Item = &'static str>) {
+    for field in incoming {
+        if !target.contains(&field) {
+            target.push(field);
+        }
+    }
+}
+
+#[cfg(feature = "param-override")]
+pub(super) fn merge_final_answer_budget_metadata(
+    body: &Bytes,
+    metadata: &mut BTreeMap<String, String>,
+    cap_decision: AnswerBudgetDecision,
+) {
+    if metadata.is_empty() {
+        return;
+    }
+    let mut combined = AnswerBudgetDecision {
+        applied: metadata
+            .get("thinking_answer_budget_preservation_applied")
+            .is_some_and(|value| value == "true"),
+        adjusted_fields: metadata_fields(metadata, "thinking_answer_budget_adjusted_fields"),
+        preserved_fields: metadata_fields(metadata, "thinking_answer_budget_preserved_fields"),
+        malformed_fields: metadata_fields(metadata, "thinking_answer_budget_malformed_fields"),
+        overflow_fields: metadata_fields(metadata, "thinking_answer_budget_overflow_fields"),
+    };
+    merge_answer_budget_decision(&mut combined, cap_decision);
+    metadata.insert(
+        String::from("thinking_answer_budget_preservation_applied"),
+        combined.applied.to_string(),
+    );
+    metadata.insert(
+        String::from("thinking_answer_budget_adjusted_fields"),
+        join_fields(&combined.adjusted_fields),
+    );
+    metadata.insert(
+        String::from("thinking_answer_budget_preserved_fields"),
+        join_fields(&combined.preserved_fields),
+    );
+    metadata.insert(
+        String::from("thinking_answer_budget_malformed_fields"),
+        join_fields(&combined.malformed_fields),
+    );
+    metadata.insert(
+        String::from("thinking_answer_budget_overflow_fields"),
+        join_fields(&combined.overflow_fields),
+    );
+
+    if let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(body) {
+        add_final_answer_budget_metadata(&object, metadata);
+    }
+}
+
+#[cfg(feature = "param-override")]
+fn metadata_fields(metadata: &BTreeMap<String, String>, key: &str) -> Vec<&'static str> {
+    metadata
+        .get(key)
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(answer_budget_field)
+        .collect()
+}
+
+#[cfg(feature = "param-override")]
+fn answer_budget_field(field: &str) -> Option<&'static str> {
+    ANSWER_BUDGET_FIELDS
+        .iter()
+        .copied()
+        .chain(std::iter::once(PARAMETERS_MAX_TOKENS_FIELD))
+        .find(|candidate| *candidate == field)
 }
 
 fn add_final_answer_budget_metadata(
@@ -1860,6 +1992,21 @@ fn add_final_answer_budget_metadata(
         };
         metadata.insert(format!("thinking_answer_budget_final_{field}"), value);
     }
+    let nested_value = object
+        .get("parameters")
+        .and_then(Value::as_object)
+        .and_then(|parameters| parameters.get("max_tokens"));
+    metadata.insert(
+        String::from("thinking_answer_budget_final_parameters_max_tokens"),
+        nested_value.map_or_else(
+            || String::from("absent"),
+            |value| {
+                value
+                    .as_u64()
+                    .map_or_else(|| String::from("malformed"), |value| value.to_string())
+            },
+        ),
+    );
 }
 
 fn previous_budget_state(observations: &BudgetObservations, configured_budget: u64) -> String {
