@@ -269,19 +269,28 @@ that permission in place while the wrapper uses this state path.
 ## Evidence profiles
 
 Two ready-to-copy profiles control how much data the proxy retains for audit,
-debugging, and loop-detector improvement. Append the relevant block to the
-`[evidence]` section of `config.toml`.
+debugging, and loop-detector improvement. Replace the complete existing
+`[evidence]`, `[evidence.shadow]`, and
+`[evidence.shadow.paired_comparison]` sections with exactly one block below.
+Do not append a second copy of these TOML tables.
 
 ### Privacy-minimal production
 
 Maximum privacy. No raw payloads, no shadow attempts, no paired comparisons.
 Suitable for live serving where no offline detector tuning is expected.
 
+<!-- BEGIN PARSEABLE EVIDENCE REPLACEMENT: privacy-minimal -->
 ```toml
 [evidence]
 enabled = true
 include_raw_payloads = false
 include_request_headers = false
+sqlite_path = "/home/obj/.local/state/llm-guard-proxy-evidence/evidence.sqlite3"
+blob_cache_dir = "/home/obj/.cache/llm-guard-proxy-evidence/blobs"
+max_bytes = 10737418240
+prune_to_bytes = 8589934592
+max_records = 200000
+prune_to_records = 160000
 
 [evidence.shadow]
 enabled = false
@@ -289,6 +298,7 @@ enabled = false
 [evidence.shadow.paired_comparison]
 enabled = false
 ```
+<!-- END PARSEABLE EVIDENCE REPLACEMENT: privacy-minimal -->
 
 ### Quality-debug / loop-improvement
 
@@ -297,13 +307,18 @@ produces paired comparison variants for offline detector calibration. **This
 mode runs extra model attempts and stores sensitive data — use only on trusted
 hosts with private storage.**
 
+<!-- BEGIN PARSEABLE EVIDENCE REPLACEMENT: quality-debug -->
 ```toml
 [evidence]
 enabled = true
 include_raw_payloads = true
 include_request_headers = true
+sqlite_path = "/home/obj/.local/state/llm-guard-proxy-evidence/evidence.sqlite3"
+blob_cache_dir = "/home/obj/.cache/llm-guard-proxy-evidence/blobs"
 max_bytes = 10737418240        # 10 GiB evidence envelope
 prune_to_bytes = 8589934592
+max_records = 200000
+prune_to_records = 160000
 
 [evidence.shadow]
 enabled = true
@@ -321,9 +336,11 @@ include_raw_input = true
 include_raw_output = true
 include_raw_reasoning = true
 sample_rate = 1.0
-max_bytes = 8589934592          # 8 GiB paired raw artifact retention
-max_age_days = 14
+max_retention_records = 100000
+max_retention_bytes = 8589934592 # 8 GiB paired raw artifact retention
+retention_days = 14
 ```
+<!-- END PARSEABLE EVIDENCE REPLACEMENT: quality-debug -->
 
 ### Safety notes
 

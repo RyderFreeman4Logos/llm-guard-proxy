@@ -29,6 +29,7 @@ use crate::{
 };
 
 const GB10_DEPLOY_CONFIG: &str = include_str!("../../../../deploy/gb10/config.toml");
+const GB10_DEPLOY_README: &str = include_str!("../../../../deploy/gb10/README.md");
 
 #[cfg(feature = "guard")]
 const FULL_OVERRIDE_CONFIG: &str = r#"
@@ -599,6 +600,90 @@ fn gb10_deploy_uncomment_ready_examples_parse() {
     }
     #[cfg(feature = "guard")]
     assert_deploy_example_parses("guard-features");
+}
+
+#[test]
+fn gb10_readme_evidence_replacements_parse_with_current_config() {
+    let privacy_minimal = config_with_readme_evidence_replacement("privacy-minimal");
+    let privacy_minimal = parse_config_text(&privacy_minimal)
+        .expect("privacy-minimal README evidence replacement should parse");
+    privacy_minimal
+        .validate()
+        .expect("privacy-minimal README evidence replacement should validate");
+    assert!(!privacy_minimal.evidence.include_raw_payloads);
+    assert!(!privacy_minimal.evidence.include_request_headers);
+    assert!(!privacy_minimal.evidence.shadow.enabled);
+    assert!(!privacy_minimal.evidence.shadow.paired_comparison.enabled);
+
+    let quality_debug = config_with_readme_evidence_replacement("quality-debug");
+    let quality_debug = parse_config_text(&quality_debug)
+        .expect("quality-debug README evidence replacement should parse");
+    quality_debug
+        .validate()
+        .expect("quality-debug README evidence replacement should validate");
+    assert!(quality_debug.evidence.include_raw_payloads);
+    assert!(quality_debug.evidence.include_request_headers);
+    assert!(quality_debug.evidence.shadow.enabled);
+    assert!(quality_debug.evidence.shadow.paired_comparison.enabled);
+    assert_eq!(
+        quality_debug
+            .evidence
+            .shadow
+            .paired_comparison
+            .max_retention_records,
+        100_000
+    );
+    assert_eq!(
+        quality_debug
+            .evidence
+            .shadow
+            .paired_comparison
+            .max_retention_bytes,
+        8_589_934_592
+    );
+    assert_eq!(
+        quality_debug
+            .evidence
+            .shadow
+            .paired_comparison
+            .retention_days,
+        14
+    );
+}
+
+fn config_with_readme_evidence_replacement(name: &str) -> String {
+    let replacement = readme_evidence_replacement(name);
+    let evidence_start = GB10_DEPLOY_CONFIG
+        .find("[evidence]\n")
+        .expect("GB10 deploy config should contain an evidence section");
+    let thinking_start = GB10_DEPLOY_CONFIG
+        .find("\n[thinking]\n")
+        .map(|index| index + 1)
+        .expect("GB10 deploy config should contain a thinking section");
+    assert!(evidence_start < thinking_start);
+    format!(
+        "{}{}\n\n{}",
+        &GB10_DEPLOY_CONFIG[..evidence_start],
+        replacement.trim(),
+        &GB10_DEPLOY_CONFIG[thinking_start..]
+    )
+}
+
+fn readme_evidence_replacement(name: &str) -> String {
+    let begin = format!("<!-- BEGIN PARSEABLE EVIDENCE REPLACEMENT: {name} -->");
+    let end = format!("<!-- END PARSEABLE EVIDENCE REPLACEMENT: {name} -->");
+    let lines = GB10_DEPLOY_README
+        .lines()
+        .skip_while(|line| *line != begin)
+        .skip(1)
+        .take_while(|line| *line != end)
+        .filter(|line| !line.starts_with("```"))
+        .collect::<Vec<_>>();
+    assert!(
+        !lines.is_empty(),
+        "missing README evidence replacement {name:?}"
+    );
+    lines.join("\n")
 }
 
 fn assert_deploy_example_parses(name: &str) {
