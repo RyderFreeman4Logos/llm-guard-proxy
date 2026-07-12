@@ -30,6 +30,12 @@ use crate::{
 
 const GB10_DEPLOY_CONFIG: &str = include_str!("../../../../deploy/gb10/config.toml");
 const GB10_DEPLOY_README: &str = include_str!("../../../../deploy/gb10/README.md");
+#[cfg(feature = "guard")]
+const CHILD_SAFE_WORKFLOW_SOURCE: &str =
+    include_str!("../../../../examples/workflows/child_safe_general.py");
+#[cfg(feature = "guard")]
+const CHILD_SAFE_WORKFLOW_DEPLOY_PATH: &str =
+    "/home/obj/.local/lib/llm-guard-proxy/workflows/child_safe_general.py";
 
 #[cfg(feature = "guard")]
 const FULL_OVERRIDE_CONFIG: &str = r#"
@@ -599,7 +605,7 @@ fn gb10_deploy_uncomment_ready_examples_parse() {
         assert_deploy_example_parses(name);
     }
     #[cfg(feature = "guard")]
-    assert_deploy_example_parses("guard-features");
+    assert_guard_deploy_example_uses_installed_workflow();
 }
 
 #[test]
@@ -693,6 +699,27 @@ fn assert_deploy_example_parses(name: &str) {
     config
         .validate()
         .unwrap_or_else(|error| panic!("GB10 deploy example {name:?} should validate: {error}"));
+}
+
+#[cfg(feature = "guard")]
+fn assert_guard_deploy_example_uses_installed_workflow() {
+    let example = deploy_config_example("guard-features");
+    let config = parse_config_text(&example).expect("guard feature example should parse");
+    config
+        .validate()
+        .expect("guard feature example should validate");
+    let workflow = config
+        .workflows
+        .get("child_safe_general.v1")
+        .expect("guard example workflow should be present");
+
+    assert_eq!(workflow.command, CHILD_SAFE_WORKFLOW_DEPLOY_PATH);
+    assert!(CHILD_SAFE_WORKFLOW_SOURCE.starts_with("#!/usr/bin/env python3"));
+    assert!(
+        GB10_DEPLOY_README.contains("examples/workflows/child_safe_general.py")
+            && GB10_DEPLOY_README.contains(CHILD_SAFE_WORKFLOW_DEPLOY_PATH),
+        "GB10 deployment steps should install the tracked workflow at the configured path"
+    );
 }
 
 fn deploy_config_example(name: &str) -> String {

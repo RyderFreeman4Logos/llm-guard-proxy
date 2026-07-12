@@ -99,6 +99,24 @@ pub(super) fn prepare_stream_request(
     })
 }
 
+/// Returns whether caller-provided native vLLM controls contradict an explicit
+/// no-thinking marker.
+///
+/// This check intentionally does not rewrite either control. Callers use it at
+/// the public request boundary so passthrough policies can preserve compatible
+/// caller values while rejecting ambiguous combinations before any upstream IO.
+pub(super) fn has_conflicting_vllm_native_controls(body: &Bytes) -> bool {
+    let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let positive_native_budget = matches!(
+        value_at_path(&object, ROOT_THINKING_TOKEN_BUDGET.path),
+        PathValue::Value(value)
+            if matches!(token_budget_value(value), BudgetState::Numeric(budget) if budget > 0)
+    );
+    positive_native_budget && detect_no_thinking_markers(&object).detected
+}
+
 /// Returns a retry request body with a bounded anti-loop system hint.
 ///
 /// The hint is deterministic and contains only proxy retry metadata; it never

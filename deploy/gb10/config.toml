@@ -518,7 +518,7 @@ enabled = true
 
 #| [workflows."child_safe_general.v1"]
 #| runtime_kind = "stdio"
-#| command = "/opt/llm-guard-proxy/workflows/content_review.py"
+#| command = "/home/obj/.local/lib/llm-guard-proxy/workflows/child_safe_general.py"
 #| args = []
 #| timeout_ms = 120000                      # Kill workflow after 2 min
 #| max_stdout_bytes = 1048576

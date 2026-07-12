@@ -118,7 +118,10 @@ Copy the wrapper assets:
 ```bash
 install -d -m 0700 /home/obj/.config/llm-guard-proxy
 install -d -m 0700 /home/obj/.local/state/llm-guard-proxy
+install -d -m 0700 /home/obj/.local/lib/llm-guard-proxy/workflows
 chmod 0755 /home/obj/.local
+install -m 0700 examples/workflows/child_safe_general.py \
+  /home/obj/.local/lib/llm-guard-proxy/workflows/child_safe_general.py
 install -m 0600 deploy/gb10/config.toml \
   /home/obj/.config/llm-guard-proxy/config.toml
 install -m 0644 deploy/gb10/llm-guard-proxy.service \

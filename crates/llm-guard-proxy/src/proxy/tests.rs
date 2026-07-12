@@ -7606,47 +7606,20 @@ default_injection_schema = "vllm_native"
 }
 
 #[tokio::test]
-async fn bounded_thinking_vllm_native_schema_zeroes_native_budget_on_explicit_opt_out() {
-    let mut fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn_with_options(
-        &fake.base_url,
-        true,
-        AppConfig::default().server.max_in_flight_requests,
+async fn bounded_thinking_vllm_native_rejects_positive_budget_with_explicit_opt_out() {
+    assert_vllm_native_conflict_rejected(
         r#"
 [thinking]
 mode = "bounded_thinking"
 default_injection_schema = "vllm_native"
 "#,
+        r#"{"model":"test-chat","messages":[{"role":"user","content":"private-prompt"}],"chat_template_kwargs":{"enable_thinking":false},"thinking_token_budget":8192,"max_tokens":64}"#,
     )
     .await;
-
-    let observed_body = post_chat_and_observe_body(
-        &proxy,
-        &mut fake,
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"chat_template_kwargs":{"enable_thinking":false},"thinking_token_budget":8192,"max_tokens":64}"#,
-    )
-    .await;
-
-    assert_eq!(
-        observed_body["chat_template_kwargs"]["enable_thinking"],
-        false
-    );
-    assert_eq!(observed_body["thinking_token_budget"], 0);
-    assert_eq!(observed_body["max_tokens"], 64);
-
-    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
-    for metadata in [&request_metadata, &attempt_metadata] {
-        assert_eq!(metadata["thinking_schema_path"], "thinking_token_budget");
-        assert_eq!(metadata["thinking_budget_final_tokens"], "0");
-        assert_eq!(
-            metadata["thinking_rewrite_reason"],
-            "caller_disabled_thinking"
-        );
-    }
 }
 
 #[tokio::test]
-async fn bounded_thinking_vllm_native_zero_config_normalizes_no_thinking_inputs() {
+async fn bounded_thinking_vllm_native_zero_config_normalizes_zero_native_budget() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -7661,26 +7634,19 @@ default_injection_schema = "vllm_native"
     )
     .await;
 
-    for body in [
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"explicit-disable"}],"chat_template_kwargs":{"enable_thinking":false},"thinking_token_budget":8192,"max_tokens":64}"#
-            .as_slice(),
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"zero-budget"}],"thinking_token_budget":0,"max_tokens":64}"#
-            .as_slice(),
-    ] {
-        let observed_body = post_chat_and_observe_owned_body(
-            &proxy,
-            &mut fake,
-            Bytes::copy_from_slice(body),
-        )
-        .await;
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"zero-budget"}],"thinking_token_budget":0,"max_tokens":64}"#,
+    )
+    .await;
 
-        assert_eq!(
-            observed_body["chat_template_kwargs"]["enable_thinking"],
-            false
-        );
-        assert_eq!(observed_body["thinking_token_budget"], 0);
-        assert_eq!(observed_body["max_tokens"], 64);
-    }
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+    assert_eq!(observed_body["thinking_token_budget"], 0);
+    assert_eq!(observed_body["max_tokens"], 64);
 }
 
 #[tokio::test]
@@ -7690,7 +7656,6 @@ async fn bounded_thinking_vllm_native_normalizes_all_explicit_opt_outs() {
         r#""thinking":{"enabled":false}"#,
         r#""chat_template_kwargs":{"enable_thinking":false}"#,
         r#""thinking_token_budget":0"#,
-        r#""enable_thinking":false,"chat_template_kwargs":"malformed","thinking_token_budget":8192"#,
     ];
     assert_vllm_native_disabled_cases("bounded_thinking", &cases).await;
 }
@@ -8020,34 +7985,17 @@ no_thinking_marker_policy = "respect_no_thinking_markers"
 }
 
 #[tokio::test]
-async fn force_thinking_vllm_native_respect_marker_clears_positive_native_budget() {
-    let mut fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn_with_options(
-        &fake.base_url,
-        true,
-        AppConfig::default().server.max_in_flight_requests,
+async fn force_thinking_vllm_native_respect_marker_rejects_positive_native_budget() {
+    assert_vllm_native_conflict_rejected(
         r#"
 [thinking]
 mode = "force_thinking"
 no_thinking_marker_policy = "respect_no_thinking_markers"
 default_injection_schema = "vllm_native"
 "#,
+        r#"{"model":"test-chat","messages":[{"role":"user","content":"private-prompt"}],"chat_template_kwargs":{"enable_thinking":false},"thinking_token_budget":8192,"max_tokens":64}"#,
     )
     .await;
-
-    let observed_body = post_chat_and_observe_body(
-        &proxy,
-        &mut fake,
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"chat_template_kwargs":{"enable_thinking":false},"thinking_token_budget":8192,"max_tokens":64}"#,
-    )
-    .await;
-
-    assert_eq!(
-        observed_body["chat_template_kwargs"]["enable_thinking"],
-        false
-    );
-    assert_eq!(observed_body["thinking_token_budget"], 0);
-    assert_eq!(observed_body["max_tokens"], 64);
 }
 
 #[tokio::test]
@@ -8120,34 +8068,17 @@ no_thinking_marker_policy = "escape_hatch_only"
 }
 
 #[tokio::test]
-async fn force_thinking_vllm_native_escape_hatch_emits_consistent_no_thinking_fields() {
-    let mut fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn_with_options(
-        &fake.base_url,
-        true,
-        AppConfig::default().server.max_in_flight_requests,
+async fn force_thinking_vllm_native_escape_hatch_rejects_positive_native_budget() {
+    assert_vllm_native_conflict_rejected(
         r#"
 [thinking]
 mode = "force_thinking"
 no_thinking_marker_policy = "escape_hatch_only"
 default_injection_schema = "vllm_native"
 "#,
+        r#"{"model":"test-chat","messages":[{"role":"user","content":"private-prompt"}],"llm_guard_proxy_disable_thinking":true,"thinking_token_budget":8192,"max_tokens":64}"#,
     )
     .await;
-
-    let observed_body = post_chat_and_observe_body(
-        &proxy,
-        &mut fake,
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"llm_guard_proxy_disable_thinking":true,"thinking_token_budget":8192,"max_tokens":64}"#,
-    )
-    .await;
-
-    assert_eq!(
-        observed_body["chat_template_kwargs"]["enable_thinking"],
-        false
-    );
-    assert_eq!(observed_body["thinking_token_budget"], 0);
-    assert_eq!(observed_body["max_tokens"], 64);
 }
 
 #[tokio::test]
@@ -8327,7 +8258,80 @@ tool_request_policy = "passthrough"
 }
 
 #[tokio::test]
-async fn vllm_native_tool_passthrough_preserves_budget_tools_and_private_payload() {
+async fn vllm_native_policy_disabled_rejects_conflicting_no_thinking_controls() {
+    assert_vllm_native_conflict_rejected(
+        r#"
+[thinking]
+enabled = false
+default_injection_schema = "vllm_native"
+"#,
+        r#"{"model":"test-chat","messages":[{"role":"user","content":"private-prompt"}],"thinking_token_budget":7,"chat_template_kwargs":{"enable_thinking":false},"max_tokens":64}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vllm_native_mode_passthrough_rejects_conflicting_no_thinking_controls() {
+    assert_vllm_native_conflict_rejected(
+        r#"
+[thinking]
+mode = "passthrough"
+default_injection_schema = "vllm_native"
+"#,
+        r#"{"model":"test-chat","messages":[{"role":"user","content":"private-prompt"}],"thinking_token_budget":7,"chat_template_kwargs":{"enable_thinking":false},"max_tokens":64}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn vllm_native_tool_passthrough_rejects_conflicting_no_thinking_controls() {
+    assert_vllm_native_conflict_rejected(
+        r#"
+[thinking]
+default_injection_schema = "vllm_native"
+tool_request_policy = "passthrough"
+"#,
+        r#"{"model":"test-chat","messages":[{"role":"user","content":"private-prompt"}],"thinking_token_budget":7,"chat_template_kwargs":{"enable_thinking":false},"max_tokens":64,"tools":[{"type":"function","function":{"name":"sensitive-tool","parameters":{"type":"object","properties":{"secret-property":{"type":"string"}}}}}],"tool_choice":{"type":"function","function":{"name":"sensitive-tool"}}}"#,
+    )
+    .await;
+}
+
+async fn assert_vllm_native_conflict_rejected(config: &str, body: &str) {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        config,
+    )
+    .await;
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.to_owned())
+        .send()
+        .await
+        .expect("proxy rejection should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let error = response_json(response).await;
+    assert_eq!(error["error"]["type"], "invalid_request_error");
+    assert_eq!(error["error"]["code"], "conflicting_thinking_controls");
+    assert_eq!(error["error"]["param"], "thinking_token_budget");
+    assert_eq!(
+        error["error"]["message"],
+        "positive thinking_token_budget cannot be combined with an explicit no-thinking marker"
+    );
+    assert_text_excludes_values(
+        &error.to_string(),
+        &["private-prompt", "sensitive-tool", "secret-property"],
+    );
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+async fn vllm_native_tool_passthrough_preserves_non_conflicting_budget_and_private_payload() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -8343,14 +8347,14 @@ tool_request_policy = "passthrough"
     let observed_body = post_chat_and_observe_body(
         &proxy,
         &mut fake,
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"private-prompt"}],"tools":[{"type":"function","function":{"name":"sensitive-tool","parameters":{"type":"object","properties":{"secret-property":{"type":"string"}}}}}],"tool_choice":{"type":"function","function":{"name":"sensitive-tool"}},"thinking_token_budget":7,"chat_template_kwargs":{"enable_thinking":false},"max_tokens":64}"#,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"private-prompt"}],"tools":[{"type":"function","function":{"name":"sensitive-tool","parameters":{"type":"object","properties":{"secret-property":{"type":"string"}}}}}],"tool_choice":{"type":"function","function":{"name":"sensitive-tool"}},"thinking_token_budget":7,"chat_template_kwargs":{"enable_thinking":true},"max_tokens":64}"#,
     )
     .await;
 
     assert_eq!(observed_body["thinking_token_budget"], 7);
     assert_eq!(
         observed_body["chat_template_kwargs"]["enable_thinking"],
-        false
+        true
     );
     assert_eq!(
         observed_body["tools"][0]["function"]["name"],

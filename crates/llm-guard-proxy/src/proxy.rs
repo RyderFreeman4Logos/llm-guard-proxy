@@ -43,15 +43,16 @@ use llm_guard_proxy_core::{
 };
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
-    DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
-    EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore, EvidenceStoreWrite, Health,
-    HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, LiveRequestEntry,
-    LiveRequestRegistry, LiveRequestState, LiveRequestSummary, LocalRecoveryConfig,
-    LoopFailurePolicy, LoopGuardConfig, MetadataConfig, ObservabilityMetricsSnapshot,
-    ObservabilityStore, RawPayloads, RequestId, RequestRecord, RequestStatus, RetryConfig,
-    RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile, ShadowComparisonAttempt,
-    ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    DefaultInjectionSchema, DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord,
+    EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore,
+    EvidenceStoreWrite, Health, HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig,
+    LiveRequestEntry, LiveRequestRegistry, LiveRequestState, LiveRequestSummary,
+    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, MetadataConfig,
+    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
+    RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
+    ShadowComparisonAttempt, ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode,
+    UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -2958,6 +2959,7 @@ fn prepare_openai_forward_request(
     let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
     let reqwest_method = upstream_method(method)?;
     let body = adapted_body;
+    validate_vllm_native_request_controls(config, &upstream_profile, method, &forward_uri, &body)?;
     let shielded_chat_plan = plan_shielded_chat(
         state,
         config,
@@ -3207,9 +3209,49 @@ fn profile_block_reason_message(reason: &BlockReason) -> String {
     }
 }
 
-#[cfg(any(feature = "guard", feature = "param-override"))]
 fn is_chat_completions_request(method: &Method, uri: &Uri) -> bool {
     method == Method::POST && uri.path() == "/v1/chat/completions"
+}
+
+fn validate_vllm_native_request_controls(
+    config: &AppConfig,
+    profile: &UpstreamProfileConfig,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+) -> Result<(), ProxyError> {
+    let vllm_native_configured = profile.thinking.default_injection_schema
+        == DefaultInjectionSchema::VllmNative
+        || config.retry.ladder.iter().any(|entry| {
+            entry
+                .default_injection_schema
+                .unwrap_or(profile.thinking.default_injection_schema)
+                == DefaultInjectionSchema::VllmNative
+        });
+    if !is_chat_completions_request(method, uri)
+        || !vllm_native_configured
+        || !shielded_chat::has_conflicting_vllm_native_controls(body)
+    {
+        return Ok(());
+    }
+
+    Err(ProxyError::ContextBudgetExceeded {
+        message: String::from(
+            "positive thinking_token_budget cannot be combined with an explicit no-thinking marker",
+        ),
+        param: "thinking_token_budget",
+        code: "conflicting_thinking_controls",
+        request_metadata: Some(BTreeMap::from([
+            (
+                String::from("thinking_control_validation"),
+                String::from("rejected_conflict"),
+            ),
+            (
+                String::from("thinking_default_injection_schema"),
+                String::from("vllm_native"),
+            ),
+        ])),
+    })
 }
 
 #[cfg(feature = "param-override")]
