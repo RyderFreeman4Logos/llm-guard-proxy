@@ -609,6 +609,43 @@ fn gb10_deploy_uncomment_ready_examples_parse() {
 }
 
 #[test]
+fn gb10_deploy_supported_optional_fields_remain_uncomment_ready() {
+    let examples = [
+        "#| probe_messages = [{\"role\":\"user\",\"content\":\"deployment readiness\"}] # Custom readiness prompt",
+        "#| probe_chat_template_kwargs = {\"enable_thinking\":false}                  # Optional template controls for the probe",
+        "#| health_chat_probe_enabled = true         # Also probe /v1/chat/completions",
+        "#| health_chat_probe_timeout_ms = 15000     # Chat probe timeout, capped at 30s",
+    ];
+    let mut uncommented = GB10_DEPLOY_CONFIG.to_owned();
+    for commented in examples {
+        assert!(
+            uncommented.contains(commented),
+            "GB10 deploy config should document {commented:?}"
+        );
+        let active = commented
+            .strip_prefix("#| ")
+            .expect("uncomment-ready examples should use the documented prefix");
+        uncommented = uncommented.replace(commented, active);
+    }
+
+    let config = parse_config_text(&uncommented)
+        .expect("GB10 deploy config optional examples should parse when uncommented");
+    config
+        .validate()
+        .expect("GB10 deploy config optional examples should validate when uncommented");
+    assert_eq!(
+        config.upstream.hot_restart.probe_messages,
+        serde_json::json!([{"role":"user","content":"deployment readiness"}])
+    );
+    assert_eq!(
+        config.upstream.hot_restart.probe_chat_template_kwargs,
+        Some(serde_json::json!({"enable_thinking":false}))
+    );
+    assert!(config.observability.health_chat_probe_enabled.is_enabled());
+    assert_eq!(config.observability.health_chat_probe_timeout_ms, 15_000);
+}
+
+#[test]
 fn gb10_readme_evidence_replacements_parse_with_current_config() {
     let privacy_minimal = config_with_readme_evidence_replacement("privacy-minimal");
     let privacy_minimal = parse_config_text(&privacy_minimal)

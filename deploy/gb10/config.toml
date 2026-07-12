@@ -77,6 +77,11 @@ probe_max_tokens = 1
 probe_interval_secs = 5
 probe_timeout_secs = 600
 
+# BEGIN UNCOMMENT-READY EXAMPLE: hot-restart-chat-probe
+#| probe_messages = [{"role":"user","content":"deployment readiness"}] # Custom readiness prompt
+#| probe_chat_template_kwargs = {"enable_thinking":false}                  # Optional template controls for the probe
+# END UNCOMMENT-READY EXAMPLE: hot-restart-chat-probe
+
 # ── Upstream stall detection ─────────────────────────────────────────────────
 # Detects stalled upstream connections (idle without producing tokens).
 
@@ -261,6 +266,11 @@ health_upstream_probe_timeout_ms = 2000    # Health probe timeout
 debug_summary_enabled = true               # Detailed per-request summaries
 debug_summary_max_records = 20             # Max debug summary records
 # debug_summary_admin_token = ""           # Token required for debug access
+
+# BEGIN UNCOMMENT-READY EXAMPLE: observability-chat-probe
+#| health_chat_probe_enabled = true         # Also probe /v1/chat/completions
+#| health_chat_probe_timeout_ms = 15000     # Chat probe timeout, capped at 30s
+# END UNCOMMENT-READY EXAMPLE: observability-chat-probe
 
 [observability.retention]
 max_bytes = 1073741824                     # 1 GiB max storage
