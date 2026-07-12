@@ -341,14 +341,23 @@ anti_loop_hint_enabled = true              # Inject anti-loop hints on retry
 # downstream_drop_policy = "cancel"  # cancel or detach after downstream drop
 
 # ── Retry ladder ──────────────────────────────────────────────────────────────
-# Escalating shielded retry quality ladder. Keep the no-thinking rung small so a
-# loop escape hatch cannot consume the caller's whole downstream timeout.
+# Escalating shielded retry quality ladder. Thinking rungs inherit the selected
+# upstream profile's injection schema, including vllm_native. Keep the
+# no-thinking rung small so a loop escape hatch cannot consume the caller's
+# whole downstream timeout.
 
 # [[retry.ladder]]
 # name = "max-thinking"
 # thinking_mode = "force_thinking"
 # max_tokens = 50000
 # thinking_token_budget = 32768
+
+# [[retry.ladder]]
+# name = "bounded-thinking-deep"
+# thinking_mode = "force_thinking"
+# max_tokens = 50000
+# thinking_token_budget = 16384
+# anti_loop_hint = "Previous attempt looped. Use a shorter reasoning path."
 
 # [[retry.ladder]]
 # name = "bounded-thinking"

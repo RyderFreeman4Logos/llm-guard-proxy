@@ -565,6 +565,7 @@ fn apply_thinking_policy(
             );
             let answer_budget =
                 apply_answer_budget_preservation(object, false, outcome.answer_budget_delta);
+            let answer_budget = apply_configured_total_cap(object, thinking, answer_budget);
             metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
             return metadata;
         }
@@ -1727,24 +1728,34 @@ fn apply_configured_total_cap(
     let Some(max_tokens) = thinking.max_tokens else {
         return decision;
     };
-    if thinking.preserve_answer_budget {
-        return decision;
-    }
     let max_tokens = u64::from(max_tokens);
     for field in ANSWER_BUDGET_FIELDS {
-        match object.get_mut(*field) {
-            Some(value) if value.as_u64() == Some(max_tokens) => {
-                decision.preserved_fields.push(field);
-            }
-            Some(value) if value.as_u64().is_some() => {
-                *value = Value::Number(Number::from(max_tokens));
+        let Some(value) = object.get_mut(*field) else {
+            continue;
+        };
+        let Some(existing) = value.as_u64() else {
+            decision.malformed_fields.push(field);
+            continue;
+        };
+        let should_adjust = if thinking.preserve_answer_budget {
+            existing > max_tokens
+        } else {
+            existing != max_tokens
+        };
+        if should_adjust {
+            *value = Value::Number(Number::from(max_tokens));
+            decision
+                .preserved_fields
+                .retain(|preserved| preserved != field);
+            if !decision.adjusted_fields.contains(field) {
                 decision.adjusted_fields.push(field);
-                decision.applied = true;
             }
-            Some(_value) => {
-                decision.malformed_fields.push(field);
-            }
-            None => {}
+            decision.applied = true;
+        } else if !decision.adjusted_fields.contains(field)
+            && !decision.overflow_fields.contains(field)
+            && !decision.preserved_fields.contains(field)
+        {
+            decision.preserved_fields.push(field);
         }
     }
     if decision.adjusted_fields.is_empty()

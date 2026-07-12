@@ -4412,20 +4412,19 @@ fn plan_shielded_chat(
     uri: &Uri,
     body: &Bytes,
 ) -> ShieldedChatPlan {
-    let retry_initial_thinking = config
-        .retry
-        .ladder
-        .first()
-        .map_or(thinking, |entry| &entry.thinking);
+    let retry_initial_thinking = config.retry.ladder.first().map_or_else(
+        || thinking.clone(),
+        |entry| retry_ladder_thinking(entry, thinking),
+    );
     let (request, intercepted, kind) = if should_intercept_non_stream_chat(method, uri, config) {
         if let Some(non_stream_request) =
-            shielded_chat::prepare_non_stream_request(body, retry_initial_thinking)
+            shielded_chat::prepare_non_stream_request(body, &retry_initial_thinking)
         {
             (Some(non_stream_request), true, ShieldedChatKind::NonStream)
         } else if let Some(stream_request) = shielded_chat::prepare_stream_request(
             body,
             if config.retry.shielded_streaming_enabled {
-                retry_initial_thinking
+                &retry_initial_thinking
             } else {
                 thinking
             },
@@ -4565,7 +4564,7 @@ impl ShieldedRetryPolicy {
                 },
                 |entry| ShieldedAttemptPlan {
                     name: entry.name.clone(),
-                    thinking: entry.thinking.clone(),
+                    thinking: retry_ladder_thinking(entry, fallback_thinking),
                     anti_loop_hint: entry.anti_loop_hint.clone(),
                 },
             );
@@ -4581,6 +4580,20 @@ struct ShieldedAttemptPlan {
     name: String,
     thinking: ThinkingConfig,
     anti_loop_hint: Option<String>,
+}
+
+fn retry_ladder_thinking(
+    entry: &RetryLadderConfig,
+    fallback_thinking: &ThinkingConfig,
+) -> ThinkingConfig {
+    let mut thinking = entry.thinking.clone();
+    thinking.default_injection_schema = entry
+        .default_injection_schema
+        .unwrap_or(fallback_thinking.default_injection_schema);
+    if thinking.effective_mode() == ThinkingMode::ForceDisable {
+        thinking.budget_tokens = 0;
+    }
+    thinking
 }
 
 fn cot_salvage_thinking(policy: LoopFailurePolicy, current: &ThinkingConfig) -> ThinkingConfig {
@@ -7768,7 +7781,7 @@ async fn start_shielded_attempt(
         &runtime.upstream_profile.thinking,
         cot_salvage,
     );
-    let (upstream_body, anti_loop_hint_applied) = shielded_attempt_body(
+    let (upstream_body, anti_loop_hint_applied, attempt_thinking_metadata) = shielded_attempt_body(
         runtime,
         attempt_number,
         retry_cause,
@@ -7784,6 +7797,7 @@ async fn start_shielded_attempt(
         anti_loop_hint_applied,
         &attempt_plan,
         cot_salvage,
+        &attempt_thinking_metadata,
     );
     let upstream_timeout = if ignores_request_deadline {
         runtime.upstream_timeout
@@ -7971,8 +7985,8 @@ fn shielded_attempt_body(
     retry_cause: Option<ShieldedRetryCause>,
     attempt_plan: &ShieldedAttemptPlan,
     cot_salvage: Option<&CotSalvageContext>,
-) -> (Bytes, bool) {
-    let prepared_body = match runtime.chat_kind {
+) -> (Bytes, bool, BTreeMap<String, String>) {
+    let prepared_request = match runtime.chat_kind {
         ShieldedChatKind::NonStream => shielded_chat::prepare_non_stream_request(
             &runtime.downstream_body,
             &attempt_plan.thinking,
@@ -7981,10 +7995,15 @@ fn shielded_attempt_body(
             shielded_chat::prepare_stream_request(&runtime.downstream_body, &attempt_plan.thinking)
         }
         ShieldedChatKind::Generic => None,
-    }
-    .map_or_else(
-        || runtime.upstream_body.clone(),
-        |request| request.upstream_body(),
+    };
+    let (prepared_body, thinking_metadata) = prepared_request.map_or_else(
+        || {
+            (
+                runtime.upstream_body.clone(),
+                runtime.thinking_metadata.clone(),
+            )
+        },
+        |request| (request.upstream_body(), request.thinking_metadata().clone()),
     );
 
     if let Some(cot_salvage) = cot_salvage
@@ -8000,6 +8019,7 @@ fn shielded_attempt_body(
         return (
             apply_param_override_to_body_or_original(body, &runtime.upstream_profile),
             true,
+            thinking_metadata,
         );
     }
 
@@ -8023,6 +8043,7 @@ fn shielded_attempt_body(
     (
         apply_param_override_to_body_or_original(prepared_body, &runtime.upstream_profile),
         anti_loop_hint_applied,
+        thinking_metadata,
     )
 }
 
@@ -8049,6 +8070,7 @@ fn shielded_attempt_request_metadata(
     anti_loop_hint_applied: bool,
     attempt_plan: &ShieldedAttemptPlan,
     cot_salvage: Option<&CotSalvageContext>,
+    thinking_metadata: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut metadata = attempt_request_metadata(
         &runtime.downstream_method,
@@ -8066,7 +8088,7 @@ fn shielded_attempt_request_metadata(
         true,
         true,
         &runtime.liveness,
-        &runtime.thinking_metadata,
+        thinking_metadata,
     );
     add_retry_attempt_metadata(
         &mut metadata,
@@ -8601,6 +8623,12 @@ fn copy_attempt_request_metadata(
     response_metadata: &mut BTreeMap<String, String>,
     request_metadata: &BTreeMap<String, String>,
 ) {
+    for (key, value) in request_metadata
+        .iter()
+        .filter(|(key, _value)| key.starts_with("thinking_"))
+    {
+        response_metadata.insert(key.clone(), value.clone());
+    }
     for key in [
         "attempt_index",
         "attempt_name",

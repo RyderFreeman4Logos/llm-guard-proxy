@@ -628,6 +628,7 @@ thinking_mode = "force_thinking"
 max_tokens = 50000
 thinking_token_budget = 32768
 no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "vllm_native"
 
 [[retry.ladder]]
 name = "bounded-thinking"
@@ -659,6 +660,10 @@ max_tokens = 50000
     );
     assert_eq!(config.retry.ladder[0].thinking.max_tokens, Some(50_000));
     assert_eq!(config.retry.ladder[0].thinking.budget_tokens, 32_768);
+    assert_eq!(
+        config.retry.ladder[0].default_injection_schema,
+        Some(DefaultInjectionSchema::VllmNative)
+    );
     assert_eq!(
         config.retry.ladder[0].thinking.no_thinking_marker_policy,
         NoThinkingMarkerPolicy::RespectNoThinkingMarkers

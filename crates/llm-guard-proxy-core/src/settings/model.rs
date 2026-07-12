@@ -3137,6 +3137,8 @@ pub struct RetryLadderConfig {
     pub name: String,
     /// Thinking rewrite policy selected for this attempt.
     pub thinking: ThinkingConfig,
+    /// Explicit schema override; absent entries inherit the selected upstream profile schema.
+    pub default_injection_schema: Option<DefaultInjectionSchema>,
     /// Optional bounded behavioral hint for loop-triggered retries.
     pub anti_loop_hint: Option<String>,
 }

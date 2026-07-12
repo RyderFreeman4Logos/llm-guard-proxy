@@ -4438,6 +4438,164 @@ thinking_mode = "force_disable"
 }
 
 #[tokio::test]
+async fn vllm_native_retry_ladder_uses_each_budget_and_original_answer_headroom() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+default_injection_schema = "vllm_native"
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 4
+anti_loop_hint_enabled = false
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 40000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "bounded-thinking-deep"
+thinking_mode = "force_thinking"
+max_tokens = 40000
+thinking_token_budget = 16384
+
+[[retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 40000
+thinking_token_budget = 8192
+
+[[retry.ladder]]
+name = "no-thinking"
+thinking_mode = "force_disable"
+max_tokens = 40000
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-three-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":10000,"max_completion_tokens":200,"max_output_tokens":18446744073709551615}"#,
+        )
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        shielded_final_json(response).await["choices"][0]["message"]["content"],
+        "Hello"
+    );
+
+    let mut observed_bodies = Vec::new();
+    for _ in 0..4 {
+        let observed = fake.recv_next().await;
+        observed_bodies.push(
+            serde_json::from_slice::<serde_json::Value>(&observed.body)
+                .expect("retry body should be JSON"),
+        );
+    }
+    assert_vllm_native_retry_bodies(&observed_bodies);
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_vllm_native_retry_metadata(&attempts);
+}
+
+fn assert_vllm_native_retry_bodies(observed_bodies: &[serde_json::Value]) {
+    assert_eq!(observed_bodies.len(), 4);
+    let budgets = [32_768_u64, 16_384, 8_192];
+    let expected_max_tokens = [40_000_u64, 26_384, 18_192];
+    for ((body, budget), expected_max_tokens) in observed_bodies
+        .iter()
+        .take(3)
+        .zip(budgets)
+        .zip(expected_max_tokens)
+    {
+        assert_eq!(body["thinking_token_budget"], budget);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(body["max_tokens"], expected_max_tokens);
+        assert_eq!(body["max_completion_tokens"], 200 + budget);
+        assert_eq!(body["max_output_tokens"], 40_000);
+        assert!(body.get("thinking").is_none());
+    }
+    let no_thinking = &observed_bodies[3];
+    assert_eq!(no_thinking["thinking_token_budget"], 0);
+    assert_eq!(
+        no_thinking["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+    assert_eq!(no_thinking["max_tokens"], 10_000);
+    assert_eq!(no_thinking["max_completion_tokens"], 200);
+    assert_eq!(no_thinking["max_output_tokens"], 40_000);
+}
+
+fn assert_vllm_native_retry_metadata(attempts: &[AttemptChainRow]) {
+    assert_eq!(attempts.len(), 4);
+    let budgets = [32_768_u64, 16_384, 8_192];
+    for (attempt, budget) in attempts.iter().take(3).zip(budgets) {
+        assert_eq!(
+            attempt.response_metadata["attempt_thinking_budget_tokens"],
+            budget.to_string()
+        );
+        assert_eq!(
+            attempt.response_metadata["thinking_default_injection_schema"],
+            "vllm_native"
+        );
+        assert_eq!(
+            attempt.response_metadata["thinking_schema_path"],
+            "thinking_token_budget"
+        );
+        assert_eq!(
+            attempt.response_metadata["thinking_budget_final_tokens"],
+            budget.to_string()
+        );
+        assert_eq!(
+            attempt.response_metadata["thinking_answer_budget_adjusted_fields"],
+            "max_tokens,max_completion_tokens,max_output_tokens"
+        );
+        assert_eq!(
+            attempt.response_metadata["thinking_policy_max_tokens"],
+            "40000"
+        );
+        assert_eq!(
+            attempt.response_metadata["attempt_thinking_max_tokens"],
+            "40000"
+        );
+        assert_eq!(
+            attempt.response_metadata["thinking_answer_budget_overflow_fields"],
+            "max_output_tokens"
+        );
+    }
+    assert_eq!(
+        attempts[3].response_metadata["attempt_thinking_budget_tokens"],
+        "0"
+    );
+    assert_eq!(
+        attempts[3].response_metadata["thinking_budget_final_tokens"],
+        "0"
+    );
+    assert_eq!(
+        attempts[3].response_metadata["thinking_answer_budget_adjusted_fields"],
+        "max_output_tokens"
+    );
+}
+
+#[tokio::test]
 async fn bounded_cot_salvage_falls_back_to_no_thinking_after_salvage_loop() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -17122,6 +17280,9 @@ fn fake_streaming_chat_completion_response(
     if let Some(response) = fake_loop_twice_then_success_response(path_and_query, state, body) {
         return Some(response);
     }
+    if let Some(response) = fake_loop_three_then_success_response(path_and_query, state, body) {
+        return Some(response);
+    }
     if let Some(response) = fake_loop_three_then_slow_success_response(path_and_query, state, body)
     {
         return Some(response);
@@ -17169,6 +17330,20 @@ fn fake_loop_three_then_slow_success_response(
         return Some(repeated_reasoning_line_sse_response(200));
     }
     Some(slow_chat_completion_sse_response(body))
+}
+
+fn fake_loop_three_then_success_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+    body: &Bytes,
+) -> Option<Response<Body>> {
+    if !path_and_query.contains("test=loop-three-then-success") {
+        return None;
+    }
+    if next_fake_attempt_count(state, path_and_query) <= 3 {
+        return Some(repeated_reasoning_line_sse_response(200));
+    }
+    Some(chat_completion_sse_response(body))
 }
 
 fn fake_loop_twice_then_success_response(

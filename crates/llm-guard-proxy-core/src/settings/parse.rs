@@ -1850,8 +1850,9 @@ fn assign_retry_ladder(
                 parse_no_thinking_marker_policy(value, line_number)?;
         }
         "default_injection_schema" | "thinking.default_injection_schema" => {
-            config.thinking.default_injection_schema =
-                parse_default_injection_schema(value, line_number)?;
+            let schema = parse_default_injection_schema(value, line_number)?;
+            config.thinking.default_injection_schema = schema;
+            config.default_injection_schema = Some(schema);
         }
         "apply_to_tool_requests" => {
             config.thinking.tool_request_policy = if parse_bool(value, line_number)? {
