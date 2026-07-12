@@ -54,6 +54,7 @@ pub struct ObservabilityStore {
     config: ConfigHandle,
     connection: Arc<Mutex<Connection>>,
     metrics: Arc<Mutex<MetricsCache>>,
+    _writer_ownership: Option<Arc<WriterOwnership>>,
     #[cfg(test)]
     fail_after_request_commit: Arc<AtomicBool>,
     #[cfg(test)]
@@ -66,6 +67,12 @@ struct MetricsCache {
     valid: bool,
 }
 
+#[derive(Debug)]
+struct WriterOwnership {
+    // The OS releases the advisory lock when the last cloned store drops this file.
+    _file: fs::File,
+}
+
 impl ObservabilityStore {
     /// Opens the configured `SQLite` database and applies schema migrations.
     ///
@@ -75,9 +82,11 @@ impl ObservabilityStore {
     /// path cannot be prepared, `SQLite` cannot open, or migration fails.
     pub fn open(config: ConfigHandle) -> Result<Self, ObservabilityError> {
         let snapshot = config.snapshot()?;
-        let sqlite_path = resolve_sqlite_path(&snapshot.observability.sqlite_path)?;
-        prepare_parent_directory(&sqlite_path)?;
+        let configured_sqlite_path = resolve_sqlite_path(&snapshot.observability.sqlite_path)?;
+        prepare_parent_directory(&configured_sqlite_path)?;
+        let sqlite_path = normalize_sqlite_path(&configured_sqlite_path)?;
         prepare_sqlite_file(&sqlite_path)?;
+        let writer_ownership = acquire_writer_ownership(&sqlite_path)?.map(Arc::new);
         let connection = open_sqlite_connection(&sqlite_path)?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -95,6 +104,7 @@ impl ObservabilityStore {
                 accumulator: metrics,
                 valid: true,
             })),
+            _writer_ownership: writer_ownership,
             #[cfg(test)]
             fail_after_request_commit: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -1638,7 +1648,8 @@ fn read_heartbeat_mode_counts(
                 source,
             })?;
         let mode = metadata_value(&response_metadata_json, "downstream_liveness_mode")
-            .or_else(|| metadata_value(&request_metadata_json, "downstream_liveness_mode"));
+            .or_else(|| metadata_value(&request_metadata_json, "downstream_liveness_mode"))
+            .map(|mode| super::metrics_accumulator::normalized_heartbeat_mode_label(&mode));
         if let Some(mode) = mode {
             let entry = counts.entry(mode).or_default();
             *entry = entry.saturating_add(1);
@@ -2057,6 +2068,128 @@ fn resolve_sqlite_path(path: &Path) -> Result<PathBuf, ObservabilityError> {
         return Err(ObservabilityError::HomeDirectoryUnavailable);
     };
     Ok(PathBuf::from(home).join(rest))
+}
+
+fn normalize_sqlite_path(path: &Path) -> Result<PathBuf, ObservabilityError> {
+    if path == Path::new(":memory:") {
+        return Ok(path.to_path_buf());
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|source| ObservabilityError::NormalizeStoragePath {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .join(path)
+    };
+    let Some(parent) = absolute.parent() else {
+        return Err(unsafe_storage_path(
+            &absolute,
+            "observability SQLite path must have a parent directory",
+        ));
+    };
+    let Some(file_name) = absolute.file_name() else {
+        return Err(unsafe_storage_path(
+            &absolute,
+            "observability SQLite path must name a file",
+        ));
+    };
+    let normalized_parent =
+        fs::canonicalize(parent).map_err(|source| ObservabilityError::NormalizeStoragePath {
+            path: absolute.clone(),
+            source,
+        })?;
+    Ok(normalized_parent.join(file_name))
+}
+
+fn acquire_writer_ownership(
+    sqlite_path: &Path,
+) -> Result<Option<WriterOwnership>, ObservabilityError> {
+    if sqlite_path == Path::new(":memory:") {
+        return Ok(None);
+    }
+    let lock_path = writer_lock_path(sqlite_path);
+    validate_writer_lock_file_path(&lock_path)?;
+    let file = open_secure_writer_lock_file(&lock_path, sqlite_path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(WriterOwnership { _file: file })),
+        Err(source) if source.kind() == fs2::lock_contended_error().kind() => {
+            Err(ObservabilityError::WriterOwnershipHeld {
+                path: sqlite_path.to_path_buf(),
+            })
+        }
+        Err(source) => Err(ObservabilityError::WriterOwnership {
+            path: sqlite_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn writer_lock_path(sqlite_path: &Path) -> PathBuf {
+    let mut lock_path = sqlite_path.as_os_str().to_os_string();
+    lock_path.push(".writer.lock");
+    PathBuf::from(lock_path)
+}
+
+fn validate_writer_lock_file_path(path: &Path) -> Result<(), ObservabilityError> {
+    let Some(metadata) = inspect_path(path)? else {
+        return Ok(());
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(unsafe_storage_path(
+            path,
+            "observability writer lock file must not be a symlink",
+        ));
+    }
+    if !file_type.is_file() {
+        return Err(unsafe_storage_path(
+            path,
+            "observability writer lock path must be a regular file",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_secure_writer_lock_file(
+    path: &Path,
+    sqlite_path: &Path,
+) -> Result<fs::File, ObservabilityError> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(OBSERVABILITY_SQLITE_MODE)
+        .open(path)
+        .map_err(|source| ObservabilityError::WriterOwnership {
+            path: sqlite_path.to_path_buf(),
+            source,
+        })?;
+    file.set_permissions(fs::Permissions::from_mode(OBSERVABILITY_SQLITE_MODE))
+        .map_err(|source| ObservabilityError::WriterOwnership {
+            path: sqlite_path.to_path_buf(),
+            source,
+        })?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_secure_writer_lock_file(
+    path: &Path,
+    sqlite_path: &Path,
+) -> Result<fs::File, ObservabilityError> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .map_err(|source| ObservabilityError::WriterOwnership {
+            path: sqlite_path.to_path_buf(),
+            source,
+        })
 }
 
 fn prepare_parent_directory(path: &Path) -> Result<(), ObservabilityError> {

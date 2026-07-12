@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::settings::HeartbeatMode;
+
 use super::model::{
     AttemptMetricCount, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram,
     ObservabilityMetricsSnapshot, RequestMetricCount, RequestTerminalMetricCount,
@@ -9,6 +11,7 @@ use super::model::{
 const HISTOGRAM_BUCKETS_MS: &[u64] = &[
     10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
 ];
+const OTHER_HEARTBEAT_MODE: &str = "other";
 
 #[derive(Clone, Debug)]
 pub(super) struct RequestMetricObservation {
@@ -38,9 +41,9 @@ impl RequestMetricObservation {
         let loop_aborted = input.abort_reason == Some("loop_guard")
             || sqlite_like_loop_detected_true(input.response_metadata_json);
         let heartbeat_mode =
-            metadata_value(input.response_metadata_json, "downstream_liveness_mode").or_else(
-                || metadata_value(input.request_metadata_json, "downstream_liveness_mode"),
-            );
+            metadata_value(input.response_metadata_json, "downstream_liveness_mode")
+                .or_else(|| metadata_value(input.request_metadata_json, "downstream_liveness_mode"))
+                .map(|mode| normalized_heartbeat_mode_label(&mode));
         Self {
             request_key: (
                 input.status.to_owned(),
@@ -398,6 +401,13 @@ fn request_terminal_reason(status: &str, abort_reason: Option<&str>) -> String {
 fn metadata_value(metadata_json: &str, key: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(metadata_json).ok()?;
     value.as_object()?.get(key)?.as_str().map(ToOwned::to_owned)
+}
+
+pub(super) fn normalized_heartbeat_mode_label(value: &str) -> String {
+    HeartbeatMode::from_label(value).map_or_else(
+        || String::from(OTHER_HEARTBEAT_MODE),
+        |mode| mode.as_str().to_owned(),
+    )
 }
 
 fn sqlite_like_loop_detected_true(metadata_json: &str) -> bool {

@@ -72,6 +72,28 @@ pub enum ObservabilityError {
     /// Shared `SQLite` connection state was poisoned by a panic.
     #[error("observability store lock is poisoned")]
     LockPoisoned,
+    /// Another store or process owns the configured writer path.
+    #[error("observability writer ownership is already held for {path}")]
+    WriterOwnershipHeld {
+        /// Normalized `SQLite` path whose writer is already active.
+        path: PathBuf,
+    },
+    /// Preparing or locking the writer-ownership sidecar failed.
+    #[error("failed to acquire observability writer ownership for {path}: {source}")]
+    WriterOwnership {
+        /// Normalized `SQLite` path whose ownership could not be acquired.
+        path: PathBuf,
+        /// Source filesystem locking error.
+        source: std::io::Error,
+    },
+    /// Resolving an alias-free `SQLite` storage path failed.
+    #[error("failed to normalize observability SQLite path {path}: {source}")]
+    NormalizeStoragePath {
+        /// Configured or absolute path being normalized.
+        path: PathBuf,
+        /// Source filesystem resolution error.
+        source: std::io::Error,
+    },
     /// Cached metrics were invalidated after database recovery failed.
     #[error("observability metrics are unavailable until the store resynchronizes")]
     MetricsUnavailable,

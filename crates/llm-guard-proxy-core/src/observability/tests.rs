@@ -240,6 +240,114 @@ fn rejects_symlink_sqlite_path_without_chmodding_target() {
 }
 
 #[test]
+fn exclusive_writer_rejects_same_path_and_reopens_after_drop() {
+    let fixture = StoreFixture::new("exclusive-writer");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let store = ObservabilityStore::open(manager.handle()).expect("first store should open");
+    store
+        .record_request(&request_record(
+            "req-exclusive-writer",
+            RequestStatus::Succeeded,
+            1_000,
+        ))
+        .expect("request should be written");
+
+    let alias_config_path = fixture.root.join("alias-config.toml");
+    let alias_sqlite_path = fixture
+        .storage_dir()
+        .join(".")
+        .join("observability.sqlite3");
+    write_config_file(
+        &alias_config_path,
+        &alias_sqlite_path,
+        true,
+        false,
+        TEST_MAX_BYTES,
+        TEST_PRUNE_TO_BYTES,
+    );
+    let alias_manager =
+        ConfigManager::from_explicit_path(&alias_config_path).expect("alias config should load");
+    let error = ObservabilityStore::open(alias_manager.handle())
+        .expect_err("second writer for the same SQLite path must be rejected");
+    match error {
+        ObservabilityError::WriterOwnershipHeld { path } => {
+            assert_eq!(path, fixture.sqlite_path);
+        }
+        other => panic!("unexpected ownership error: {other}"),
+    }
+
+    let writer_lock_path = writer_lock_path_for_test(&fixture.sqlite_path);
+    assert!(writer_lock_path.is_file());
+    #[cfg(unix)]
+    assert_eq!(file_mode(&writer_lock_path), 0o600);
+
+    drop(store);
+    assert!(
+        writer_lock_path.is_file(),
+        "writer lock sidecar must persist"
+    );
+    let reopened = ObservabilityStore::open(manager.handle())
+        .expect("writer ownership should release when the last store clone drops");
+    assert_eq!(
+        reopened
+            .metrics_snapshot()
+            .expect("reopened snapshot")
+            .retention_usage
+            .request_count,
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_symlink_writer_lock_without_chmodding_target() {
+    let fixture = StoreFixture::new("writer-lock-symlink");
+    fs::create_dir_all(fixture.storage_dir()).expect("storage directory should be created");
+    fs::set_permissions(fixture.storage_dir(), fs::Permissions::from_mode(0o700))
+        .expect("storage directory should be owner-only");
+
+    let target_path = fixture.root.join("writer-lock-target");
+    fs::write(&target_path, []).expect("target file should be created");
+    fs::set_permissions(&target_path, fs::Permissions::from_mode(0o666))
+        .expect("target file permissions should be broadened");
+    let original_target_mode = file_mode(&target_path);
+    let lock_path = writer_lock_path_for_test(&fixture.sqlite_path);
+    symlink(&target_path, &lock_path).expect("writer lock symlink should be created");
+
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let error = ObservabilityStore::open(manager.handle())
+        .expect_err("writer lock symlink should be rejected");
+    match error {
+        ObservabilityError::UnsafeStoragePath { path, reason } => {
+            assert_eq!(path, lock_path);
+            assert!(reason.contains("writer lock"));
+            assert!(reason.contains("symlink"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(file_mode(&target_path), original_target_mode);
+}
+
+#[test]
+fn writer_ownership_releases_when_store_initialization_fails() {
+    let fixture = StoreFixture::new("writer-lock-open-error");
+    fs::create_dir_all(fixture.storage_dir()).expect("storage directory should be created");
+    #[cfg(unix)]
+    fs::set_permissions(fixture.storage_dir(), fs::Permissions::from_mode(0o700))
+        .expect("storage directory should be owner-only");
+    fs::write(&fixture.sqlite_path, b"not a SQLite database")
+        .expect("invalid database fixture should be written");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+
+    ObservabilityStore::open(manager.handle())
+        .expect_err("invalid SQLite content should fail after acquiring ownership");
+    fs::remove_file(&fixture.sqlite_path).expect("invalid database should be removed");
+
+    ObservabilityStore::open(manager.handle())
+        .expect("failed initialization must release writer ownership");
+}
+
+#[test]
 fn writes_success_and_failure_request_and_attempt_rows() {
     let fixture = StoreFixture::new("success-failure");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
@@ -561,6 +669,85 @@ fn metrics_snapshot_work_is_independent_of_retained_row_count() {
     assert_eq!(snapshot.retention_usage.request_count, 200);
     assert_eq!(snapshot.request_counts[0].count, 200);
     assert_eq!(many_row_work, one_row_work);
+}
+
+#[test]
+fn heartbeat_metric_labels_use_a_closed_vocabulary() {
+    let fixture = StoreFixture::new("metrics-closed-heartbeat-labels");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let adversarial_values = [
+        "raw prompt: summarize the patient's private record",
+        "raw response: account balance is 12345",
+        "reasoning trace: hidden chain of thought",
+        "x-custom-header: private-header-value",
+        "SSE",
+    ];
+
+    for (index, value) in adversarial_values.iter().enumerate() {
+        let request = RequestRecord {
+            response_metadata: BTreeMap::from([(
+                String::from("downstream_liveness_mode"),
+                (*value).to_owned(),
+            )]),
+            ..request_record(
+                &format!("req-adversarial-heartbeat-{index}"),
+                RequestStatus::Succeeded,
+                1_000 + u64::try_from(index).expect("small test index"),
+            )
+        };
+        store.record_request(&request).expect("request write");
+    }
+
+    for (index, mode) in ["sse", "json-whitespace", "disabled"].iter().enumerate() {
+        let request = RequestRecord {
+            request_metadata: BTreeMap::from([(
+                String::from("downstream_liveness_mode"),
+                (*mode).to_owned(),
+            )]),
+            response_metadata: BTreeMap::new(),
+            ..request_record(
+                &format!("req-valid-heartbeat-{index}"),
+                RequestStatus::Succeeded,
+                2_000 + u64::try_from(index).expect("small test index"),
+            )
+        };
+        store.record_request(&request).expect("request write");
+    }
+
+    let snapshot = store.metrics_snapshot().expect("metrics snapshot");
+    assert_eq!(
+        snapshot
+            .heartbeat_mode_counts
+            .iter()
+            .find(|row| row.mode == "other")
+            .map(|row| row.count),
+        Some(5)
+    );
+    for mode in ["sse", "json-whitespace", "disabled"] {
+        assert_eq!(
+            snapshot
+                .heartbeat_mode_counts
+                .iter()
+                .find(|row| row.mode == mode)
+                .map(|row| row.count),
+            Some(1),
+            "missing valid heartbeat mode {mode}"
+        );
+    }
+    assert!(snapshot.heartbeat_mode_counts.iter().all(|row| {
+        matches!(
+            row.mode.as_str(),
+            "sse" | "json-whitespace" | "disabled" | "other"
+        )
+    }));
+    for raw_value in adversarial_values {
+        assert!(
+            snapshot
+                .heartbeat_mode_counts
+                .iter()
+                .all(|row| row.mode != raw_value)
+        );
+    }
 }
 
 #[test]
@@ -1585,6 +1772,12 @@ fn file_mode(path: &Path) -> u32 {
         .permissions()
         .mode()
         & 0o777
+}
+
+fn writer_lock_path_for_test(sqlite_path: &Path) -> PathBuf {
+    let mut lock_path = sqlite_path.as_os_str().to_os_string();
+    lock_path.push(".writer.lock");
+    PathBuf::from(lock_path)
 }
 
 fn unique_test_dir(name: &str) -> PathBuf {
