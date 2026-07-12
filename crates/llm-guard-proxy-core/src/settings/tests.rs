@@ -467,6 +467,18 @@ thinking.no_thinking_marker_policy = "escape_hatch_only"
 
 #[test]
 fn parses_default_injection_schema_values() {
+    let vllm_native = parse_config_text(
+        r#"
+[thinking]
+default_injection_schema = "vllm_native"
+"#,
+    )
+    .expect("vLLM native schema should parse");
+    assert_eq!(
+        vllm_native.thinking.default_injection_schema,
+        DefaultInjectionSchema::VllmNative
+    );
+
     let chat_template_kwargs = parse_config_text(
         r#"
 [thinking]
@@ -510,6 +522,7 @@ default_injection_schema = "qwen"
     );
     assert!(error.message().contains("canonical"));
     assert!(error.message().contains("chat_template_kwargs"));
+    assert!(error.message().contains("vllm_native"));
 }
 
 #[test]
@@ -735,7 +748,7 @@ thinking_token_budget = 32768
 budget_accounting = "total_cap"
 apply_to_tool_requests = true
 no_thinking_marker_policy = "escape_hatch_only"
-default_injection_schema = "chat_template_kwargs"
+default_injection_schema = "vllm_native"
 
 [[upstreams]]
 name = "fast-no-think"
@@ -782,7 +795,7 @@ mode = "force_disable"
     );
     assert_eq!(
         aeon.thinking.default_injection_schema,
-        DefaultInjectionSchema::ChatTemplateKwargs
+        DefaultInjectionSchema::VllmNative
     );
 
     let fast = &config.upstream_profiles[1];
@@ -2776,6 +2789,59 @@ fn explicit_path_requires_existing_file() {
         .expect_err("explicit config should require a file");
 
     assert!(error.to_string().contains("failed to read config"));
+}
+
+#[test]
+fn reload_switches_default_injection_schema_in_both_directions() {
+    let path = unique_test_path("thinking-schema-reload.toml");
+    write_config(
+        &path,
+        r#"
+[thinking]
+default_injection_schema = "canonical"
+"#,
+    );
+    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
+
+    write_config(
+        &path,
+        r#"
+[thinking]
+default_injection_schema = "vllm_native"
+"#,
+    );
+    let outcome = manager.reload().expect("vLLM native reload should succeed");
+    assert!(outcome.applied);
+    assert_eq!(
+        manager
+            .handle()
+            .snapshot()
+            .expect("snapshot should succeed")
+            .thinking
+            .default_injection_schema,
+        DefaultInjectionSchema::VllmNative
+    );
+
+    write_config(
+        &path,
+        r#"
+[thinking]
+default_injection_schema = "chat_template_kwargs"
+"#,
+    );
+    let outcome = manager.reload().expect("legacy reload should succeed");
+    assert!(outcome.applied);
+    assert_eq!(
+        manager
+            .handle()
+            .snapshot()
+            .expect("snapshot should succeed")
+            .thinking
+            .default_injection_schema,
+        DefaultInjectionSchema::ChatTemplateKwargs
+    );
+
+    remove_file(&path);
 }
 
 #[test]

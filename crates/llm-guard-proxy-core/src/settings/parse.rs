@@ -1486,10 +1486,11 @@ fn parse_default_injection_schema(
     match parse_string(value, line_number)?.trim() {
         "canonical" => Ok(DefaultInjectionSchema::Canonical),
         "chat_template_kwargs" => Ok(DefaultInjectionSchema::ChatTemplateKwargs),
+        "vllm_native" => Ok(DefaultInjectionSchema::VllmNative),
         other => Err(ConfigParseError::new(
             line_number,
             format!(
-                "invalid thinking.default_injection_schema {other:?}; expected \"canonical\" or \"chat_template_kwargs\""
+                "invalid thinking.default_injection_schema {other:?}; expected \"canonical\", \"chat_template_kwargs\", or \"vllm_native\""
             ),
         )),
     }

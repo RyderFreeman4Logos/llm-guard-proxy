@@ -253,9 +253,9 @@ budget_tokens = 32768                      # Max thinking tokens per request
 # budget_accounting = "canonical"         # How budget is communicated to model
 # max_tokens = 0                          # Max output tokens (0 = unlimited)
 
-# AEON/Qwen vLLM ignores canonical thinking.budget_tokens on plain OpenAI
-# payloads; inject chat_template_kwargs when no caller schema exists.
-default_injection_schema = "chat_template_kwargs"
+# AEON/Qwen vLLM enforces the numeric budget through the top-level
+# thinking_token_budget field; enable_thinking remains a template control.
+default_injection_schema = "vllm_native"
 preserve_answer_budget = true              # Don't let thinking eat answer budget
 tool_request_policy = "passthrough"        # How thinking applies to tool calls
 

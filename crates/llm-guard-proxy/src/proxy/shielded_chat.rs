@@ -686,6 +686,10 @@ fn initial_thinking_metadata(
             thinking.default_injection_schema.as_str().to_owned(),
         ),
         (
+            String::from("thinking_enable_marker_path"),
+            String::from("none"),
+        ),
+        (
             String::from("thinking_budget_previous_state"),
             previous_budget_state(budget_observations, configured_budget),
         ),
@@ -800,7 +804,10 @@ fn apply_force_thinking_policy(
         return thinking_noop("configured_budget_zero", budget_observations);
     }
 
-    let enable_marker_paths = normalize_force_enable_markers(object, metadata);
+    let mut enable_marker_paths = normalize_force_enable_markers(object, metadata);
+    if let Some(path) = ensure_vllm_native_enable_marker(object, metadata, default_schema) {
+        enable_marker_paths.push(path);
+    }
     metadata.insert(
         String::from("thinking_enable_marker_rewritten_paths"),
         join_paths(&enable_marker_paths),
@@ -842,6 +849,24 @@ fn apply_force_thinking_policy(
             }
         }
     }
+    if default_schema == DefaultInjectionSchema::VllmNative {
+        metadata.insert(
+            String::from("thinking_schema_path"),
+            ROOT_THINKING_TOKEN_BUDGET.display_path(),
+        );
+        metadata.insert(
+            String::from("thinking_schema_variant"),
+            ROOT_THINKING_TOKEN_BUDGET.variant.to_owned(),
+        );
+        if !budget_observations
+            .entries
+            .iter()
+            .any(|observation| observation.path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+            && set_budget_at_path(object, ROOT_THINKING_TOKEN_BUDGET, configured_budget)
+        {
+            rewritten_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+        }
+    }
 
     ThinkingPolicyOutcome {
         rewrite_applied: !rewritten_paths.is_empty() || !enable_marker_paths.is_empty(),
@@ -872,19 +897,48 @@ fn apply_thinking_budget_policy(
     match disable_marker {
         DisableMarker::Disabled(path) => {
             insert_disable_marker_metadata(metadata, path);
-            thinking_noop("caller_disabled_thinking", budget_observations)
+            let mut outcome = thinking_noop("caller_disabled_thinking", budget_observations);
+            clear_positive_vllm_native_budget(
+                object,
+                metadata,
+                thinking.default_injection_schema,
+                budget_observations,
+                &mut outcome,
+            );
+            outcome
         }
         DisableMarker::Malformed(path) => {
             insert_disable_marker_metadata(metadata, path);
             thinking_noop("malformed_disable_marker", budget_observations)
         }
-        DisableMarker::None => apply_budget_observations(
-            object,
-            configured_budget,
-            budget_observations,
-            metadata,
-            thinking.default_injection_schema,
-        ),
+        DisableMarker::None => {
+            let enable_marker_path = ensure_vllm_native_enable_marker(
+                object,
+                metadata,
+                thinking.default_injection_schema,
+            );
+            metadata.insert(
+                String::from("thinking_enable_marker_rewritten_paths"),
+                enable_marker_path.map_or_else(|| String::from("none"), JsonPath::display_path),
+            );
+            let mut outcome = apply_budget_observations(
+                object,
+                configured_budget,
+                budget_observations,
+                metadata,
+                thinking.default_injection_schema,
+            );
+            ensure_vllm_native_budget(
+                object,
+                metadata,
+                thinking.default_injection_schema,
+                configured_budget,
+                budget_observations,
+                &mut outcome,
+            );
+            outcome.rewrite_applied = outcome.rewrite_applied || enable_marker_path.is_some();
+            outcome
+        }
     }
 }
 
@@ -1067,6 +1121,10 @@ fn inject_missing_budget(
     );
     if set_budget_at_path(object, path, configured_budget) {
         if let Some(enable_path) = chat_template_enable_marker_path(path) {
+            metadata.insert(
+                String::from("thinking_enable_marker_path"),
+                enable_path.display_path(),
+            );
             if matches!(value_at_path(object, enable_path.path), PathValue::Missing) {
                 let _enabled = set_bool_at_path(object, enable_path, true);
             }
@@ -1337,6 +1395,9 @@ fn token_budget_value(value: &Value) -> BudgetState {
 }
 
 fn injection_path(object: &Map<String, Value>, default_schema: DefaultInjectionSchema) -> JsonPath {
+    if default_schema == DefaultInjectionSchema::VllmNative {
+        return ROOT_THINKING_TOKEN_BUDGET;
+    }
     if object_at_path(object, &["chat_template_kwargs"]) {
         return ROOT_CHAT_TEMPLATE_THINKING_BUDGET;
     }
@@ -1349,6 +1410,7 @@ fn injection_path(object: &Map<String, Value>, default_schema: DefaultInjectionS
     match default_schema {
         DefaultInjectionSchema::Canonical => CANONICAL_THINKING_BUDGET,
         DefaultInjectionSchema::ChatTemplateKwargs => ROOT_CHAT_TEMPLATE_THINKING_BUDGET,
+        DefaultInjectionSchema::VllmNative => ROOT_THINKING_TOKEN_BUDGET,
     }
 }
 
@@ -1368,7 +1430,10 @@ fn force_disable_marker_path(
     if object_at_path(object, &["thinking"]) {
         return THINKING_ENABLED;
     }
-    if default_schema == DefaultInjectionSchema::ChatTemplateKwargs {
+    if matches!(
+        default_schema,
+        DefaultInjectionSchema::ChatTemplateKwargs | DefaultInjectionSchema::VllmNative
+    ) {
         return ROOT_CHAT_TEMPLATE_ENABLE_THINKING;
     }
     if object_at_path(object, &["extra_body"]) {
@@ -1378,13 +1443,115 @@ fn force_disable_marker_path(
 }
 
 fn chat_template_enable_marker_path(budget_path: JsonPath) -> Option<JsonPath> {
-    if budget_path.path == ROOT_CHAT_TEMPLATE_THINKING_BUDGET.path {
+    if budget_path.path == ROOT_THINKING_TOKEN_BUDGET.path
+        || budget_path.path == ROOT_CHAT_TEMPLATE_THINKING_BUDGET.path
+    {
         return Some(ROOT_CHAT_TEMPLATE_ENABLE_THINKING);
     }
     if budget_path.path == EXTRA_BODY_CHAT_TEMPLATE_THINKING_BUDGET.path {
         return Some(EXTRA_BODY_CHAT_TEMPLATE_ENABLE_THINKING);
     }
     None
+}
+
+fn ensure_vllm_native_enable_marker(
+    object: &mut Map<String, Value>,
+    metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
+) -> Option<JsonPath> {
+    if default_schema != DefaultInjectionSchema::VllmNative {
+        return None;
+    }
+    metadata.insert(
+        String::from("thinking_enable_marker_path"),
+        ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path(),
+    );
+    if matches!(
+        value_at_path(object, ROOT_CHAT_TEMPLATE_ENABLE_THINKING.path),
+        PathValue::Value(Value::Bool(true))
+    ) {
+        return None;
+    }
+    set_bool_at_path(object, ROOT_CHAT_TEMPLATE_ENABLE_THINKING, true)
+        .then_some(ROOT_CHAT_TEMPLATE_ENABLE_THINKING)
+}
+
+fn ensure_vllm_native_budget(
+    object: &mut Map<String, Value>,
+    metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
+    configured_budget: u64,
+    budget_observations: &BudgetObservations,
+    outcome: &mut ThinkingPolicyOutcome,
+) {
+    if default_schema != DefaultInjectionSchema::VllmNative || !outcome.zero_paths.is_empty() {
+        return;
+    }
+    metadata.insert(
+        String::from("thinking_schema_path"),
+        ROOT_THINKING_TOKEN_BUDGET.display_path(),
+    );
+    metadata.insert(
+        String::from("thinking_schema_variant"),
+        ROOT_THINKING_TOKEN_BUDGET.variant.to_owned(),
+    );
+    if budget_observations
+        .entries
+        .iter()
+        .any(|observation| observation.path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+    {
+        return;
+    }
+    if set_budget_at_path(object, ROOT_THINKING_TOKEN_BUDGET, configured_budget) {
+        if outcome.final_budget == "unknown" {
+            outcome.answer_budget_delta = configured_budget;
+        }
+        outcome.rewrite_applied = true;
+        outcome.final_budget = configured_budget.to_string();
+        outcome.rewritten_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+    }
+}
+
+fn clear_positive_vllm_native_budget(
+    object: &mut Map<String, Value>,
+    metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
+    budget_observations: &BudgetObservations,
+    outcome: &mut ThinkingPolicyOutcome,
+) {
+    if default_schema != DefaultInjectionSchema::VllmNative {
+        return;
+    }
+    let Some(observation) = budget_observations
+        .entries
+        .iter()
+        .find(|observation| observation.path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+    else {
+        return;
+    };
+    metadata.insert(
+        String::from("thinking_schema_path"),
+        ROOT_THINKING_TOKEN_BUDGET.display_path(),
+    );
+    metadata.insert(
+        String::from("thinking_schema_variant"),
+        ROOT_THINKING_TOKEN_BUDGET.variant.to_owned(),
+    );
+    if matches!(observation.state, BudgetState::Numeric(0)) {
+        return;
+    }
+    if set_budget_at_path(object, ROOT_THINKING_TOKEN_BUDGET, 0) {
+        outcome.rewrite_applied = true;
+        outcome.final_budget = String::from("0");
+        outcome
+            .preserved_paths
+            .retain(|path| path.path != ROOT_THINKING_TOKEN_BUDGET.path);
+        outcome
+            .malformed_paths
+            .retain(|path| path.path != ROOT_THINKING_TOKEN_BUDGET.path);
+        outcome.rewritten_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+        outcome.zero_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+    }
 }
 
 fn object_at_path(object: &Map<String, Value>, path: &[&str]) -> bool {

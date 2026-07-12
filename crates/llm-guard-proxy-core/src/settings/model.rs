@@ -2665,6 +2665,10 @@ pub enum DefaultInjectionSchema {
     ///
     /// Required by AEON/Qwen vLLM backends that ignore the canonical thinking schema.
     ChatTemplateKwargs,
+    /// Use top-level `thinking_token_budget` with `chat_template_kwargs.enable_thinking`.
+    ///
+    /// Required by vLLM backends whose native sampling parameter enforces the numeric budget.
+    VllmNative,
 }
 
 impl DefaultInjectionSchema {
@@ -2673,6 +2677,7 @@ impl DefaultInjectionSchema {
         match self {
             Self::Canonical => "canonical",
             Self::ChatTemplateKwargs => "chat_template_kwargs",
+            Self::VllmNative => "vllm_native",
         }
     }
 }
