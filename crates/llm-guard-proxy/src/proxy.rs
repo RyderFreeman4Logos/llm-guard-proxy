@@ -2098,7 +2098,7 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
         record_failed_request(
             &state.store,
             FailedRequestRecord {
-                request_id,
+                request_id: request_id.clone(),
                 started_at_unix_ms,
                 finished_at_unix_ms,
                 status: RequestStatus::Failed,
@@ -2112,7 +2112,7 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
         );
         live_registry.update_state(live_request_id.as_str(), LiveRequestState::Failed);
         live_registry.fail(live_request_id.as_str());
-        return response;
+        return finalize_proxy_terminal_response(response, &request_id);
     }
 
     let admission_request = AdmissionRequestMetadata::from_request(&request);
@@ -2129,7 +2129,7 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
                     .live_registry
                     .update_state(request_id.as_str(), LiveRequestState::Failed);
                 state.live_registry.fail(request_id.as_str());
-                return response;
+                return finalize_proxy_terminal_response(response, &request_id);
             }
         };
 
@@ -2144,7 +2144,7 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
         admission.config.server.max_request_body_bytes,
     ))
     .await;
-    match forward_result {
+    let response = match forward_result {
         Ok(response) => {
             state
                 .live_registry
@@ -2167,7 +2167,7 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
             record_failed_request(
                 &state.store,
                 FailedRequestRecord {
-                    request_id,
+                    request_id: request_id.clone(),
                     started_at_unix_ms,
                     finished_at_unix_ms,
                     status: error.request_status(),
@@ -2185,7 +2185,8 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
             live_registry.fail(live_request_id.as_str());
             response
         }
-    }
+    };
+    finalize_proxy_terminal_response(response, &request_id)
 }
 
 struct RequestAdmission {
@@ -10043,6 +10044,22 @@ fn downstream_response(
     let mut headers = HeaderMap::new();
     copy_response_headers(upstream_headers, &mut headers);
     response_with_headers(status, headers, body)
+}
+
+/// Adds the stable observability identifier at the single terminal proxy boundary.
+///
+/// This overwrites any upstream value so every client-visible terminal response
+/// correlates with the request record persisted by this proxy.
+fn finalize_proxy_terminal_response(
+    mut response: Response<Body>,
+    request_id: &RequestId,
+) -> Response<Body> {
+    let request_id = HeaderValue::from_str(request_id.as_str())
+        .expect("generated request IDs must be valid HTTP header values");
+    response
+        .headers_mut()
+        .insert(HeaderName::from_static("x-request-id"), request_id);
+    response
 }
 
 fn response_with_headers(

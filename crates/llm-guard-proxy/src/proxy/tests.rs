@@ -1314,7 +1314,10 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
 
     let response = proxy
         .client
-        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .post(format!(
+            "{}/v1/chat/completions?test=request-id-collision",
+            proxy.base_url
+        ))
         .header(CONTENT_TYPE, "application/json")
         .body(body.clone())
         .send()
@@ -1322,6 +1325,17 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
         .expect("proxy request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
+    let response_request_id = response
+        .headers()
+        .get("x-request-id")
+        .expect("terminal response should include x-request-id")
+        .to_str()
+        .expect("x-request-id should be valid header text")
+        .to_owned();
+    assert_ne!(
+        response_request_id, "upstream-request-id-collision",
+        "proxy terminal response must overwrite the upstream request ID"
+    );
     assert_eq!(
         response
             .headers()
@@ -1380,9 +1394,15 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
     assert_eq!(aggregated["usage"]["completion_tokens"], 2);
     assert_eq!(aggregated["usage"]["total_tokens"], 5);
 
+    let persisted_request = read_last_observability_row(&proxy.sqlite_path, "requests");
+    assert_eq!(response_request_id, persisted_request.request_id);
+
     let observed = fake.recv_next().await;
     assert_eq!(observed.method, Method::POST);
-    assert_eq!(observed.path_and_query, "/v1/chat/completions");
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=request-id-collision"
+    );
     let observed_body: serde_json::Value =
         serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
     assert_eq!(observed_body["model"], "test-chat");
@@ -12881,6 +12901,8 @@ async fn invalid_openai_path_writes_failed_request_without_attempt() {
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
 
     let response = send_raw_proxy_get(&proxy.base_url, "/v1/../admin").await;
+    let response_request_id = raw_response_header(&response, "x-request-id")
+        .expect("terminal response should include x-request-id");
 
     assert!(
         response.starts_with("HTTP/1.1 400 Bad Request"),
@@ -12906,6 +12928,7 @@ async fn invalid_openai_path_writes_failed_request_without_attempt() {
     let request_metadata: serde_json::Value =
         serde_json::from_str(&request_row.3).expect("request metadata should be json");
 
+    assert_response_request_id_matches_persisted_request(response_request_id, &proxy);
     assert_eq!(request_row.0, "failed");
     assert_eq!(request_row.1, 400);
     assert!(request_row.2.contains("invalid_request_path"));
@@ -12933,6 +12956,7 @@ async fn upstream_transport_failure_writes_failed_request_and_attempt() {
         .expect("proxy request should complete with gateway error");
 
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let response_request_id = terminal_response_request_id(response.headers());
     let body = response.text().await.expect("body should be text");
     assert!(
         body.contains("upstream_transport_error"),
@@ -12992,6 +13016,7 @@ async fn upstream_transport_failure_writes_failed_request_and_attempt() {
 
     assert_eq!(request_count, 1);
     assert_eq!(attempt_count, 1);
+    assert_response_request_id_matches_persisted_request(&response_request_id, &proxy);
     assert_eq!(request_row.0, "failed");
     assert_eq!(request_row.1, 502);
     assert!(request_row.2.contains("upstream_transport_error"));
@@ -14873,6 +14898,7 @@ async fn generation_queue_full_fails_without_body_buffering_or_upstream_forward(
     .expect("queue-full response should be bounded");
 
     assert_eq!(overflow_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let response_request_id = terminal_response_request_id(overflow_response.headers());
     assert_eq!(
         overflow_response
             .headers()
@@ -14893,6 +14919,9 @@ async fn generation_queue_full_fails_without_body_buffering_or_upstream_forward(
         !overflow_body_polled.load(Ordering::SeqCst),
         "queue-full rejection must not read the request body"
     );
+    let persisted_request = read_last_observability_row(&proxy.sqlite_path, "requests");
+    assert_eq!(response_request_id, persisted_request.request_id);
+    assert_eq!(persisted_request.status, "failed");
     assert_no_upstream_request(&mut fake).await;
 
     queued.abort();
@@ -16854,6 +16883,7 @@ fn assert_forwarded_abort_recorded(proxy: &ProxyFixture) {
 
 #[derive(Debug)]
 struct ObservabilityRow {
+    request_id: String,
     status: String,
     response_metadata: serde_json::Value,
 }
@@ -17191,14 +17221,16 @@ async fn wait_for_evidence_role_status_count(
 fn read_last_observability_row(sqlite_path: &Path, table: &str) -> ObservabilityRow {
     assert!(matches!(table, "requests" | "attempts"));
     let connection = Connection::open(sqlite_path).expect("sqlite should open");
-    let sql =
-        format!("SELECT status, response_metadata_json FROM {table} ORDER BY rowid DESC LIMIT 1");
-    let row: (String, String) = connection
-        .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
+    let sql = format!(
+        "SELECT request_id, status, response_metadata_json FROM {table} ORDER BY rowid DESC LIMIT 1"
+    );
+    let row: (String, String, String) = connection
+        .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .expect("observability row should exist");
-    let response_metadata = serde_json::from_str(&row.1).expect("response metadata should be json");
+    let response_metadata = serde_json::from_str(&row.2).expect("response metadata should be json");
     ObservabilityRow {
-        status: row.0,
+        request_id: row.0,
+        status: row.1,
         response_metadata,
     }
 }
@@ -17752,7 +17784,14 @@ async fn fake_upstream_handler(
         sleep(STREAM_COMPLETION_TIMEOUT.saturating_mul(5)).await;
     }
 
-    fake_upstream_endpoint_response(&endpoint, &path_and_query, &state, &body)
+    let mut response = fake_upstream_endpoint_response(&endpoint, &path_and_query, &state, &body);
+    if path_and_query.contains("test=request-id-collision") {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-request-id"),
+            HeaderValue::from_static("upstream-request-id-collision"),
+        );
+    }
+    response
 }
 
 async fn observe_request(request: Request<Body>) -> ObservedRequest {
@@ -19959,6 +19998,34 @@ async fn send_raw_proxy_get(base_url: &str, request_target: &str) -> String {
     })
     .await
     .expect("blocking raw proxy request should finish")
+}
+
+fn raw_response_header<'response>(response: &'response str, name: &str) -> Option<&'response str> {
+    response.split("\r\n").find_map(|line| {
+        let (header_name, value) = line.split_once(':')?;
+        header_name
+            .eq_ignore_ascii_case(name)
+            .then_some(value.trim())
+    })
+}
+
+fn terminal_response_request_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-request-id")
+        .expect("terminal response should include x-request-id")
+        .to_str()
+        .expect("x-request-id should be valid header text")
+        .to_owned()
+}
+
+fn assert_response_request_id_matches_persisted_request(
+    response_request_id: &str,
+    proxy: &ProxyFixture,
+) {
+    assert_eq!(
+        response_request_id,
+        read_last_observability_row(&proxy.sqlite_path, "requests").request_id
+    );
 }
 
 // ---------------------------------------------------------------------------
