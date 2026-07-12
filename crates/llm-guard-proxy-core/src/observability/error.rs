@@ -72,6 +72,19 @@ pub enum ObservabilityError {
     /// Shared `SQLite` connection state was poisoned by a panic.
     #[error("observability store lock is poisoned")]
     LockPoisoned,
+    /// Cached metrics were invalidated after database recovery failed.
+    #[error("observability metrics are unavailable until the store resynchronizes")]
+    MetricsUnavailable,
+    /// A write failed and the metrics cache could not be resynchronized.
+    #[error(
+        "observability write failed ({write_error}); metrics recovery also failed ({recovery_error})"
+    )]
+    MetricsRecoveryFailed {
+        /// Original write-path failure.
+        write_error: Box<Self>,
+        /// Failure while rebuilding metrics from committed database state.
+        recovery_error: Box<Self>,
+    },
     /// Caller supplied an empty typed identifier.
     #[error("observability {kind} id must not be empty")]
     EmptyIdentifier {

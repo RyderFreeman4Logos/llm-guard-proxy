@@ -8,6 +8,7 @@
 mod error;
 mod ids;
 mod live_registry;
+mod metrics_accumulator;
 mod model;
 mod redaction;
 mod store;
