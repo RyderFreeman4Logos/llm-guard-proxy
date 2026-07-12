@@ -7248,6 +7248,37 @@ no_thinking_marker_policy = "respect_no_thinking_markers"
 }
 
 #[tokio::test]
+async fn force_thinking_vllm_native_respect_marker_clears_positive_native_budget() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+mode = "force_thinking"
+no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "vllm_native"
+"#,
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"chat_template_kwargs":{"enable_thinking":false},"thinking_token_budget":8192,"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+    assert_eq!(observed_body["thinking_token_budget"], 0);
+    assert_eq!(observed_body["max_tokens"], 64);
+}
+
+#[tokio::test]
 async fn force_thinking_respect_markers_preserves_reasoning_effort_none() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -7314,6 +7345,37 @@ no_thinking_marker_policy = "escape_hatch_only"
     assert_eq!(escape_hatch_body["llm_guard_proxy_disable_thinking"], true);
     assert!(escape_hatch_body.get("thinking").is_none());
     assert_eq!(escape_hatch_body["max_tokens"], 64);
+}
+
+#[tokio::test]
+async fn force_thinking_vllm_native_escape_hatch_emits_consistent_no_thinking_fields() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+mode = "force_thinking"
+no_thinking_marker_policy = "escape_hatch_only"
+default_injection_schema = "vllm_native"
+"#,
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"llm_guard_proxy_disable_thinking":true,"thinking_token_budget":8192,"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+    assert_eq!(observed_body["thinking_token_budget"], 0);
+    assert_eq!(observed_body["max_tokens"], 64);
 }
 
 #[tokio::test]
@@ -7493,6 +7555,55 @@ tool_request_policy = "passthrough"
 }
 
 #[tokio::test]
+async fn vllm_native_tool_passthrough_preserves_budget_tools_and_private_payload() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+default_injection_schema = "vllm_native"
+tool_request_policy = "passthrough"
+"#,
+    )
+    .await;
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"private-prompt"}],"tools":[{"type":"function","function":{"name":"sensitive-tool","parameters":{"type":"object","properties":{"secret-property":{"type":"string"}}}}}],"tool_choice":{"type":"function","function":{"name":"sensitive-tool"}},"thinking_token_budget":7,"chat_template_kwargs":{"enable_thinking":false},"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(observed_body["thinking_token_budget"], 7);
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+    assert_eq!(
+        observed_body["tools"][0]["function"]["name"],
+        "sensitive-tool"
+    );
+    assert_eq!(
+        observed_body["tool_choice"]["function"]["name"],
+        "sensitive-tool"
+    );
+    assert_eq!(observed_body["max_tokens"], 64);
+
+    let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
+    for metadata in [&request_metadata, &attempt_metadata] {
+        assert_eq!(
+            metadata["thinking_rewrite_reason"],
+            "tool_request_passthrough"
+        );
+        assert_text_excludes_values(
+            &metadata.to_string(),
+            &["private-prompt", "sensitive-tool", "secret-property"],
+        );
+    }
+}
+
+#[tokio::test]
 async fn force_disable_thinking_zeroes_existing_budget_paths_without_answer_budget_raise() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -7621,6 +7732,37 @@ tool_request_policy = "passthrough"
         );
         assert_eq!(metadata["thinking_budget_final_tokens"], "0");
     }
+}
+
+#[tokio::test]
+async fn force_disable_vllm_native_overrides_tool_passthrough_and_clears_native_budget() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+mode = "force_disable"
+default_injection_schema = "vllm_native"
+tool_request_policy = "passthrough"
+"#,
+    )
+    .await;
+
+    let observed_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],"thinking_token_budget":8192,"chat_template_kwargs":{"enable_thinking":true},"max_tokens":64}"#,
+    )
+    .await;
+
+    assert_eq!(observed_body["thinking_token_budget"], 0);
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+    assert_eq!(observed_body["max_tokens"], 64);
 }
 
 #[tokio::test]

@@ -733,12 +733,14 @@ fn initial_thinking_metadata(
 /// Evaluates the no-thinking marker policy for `ForceThinking` mode.
 ///
 /// Returns `true` if the request bypasses force-thinking (caller marker
-/// passthrough), in which case the caller should return immediately.
+/// passthrough), in which case the caller should return immediately. Native
+/// vLLM requests are normalized to a disabled template marker and zero budget
+/// so the passthrough decision cannot leave contradictory controls.
 /// Returns `false` if force-thinking should proceed. When a marker was
 /// detected but overridden, records observability metadata and returns
 /// `false`.
 fn record_force_thinking_marker_decision(
-    object: &Map<String, Value>,
+    object: &mut Map<String, Value>,
     thinking: &ThinkingConfig,
     budget_observations: &BudgetObservations,
     metadata: &mut BTreeMap<String, String>,
@@ -765,7 +767,35 @@ fn record_force_thinking_marker_decision(
             String::from("thinking_no_thinking_marker_escape_hatch"),
             marker.is_escape_hatch.to_string(),
         );
-        let outcome = thinking_noop("caller_no_thinking_marker_passthrough", budget_observations);
+        let mut outcome =
+            thinking_noop("caller_no_thinking_marker_passthrough", budget_observations);
+        if thinking.default_injection_schema == DefaultInjectionSchema::VllmNative {
+            metadata.insert(
+                String::from("thinking_enable_marker_path"),
+                ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path(),
+            );
+            let enable_marker_rewritten =
+                !matches!(
+                    value_at_path(object, ROOT_CHAT_TEMPLATE_ENABLE_THINKING.path),
+                    PathValue::Value(Value::Bool(false))
+                ) && set_bool_at_path(object, ROOT_CHAT_TEMPLATE_ENABLE_THINKING, false);
+            metadata.insert(
+                String::from("thinking_disable_marker_rewritten_paths"),
+                if enable_marker_rewritten {
+                    ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path()
+                } else {
+                    String::from("none")
+                },
+            );
+            clear_positive_vllm_native_budget(
+                object,
+                metadata,
+                thinking.default_injection_schema,
+                budget_observations,
+                &mut outcome,
+            );
+            outcome.rewrite_applied = outcome.rewrite_applied || enable_marker_rewritten;
+        }
         metadata.extend(thinking_outcome_metadata(
             &outcome,
             &AnswerBudgetDecision::default(),
