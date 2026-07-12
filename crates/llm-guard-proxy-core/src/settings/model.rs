@@ -1758,7 +1758,7 @@ pub struct ParamOverrideConfig {
     pub top_p: Option<f64>,
     /// Forced `top_k` value.
     pub top_k: Option<u32>,
-    /// Forced `max_tokens` value.
+    /// Total output cap and default when the caller omits output-limit fields.
     pub max_tokens: Option<u32>,
     /// Forced `frequency_penalty` value.
     pub frequency_penalty: Option<f64>,
@@ -2665,6 +2665,10 @@ pub enum DefaultInjectionSchema {
     ///
     /// Required by AEON/Qwen vLLM backends that ignore the canonical thinking schema.
     ChatTemplateKwargs,
+    /// Use top-level `thinking_token_budget` with `chat_template_kwargs.enable_thinking`.
+    ///
+    /// Required by vLLM backends whose native sampling parameter enforces the numeric budget.
+    VllmNative,
 }
 
 impl DefaultInjectionSchema {
@@ -2673,6 +2677,7 @@ impl DefaultInjectionSchema {
         match self {
             Self::Canonical => "canonical",
             Self::ChatTemplateKwargs => "chat_template_kwargs",
+            Self::VllmNative => "vllm_native",
         }
     }
 }
@@ -3132,6 +3137,8 @@ pub struct RetryLadderConfig {
     pub name: String,
     /// Thinking rewrite policy selected for this attempt.
     pub thinking: ThinkingConfig,
+    /// Explicit schema override; absent entries inherit the selected upstream profile schema.
+    pub default_injection_schema: Option<DefaultInjectionSchema>,
     /// Optional bounded behavioral hint for loop-triggered retries.
     pub anti_loop_hint: Option<String>,
 }

@@ -55,7 +55,8 @@ pub(super) fn prepare_non_stream_request(
         return None;
     }
 
-    let thinking_metadata = apply_thinking_policy(object, thinking);
+    let mut thinking_metadata = apply_thinking_policy(object, thinking);
+    add_final_answer_budget_metadata(object, &mut thinking_metadata);
     object.insert(String::from("stream"), Value::Bool(true));
     let stream_options = object
         .entry(String::from("stream_options"))
@@ -88,13 +89,32 @@ pub(super) fn prepare_stream_request(
         return None;
     }
 
-    let thinking_metadata = apply_thinking_policy(object, thinking);
+    let mut thinking_metadata = apply_thinking_policy(object, thinking);
+    add_final_answer_budget_metadata(object, &mut thinking_metadata);
     let upstream_body = serde_json::to_vec(&value).ok()?;
 
     Some(PreparedChatRequest {
         upstream_body: Bytes::from(upstream_body),
         thinking_metadata,
     })
+}
+
+/// Returns whether caller-provided native vLLM controls contradict an explicit
+/// no-thinking marker.
+///
+/// This check intentionally does not rewrite either control. Callers use it at
+/// the public request boundary so passthrough policies can preserve compatible
+/// caller values while rejecting ambiguous combinations before any upstream IO.
+pub(super) fn has_conflicting_vllm_native_controls(body: &Bytes) -> bool {
+    let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(body) else {
+        return false;
+    };
+    let positive_native_budget = matches!(
+        value_at_path(&object, ROOT_THINKING_TOKEN_BUDGET.path),
+        PathValue::Value(value)
+            if matches!(token_budget_value(value), BudgetState::Numeric(budget) if budget > 0)
+    );
+    positive_native_budget && detect_no_thinking_markers(&object).detected
 }
 
 /// Returns a retry request body with a bounded anti-loop system hint.
@@ -272,7 +292,7 @@ struct NoThinkingMarkerDetection {
 }
 
 #[derive(Clone, Debug, Default)]
-struct AnswerBudgetDecision {
+pub(super) struct AnswerBudgetDecision {
     applied: bool,
     adjusted_fields: Vec<&'static str>,
     preserved_fields: Vec<&'static str>,
@@ -513,6 +533,7 @@ const BUDGET_NO_THINKING_MARKERS: &[NoThinkingMarkerPath] = &[
 ];
 
 const ANSWER_BUDGET_FIELDS: &[&str] = &["max_tokens", "max_completion_tokens", "max_output_tokens"];
+const PARAMETERS_MAX_TOKENS_FIELD: &str = "parameters.max_tokens";
 
 #[derive(Debug)]
 struct ThinkingPolicyOutcome {
@@ -541,30 +562,35 @@ fn apply_thinking_policy(
     );
     if !thinking.enabled && !thinking.force_disable {
         let outcome = thinking_noop("policy_disabled", &budget_observations);
-        metadata.extend(thinking_outcome_metadata(
-            &outcome,
-            &AnswerBudgetDecision::default(),
-        ));
+        let answer_budget =
+            apply_configured_total_cap(object, thinking, AnswerBudgetDecision::default());
+        metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
         return metadata;
     }
     match thinking.effective_mode() {
         ThinkingMode::Passthrough => {
             let outcome = thinking_noop("mode_passthrough", &budget_observations);
-            metadata.extend(thinking_outcome_metadata(
-                &outcome,
-                &AnswerBudgetDecision::default(),
-            ));
+            let answer_budget =
+                apply_configured_total_cap(object, thinking, AnswerBudgetDecision::default());
+            metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
             return metadata;
         }
         ThinkingMode::ForceDisable => {
-            let outcome = apply_force_disable_thinking(
+            let mut outcome = apply_force_disable_thinking(
                 object,
                 &budget_observations,
                 &mut metadata,
                 thinking.default_injection_schema,
             );
+            normalize_vllm_native_disabled_state(
+                object,
+                &mut metadata,
+                thinking.default_injection_schema,
+                &mut outcome,
+            );
             let answer_budget =
                 apply_answer_budget_preservation(object, false, outcome.answer_budget_delta);
+            let answer_budget = apply_configured_total_cap(object, thinking, answer_budget);
             metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
             return metadata;
         }
@@ -577,10 +603,9 @@ fn apply_thinking_policy(
         )
     {
         let outcome = thinking_noop("tool_request_passthrough", &budget_observations);
-        metadata.extend(thinking_outcome_metadata(
-            &outcome,
-            &AnswerBudgetDecision::default(),
-        ));
+        let answer_budget =
+            apply_configured_total_cap(object, thinking, AnswerBudgetDecision::default());
+        metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
         return metadata;
     }
     if record_force_thinking_marker_decision(object, thinking, &budget_observations, &mut metadata)
@@ -686,6 +711,10 @@ fn initial_thinking_metadata(
             thinking.default_injection_schema.as_str().to_owned(),
         ),
         (
+            String::from("thinking_enable_marker_path"),
+            String::from("none"),
+        ),
+        (
             String::from("thinking_budget_previous_state"),
             previous_budget_state(budget_observations, configured_budget),
         ),
@@ -729,12 +758,14 @@ fn initial_thinking_metadata(
 /// Evaluates the no-thinking marker policy for `ForceThinking` mode.
 ///
 /// Returns `true` if the request bypasses force-thinking (caller marker
-/// passthrough), in which case the caller should return immediately.
+/// passthrough), in which case the caller should return immediately. Native
+/// vLLM requests are normalized to a disabled template marker and zero budget
+/// so the passthrough decision cannot leave contradictory controls.
 /// Returns `false` if force-thinking should proceed. When a marker was
 /// detected but overridden, records observability metadata and returns
 /// `false`.
 fn record_force_thinking_marker_decision(
-    object: &Map<String, Value>,
+    object: &mut Map<String, Value>,
     thinking: &ThinkingConfig,
     budget_observations: &BudgetObservations,
     metadata: &mut BTreeMap<String, String>,
@@ -761,11 +792,17 @@ fn record_force_thinking_marker_decision(
             String::from("thinking_no_thinking_marker_escape_hatch"),
             marker.is_escape_hatch.to_string(),
         );
-        let outcome = thinking_noop("caller_no_thinking_marker_passthrough", budget_observations);
-        metadata.extend(thinking_outcome_metadata(
-            &outcome,
-            &AnswerBudgetDecision::default(),
-        ));
+        let mut outcome =
+            thinking_noop("caller_no_thinking_marker_passthrough", budget_observations);
+        normalize_vllm_native_disabled_state(
+            object,
+            metadata,
+            thinking.default_injection_schema,
+            &mut outcome,
+        );
+        let answer_budget =
+            apply_configured_total_cap(object, thinking, AnswerBudgetDecision::default());
+        metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
         return true;
     }
     if marker.detected {
@@ -800,7 +837,10 @@ fn apply_force_thinking_policy(
         return thinking_noop("configured_budget_zero", budget_observations);
     }
 
-    let enable_marker_paths = normalize_force_enable_markers(object, metadata);
+    let mut enable_marker_paths = normalize_force_enable_markers(object, metadata);
+    if let Some(path) = ensure_vllm_native_enable_marker(object, metadata, default_schema) {
+        enable_marker_paths.push(path);
+    }
     metadata.insert(
         String::from("thinking_enable_marker_rewritten_paths"),
         join_paths(&enable_marker_paths),
@@ -842,6 +882,26 @@ fn apply_force_thinking_policy(
             }
         }
     }
+    if default_schema == DefaultInjectionSchema::VllmNative {
+        answer_budget_delta =
+            vllm_native_answer_budget_delta(budget_observations, configured_budget);
+        metadata.insert(
+            String::from("thinking_schema_path"),
+            ROOT_THINKING_TOKEN_BUDGET.display_path(),
+        );
+        metadata.insert(
+            String::from("thinking_schema_variant"),
+            ROOT_THINKING_TOKEN_BUDGET.variant.to_owned(),
+        );
+        if !budget_observations
+            .entries
+            .iter()
+            .any(|observation| observation.path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+            && set_budget_at_path(object, ROOT_THINKING_TOKEN_BUDGET, configured_budget)
+        {
+            rewritten_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+        }
+    }
 
     ThinkingPolicyOutcome {
         rewrite_applied: !rewritten_paths.is_empty() || !enable_marker_paths.is_empty(),
@@ -866,26 +926,68 @@ fn apply_thinking_budget_policy(
     if !thinking.enabled {
         return thinking_noop("policy_disabled", budget_observations);
     }
-    if configured_budget == 0 {
-        return thinking_noop("configured_budget_zero", budget_observations);
-    }
     match disable_marker {
         DisableMarker::Disabled(path) => {
             insert_disable_marker_metadata(metadata, path);
-            thinking_noop("caller_disabled_thinking", budget_observations)
+            let mut outcome = thinking_noop("caller_disabled_thinking", budget_observations);
+            normalize_vllm_native_disabled_state(
+                object,
+                metadata,
+                thinking.default_injection_schema,
+                &mut outcome,
+            );
+            return outcome;
         }
         DisableMarker::Malformed(path) => {
             insert_disable_marker_metadata(metadata, path);
-            thinking_noop("malformed_disable_marker", budget_observations)
+            return thinking_noop("malformed_disable_marker", budget_observations);
         }
-        DisableMarker::None => apply_budget_observations(
+        DisableMarker::None => {}
+    }
+    if configured_budget == 0 {
+        let mut outcome = thinking_noop("configured_budget_zero", budget_observations);
+        if !outcome.zero_paths.is_empty() {
+            normalize_vllm_native_disabled_state(
+                object,
+                metadata,
+                thinking.default_injection_schema,
+                &mut outcome,
+            );
+        }
+        return outcome;
+    }
+    let mut outcome = apply_budget_observations(
+        object,
+        configured_budget,
+        budget_observations,
+        metadata,
+        thinking.default_injection_schema,
+    );
+    if !outcome.zero_paths.is_empty() {
+        normalize_vllm_native_disabled_state(
             object,
-            configured_budget,
-            budget_observations,
             metadata,
             thinking.default_injection_schema,
-        ),
+            &mut outcome,
+        );
+        return outcome;
     }
+    let enable_marker_path =
+        ensure_vllm_native_enable_marker(object, metadata, thinking.default_injection_schema);
+    metadata.insert(
+        String::from("thinking_enable_marker_rewritten_paths"),
+        enable_marker_path.map_or_else(|| String::from("none"), JsonPath::display_path),
+    );
+    ensure_vllm_native_budget(
+        object,
+        metadata,
+        thinking.default_injection_schema,
+        configured_budget,
+        budget_observations,
+        &mut outcome,
+    );
+    outcome.rewrite_applied = outcome.rewrite_applied || enable_marker_path.is_some();
+    outcome
 }
 
 fn apply_force_disable_thinking(
@@ -1067,6 +1169,10 @@ fn inject_missing_budget(
     );
     if set_budget_at_path(object, path, configured_budget) {
         if let Some(enable_path) = chat_template_enable_marker_path(path) {
+            metadata.insert(
+                String::from("thinking_enable_marker_path"),
+                enable_path.display_path(),
+            );
             if matches!(value_at_path(object, enable_path.path), PathValue::Missing) {
                 let _enabled = set_bool_at_path(object, enable_path, true);
             }
@@ -1337,6 +1443,9 @@ fn token_budget_value(value: &Value) -> BudgetState {
 }
 
 fn injection_path(object: &Map<String, Value>, default_schema: DefaultInjectionSchema) -> JsonPath {
+    if default_schema == DefaultInjectionSchema::VllmNative {
+        return ROOT_THINKING_TOKEN_BUDGET;
+    }
     if object_at_path(object, &["chat_template_kwargs"]) {
         return ROOT_CHAT_TEMPLATE_THINKING_BUDGET;
     }
@@ -1349,6 +1458,7 @@ fn injection_path(object: &Map<String, Value>, default_schema: DefaultInjectionS
     match default_schema {
         DefaultInjectionSchema::Canonical => CANONICAL_THINKING_BUDGET,
         DefaultInjectionSchema::ChatTemplateKwargs => ROOT_CHAT_TEMPLATE_THINKING_BUDGET,
+        DefaultInjectionSchema::VllmNative => ROOT_THINKING_TOKEN_BUDGET,
     }
 }
 
@@ -1368,7 +1478,10 @@ fn force_disable_marker_path(
     if object_at_path(object, &["thinking"]) {
         return THINKING_ENABLED;
     }
-    if default_schema == DefaultInjectionSchema::ChatTemplateKwargs {
+    if matches!(
+        default_schema,
+        DefaultInjectionSchema::ChatTemplateKwargs | DefaultInjectionSchema::VllmNative
+    ) {
         return ROOT_CHAT_TEMPLATE_ENABLE_THINKING;
     }
     if object_at_path(object, &["extra_body"]) {
@@ -1378,13 +1491,192 @@ fn force_disable_marker_path(
 }
 
 fn chat_template_enable_marker_path(budget_path: JsonPath) -> Option<JsonPath> {
-    if budget_path.path == ROOT_CHAT_TEMPLATE_THINKING_BUDGET.path {
+    if budget_path.path == ROOT_THINKING_TOKEN_BUDGET.path
+        || budget_path.path == ROOT_CHAT_TEMPLATE_THINKING_BUDGET.path
+    {
         return Some(ROOT_CHAT_TEMPLATE_ENABLE_THINKING);
     }
     if budget_path.path == EXTRA_BODY_CHAT_TEMPLATE_THINKING_BUDGET.path {
         return Some(EXTRA_BODY_CHAT_TEMPLATE_ENABLE_THINKING);
     }
     None
+}
+
+fn ensure_vllm_native_enable_marker(
+    object: &mut Map<String, Value>,
+    metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
+) -> Option<JsonPath> {
+    if default_schema != DefaultInjectionSchema::VllmNative {
+        return None;
+    }
+    metadata.insert(
+        String::from("thinking_enable_marker_path"),
+        ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path(),
+    );
+    set_vllm_native_enable_marker(object, true).then_some(ROOT_CHAT_TEMPLATE_ENABLE_THINKING)
+}
+
+fn ensure_vllm_native_budget(
+    object: &mut Map<String, Value>,
+    metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
+    configured_budget: u64,
+    budget_observations: &BudgetObservations,
+    outcome: &mut ThinkingPolicyOutcome,
+) {
+    if default_schema != DefaultInjectionSchema::VllmNative || !outcome.zero_paths.is_empty() {
+        return;
+    }
+    metadata.insert(
+        String::from("thinking_schema_path"),
+        ROOT_THINKING_TOKEN_BUDGET.display_path(),
+    );
+    metadata.insert(
+        String::from("thinking_schema_variant"),
+        ROOT_THINKING_TOKEN_BUDGET.variant.to_owned(),
+    );
+    let previous_budget = vllm_native_budget_state(budget_observations);
+    outcome.answer_budget_delta =
+        vllm_native_answer_budget_delta(budget_observations, configured_budget);
+    let final_budget = match previous_budget {
+        Some(BudgetState::Numeric(previous)) => previous.max(configured_budget),
+        Some(BudgetState::Malformed) | None => {
+            if set_budget_at_path(object, ROOT_THINKING_TOKEN_BUDGET, configured_budget) {
+                outcome.rewrite_applied = true;
+                outcome
+                    .preserved_paths
+                    .retain(|path| path.path != ROOT_THINKING_TOKEN_BUDGET.path);
+                outcome
+                    .malformed_paths
+                    .retain(|path| path.path != ROOT_THINKING_TOKEN_BUDGET.path);
+                if !outcome
+                    .rewritten_paths
+                    .iter()
+                    .any(|path| path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+                {
+                    outcome.rewritten_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+                }
+            }
+            configured_budget
+        }
+    };
+    outcome.final_budget = final_budget.to_string();
+}
+
+fn vllm_native_budget_state(budget_observations: &BudgetObservations) -> Option<BudgetState> {
+    budget_observations
+        .entries
+        .iter()
+        .find(|observation| observation.path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+        .map(|observation| observation.state)
+}
+
+fn vllm_native_answer_budget_delta(
+    budget_observations: &BudgetObservations,
+    configured_budget: u64,
+) -> u64 {
+    let previous_budget = match vllm_native_budget_state(budget_observations) {
+        Some(BudgetState::Numeric(previous)) => previous,
+        Some(BudgetState::Malformed) | None => 0,
+    };
+    configured_budget.saturating_sub(previous_budget)
+}
+
+fn set_vllm_native_enable_marker(object: &mut Map<String, Value>, enabled: bool) -> bool {
+    if matches!(
+        value_at_path(object, ROOT_CHAT_TEMPLATE_ENABLE_THINKING.path),
+        PathValue::Value(Value::Bool(current)) if *current == enabled
+    ) {
+        return false;
+    }
+    let chat_template_kwargs = object
+        .entry(String::from("chat_template_kwargs"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !chat_template_kwargs.is_object() {
+        *chat_template_kwargs = Value::Object(Map::new());
+    }
+    let Value::Object(chat_template_kwargs) = chat_template_kwargs else {
+        return false;
+    };
+    chat_template_kwargs.insert(String::from("enable_thinking"), Value::Bool(enabled));
+    true
+}
+
+fn normalize_vllm_native_disabled_state(
+    object: &mut Map<String, Value>,
+    metadata: &mut BTreeMap<String, String>,
+    default_schema: DefaultInjectionSchema,
+    outcome: &mut ThinkingPolicyOutcome,
+) {
+    if default_schema != DefaultInjectionSchema::VllmNative {
+        return;
+    }
+    metadata.insert(
+        String::from("thinking_schema_path"),
+        ROOT_THINKING_TOKEN_BUDGET.display_path(),
+    );
+    metadata.insert(
+        String::from("thinking_schema_variant"),
+        ROOT_THINKING_TOKEN_BUDGET.variant.to_owned(),
+    );
+    metadata.insert(
+        String::from("thinking_enable_marker_path"),
+        ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path(),
+    );
+    let enable_marker_rewritten = set_vllm_native_enable_marker(object, false);
+    let rewritten_marker_paths = metadata
+        .entry(String::from("thinking_disable_marker_rewritten_paths"))
+        .or_insert_with(|| String::from("none"));
+    if enable_marker_rewritten {
+        let native_marker_path = ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path();
+        if rewritten_marker_paths == "none" {
+            *rewritten_marker_paths = native_marker_path;
+        } else if !rewritten_marker_paths
+            .split(',')
+            .any(|path| path == native_marker_path)
+        {
+            rewritten_marker_paths.push(',');
+            rewritten_marker_paths.push_str(&native_marker_path);
+        }
+    }
+    let native_budget_present = !matches!(
+        value_at_path(object, ROOT_THINKING_TOKEN_BUDGET.path),
+        PathValue::Missing
+    );
+    let native_budget_rewritten = native_budget_present
+        && !matches!(
+            value_at_path(object, ROOT_THINKING_TOKEN_BUDGET.path),
+            PathValue::Value(Value::Number(number)) if number.as_u64() == Some(0)
+        )
+        && set_budget_at_path(object, ROOT_THINKING_TOKEN_BUDGET, 0);
+    if native_budget_rewritten {
+        outcome.rewrite_applied = true;
+        outcome
+            .preserved_paths
+            .retain(|path| path.path != ROOT_THINKING_TOKEN_BUDGET.path);
+        outcome
+            .malformed_paths
+            .retain(|path| path.path != ROOT_THINKING_TOKEN_BUDGET.path);
+        if !outcome
+            .rewritten_paths
+            .iter()
+            .any(|path| path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+        {
+            outcome.rewritten_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+        }
+    }
+    if native_budget_present
+        && !outcome
+            .zero_paths
+            .iter()
+            .any(|path| path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+    {
+        outcome.zero_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+    }
+    outcome.rewrite_applied = outcome.rewrite_applied || enable_marker_rewritten;
+    outcome.final_budget = String::from("0");
+    outcome.answer_budget_delta = 0;
 }
 
 fn object_at_path(object: &Map<String, Value>, path: &[&str]) -> bool {
@@ -1530,30 +1822,43 @@ fn apply_configured_total_cap(
     let Some(max_tokens) = thinking.max_tokens else {
         return decision;
     };
-    if thinking.preserve_answer_budget {
-        return decision;
-    }
-    let max_tokens = u64::from(max_tokens);
+    let cap_decision = apply_output_token_limit(
+        object,
+        u64::from(max_tokens),
+        thinking.preserve_answer_budget,
+    );
+    merge_answer_budget_decision(&mut decision, cap_decision);
+    decision
+}
+
+/// Applies one clamp-or-default output cap to every supported parameter container.
+///
+/// Root OpenAI-compatible output fields share one default: when none is present,
+/// `max_tokens` is inserted. A present top-level `parameters` object receives the
+/// same treatment for its nested `max_tokens` field.
+#[cfg(feature = "param-override")]
+pub(super) fn apply_output_token_cap(
+    object: &mut Map<String, Value>,
+    max_tokens: u64,
+) -> AnswerBudgetDecision {
+    apply_output_token_limit(object, max_tokens, true)
+}
+
+fn apply_output_token_limit(
+    object: &mut Map<String, Value>,
+    max_tokens: u64,
+    preserve_lower: bool,
+) -> AnswerBudgetDecision {
+    let mut decision = AnswerBudgetDecision::default();
+    let mut root_field_present = false;
     for field in ANSWER_BUDGET_FIELDS {
-        match object.get_mut(*field) {
-            Some(value) if value.as_u64() == Some(max_tokens) => {
-                decision.preserved_fields.push(field);
-            }
-            Some(value) if value.as_u64().is_some() => {
-                *value = Value::Number(Number::from(max_tokens));
-                decision.adjusted_fields.push(field);
-                decision.applied = true;
-            }
-            Some(_value) => {
-                decision.malformed_fields.push(field);
-            }
-            None => {}
-        }
+        let Some(value) = object.get_mut(*field) else {
+            continue;
+        };
+        root_field_present = true;
+        apply_output_token_limit_field(value, field, max_tokens, preserve_lower, &mut decision);
     }
-    if decision.adjusted_fields.is_empty()
-        && decision.preserved_fields.is_empty()
-        && decision.malformed_fields.is_empty()
-    {
+    if !root_field_present {
         object.insert(
             String::from("max_tokens"),
             Value::Number(Number::from(max_tokens)),
@@ -1561,7 +1866,165 @@ fn apply_configured_total_cap(
         decision.adjusted_fields.push("max_tokens");
         decision.applied = true;
     }
+
+    if let Some(Value::Object(parameters)) = object.get_mut("parameters") {
+        if let Some(value) = parameters.get_mut("max_tokens") {
+            apply_output_token_limit_field(
+                value,
+                PARAMETERS_MAX_TOKENS_FIELD,
+                max_tokens,
+                preserve_lower,
+                &mut decision,
+            );
+        } else {
+            parameters.insert(
+                String::from("max_tokens"),
+                Value::Number(Number::from(max_tokens)),
+            );
+            decision.adjusted_fields.push(PARAMETERS_MAX_TOKENS_FIELD);
+            decision.applied = true;
+        }
+    }
     decision
+}
+
+fn apply_output_token_limit_field(
+    value: &mut Value,
+    field: &'static str,
+    max_tokens: u64,
+    preserve_lower: bool,
+    decision: &mut AnswerBudgetDecision,
+) {
+    let Some(existing) = value.as_u64() else {
+        decision.malformed_fields.push(field);
+        return;
+    };
+    if (preserve_lower && existing <= max_tokens) || (!preserve_lower && existing == max_tokens) {
+        decision.preserved_fields.push(field);
+        return;
+    }
+    *value = Value::Number(Number::from(max_tokens));
+    decision.adjusted_fields.push(field);
+    decision.applied = true;
+}
+
+fn merge_answer_budget_decision(target: &mut AnswerBudgetDecision, incoming: AnswerBudgetDecision) {
+    target.applied |= incoming.applied;
+    merge_fields(&mut target.adjusted_fields, incoming.adjusted_fields);
+    let adjusted_fields = &target.adjusted_fields;
+    target
+        .preserved_fields
+        .retain(|field| !adjusted_fields.contains(field));
+    let incoming_preserved = incoming
+        .preserved_fields
+        .into_iter()
+        .filter(|field| !adjusted_fields.contains(field))
+        .collect::<Vec<_>>();
+    merge_fields(&mut target.preserved_fields, incoming_preserved);
+    merge_fields(&mut target.malformed_fields, incoming.malformed_fields);
+    merge_fields(&mut target.overflow_fields, incoming.overflow_fields);
+}
+
+fn merge_fields(target: &mut Vec<&'static str>, incoming: impl IntoIterator<Item = &'static str>) {
+    for field in incoming {
+        if !target.contains(&field) {
+            target.push(field);
+        }
+    }
+}
+
+#[cfg(feature = "param-override")]
+pub(super) fn merge_final_answer_budget_metadata(
+    body: &Bytes,
+    metadata: &mut BTreeMap<String, String>,
+    cap_decision: AnswerBudgetDecision,
+) {
+    if metadata.is_empty() {
+        return;
+    }
+    let mut combined = AnswerBudgetDecision {
+        applied: metadata
+            .get("thinking_answer_budget_preservation_applied")
+            .is_some_and(|value| value == "true"),
+        adjusted_fields: metadata_fields(metadata, "thinking_answer_budget_adjusted_fields"),
+        preserved_fields: metadata_fields(metadata, "thinking_answer_budget_preserved_fields"),
+        malformed_fields: metadata_fields(metadata, "thinking_answer_budget_malformed_fields"),
+        overflow_fields: metadata_fields(metadata, "thinking_answer_budget_overflow_fields"),
+    };
+    merge_answer_budget_decision(&mut combined, cap_decision);
+    metadata.insert(
+        String::from("thinking_answer_budget_preservation_applied"),
+        combined.applied.to_string(),
+    );
+    metadata.insert(
+        String::from("thinking_answer_budget_adjusted_fields"),
+        join_fields(&combined.adjusted_fields),
+    );
+    metadata.insert(
+        String::from("thinking_answer_budget_preserved_fields"),
+        join_fields(&combined.preserved_fields),
+    );
+    metadata.insert(
+        String::from("thinking_answer_budget_malformed_fields"),
+        join_fields(&combined.malformed_fields),
+    );
+    metadata.insert(
+        String::from("thinking_answer_budget_overflow_fields"),
+        join_fields(&combined.overflow_fields),
+    );
+
+    if let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(body) {
+        add_final_answer_budget_metadata(&object, metadata);
+    }
+}
+
+#[cfg(feature = "param-override")]
+fn metadata_fields(metadata: &BTreeMap<String, String>, key: &str) -> Vec<&'static str> {
+    metadata
+        .get(key)
+        .into_iter()
+        .flat_map(|value| value.split(','))
+        .filter_map(answer_budget_field)
+        .collect()
+}
+
+#[cfg(feature = "param-override")]
+fn answer_budget_field(field: &str) -> Option<&'static str> {
+    ANSWER_BUDGET_FIELDS
+        .iter()
+        .copied()
+        .chain(std::iter::once(PARAMETERS_MAX_TOKENS_FIELD))
+        .find(|candidate| *candidate == field)
+}
+
+fn add_final_answer_budget_metadata(
+    object: &Map<String, Value>,
+    metadata: &mut BTreeMap<String, String>,
+) {
+    for field in ANSWER_BUDGET_FIELDS {
+        let value = match object.get(*field) {
+            Some(value) => value
+                .as_u64()
+                .map_or_else(|| String::from("malformed"), |value| value.to_string()),
+            None => String::from("absent"),
+        };
+        metadata.insert(format!("thinking_answer_budget_final_{field}"), value);
+    }
+    let nested_value = object
+        .get("parameters")
+        .and_then(Value::as_object)
+        .and_then(|parameters| parameters.get("max_tokens"));
+    metadata.insert(
+        String::from("thinking_answer_budget_final_parameters_max_tokens"),
+        nested_value.map_or_else(
+            || String::from("absent"),
+            |value| {
+                value
+                    .as_u64()
+                    .map_or_else(|| String::from("malformed"), |value| value.to_string())
+            },
+        ),
+    );
 }
 
 fn previous_budget_state(observations: &BudgetObservations, configured_budget: u64) -> String {

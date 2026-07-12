@@ -127,6 +127,10 @@ fn is_non_secret_token_metric(normalized_key: &str) -> bool {
             | "thinkingbudgetprevioustokens"
             | "thinkingbudgetfinaltokens"
             | "thinkinganswerbudgetdeltatokens"
+            | "thinkinganswerbudgetfinalmaxtokens"
+            | "thinkinganswerbudgetfinalmaxcompletiontokens"
+            | "thinkinganswerbudgetfinalmaxoutputtokens"
+            | "thinkinganswerbudgetfinalparametersmaxtokens"
             | "attemptthinkingbudgettokens"
             | "attemptthinkingmaxtokens"
     ) || normalized_key.contains("tokenwindowsize")

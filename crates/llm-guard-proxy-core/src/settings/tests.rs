@@ -28,6 +28,15 @@ use crate::{
     CategoryAction, FAMILY_GUARD_PACK_NAME, FamilyCategory, FamilyPolicyOutcome,
 };
 
+const GB10_DEPLOY_CONFIG: &str = include_str!("../../../../deploy/gb10/config.toml");
+const GB10_DEPLOY_README: &str = include_str!("../../../../deploy/gb10/README.md");
+#[cfg(feature = "guard")]
+const CHILD_SAFE_WORKFLOW_SOURCE: &str =
+    include_str!("../../../../examples/workflows/child_safe_general.py");
+#[cfg(feature = "guard")]
+const CHILD_SAFE_WORKFLOW_DEPLOY_PATH: &str =
+    "/home/obj/.local/lib/llm-guard-proxy/workflows/child_safe_general.py";
+
 #[cfg(feature = "guard")]
 const FULL_OVERRIDE_CONFIG: &str = r#"
 [server]
@@ -467,6 +476,18 @@ thinking.no_thinking_marker_policy = "escape_hatch_only"
 
 #[test]
 fn parses_default_injection_schema_values() {
+    let vllm_native = parse_config_text(
+        r#"
+[thinking]
+default_injection_schema = "vllm_native"
+"#,
+    )
+    .expect("vLLM native schema should parse");
+    assert_eq!(
+        vllm_native.thinking.default_injection_schema,
+        DefaultInjectionSchema::VllmNative
+    );
+
     let chat_template_kwargs = parse_config_text(
         r#"
 [thinking]
@@ -493,6 +514,266 @@ thinking.default_injection_schema = "canonical"
 }
 
 #[test]
+fn gb10_deploy_config_preserves_authoritative_topology_with_native_thinking() {
+    let config = parse_config_text(GB10_DEPLOY_CONFIG).expect("GB10 deploy config should parse");
+    config
+        .validate()
+        .expect("GB10 deploy config should validate");
+
+    assert_eq!(config.server.max_in_flight_requests, 4);
+    assert_eq!(config.server.max_queued_generation_requests, 128);
+    assert_eq!(config.server.generation_queue_timeout_ms, 1_800_000);
+    assert_eq!(config.upstream.request_timeout_ms, 1_800_000);
+    assert_eq!(config.upstream_stall.first_chunk_timeout_ms, 600_000);
+    assert_eq!(config.upstream_stall.idle_timeout_ms, 300_000);
+    assert_eq!(config.upstream_stall.recovery_timeout_ms, 300_000);
+    assert_eq!(config.upstream_stall.recovery_cooldown_ms, 300_000);
+    assert_eq!(config.upstream_stall.recovery_budget_window_ms, 900_000);
+    assert_eq!(config.retry.max_attempts, 4);
+    assert_eq!(config.retry.request_deadline_ms, 1_200_000);
+    assert!(config.retry.shielded_streaming_enabled);
+    assert!(config.evidence.include_raw_payloads);
+    assert!(config.evidence.include_request_headers);
+    assert_eq!(config.loop_guard.embedding.model, "Qwen/Qwen3-Embedding-8B");
+    assert_eq!(
+        config.thinking.default_injection_schema,
+        DefaultInjectionSchema::VllmNative
+    );
+
+    assert_eq!(config.listeners.len(), 3);
+    assert_eq!(config.listeners[0].name, "embedding-legacy");
+    assert_eq!(config.listeners[0].port, 18_002);
+    assert_eq!(
+        config.listeners[0]
+            .allowed_upstreams
+            .as_deref()
+            .and_then(|profiles| profiles.first())
+            .map(String::as_str),
+        Some("qwen3-embedding-8b")
+    );
+    assert_eq!(
+        config.listeners[1]
+            .allowed_upstreams
+            .as_deref()
+            .and_then(|profiles| profiles.first())
+            .map(String::as_str),
+        Some("qwen3-reranker-8b")
+    );
+    assert_eq!(config.listeners[2].name, "aggregate");
+    assert_eq!(config.listeners[2].port, 18_005);
+
+    let profile_limits = config
+        .upstream_profiles
+        .iter()
+        .map(|profile| {
+            (
+                profile.name.as_str(),
+                profile.max_in_flight_requests,
+                profile.max_queued_generation_requests,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        profile_limits,
+        vec![
+            ("aeon-chat", Some(4), Some(64)),
+            ("qwen3-embedding-8b", Some(8), Some(64)),
+            ("qwen3-reranker-8b", Some(8), Some(64)),
+        ]
+    );
+    assert_eq!(
+        config.upstream_profiles[0]
+            .thinking
+            .default_injection_schema,
+        DefaultInjectionSchema::VllmNative
+    );
+    assert_eq!(config.retry.ladder.len(), 4);
+    assert!(config
+        .retry
+        .ladder
+        .iter()
+        .all(|entry| entry.default_injection_schema == Some(DefaultInjectionSchema::VllmNative)));
+}
+
+#[test]
+fn gb10_deploy_uncomment_ready_examples_parse() {
+    for name in [
+        "upstream-stall-recovery",
+        "upstream-local-recovery",
+        "upstream-profile",
+    ] {
+        assert_deploy_example_parses(name);
+    }
+    #[cfg(feature = "guard")]
+    assert_guard_deploy_example_uses_installed_workflow();
+}
+
+#[test]
+fn gb10_deploy_supported_optional_fields_remain_uncomment_ready() {
+    let examples = [
+        "#| probe_messages = [{\"role\":\"user\",\"content\":\"deployment readiness\"}] # Custom readiness prompt",
+        "#| probe_chat_template_kwargs = {\"enable_thinking\":false}                  # Optional template controls for the probe",
+        "#| health_chat_probe_enabled = true         # Also probe /v1/chat/completions",
+        "#| health_chat_probe_timeout_ms = 15000     # Chat probe timeout, capped at 30s",
+    ];
+    let mut uncommented = GB10_DEPLOY_CONFIG.to_owned();
+    for commented in examples {
+        assert!(
+            uncommented.contains(commented),
+            "GB10 deploy config should document {commented:?}"
+        );
+        let active = commented
+            .strip_prefix("#| ")
+            .expect("uncomment-ready examples should use the documented prefix");
+        uncommented = uncommented.replace(commented, active);
+    }
+
+    let config = parse_config_text(&uncommented)
+        .expect("GB10 deploy config optional examples should parse when uncommented");
+    config
+        .validate()
+        .expect("GB10 deploy config optional examples should validate when uncommented");
+    assert_eq!(
+        config.upstream.hot_restart.probe_messages,
+        serde_json::json!([{"role":"user","content":"deployment readiness"}])
+    );
+    assert_eq!(
+        config.upstream.hot_restart.probe_chat_template_kwargs,
+        Some(serde_json::json!({"enable_thinking":false}))
+    );
+    assert!(config.observability.health_chat_probe_enabled.is_enabled());
+    assert_eq!(config.observability.health_chat_probe_timeout_ms, 15_000);
+}
+
+#[test]
+fn gb10_readme_evidence_replacements_parse_with_current_config() {
+    let privacy_minimal = config_with_readme_evidence_replacement("privacy-minimal");
+    let privacy_minimal = parse_config_text(&privacy_minimal)
+        .expect("privacy-minimal README evidence replacement should parse");
+    privacy_minimal
+        .validate()
+        .expect("privacy-minimal README evidence replacement should validate");
+    assert!(!privacy_minimal.evidence.include_raw_payloads);
+    assert!(!privacy_minimal.evidence.include_request_headers);
+    assert!(!privacy_minimal.evidence.shadow.enabled);
+    assert!(!privacy_minimal.evidence.shadow.paired_comparison.enabled);
+
+    let quality_debug = config_with_readme_evidence_replacement("quality-debug");
+    let quality_debug = parse_config_text(&quality_debug)
+        .expect("quality-debug README evidence replacement should parse");
+    quality_debug
+        .validate()
+        .expect("quality-debug README evidence replacement should validate");
+    assert!(quality_debug.evidence.include_raw_payloads);
+    assert!(quality_debug.evidence.include_request_headers);
+    assert!(quality_debug.evidence.shadow.enabled);
+    assert!(quality_debug.evidence.shadow.paired_comparison.enabled);
+    assert_eq!(
+        quality_debug
+            .evidence
+            .shadow
+            .paired_comparison
+            .max_retention_records,
+        100_000
+    );
+    assert_eq!(
+        quality_debug
+            .evidence
+            .shadow
+            .paired_comparison
+            .max_retention_bytes,
+        8_589_934_592
+    );
+    assert_eq!(
+        quality_debug
+            .evidence
+            .shadow
+            .paired_comparison
+            .retention_days,
+        14
+    );
+}
+
+fn config_with_readme_evidence_replacement(name: &str) -> String {
+    let replacement = readme_evidence_replacement(name);
+    let evidence_start = GB10_DEPLOY_CONFIG
+        .find("[evidence]\n")
+        .expect("GB10 deploy config should contain an evidence section");
+    let thinking_start = GB10_DEPLOY_CONFIG
+        .find("\n[thinking]\n")
+        .map(|index| index + 1)
+        .expect("GB10 deploy config should contain a thinking section");
+    assert!(evidence_start < thinking_start);
+    format!(
+        "{}{}\n\n{}",
+        &GB10_DEPLOY_CONFIG[..evidence_start],
+        replacement.trim(),
+        &GB10_DEPLOY_CONFIG[thinking_start..]
+    )
+}
+
+fn readme_evidence_replacement(name: &str) -> String {
+    let begin = format!("<!-- BEGIN PARSEABLE EVIDENCE REPLACEMENT: {name} -->");
+    let end = format!("<!-- END PARSEABLE EVIDENCE REPLACEMENT: {name} -->");
+    let lines = GB10_DEPLOY_README
+        .lines()
+        .skip_while(|line| *line != begin)
+        .skip(1)
+        .take_while(|line| *line != end)
+        .filter(|line| !line.starts_with("```"))
+        .collect::<Vec<_>>();
+    assert!(
+        !lines.is_empty(),
+        "missing README evidence replacement {name:?}"
+    );
+    lines.join("\n")
+}
+
+fn assert_deploy_example_parses(name: &str) {
+    let example = deploy_config_example(name);
+    let config = parse_config_text(&example)
+        .unwrap_or_else(|error| panic!("GB10 deploy example {name:?} should parse: {error}"));
+    config
+        .validate()
+        .unwrap_or_else(|error| panic!("GB10 deploy example {name:?} should validate: {error}"));
+}
+
+#[cfg(feature = "guard")]
+fn assert_guard_deploy_example_uses_installed_workflow() {
+    let example = deploy_config_example("guard-features");
+    let config = parse_config_text(&example).expect("guard feature example should parse");
+    config
+        .validate()
+        .expect("guard feature example should validate");
+    let workflow = config
+        .workflows
+        .get("child_safe_general.v1")
+        .expect("guard example workflow should be present");
+
+    assert_eq!(workflow.command, CHILD_SAFE_WORKFLOW_DEPLOY_PATH);
+    assert!(CHILD_SAFE_WORKFLOW_SOURCE.starts_with("#!/usr/bin/env python3"));
+    assert!(
+        GB10_DEPLOY_README.contains("examples/workflows/child_safe_general.py")
+            && GB10_DEPLOY_README.contains(CHILD_SAFE_WORKFLOW_DEPLOY_PATH),
+        "GB10 deployment steps should install the tracked workflow at the configured path"
+    );
+}
+
+fn deploy_config_example(name: &str) -> String {
+    let begin = format!("# BEGIN PARSEABLE EXAMPLE: {name}");
+    let end = format!("# END PARSEABLE EXAMPLE: {name}");
+    let lines = GB10_DEPLOY_CONFIG
+        .lines()
+        .skip_while(|line| *line != begin)
+        .skip(1)
+        .take_while(|line| *line != end)
+        .filter_map(|line| line.strip_prefix("#| "))
+        .collect::<Vec<_>>();
+    assert!(!lines.is_empty(), "missing GB10 deploy example {name:?}");
+    lines.join("\n")
+}
+
+#[test]
 fn rejects_invalid_default_injection_schema() {
     let error = parse_config_text(
         r#"
@@ -510,6 +791,7 @@ default_injection_schema = "qwen"
     );
     assert!(error.message().contains("canonical"));
     assert!(error.message().contains("chat_template_kwargs"));
+    assert!(error.message().contains("vllm_native"));
 }
 
 #[test]
@@ -615,6 +897,7 @@ thinking_mode = "force_thinking"
 max_tokens = 50000
 thinking_token_budget = 32768
 no_thinking_marker_policy = "respect_no_thinking_markers"
+default_injection_schema = "vllm_native"
 
 [[retry.ladder]]
 name = "bounded-thinking"
@@ -646,6 +929,10 @@ max_tokens = 50000
     );
     assert_eq!(config.retry.ladder[0].thinking.max_tokens, Some(50_000));
     assert_eq!(config.retry.ladder[0].thinking.budget_tokens, 32_768);
+    assert_eq!(
+        config.retry.ladder[0].default_injection_schema,
+        Some(DefaultInjectionSchema::VllmNative)
+    );
     assert_eq!(
         config.retry.ladder[0].thinking.no_thinking_marker_policy,
         NoThinkingMarkerPolicy::RespectNoThinkingMarkers
@@ -735,7 +1022,7 @@ thinking_token_budget = 32768
 budget_accounting = "total_cap"
 apply_to_tool_requests = true
 no_thinking_marker_policy = "escape_hatch_only"
-default_injection_schema = "chat_template_kwargs"
+default_injection_schema = "vllm_native"
 
 [[upstreams]]
 name = "fast-no-think"
@@ -782,7 +1069,7 @@ mode = "force_disable"
     );
     assert_eq!(
         aeon.thinking.default_injection_schema,
-        DefaultInjectionSchema::ChatTemplateKwargs
+        DefaultInjectionSchema::VllmNative
     );
 
     let fast = &config.upstream_profiles[1];
@@ -2776,6 +3063,59 @@ fn explicit_path_requires_existing_file() {
         .expect_err("explicit config should require a file");
 
     assert!(error.to_string().contains("failed to read config"));
+}
+
+#[test]
+fn reload_switches_default_injection_schema_in_both_directions() {
+    let path = unique_test_path("thinking-schema-reload.toml");
+    write_config(
+        &path,
+        r#"
+[thinking]
+default_injection_schema = "canonical"
+"#,
+    );
+    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
+
+    write_config(
+        &path,
+        r#"
+[thinking]
+default_injection_schema = "vllm_native"
+"#,
+    );
+    let outcome = manager.reload().expect("vLLM native reload should succeed");
+    assert!(outcome.applied);
+    assert_eq!(
+        manager
+            .handle()
+            .snapshot()
+            .expect("snapshot should succeed")
+            .thinking
+            .default_injection_schema,
+        DefaultInjectionSchema::VllmNative
+    );
+
+    write_config(
+        &path,
+        r#"
+[thinking]
+default_injection_schema = "chat_template_kwargs"
+"#,
+    );
+    let outcome = manager.reload().expect("legacy reload should succeed");
+    assert!(outcome.applied);
+    assert_eq!(
+        manager
+            .handle()
+            .snapshot()
+            .expect("snapshot should succeed")
+            .thinking
+            .default_injection_schema,
+        DefaultInjectionSchema::ChatTemplateKwargs
+    );
+
+    remove_file(&path);
 }
 
 #[test]

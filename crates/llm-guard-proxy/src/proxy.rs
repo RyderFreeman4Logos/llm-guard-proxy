@@ -43,15 +43,16 @@ use llm_guard_proxy_core::{
 };
 use llm_guard_proxy_core::{
     AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
-    DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord, EvidenceAttemptRole,
-    EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore, EvidenceStoreWrite, Health,
-    HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig, LiveRequestEntry,
-    LiveRequestRegistry, LiveRequestState, LiveRequestSummary, LocalRecoveryConfig,
-    LoopFailurePolicy, LoopGuardConfig, MetadataConfig, ObservabilityMetricsSnapshot,
-    ObservabilityStore, RawPayloads, RequestId, RequestRecord, RequestStatus, RetryConfig,
-    RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile, ShadowComparisonAttempt,
-    ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    DefaultInjectionSchema, DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord,
+    EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore,
+    EvidenceStoreWrite, Health, HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig,
+    LiveRequestEntry, LiveRequestRegistry, LiveRequestState, LiveRequestSummary,
+    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, MetadataConfig,
+    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
+    RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
+    ShadowComparisonAttempt, ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode,
+    UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 use reqwest::{Client, Url};
 use serde_json::json;
@@ -2957,15 +2958,12 @@ fn prepare_openai_forward_request(
     let adapted_body = adapted_score.adapted_body;
     let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
     let reqwest_method = upstream_method(method)?;
-    #[cfg(feature = "param-override")]
-    let body =
-        apply_param_override_if_configured(method, &forward_uri, &adapted_body, &upstream_profile)?;
-    #[cfg(not(feature = "param-override"))]
     let body = adapted_body;
+    validate_vllm_native_request_controls(config, &upstream_profile, method, &forward_uri, &body)?;
     let shielded_chat_plan = plan_shielded_chat(
         state,
         config,
-        &upstream_profile.thinking,
+        &upstream_profile,
         method,
         &forward_uri,
         &body,
@@ -3211,9 +3209,49 @@ fn profile_block_reason_message(reason: &BlockReason) -> String {
     }
 }
 
-#[cfg(any(feature = "guard", feature = "param-override"))]
 fn is_chat_completions_request(method: &Method, uri: &Uri) -> bool {
     method == Method::POST && uri.path() == "/v1/chat/completions"
+}
+
+fn validate_vllm_native_request_controls(
+    config: &AppConfig,
+    profile: &UpstreamProfileConfig,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+) -> Result<(), ProxyError> {
+    let vllm_native_configured = profile.thinking.default_injection_schema
+        == DefaultInjectionSchema::VllmNative
+        || config.retry.ladder.iter().any(|entry| {
+            entry
+                .default_injection_schema
+                .unwrap_or(profile.thinking.default_injection_schema)
+                == DefaultInjectionSchema::VllmNative
+        });
+    if !is_chat_completions_request(method, uri)
+        || !vllm_native_configured
+        || !shielded_chat::has_conflicting_vllm_native_controls(body)
+    {
+        return Ok(());
+    }
+
+    Err(ProxyError::ContextBudgetExceeded {
+        message: String::from(
+            "positive thinking_token_budget cannot be combined with an explicit no-thinking marker",
+        ),
+        param: "thinking_token_budget",
+        code: "conflicting_thinking_controls",
+        request_metadata: Some(BTreeMap::from([
+            (
+                String::from("thinking_control_validation"),
+                String::from("rejected_conflict"),
+            ),
+            (
+                String::from("thinking_default_injection_schema"),
+                String::from("vllm_native"),
+            ),
+        ])),
+    })
 }
 
 #[cfg(feature = "param-override")]
@@ -3221,19 +3259,6 @@ fn param_override_applies(method: &Method, uri: &Uri, profile: &UpstreamProfileC
     is_chat_completions_request(method, uri)
         && profile.param_override.enabled
         && param_override_has_fields(&profile.param_override)
-}
-
-#[cfg(feature = "param-override")]
-fn apply_param_override_if_configured(
-    method: &Method,
-    uri: &Uri,
-    body: &Bytes,
-    profile: &UpstreamProfileConfig,
-) -> Result<Bytes, ProxyError> {
-    if !param_override_applies(method, uri, profile) {
-        return Ok(body.clone());
-    }
-    apply_param_override_to_body(body, profile)
 }
 
 #[cfg(feature = "param-override")]
@@ -3246,8 +3271,13 @@ fn apply_param_override_to_shielded_plan(
     if !param_override_applies(method, uri, profile) {
         return Ok(());
     }
-    plan.downstream_body = apply_param_override_to_body(&plan.downstream_body, profile)?;
-    plan.upstream_body = apply_param_override_to_body(&plan.upstream_body, profile)?;
+    let (upstream_body, cap_decision) = apply_param_override_to_body(&plan.upstream_body, profile)?;
+    plan.upstream_body = upstream_body;
+    shielded_chat::merge_final_answer_budget_metadata(
+        &plan.upstream_body,
+        &mut plan.thinking_metadata,
+        cap_decision,
+    );
     Ok(())
 }
 
@@ -3255,20 +3285,20 @@ fn apply_param_override_to_shielded_plan(
 fn apply_param_override_to_body(
     body: &Bytes,
     profile: &UpstreamProfileConfig,
-) -> Result<Bytes, ProxyError> {
+) -> Result<(Bytes, shielded_chat::AnswerBudgetDecision), ProxyError> {
     if !profile.param_override.enabled || !param_override_has_fields(&profile.param_override) {
-        return Ok(body.clone());
+        return Ok((body.clone(), shielded_chat::AnswerBudgetDecision::default()));
     }
     let mut value = serde_json::from_slice::<serde_json::Value>(body)
         .map_err(|error| ProxyError::request_body(format!("request body is not JSON: {error}")))?;
     let serde_json::Value::Object(object) = &mut value else {
-        return Ok(body.clone());
+        return Ok((body.clone(), shielded_chat::AnswerBudgetDecision::default()));
     };
-    apply_param_override_object(object, &profile.param_override);
+    let cap_decision = apply_param_override_object(object, &profile.param_override);
     let rewritten = serde_json::to_vec(&value).map_err(|error| {
         ProxyError::request_body(format!("request body rewrite failed: {error}"))
     })?;
-    Ok(Bytes::from(rewritten))
+    Ok((Bytes::from(rewritten), cap_decision))
 }
 
 #[cfg(feature = "param-override")]
@@ -3285,11 +3315,16 @@ fn param_override_has_fields(config: &ParamOverrideConfig) -> bool {
 fn apply_param_override_object(
     object: &mut serde_json::Map<String, serde_json::Value>,
     config: &ParamOverrideConfig,
-) {
+) -> shielded_chat::AnswerBudgetDecision {
     insert_param_override_fields(object, config);
     if let Some(serde_json::Value::Object(parameters)) = object.get_mut("parameters") {
         insert_param_override_fields(parameters, config);
     }
+    config
+        .max_tokens
+        .map_or_else(shielded_chat::AnswerBudgetDecision::default, |max_tokens| {
+            shielded_chat::apply_output_token_cap(object, u64::from(max_tokens))
+        })
 }
 
 #[cfg(feature = "param-override")]
@@ -3300,7 +3335,6 @@ fn insert_param_override_fields(
     insert_f64_override(object, "temperature", config.temperature);
     insert_f64_override(object, "top_p", config.top_p);
     insert_u32_override(object, "top_k", config.top_k);
-    insert_u32_override(object, "max_tokens", config.max_tokens);
     insert_f64_override(object, "frequency_penalty", config.frequency_penalty);
     insert_f64_override(object, "presence_penalty", config.presence_penalty);
 }
@@ -4407,25 +4441,25 @@ enum ShieldedChatKind {
 fn plan_shielded_chat(
     state: &ProxyState,
     config: &AppConfig,
-    thinking: &ThinkingConfig,
+    upstream_profile: &UpstreamProfileConfig,
     method: &Method,
     uri: &Uri,
     body: &Bytes,
 ) -> ShieldedChatPlan {
-    let retry_initial_thinking = config
-        .retry
-        .ladder
-        .first()
-        .map_or(thinking, |entry| &entry.thinking);
+    let thinking = &upstream_profile.thinking;
+    let retry_initial_thinking = config.retry.ladder.first().map_or_else(
+        || thinking.clone(),
+        |entry| retry_ladder_thinking(entry, thinking),
+    );
     let (request, intercepted, kind) = if should_intercept_non_stream_chat(method, uri, config) {
         if let Some(non_stream_request) =
-            shielded_chat::prepare_non_stream_request(body, retry_initial_thinking)
+            shielded_chat::prepare_non_stream_request(body, &retry_initial_thinking)
         {
             (Some(non_stream_request), true, ShieldedChatKind::NonStream)
         } else if let Some(stream_request) = shielded_chat::prepare_stream_request(
             body,
             if config.retry.shielded_streaming_enabled {
-                retry_initial_thinking
+                &retry_initial_thinking
             } else {
                 thinking
             },
@@ -4550,9 +4584,10 @@ impl ShieldedRetryPolicy {
     fn attempt_plan(
         &self,
         attempt_number: u32,
-        fallback_thinking: &ThinkingConfig,
+        upstream_profile: &UpstreamProfileConfig,
         cot_salvage: Option<&CotSalvageContext>,
     ) -> ShieldedAttemptPlan {
+        let fallback_thinking = &upstream_profile.thinking;
         let index = attempt_number.saturating_sub(1);
         let mut plan = self
             .ladder
@@ -4565,7 +4600,7 @@ impl ShieldedRetryPolicy {
                 },
                 |entry| ShieldedAttemptPlan {
                     name: entry.name.clone(),
-                    thinking: entry.thinking.clone(),
+                    thinking: retry_ladder_thinking(entry, fallback_thinking),
                     anti_loop_hint: entry.anti_loop_hint.clone(),
                 },
             );
@@ -4581,6 +4616,20 @@ struct ShieldedAttemptPlan {
     name: String,
     thinking: ThinkingConfig,
     anti_loop_hint: Option<String>,
+}
+
+fn retry_ladder_thinking(
+    entry: &RetryLadderConfig,
+    fallback_thinking: &ThinkingConfig,
+) -> ThinkingConfig {
+    let mut thinking = entry.thinking.clone();
+    thinking.default_injection_schema = entry
+        .default_injection_schema
+        .unwrap_or(fallback_thinking.default_injection_schema);
+    if thinking.effective_mode() == ThinkingMode::ForceDisable {
+        thinking.budget_tokens = 0;
+    }
+    thinking
 }
 
 fn cot_salvage_thinking(policy: LoopFailurePolicy, current: &ThinkingConfig) -> ThinkingConfig {
@@ -7763,12 +7812,11 @@ async fn start_shielded_attempt(
 ) -> Result<ShieldedStartedAttempt, ShieldedAttemptFailure> {
     let attempt_id = AttemptId::for_request(&runtime.request_id, attempt_number);
     let attempt_started_at_unix_ms = unix_time_millis();
-    let attempt_plan = runtime.retry_policy.attempt_plan(
-        attempt_number,
-        &runtime.upstream_profile.thinking,
-        cot_salvage,
-    );
-    let (upstream_body, anti_loop_hint_applied) = shielded_attempt_body(
+    let attempt_plan =
+        runtime
+            .retry_policy
+            .attempt_plan(attempt_number, &runtime.upstream_profile, cot_salvage);
+    let (upstream_body, anti_loop_hint_applied, attempt_thinking_metadata) = shielded_attempt_body(
         runtime,
         attempt_number,
         retry_cause,
@@ -7784,6 +7832,7 @@ async fn start_shielded_attempt(
         anti_loop_hint_applied,
         &attempt_plan,
         cot_salvage,
+        &attempt_thinking_metadata,
     );
     let upstream_timeout = if ignores_request_deadline {
         runtime.upstream_timeout
@@ -7971,8 +8020,8 @@ fn shielded_attempt_body(
     retry_cause: Option<ShieldedRetryCause>,
     attempt_plan: &ShieldedAttemptPlan,
     cot_salvage: Option<&CotSalvageContext>,
-) -> (Bytes, bool) {
-    let prepared_body = match runtime.chat_kind {
+) -> (Bytes, bool, BTreeMap<String, String>) {
+    let prepared_request = match runtime.chat_kind {
         ShieldedChatKind::NonStream => shielded_chat::prepare_non_stream_request(
             &runtime.downstream_body,
             &attempt_plan.thinking,
@@ -7981,10 +8030,15 @@ fn shielded_attempt_body(
             shielded_chat::prepare_stream_request(&runtime.downstream_body, &attempt_plan.thinking)
         }
         ShieldedChatKind::Generic => None,
-    }
-    .map_or_else(
-        || runtime.upstream_body.clone(),
-        |request| request.upstream_body(),
+    };
+    let (prepared_body, mut thinking_metadata) = prepared_request.map_or_else(
+        || {
+            (
+                runtime.upstream_body.clone(),
+                runtime.thinking_metadata.clone(),
+            )
+        },
+        |request| (request.upstream_body(), request.thinking_metadata().clone()),
     );
 
     if let Some(cot_salvage) = cot_salvage
@@ -7997,10 +8051,12 @@ fn shielded_attempt_body(
             attempt_plan.anti_loop_hint.as_deref(),
         )
     {
-        return (
-            apply_param_override_to_body_or_original(body, &runtime.upstream_profile),
-            true,
+        let body = apply_shielded_param_override_to_body_or_original(
+            body,
+            &runtime.upstream_profile,
+            &mut thinking_metadata,
         );
+        return (body, true, thinking_metadata);
     }
 
     let (prepared_body, anti_loop_hint_applied) = if attempt_number > 1
@@ -8020,24 +8076,38 @@ fn shielded_attempt_body(
     } else {
         (prepared_body, false)
     };
-    (
-        apply_param_override_to_body_or_original(prepared_body, &runtime.upstream_profile),
-        anti_loop_hint_applied,
-    )
+    let prepared_body = apply_shielded_param_override_to_body_or_original(
+        prepared_body,
+        &runtime.upstream_profile,
+        &mut thinking_metadata,
+    );
+    (prepared_body, anti_loop_hint_applied, thinking_metadata)
 }
 
 #[cfg(feature = "param-override")]
-fn apply_param_override_to_body_or_original(body: Bytes, profile: &UpstreamProfileConfig) -> Bytes {
+fn apply_shielded_param_override_to_body_or_original(
+    body: Bytes,
+    profile: &UpstreamProfileConfig,
+    thinking_metadata: &mut BTreeMap<String, String>,
+) -> Bytes {
     match apply_param_override_to_body(&body, profile) {
-        Ok(rewritten) => rewritten,
+        Ok((rewritten, cap_decision)) => {
+            shielded_chat::merge_final_answer_budget_metadata(
+                &rewritten,
+                thinking_metadata,
+                cap_decision,
+            );
+            rewritten
+        }
         Err(_error) => body,
     }
 }
 
 #[cfg(not(feature = "param-override"))]
-fn apply_param_override_to_body_or_original(
+fn apply_shielded_param_override_to_body_or_original(
     body: Bytes,
     _profile: &UpstreamProfileConfig,
+    _thinking_metadata: &mut BTreeMap<String, String>,
 ) -> Bytes {
     body
 }
@@ -8049,6 +8119,7 @@ fn shielded_attempt_request_metadata(
     anti_loop_hint_applied: bool,
     attempt_plan: &ShieldedAttemptPlan,
     cot_salvage: Option<&CotSalvageContext>,
+    thinking_metadata: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut metadata = attempt_request_metadata(
         &runtime.downstream_method,
@@ -8066,7 +8137,7 @@ fn shielded_attempt_request_metadata(
         true,
         true,
         &runtime.liveness,
-        &runtime.thinking_metadata,
+        thinking_metadata,
     );
     add_retry_attempt_metadata(
         &mut metadata,
@@ -8601,6 +8672,12 @@ fn copy_attempt_request_metadata(
     response_metadata: &mut BTreeMap<String, String>,
     request_metadata: &BTreeMap<String, String>,
 ) {
+    for (key, value) in request_metadata
+        .iter()
+        .filter(|(key, _value)| key.starts_with("thinking_"))
+    {
+        response_metadata.insert(key.clone(), value.clone());
+    }
     for key in [
         "attempt_index",
         "attempt_name",
@@ -11442,7 +11519,8 @@ fn shadow_comparison_attempt_plan(
     comparison: ShadowComparisonAttempt,
 ) -> Option<ShadowAttemptPlan> {
     let thinking = shadow_comparison_thinking(comparison, &runtime.upstream_profile.thinking);
-    let mut upstream_body = prepared_shadow_body(runtime, &thinking);
+    let mut prepared = prepared_shadow_body(runtime, &thinking);
+    let mut upstream_body = prepared.upstream_body;
     if comparison == ShadowComparisonAttempt::CotSalvage {
         let reasoning = failure.raw_payloads.reasoning.as_deref()?;
         let reasoning_prefix = bounded_utf8_prefix(reasoning, COT_SALVAGE_PREFIX_MAX_BYTES);
@@ -11458,9 +11536,13 @@ fn shadow_comparison_attempt_plan(
             None,
         )?;
     }
-    upstream_body =
-        apply_param_override_to_body_or_original(upstream_body, &runtime.upstream_profile);
+    upstream_body = apply_shielded_param_override_to_body_or_original(
+        upstream_body,
+        &runtime.upstream_profile,
+        &mut prepared.thinking_metadata,
+    );
     let mut request_metadata = source.request_metadata.clone();
+    request_metadata.extend(prepared.thinking_metadata);
     request_metadata.insert(
         String::from("shadow_compare_attempt"),
         comparison.as_str().to_owned(),
@@ -11495,11 +11577,14 @@ fn paired_shadow_comparison_attempt_plan(
         return None;
     }
     let thinking = shadow_comparison_thinking(comparison, &runtime.upstream_profile.thinking);
-    let upstream_body = apply_param_override_to_body_or_original(
-        prepared_shadow_body(runtime, &thinking),
+    let mut prepared = prepared_shadow_body(runtime, &thinking);
+    let upstream_body = apply_shielded_param_override_to_body_or_original(
+        prepared.upstream_body,
         &runtime.upstream_profile,
+        &mut prepared.thinking_metadata,
     );
     let mut request_metadata = source.request_metadata.clone();
+    request_metadata.extend(prepared.thinking_metadata);
     request_metadata.insert(
         String::from("shadow_compare_attempt"),
         comparison.as_str().to_owned(),
@@ -11530,8 +11615,16 @@ fn paired_shadow_comparison_attempt_plan(
     })
 }
 
-fn prepared_shadow_body(runtime: &ShieldedRetryRuntime, thinking: &ThinkingConfig) -> Bytes {
-    match runtime.chat_kind {
+struct PreparedShadowBody {
+    upstream_body: Bytes,
+    thinking_metadata: BTreeMap<String, String>,
+}
+
+fn prepared_shadow_body(
+    runtime: &ShieldedRetryRuntime,
+    thinking: &ThinkingConfig,
+) -> PreparedShadowBody {
+    let prepared = match runtime.chat_kind {
         ShieldedChatKind::NonStream => {
             shielded_chat::prepare_non_stream_request(&runtime.downstream_body, thinking)
         }
@@ -11539,10 +11632,16 @@ fn prepared_shadow_body(runtime: &ShieldedRetryRuntime, thinking: &ThinkingConfi
             shielded_chat::prepare_stream_request(&runtime.downstream_body, thinking)
         }
         ShieldedChatKind::Generic => None,
-    }
-    .map_or_else(
-        || runtime.upstream_body.clone(),
-        |request| request.upstream_body(),
+    };
+    prepared.map_or_else(
+        || PreparedShadowBody {
+            upstream_body: runtime.upstream_body.clone(),
+            thinking_metadata: runtime.thinking_metadata.clone(),
+        },
+        |request| PreparedShadowBody {
+            upstream_body: request.upstream_body(),
+            thinking_metadata: request.thinking_metadata().clone(),
+        },
     )
 }
 
