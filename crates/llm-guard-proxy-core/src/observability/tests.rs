@@ -300,6 +300,100 @@ fn exclusive_writer_rejects_same_path_and_reopens_after_drop() {
 
 #[cfg(unix)]
 #[test]
+fn rejects_preexisting_hard_link_aliases_without_mutating_database() {
+    let fixture = StoreFixture::new("writer-hard-link-existing");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let store = ObservabilityStore::open(manager.handle()).expect("initial store should open");
+    store
+        .record_request(&request_record(
+            "req-writer-hard-link-existing",
+            RequestStatus::Succeeded,
+            1_000,
+        ))
+        .expect("request should be written");
+    drop(store);
+
+    let database_before_rejections =
+        fs::read(&fixture.sqlite_path).expect("database should be readable");
+    let alias_path = fixture.storage_dir().join("hard-link-alias.sqlite3");
+    fs::hard_link(&fixture.sqlite_path, &alias_path).expect("hard link should be created");
+
+    let original_error = ObservabilityStore::open(manager.handle())
+        .expect_err("original hard-link path should be rejected");
+    assert_writer_link_count_error(original_error, &fixture.sqlite_path, 2);
+
+    let alias_manager = fixture.manager_for_sqlite_path("hard-link-alias.toml", &alias_path);
+    let alias_error = ObservabilityStore::open(alias_manager.handle())
+        .expect_err("hard-link alias should be rejected");
+    assert_writer_link_count_error(alias_error, &alias_path, 2);
+
+    assert_eq!(
+        fs::read(&fixture.sqlite_path).expect("original database should remain readable"),
+        database_before_rejections
+    );
+    assert_eq!(
+        fs::read(&alias_path).expect("aliased database should remain readable"),
+        database_before_rejections
+    );
+    assert!(
+        !writer_lock_path_for_test(&alias_path).exists(),
+        "rejection must happen before creating an alias-owned sidecar"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_hard_link_alias_created_after_writer_open() {
+    let fixture = StoreFixture::new("writer-hard-link-after-open");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let store = ObservabilityStore::open(manager.handle()).expect("initial store should open");
+    store
+        .record_request(&request_record(
+            "req-writer-hard-link-after-open",
+            RequestStatus::Succeeded,
+            1_000,
+        ))
+        .expect("request should be written");
+
+    let alias_path = fixture.storage_dir().join("late-hard-link-alias.sqlite3");
+    fs::hard_link(&fixture.sqlite_path, &alias_path).expect("hard link should be created");
+    let database_before_rejection =
+        fs::read(&fixture.sqlite_path).expect("database should be readable");
+    let alias_manager = fixture.manager_for_sqlite_path("late-hard-link-alias.toml", &alias_path);
+
+    let alias_error = ObservabilityStore::open(alias_manager.handle())
+        .expect_err("late hard-link alias should not create a second writer");
+    assert_writer_link_count_error(alias_error, &alias_path, 2);
+    assert_eq!(
+        fs::read(&fixture.sqlite_path).expect("database should remain readable"),
+        database_before_rejection
+    );
+    assert_eq!(
+        store
+            .metrics_snapshot()
+            .expect("original accumulator should remain available")
+            .retention_usage
+            .request_count,
+        1
+    );
+    assert!(!writer_lock_path_for_test(&alias_path).exists());
+
+    fs::remove_file(&alias_path).expect("hard-link alias should be removed");
+    drop(store);
+    let reopened = ObservabilityStore::open(manager.handle())
+        .expect("single-link database should reopen after the owner drops");
+    assert_eq!(
+        reopened
+            .metrics_snapshot()
+            .expect("reopened accumulator should reconstruct")
+            .retention_usage
+            .request_count,
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn rejects_symlink_writer_lock_without_chmodding_target() {
     let fixture = StoreFixture::new("writer-lock-symlink");
     fs::create_dir_all(fixture.storage_dir()).expect("storage directory should be created");
@@ -1522,6 +1616,19 @@ impl StoreFixture {
         )
     }
 
+    fn manager_for_sqlite_path(&self, config_name: &str, sqlite_path: &Path) -> ConfigManager {
+        let config_path = self.root.join(config_name);
+        write_config_file(
+            &config_path,
+            sqlite_path,
+            true,
+            false,
+            TEST_MAX_BYTES,
+            TEST_PRUNE_TO_BYTES,
+        );
+        ConfigManager::from_explicit_path(&config_path).expect("alias config should load")
+    }
+
     fn manager_with_max_records(
         &self,
         enabled: bool,
@@ -1778,6 +1885,21 @@ fn writer_lock_path_for_test(sqlite_path: &Path) -> PathBuf {
     let mut lock_path = sqlite_path.as_os_str().to_os_string();
     lock_path.push(".writer.lock");
     PathBuf::from(lock_path)
+}
+
+#[cfg(unix)]
+fn assert_writer_link_count_error(
+    error: ObservabilityError,
+    expected_path: &Path,
+    expected_link_count: u64,
+) {
+    match error {
+        ObservabilityError::WriterOwnershipLinkCount { path, link_count } => {
+            assert_eq!(path, expected_path);
+            assert_eq!(link_count, expected_link_count);
+        }
+        other => panic!("unexpected ownership error: {other}"),
+    }
 }
 
 fn unique_test_dir(name: &str) -> PathBuf {

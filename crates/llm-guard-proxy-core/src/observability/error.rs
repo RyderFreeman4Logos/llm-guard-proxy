@@ -86,6 +86,16 @@ pub enum ObservabilityError {
         /// Source filesystem locking error.
         source: std::io::Error,
     },
+    /// A file-backed database cannot be represented by one path-owned writer lock.
+    #[error(
+        "observability writer ownership requires exactly one filesystem link for {path}; found {link_count}"
+    )]
+    WriterOwnershipLinkCount {
+        /// Normalized `SQLite` path with unsupported filesystem identity.
+        path: PathBuf,
+        /// Link count read from the securely opened database file descriptor.
+        link_count: u64,
+    },
     /// Resolving an alias-free `SQLite` storage path failed.
     #[error("failed to normalize observability SQLite path {path}: {source}")]
     NormalizeStoragePath {

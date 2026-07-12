@@ -11,7 +11,7 @@ use std::{
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
@@ -85,8 +85,10 @@ impl ObservabilityStore {
         let configured_sqlite_path = resolve_sqlite_path(&snapshot.observability.sqlite_path)?;
         prepare_parent_directory(&configured_sqlite_path)?;
         let sqlite_path = normalize_sqlite_path(&configured_sqlite_path)?;
-        prepare_sqlite_file(&sqlite_path)?;
+        let sqlite_file = prepare_sqlite_file(&sqlite_path)?;
+        validate_single_link_writer_identity(sqlite_file.as_ref(), &sqlite_path)?;
         let writer_ownership = acquire_writer_ownership(&sqlite_path)?.map(Arc::new);
+        drop(sqlite_file);
         let connection = open_sqlite_connection(&sqlite_path)?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -2104,6 +2106,44 @@ fn normalize_sqlite_path(path: &Path) -> Result<PathBuf, ObservabilityError> {
     Ok(normalized_parent.join(file_name))
 }
 
+/// Ensures one path-derived sidecar can represent the opened database inode.
+///
+/// Lexical normalization cannot collapse hard links because each alias is an
+/// equally canonical path. Rejecting multi-link files before sidecar ownership
+/// prevents independent accumulators from claiming the same `SQLite` inode.
+#[cfg(unix)]
+fn validate_single_link_writer_identity(
+    sqlite_file: Option<&fs::File>,
+    sqlite_path: &Path,
+) -> Result<(), ObservabilityError> {
+    let Some(sqlite_file) = sqlite_file else {
+        return Ok(());
+    };
+    let link_count = sqlite_file
+        .metadata()
+        .map_err(|source| ObservabilityError::InspectPath {
+            path: sqlite_path.to_path_buf(),
+            source,
+        })?
+        .nlink();
+    if link_count == 1 {
+        Ok(())
+    } else {
+        Err(ObservabilityError::WriterOwnershipLinkCount {
+            path: sqlite_path.to_path_buf(),
+            link_count,
+        })
+    }
+}
+
+#[cfg(not(unix))]
+fn validate_single_link_writer_identity(
+    _sqlite_file: Option<&fs::File>,
+    _sqlite_path: &Path,
+) -> Result<(), ObservabilityError> {
+    Ok(())
+}
+
 fn acquire_writer_ownership(
     sqlite_path: &Path,
 ) -> Result<Option<WriterOwnership>, ObservabilityError> {
@@ -2212,12 +2252,12 @@ fn prepare_parent_directory(path: &Path) -> Result<(), ObservabilityError> {
     }
 }
 
-fn prepare_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
+fn prepare_sqlite_file(path: &Path) -> Result<Option<fs::File>, ObservabilityError> {
     if path == Path::new(":memory:") {
-        return Ok(());
+        return Ok(None);
     }
     validate_sqlite_file_path(path)?;
-    create_secure_sqlite_file(path)
+    create_secure_sqlite_file(path).map(Some)
 }
 
 fn open_sqlite_connection(path: &Path) -> Result<Connection, ObservabilityError> {
@@ -2430,7 +2470,7 @@ fn unsafe_storage_path(path: &Path, reason: &'static str) -> ObservabilityError 
 }
 
 #[cfg(unix)]
-fn create_secure_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
+fn create_secure_sqlite_file(path: &Path) -> Result<fs::File, ObservabilityError> {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -2445,17 +2485,17 @@ fn create_secure_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
         .map_err(|source| ObservabilityError::RestrictPermissions {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+    Ok(file)
 }
 
 #[cfg(not(unix))]
-fn create_secure_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
+fn create_secure_sqlite_file(path: &Path) -> Result<fs::File, ObservabilityError> {
     fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .open(path)
-        .map(|_file| ())
         .map_err(|source| ObservabilityError::RestrictPermissions {
             path: path.to_path_buf(),
             source,
