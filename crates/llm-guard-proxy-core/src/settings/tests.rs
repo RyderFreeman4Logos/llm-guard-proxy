@@ -28,6 +28,8 @@ use crate::{
     CategoryAction, FAMILY_GUARD_PACK_NAME, FamilyCategory, FamilyPolicyOutcome,
 };
 
+const GB10_DEPLOY_CONFIG: &str = include_str!("../../../../deploy/gb10/config.toml");
+
 #[cfg(feature = "guard")]
 const FULL_OVERRIDE_CONFIG: &str = r#"
 [server]
@@ -502,6 +504,124 @@ thinking.default_injection_schema = "canonical"
         canonical.thinking.default_injection_schema,
         DefaultInjectionSchema::Canonical
     );
+}
+
+#[test]
+fn gb10_deploy_config_preserves_authoritative_topology_with_native_thinking() {
+    let config = parse_config_text(GB10_DEPLOY_CONFIG).expect("GB10 deploy config should parse");
+    config
+        .validate()
+        .expect("GB10 deploy config should validate");
+
+    assert_eq!(config.server.max_in_flight_requests, 4);
+    assert_eq!(config.server.max_queued_generation_requests, 128);
+    assert_eq!(config.server.generation_queue_timeout_ms, 1_800_000);
+    assert_eq!(config.upstream.request_timeout_ms, 1_800_000);
+    assert_eq!(config.upstream_stall.first_chunk_timeout_ms, 600_000);
+    assert_eq!(config.upstream_stall.idle_timeout_ms, 300_000);
+    assert_eq!(config.upstream_stall.recovery_timeout_ms, 300_000);
+    assert_eq!(config.upstream_stall.recovery_cooldown_ms, 300_000);
+    assert_eq!(config.upstream_stall.recovery_budget_window_ms, 900_000);
+    assert_eq!(config.retry.max_attempts, 4);
+    assert_eq!(config.retry.request_deadline_ms, 1_200_000);
+    assert!(config.retry.shielded_streaming_enabled);
+    assert!(config.evidence.include_raw_payloads);
+    assert!(config.evidence.include_request_headers);
+    assert_eq!(config.loop_guard.embedding.model, "Qwen/Qwen3-Embedding-8B");
+    assert_eq!(
+        config.thinking.default_injection_schema,
+        DefaultInjectionSchema::VllmNative
+    );
+
+    assert_eq!(config.listeners.len(), 3);
+    assert_eq!(config.listeners[0].name, "embedding-legacy");
+    assert_eq!(config.listeners[0].port, 18_002);
+    assert_eq!(
+        config.listeners[0]
+            .allowed_upstreams
+            .as_deref()
+            .and_then(|profiles| profiles.first())
+            .map(String::as_str),
+        Some("qwen3-embedding-8b")
+    );
+    assert_eq!(
+        config.listeners[1]
+            .allowed_upstreams
+            .as_deref()
+            .and_then(|profiles| profiles.first())
+            .map(String::as_str),
+        Some("qwen3-reranker-8b")
+    );
+    assert_eq!(config.listeners[2].name, "aggregate");
+    assert_eq!(config.listeners[2].port, 18_005);
+
+    let profile_limits = config
+        .upstream_profiles
+        .iter()
+        .map(|profile| {
+            (
+                profile.name.as_str(),
+                profile.max_in_flight_requests,
+                profile.max_queued_generation_requests,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        profile_limits,
+        vec![
+            ("aeon-chat", Some(4), Some(64)),
+            ("qwen3-embedding-8b", Some(8), Some(64)),
+            ("qwen3-reranker-8b", Some(8), Some(64)),
+        ]
+    );
+    assert_eq!(
+        config.upstream_profiles[0]
+            .thinking
+            .default_injection_schema,
+        DefaultInjectionSchema::VllmNative
+    );
+    assert_eq!(config.retry.ladder.len(), 4);
+    assert!(config
+        .retry
+        .ladder
+        .iter()
+        .all(|entry| entry.default_injection_schema == Some(DefaultInjectionSchema::VllmNative)));
+}
+
+#[test]
+fn gb10_deploy_uncomment_ready_examples_parse() {
+    for name in [
+        "upstream-stall-recovery",
+        "upstream-local-recovery",
+        "upstream-profile",
+    ] {
+        assert_deploy_example_parses(name);
+    }
+    #[cfg(feature = "guard")]
+    assert_deploy_example_parses("guard-features");
+}
+
+fn assert_deploy_example_parses(name: &str) {
+    let example = deploy_config_example(name);
+    let config = parse_config_text(&example)
+        .unwrap_or_else(|error| panic!("GB10 deploy example {name:?} should parse: {error}"));
+    config
+        .validate()
+        .unwrap_or_else(|error| panic!("GB10 deploy example {name:?} should validate: {error}"));
+}
+
+fn deploy_config_example(name: &str) -> String {
+    let begin = format!("# BEGIN PARSEABLE EXAMPLE: {name}");
+    let end = format!("# END PARSEABLE EXAMPLE: {name}");
+    let lines = GB10_DEPLOY_CONFIG
+        .lines()
+        .skip_while(|line| *line != begin)
+        .skip(1)
+        .take_while(|line| *line != end)
+        .filter_map(|line| line.strip_prefix("#| "))
+        .collect::<Vec<_>>();
+    assert!(!lines.is_empty(), "missing GB10 deploy example {name:?}");
+    lines.join("\n")
 }
 
 #[test]

@@ -909,9 +909,6 @@ fn apply_thinking_budget_policy(
     if !thinking.enabled {
         return thinking_noop("policy_disabled", budget_observations);
     }
-    if configured_budget == 0 {
-        return thinking_noop("configured_budget_zero", budget_observations);
-    }
     match disable_marker {
         DisableMarker::Disabled(path) => {
             insert_disable_marker_metadata(metadata, path);
@@ -922,50 +919,58 @@ fn apply_thinking_budget_policy(
                 thinking.default_injection_schema,
                 &mut outcome,
             );
-            outcome
+            return outcome;
         }
         DisableMarker::Malformed(path) => {
             insert_disable_marker_metadata(metadata, path);
-            thinking_noop("malformed_disable_marker", budget_observations)
+            return thinking_noop("malformed_disable_marker", budget_observations);
         }
-        DisableMarker::None => {
-            let mut outcome = apply_budget_observations(
-                object,
-                configured_budget,
-                budget_observations,
-                metadata,
-                thinking.default_injection_schema,
-            );
-            if !outcome.zero_paths.is_empty() {
-                normalize_vllm_native_disabled_state(
-                    object,
-                    metadata,
-                    thinking.default_injection_schema,
-                    &mut outcome,
-                );
-                return outcome;
-            }
-            let enable_marker_path = ensure_vllm_native_enable_marker(
+        DisableMarker::None => {}
+    }
+    if configured_budget == 0 {
+        let mut outcome = thinking_noop("configured_budget_zero", budget_observations);
+        if !outcome.zero_paths.is_empty() {
+            normalize_vllm_native_disabled_state(
                 object,
                 metadata,
                 thinking.default_injection_schema,
-            );
-            metadata.insert(
-                String::from("thinking_enable_marker_rewritten_paths"),
-                enable_marker_path.map_or_else(|| String::from("none"), JsonPath::display_path),
-            );
-            ensure_vllm_native_budget(
-                object,
-                metadata,
-                thinking.default_injection_schema,
-                configured_budget,
-                budget_observations,
                 &mut outcome,
             );
-            outcome.rewrite_applied = outcome.rewrite_applied || enable_marker_path.is_some();
-            outcome
         }
+        return outcome;
     }
+    let mut outcome = apply_budget_observations(
+        object,
+        configured_budget,
+        budget_observations,
+        metadata,
+        thinking.default_injection_schema,
+    );
+    if !outcome.zero_paths.is_empty() {
+        normalize_vllm_native_disabled_state(
+            object,
+            metadata,
+            thinking.default_injection_schema,
+            &mut outcome,
+        );
+        return outcome;
+    }
+    let enable_marker_path =
+        ensure_vllm_native_enable_marker(object, metadata, thinking.default_injection_schema);
+    metadata.insert(
+        String::from("thinking_enable_marker_rewritten_paths"),
+        enable_marker_path.map_or_else(|| String::from("none"), JsonPath::display_path),
+    );
+    ensure_vllm_native_budget(
+        object,
+        metadata,
+        thinking.default_injection_schema,
+        configured_budget,
+        budget_observations,
+        &mut outcome,
+    );
+    outcome.rewrite_applied = outcome.rewrite_applied || enable_marker_path.is_some();
+    outcome
 }
 
 fn apply_force_disable_thinking(

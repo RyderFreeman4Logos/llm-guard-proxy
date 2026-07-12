@@ -29,6 +29,27 @@ The bounded SQLite observability store lives at:
 /home/obj/.local/state/llm-guard-proxy/observability.sqlite3
 ```
 
+## Configuration source boundary
+
+The operational source of truth is:
+
+```text
+/home/obj/project/github/RyderFreeman4Logos/gb10-services/config/llm-guard-proxy/config.toml
+```
+
+`deploy/gb10/config.toml` is the reviewed installation snapshot derived from
+that file. Before each deployment, compare all active values against the source
+of truth. For this change, the only intended semantic difference is
+`default_injection_schema = "vllm_native"` in the global thinking policy, the
+AEON profile, and every retry rung. Do not replace current listener routing,
+per-upstream concurrency, timeouts, evidence settings, or loop-embedding policy
+with example defaults.
+
+Deployment ordering is binary first, configuration second: install and verify
+the reviewed binary before copying the matching config snapshot. The live
+Guard-to-AEON bounded-thinking smoke is an issue-closure gate after both steps;
+it is not evidence that can be produced by pre-merge fake-upstream tests.
+
 ## Pre-deploy gate
 
 Run this before moving ports, while `gb10:18009` still points directly at vLLM:

@@ -7207,6 +7207,44 @@ default_injection_schema = "vllm_native"
 }
 
 #[tokio::test]
+async fn bounded_thinking_vllm_native_zero_config_normalizes_no_thinking_inputs() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+mode = "bounded_thinking"
+budget_tokens = 0
+default_injection_schema = "vllm_native"
+"#,
+    )
+    .await;
+
+    for body in [
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"explicit-disable"}],"chat_template_kwargs":{"enable_thinking":false},"thinking_token_budget":8192,"max_tokens":64}"#
+            .as_slice(),
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"zero-budget"}],"thinking_token_budget":0,"max_tokens":64}"#
+            .as_slice(),
+    ] {
+        let observed_body = post_chat_and_observe_owned_body(
+            &proxy,
+            &mut fake,
+            Bytes::copy_from_slice(body),
+        )
+        .await;
+
+        assert_eq!(
+            observed_body["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
+        assert_eq!(observed_body["thinking_token_budget"], 0);
+        assert_eq!(observed_body["max_tokens"], 64);
+    }
+}
+
+#[tokio::test]
 async fn bounded_thinking_vllm_native_normalizes_all_explicit_opt_outs() {
     let cases = [
         r#""enable_thinking":false"#,
