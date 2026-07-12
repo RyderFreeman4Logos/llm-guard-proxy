@@ -1758,7 +1758,7 @@ pub struct ParamOverrideConfig {
     pub top_p: Option<f64>,
     /// Forced `top_k` value.
     pub top_k: Option<u32>,
-    /// Forced `max_tokens` value.
+    /// Total output cap and default when the caller omits output-limit fields.
     pub max_tokens: Option<u32>,
     /// Forced `frequency_penalty` value.
     pub frequency_penalty: Option<f64>,

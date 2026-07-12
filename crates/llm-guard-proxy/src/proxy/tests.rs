@@ -3769,6 +3769,174 @@ sample_rate = 1.0
     );
 }
 
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn shadow_and_paired_comparisons_do_not_reexpand_thinking_caps() {
+    let mut fake = FakeUpstream::spawn().await;
+    let profile_config = shadow_param_override_profile_config(&fake.base_url);
+    let proxy = ProxyFixture::spawn_with_full_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        "",
+        &profile_config,
+        "",
+        shadow_and_paired_comparison_config(),
+    )
+    .await;
+
+    let loop_response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-once-shadow-raw-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"max_tokens":64}"#,
+        )
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(loop_response.status(), StatusCode::OK);
+    assert_eq!(
+        shielded_final_json(loop_response).await["choices"][0]["message"]["content"],
+        "Hello"
+    );
+    let mut upstream_requests = recv_n_upstream_requests(&mut fake, 3).await;
+
+    let paired_response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=paired-shadow",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"paired"}],"max_tokens":64}"#,
+        )
+        .send()
+        .await
+        .expect("paired proxy request should complete");
+    assert_eq!(paired_response.status(), StatusCode::OK);
+    assert_eq!(
+        shielded_final_json(paired_response).await["choices"][0]["message"]["content"],
+        "Hello"
+    );
+    upstream_requests.extend(recv_n_upstream_requests(&mut fake, 3).await);
+
+    assert_shadow_param_override_bodies(&upstream_requests);
+
+    wait_for_evidence_role_status_count(
+        &proxy.evidence_sqlite_path,
+        "shadow_continued",
+        "accepted",
+        3,
+    )
+    .await;
+    assert_shadow_param_override_metadata(&proxy.evidence_sqlite_path);
+}
+
+#[cfg(feature = "param-override")]
+fn shadow_param_override_profile_config(base_url: &str) -> String {
+    format!(
+        r#"
+[[upstreams]]
+name = "shadow-param-override"
+base_url = "{base_url}"
+match_models = ["test-chat"]
+
+[upstreams.thinking]
+mode = "bounded_thinking"
+max_tokens = 4096
+default_injection_schema = "vllm_native"
+
+[upstreams.param_override]
+enabled = true
+temperature = 0.6
+max_tokens = 50000
+"#,
+    )
+}
+
+#[cfg(feature = "param-override")]
+fn shadow_and_paired_comparison_config() -> &'static str {
+    r#"
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = true
+keep_looping_attempt_running = false
+compare_attempts = ["no-thinking"]
+max_shadow_attempts_per_request = 4
+max_global_shadow_in_flight = 4
+shadow_attempt_timeout_ms = 2000
+
+[evidence.shadow.paired_comparison]
+enabled = true
+variants = ["max-thinking", "no-thinking"]
+include_raw_input = true
+include_raw_output = true
+sample_rate = 1.0
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = true
+"#
+}
+
+#[cfg(feature = "param-override")]
+fn assert_shadow_param_override_bodies(upstream_requests: &[ObservedRequest]) {
+    let bodies = upstream_requests.iter().map(|request| {
+        serde_json::from_slice::<serde_json::Value>(&request.body)
+            .expect("shadow request body should be JSON")
+    });
+    assert!(
+        bodies
+            .into_iter()
+            .all(|body| body["max_tokens"] == 4_096 && body["temperature"] == 0.6)
+    );
+    assert_eq!(
+        upstream_requests
+            .iter()
+            .filter(|request| body_thinking_budget(&request.body) == Some(0))
+            .count(),
+        2
+    );
+}
+
+#[cfg(feature = "param-override")]
+fn assert_shadow_param_override_metadata(sqlite_path: &Path) {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
+    let mut statement = connection
+        .prepare(
+            "SELECT request_metadata_json FROM evidence_attempts \
+             WHERE role = 'shadow_continued' ORDER BY rowid",
+        )
+        .expect("shadow metadata query should prepare");
+    let metadata = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("shadow metadata query should execute")
+        .map(|row| {
+            serde_json::from_str::<serde_json::Value>(
+                &row.expect("shadow metadata row should decode"),
+            )
+            .expect("shadow metadata should be JSON")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(metadata.len(), 3);
+    for metadata in metadata {
+        assert_eq!(metadata["attempt_thinking_max_tokens"], "4096");
+        assert_eq!(metadata["thinking_answer_budget_final_max_tokens"], "4096");
+    }
+}
+
 fn assert_shadow_raw_attempt_redacts_and_preserves_stream_payloads(connection: &Connection) {
     let (request_metadata_json, raw_input, raw_output, raw_reasoning, raw_tool_calls): (
         String,
@@ -4444,9 +4612,23 @@ async fn vllm_native_retry_ladder_uses_each_budget_and_original_answer_headroom(
         &fake.base_url,
         true,
         AppConfig::default().server.max_in_flight_requests,
-        r#"
-[thinking]
+        &format!(
+            r#"
+[[upstreams]]
+name = "aeon-chat"
+base_url = "{base_url}"
+match_models = ["test-chat"]
+
+[upstreams.thinking]
+mode = "bounded_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
 default_injection_schema = "vllm_native"
+
+[upstreams.param_override]
+enabled = true
+temperature = 0.6
+max_tokens = 50000
 
 [loop_guard]
 mode = "enforce"
@@ -4459,26 +4641,28 @@ anti_loop_hint_enabled = false
 [[retry.ladder]]
 name = "max-thinking"
 thinking_mode = "force_thinking"
-max_tokens = 40000
+max_tokens = 50000
 thinking_token_budget = 32768
 
 [[retry.ladder]]
 name = "bounded-thinking-deep"
 thinking_mode = "force_thinking"
-max_tokens = 40000
+max_tokens = 50000
 thinking_token_budget = 16384
 
 [[retry.ladder]]
 name = "bounded-thinking"
 thinking_mode = "force_thinking"
-max_tokens = 40000
+max_tokens = 50000
 thinking_token_budget = 8192
 
 [[retry.ladder]]
 name = "no-thinking"
 thinking_mode = "force_disable"
-max_tokens = 40000
+max_tokens = 1024
 "#,
+            base_url = fake.base_url,
+        ),
     )
     .await;
 
@@ -4513,13 +4697,13 @@ max_tokens = 40000
     assert_vllm_native_retry_bodies(&observed_bodies);
 
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
-    assert_vllm_native_retry_metadata(&attempts);
+    assert_vllm_native_retry_metadata(&attempts, &observed_bodies);
 }
 
 fn assert_vllm_native_retry_bodies(observed_bodies: &[serde_json::Value]) {
     assert_eq!(observed_bodies.len(), 4);
     let budgets = [32_768_u64, 16_384, 8_192];
-    let expected_max_tokens = [40_000_u64, 26_384, 18_192];
+    let expected_max_tokens = [42_768_u64, 26_384, 18_192];
     for ((body, budget), expected_max_tokens) in observed_bodies
         .iter()
         .take(3)
@@ -4530,7 +4714,8 @@ fn assert_vllm_native_retry_bodies(observed_bodies: &[serde_json::Value]) {
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
         assert_eq!(body["max_tokens"], expected_max_tokens);
         assert_eq!(body["max_completion_tokens"], 200 + budget);
-        assert_eq!(body["max_output_tokens"], 40_000);
+        assert_eq!(body["max_output_tokens"], 50_000);
+        assert_eq!(body["temperature"], 0.6);
         assert!(body.get("thinking").is_none());
     }
     let no_thinking = &observed_bodies[3];
@@ -4539,15 +4724,19 @@ fn assert_vllm_native_retry_bodies(observed_bodies: &[serde_json::Value]) {
         no_thinking["chat_template_kwargs"]["enable_thinking"],
         false
     );
-    assert_eq!(no_thinking["max_tokens"], 10_000);
+    assert_eq!(no_thinking["max_tokens"], 1_024);
     assert_eq!(no_thinking["max_completion_tokens"], 200);
-    assert_eq!(no_thinking["max_output_tokens"], 40_000);
+    assert_eq!(no_thinking["max_output_tokens"], 1_024);
+    assert_eq!(no_thinking["temperature"], 0.6);
 }
 
-fn assert_vllm_native_retry_metadata(attempts: &[AttemptChainRow]) {
+fn assert_vllm_native_retry_metadata(
+    attempts: &[AttemptChainRow],
+    observed_bodies: &[serde_json::Value],
+) {
     assert_eq!(attempts.len(), 4);
     let budgets = [32_768_u64, 16_384, 8_192];
-    for (attempt, budget) in attempts.iter().take(3).zip(budgets) {
+    for ((attempt, body), budget) in attempts.iter().zip(observed_bodies).take(3).zip(budgets) {
         assert_eq!(
             attempt.response_metadata["attempt_thinking_budget_tokens"],
             budget.to_string()
@@ -4570,15 +4759,36 @@ fn assert_vllm_native_retry_metadata(attempts: &[AttemptChainRow]) {
         );
         assert_eq!(
             attempt.response_metadata["thinking_policy_max_tokens"],
-            "40000"
+            "50000"
         );
         assert_eq!(
             attempt.response_metadata["attempt_thinking_max_tokens"],
-            "40000"
+            "50000"
         );
         assert_eq!(
             attempt.response_metadata["thinking_answer_budget_overflow_fields"],
             "max_output_tokens"
+        );
+        assert_eq!(
+            attempt.response_metadata["thinking_answer_budget_final_max_tokens"],
+            body["max_tokens"]
+                .as_u64()
+                .expect("max_tokens should be numeric")
+                .to_string()
+        );
+        assert_eq!(
+            attempt.response_metadata["thinking_answer_budget_final_max_completion_tokens"],
+            body["max_completion_tokens"]
+                .as_u64()
+                .expect("max_completion_tokens should be numeric")
+                .to_string()
+        );
+        assert_eq!(
+            attempt.response_metadata["thinking_answer_budget_final_max_output_tokens"],
+            body["max_output_tokens"]
+                .as_u64()
+                .expect("max_output_tokens should be numeric")
+                .to_string()
         );
     }
     assert_eq!(
@@ -4591,7 +4801,19 @@ fn assert_vllm_native_retry_metadata(attempts: &[AttemptChainRow]) {
     );
     assert_eq!(
         attempts[3].response_metadata["thinking_answer_budget_adjusted_fields"],
-        "max_output_tokens"
+        "max_tokens,max_output_tokens"
+    );
+    assert_eq!(
+        attempts[3].response_metadata["attempt_thinking_max_tokens"],
+        "1024"
+    );
+    assert_eq!(
+        attempts[3].response_metadata["thinking_answer_budget_final_max_tokens"],
+        observed_bodies[3]["max_tokens"].to_string()
+    );
+    assert_eq!(
+        attempts[3].response_metadata["thinking_answer_budget_final_max_output_tokens"],
+        observed_bodies[3]["max_output_tokens"].to_string()
     );
 }
 
@@ -6911,7 +7133,7 @@ temperature = 0.6
 
 #[cfg(feature = "param-override")]
 #[tokio::test]
-async fn override_max_tokens_wins_after_thinking_policy() {
+async fn override_max_tokens_caps_thinking_policy_without_replacing_caller_headroom() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -6928,7 +7150,7 @@ match_models = ["test-chat"]
 mode = "force_thinking"
 
 [upstreams.param_override]
-max_tokens = 128
+max_tokens = 50000
 "#,
             base_url = fake.base_url,
         ),
@@ -6943,7 +7165,44 @@ max_tokens = 128
     .await;
 
     assert_eq!(observed_body["thinking"]["budget_tokens"], 32_768);
-    assert_eq!(observed_body["max_tokens"], 128);
+    assert_eq!(observed_body["max_tokens"], 32_832);
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn override_max_tokens_is_a_default_cap_for_passthrough_thinking() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &param_override_profile_config(
+            &fake.base_url,
+            r"
+temperature = 0.6
+max_tokens = 128
+",
+        ),
+    )
+    .await;
+
+    let caller_limited = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"caller-limited"}],"max_tokens":64}"#,
+    )
+    .await;
+    assert_eq!(caller_limited["max_tokens"], 64);
+    assert_eq!(caller_limited["temperature"], 0.6);
+
+    let defaulted = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"defaulted"}]}"#,
+    )
+    .await;
+    assert_eq!(defaulted["max_tokens"], 128);
+    assert_eq!(defaulted["temperature"], 0.6);
 }
 
 #[tokio::test]

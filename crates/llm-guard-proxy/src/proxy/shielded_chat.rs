@@ -55,7 +55,8 @@ pub(super) fn prepare_non_stream_request(
         return None;
     }
 
-    let thinking_metadata = apply_thinking_policy(object, thinking);
+    let mut thinking_metadata = apply_thinking_policy(object, thinking);
+    add_final_answer_budget_metadata(object, &mut thinking_metadata);
     object.insert(String::from("stream"), Value::Bool(true));
     let stream_options = object
         .entry(String::from("stream_options"))
@@ -88,7 +89,8 @@ pub(super) fn prepare_stream_request(
         return None;
     }
 
-    let thinking_metadata = apply_thinking_policy(object, thinking);
+    let mut thinking_metadata = apply_thinking_policy(object, thinking);
+    add_final_answer_budget_metadata(object, &mut thinking_metadata);
     let upstream_body = serde_json::to_vec(&value).ok()?;
 
     Some(PreparedChatRequest {
@@ -541,19 +543,17 @@ fn apply_thinking_policy(
     );
     if !thinking.enabled && !thinking.force_disable {
         let outcome = thinking_noop("policy_disabled", &budget_observations);
-        metadata.extend(thinking_outcome_metadata(
-            &outcome,
-            &AnswerBudgetDecision::default(),
-        ));
+        let answer_budget =
+            apply_configured_total_cap(object, thinking, AnswerBudgetDecision::default());
+        metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
         return metadata;
     }
     match thinking.effective_mode() {
         ThinkingMode::Passthrough => {
             let outcome = thinking_noop("mode_passthrough", &budget_observations);
-            metadata.extend(thinking_outcome_metadata(
-                &outcome,
-                &AnswerBudgetDecision::default(),
-            ));
+            let answer_budget =
+                apply_configured_total_cap(object, thinking, AnswerBudgetDecision::default());
+            metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
             return metadata;
         }
         ThinkingMode::ForceDisable => {
@@ -584,10 +584,9 @@ fn apply_thinking_policy(
         )
     {
         let outcome = thinking_noop("tool_request_passthrough", &budget_observations);
-        metadata.extend(thinking_outcome_metadata(
-            &outcome,
-            &AnswerBudgetDecision::default(),
-        ));
+        let answer_budget =
+            apply_configured_total_cap(object, thinking, AnswerBudgetDecision::default());
+        metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
         return metadata;
     }
     if record_force_thinking_marker_decision(object, thinking, &budget_observations, &mut metadata)
@@ -782,10 +781,9 @@ fn record_force_thinking_marker_decision(
             thinking.default_injection_schema,
             &mut outcome,
         );
-        metadata.extend(thinking_outcome_metadata(
-            &outcome,
-            &AnswerBudgetDecision::default(),
-        ));
+        let answer_budget =
+            apply_configured_total_cap(object, thinking, AnswerBudgetDecision::default());
+        metadata.extend(thinking_outcome_metadata(&outcome, &answer_budget));
         return true;
     }
     if marker.detected {
@@ -1847,6 +1845,21 @@ fn apply_configured_total_cap(
         decision.applied = true;
     }
     decision
+}
+
+fn add_final_answer_budget_metadata(
+    object: &Map<String, Value>,
+    metadata: &mut BTreeMap<String, String>,
+) {
+    for field in ANSWER_BUDGET_FIELDS {
+        let value = match object.get(*field) {
+            Some(value) => value
+                .as_u64()
+                .map_or_else(|| String::from("malformed"), |value| value.to_string()),
+            None => String::from("absent"),
+        };
+        metadata.insert(format!("thinking_answer_budget_final_{field}"), value);
+    }
 }
 
 fn previous_budget_state(observations: &BudgetObservations, configured_budget: u64) -> String {

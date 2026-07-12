@@ -158,7 +158,7 @@ probe_timeout_secs = 600
 mode = "bounded_thinking"
 enabled = true
 force_disable = false
-max_tokens = 50000
+max_tokens = 50000                 # Total output cap; caller limits below it remain unchanged
 budget_tokens = 32768
 preserve_answer_budget = true
 tool_request_policy = "apply"
@@ -170,7 +170,7 @@ enabled = true
 temperature = 0.6
 top_p = 0.95
 top_k = 20
-max_tokens = 50000
+max_tokens = 50000                 # Supplies the same total cap when thinking policy omits one
 frequency_penalty = 0.0
 presence_penalty = 0.0
 
