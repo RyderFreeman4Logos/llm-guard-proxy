@@ -1322,6 +1322,13 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
         .expect("proxy request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
+    let response_request_id = response
+        .headers()
+        .get("x-request-id")
+        .expect("terminal response should include x-request-id")
+        .to_str()
+        .expect("x-request-id should be valid header text")
+        .to_owned();
     assert_eq!(
         response
             .headers()
@@ -1379,6 +1386,9 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
     assert_eq!(aggregated["usage"]["prompt_tokens"], 3);
     assert_eq!(aggregated["usage"]["completion_tokens"], 2);
     assert_eq!(aggregated["usage"]["total_tokens"], 5);
+
+    let persisted_request = read_last_observability_row(&proxy.sqlite_path, "requests");
+    assert_eq!(response_request_id, persisted_request.request_id);
 
     let observed = fake.recv_next().await;
     assert_eq!(observed.method, Method::POST);
@@ -16854,6 +16864,7 @@ fn assert_forwarded_abort_recorded(proxy: &ProxyFixture) {
 
 #[derive(Debug)]
 struct ObservabilityRow {
+    request_id: String,
     status: String,
     response_metadata: serde_json::Value,
 }
@@ -17191,14 +17202,16 @@ async fn wait_for_evidence_role_status_count(
 fn read_last_observability_row(sqlite_path: &Path, table: &str) -> ObservabilityRow {
     assert!(matches!(table, "requests" | "attempts"));
     let connection = Connection::open(sqlite_path).expect("sqlite should open");
-    let sql =
-        format!("SELECT status, response_metadata_json FROM {table} ORDER BY rowid DESC LIMIT 1");
-    let row: (String, String) = connection
-        .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
+    let sql = format!(
+        "SELECT request_id, status, response_metadata_json FROM {table} ORDER BY rowid DESC LIMIT 1"
+    );
+    let row: (String, String, String) = connection
+        .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .expect("observability row should exist");
-    let response_metadata = serde_json::from_str(&row.1).expect("response metadata should be json");
+    let response_metadata = serde_json::from_str(&row.2).expect("response metadata should be json");
     ObservabilityRow {
-        status: row.0,
+        request_id: row.0,
+        status: row.1,
         response_metadata,
     }
 }
