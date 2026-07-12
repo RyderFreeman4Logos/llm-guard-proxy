@@ -2099,15 +2099,12 @@ fn parse_heartbeat_mode(
     line_number: usize,
 ) -> Result<HeartbeatMode, ConfigParseError> {
     let mode = parse_string(value, line_number)?;
-    match mode.as_str() {
-        "sse" => Ok(HeartbeatMode::Sse),
-        "json-whitespace" => Ok(HeartbeatMode::JsonWhitespace),
-        "disabled" => Ok(HeartbeatMode::Disabled),
-        _ => Err(ConfigParseError::new(
+    HeartbeatMode::from_label(&mode).ok_or_else(|| {
+        ConfigParseError::new(
             line_number,
             "heartbeat.mode must be sse, json-whitespace, or disabled",
-        )),
-    }
+        )
+    })
 }
 
 fn parse_u16(value: &str, line_number: usize, field: &str) -> Result<u16, ConfigParseError> {

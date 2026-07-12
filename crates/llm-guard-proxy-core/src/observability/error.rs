@@ -72,6 +72,51 @@ pub enum ObservabilityError {
     /// Shared `SQLite` connection state was poisoned by a panic.
     #[error("observability store lock is poisoned")]
     LockPoisoned,
+    /// Another store or process owns the configured writer path.
+    #[error("observability writer ownership is already held for {path}")]
+    WriterOwnershipHeld {
+        /// Normalized `SQLite` path whose writer is already active.
+        path: PathBuf,
+    },
+    /// Preparing or locking the writer-ownership sidecar failed.
+    #[error("failed to acquire observability writer ownership for {path}: {source}")]
+    WriterOwnership {
+        /// Normalized `SQLite` path whose ownership could not be acquired.
+        path: PathBuf,
+        /// Source filesystem locking error.
+        source: std::io::Error,
+    },
+    /// A file-backed database cannot be represented by one path-owned writer lock.
+    #[error(
+        "observability writer ownership requires exactly one filesystem link for {path}; found {link_count}"
+    )]
+    WriterOwnershipLinkCount {
+        /// Normalized `SQLite` path with unsupported filesystem identity.
+        path: PathBuf,
+        /// Link count read from the securely opened database file descriptor.
+        link_count: u64,
+    },
+    /// Resolving an alias-free `SQLite` storage path failed.
+    #[error("failed to normalize observability SQLite path {path}: {source}")]
+    NormalizeStoragePath {
+        /// Configured or absolute path being normalized.
+        path: PathBuf,
+        /// Source filesystem resolution error.
+        source: std::io::Error,
+    },
+    /// Cached metrics were invalidated after database recovery failed.
+    #[error("observability metrics are unavailable until the store resynchronizes")]
+    MetricsUnavailable,
+    /// A write failed and the metrics cache could not be resynchronized.
+    #[error(
+        "observability write failed ({write_error}); metrics recovery also failed ({recovery_error})"
+    )]
+    MetricsRecoveryFailed {
+        /// Original write-path failure.
+        write_error: Box<Self>,
+        /// Failure while rebuilding metrics from committed database state.
+        recovery_error: Box<Self>,
+    },
     /// Caller supplied an empty typed identifier.
     #[error("observability {kind} id must not be empty")]
     EmptyIdentifier {

@@ -2,6 +2,9 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Barrier, mpsc},
+    thread,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -237,6 +240,208 @@ fn rejects_symlink_sqlite_path_without_chmodding_target() {
 }
 
 #[test]
+fn exclusive_writer_rejects_same_path_and_reopens_after_drop() {
+    let fixture = StoreFixture::new("exclusive-writer");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let store = ObservabilityStore::open(manager.handle()).expect("first store should open");
+    store
+        .record_request(&request_record(
+            "req-exclusive-writer",
+            RequestStatus::Succeeded,
+            1_000,
+        ))
+        .expect("request should be written");
+
+    let alias_config_path = fixture.root.join("alias-config.toml");
+    let alias_sqlite_path = fixture
+        .storage_dir()
+        .join(".")
+        .join("observability.sqlite3");
+    write_config_file(
+        &alias_config_path,
+        &alias_sqlite_path,
+        true,
+        false,
+        TEST_MAX_BYTES,
+        TEST_PRUNE_TO_BYTES,
+    );
+    let alias_manager =
+        ConfigManager::from_explicit_path(&alias_config_path).expect("alias config should load");
+    let error = ObservabilityStore::open(alias_manager.handle())
+        .expect_err("second writer for the same SQLite path must be rejected");
+    match error {
+        ObservabilityError::WriterOwnershipHeld { path } => {
+            assert_eq!(path, fixture.sqlite_path);
+        }
+        other => panic!("unexpected ownership error: {other}"),
+    }
+
+    let writer_lock_path = writer_lock_path_for_test(&fixture.sqlite_path);
+    assert!(writer_lock_path.is_file());
+    #[cfg(unix)]
+    assert_eq!(file_mode(&writer_lock_path), 0o600);
+
+    drop(store);
+    assert!(
+        writer_lock_path.is_file(),
+        "writer lock sidecar must persist"
+    );
+    let reopened = ObservabilityStore::open(manager.handle())
+        .expect("writer ownership should release when the last store clone drops");
+    assert_eq!(
+        reopened
+            .metrics_snapshot()
+            .expect("reopened snapshot")
+            .retention_usage
+            .request_count,
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_preexisting_hard_link_aliases_without_mutating_database() {
+    let fixture = StoreFixture::new("writer-hard-link-existing");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let store = ObservabilityStore::open(manager.handle()).expect("initial store should open");
+    store
+        .record_request(&request_record(
+            "req-writer-hard-link-existing",
+            RequestStatus::Succeeded,
+            1_000,
+        ))
+        .expect("request should be written");
+    drop(store);
+
+    let database_before_rejections =
+        fs::read(&fixture.sqlite_path).expect("database should be readable");
+    let alias_path = fixture.storage_dir().join("hard-link-alias.sqlite3");
+    fs::hard_link(&fixture.sqlite_path, &alias_path).expect("hard link should be created");
+
+    let original_error = ObservabilityStore::open(manager.handle())
+        .expect_err("original hard-link path should be rejected");
+    assert_writer_link_count_error(original_error, &fixture.sqlite_path, 2);
+
+    let alias_manager = fixture.manager_for_sqlite_path("hard-link-alias.toml", &alias_path);
+    let alias_error = ObservabilityStore::open(alias_manager.handle())
+        .expect_err("hard-link alias should be rejected");
+    assert_writer_link_count_error(alias_error, &alias_path, 2);
+
+    assert_eq!(
+        fs::read(&fixture.sqlite_path).expect("original database should remain readable"),
+        database_before_rejections
+    );
+    assert_eq!(
+        fs::read(&alias_path).expect("aliased database should remain readable"),
+        database_before_rejections
+    );
+    assert!(
+        !writer_lock_path_for_test(&alias_path).exists(),
+        "rejection must happen before creating an alias-owned sidecar"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_hard_link_alias_created_after_writer_open() {
+    let fixture = StoreFixture::new("writer-hard-link-after-open");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let store = ObservabilityStore::open(manager.handle()).expect("initial store should open");
+    store
+        .record_request(&request_record(
+            "req-writer-hard-link-after-open",
+            RequestStatus::Succeeded,
+            1_000,
+        ))
+        .expect("request should be written");
+
+    let alias_path = fixture.storage_dir().join("late-hard-link-alias.sqlite3");
+    fs::hard_link(&fixture.sqlite_path, &alias_path).expect("hard link should be created");
+    let database_before_rejection =
+        fs::read(&fixture.sqlite_path).expect("database should be readable");
+    let alias_manager = fixture.manager_for_sqlite_path("late-hard-link-alias.toml", &alias_path);
+
+    let alias_error = ObservabilityStore::open(alias_manager.handle())
+        .expect_err("late hard-link alias should not create a second writer");
+    assert_writer_link_count_error(alias_error, &alias_path, 2);
+    assert_eq!(
+        fs::read(&fixture.sqlite_path).expect("database should remain readable"),
+        database_before_rejection
+    );
+    assert_eq!(
+        store
+            .metrics_snapshot()
+            .expect("original accumulator should remain available")
+            .retention_usage
+            .request_count,
+        1
+    );
+    assert!(!writer_lock_path_for_test(&alias_path).exists());
+
+    fs::remove_file(&alias_path).expect("hard-link alias should be removed");
+    drop(store);
+    let reopened = ObservabilityStore::open(manager.handle())
+        .expect("single-link database should reopen after the owner drops");
+    assert_eq!(
+        reopened
+            .metrics_snapshot()
+            .expect("reopened accumulator should reconstruct")
+            .retention_usage
+            .request_count,
+        1
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_symlink_writer_lock_without_chmodding_target() {
+    let fixture = StoreFixture::new("writer-lock-symlink");
+    fs::create_dir_all(fixture.storage_dir()).expect("storage directory should be created");
+    fs::set_permissions(fixture.storage_dir(), fs::Permissions::from_mode(0o700))
+        .expect("storage directory should be owner-only");
+
+    let target_path = fixture.root.join("writer-lock-target");
+    fs::write(&target_path, []).expect("target file should be created");
+    fs::set_permissions(&target_path, fs::Permissions::from_mode(0o666))
+        .expect("target file permissions should be broadened");
+    let original_target_mode = file_mode(&target_path);
+    let lock_path = writer_lock_path_for_test(&fixture.sqlite_path);
+    symlink(&target_path, &lock_path).expect("writer lock symlink should be created");
+
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let error = ObservabilityStore::open(manager.handle())
+        .expect_err("writer lock symlink should be rejected");
+    match error {
+        ObservabilityError::UnsafeStoragePath { path, reason } => {
+            assert_eq!(path, lock_path);
+            assert!(reason.contains("writer lock"));
+            assert!(reason.contains("symlink"));
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+    assert_eq!(file_mode(&target_path), original_target_mode);
+}
+
+#[test]
+fn writer_ownership_releases_when_store_initialization_fails() {
+    let fixture = StoreFixture::new("writer-lock-open-error");
+    fs::create_dir_all(fixture.storage_dir()).expect("storage directory should be created");
+    #[cfg(unix)]
+    fs::set_permissions(fixture.storage_dir(), fs::Permissions::from_mode(0o700))
+        .expect("storage directory should be owner-only");
+    fs::write(&fixture.sqlite_path, b"not a SQLite database")
+        .expect("invalid database fixture should be written");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+
+    ObservabilityStore::open(manager.handle())
+        .expect_err("invalid SQLite content should fail after acquiring ownership");
+    fs::remove_file(&fixture.sqlite_path).expect("invalid database should be removed");
+
+    ObservabilityStore::open(manager.handle())
+        .expect("failed initialization must release writer ownership");
+}
+
+#[test]
 fn writes_success_and_failure_request_and_attempt_rows() {
     let fixture = StoreFixture::new("success-failure");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
@@ -375,6 +580,503 @@ fn metrics_snapshot_buckets_request_terminal_reasons() {
             .iter()
             .any(|row| row.terminal_reason.contains("sensitive"))
     );
+}
+
+#[test]
+fn metrics_snapshot_does_not_wait_for_sqlite_connection_lock() {
+    let fixture = StoreFixture::new("metrics-independent-connection-lock");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    store
+        .record_request(&request_record(
+            "req-metrics-lock",
+            RequestStatus::Succeeded,
+            1_000,
+        ))
+        .expect("request write");
+
+    let connection = store.lock_connection().expect("connection lock");
+    let ready = Arc::new(Barrier::new(2));
+    let worker_ready = Arc::clone(&ready);
+    let worker_store = store.clone();
+    let (snapshot_sender, snapshot_receiver) = mpsc::sync_channel(1);
+    let worker = thread::spawn(move || {
+        worker_ready.wait();
+        let result = (|| {
+            let first = worker_store.metrics_snapshot()?;
+            let second = worker_store.metrics_snapshot()?;
+            Ok::<_, ObservabilityError>((first, second))
+        })();
+        snapshot_sender
+            .send(result)
+            .expect("snapshot result receiver should remain alive");
+    });
+
+    ready.wait();
+    let prompt_result = snapshot_receiver.recv_timeout(Duration::from_millis(250));
+    drop(connection);
+    let (snapshot, repeated_snapshot) = prompt_result
+        .expect("metrics snapshot must not wait for the SQLite connection lock")
+        .expect("metrics snapshot should succeed");
+    worker.join().expect("snapshot worker should finish");
+
+    assert_eq!(snapshot.retention_usage.request_count, 1);
+    assert_eq!(snapshot.retention_usage.attempt_count, 0);
+    assert_eq!(repeated_snapshot, snapshot);
+}
+
+#[test]
+fn metrics_snapshot_tracks_updates_pruning_and_reopen_exactly() {
+    let fixture = StoreFixture::new("metrics-update-prune-reopen");
+    let manager =
+        fixture.manager_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 2);
+    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let initial_request = RequestRecord {
+        status: RequestStatus::Failed,
+        http_status: Some(503),
+        abort_reason: Some(String::from("upstream_stall")),
+        ..request_record("req-metrics-old", RequestStatus::Failed, 1_000)
+    };
+    let initial_attempt = AttemptRecord {
+        status: AttemptStatus::Retried,
+        http_status: Some(503),
+        retry_reason: Some(String::from("upstream unavailable")),
+        response_metadata: BTreeMap::from([
+            (String::from("first_token_latency_ms"), String::from("250")),
+            (String::from("loop_detected"), String::from("true")),
+        ]),
+        ..attempt_record(
+            "attempt-metrics-old",
+            &initial_request.request_id,
+            AttemptStatus::Retried,
+            1,
+            1_010,
+        )
+    };
+    store
+        .record_request(&initial_request)
+        .expect("initial request write");
+    store
+        .record_attempt(&initial_attempt)
+        .expect("initial attempt write");
+
+    let final_request = RequestRecord {
+        status: RequestStatus::Succeeded,
+        http_status: Some(200),
+        abort_reason: None,
+        ..initial_request
+    };
+    let final_attempt = AttemptRecord {
+        status: AttemptStatus::Succeeded,
+        http_status: Some(200),
+        retry_reason: None,
+        response_metadata: BTreeMap::from([(
+            String::from("first_token_latency_ms"),
+            String::from("25"),
+        )]),
+        ..initial_attempt
+    };
+    store
+        .record_request(&final_request)
+        .expect("request update");
+    store
+        .record_attempt(&final_attempt)
+        .expect("attempt update");
+
+    let updated = store.metrics_snapshot().expect("updated metrics snapshot");
+    assert_eq!(updated.retention_usage.request_count, 1);
+    assert_eq!(updated.retention_usage.attempt_count, 1);
+    assert_eq!(updated.retry_count, 0);
+    assert_eq!(updated.loop_abort_count, 0);
+    assert_eq!(updated.first_token_latency_ms.count, 1);
+    assert_eq!(updated.first_token_latency_ms.sum_ms, 25);
+    assert_eq!(updated.total_latency_ms.count, 1);
+    assert_eq!(updated.total_latency_ms.sum_ms, 100);
+    assert_eq!(updated.request_counts.len(), 1);
+    assert_eq!(updated.request_counts[0].status, "succeeded");
+    assert_eq!(updated.request_counts[0].http_status_class, "2xx");
+    assert_eq!(updated.request_counts[0].count, 1);
+    assert_eq!(updated.attempt_counts.len(), 1);
+    assert_eq!(updated.attempt_counts[0].status, "succeeded");
+    assert_eq!(updated.attempt_counts[0].http_status_class, "2xx");
+    assert_eq!(updated.attempt_counts[0].count, 1);
+
+    store
+        .record_request(&request_record(
+            "req-metrics-new",
+            RequestStatus::Succeeded,
+            2_000,
+        ))
+        .expect("retention-triggering request write");
+    let pruned = store.metrics_snapshot().expect("pruned metrics snapshot");
+    assert_eq!(pruned.retention_usage.request_count, 1);
+    assert_eq!(pruned.retention_usage.attempt_count, 0);
+    assert_eq!(pruned.retention_usage.record_count, 1);
+    assert_eq!(pruned.retry_count, 0);
+    assert_eq!(pruned.loop_abort_count, 0);
+    assert_eq!(pruned.first_token_latency_ms.count, 0);
+    assert_eq!(pruned.first_token_latency_ms.sum_ms, 0);
+    assert_eq!(pruned.total_latency_ms.count, 1);
+    assert_eq!(pruned.total_latency_ms.sum_ms, 100);
+    assert_eq!(pruned.pruning.prune_events, 1);
+    assert_eq!(pruned.pruning.pruned_requests, 1);
+    assert_eq!(pruned.pruning.pruned_attempts, 1);
+
+    drop(store);
+    let reopened = ObservabilityStore::open(manager.handle()).expect("store should reopen");
+    assert_eq!(
+        reopened.metrics_snapshot().expect("reopened snapshot"),
+        pruned
+    );
+}
+
+#[test]
+fn metrics_snapshot_work_is_independent_of_retained_row_count() {
+    let fixture = StoreFixture::new("metrics-snapshot-scaling");
+    let manager =
+        fixture.manager_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 1_000);
+    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    store
+        .record_request(&request_record(
+            "req-metrics-scaling-0",
+            RequestStatus::Succeeded,
+            1_000,
+        ))
+        .expect("initial request write");
+    let one_row_work = store
+        .metrics_snapshot_work_units()
+        .expect("one-row snapshot work");
+
+    for index in 1_u64..200 {
+        store
+            .record_request(&request_record(
+                &format!("req-metrics-scaling-{index}"),
+                RequestStatus::Succeeded,
+                1_000 + index,
+            ))
+            .expect("scaling request write");
+    }
+
+    let snapshot = store.metrics_snapshot().expect("large metrics snapshot");
+    let many_row_work = store
+        .metrics_snapshot_work_units()
+        .expect("many-row snapshot work");
+    assert_eq!(snapshot.retention_usage.request_count, 200);
+    assert_eq!(snapshot.request_counts[0].count, 200);
+    assert_eq!(many_row_work, one_row_work);
+}
+
+#[test]
+fn heartbeat_metric_labels_use_a_closed_vocabulary() {
+    let fixture = StoreFixture::new("metrics-closed-heartbeat-labels");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let adversarial_values = [
+        "raw prompt: summarize the patient's private record",
+        "raw response: account balance is 12345",
+        "reasoning trace: hidden chain of thought",
+        "x-custom-header: private-header-value",
+        "SSE",
+    ];
+
+    for (index, value) in adversarial_values.iter().enumerate() {
+        let request = RequestRecord {
+            response_metadata: BTreeMap::from([(
+                String::from("downstream_liveness_mode"),
+                (*value).to_owned(),
+            )]),
+            ..request_record(
+                &format!("req-adversarial-heartbeat-{index}"),
+                RequestStatus::Succeeded,
+                1_000 + u64::try_from(index).expect("small test index"),
+            )
+        };
+        store.record_request(&request).expect("request write");
+    }
+
+    for (index, mode) in ["sse", "json-whitespace", "disabled"].iter().enumerate() {
+        let request = RequestRecord {
+            request_metadata: BTreeMap::from([(
+                String::from("downstream_liveness_mode"),
+                (*mode).to_owned(),
+            )]),
+            response_metadata: BTreeMap::new(),
+            ..request_record(
+                &format!("req-valid-heartbeat-{index}"),
+                RequestStatus::Succeeded,
+                2_000 + u64::try_from(index).expect("small test index"),
+            )
+        };
+        store.record_request(&request).expect("request write");
+    }
+
+    let snapshot = store.metrics_snapshot().expect("metrics snapshot");
+    assert_eq!(
+        snapshot
+            .heartbeat_mode_counts
+            .iter()
+            .find(|row| row.mode == "other")
+            .map(|row| row.count),
+        Some(5)
+    );
+    for mode in ["sse", "json-whitespace", "disabled"] {
+        assert_eq!(
+            snapshot
+                .heartbeat_mode_counts
+                .iter()
+                .find(|row| row.mode == mode)
+                .map(|row| row.count),
+            Some(1),
+            "missing valid heartbeat mode {mode}"
+        );
+    }
+    assert!(snapshot.heartbeat_mode_counts.iter().all(|row| {
+        matches!(
+            row.mode.as_str(),
+            "sse" | "json-whitespace" | "disabled" | "other"
+        )
+    }));
+    for raw_value in adversarial_values {
+        assert!(
+            snapshot
+                .heartbeat_mode_counts
+                .iter()
+                .all(|row| row.mode != raw_value)
+        );
+    }
+}
+
+#[test]
+fn incremental_metrics_match_sql_for_conflicts_disabled_writes_and_errors() {
+    let fixture = StoreFixture::new("metrics-differential");
+    let manager =
+        fixture.manager_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 20);
+    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let request = RequestRecord {
+        status: RequestStatus::Aborted,
+        http_status: Some(504),
+        abort_reason: Some(String::from("loop_guard")),
+        request_metadata: BTreeMap::from([(
+            String::from("downstream_liveness_mode"),
+            String::from("request-fallback"),
+        )]),
+        response_metadata: BTreeMap::from([(
+            String::from("downstream_liveness_mode"),
+            String::from("sse"),
+        )]),
+        ..request_record("req-metrics-differential", RequestStatus::Aborted, 1_000)
+    };
+    store.record_request(&request).expect("request write");
+
+    let first_attempt = AttemptRecord {
+        status: AttemptStatus::Retried,
+        http_status: Some(429),
+        retry_reason: Some(String::new()),
+        response_metadata: BTreeMap::from([(
+            String::from("first_token_latency_ms"),
+            String::from("60001"),
+        )]),
+        ..attempt_record(
+            "attempt-metrics-conflict-a",
+            &request.request_id,
+            AttemptStatus::Retried,
+            1,
+            1_010,
+        )
+    };
+    let second_attempt = AttemptRecord {
+        status: AttemptStatus::Failed,
+        http_status: None,
+        response_metadata: BTreeMap::from([(
+            String::from("prefix_loop💥detected_suffix"),
+            String::from("true"),
+        )]),
+        ..attempt_record(
+            "attempt-metrics-conflict-b",
+            &request.request_id,
+            AttemptStatus::Failed,
+            2,
+            1_020,
+        )
+    };
+    store
+        .record_attempt(&first_attempt)
+        .expect("first attempt write");
+    store
+        .record_attempt(&second_attempt)
+        .expect("second attempt write");
+    assert_metrics_cache_matches_sql(&store);
+
+    let dual_conflict = AttemptRecord {
+        attempt_id: first_attempt.attempt_id.clone(),
+        request_id: request.request_id.clone(),
+        attempt_number: 2,
+        status: AttemptStatus::Succeeded,
+        http_status: Some(200),
+        retry_reason: None,
+        abort_reason: None,
+        response_metadata: BTreeMap::from([(
+            String::from("first_token_latency_ms"),
+            String::from("10"),
+        )]),
+        ..first_attempt
+    };
+    store
+        .record_attempt(&dual_conflict)
+        .expect("dual-conflict replacement");
+    assert_metrics_cache_matches_sql(&store);
+
+    assert_disabled_and_failed_writes_do_not_change_metrics(&fixture, &manager, &store);
+}
+
+fn assert_disabled_and_failed_writes_do_not_change_metrics(
+    fixture: &StoreFixture,
+    manager: &ConfigManager,
+    store: &ObservabilityStore,
+) {
+    fixture.write_config(false, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    assert!(manager.reload().expect("disable reload").applied);
+    let before_disabled = store
+        .metrics_snapshot()
+        .expect("snapshot before disabled write");
+    assert_eq!(
+        store
+            .record_request(&request_record(
+                "req-metrics-disabled",
+                RequestStatus::Succeeded,
+                2_000,
+            ))
+            .expect("disabled write"),
+        StoreWrite::Disabled
+    );
+    assert_eq!(
+        store
+            .metrics_snapshot()
+            .expect("snapshot after disabled write"),
+        before_disabled
+    );
+
+    fixture.write_config(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    assert!(manager.reload().expect("enable reload").applied);
+    let missing_parent = RequestId::from_string("req-missing-parent")
+        .expect("missing parent request id should be valid");
+    let failed_write = attempt_record(
+        "attempt-missing-parent",
+        &missing_parent,
+        AttemptStatus::Failed,
+        1,
+        3_000,
+    );
+    assert!(store.record_attempt(&failed_write).is_err());
+    assert_metrics_cache_matches_sql(store);
+}
+
+#[test]
+fn histogram_sum_remains_reversible_after_reopen() {
+    let fixture = StoreFixture::new("metrics-histogram-overflow");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let request = request_record(
+        "req-metrics-histogram-overflow",
+        RequestStatus::Succeeded,
+        1_000,
+    );
+    store.record_request(&request).expect("request write");
+    for attempt_number in 1..=2 {
+        let attempt = AttemptRecord {
+            response_metadata: BTreeMap::from([(
+                String::from("first_token_latency_ms"),
+                u64::MAX.to_string(),
+            )]),
+            ..attempt_record(
+                &format!("attempt-metrics-overflow-{attempt_number}"),
+                &request.request_id,
+                AttemptStatus::Succeeded,
+                attempt_number,
+                1_000 + u64::from(attempt_number),
+            )
+        };
+        store.record_attempt(&attempt).expect("attempt write");
+    }
+    drop(store);
+
+    let reopened = ObservabilityStore::open(manager.handle()).expect("store should reopen");
+    for attempt_number in 1..=2 {
+        let replacement = AttemptRecord {
+            response_metadata: BTreeMap::from([(
+                String::from("first_token_latency_ms"),
+                String::from("1"),
+            )]),
+            ..attempt_record(
+                &format!("attempt-metrics-overflow-{attempt_number}"),
+                &request.request_id,
+                AttemptStatus::Succeeded,
+                attempt_number,
+                2_000 + u64::from(attempt_number),
+            )
+        };
+        reopened
+            .record_attempt(&replacement)
+            .expect("attempt replacement");
+        assert_metrics_cache_matches_sql(&reopened);
+    }
+    assert_eq!(
+        reopened
+            .metrics_snapshot()
+            .expect("final snapshot")
+            .first_token_latency_ms
+            .sum_ms,
+        2
+    );
+}
+
+#[test]
+fn metrics_fail_closed_when_post_commit_reconstruction_fails() {
+    let fixture = StoreFixture::new("metrics-recovery-failure");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    store.inject_metrics_recovery_failure_after_request_commit();
+
+    let error = store
+        .record_request(&request_record(
+            "req-metrics-committed-before-error",
+            RequestStatus::Succeeded,
+            1_000,
+        ))
+        .expect_err("injected post-commit failure should surface");
+    assert!(matches!(
+        error,
+        ObservabilityError::MetricsRecoveryFailed { .. }
+    ));
+    assert!(matches!(
+        store.metrics_snapshot(),
+        Err(ObservabilityError::MetricsUnavailable)
+    ));
+    let connection = store.lock_connection().expect("connection lock");
+    assert_eq!(count_rows(&connection, "SELECT COUNT(*) FROM requests"), 1);
+    drop(connection);
+
+    store
+        .record_request(&request_record(
+            "req-metrics-resynchronizes",
+            RequestStatus::Succeeded,
+            2_000,
+        ))
+        .expect("next successful write should resynchronize metrics");
+    assert_metrics_cache_matches_sql(&store);
+    assert_eq!(
+        store
+            .metrics_snapshot()
+            .expect("resynchronized snapshot")
+            .retention_usage
+            .request_count,
+        2
+    );
+}
+
+fn assert_metrics_cache_matches_sql(store: &ObservabilityStore) {
+    let cached = store.metrics_snapshot().expect("cached metrics snapshot");
+    let reconstructed = store
+        .reconstructed_metrics_snapshot_for_test()
+        .expect("SQL metrics reconstruction");
+    assert_eq!(cached, reconstructed);
 }
 
 #[test]
@@ -914,6 +1616,19 @@ impl StoreFixture {
         )
     }
 
+    fn manager_for_sqlite_path(&self, config_name: &str, sqlite_path: &Path) -> ConfigManager {
+        let config_path = self.root.join(config_name);
+        write_config_file(
+            &config_path,
+            sqlite_path,
+            true,
+            false,
+            TEST_MAX_BYTES,
+            TEST_PRUNE_TO_BYTES,
+        );
+        ConfigManager::from_explicit_path(&config_path).expect("alias config should load")
+    }
+
     fn manager_with_max_records(
         &self,
         enabled: bool,
@@ -1164,6 +1879,27 @@ fn file_mode(path: &Path) -> u32 {
         .permissions()
         .mode()
         & 0o777
+}
+
+fn writer_lock_path_for_test(sqlite_path: &Path) -> PathBuf {
+    let mut lock_path = sqlite_path.as_os_str().to_os_string();
+    lock_path.push(".writer.lock");
+    PathBuf::from(lock_path)
+}
+
+#[cfg(unix)]
+fn assert_writer_link_count_error(
+    error: ObservabilityError,
+    expected_path: &Path,
+    expected_link_count: u64,
+) {
+    match error {
+        ObservabilityError::WriterOwnershipLinkCount { path, link_count } => {
+            assert_eq!(path, expected_path);
+            assert_eq!(link_count, expected_link_count);
+        }
+        other => panic!("unexpected ownership error: {other}"),
+    }
 }
 
 fn unique_test_dir(name: &str) -> PathBuf {

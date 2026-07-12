@@ -170,6 +170,59 @@ async fn metrics_expose_retained_gauges_without_secrets() {
 }
 
 #[tokio::test]
+async fn metrics_render_unknown_liveness_values_only_as_other() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let adversarial_values = [
+        "raw prompt: private patient record",
+        "raw response: confidential account balance",
+        "reasoning trace: hidden model analysis",
+        "x-private-header: confidential-header-value",
+        "SSE",
+    ];
+
+    for (index, value) in adversarial_values.iter().enumerate() {
+        let request = RequestRecord {
+            request_id: RequestId::from_string(format!("req-rendered-label-{index}"))
+                .expect("test request id should be valid"),
+            started_at_unix_ms: 1_000 + u64::try_from(index).expect("small test index"),
+            finished_at_unix_ms: Some(1_100 + u64::try_from(index).expect("small test index")),
+            downstream_mode: DownstreamMode::NonStreamJson,
+            upstream_mode: UpstreamMode::Streaming,
+            model_id: None,
+            input_fingerprint: None,
+            status: RequestStatus::Succeeded,
+            http_status: Some(200),
+            error_reason: None,
+            abort_reason: None,
+            request_metadata: BTreeMap::new(),
+            response_metadata: BTreeMap::from([(
+                String::from("downstream_liveness_mode"),
+                (*value).to_owned(),
+            )]),
+            raw_payloads: RawPayloads::default(),
+        };
+        proxy
+            .store
+            .record_request(&request)
+            .expect("request should be recorded");
+    }
+
+    let body = fetch_metrics(&proxy).await;
+    assert_eq!(
+        labelled_metric_value(
+            &body,
+            "llm_guard_proxy_current_retained_heartbeat_modes",
+            &[("mode", "other")],
+        ),
+        5
+    );
+    for raw_value in adversarial_values {
+        assert!(!body.contains(raw_value));
+    }
+}
+
+#[tokio::test]
 async fn retained_metrics_stay_prometheus_safe_after_pruning() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;

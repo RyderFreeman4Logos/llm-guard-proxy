@@ -7,18 +7,28 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
+
 #[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
+#[cfg(test)]
+use super::model::{
+    AttemptMetricCount, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram,
+    RequestMetricCount, RequestTerminalMetricCount, UpstreamErrorMetricCount,
+};
 use super::{
     error::ObservabilityError,
+    metrics_accumulator::{
+        AttemptMetricInput, AttemptMetricObservation, MetricsAccumulator, RequestMetricInput,
+        RequestMetricObservation,
+    },
     model::{
-        AttemptMetricCount, AttemptRecord, DebugRequestSummary, HeartbeatModeMetricCount,
-        HistogramBucket, LatencyHistogram, ObservabilityMetricsSnapshot, RawPayloads,
-        RequestMetricCount, RequestRecord, RequestTerminalMetricCount, RetentionPruningStats,
-        RetentionUsage, StoreWrite, UpstreamErrorMetricCount,
+        AttemptRecord, DebugRequestSummary, ObservabilityMetricsSnapshot, RawPayloads,
+        RequestRecord, RetentionPruningStats, RetentionUsage, StoreWrite,
     },
     redaction::{
         debug_safe_metadata_map, redacted_metadata_json, sanitize_optional_text,
@@ -28,6 +38,7 @@ use super::{
 use crate::{ConfigHandle, RetentionConfig};
 
 const SCHEMA_VERSION: i64 = 2;
+#[cfg(test)]
 const HISTOGRAM_BUCKETS_MS: &[u64] = &[
     10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
 ];
@@ -42,6 +53,24 @@ const OBSERVABILITY_SQLITE_MODE: u32 = 0o600;
 pub struct ObservabilityStore {
     config: ConfigHandle,
     connection: Arc<Mutex<Connection>>,
+    metrics: Arc<Mutex<MetricsCache>>,
+    _writer_ownership: Option<Arc<WriterOwnership>>,
+    #[cfg(test)]
+    fail_after_request_commit: Arc<AtomicBool>,
+    #[cfg(test)]
+    fail_metrics_reconstruction: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct MetricsCache {
+    accumulator: MetricsAccumulator,
+    valid: bool,
+}
+
+#[derive(Debug)]
+struct WriterOwnership {
+    // The OS releases the advisory lock when the last cloned store drops this file.
+    _file: fs::File,
 }
 
 impl ObservabilityStore {
@@ -53,9 +82,13 @@ impl ObservabilityStore {
     /// path cannot be prepared, `SQLite` cannot open, or migration fails.
     pub fn open(config: ConfigHandle) -> Result<Self, ObservabilityError> {
         let snapshot = config.snapshot()?;
-        let sqlite_path = resolve_sqlite_path(&snapshot.observability.sqlite_path)?;
-        prepare_parent_directory(&sqlite_path)?;
-        prepare_sqlite_file(&sqlite_path)?;
+        let configured_sqlite_path = resolve_sqlite_path(&snapshot.observability.sqlite_path)?;
+        prepare_parent_directory(&configured_sqlite_path)?;
+        let sqlite_path = normalize_sqlite_path(&configured_sqlite_path)?;
+        let sqlite_file = prepare_sqlite_file(&sqlite_path)?;
+        validate_single_link_writer_identity(sqlite_file.as_ref(), &sqlite_path)?;
+        let writer_ownership = acquire_writer_ownership(&sqlite_path)?.map(Arc::new);
+        drop(sqlite_file);
         let connection = open_sqlite_connection(&sqlite_path)?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
@@ -64,10 +97,20 @@ impl ObservabilityStore {
                 source,
             })?;
         migrate(&connection)?;
+        let metrics = reconstruct_metrics_accumulator(&connection)?;
 
         Ok(Self {
             config,
             connection: Arc::new(Mutex::new(connection)),
+            metrics: Arc::new(Mutex::new(MetricsCache {
+                accumulator: metrics,
+                valid: true,
+            })),
+            _writer_ownership: writer_ownership,
+            #[cfg(test)]
+            fail_after_request_commit: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            fail_metrics_reconstruction: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -102,10 +145,24 @@ impl ObservabilityStore {
         let prepared =
             PreparedRequest::from_record(record, settings.observability.capture_raw_payloads)?;
         let mut connection = self.lock_connection()?;
-        insert_request(&mut connection, &prepared)?;
-        let pruning = enforce_retention(&mut connection, &settings.observability.retention)?;
-        record_pruning_outcome(&mut connection, &pruning)?;
-        Ok(StoreWrite::Written)
+        let previous = read_request_metric_observation(&connection, &prepared.request_id)?;
+        let result = (|| {
+            insert_request(&mut connection, &prepared)?;
+            #[cfg(test)]
+            self.inject_post_commit_failure()?;
+            let pruning = enforce_retention(&mut connection, &settings.observability.retention)?;
+            record_pruning_outcome(&mut connection, &pruning)?;
+            Ok(StoreMetricsUpdate {
+                previous_requests: previous.into_iter().collect(),
+                new_request: Some(prepared.metric_observation()),
+                previous_attempts: Vec::new(),
+                new_attempt: None,
+                pruning,
+                retention_usage: read_retention_usage(&connection)?,
+                pruning_stats: read_pruning_stats(&connection)?,
+            })
+        })();
+        self.finish_write(&connection, result)
     }
 
     /// Persists one upstream attempt record.
@@ -127,10 +184,22 @@ impl ObservabilityStore {
         let prepared =
             PreparedAttempt::from_record(record, settings.observability.capture_raw_payloads)?;
         let mut connection = self.lock_connection()?;
-        insert_attempt(&mut connection, &prepared)?;
-        let pruning = enforce_retention(&mut connection, &settings.observability.retention)?;
-        record_pruning_outcome(&mut connection, &pruning)?;
-        Ok(StoreWrite::Written)
+        let previous = read_replaced_attempt_metric_observations(&connection, &prepared)?;
+        let result = (|| {
+            insert_attempt(&mut connection, &prepared)?;
+            let pruning = enforce_retention(&mut connection, &settings.observability.retention)?;
+            record_pruning_outcome(&mut connection, &pruning)?;
+            Ok(StoreMetricsUpdate {
+                previous_requests: Vec::new(),
+                new_request: None,
+                previous_attempts: previous,
+                new_attempt: Some(prepared.metric_observation()),
+                pruning,
+                retention_usage: read_retention_usage(&connection)?,
+                pruning_stats: read_pruning_stats(&connection)?,
+            })
+        })();
+        self.finish_write(&connection, result)
     }
 
     /// Returns logical retention usage for tests and diagnostics.
@@ -146,13 +215,21 @@ impl ObservabilityStore {
 
     /// Returns aggregate metrics derived from retained observability rows.
     ///
+    /// This method reads only the in-memory accumulator. It never acquires the
+    /// `SQLite` connection lock or executes SQL, so callers may use it directly
+    /// from async request handlers.
+    ///
     /// # Errors
     ///
-    /// Returns [`ObservabilityError`] when the database lock is poisoned or
-    /// metric rows cannot be read.
+    /// Returns [`ObservabilityError`] when the metrics lock is poisoned or a
+    /// prior write left the cache invalid and database reconstruction failed.
     pub fn metrics_snapshot(&self) -> Result<ObservabilityMetricsSnapshot, ObservabilityError> {
-        let connection = self.lock_connection()?;
-        read_metrics_snapshot(&connection)
+        let cache = self.lock_metrics()?;
+        if cache.valid {
+            Ok(cache.accumulator.snapshot())
+        } else {
+            Err(ObservabilityError::MetricsUnavailable)
+        }
     }
 
     /// Returns bounded, redacted summaries of recent requests.
@@ -173,6 +250,139 @@ impl ObservabilityStore {
         self.connection
             .lock()
             .map_err(|_error| ObservabilityError::LockPoisoned)
+    }
+
+    #[cfg(test)]
+    pub(super) fn metrics_snapshot_work_units(&self) -> Result<usize, ObservabilityError> {
+        let cache = self.lock_metrics()?;
+        if cache.valid {
+            Ok(cache.accumulator.snapshot_work_units())
+        } else {
+            Err(ObservabilityError::MetricsUnavailable)
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reconstructed_metrics_snapshot_for_test(
+        &self,
+    ) -> Result<ObservabilityMetricsSnapshot, ObservabilityError> {
+        let connection = self.lock_connection()?;
+        read_metrics_snapshot(&connection)
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_metrics_recovery_failure_after_request_commit(&self) {
+        self.fail_after_request_commit
+            .store(true, Ordering::Release);
+        self.fail_metrics_reconstruction
+            .store(true, Ordering::Release);
+    }
+
+    /// Lock order is always connection then metrics. Snapshot reads take only
+    /// metrics; no code may hold metrics while acquiring the connection.
+    fn finish_write(
+        &self,
+        connection: &Connection,
+        result: Result<StoreMetricsUpdate, ObservabilityError>,
+    ) -> Result<StoreWrite, ObservabilityError> {
+        match result {
+            Ok(update) => {
+                let mut cache = self.lock_metrics()?;
+                if cache.valid {
+                    update.apply(&mut cache.accumulator);
+                } else {
+                    drop(cache);
+                    self.reconstruct_metrics(connection)?;
+                }
+                Ok(StoreWrite::Written)
+            }
+            Err(write_error) => {
+                if let Err(recovery_error) = self.reconstruct_metrics(connection) {
+                    self.invalidate_metrics()?;
+                    return Err(ObservabilityError::MetricsRecoveryFailed {
+                        write_error: Box::new(write_error),
+                        recovery_error: Box::new(recovery_error),
+                    });
+                }
+                Err(write_error)
+            }
+        }
+    }
+
+    fn reconstruct_metrics(&self, connection: &Connection) -> Result<(), ObservabilityError> {
+        #[cfg(test)]
+        if self
+            .fail_metrics_reconstruction
+            .swap(false, Ordering::AcqRel)
+        {
+            return Err(ObservabilityError::Sqlite {
+                action: "reconstruct injected metrics failure",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        let reconstructed = reconstruct_metrics_accumulator(connection)?;
+        *self.lock_metrics()? = MetricsCache {
+            accumulator: reconstructed,
+            valid: true,
+        };
+        Ok(())
+    }
+
+    fn invalidate_metrics(&self) -> Result<(), ObservabilityError> {
+        self.lock_metrics()?.valid = false;
+        Ok(())
+    }
+
+    fn lock_metrics(&self) -> Result<MutexGuard<'_, MetricsCache>, ObservabilityError> {
+        self.metrics
+            .lock()
+            .map_err(|_error| ObservabilityError::LockPoisoned)
+    }
+
+    #[cfg(test)]
+    fn inject_post_commit_failure(&self) -> Result<(), ObservabilityError> {
+        if self.fail_after_request_commit.swap(false, Ordering::AcqRel) {
+            return Err(ObservabilityError::Sqlite {
+                action: "inject post-commit request failure",
+                source: rusqlite::Error::InvalidQuery,
+            });
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct StoreMetricsUpdate {
+    previous_requests: Vec<RequestMetricObservation>,
+    new_request: Option<RequestMetricObservation>,
+    previous_attempts: Vec<AttemptMetricObservation>,
+    new_attempt: Option<AttemptMetricObservation>,
+    pruning: RetentionPruneOutcome,
+    retention_usage: RetentionUsage,
+    pruning_stats: RetentionPruningStats,
+}
+
+impl StoreMetricsUpdate {
+    fn apply(self, metrics: &mut MetricsAccumulator) {
+        for observation in &self.previous_requests {
+            metrics.remove_request(observation);
+        }
+        for observation in &self.previous_attempts {
+            metrics.remove_attempt(observation);
+        }
+        if let Some(observation) = &self.new_request {
+            metrics.add_request(observation);
+        }
+        if let Some(observation) = &self.new_attempt {
+            metrics.add_attempt(observation);
+        }
+        for observation in &self.pruning.removed_requests {
+            metrics.remove_request(observation);
+        }
+        for observation in &self.pruning.removed_attempts {
+            metrics.remove_attempt(observation);
+        }
+        metrics.set_store_state(self.retention_usage, self.pruning_stats);
     }
 }
 
@@ -234,6 +444,19 @@ impl PreparedRequest {
             response_metadata_json,
             raw_payloads,
             estimated_bytes,
+        })
+    }
+
+    fn metric_observation(&self) -> RequestMetricObservation {
+        RequestMetricObservation::new(RequestMetricInput {
+            status: self.status,
+            downstream_mode: self.downstream_mode,
+            upstream_mode: self.upstream_mode,
+            http_status: self.http_status,
+            abort_reason: self.abort_reason.as_deref(),
+            request_metadata_json: &self.request_metadata_json,
+            response_metadata_json: &self.response_metadata_json,
+            duration_ms: self.duration_ms,
         })
     }
 }
@@ -298,6 +521,17 @@ impl PreparedAttempt {
             response_metadata_json,
             raw_payloads,
             estimated_bytes,
+        })
+    }
+
+    fn metric_observation(&self) -> AttemptMetricObservation {
+        AttemptMetricObservation::new(AttemptMetricInput {
+            status: self.status,
+            upstream_mode: self.upstream_mode,
+            http_status: self.http_status,
+            retry_reason: self.retry_reason.as_deref(),
+            abort_reason: self.abort_reason.as_deref(),
+            response_metadata_json: &self.response_metadata_json,
         })
     }
 }
@@ -593,20 +827,196 @@ INSERT OR REPLACE INTO attempts (
         })
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+fn read_request_metric_observation(
+    connection: &Connection,
+    request_id: &str,
+) -> Result<Option<RequestMetricObservation>, ObservabilityError> {
+    connection
+        .query_row(
+            r"
+SELECT
+    status,
+    downstream_mode,
+    upstream_mode,
+    http_status,
+    abort_reason,
+    request_metadata_json,
+    response_metadata_json,
+    duration_ms
+FROM requests
+WHERE request_id = ?1
+",
+            params![request_id],
+            decode_request_metric_observation,
+        )
+        .optional()
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "read request metric observation",
+            source,
+        })
+}
+
+fn reconstruct_metrics_accumulator(
+    connection: &Connection,
+) -> Result<MetricsAccumulator, ObservabilityError> {
+    let mut metrics = MetricsAccumulator::new(
+        read_retention_usage(connection)?,
+        read_pruning_stats(connection)?,
+    );
+    let mut request_statement = connection
+        .prepare(
+            r"
+SELECT
+    status,
+    downstream_mode,
+    upstream_mode,
+    http_status,
+    abort_reason,
+    request_metadata_json,
+    response_metadata_json,
+    duration_ms
+FROM requests
+",
+        )
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "prepare request metrics reconstruction",
+            source,
+        })?;
+    let request_rows = request_statement
+        .query_map([], decode_request_metric_observation)
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "query request metrics reconstruction",
+            source,
+        })?;
+    for observation in request_rows {
+        metrics.add_request(&observation.map_err(|source| ObservabilityError::Sqlite {
+            action: "decode request metrics reconstruction",
+            source,
+        })?);
+    }
+
+    let attempt_observations = read_attempt_metric_observations(
+        connection,
+        r"
+SELECT status, upstream_mode, http_status, retry_reason, abort_reason, response_metadata_json
+FROM attempts
+",
+        [],
+        "reconstruct attempt metrics",
+    )?;
+    for observation in &attempt_observations {
+        metrics.add_attempt(observation);
+    }
+    Ok(metrics)
+}
+
+fn decode_request_metric_observation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<RequestMetricObservation> {
+    let status = row.get::<_, String>(0)?;
+    let downstream_mode = row.get::<_, String>(1)?;
+    let upstream_mode = row.get::<_, String>(2)?;
+    let abort_reason = row.get::<_, Option<String>>(4)?;
+    let request_metadata_json = row.get::<_, String>(5)?;
+    let response_metadata_json = row.get::<_, String>(6)?;
+    Ok(RequestMetricObservation::new(RequestMetricInput {
+        status: &status,
+        downstream_mode: &downstream_mode,
+        upstream_mode: &upstream_mode,
+        http_status: row.get(3)?,
+        abort_reason: abort_reason.as_deref(),
+        request_metadata_json: &request_metadata_json,
+        response_metadata_json: &response_metadata_json,
+        duration_ms: row.get(7)?,
+    }))
+}
+
+fn read_replaced_attempt_metric_observations(
+    connection: &Connection,
+    record: &PreparedAttempt,
+) -> Result<Vec<AttemptMetricObservation>, ObservabilityError> {
+    read_attempt_metric_observations(
+        connection,
+        r"
+SELECT status, upstream_mode, http_status, retry_reason, abort_reason, response_metadata_json
+FROM attempts
+WHERE attempt_id = ?1 OR (request_id = ?2 AND attempt_number = ?3)
+ORDER BY attempt_id
+",
+        params![record.attempt_id, record.request_id, record.attempt_number],
+        "read replaced attempt metric observations",
+    )
+}
+
+fn read_attempt_metric_observations_for_request(
+    connection: &Connection,
+    request_id: &str,
+) -> Result<Vec<AttemptMetricObservation>, ObservabilityError> {
+    read_attempt_metric_observations(
+        connection,
+        r"
+SELECT status, upstream_mode, http_status, retry_reason, abort_reason, response_metadata_json
+FROM attempts
+WHERE request_id = ?1
+ORDER BY attempt_id
+",
+        params![request_id],
+        "read pruned attempt metric observations",
+    )
+}
+
+fn read_attempt_metric_observations<P: rusqlite::Params>(
+    connection: &Connection,
+    sql: &str,
+    params: P,
+    action: &'static str,
+) -> Result<Vec<AttemptMetricObservation>, ObservabilityError> {
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|source| ObservabilityError::Sqlite { action, source })?;
+    let rows = statement
+        .query_map(params, decode_attempt_metric_observation)
+        .map_err(|source| ObservabilityError::Sqlite { action, source })?;
+    rows.collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|source| ObservabilityError::Sqlite { action, source })
+}
+
+fn decode_attempt_metric_observation(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AttemptMetricObservation> {
+    let retry_reason = row.get::<_, Option<String>>(3)?;
+    let abort_reason = row.get::<_, Option<String>>(4)?;
+    let status = row.get::<_, String>(0)?;
+    let upstream_mode = row.get::<_, String>(1)?;
+    let response_metadata_json = row.get::<_, String>(5)?;
+    Ok(AttemptMetricObservation::new(AttemptMetricInput {
+        status: &status,
+        upstream_mode: &upstream_mode,
+        http_status: row.get(2)?,
+        retry_reason: retry_reason.as_deref(),
+        abort_reason: abort_reason.as_deref(),
+        response_metadata_json: &response_metadata_json,
+    }))
+}
+
+#[derive(Debug, Default)]
 struct RetentionPruneOutcome {
     deleted_requests: u64,
     deleted_attempts: u64,
+    removed_requests: Vec<RequestMetricObservation>,
+    removed_attempts: Vec<AttemptMetricObservation>,
 }
 
 impl RetentionPruneOutcome {
-    const fn deleted_any(self) -> bool {
+    const fn deleted_any(&self) -> bool {
         self.deleted_requests > 0 || self.deleted_attempts > 0
     }
 
-    fn add(&mut self, other: Self) {
+    fn add(&mut self, mut other: Self) {
         self.deleted_requests = self.deleted_requests.saturating_add(other.deleted_requests);
         self.deleted_attempts = self.deleted_attempts.saturating_add(other.deleted_attempts);
+        self.removed_requests.append(&mut other.removed_requests);
+        self.removed_attempts.append(&mut other.removed_attempts);
     }
 }
 
@@ -667,7 +1077,10 @@ fn prune_retained_rows(
         let Some(request_id) = oldest_request_id(&transaction)? else {
             break;
         };
-        let attempt_count = read_attempt_count_for_request(&transaction, &request_id)?;
+        let request_observation = read_request_metric_observation(&transaction, &request_id)?;
+        let attempt_observations =
+            read_attempt_metric_observations_for_request(&transaction, &request_id)?;
+        let attempt_count = attempt_observations.len().try_into().unwrap_or(u64::MAX);
         transaction
             .execute(
                 "DELETE FROM requests WHERE request_id = ?1",
@@ -679,6 +1092,10 @@ fn prune_retained_rows(
             })?;
         outcome.deleted_requests = outcome.deleted_requests.saturating_add(1);
         outcome.deleted_attempts = outcome.deleted_attempts.saturating_add(attempt_count);
+        if let Some(observation) = request_observation {
+            outcome.removed_requests.push(observation);
+        }
+        outcome.removed_attempts.extend(attempt_observations);
         usage = read_retention_usage(&transaction)?;
         logical_bytes = read_logical_observed_bytes(&transaction)?;
     }
@@ -770,23 +1187,6 @@ fn read_attempt_count(connection: &Connection) -> Result<u64, ObservabilityError
     Ok(nonnegative_i64_to_u64(attempt_count))
 }
 
-fn read_attempt_count_for_request(
-    connection: &Connection,
-    request_id: &str,
-) -> Result<u64, ObservabilityError> {
-    let attempt_count: i64 = connection
-        .query_row(
-            "SELECT COUNT(*) FROM attempts WHERE request_id = ?1",
-            params![request_id],
-            |row| row.get(0),
-        )
-        .map_err(|source| ObservabilityError::Sqlite {
-            action: "read observability attempt count for pruned request",
-            source,
-        })?;
-    Ok(nonnegative_i64_to_u64(attempt_count))
-}
-
 fn record_pruning_outcome(
     connection: &mut Connection,
     outcome: &RetentionPruneOutcome,
@@ -816,6 +1216,7 @@ WHERE stats_key = 'global'
         })
 }
 
+#[cfg(test)]
 fn read_metrics_snapshot(
     connection: &Connection,
 ) -> Result<ObservabilityMetricsSnapshot, ObservabilityError> {
@@ -834,6 +1235,7 @@ fn read_metrics_snapshot(
     })
 }
 
+#[cfg(test)]
 fn read_request_metric_counts(
     connection: &Connection,
 ) -> Result<Vec<RequestMetricCount>, ObservabilityError> {
@@ -906,6 +1308,7 @@ ORDER BY status, downstream_mode, upstream_mode, http_status
         .collect())
 }
 
+#[cfg(test)]
 fn read_request_terminal_metric_counts(
     connection: &Connection,
 ) -> Result<Vec<RequestTerminalMetricCount>, ObservabilityError> {
@@ -971,6 +1374,7 @@ ORDER BY status, abort_reason, http_status
         .collect())
 }
 
+#[cfg(test)]
 fn read_attempt_metric_counts(
     connection: &Connection,
 ) -> Result<Vec<AttemptMetricCount>, ObservabilityError> {
@@ -1031,6 +1435,7 @@ ORDER BY status, upstream_mode, http_status
         .collect())
 }
 
+#[cfg(test)]
 fn read_retry_count(connection: &Connection) -> Result<u64, ObservabilityError> {
     let count: i64 = connection
         .query_row(
@@ -1049,6 +1454,7 @@ WHERE status = 'retried' OR retry_reason IS NOT NULL
     Ok(nonnegative_i64_to_u64(count))
 }
 
+#[cfg(test)]
 fn read_loop_abort_count(connection: &Connection) -> Result<u64, ObservabilityError> {
     let count: i64 = connection
         .query_row(
@@ -1072,6 +1478,7 @@ SELECT
     Ok(nonnegative_i64_to_u64(count))
 }
 
+#[cfg(test)]
 fn request_terminal_reason(status: &str, abort_reason: Option<&str>) -> &'static str {
     match abort_reason {
         Some("downstream_body_dropped_before_eof" | "downstream_disconnected_while_queued") => {
@@ -1089,6 +1496,7 @@ fn request_terminal_reason(status: &str, abort_reason: Option<&str>) -> &'static
     }
 }
 
+#[cfg(test)]
 fn read_upstream_error_counts(
     connection: &Connection,
 ) -> Result<Vec<UpstreamErrorMetricCount>, ObservabilityError> {
@@ -1148,6 +1556,7 @@ ORDER BY status, http_status
         .collect())
 }
 
+#[cfg(test)]
 fn read_first_token_latency_histogram(
     connection: &Connection,
 ) -> Result<LatencyHistogram, ObservabilityError> {
@@ -1179,6 +1588,7 @@ fn read_first_token_latency_histogram(
     Ok(latency_histogram(&values))
 }
 
+#[cfg(test)]
 fn read_total_latency_histogram(
     connection: &Connection,
 ) -> Result<LatencyHistogram, ObservabilityError> {
@@ -1208,6 +1618,7 @@ fn read_total_latency_histogram(
     Ok(latency_histogram(&values))
 }
 
+#[cfg(test)]
 fn read_heartbeat_mode_counts(
     connection: &Connection,
 ) -> Result<Vec<HeartbeatModeMetricCount>, ObservabilityError> {
@@ -1239,7 +1650,8 @@ fn read_heartbeat_mode_counts(
                 source,
             })?;
         let mode = metadata_value(&response_metadata_json, "downstream_liveness_mode")
-            .or_else(|| metadata_value(&request_metadata_json, "downstream_liveness_mode"));
+            .or_else(|| metadata_value(&request_metadata_json, "downstream_liveness_mode"))
+            .map(|mode| super::metrics_accumulator::normalized_heartbeat_mode_label(&mode));
         if let Some(mode) = mode {
             let entry = counts.entry(mode).or_default();
             *entry = entry.saturating_add(1);
@@ -1407,6 +1819,7 @@ fn decode_recent_request_summary(
     })
 }
 
+#[cfg(test)]
 fn http_status_class(status: Option<i64>) -> String {
     match status.and_then(|status| u16::try_from(status).ok()) {
         Some(100..=199) => String::from("1xx"),
@@ -1419,6 +1832,7 @@ fn http_status_class(status: Option<i64>) -> String {
     }
 }
 
+#[cfg(test)]
 fn upstream_error_kind(status: &str, http_status: Option<i64>) -> &'static str {
     let code = http_status.and_then(|status| u16::try_from(status).ok());
     match code {
@@ -1430,6 +1844,7 @@ fn upstream_error_kind(status: &str, http_status: Option<i64>) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn latency_histogram(values: &[u64]) -> LatencyHistogram {
     let buckets = HISTOGRAM_BUCKETS_MS
         .iter()
@@ -1452,10 +1867,12 @@ fn latency_histogram(values: &[u64]) -> LatencyHistogram {
     }
 }
 
+#[cfg(test)]
 fn metadata_value_as_u64(metadata_json: &str, key: &str) -> Option<u64> {
     metadata_value(metadata_json, key).and_then(|value| value.parse::<u64>().ok())
 }
 
+#[cfg(test)]
 fn metadata_value(metadata_json: &str, key: &str) -> Option<String> {
     metadata_map_from_json(metadata_json).remove(key)
 }
@@ -1655,6 +2072,166 @@ fn resolve_sqlite_path(path: &Path) -> Result<PathBuf, ObservabilityError> {
     Ok(PathBuf::from(home).join(rest))
 }
 
+fn normalize_sqlite_path(path: &Path) -> Result<PathBuf, ObservabilityError> {
+    if path == Path::new(":memory:") {
+        return Ok(path.to_path_buf());
+    }
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        env::current_dir()
+            .map_err(|source| ObservabilityError::NormalizeStoragePath {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .join(path)
+    };
+    let Some(parent) = absolute.parent() else {
+        return Err(unsafe_storage_path(
+            &absolute,
+            "observability SQLite path must have a parent directory",
+        ));
+    };
+    let Some(file_name) = absolute.file_name() else {
+        return Err(unsafe_storage_path(
+            &absolute,
+            "observability SQLite path must name a file",
+        ));
+    };
+    let normalized_parent =
+        fs::canonicalize(parent).map_err(|source| ObservabilityError::NormalizeStoragePath {
+            path: absolute.clone(),
+            source,
+        })?;
+    Ok(normalized_parent.join(file_name))
+}
+
+/// Ensures one path-derived sidecar can represent the opened database inode.
+///
+/// Lexical normalization cannot collapse hard links because each alias is an
+/// equally canonical path. Rejecting multi-link files before sidecar ownership
+/// prevents independent accumulators from claiming the same `SQLite` inode.
+#[cfg(unix)]
+fn validate_single_link_writer_identity(
+    sqlite_file: Option<&fs::File>,
+    sqlite_path: &Path,
+) -> Result<(), ObservabilityError> {
+    let Some(sqlite_file) = sqlite_file else {
+        return Ok(());
+    };
+    let link_count = sqlite_file
+        .metadata()
+        .map_err(|source| ObservabilityError::InspectPath {
+            path: sqlite_path.to_path_buf(),
+            source,
+        })?
+        .nlink();
+    if link_count == 1 {
+        Ok(())
+    } else {
+        Err(ObservabilityError::WriterOwnershipLinkCount {
+            path: sqlite_path.to_path_buf(),
+            link_count,
+        })
+    }
+}
+
+#[cfg(not(unix))]
+fn validate_single_link_writer_identity(
+    _sqlite_file: Option<&fs::File>,
+    _sqlite_path: &Path,
+) -> Result<(), ObservabilityError> {
+    Ok(())
+}
+
+fn acquire_writer_ownership(
+    sqlite_path: &Path,
+) -> Result<Option<WriterOwnership>, ObservabilityError> {
+    if sqlite_path == Path::new(":memory:") {
+        return Ok(None);
+    }
+    let lock_path = writer_lock_path(sqlite_path);
+    validate_writer_lock_file_path(&lock_path)?;
+    let file = open_secure_writer_lock_file(&lock_path, sqlite_path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(WriterOwnership { _file: file })),
+        Err(source) if source.kind() == fs2::lock_contended_error().kind() => {
+            Err(ObservabilityError::WriterOwnershipHeld {
+                path: sqlite_path.to_path_buf(),
+            })
+        }
+        Err(source) => Err(ObservabilityError::WriterOwnership {
+            path: sqlite_path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn writer_lock_path(sqlite_path: &Path) -> PathBuf {
+    let mut lock_path = sqlite_path.as_os_str().to_os_string();
+    lock_path.push(".writer.lock");
+    PathBuf::from(lock_path)
+}
+
+fn validate_writer_lock_file_path(path: &Path) -> Result<(), ObservabilityError> {
+    let Some(metadata) = inspect_path(path)? else {
+        return Ok(());
+    };
+    let file_type = metadata.file_type();
+    if file_type.is_symlink() {
+        return Err(unsafe_storage_path(
+            path,
+            "observability writer lock file must not be a symlink",
+        ));
+    }
+    if !file_type.is_file() {
+        return Err(unsafe_storage_path(
+            path,
+            "observability writer lock path must be a regular file",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_secure_writer_lock_file(
+    path: &Path,
+    sqlite_path: &Path,
+) -> Result<fs::File, ObservabilityError> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(OBSERVABILITY_SQLITE_MODE)
+        .open(path)
+        .map_err(|source| ObservabilityError::WriterOwnership {
+            path: sqlite_path.to_path_buf(),
+            source,
+        })?;
+    file.set_permissions(fs::Permissions::from_mode(OBSERVABILITY_SQLITE_MODE))
+        .map_err(|source| ObservabilityError::WriterOwnership {
+            path: sqlite_path.to_path_buf(),
+            source,
+        })?;
+    Ok(file)
+}
+
+#[cfg(not(unix))]
+fn open_secure_writer_lock_file(
+    path: &Path,
+    sqlite_path: &Path,
+) -> Result<fs::File, ObservabilityError> {
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(path)
+        .map_err(|source| ObservabilityError::WriterOwnership {
+            path: sqlite_path.to_path_buf(),
+            source,
+        })
+}
+
 fn prepare_parent_directory(path: &Path) -> Result<(), ObservabilityError> {
     if path == Path::new(":memory:") {
         return Ok(());
@@ -1675,12 +2252,12 @@ fn prepare_parent_directory(path: &Path) -> Result<(), ObservabilityError> {
     }
 }
 
-fn prepare_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
+fn prepare_sqlite_file(path: &Path) -> Result<Option<fs::File>, ObservabilityError> {
     if path == Path::new(":memory:") {
-        return Ok(());
+        return Ok(None);
     }
     validate_sqlite_file_path(path)?;
-    create_secure_sqlite_file(path)
+    create_secure_sqlite_file(path).map(Some)
 }
 
 fn open_sqlite_connection(path: &Path) -> Result<Connection, ObservabilityError> {
@@ -1893,7 +2470,7 @@ fn unsafe_storage_path(path: &Path, reason: &'static str) -> ObservabilityError 
 }
 
 #[cfg(unix)]
-fn create_secure_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
+fn create_secure_sqlite_file(path: &Path) -> Result<fs::File, ObservabilityError> {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -1908,17 +2485,17 @@ fn create_secure_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
         .map_err(|source| ObservabilityError::RestrictPermissions {
             path: path.to_path_buf(),
             source,
-        })
+        })?;
+    Ok(file)
 }
 
 #[cfg(not(unix))]
-fn create_secure_sqlite_file(path: &Path) -> Result<(), ObservabilityError> {
+fn create_secure_sqlite_file(path: &Path) -> Result<fs::File, ObservabilityError> {
     fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .open(path)
-        .map(|_file| ())
         .map_err(|source| ObservabilityError::RestrictPermissions {
             path: path.to_path_buf(),
             source,
