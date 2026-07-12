@@ -557,11 +557,17 @@ fn apply_thinking_policy(
             return metadata;
         }
         ThinkingMode::ForceDisable => {
-            let outcome = apply_force_disable_thinking(
+            let mut outcome = apply_force_disable_thinking(
                 object,
                 &budget_observations,
                 &mut metadata,
                 thinking.default_injection_schema,
+            );
+            normalize_vllm_native_disabled_state(
+                object,
+                &mut metadata,
+                thinking.default_injection_schema,
+                &mut outcome,
             );
             let answer_budget =
                 apply_answer_budget_preservation(object, false, outcome.answer_budget_delta);
@@ -770,33 +776,12 @@ fn record_force_thinking_marker_decision(
         );
         let mut outcome =
             thinking_noop("caller_no_thinking_marker_passthrough", budget_observations);
-        if thinking.default_injection_schema == DefaultInjectionSchema::VllmNative {
-            metadata.insert(
-                String::from("thinking_enable_marker_path"),
-                ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path(),
-            );
-            let enable_marker_rewritten =
-                !matches!(
-                    value_at_path(object, ROOT_CHAT_TEMPLATE_ENABLE_THINKING.path),
-                    PathValue::Value(Value::Bool(false))
-                ) && set_bool_at_path(object, ROOT_CHAT_TEMPLATE_ENABLE_THINKING, false);
-            metadata.insert(
-                String::from("thinking_disable_marker_rewritten_paths"),
-                if enable_marker_rewritten {
-                    ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path()
-                } else {
-                    String::from("none")
-                },
-            );
-            clear_positive_vllm_native_budget(
-                object,
-                metadata,
-                thinking.default_injection_schema,
-                budget_observations,
-                &mut outcome,
-            );
-            outcome.rewrite_applied = outcome.rewrite_applied || enable_marker_rewritten;
-        }
+        normalize_vllm_native_disabled_state(
+            object,
+            metadata,
+            thinking.default_injection_schema,
+            &mut outcome,
+        );
         metadata.extend(thinking_outcome_metadata(
             &outcome,
             &AnswerBudgetDecision::default(),
@@ -881,6 +866,8 @@ fn apply_force_thinking_policy(
         }
     }
     if default_schema == DefaultInjectionSchema::VllmNative {
+        answer_budget_delta =
+            vllm_native_answer_budget_delta(budget_observations, configured_budget);
         metadata.insert(
             String::from("thinking_schema_path"),
             ROOT_THINKING_TOKEN_BUDGET.display_path(),
@@ -929,11 +916,10 @@ fn apply_thinking_budget_policy(
         DisableMarker::Disabled(path) => {
             insert_disable_marker_metadata(metadata, path);
             let mut outcome = thinking_noop("caller_disabled_thinking", budget_observations);
-            clear_positive_vllm_native_budget(
+            normalize_vllm_native_disabled_state(
                 object,
                 metadata,
                 thinking.default_injection_schema,
-                budget_observations,
                 &mut outcome,
             );
             outcome
@@ -943,6 +929,22 @@ fn apply_thinking_budget_policy(
             thinking_noop("malformed_disable_marker", budget_observations)
         }
         DisableMarker::None => {
+            let mut outcome = apply_budget_observations(
+                object,
+                configured_budget,
+                budget_observations,
+                metadata,
+                thinking.default_injection_schema,
+            );
+            if !outcome.zero_paths.is_empty() {
+                normalize_vllm_native_disabled_state(
+                    object,
+                    metadata,
+                    thinking.default_injection_schema,
+                    &mut outcome,
+                );
+                return outcome;
+            }
             let enable_marker_path = ensure_vllm_native_enable_marker(
                 object,
                 metadata,
@@ -951,13 +953,6 @@ fn apply_thinking_budget_policy(
             metadata.insert(
                 String::from("thinking_enable_marker_rewritten_paths"),
                 enable_marker_path.map_or_else(|| String::from("none"), JsonPath::display_path),
-            );
-            let mut outcome = apply_budget_observations(
-                object,
-                configured_budget,
-                budget_observations,
-                metadata,
-                thinking.default_injection_schema,
             );
             ensure_vllm_native_budget(
                 object,
@@ -1497,14 +1492,7 @@ fn ensure_vllm_native_enable_marker(
         String::from("thinking_enable_marker_path"),
         ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path(),
     );
-    if matches!(
-        value_at_path(object, ROOT_CHAT_TEMPLATE_ENABLE_THINKING.path),
-        PathValue::Value(Value::Bool(true))
-    ) {
-        return None;
-    }
-    set_bool_at_path(object, ROOT_CHAT_TEMPLATE_ENABLE_THINKING, true)
-        .then_some(ROOT_CHAT_TEMPLATE_ENABLE_THINKING)
+    set_vllm_native_enable_marker(object, true).then_some(ROOT_CHAT_TEMPLATE_ENABLE_THINKING)
 }
 
 fn ensure_vllm_native_budget(
@@ -1526,40 +1514,82 @@ fn ensure_vllm_native_budget(
         String::from("thinking_schema_variant"),
         ROOT_THINKING_TOKEN_BUDGET.variant.to_owned(),
     );
-    if budget_observations
-        .entries
-        .iter()
-        .any(|observation| observation.path.path == ROOT_THINKING_TOKEN_BUDGET.path)
-    {
-        return;
-    }
-    if set_budget_at_path(object, ROOT_THINKING_TOKEN_BUDGET, configured_budget) {
-        if outcome.final_budget == "unknown" {
-            outcome.answer_budget_delta = configured_budget;
+    let previous_budget = vllm_native_budget_state(budget_observations);
+    outcome.answer_budget_delta =
+        vllm_native_answer_budget_delta(budget_observations, configured_budget);
+    let final_budget = match previous_budget {
+        Some(BudgetState::Numeric(previous)) => previous.max(configured_budget),
+        Some(BudgetState::Malformed) | None => {
+            if set_budget_at_path(object, ROOT_THINKING_TOKEN_BUDGET, configured_budget) {
+                outcome.rewrite_applied = true;
+                outcome
+                    .preserved_paths
+                    .retain(|path| path.path != ROOT_THINKING_TOKEN_BUDGET.path);
+                outcome
+                    .malformed_paths
+                    .retain(|path| path.path != ROOT_THINKING_TOKEN_BUDGET.path);
+                if !outcome
+                    .rewritten_paths
+                    .iter()
+                    .any(|path| path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+                {
+                    outcome.rewritten_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+                }
+            }
+            configured_budget
         }
-        outcome.rewrite_applied = true;
-        outcome.final_budget = configured_budget.to_string();
-        outcome.rewritten_paths.push(ROOT_THINKING_TOKEN_BUDGET);
-    }
+    };
+    outcome.final_budget = final_budget.to_string();
 }
 
-fn clear_positive_vllm_native_budget(
+fn vllm_native_budget_state(budget_observations: &BudgetObservations) -> Option<BudgetState> {
+    budget_observations
+        .entries
+        .iter()
+        .find(|observation| observation.path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+        .map(|observation| observation.state)
+}
+
+fn vllm_native_answer_budget_delta(
+    budget_observations: &BudgetObservations,
+    configured_budget: u64,
+) -> u64 {
+    let previous_budget = match vllm_native_budget_state(budget_observations) {
+        Some(BudgetState::Numeric(previous)) => previous,
+        Some(BudgetState::Malformed) | None => 0,
+    };
+    configured_budget.saturating_sub(previous_budget)
+}
+
+fn set_vllm_native_enable_marker(object: &mut Map<String, Value>, enabled: bool) -> bool {
+    if matches!(
+        value_at_path(object, ROOT_CHAT_TEMPLATE_ENABLE_THINKING.path),
+        PathValue::Value(Value::Bool(current)) if *current == enabled
+    ) {
+        return false;
+    }
+    let chat_template_kwargs = object
+        .entry(String::from("chat_template_kwargs"))
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !chat_template_kwargs.is_object() {
+        *chat_template_kwargs = Value::Object(Map::new());
+    }
+    let Value::Object(chat_template_kwargs) = chat_template_kwargs else {
+        return false;
+    };
+    chat_template_kwargs.insert(String::from("enable_thinking"), Value::Bool(enabled));
+    true
+}
+
+fn normalize_vllm_native_disabled_state(
     object: &mut Map<String, Value>,
     metadata: &mut BTreeMap<String, String>,
     default_schema: DefaultInjectionSchema,
-    budget_observations: &BudgetObservations,
     outcome: &mut ThinkingPolicyOutcome,
 ) {
     if default_schema != DefaultInjectionSchema::VllmNative {
         return;
     }
-    let Some(observation) = budget_observations
-        .entries
-        .iter()
-        .find(|observation| observation.path.path == ROOT_THINKING_TOKEN_BUDGET.path)
-    else {
-        return;
-    };
     metadata.insert(
         String::from("thinking_schema_path"),
         ROOT_THINKING_TOKEN_BUDGET.display_path(),
@@ -1568,21 +1598,63 @@ fn clear_positive_vllm_native_budget(
         String::from("thinking_schema_variant"),
         ROOT_THINKING_TOKEN_BUDGET.variant.to_owned(),
     );
-    if matches!(observation.state, BudgetState::Numeric(0)) {
-        return;
+    metadata.insert(
+        String::from("thinking_enable_marker_path"),
+        ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path(),
+    );
+    let enable_marker_rewritten = set_vllm_native_enable_marker(object, false);
+    let rewritten_marker_paths = metadata
+        .entry(String::from("thinking_disable_marker_rewritten_paths"))
+        .or_insert_with(|| String::from("none"));
+    if enable_marker_rewritten {
+        let native_marker_path = ROOT_CHAT_TEMPLATE_ENABLE_THINKING.display_path();
+        if rewritten_marker_paths == "none" {
+            *rewritten_marker_paths = native_marker_path;
+        } else if !rewritten_marker_paths
+            .split(',')
+            .any(|path| path == native_marker_path)
+        {
+            rewritten_marker_paths.push(',');
+            rewritten_marker_paths.push_str(&native_marker_path);
+        }
     }
-    if set_budget_at_path(object, ROOT_THINKING_TOKEN_BUDGET, 0) {
+    let native_budget_present = !matches!(
+        value_at_path(object, ROOT_THINKING_TOKEN_BUDGET.path),
+        PathValue::Missing
+    );
+    let native_budget_rewritten = native_budget_present
+        && !matches!(
+            value_at_path(object, ROOT_THINKING_TOKEN_BUDGET.path),
+            PathValue::Value(Value::Number(number)) if number.as_u64() == Some(0)
+        )
+        && set_budget_at_path(object, ROOT_THINKING_TOKEN_BUDGET, 0);
+    if native_budget_rewritten {
         outcome.rewrite_applied = true;
-        outcome.final_budget = String::from("0");
         outcome
             .preserved_paths
             .retain(|path| path.path != ROOT_THINKING_TOKEN_BUDGET.path);
         outcome
             .malformed_paths
             .retain(|path| path.path != ROOT_THINKING_TOKEN_BUDGET.path);
-        outcome.rewritten_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+        if !outcome
+            .rewritten_paths
+            .iter()
+            .any(|path| path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+        {
+            outcome.rewritten_paths.push(ROOT_THINKING_TOKEN_BUDGET);
+        }
+    }
+    if native_budget_present
+        && !outcome
+            .zero_paths
+            .iter()
+            .any(|path| path.path == ROOT_THINKING_TOKEN_BUDGET.path)
+    {
         outcome.zero_paths.push(ROOT_THINKING_TOKEN_BUDGET);
     }
+    outcome.rewrite_applied = outcome.rewrite_applied || enable_marker_rewritten;
+    outcome.final_budget = String::from("0");
+    outcome.answer_budget_delta = 0;
 }
 
 fn object_at_path(object: &Map<String, Value>, path: &[&str]) -> bool {

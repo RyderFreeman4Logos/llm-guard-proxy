@@ -7071,7 +7071,7 @@ default_injection_schema = "vllm_native"
         observed_body["chat_template_kwargs"]["thinking_budget"],
         32_768
     );
-    assert_eq!(observed_body["max_tokens"], 32_824);
+    assert_eq!(observed_body["max_tokens"], 32_832);
 
     let (request_metadata, attempt_metadata) = read_single_request_and_attempt_metadata(&proxy);
     for metadata in [&request_metadata, &attempt_metadata] {
@@ -7120,7 +7120,50 @@ default_injection_schema = "vllm_native"
         observed_body["chat_template_kwargs"]["thinking_budget"],
         32_768
     );
-    assert_eq!(observed_body["max_tokens"], 24_640);
+    assert_eq!(observed_body["max_tokens"], 32_832);
+}
+
+#[tokio::test]
+async fn force_thinking_vllm_native_ignores_legacy_budgets_when_preserving_answer_headroom() {
+    assert_vllm_native_legacy_budget_matrix("force_thinking", [32_768, 8_192, 65_536]).await;
+}
+
+#[tokio::test]
+async fn bounded_thinking_vllm_native_ignores_legacy_budgets_when_preserving_answer_headroom() {
+    assert_vllm_native_legacy_budget_matrix("bounded_thinking", [32_768, 8_192, 65_536]).await;
+}
+
+async fn assert_vllm_native_legacy_budget_matrix(mode: &str, legacy_budgets: [u64; 3]) {
+    let mut fake = FakeUpstream::spawn().await;
+    let config = format!(
+        r#"
+[thinking]
+mode = "{mode}"
+default_injection_schema = "vllm_native"
+"#,
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &config,
+    )
+    .await;
+
+    for (index, legacy_budget) in legacy_budgets.into_iter().enumerate() {
+        let body = format!(
+            r#"{{"model":"test-chat","messages":[{{"role":"user","content":"case-{index}"}}],"chat_template_kwargs":{{"thinking_budget":{legacy_budget}}},"max_tokens":64}}"#,
+        );
+        let observed_body =
+            post_chat_and_observe_owned_body(&proxy, &mut fake, Bytes::from(body)).await;
+
+        assert_eq!(observed_body["thinking_token_budget"], 32_768);
+        assert_eq!(
+            observed_body["chat_template_kwargs"]["enable_thinking"],
+            true
+        );
+        assert_eq!(observed_body["max_tokens"], 32_832);
+    }
 }
 
 #[tokio::test]
@@ -7160,6 +7203,65 @@ default_injection_schema = "vllm_native"
             metadata["thinking_rewrite_reason"],
             "caller_disabled_thinking"
         );
+    }
+}
+
+#[tokio::test]
+async fn bounded_thinking_vllm_native_normalizes_all_explicit_opt_outs() {
+    let cases = [
+        r#""enable_thinking":false"#,
+        r#""thinking":{"enabled":false}"#,
+        r#""chat_template_kwargs":{"enable_thinking":false}"#,
+        r#""thinking_token_budget":0"#,
+        r#""enable_thinking":false,"chat_template_kwargs":"malformed","thinking_token_budget":8192"#,
+    ];
+    assert_vllm_native_disabled_cases("bounded_thinking", &cases).await;
+}
+
+#[tokio::test]
+async fn force_disable_vllm_native_normalizes_markers_and_malformed_containers() {
+    let cases = [
+        r#""enable_thinking":false"#,
+        r#""thinking":{"enabled":false}"#,
+        r#""chat_template_kwargs":{"enable_thinking":false}"#,
+        r#""chat_template_kwargs":"malformed","thinking_token_budget":8192"#,
+    ];
+    assert_vllm_native_disabled_cases("force_disable", &cases).await;
+}
+
+async fn assert_vllm_native_disabled_cases(mode: &str, cases: &[&str]) {
+    let mut fake = FakeUpstream::spawn().await;
+    let config = format!(
+        r#"
+[thinking]
+mode = "{mode}"
+default_injection_schema = "vllm_native"
+"#,
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &config,
+    )
+    .await;
+
+    for (index, fields) in cases.iter().enumerate() {
+        let body = format!(
+            r#"{{"model":"test-chat","messages":[{{"role":"user","content":"disable-case-{index}"}}],{fields},"max_tokens":64}}"#,
+        );
+        let observed_body =
+            post_chat_and_observe_owned_body(&proxy, &mut fake, Bytes::from(body)).await;
+
+        assert_eq!(
+            observed_body["chat_template_kwargs"]["enable_thinking"],
+            false
+        );
+        assert!(
+            observed_body.get("thinking_token_budget").is_none()
+                || observed_body["thinking_token_budget"] == 0
+        );
+        assert_eq!(observed_body["max_tokens"], 64);
     }
 }
 
@@ -7207,7 +7309,7 @@ default_injection_schema = "chat_template_kwargs"
 }
 
 #[tokio::test]
-async fn hot_reloaded_default_injection_schema_changes_injection_path() {
+async fn hot_reloaded_default_injection_schema_switches_legacy_and_native_without_restart() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -7216,6 +7318,7 @@ async fn hot_reloaded_default_injection_schema_changes_injection_path() {
         r#"
 [thinking]
 mode = "force_thinking"
+default_injection_schema = "chat_template_kwargs"
 
 [loop_guard]
 enabled = false
@@ -7223,14 +7326,52 @@ enabled = false
     )
     .await;
 
-    let canonical_body = post_chat_and_observe_body(
+    let legacy_body = post_chat_and_observe_body(
         &proxy,
         &mut fake,
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"schema-before"}],"max_tokens":64}"#,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"legacy-before"}],"max_tokens":64}"#,
     )
     .await;
-    assert_eq!(canonical_body["thinking"]["budget_tokens"], 32_768);
-    assert!(canonical_body.get("chat_template_kwargs").is_none());
+    assert_eq!(
+        legacy_body["chat_template_kwargs"]["thinking_budget"],
+        32_768
+    );
+    assert!(legacy_body.get("thinking_token_budget").is_none());
+
+    write_proxy_config(
+        proxy.manager.path(),
+        &fake.base_url,
+        &proxy.sqlite_path,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[thinking]
+mode = "force_thinking"
+default_injection_schema = "vllm_native"
+
+[loop_guard]
+enabled = false
+"#,
+    );
+    let outcome = proxy
+        .manager
+        .reload()
+        .expect("default injection schema reload should succeed");
+    assert!(outcome.applied);
+
+    let native_body = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"native-middle"}],"max_tokens":64}"#,
+    )
+    .await;
+    assert_eq!(native_body["thinking_token_budget"], 32_768);
+    assert_eq!(native_body["chat_template_kwargs"]["enable_thinking"], true);
+    assert!(
+        native_body["chat_template_kwargs"]
+            .get("thinking_budget")
+            .is_none()
+    );
 
     write_proxy_config(
         proxy.manager.path(),
@@ -7250,22 +7391,18 @@ enabled = false
     let outcome = proxy
         .manager
         .reload()
-        .expect("default injection schema reload should succeed");
+        .expect("legacy schema reload should succeed");
     assert!(outcome.applied);
 
-    let chat_template_body = post_chat_and_observe_body(
+    let legacy_body = post_chat_and_observe_body(
         &proxy,
         &mut fake,
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"schema-after"}],"max_tokens":64}"#,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"legacy-after"}],"max_tokens":64}"#,
     )
     .await;
-    assert!(chat_template_body.get("thinking").is_none());
+    assert!(legacy_body.get("thinking_token_budget").is_none());
     assert_eq!(
-        chat_template_body["chat_template_kwargs"]["enable_thinking"],
-        true
-    );
-    assert_eq!(
-        chat_template_body["chat_template_kwargs"]["thinking_budget"],
+        legacy_body["chat_template_kwargs"]["thinking_budget"],
         32_768
     );
 }
@@ -15757,11 +15894,19 @@ async fn post_chat_and_observe_body(
     fake: &mut FakeUpstream,
     body: &'static [u8],
 ) -> serde_json::Value {
+    post_chat_and_observe_owned_body(proxy, fake, Bytes::from_static(body)).await
+}
+
+async fn post_chat_and_observe_owned_body(
+    proxy: &ProxyFixture,
+    fake: &mut FakeUpstream,
+    body: Bytes,
+) -> serde_json::Value {
     let response = proxy
         .client
         .post(format!("{}/v1/chat/completions", proxy.base_url))
         .header(CONTENT_TYPE, "application/json")
-        .body(Bytes::from_static(body))
+        .body(body)
         .send()
         .await
         .expect("proxy request should complete");

@@ -250,8 +250,8 @@ enabled = true
 force_disable = false
 budget_tokens = 32768                      # Max thinking tokens per request
 # thinking_token_budget = 32768           # Alias for budget_tokens
-# budget_accounting = "canonical"         # How budget is communicated to model
-# max_tokens = 0                          # Max output tokens (0 = unlimited)
+# budget_accounting = "preserve_answer_budget" # Preserve caller answer headroom
+# max_tokens = 50000                      # Optional positive total output cap
 
 # AEON/Qwen vLLM enforces the numeric budget through the top-level
 # thinking_token_budget field; enable_thinking remains a template control.
@@ -351,6 +351,7 @@ anti_loop_hint_enabled = true              # Inject anti-loop hints on retry
 # thinking_mode = "force_thinking"
 # max_tokens = 50000
 # thinking_token_budget = 32768
+# default_injection_schema = "vllm_native" # Override inherited schema for this rung
 
 # [[retry.ladder]]
 # name = "bounded-thinking-deep"
