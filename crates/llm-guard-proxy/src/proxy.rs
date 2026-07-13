@@ -56,6 +56,18 @@ use llm_guard_proxy_state::{
 };
 #[cfg(feature = "guard")]
 use llm_guard_proxy_state::{BudgetError, BudgetStore, current_budget_date};
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    target_os = "linux"
+))]
+use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+#[cfg(unix)]
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;
@@ -7752,45 +7764,24 @@ async fn terminate_timed_out_recovery_child(
 
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_term_sent"),
-        send_recovery_process_group_signal(pid, "TERM")
-            .await
-            .to_string(),
+        send_recovery_process_group_signal(pid, Signal::SIGTERM).to_string(),
     );
     tokio::time::sleep(RECOVERY_PROCESS_GROUP_TERM_GRACE).await;
-    let child_reaped_after_term;
-    let term_child_wait_status = match child.try_wait() {
-        Ok(Some(_status)) => {
-            child_reaped_after_term = true;
-            "child_reaped_after_term"
-        }
-        Ok(None) => {
-            child_reaped_after_term = false;
-            "child_still_running_after_term"
-        }
-        Err(_error) => {
-            child_reaped_after_term = false;
-            "child_wait_failed_after_term"
-        }
-    };
+    // WNOWAIT keeps the leader PID reserved until the final group signal, so
+    // numeric PID reuse cannot redirect SIGKILL to an unrelated process group.
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_term_child_wait_status"),
-        String::from(term_child_wait_status),
+        String::from(observe_recovery_child_without_reaping(pid)),
     );
 
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_kill_sent"),
-        send_recovery_process_group_signal(pid, "KILL")
-            .await
-            .to_string(),
+        send_recovery_process_group_signal(pid, Signal::SIGKILL).to_string(),
     );
-    let cleanup_status = if child_reaped_after_term {
-        "group_killed_after_child_reaped"
-    } else {
-        match timeout(RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE, child.wait()).await {
-            Ok(Ok(_status)) => "terminated_after_kill",
-            Ok(Err(_error)) => "wait_failed_after_kill",
-            Err(_elapsed) => "wait_timeout_after_kill",
-        }
+    let cleanup_status = match timeout(RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE, child.wait()).await {
+        Ok(Ok(_status)) => "terminated_after_kill",
+        Ok(Err(_error)) => "wait_failed_after_kill",
+        Err(_elapsed) => "wait_timeout_after_kill",
     };
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_cleanup_status"),
@@ -7815,17 +7806,49 @@ async fn terminate_timed_out_recovery_child(
 }
 
 #[cfg(unix)]
-async fn send_recovery_process_group_signal(pid: u32, signal: &str) -> bool {
-    Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|status| status.success())
+fn send_recovery_process_group_signal(pid: u32, signal: Signal) -> bool {
+    let Ok(process_group_id) = i32::try_from(pid) else {
+        return false;
+    };
+    if process_group_id == 0 {
+        return false;
+    }
+    kill(Pid::from_raw(-process_group_id), signal).is_ok()
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    target_os = "linux"
+))]
+fn observe_recovery_child_without_reaping(pid: u32) -> &'static str {
+    let Ok(pid) = i32::try_from(pid) else {
+        return "invalid_child_pid";
+    };
+    if pid == 0 {
+        return "invalid_child_pid";
+    }
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    match waitid(Id::Pid(Pid::from_raw(pid)), flags) {
+        Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => "child_exited_unreaped_after_term",
+        Ok(WaitStatus::StillAlive) => "child_still_running_after_term",
+        Ok(_) => "child_state_changed_unreaped_after_term",
+        Err(_) => "child_wait_failed_after_term",
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "linux"
+    ))
+))]
+fn observe_recovery_child_without_reaping(_pid: u32) -> &'static str {
+    "child_state_unavailable_before_kill"
 }
 
 async fn start_shielded_attempt(

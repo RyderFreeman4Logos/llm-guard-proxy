@@ -5967,6 +5967,33 @@ async fn recovery_fixture_helpers_are_raii_bounded() {
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn recovery_process_group_signal_uses_typed_in_process_api() {
+    let fixture = RecoveryProcessFixture::spawn_shell("while :; do sleep 1; done");
+
+    assert!(send_recovery_process_group_signal(
+        fixture.process_group_id,
+        Signal::SIGTERM,
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn process_cleanup_refuses_changed_start_time_identity() {
+    let fixture = RecoveryProcessFixture::spawn_shell("while :; do sleep 1; done");
+    let identity = LinuxProcessIdentity::capture(fixture.process_group_id)
+        .expect("fixture process identity should be readable");
+    let stale_identity = LinuxProcessIdentity {
+        start_time_ticks: identity.start_time_ticks ^ 1,
+        ..identity
+    };
+
+    kill_process_if_running(stale_identity);
+
+    assert!(identity.is_running());
+}
+
+#[cfg(unix)]
 struct RecoveryProcessFixture {
     child: Option<tokio::process::Child>,
     process_group_id: u32,
@@ -6059,7 +6086,7 @@ async fn recovery_child_timeout_cleanup_can_be_exercised_after_fixture_readiness
     }
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
     let test_dir = unique_test_dir("recovery-process-group");
@@ -6096,7 +6123,7 @@ async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
     remove_dir_all(&test_dir);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process_group() {
     let test_dir = unique_test_dir("recovery-term-resistant-process-group");
@@ -6109,7 +6136,7 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process
     fs::write(
         &script_path,
         format!(
-            "#!/bin/sh\nset -eu\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > {pid}; : > {ready}; while :; do sleep 1; done' &\n# Parent waits for the descendant readiness handshake before sleeping so suite\n# load cannot kill the group before the PID under test exists.\nwhile [ ! -f {ready} ]; do sleep 0.01; done\nsleep 30\n",
+            "#!/bin/sh\nset -eu\ntrap 'exit 0' TERM\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > {pid}; : > {ready}; while :; do sleep 1; done' &\n# Parent waits for the descendant readiness handshake before sleeping so suite\n# load cannot kill the group before the PID under test exists.\nwhile [ ! -f {ready} ]; do sleep 0.01; done\nsleep 30\n",
             pid = child_pid_path.display(),
             ready = ready_path.display()
         ),
@@ -6127,11 +6154,19 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process
         metadata["upstream_stall_recovery_timeout_cleanup_scope"],
         "process_group"
     );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_term_child_wait_status"],
+        "child_exited_unreaped_after_term"
+    );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_cleanup_status"],
+        "terminated_after_kill"
+    );
     assert_process_not_running(child_pid).await;
     remove_dir_all(&test_dir);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_before_join_timeout() {
     let test_dir = unique_test_dir("recovery-term-resistant-group-leader");
@@ -6162,7 +6197,7 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_befor
         .map(String::as_str)
         != Some("timeout_killed")
     {
-        kill_process_if_running(child_pid).await;
+        kill_process_if_running(child_pid);
     }
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
@@ -19784,8 +19819,35 @@ fn remove_dir_all(path: &Path) {
     }
 }
 
-#[cfg(unix)]
-async fn read_pid_file_after_ready(pid_path: &Path, ready_path: &Path) -> u32 {
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct LinuxProcessIdentity {
+    pid: u32,
+    start_time_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxProcessIdentity {
+    fn capture(pid: u32) -> Option<Self> {
+        let (_state, start_time_ticks) = linux_process_state_and_start_time(pid)?;
+        if start_time_ticks == 0 {
+            return None;
+        }
+        Some(Self {
+            pid,
+            start_time_ticks,
+        })
+    }
+
+    fn is_running(self) -> bool {
+        linux_process_state_and_start_time(self.pid).is_some_and(|(state, start_time_ticks)| {
+            state != 'Z' && start_time_ticks == self.start_time_ticks
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn read_pid_file_after_ready(pid_path: &Path, ready_path: &Path) -> LinuxProcessIdentity {
     // Suite-load scheduling can delay shell startup well beyond 200ms.
     // Wait long enough for the readiness handshake, but fail closed with
     // cleanup-friendly diagnostics if the fixture still never appears.
@@ -19793,7 +19855,9 @@ async fn read_pid_file_after_ready(pid_path: &Path, ready_path: &Path) -> u32 {
         if ready_path.exists() {
             if let Ok(text) = fs::read_to_string(pid_path) {
                 if let Ok(pid) = text.trim().parse::<u32>() {
-                    return pid;
+                    if let Some(identity) = LinuxProcessIdentity::capture(pid) {
+                        return identity;
+                    }
                 }
             }
         }
@@ -19806,45 +19870,37 @@ async fn read_pid_file_after_ready(pid_path: &Path, ready_path: &Path) -> u32 {
     );
 }
 
-#[cfg(unix)]
-async fn assert_process_not_running(pid: u32) {
+#[cfg(target_os = "linux")]
+async fn assert_process_not_running(identity: LinuxProcessIdentity) {
     for _ in 0..20 {
-        match linux_process_state(pid) {
-            None | Some('Z') => return,
-            Some(_) => sleep(Duration::from_millis(50)).await,
+        if !identity.is_running() {
+            return;
         }
+        sleep(Duration::from_millis(50)).await;
     }
-    let _ = tokio::process::Command::new("kill")
-        .arg("-KILL")
-        .arg(pid.to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
-    panic!("process {pid} still appears to be running");
+    kill_process_if_running(identity);
+    panic!("process {} still appears to be running", identity.pid);
 }
 
-#[cfg(unix)]
-async fn kill_process_if_running(pid: u32) {
-    if matches!(linux_process_state(pid), None | Some('Z')) {
+#[cfg(target_os = "linux")]
+fn kill_process_if_running(identity: LinuxProcessIdentity) {
+    if !identity.is_running() {
         return;
     }
-    let _ = tokio::process::Command::new("kill")
-        .arg("-KILL")
-        .arg(pid.to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
+    let Ok(pid) = i32::try_from(identity.pid) else {
+        return;
+    };
+    let _signal_result = kill(Pid::from_raw(pid), Signal::SIGKILL);
 }
 
-#[cfg(unix)]
-fn linux_process_state(pid: u32) -> Option<char> {
+#[cfg(target_os = "linux")]
+fn linux_process_state_and_start_time(pid: u32) -> Option<(char, u64)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_prefix, suffix) = stat.rsplit_once(") ")?;
-    suffix.chars().next()
+    let state = suffix.chars().next()?;
+    // The suffix starts at field 3 (state); starttime is field 22.
+    let start_time_ticks = suffix.split_whitespace().nth(19)?.parse().ok()?;
+    Some((state, start_time_ticks))
 }
 
 async fn assert_no_upstream_request(fake: &mut FakeUpstream) {
