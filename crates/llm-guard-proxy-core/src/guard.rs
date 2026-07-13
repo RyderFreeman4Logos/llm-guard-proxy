@@ -226,6 +226,7 @@ mod tests {
                 pre_request: Some(String::from("guard")),
                 post_response: None,
                 fail_closed_blocks: false,
+                ..GuardWorkflowConfig::default()
             },
             &workflow_executor,
         );
@@ -267,6 +268,7 @@ mod tests {
                 pre_request: Some(String::from("guard")),
                 post_response: None,
                 fail_closed_blocks: false,
+                ..GuardWorkflowConfig::default()
             },
             &workflow_executor,
         );

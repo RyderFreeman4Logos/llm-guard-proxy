@@ -11,7 +11,11 @@ description = "OpenAI-compatible LLM guard proxy service."
 default = ["upstream-hot-restart", "param-override"]
 upstream-hot-restart = ["llm-guard-proxy-core/upstream-hot-restart"]
 param-override = ["llm-guard-proxy-core/param-override"]
-guard = ["llm-guard-proxy-core/guard", "llm-guard-proxy-state/guard"]
+guard = [
+  "llm-guard-proxy-core/guard",
+  "llm-guard-proxy-state/guard",
+  "nix/poll",
+]
 
 [dependencies]
 axum = "0.8"

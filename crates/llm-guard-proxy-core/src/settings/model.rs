@@ -238,6 +238,17 @@ impl AppConfig {
 
     #[cfg(feature = "guard")]
     fn validate_guard_workflows(&self) -> Result<(), ValidationError> {
+        require(
+            self.guard_workflows.max_in_flight_executions > 0,
+            "guard_workflows.max_in_flight_executions",
+            "must be greater than zero",
+        )?;
+        require(
+            self.guard_workflows.max_in_flight_executions
+                <= GuardWorkflowConfig::MAX_IN_FLIGHT_EXECUTIONS,
+            "guard_workflows.max_in_flight_executions",
+            "must be less than or equal to 128",
+        )?;
         self.validate_guard_workflow_id(
             "guard_workflows.pre_request",
             self.guard_workflows.pre_request.as_deref(),
@@ -931,6 +942,8 @@ pub struct GuardWorkflowConfig {
     pub post_response: Option<String>,
     /// Whether `error_fail_closed` guard results should block the request or response.
     pub fail_closed_blocks: bool,
+    /// Maximum admitted workflow executions across aliases and guard hooks.
+    pub max_in_flight_executions: usize,
 }
 
 #[cfg(feature = "guard")]
@@ -940,8 +953,15 @@ impl Default for GuardWorkflowConfig {
             pre_request: None,
             post_response: None,
             fail_closed_blocks: true,
+            max_in_flight_executions: 4,
         }
     }
+}
+
+#[cfg(feature = "guard")]
+impl GuardWorkflowConfig {
+    /// Maximum accepted workflow execution admission limit.
+    pub const MAX_IN_FLIGHT_EXECUTIONS: usize = 128;
 }
 
 /// Virtual key resolution settings for caller profile selection.

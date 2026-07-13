@@ -1,3 +1,5 @@
+#[cfg(feature = "guard")]
+use super::GuardWorkflowConfig;
 use super::{
     AppConfig, ConfigHandle, ConfigParseError, DefaultInjectionSchema, DownstreamDropPolicy,
     HeartbeatMode, LoopFailurePolicy, LoopGuardMode, NoThinkingMarkerPolicy, RELOADABLE_FIELDS,
@@ -86,6 +88,7 @@ max_stdout_bytes = 1048576
 pre_request = "family.child_safe_general.v1"
 post_response = "family.child_safe_general.v1"
 fail_closed_blocks = false
+max_in_flight_executions = 8
 
 [profiles.child_default]
 kind = "child"
@@ -1633,6 +1636,7 @@ fn parses_toml_with_defaults_and_overrides() {
             Some("family.child_safe_general.v1")
         );
         assert!(!config.guard_workflows.fail_closed_blocks);
+        assert_eq!(config.guard_workflows.max_in_flight_executions, 8);
     }
     #[cfg(feature = "guard")]
     assert_parsed_profiles(&config);
@@ -1959,6 +1963,42 @@ pre_request = "missing.guard"
         .expect_err("missing guard workflow should fail validation");
 
     assert_eq!(error.field(), "guard_workflows.pre_request");
+}
+
+#[test]
+#[cfg(feature = "guard")]
+fn workflow_execution_admission_has_a_small_bounded_default() {
+    let defaults = AppConfig::default().guard_workflows;
+
+    assert_eq!(defaults.max_in_flight_executions, 4);
+    assert!(defaults.max_in_flight_executions <= GuardWorkflowConfig::MAX_IN_FLIGHT_EXECUTIONS);
+}
+
+#[test]
+#[cfg(feature = "guard")]
+fn parses_and_validates_workflow_execution_admission_bound() {
+    let valid = parse_config_text(
+        r"
+[guard_workflows]
+max_in_flight_executions = 8
+",
+    )
+    .expect("workflow admission limit should parse");
+    valid
+        .validate()
+        .expect("workflow admission limit should validate");
+    assert_eq!(valid.guard_workflows.max_in_flight_executions, 8);
+
+    for invalid in [0, GuardWorkflowConfig::MAX_IN_FLIGHT_EXECUTIONS + 1] {
+        let config = parse_config_text(&format!(
+            "[guard_workflows]\nmax_in_flight_executions = {invalid}\n"
+        ))
+        .expect("workflow admission syntax should parse");
+        let error = config
+            .validate()
+            .expect_err("out-of-range workflow admission should fail");
+        assert_eq!(error.field(), "guard_workflows.max_in_flight_executions");
+    }
 }
 
 #[test]

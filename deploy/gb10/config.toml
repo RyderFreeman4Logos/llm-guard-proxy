@@ -540,6 +540,7 @@ enabled = true
 #| pre_request = "child_safe_general.v1"     # Run before forwarding to upstream
 #| post_response = "child_safe_general.v1"   # Check the completed response
 #| fail_closed_blocks = true                 # Block request if guard errors
+#| max_in_flight_executions = 4              # Hard global workflow spawn limit (1-128)
 # END PARSEABLE EXAMPLE: guard-features
 
 # ════════════════════════════════════════════════════════════════════════════
