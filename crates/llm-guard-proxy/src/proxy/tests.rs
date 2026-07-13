@@ -13,6 +13,12 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(unix)]
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
+
 use crate::config_reload::ConfigManager;
 use axum::http::header::{AUTHORIZATION, CONNECTION, LOCATION};
 use futures_util::{Stream, StreamExt, stream};
@@ -5940,6 +5946,14 @@ async fn upstream_stall_recovery_command_wiring_times_out_and_cleans_process_gro
     assert_eq!(metadata["upstream_stall_recovery_ran"], "true");
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
+        metadata["upstream_stall_recovery_timeout_term_sent"],
+        "true"
+    );
+    assert_ne!(
+        metadata["upstream_stall_recovery_timeout_cleanup_status"],
+        "wait_timeout_after_kill"
+    );
+    assert_eq!(
         metadata["upstream_stall_recovery_timeout_cleanup_scope"],
         "process_group"
     );
@@ -6016,9 +6030,9 @@ impl Drop for RecoveryProcessFixture {
         let Some(child) = self.child.as_mut() else {
             return;
         };
-        let _status = std::process::Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", self.process_group_id)])
-            .status();
+        if let Ok(process_group_id) = i32::try_from(self.process_group_id) {
+            let _signal_result = kill(Pid::from_raw(-process_group_id), Signal::SIGKILL);
+        }
         let _kill_result = child.start_kill();
         let deadline = std::time::Instant::now() + RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE;
         while std::time::Instant::now() < deadline {
