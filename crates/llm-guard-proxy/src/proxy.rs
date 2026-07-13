@@ -7773,7 +7773,11 @@ impl RecoveryProcessGuard {
         result
     }
 
-    async fn kill(&mut self) -> std::io::Result<()> {
+    /// Kills only the direct child when no validated process-group identity is available.
+    ///
+    /// The normal Unix timeout path signals the entire process group before waiting. This fallback
+    /// is used only for a missing group ID or on platforms without recovery process groups.
+    async fn kill_direct_child(&mut self) -> std::io::Result<()> {
         let Some(child) = self.child.as_mut() else {
             return Ok(());
         };
@@ -7809,8 +7813,10 @@ impl Drop for RecoveryProcessGuard {
 }
 
 fn spawn_recovery_child_reaper(mut child: tokio::process::Child) {
-    // `kill_on_drop` remains enabled, so failure to create the reaper thread still requests direct
-    // child termination and lets Tokio's orphan queue make a best-effort reap.
+    // Tokio documents orphan-queue cleanup as best-effort with no speed or frequency guarantee.
+    // Retaining the owned child here gives cancellation a bounded `try_wait` loop; on Unix,
+    // `try_wait` reaps an exited child. If thread creation fails, `kill_on_drop` still requests
+    // direct-child termination and Tokio's orphan queue remains the best-effort fallback.
     let _reaper = std::thread::Builder::new()
         .name(String::from("llm-guard-recovery-reaper"))
         .spawn(move || {
@@ -7854,7 +7860,7 @@ async fn terminate_timed_out_recovery_child(
             String::from("upstream_stall_recovery_timeout_cleanup_status"),
             String::from("missing_child_pid"),
         );
-        let _kill_result = child.kill().await;
+        let _kill_result = child.kill_direct_child().await;
         return metadata;
     };
 
@@ -7896,7 +7902,7 @@ async fn terminate_timed_out_recovery_child(
     )]);
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_cleanup_status"),
-        child.kill().await.is_ok().to_string(),
+        child.kill_direct_child().await.is_ok().to_string(),
     );
     metadata
 }
