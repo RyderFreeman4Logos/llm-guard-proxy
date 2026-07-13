@@ -5914,6 +5914,39 @@ async fn upstream_stall_recovery_joiner_uses_completed_state_after_lost_notifica
 
 #[cfg(unix)]
 #[tokio::test]
+async fn upstream_stall_recovery_command_wiring_times_out_and_cleans_process_group() {
+    let policy = UpstreamStallPolicy {
+        enabled: true,
+        first_chunk_timeout: Duration::from_millis(50),
+        idle_timeout: Duration::from_millis(50),
+        recovery_command: vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            String::from("while :; do sleep 1; done"),
+        ],
+        recovery_timeout: Duration::from_millis(1),
+        recovery_cooldown: Duration::from_millis(1),
+        recovery_budget_window: Duration::from_secs(60),
+        recovery_max_per_window: 2,
+    };
+
+    let metadata = timeout(
+        Duration::from_secs(2),
+        run_upstream_stall_recovery_command(&policy),
+    )
+    .await
+    .expect("production recovery command cleanup should complete within its bounded grace");
+
+    assert_eq!(metadata["upstream_stall_recovery_ran"], "true");
+    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_cleanup_scope"],
+        "process_group"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn recovery_fixture_helpers_are_raii_bounded() {
     let fixture = RecoveryProcessFixture::spawn_shell("while :; do sleep 1; done");
     drop(fixture);
