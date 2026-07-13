@@ -723,6 +723,13 @@ fn assign_guard_workflows(
         "pre_request" => config.pre_request = Some(parse_string(value, line_number)?),
         "post_response" => config.post_response = Some(parse_string(value, line_number)?),
         "fail_closed_blocks" => config.fail_closed_blocks = parse_bool(value, line_number)?,
+        "max_in_flight_executions" => {
+            config.max_in_flight_executions = parse_usize(
+                value,
+                line_number,
+                "guard_workflows.max_in_flight_executions",
+            )?;
+        }
         _ => return unknown_key("guard_workflows", key, line_number),
     }
     Ok(())

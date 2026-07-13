@@ -33,6 +33,9 @@ A simple keyword/pattern-based content filter demonstrating:
    pre_request = "harmful_content_guard.v1"
    post_response = "harmful_content_guard.v1"
    fail_closed_blocks = true
+   # Hard, process-level admission bound shared by alias, pre-, and post-guard execution.
+   # Saturated requests do not queue a blocking workflow worker.
+   max_in_flight_executions = 4
    ```
 
 3. Build the proxy with the guard feature:

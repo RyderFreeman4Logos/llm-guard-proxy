@@ -81,7 +81,7 @@ use tokio::{
 };
 
 #[cfg(feature = "guard")]
-use crate::workflow_runtime::WorkflowRuntimeAdapter;
+use crate::{workflow_execution::WorkflowExecutionLease, workflow_runtime::WorkflowRuntimeAdapter};
 
 mod model_metadata;
 mod score_adapter;
@@ -123,6 +123,8 @@ pub(crate) struct ProxyState {
     generation_body_routing_requests: Arc<InFlightLimiter>,
     generation_profile_requests: Arc<Mutex<HashMap<String, Arc<InFlightLimiter>>>>,
     control_plane_requests: Arc<InFlightLimiter>,
+    #[cfg(feature = "guard")]
+    workflow_execution_requests: Arc<InFlightLimiter>,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     local_recovery: Arc<LocalRecoveryCoordinatorSet>,
     #[cfg(feature = "upstream-hot-restart")]
@@ -249,6 +251,8 @@ impl ProxyState {
             generation_body_routing_requests: Arc::new(InFlightLimiter::default()),
             generation_profile_requests: Arc::new(Mutex::new(HashMap::new())),
             control_plane_requests: Arc::new(InFlightLimiter::default()),
+            #[cfg(feature = "guard")]
+            workflow_execution_requests: Arc::new(InFlightLimiter::default()),
             upstream_stall_recovery: Arc::new(UpstreamStallRecoveryCoordinator::default()),
             local_recovery: Arc::new(LocalRecoveryCoordinatorSet::default()),
             #[cfg(feature = "upstream-hot-restart")]
@@ -711,6 +715,53 @@ impl InFlightLimiter {
     fn snapshot_counts(&self) -> AdmissionCounts {
         *admission_counts(&self.counts)
     }
+}
+
+#[cfg(feature = "guard")]
+#[derive(Clone, Debug, Error, Eq, PartialEq)]
+enum WorkflowExecutionTaskError {
+    #[error(
+        "workflow execution capacity exhausted (max_in_flight_executions={max_in_flight_executions})"
+    )]
+    AtCapacity { max_in_flight_executions: usize },
+    #[error("workflow worker failed: {0}")]
+    WorkerFailed(String),
+}
+
+#[cfg(feature = "guard")]
+async fn run_workflow_execution<T, Execute>(
+    limiter: Arc<InFlightLimiter>,
+    max_in_flight_executions: usize,
+    execute: Execute,
+) -> Result<T, WorkflowExecutionTaskError>
+where
+    T: Send + 'static,
+    Execute: FnOnce(WorkflowExecutionLease) -> T + Send + 'static,
+{
+    let permit = limiter.try_acquire(max_in_flight_executions).ok_or(
+        WorkflowExecutionTaskError::AtCapacity {
+            max_in_flight_executions,
+        },
+    )?;
+    tokio::task::spawn_blocking(move || execute(WorkflowExecutionLease::new(permit)))
+        .await
+        .map_err(|error| WorkflowExecutionTaskError::WorkerFailed(error.to_string()))
+}
+
+#[cfg(feature = "guard")]
+fn guard_outcome_after_workflow_task(
+    result: Result<GuardOutcome, WorkflowExecutionTaskError>,
+    fail_closed_blocks: bool,
+) -> GuardOutcome {
+    result.unwrap_or_else(|error| {
+        if fail_closed_blocks {
+            GuardOutcome::Block {
+                reason: error.to_string(),
+            }
+        } else {
+            GuardOutcome::Allow
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -2533,9 +2584,16 @@ async fn forward_openai_request(
         .await;
     }
     #[cfg(feature = "guard")]
-    apply_pre_request_guard(&config, request_id, &method, &uri, &mut prepared_request)
-        .await
-        .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    apply_pre_request_guard(
+        &config,
+        request_id,
+        &method,
+        &uri,
+        &mut prepared_request,
+        Arc::clone(&state.workflow_execution_requests),
+    )
+    .await
+    .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry, &config.loop_guard);
     let upstream_stall_policy = UpstreamStallPolicy::from_config(&config.upstream_stall);
     let upstream_timeout =
@@ -2573,6 +2631,8 @@ async fn forward_openai_request(
                 caller_profile_name: prepared_request.caller_profile_name,
                 #[cfg(feature = "guard")]
                 caller_profile: prepared_request.caller_profile,
+                #[cfg(feature = "guard")]
+                workflow_execution_requests: Arc::clone(&state.workflow_execution_requests),
                 route_reason: prepared_request.route_reason,
                 liveness: prepared_request.shielded_chat_plan.liveness,
                 thinking_metadata: prepared_request.shielded_chat_plan.thinking_metadata,
@@ -3416,14 +3476,21 @@ async fn handle_workflow_alias_request(
     };
     let workflow_id = context.workflow_alias.workflow_id.clone();
     let workflow_config = workflow_config_for_alias(context.config, &context.workflow_alias)?;
-    let workflow_executor =
-        WorkflowRuntimeAdapter::new(HashMap::from([(workflow_id.clone(), workflow_config)]));
     let execution_workflow_id = workflow_id.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        workflow_executor.execute(&execution_workflow_id, &invocation)
-    })
+    let runtime_workflow_id = workflow_id.clone();
+    let result = run_workflow_execution(
+        Arc::clone(&context.state.workflow_execution_requests),
+        context.config.guard_workflows.max_in_flight_executions,
+        move |execution_lease| {
+            WorkflowRuntimeAdapter::new(
+                HashMap::from([(runtime_workflow_id, workflow_config)]),
+                &execution_lease,
+            )
+            .execute(&execution_workflow_id, &invocation)
+        },
+    )
     .await
-    .map_err(|error| ProxyError::guard_blocked(format!("workflow worker failed: {error}")))?
+    .map_err(|error| ProxyError::guard_blocked(error.to_string()))?
     .ok_or_else(|| {
         ProxyError::guard_blocked(format!(
             "workflow alias references unconfigured workflow {workflow_id:?}"
@@ -3611,6 +3678,7 @@ async fn apply_pre_request_guard(
     method: &Method,
     uri: &Uri,
     prepared_request: &mut PreparedOpenAiRequest,
+    workflow_execution_requests: Arc<InFlightLimiter>,
 ) -> Result<(), ProxyError> {
     if !is_chat_completions_request(method, uri) || config.guard_workflows.pre_request.is_none() {
         return Ok(());
@@ -3627,6 +3695,7 @@ async fn apply_pre_request_guard(
         messages,
         prepared_request.caller_profile_name.clone(),
         prepared_request.caller_profile.clone(),
+        workflow_execution_requests,
     )
     .await;
     match outcome {
@@ -3654,32 +3723,30 @@ async fn run_pre_request_guard(
     messages: Vec<serde_json::Value>,
     profile_name: String,
     profile: ProfileConfig,
+    workflow_execution_requests: Arc<InFlightLimiter>,
 ) -> GuardOutcome {
     let guard_config = config.guard_workflows.clone();
     let workflows = config.workflows.clone();
     let request_id = request_id.to_owned();
     let model = model.to_owned();
     let fail_closed_blocks = guard_config.fail_closed_blocks;
-    tokio::task::spawn_blocking(move || {
-        let workflow_executor = WorkflowRuntimeAdapter::new(workflows);
-        GuardExecutor::new(guard_config, &workflow_executor).pre_request_guard(
-            &request_id,
-            &model,
-            &messages,
-            &profile_name,
-            &profile,
-        )
-    })
-    .await
-    .unwrap_or_else(|error| {
-        if fail_closed_blocks {
-            GuardOutcome::Block {
-                reason: format!("guard worker failed: {error}"),
-            }
-        } else {
-            GuardOutcome::Allow
-        }
-    })
+    let max_in_flight_executions = guard_config.max_in_flight_executions;
+    let result = run_workflow_execution(
+        workflow_execution_requests,
+        max_in_flight_executions,
+        move |execution_lease| {
+            let workflow_executor = WorkflowRuntimeAdapter::new(workflows, &execution_lease);
+            GuardExecutor::new(guard_config, &workflow_executor).pre_request_guard(
+                &request_id,
+                &model,
+                &messages,
+                &profile_name,
+                &profile,
+            )
+        },
+    )
+    .await;
+    guard_outcome_after_workflow_task(result, fail_closed_blocks)
 }
 
 #[cfg(feature = "guard")]
@@ -3703,6 +3770,7 @@ async fn apply_post_response_guard(
         response.clone(),
         runtime.caller_profile_name.clone(),
         runtime.caller_profile.clone(),
+        Arc::clone(&runtime.workflow_execution_requests),
     )
     .await;
     match outcome {
@@ -3728,32 +3796,30 @@ async fn run_post_response_guard(
     response: serde_json::Value,
     profile_name: String,
     profile: ProfileConfig,
+    workflow_execution_requests: Arc<InFlightLimiter>,
 ) -> GuardOutcome {
     let guard_config = config.guard_workflows.clone();
     let workflows = config.workflows.clone();
     let request_id = request_id.to_owned();
     let model = model.to_owned();
     let fail_closed_blocks = guard_config.fail_closed_blocks;
-    tokio::task::spawn_blocking(move || {
-        let workflow_executor = WorkflowRuntimeAdapter::new(workflows);
-        GuardExecutor::new(guard_config, &workflow_executor).post_response_guard(
-            &request_id,
-            &model,
-            &response,
-            &profile_name,
-            &profile,
-        )
-    })
-    .await
-    .unwrap_or_else(|error| {
-        if fail_closed_blocks {
-            GuardOutcome::Block {
-                reason: format!("guard worker failed: {error}"),
-            }
-        } else {
-            GuardOutcome::Allow
-        }
-    })
+    let max_in_flight_executions = guard_config.max_in_flight_executions;
+    let result = run_workflow_execution(
+        workflow_execution_requests,
+        max_in_flight_executions,
+        move |execution_lease| {
+            let workflow_executor = WorkflowRuntimeAdapter::new(workflows, &execution_lease);
+            GuardExecutor::new(guard_config, &workflow_executor).post_response_guard(
+                &request_id,
+                &model,
+                &response,
+                &profile_name,
+                &profile,
+            )
+        },
+    )
+    .await;
+    guard_outcome_after_workflow_task(result, fail_closed_blocks)
 }
 
 #[cfg(feature = "guard")]
@@ -5581,6 +5647,8 @@ struct ShieldedRetryRuntime {
     caller_profile_name: String,
     #[cfg(feature = "guard")]
     caller_profile: ProfileConfig,
+    #[cfg(feature = "guard")]
+    workflow_execution_requests: Arc<InFlightLimiter>,
     route_reason: UpstreamRouteReason,
     liveness: ShieldedLivenessSelection,
     thinking_metadata: BTreeMap<String, String>,
@@ -13026,3 +13094,7 @@ impl OpenAiPathError {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "guard"))]
+#[path = "proxy/workflow_admission_tests.rs"]
+mod workflow_admission_tests;

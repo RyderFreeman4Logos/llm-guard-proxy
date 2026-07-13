@@ -2,27 +2,22 @@
 
 use std::{
     collections::HashMap,
-    env,
-    io::{self, Read, Write},
-    process::{Child, Command, ExitStatus, Stdio},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
-    thread::{self, JoinHandle},
+    io::{self},
+    process::ExitStatus,
     time::Duration,
 };
-
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
 
 use llm_guard_proxy_core::{
     GuardWorkflowExecutor, GwpAudit, GwpDecision, GwpInvocation, GwpResult, WorkflowConfig,
 };
 
-const READ_CHUNK_BYTES: usize = 8 * 1024;
-const ALLOWED_ENV_VARS: [&str; 4] = ["PATH", "LANG", "LC_ALL", "HOME"];
+use crate::{
+    workflow_execution::WorkflowExecutionLease,
+    workflow_process::{
+        WorkflowProcess, WorkflowProcessFinishError, WorkflowProcessStartError, WorkflowStdinError,
+        WorkflowStdoutError,
+    },
+};
 
 /// Configured service adapter for the core workflow-execution port.
 pub(crate) struct WorkflowRuntimeAdapter {
@@ -31,10 +26,18 @@ pub(crate) struct WorkflowRuntimeAdapter {
 
 impl WorkflowRuntimeAdapter {
     /// Builds an adapter from one immutable configuration snapshot.
-    pub(crate) fn new(workflows: HashMap<String, WorkflowConfig>) -> Self {
+    pub(crate) fn new(
+        workflows: HashMap<String, WorkflowConfig>,
+        execution_lease: &WorkflowExecutionLease,
+    ) -> Self {
         let workflows = workflows
             .into_iter()
-            .map(|(id, config)| (id, StdioRuntime::new(config)))
+            .map(|(id, config)| {
+                (
+                    id,
+                    StdioRuntime::with_execution_lease(config, execution_lease.clone()),
+                )
+            })
             .collect();
         Self { workflows }
     }
@@ -49,16 +52,28 @@ impl GuardWorkflowExecutor for WorkflowRuntimeAdapter {
 }
 
 /// Synchronous stdio workflow runtime.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 struct StdioRuntime {
     config: WorkflowConfig,
+    execution_lease: WorkflowExecutionLease,
 }
 
 impl StdioRuntime {
     /// Builds a stdio workflow runtime from validated config.
     #[must_use]
-    const fn new(config: WorkflowConfig) -> Self {
-        Self { config }
+    #[cfg(test)]
+    fn new(config: WorkflowConfig) -> Self {
+        Self::with_execution_lease(config, WorkflowExecutionLease::default())
+    }
+
+    fn with_execution_lease(
+        config: WorkflowConfig,
+        execution_lease: WorkflowExecutionLease,
+    ) -> Self {
+        Self {
+            config,
+            execution_lease,
+        }
     }
 
     /// Spawn the workflow process, write invocation JSON to stdin, read result JSON from stdout,
@@ -76,74 +91,26 @@ impl StdioRuntime {
         invocation: &GwpInvocation,
     ) -> Result<GwpResult, WorkflowExecutionError> {
         validate_runtime_config(&self.config)?;
+        let mut process = WorkflowProcess::start_with_execution_lease(
+            &self.config,
+            Duration::from_millis(self.config.timeout_ms),
+            self.execution_lease.clone(),
+        )
+        .map_err(workflow_process_start_error)?;
 
-        let mut command = Command::new(&self.config.command);
-        command
-            .args(&self.config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        apply_allowed_environment(&mut command);
-        configure_process_group(&mut command);
-
-        let mut child = command.spawn().map_err(|error| {
-            WorkflowExecutionError::new(
-                "spawn",
-                "failed to spawn workflow process",
-                format!("failed to spawn workflow process: {error}"),
-            )
-        })?;
-
-        let pid = child.id();
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let watchdog = spawn_timeout_watchdog(pid, self.config.timeout_ms, Arc::clone(&timed_out));
-        let stderr_handle = child.stderr.take().map(spawn_pipe_drain);
-
-        let Some(stdout) = child.stdout.take() else {
-            terminate_child_group(pid);
-            let _ignored = child.wait();
-            finish_watchdog(watchdog);
-            finish_stderr_drain(stderr_handle);
-            return Err(WorkflowExecutionError::new(
-                "spawn",
-                "workflow stdout was not captured",
-                "workflow child missing stdout pipe",
-            ));
-        };
-
-        let output = match write_invocation(&mut child, invocation)
-            .and_then(|()| read_stdout_limited(stdout, self.config.max_stdout_bytes))
+        let output = match write_invocation(&mut process, invocation)
+            .and_then(|()| read_stdout_limited(&mut process, self.config.max_stdout_bytes))
         {
             Ok(output) => output,
             Err(error) => {
-                terminate_child_group(pid);
-                let _ignored = child.wait();
-                finish_watchdog(watchdog);
-                finish_stderr_drain(stderr_handle);
+                process.abort();
                 return Err(error);
             }
         };
 
-        let status = match child.wait() {
-            Ok(status) => status,
-            Err(error) => {
-                terminate_child_group(pid);
-                finish_watchdog(watchdog);
-                finish_stderr_drain(stderr_handle);
-                return Err(WorkflowExecutionError::new(
-                    "wait",
-                    "failed to wait for workflow process",
-                    format!("failed to wait for workflow process: {error}"),
-                ));
-            }
-        };
-        // Always terminate the process group to clean up any descendant
-        // processes the workflow may have spawned, even on the success path.
-        terminate_child_group(pid);
-        finish_watchdog(watchdog);
-        finish_stderr_drain(stderr_handle);
+        let completion = process.complete().map_err(workflow_process_finish_error)?;
 
-        if timed_out.load(Ordering::SeqCst) {
+        if completion.timed_out {
             return Err(WorkflowExecutionError::new(
                 "timeout",
                 "workflow process timed out",
@@ -153,8 +120,8 @@ impl StdioRuntime {
                 ),
             ));
         }
-        if !status.success() {
-            return Err(non_zero_exit_error(status));
+        if !completion.status.success() {
+            return Err(non_zero_exit_error(completion.status));
         }
         parse_workflow_result(&output)
     }
@@ -219,65 +186,82 @@ fn validate_runtime_config(config: &WorkflowConfig) -> Result<(), WorkflowExecut
     Ok(())
 }
 
-fn apply_allowed_environment(command: &mut Command) {
-    command.env_clear();
-    for key in ALLOWED_ENV_VARS {
-        if let Some(value) = env::var_os(key) {
-            command.env(key, value);
+fn workflow_process_start_error(error: WorkflowProcessStartError) -> WorkflowExecutionError {
+    match error {
+        WorkflowProcessStartError::CleanupUnavailable => WorkflowExecutionError::new(
+            "runtime",
+            "workflow cleanup worker is unavailable",
+            "workflow cleanup worker is unavailable or still owns a group awaiting termination",
+        ),
+        WorkflowProcessStartError::Spawn(error) => WorkflowExecutionError::new(
+            "spawn",
+            "failed to spawn workflow process",
+            format!("failed to spawn workflow process: {error}"),
+        ),
+        WorkflowProcessStartError::IdentityCapture(error) => WorkflowExecutionError::new(
+            "spawn",
+            "failed to capture workflow process identity",
+            format!("failed to capture workflow process identity: {error}"),
+        ),
+        WorkflowProcessStartError::IdentityChanged(error) => WorkflowExecutionError::new(
+            "spawn",
+            "workflow process identity changed during startup",
+            format!("workflow process identity changed during startup: {error}"),
+        ),
+        WorkflowProcessStartError::Watchdog(error) => WorkflowExecutionError::new(
+            "runtime",
+            "failed to start workflow timeout watchdog",
+            format!("failed to start workflow timeout watchdog: {error}"),
+        ),
+        WorkflowProcessStartError::StderrDrain(error) => WorkflowExecutionError::new(
+            "runtime",
+            "failed to start workflow stderr drain",
+            format!("failed to start workflow stderr drain: {error}"),
+        ),
+    }
+}
+
+fn workflow_process_finish_error(error: WorkflowProcessFinishError) -> WorkflowExecutionError {
+    match error {
+        WorkflowProcessFinishError::OwnershipLost => WorkflowExecutionError::new(
+            "wait",
+            "workflow process ownership was lost before cleanup",
+            "waitid reported ECHILD before workflow cleanup",
+        ),
+        WorkflowProcessFinishError::Cleanup(error) => {
+            let (category, summary) = if error.kind() == io::ErrorKind::TimedOut {
+                ("timeout", "workflow process timed out")
+            } else {
+                ("wait", "failed to finalize workflow process")
+            };
+            WorkflowExecutionError::new(
+                category,
+                summary,
+                format!("failed to signal or reap workflow process: {error}"),
+            )
         }
-    }
-}
-
-fn configure_process_group(command: &mut Command) {
-    #[cfg(unix)]
-    {
-        command.process_group(0);
-    }
-}
-
-fn spawn_timeout_watchdog(pid: u32, timeout_ms: u64, timed_out: Arc<AtomicBool>) -> Watchdog {
-    let (done_sender, done_receiver) = mpsc::channel();
-    let timeout = Duration::from_millis(timeout_ms);
-    let handle = thread::spawn(move || {
-        if matches!(
-            done_receiver.recv_timeout(timeout),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        ) {
-            timed_out.store(true, Ordering::SeqCst);
-            terminate_child_group(pid);
+        WorkflowProcessFinishError::DeadlineExceeded(error) => WorkflowExecutionError::new(
+            "timeout",
+            "workflow process timed out",
+            format!("workflow deadline elapsed before cleanup completed: {error}"),
+        ),
+        WorkflowProcessFinishError::Stderr(error) => {
+            let (category, summary) = if error.kind() == io::ErrorKind::TimedOut {
+                ("timeout", "workflow process timed out")
+            } else {
+                ("stderr", "failed to drain workflow stderr")
+            };
+            WorkflowExecutionError::new(
+                category,
+                summary,
+                format!("failed to drain workflow stderr: {error}"),
+            )
         }
-    });
-    Watchdog {
-        done_sender,
-        handle,
-    }
-}
-
-struct Watchdog {
-    done_sender: mpsc::Sender<()>,
-    handle: JoinHandle<()>,
-}
-
-fn finish_watchdog(watchdog: Watchdog) {
-    let _ignored = watchdog.done_sender.send(());
-    let _ignored = watchdog.handle.join();
-}
-
-fn spawn_pipe_drain<R>(pipe: R) -> JoinHandle<io::Result<Vec<u8>>>
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || read_bounded(pipe, WorkflowConfig::default_max_stdout_bytes()))
-}
-
-fn finish_stderr_drain(handle: Option<JoinHandle<io::Result<Vec<u8>>>>) {
-    if let Some(handle) = handle {
-        let _ignored = handle.join();
     }
 }
 
 fn write_invocation(
-    child: &mut Child,
+    process: &mut WorkflowProcess,
     invocation: &GwpInvocation,
 ) -> Result<(), WorkflowExecutionError> {
     let mut payload = serde_json::to_vec(invocation).map_err(|error| {
@@ -289,35 +273,49 @@ fn write_invocation(
     })?;
     payload.push(b'\n');
 
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        WorkflowExecutionError::new(
+    process.write_stdin(&payload).map_err(|error| match error {
+        WorkflowStdinError::Missing => WorkflowExecutionError::new(
             "stdin",
             "workflow stdin was not captured",
             "workflow child missing stdin pipe",
-        )
-    })?;
-    stdin.write_all(&payload).map_err(|error| {
-        WorkflowExecutionError::new(
-            "stdin",
-            "failed to write workflow invocation",
-            format!("failed to write workflow invocation to stdin: {error}"),
-        )
+        ),
+        WorkflowStdinError::Write(error) => {
+            let (category, summary) = if error.kind() == io::ErrorKind::TimedOut {
+                ("timeout", "workflow process timed out")
+            } else {
+                ("stdin", "failed to write workflow invocation")
+            };
+            WorkflowExecutionError::new(
+                category,
+                summary,
+                format!("failed to write workflow invocation to stdin: {error}"),
+            )
+        }
     })
 }
 
-fn read_stdout_limited<R>(
-    stdout: R,
+fn read_stdout_limited(
+    process: &mut WorkflowProcess,
     max_stdout_bytes: usize,
-) -> Result<Vec<u8>, WorkflowExecutionError>
-where
-    R: Read,
-{
-    read_bounded(stdout, max_stdout_bytes).map_err(|error| {
+) -> Result<Vec<u8>, WorkflowExecutionError> {
+    process.read_stdout(max_stdout_bytes).map_err(|error| {
+        let error = match error {
+            WorkflowStdoutError::Missing => {
+                return WorkflowExecutionError::new(
+                    "spawn",
+                    "workflow stdout was not captured",
+                    "workflow child missing stdout pipe",
+                );
+            }
+            WorkflowStdoutError::Read(error) => error,
+        };
         let (category, summary) = if error.kind() == io::ErrorKind::InvalidData {
             (
                 "stdout_limit",
                 "workflow stdout exceeded the configured byte limit",
             )
+        } else if error.kind() == io::ErrorKind::TimedOut {
+            ("timeout", "workflow process timed out")
         } else {
             ("stdout", "failed to read workflow stdout")
         };
@@ -327,27 +325,6 @@ where
             format!("failed to read workflow stdout: {error}"),
         )
     })
-}
-
-fn read_bounded<R>(mut reader: R, max_bytes: usize) -> io::Result<Vec<u8>>
-where
-    R: Read,
-{
-    let mut output = Vec::new();
-    let mut buffer = [0_u8; READ_CHUNK_BYTES];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(output);
-        }
-        if output.len().saturating_add(read) > max_bytes {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("stdout exceeded max_stdout_bytes={max_bytes}"),
-            ));
-        }
-        output.extend_from_slice(&buffer[..read]);
-    }
 }
 
 fn parse_workflow_result(output: &[u8]) -> Result<GwpResult, WorkflowExecutionError> {
@@ -368,37 +345,33 @@ fn non_zero_exit_error(status: ExitStatus) -> WorkflowExecutionError {
     )
 }
 
-fn terminate_child_group(pid: u32) {
-    // Send SIGKILL to the entire process group, then to the process itself.
-    // The group kill catches descendant processes the workflow may have
-    // spawned; the direct kill handles the case where the group leader has
-    // already exited and the PGID was recycled.
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-
-    let pid_signed = i32::try_from(pid).unwrap_or(-1);
-    let group_pid = Pid::from_raw(-pid_signed);
-    let direct_pid = Pid::from_raw(pid_signed);
-    let _ignored = kill(group_pid, Signal::SIGKILL);
-    let _ignored2 = kill(direct_pid, Signal::SIGKILL);
-}
+#[cfg(test)]
+#[path = "workflow_runtime/deadline_tests.rs"]
+mod deadline_tests;
 
 #[cfg(test)]
 mod tests {
     use std::{
-        fs,
+        fs, io,
         path::{Path, PathBuf},
-        process::Command,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        process::{Child, Command},
+        thread,
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use serde_json::json;
 
-    use super::StdioRuntime;
+    use super::{StdioRuntime, workflow_process_finish_error};
+    use crate::workflow_process::{
+        WorkflowProcessFinishError,
+        test_support::{TestProcessIdentity, wait_for_current_published_identity},
+    };
     use llm_guard_proxy_core::{
         GWP_PROTOCOL_VERSION, GwpDecision, GwpHook, GwpInvocation, GwpProfile, GwpProfileKind,
         GwpTraceMode, WorkflowConfig, WorkflowRuntime,
     };
+
+    const PID_FILE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
 
     #[test]
     fn executes_allow_script() {
@@ -453,25 +426,54 @@ printf '%s\n' '{"decision":"block","risk_level":"high","tags":["policy"],"summar
     }
 
     #[test]
+    fn cleanup_deadline_exhaustion_is_classified_as_timeout() {
+        let error = workflow_process_finish_error(WorkflowProcessFinishError::Cleanup(
+            io::Error::new(io::ErrorKind::TimedOut, "injected cleanup deadline"),
+        ));
+
+        assert_eq!(error.category, "timeout");
+        assert_eq!(error.summary, "workflow process timed out");
+    }
+
+    #[test]
+    fn observed_deadline_has_priority_over_later_signal_failure() {
+        let result = workflow_process_finish_error(WorkflowProcessFinishError::DeadlineExceeded(
+            io::Error::other("signal_failed"),
+        ))
+        .into_result();
+
+        assert_eq!(
+            result.tags,
+            vec![String::from("error"), String::from("timeout")]
+        );
+    }
+
+    #[test]
     fn timeout_fails_closed_and_kills_process_group() {
+        const TIMEOUT_MS: u64 = 2_000;
         let temp = TempWorkflowDir::new("timeout");
         let child_pid_path = temp.path.join("child.pid");
         let script = temp.write_script(
             "timeout.sh",
             &format!(
-                "read ignored\nsleep 30 &\necho $! > '{}'\nwait\n",
+                "read ignored\nsleep 30 &\nchild=$!\nstart=$(awk '{{print $22}}' /proc/$child/stat)\nmarker='{}'\ntmp=\"${{marker}}.tmp.$$\"\nif [ \"$child\" -le 0 ] || [ -z \"$start\" ] || [ \"$start\" -le 0 ]; then exit 90; fi\nprintf '%s %s\\n' \"$child\" \"$start\" > \"$tmp\"\nmv -f \"$tmp\" \"$marker\"\nwait\n",
                 child_pid_path.display()
             ),
         );
+        let cleanup = TestPidFileCleanup::new(child_pid_path.clone());
+        let runtime = runtime(&script, Vec::new(), TIMEOUT_MS, 4096);
+        let invocation = invocation();
 
-        let result = runtime(&script, Vec::new(), 100, 4096).execute(&invocation());
+        thread::scope(|scope| {
+            let execution = scope.spawn(|| runtime.execute(&invocation));
+            let child_identity = cleanup
+                .wait_for_identity(Instant::now() + Duration::from_secs(1))
+                .expect("script should publish its child identity before the timeout");
+            let result = execution.join().expect("workflow execution should join");
 
-        assert_error(&result, "timeout");
-        let child_pid = fs::read_to_string(&child_pid_path)
-            .expect("script should write child pid")
-            .trim()
-            .to_owned();
-        assert_process_exits(&child_pid);
+            assert_error(&result, "timeout");
+            assert_process_exits(child_identity);
+        });
     }
 
     #[test]
@@ -485,20 +487,20 @@ printf '%s\n' '{"decision":"block","risk_level":"high","tags":["policy"],"summar
         let script = temp.write_script(
             "descendant.sh",
             &format!(
-                "read ignored\nsleep 30 >'{idle}' 2>&1 &\necho $! > '{pid}'\nprintf '%s\\n' '{{\"decision\":\"allow\",\"risk_level\":\"low\",\"tags\":[\"ok\"],\"summary\":\"ok\",\"replacement_messages\":null,\"audit\":{{\"evidence_spans\":[],\"notes\":[\"ok\"]}}}}'\n",
+                "read ignored\nsleep 30 >'{idle}' 2>&1 &\nchild=$!\nstart=$(awk '{{print $22}}' /proc/$child/stat)\nmarker='{pid}'\ntmp=\"${{marker}}.tmp.$$\"\nif [ \"$child\" -le 0 ] || [ -z \"$start\" ] || [ \"$start\" -le 0 ]; then exit 90; fi\nprintf '%s %s\\n' \"$child\" \"$start\" > \"$tmp\"\nmv -f \"$tmp\" \"$marker\"\nprintf '%s\\n' '{{\"decision\":\"allow\",\"risk_level\":\"low\",\"tags\":[\"ok\"],\"summary\":\"ok\",\"replacement_messages\":null,\"audit\":{{\"evidence_spans\":[],\"notes\":[\"ok\"]}}}}'\n",
                 idle = temp.path.join("idle.log").display(),
                 pid = child_pid_path.display()
             ),
         );
+        let cleanup = TestPidFileCleanup::new(child_pid_path.clone());
 
         let result = runtime(&script, Vec::new(), 5_000, 4096).execute(&invocation());
 
         assert_eq!(result.decision, GwpDecision::Allow);
-        let child_pid = fs::read_to_string(&child_pid_path)
-            .expect("script should write child pid")
-            .trim()
-            .to_owned();
-        assert_process_exits(&child_pid);
+        let child_identity = cleanup
+            .identity()
+            .expect("script should persist child identity");
+        assert_process_exits(child_identity);
     }
 
     #[test]
@@ -532,6 +534,55 @@ fi
 
         assert_eq!(result.decision, GwpDecision::Allow);
         assert_eq!(result.summary, "clean");
+    }
+
+    #[test]
+    fn pid_file_cleanup_retries_malformed_marker_until_atomic_identity_arrives() {
+        let temp = TempWorkflowDir::new("pid-cleanup-retry");
+        let pid_file = temp.path.join("process.identity");
+        fs::write(&pid_file, b"truncated\n").expect("malformed fixture marker should be written");
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("cleanup fixture should spawn");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut child = TestChildGuard::new(child, deadline);
+        let published = TestProcessIdentity::capture(child.pid())
+            .expect("cleanup fixture identity should be captured");
+        let cleanup = TestPidFileCleanup::new(pid_file.clone());
+        let staging_file = pid_file.with_extension("identity.tmp");
+
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                thread::sleep(Duration::from_millis(20));
+                fs::write(
+                    &staging_file,
+                    format!("{} {}\n", published.pid, published.start_time_ticks),
+                )
+                .expect("complete identity should be staged");
+                fs::rename(&staging_file, &pid_file)
+                    .expect("complete identity should be published atomically");
+            });
+            drop(cleanup);
+        });
+
+        loop {
+            match child
+                .child_mut()
+                .expect("cleanup fixture should remain armed")
+                .try_wait()
+            {
+                Ok(Some(_)) => {
+                    child.disarm();
+                    break;
+                }
+                Ok(None) => {
+                    assert!(Instant::now() < deadline, "cleanup fixture remained alive");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("cleanup fixture status failed: {error}"),
+            }
+        }
     }
 
     fn runtime(
@@ -579,29 +630,91 @@ fi
         assert!(!result.audit.notes.is_empty());
     }
 
-    fn assert_process_exits(pid: &str) {
+    fn assert_process_exits(identity: TestProcessIdentity) {
         for _attempt in 0..20 {
-            if !process_exists(pid) {
+            if !process_exists(identity) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(50));
         }
-        panic!("process {pid} should not survive workflow timeout");
+        panic!(
+            "process {} should not survive workflow timeout",
+            identity.pid
+        );
     }
 
-    #[cfg(unix)]
-    fn process_exists(pid: &str) -> bool {
-        Command::new("kill")
-            .args(["-0", pid])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success())
+    fn process_exists(identity: TestProcessIdentity) -> bool {
+        identity.is_live()
     }
 
-    #[cfg(windows)]
-    fn process_exists(_pid: &str) -> bool {
-        false
+    struct TestChildGuard {
+        child: Option<Child>,
+        cleanup_deadline: Instant,
+    }
+
+    impl TestChildGuard {
+        fn new(child: Child, cleanup_deadline: Instant) -> Self {
+            Self {
+                child: Some(child),
+                cleanup_deadline,
+            }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.as_ref().expect("child guard is armed").id()
+        }
+
+        fn child_mut(&mut self) -> Option<&mut Child> {
+            self.child.as_mut()
+        }
+
+        fn disarm(&mut self) {
+            let _child = self.child.take();
+        }
+    }
+
+    impl Drop for TestChildGuard {
+        fn drop(&mut self) {
+            let Some(child) = self.child.as_mut() else {
+                return;
+            };
+            let _killed = child.kill();
+            loop {
+                if child.try_wait().ok().flatten().is_some()
+                    || Instant::now() >= self.cleanup_deadline
+                {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    struct TestPidFileCleanup {
+        path: PathBuf,
+    }
+
+    impl TestPidFileCleanup {
+        const fn new(path: PathBuf) -> Self {
+            Self { path }
+        }
+
+        fn identity(&self) -> Option<TestProcessIdentity> {
+            self.wait_for_identity(Instant::now() + PID_FILE_CLEANUP_TIMEOUT)
+        }
+
+        fn wait_for_identity(&self, deadline: Instant) -> Option<TestProcessIdentity> {
+            wait_for_current_published_identity(&self.path, deadline)
+        }
+    }
+
+    impl Drop for TestPidFileCleanup {
+        fn drop(&mut self) {
+            let deadline = Instant::now() + PID_FILE_CLEANUP_TIMEOUT;
+            if let Some(identity) = self.wait_for_identity(deadline) {
+                identity.signal_if_live();
+            }
+        }
     }
 
     struct TempWorkflowDir {
