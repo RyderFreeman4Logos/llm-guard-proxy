@@ -1,17 +1,21 @@
 #![forbid(unsafe_code)]
 
+pub mod config_reload;
 mod embedding_backend;
 mod model_judge;
 mod proxy;
 mod replay_calibrate;
+#[cfg(feature = "guard")]
+mod workflow_runtime;
 
 use std::{ffi::OsString, fs, future::pending, path::PathBuf, process::ExitCode, time::Duration};
 
+use config_reload::ConfigManager;
+use llm_guard_proxy_core::redact_upstream_base_url;
 #[cfg(feature = "guard")]
-use llm_guard_proxy_core::BudgetStore;
-use llm_guard_proxy_core::{
-    ConfigManager, EvidenceRawArtifactKind, EvidenceStore, ObservabilityStore, RequestId,
-    redact_upstream_base_url,
+use llm_guard_proxy_state::BudgetStore;
+use llm_guard_proxy_state::{
+    EvidenceRawArtifactKind, EvidenceStore, ObservabilityStore, RequestId,
 };
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
@@ -534,7 +538,8 @@ fn parse_artifact_kind(value: &str) -> Result<EvidenceRawArtifactKind, String> {
 mod tests {
     use std::{ffi::OsString, path::Path};
 
-    use llm_guard_proxy_core::{AppConfig, HeartbeatMode, RequestId};
+    use llm_guard_proxy_core::{AppConfig, HeartbeatMode};
+    use llm_guard_proxy_state::RequestId;
 
     use super::{
         EvidenceCommand, parse_config_path, parse_evidence_command, proxy::render_health,

@@ -627,6 +627,8 @@ dependencies = [
  "futures-util",
  "lexical-core",
  "llm-guard-proxy-core",
+ "llm-guard-proxy-state",
+ "nix",
  "reqwest",
  "rusqlite",
  "serde",
@@ -639,13 +641,22 @@ dependencies = [
 name = "llm-guard-proxy-core"
 version = "0.1.0"
 dependencies = [
- "fs2",
- "nix",
- "rusqlite",
  "serde",
  "serde_json",
  "thiserror",
  "url",
+]
+
+[[package]]
+name = "llm-guard-proxy-state"
+version = "0.1.0"
+dependencies = [
+ "fs2",
+ "llm-guard-proxy-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
 ]
 
 [[package]]

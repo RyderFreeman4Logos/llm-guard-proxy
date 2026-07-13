@@ -4,9 +4,10 @@ use axum::body::Bytes;
 use bytes::BytesMut;
 use futures_util::{Stream, StreamExt};
 use llm_guard_proxy_core::{
-    DefaultInjectionSchema, NoThinkingMarkerPolicy, RawPayloadChunk, RawPayloads, StreamChannel,
-    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy,
+    DefaultInjectionSchema, NoThinkingMarkerPolicy, StreamChannel, ThinkingConfig, ThinkingMode,
+    ToolRequestThinkingPolicy,
 };
+use llm_guard_proxy_state::{RawPayloadChunk, RawPayloads};
 use serde_json::{Map, Number, Value, json};
 use tokio::time::timeout;
 

@@ -14,7 +14,9 @@ use super::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord,
     EvidenceRawArtifactKind, EvidenceStore, EvidenceStoreWrite, ShadowSkipReason,
 };
-use crate::{AttemptId, ConfigManager, RawPayloadChunk, RawPayloads, RequestId, RequestStatus};
+use llm_guard_proxy_core::{AppConfig, ConfigHandle};
+
+use crate::{AttemptId, RawPayloadChunk, RawPayloads, RequestId, RequestStatus};
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;
@@ -23,7 +25,7 @@ const TEST_PRUNE_TO_BYTES: u64 = 800_000;
 fn disabled_evidence_write_creates_no_artifacts() {
     let fixture = EvidenceFixture::new("disabled");
     let manager = fixture.manager(false, false, false, 100, None);
-    let store = EvidenceStore::open(manager.handle());
+    let store = EvidenceStore::open(manager.clone());
 
     let write = store
         .record_group(&group_record("group-disabled", 1_000), &[])
@@ -38,7 +40,7 @@ fn disabled_evidence_write_creates_no_artifacts() {
 fn content_free_evidence_records_correlated_attempts_without_raw_payloads() {
     let fixture = EvidenceFixture::new("content-free");
     let manager = fixture.manager(true, false, false, 100, None);
-    let store = EvidenceStore::open(manager.handle());
+    let store = EvidenceStore::open(manager.clone());
     let group = group_record("group-content-free", 1_000);
     let attempts = vec![
         attempt_record(
@@ -127,7 +129,7 @@ max_raw_output_bytes = 7
 max_raw_reasoning_bytes = 8
 ",
     );
-    let store = EvidenceStore::open(manager.handle());
+    let store = EvidenceStore::open(manager.clone());
     let group_id = "group-paired-raw";
     let mut max_thinking = paired_shadow_attempt(group_id, "max-thinking");
     max_thinking.raw_payloads = RawPayloads {
@@ -214,7 +216,7 @@ max_raw_reasoning_bytes = 8
 fn raw_evidence_capture_redacts_headers_and_secret_fragments() {
     let fixture = EvidenceFixture::new("raw-redaction");
     let manager = fixture.manager(true, true, true, 100, None);
-    let store = EvidenceStore::open(manager.handle());
+    let store = EvidenceStore::open(manager.clone());
     let group = group_record("group-raw", 1_000);
     let mut attempt = attempt_record(
         "group-raw",
@@ -319,7 +321,7 @@ fn raw_evidence_capture_redacts_headers_and_secret_fragments() {
 fn retention_prunes_complete_oldest_groups_and_chunks() {
     let fixture = EvidenceFixture::new("retention");
     let manager = fixture.manager(true, true, false, 4, Some(2));
-    let store = EvidenceStore::open(manager.handle());
+    let store = EvidenceStore::open(manager.clone());
 
     for index in 0..3 {
         let group_id = format!("group-retention-{index}");
@@ -384,7 +386,7 @@ max_retention_bytes = 1000000
 retention_days = 1
 ",
     );
-    let store = EvidenceStore::open(manager.handle());
+    let store = EvidenceStore::open(manager.clone());
     let mut first_attempt = paired_shadow_attempt("group-expired-raw-1", "max-thinking");
     first_attempt.raw_payloads.input = Some(String::from("expired raw input"));
     store
@@ -622,7 +624,6 @@ fn count_rows(connection: &Connection, sql: &str) -> u64 {
 
 struct EvidenceFixture {
     root: PathBuf,
-    config_path: PathBuf,
     sqlite_path: PathBuf,
     blob_cache_dir: PathBuf,
 }
@@ -634,7 +635,6 @@ impl EvidenceFixture {
         set_owner_only_dir(&root);
         set_owner_only_dir(&root.join("storage"));
         Self {
-            config_path: root.join("config.toml"),
             sqlite_path: root.join("storage").join("evidence.sqlite3"),
             blob_cache_dir: root.join("cache").join("evidence").join("blobs"),
             root,
@@ -648,7 +648,7 @@ impl EvidenceFixture {
         include_request_headers: bool,
         max_records: u64,
         prune_to_records: Option<u64>,
-    ) -> ConfigManager {
+    ) -> ConfigHandle {
         self.manager_with_extra(
             evidence_enabled,
             include_raw_payloads,
@@ -667,14 +667,12 @@ impl EvidenceFixture {
         max_records: u64,
         prune_to_records: Option<u64>,
         extra_config: &str,
-    ) -> ConfigManager {
+    ) -> ConfigHandle {
         let prune_to_records_entry = prune_to_records
             .map(|value| format!("prune_to_records = {value}\n"))
             .unwrap_or_default();
-        fs::write(
-            &self.config_path,
-            format!(
-                r#"
+        let contents = format!(
+            r#"
 [evidence]
 enabled = {evidence_enabled}
 sqlite_path = "{sqlite_path}"
@@ -687,13 +685,13 @@ max_records = {max_records}
 {prune_to_records_entry}
 {extra_config}
 "#,
-                sqlite_path = self.sqlite_path.display(),
-                blob_cache_dir = self.blob_cache_dir.display(),
-                extra_config = extra_config,
-            ),
-        )
-        .expect("config should be written");
-        ConfigManager::from_explicit_path(&self.config_path).expect("config should load")
+            sqlite_path = self.sqlite_path.display(),
+            blob_cache_dir = self.blob_cache_dir.display(),
+            extra_config = extra_config,
+        );
+        let config = AppConfig::parse(&contents).expect("config should parse");
+        config.validate().expect("config should validate");
+        ConfigHandle::new(config)
     }
 }
 

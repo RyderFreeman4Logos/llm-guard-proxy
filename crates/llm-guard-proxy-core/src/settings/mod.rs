@@ -1,7 +1,7 @@
-//! Typed configuration loading and hot reload support.
+//! Typed configuration parsing, validation, and live snapshot support.
 //!
-//! This module keeps configuration policy in the headless core so the binary,
-//! future proxy server, and tests all consume the same validated model.
+//! Filesystem sources and polling belong to the service adapter; this module
+//! contains only deterministic policy and shared validated snapshots.
 
 mod error;
 mod model;
@@ -11,7 +11,7 @@ mod reload;
 #[cfg(test)]
 mod tests;
 
-pub use error::{ConfigError, ConfigParseError, ValidationError};
+pub use error::{ConfigParseError, ValidationError};
 #[cfg(feature = "param-override")]
 pub use model::ParamOverrideConfig;
 pub use model::{
@@ -29,13 +29,7 @@ pub use model::{
 pub use model::{BudgetConfig, GuardWorkflowConfig};
 #[cfg(feature = "guard")]
 pub use model::{UnknownKeyPolicy, VirtualKeyConfig};
-pub use reload::{
-    ConfigHandle, ConfigManager, MissingConfigPolicy, ReloadOutcome, ReloadWatcher,
-    default_config_path,
-};
-
-/// Default config location relative to the user's home directory.
-pub const DEFAULT_CONFIG_RELATIVE_PATH: &str = ".config/llm-guard-proxy/config.toml";
+pub use reload::{ConfigHandle, ConfigHandleError, ReloadOutcome, apply_reloadable};
 
 /// Fields that can be changed by reloading the config file.
 pub const RELOADABLE_FIELDS: &[&str] = &[

@@ -4,11 +4,8 @@
 //! Issue #1 intentionally kept this crate small. Later issues add proxy,
 //! retry, and request-shielding behavior behind core interfaces.
 
-#[cfg(feature = "guard")]
-pub mod budget;
 pub mod context_rot;
 pub mod embedding;
-pub mod evidence;
 #[cfg(feature = "family")]
 pub mod family;
 #[cfg(feature = "guard")]
@@ -19,7 +16,6 @@ mod loop_detector;
 #[cfg(feature = "guard")]
 mod model_alias;
 pub mod model_judge;
-mod observability;
 #[cfg(feature = "guard")]
 pub mod profile;
 pub mod replay;
@@ -28,8 +24,6 @@ mod settings;
 #[cfg(feature = "guard")]
 pub mod workflow;
 
-#[cfg(feature = "guard")]
-pub use budget::{BudgetCheck, BudgetError, BudgetStore, current_budget_date};
 pub use context_rot::{
     ContextChunk, ContextRotConfig, ContextRotScorer, ContextRotSignal, DEFAULT_CONTENT_WEIGHT,
     DEFAULT_ECHO_REPEAT_COUNT, DEFAULT_ECHO_SIMILARITY_THRESHOLD, DEFAULT_MAX_CONTEXT_CHUNKS,
@@ -40,12 +34,6 @@ pub use embedding::{
     EmbeddingError, EmbeddingFuture, EmbeddingInput, EmbeddingQueue, EmbeddingQueueResult,
     EmbeddingVector, MIN_OBSERVATIONS_FOR_SIGNAL, REASONING_SIMILARITY_THRESHOLD,
     SemanticLoopConfig, SemanticLoopScorer, SemanticLoopSignal, TOOL_ARGS_SIMILARITY_THRESHOLD,
-};
-pub use evidence::{
-    EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceDatabaseStatus,
-    EvidenceError, EvidenceExportArtifact, EvidenceExportPair, EvidenceGroupRecord,
-    EvidencePruningStats, EvidenceRawArtifactKind, EvidenceRetentionUsage, EvidenceShadowRecord,
-    EvidenceStore, EvidenceStoreWrite, EvidenceSummaryRow, ShadowSkipReason,
 };
 #[cfg(feature = "family")]
 pub use family::{
@@ -75,15 +63,6 @@ pub use model_judge::{
     JudgeSeverity, JudgeSnapshot, LoopJudgeResult, LoopType, ProvenanceFact, RecommendedAction,
     SnapshotChannels, TaskKind, ToolState, WindowSpan,
 };
-pub use observability::{
-    AttemptId, AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary,
-    DownstreamMode, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram, LiveRequestEntry,
-    LiveRequestRegistry, LiveRequestState, LiveRequestSummary, ObservabilityError,
-    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloadChunk, RawPayloads, RequestId,
-    RequestMetricCount, RequestRecord, RequestStatus, RequestTerminalMetricCount,
-    RetentionPruningStats, RetentionUsage, StoreWrite, TimelineEvent, UpstreamErrorMetricCount,
-    UpstreamMode,
-};
 #[cfg(feature = "guard")]
 pub use profile::{
     BlockReason, DEFAULT_PROFILE_NAME, ProfileCheckResult, ProfileConfig, ProfileKind,
@@ -97,22 +76,21 @@ pub use risk_combiner::{CombinedRisk, DetectorKind, DetectorSignal, RiskCombiner
 #[cfg(feature = "param-override")]
 pub use settings::ParamOverrideConfig;
 pub use settings::{
-    AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
-    DEFAULT_CONFIG_RELATIVE_PATH, DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig,
-    EvidencePairedComparisonConfig, EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode,
-    HotRestartConfig, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
-    LoopGuardMode, MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy,
-    ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher,
-    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
+    AppConfig, CloudflareConfig, ConfigHandle, ConfigHandleError, ConfigParseError,
+    DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig, EvidencePairedComparisonConfig,
+    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
+    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig,
+    NoThinkingMarkerPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
+    ReloadOutcome, RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
     SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
     ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, ValidationError, default_config_path,
+    UpstreamRouteReason, UpstreamStallConfig, ValidationError, apply_reloadable,
     redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 pub use settings::{BudgetConfig, UnknownKeyPolicy, VirtualKeyConfig};
 #[cfg(feature = "guard")]
-pub use workflow::{StdioRuntime, WorkflowConfig, WorkflowRuntime};
+pub use workflow::{GuardWorkflowExecutor, WorkflowConfig, WorkflowRuntime};
 
 /// Public service name used by the binary and documentation.
 pub const SERVICE_NAME: &str = "llm-guard-proxy";

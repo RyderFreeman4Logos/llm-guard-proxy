@@ -1,20 +1,8 @@
-#[cfg(unix)]
-use std::os::unix::fs::{PermissionsExt, symlink};
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-
-use super::model::{
-    evidence_blob_cache_dir_from_xdg_cache_home, evidence_sqlite_path_from_xdg_state_home,
-};
 use super::{
-    AppConfig, ConfigManager, ConfigParseError, DefaultInjectionSchema, DownstreamDropPolicy,
-    HeartbeatMode, LoopFailurePolicy, LoopGuardMode, MissingConfigPolicy, NoThinkingMarkerPolicy,
-    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ShadowComparisonAttempt, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamRouteReason, ValidationError, parse::parse_config_text,
+    AppConfig, ConfigHandle, ConfigParseError, DefaultInjectionSchema, DownstreamDropPolicy,
+    HeartbeatMode, LoopFailurePolicy, LoopGuardMode, NoThinkingMarkerPolicy, RELOADABLE_FIELDS,
+    RESTART_REQUIRED_FIELDS, ShadowComparisonAttempt, ThinkingMode, ToolRequestThinkingPolicy,
+    UpstreamRouteReason, ValidationError, apply_reloadable, parse::parse_config_text,
     redact_upstream_base_url,
 };
 #[cfg(feature = "guard")]
@@ -27,8 +15,11 @@ use crate::{
     CHILD_SAFE_DAILY_REQUEST_LIMIT, CHILD_SAFE_MODEL_ALIAS, CHILD_SAFE_PROFILE_NAME,
     CategoryAction, FAMILY_GUARD_PACK_NAME, FamilyCategory, FamilyPolicyOutcome,
 };
+use std::path::PathBuf;
 
+#[cfg(any(feature = "guard", feature = "param-override"))]
 const GB10_DEPLOY_CONFIG: &str = include_str!("../../../../deploy/gb10/config.toml");
+#[cfg(any(feature = "guard", feature = "param-override"))]
 const GB10_DEPLOY_README: &str = include_str!("../../../../deploy/gb10/README.md");
 #[cfg(feature = "guard")]
 const CHILD_SAFE_WORKFLOW_SOURCE: &str =
@@ -514,6 +505,7 @@ thinking.default_injection_schema = "canonical"
 }
 
 #[test]
+#[cfg(feature = "param-override")]
 fn gb10_deploy_config_preserves_authoritative_topology_with_native_thinking() {
     let config = parse_config_text(GB10_DEPLOY_CONFIG).expect("GB10 deploy config should parse");
     config
@@ -596,6 +588,7 @@ fn gb10_deploy_config_preserves_authoritative_topology_with_native_thinking() {
 }
 
 #[test]
+#[cfg(feature = "param-override")]
 fn gb10_deploy_uncomment_ready_examples_parse() {
     for name in [
         "upstream-stall-recovery",
@@ -609,6 +602,7 @@ fn gb10_deploy_uncomment_ready_examples_parse() {
 }
 
 #[test]
+#[cfg(feature = "param-override")]
 fn gb10_deploy_supported_optional_fields_remain_uncomment_ready() {
     let examples = [
         "#| probe_messages = [{\"role\":\"user\",\"content\":\"deployment readiness\"}] # Custom readiness prompt",
@@ -646,6 +640,7 @@ fn gb10_deploy_supported_optional_fields_remain_uncomment_ready() {
 }
 
 #[test]
+#[cfg(feature = "param-override")]
 fn gb10_readme_evidence_replacements_parse_with_current_config() {
     let privacy_minimal = config_with_readme_evidence_replacement("privacy-minimal");
     let privacy_minimal = parse_config_text(&privacy_minimal)
@@ -694,6 +689,7 @@ fn gb10_readme_evidence_replacements_parse_with_current_config() {
     );
 }
 
+#[cfg(feature = "param-override")]
 fn config_with_readme_evidence_replacement(name: &str) -> String {
     let replacement = readme_evidence_replacement(name);
     let evidence_start = GB10_DEPLOY_CONFIG
@@ -712,6 +708,7 @@ fn config_with_readme_evidence_replacement(name: &str) -> String {
     )
 }
 
+#[cfg(feature = "param-override")]
 fn readme_evidence_replacement(name: &str) -> String {
     let begin = format!("<!-- BEGIN PARSEABLE EVIDENCE REPLACEMENT: {name} -->");
     let end = format!("<!-- END PARSEABLE EVIDENCE REPLACEMENT: {name} -->");
@@ -729,6 +726,7 @@ fn readme_evidence_replacement(name: &str) -> String {
     lines.join("\n")
 }
 
+#[cfg(feature = "param-override")]
 fn assert_deploy_example_parses(name: &str) {
     let example = deploy_config_example(name);
     let config = parse_config_text(&example)
@@ -759,6 +757,7 @@ fn assert_guard_deploy_example_uses_installed_workflow() {
     );
 }
 
+#[cfg(any(feature = "guard", feature = "param-override"))]
 fn deploy_config_example(name: &str) -> String {
     let begin = format!("# BEGIN PARSEABLE EXAMPLE: {name}");
     let end = format!("# END PARSEABLE EXAMPLE: {name}");
@@ -860,21 +859,27 @@ fn assert_default_evidence_config(config: &AppConfig) {
 }
 
 #[test]
-fn evidence_default_paths_follow_xdg_inputs_and_home_fallbacks() {
+fn parse_with_defaults_preserves_explicit_evidence_paths() {
+    let mut defaults = AppConfig::default();
+    defaults.evidence.sqlite_path = PathBuf::from("/xdg/state/evidence.sqlite3");
+    defaults.evidence.blob_cache_dir = PathBuf::from("/xdg/cache/evidence/blobs");
+
+    let config = AppConfig::parse_with_defaults(
+        r#"
+[evidence]
+sqlite_path = "~/.local/state/llm-guard-proxy/evidence.sqlite3"
+blob_cache_dir = "~/.cache/llm-guard-proxy/evidence/blobs"
+"#,
+        defaults,
+    )
+    .expect("explicit paths should parse over adapter defaults");
+
     assert_eq!(
-        evidence_sqlite_path_from_xdg_state_home(Some(PathBuf::from("/tmp/xdg-state"))),
-        PathBuf::from("/tmp/xdg-state/llm-guard-proxy/evidence.sqlite3")
-    );
-    assert_eq!(
-        evidence_blob_cache_dir_from_xdg_cache_home(Some(PathBuf::from("/tmp/xdg-cache"))),
-        PathBuf::from("/tmp/xdg-cache/llm-guard-proxy/evidence/blobs")
-    );
-    assert_eq!(
-        evidence_sqlite_path_from_xdg_state_home(None),
+        config.evidence.sqlite_path,
         PathBuf::from("~/.local/state/llm-guard-proxy/evidence.sqlite3")
     );
     assert_eq!(
-        evidence_blob_cache_dir_from_xdg_cache_home(None),
+        config.evidence.blob_cache_dir,
         PathBuf::from("~/.cache/llm-guard-proxy/evidence/blobs")
     );
 }
@@ -2576,65 +2581,6 @@ fn validates_evidence_paths_and_retention() {
     assert_eq!(error.field(), "evidence.prune_to_records");
 }
 
-#[cfg(unix)]
-#[test]
-fn validates_evidence_rejects_unsafe_parent_permissions_when_disabled() {
-    let root = unique_test_path("unsafe-evidence-parent");
-    fs::create_dir_all(&root).expect("test evidence parent should be created");
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
-        .expect("test evidence parent permissions should be configurable");
-
-    let mut config = AppConfig::default();
-    config.evidence.enabled = false;
-    config.evidence.sqlite_path = root.join("evidence.sqlite3");
-    config.evidence.blob_cache_dir = root.join("blobs");
-
-    let error = config
-        .validate()
-        .expect_err("disabled evidence should still reject unsafe parent permissions");
-
-    assert_eq!(error.field(), "evidence.sqlite_path");
-    assert!(error.message().contains("group or other users"));
-
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-        .expect("test evidence parent permissions should be restorable");
-    remove_dir_all(&root);
-}
-
-#[cfg(unix)]
-#[test]
-fn validates_evidence_rejects_symlink_path_components_when_disabled() {
-    let root = unique_test_path("symlink-evidence-path");
-    let real = root.join("real");
-    let link = root.join("link");
-    fs::create_dir_all(&real).expect("real evidence directory should be created");
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
-        .expect("root permissions should be owner-private");
-    fs::set_permissions(&real, fs::Permissions::from_mode(0o700))
-        .expect("real evidence permissions should be owner-private");
-    symlink(&real, &link).expect("test symlink should be created");
-
-    let mut config = AppConfig::default();
-    config.evidence.enabled = false;
-    config.evidence.sqlite_path = link.join("evidence.sqlite3");
-    config.evidence.blob_cache_dir = real.join("blobs");
-    let error = config
-        .validate()
-        .expect_err("disabled evidence should still reject sqlite symlink components");
-    assert_eq!(error.field(), "evidence.sqlite_path");
-    assert!(error.message().contains("symlink"));
-
-    config.evidence.sqlite_path = real.join("evidence.sqlite3");
-    config.evidence.blob_cache_dir = link.join("blobs");
-    let error = config
-        .validate()
-        .expect_err("disabled evidence should still reject blob cache symlink components");
-    assert_eq!(error.field(), "evidence.blob_cache_dir");
-    assert!(error.message().contains("symlink"));
-
-    remove_dir_all(&root);
-}
-
 #[test]
 fn validates_retry_attempt_bounds() {
     let mut config = AppConfig::default();
@@ -3042,519 +2988,68 @@ fn redacts_sensitive_upstream_query_variants_and_fragments_for_display() {
 }
 
 #[test]
-fn default_path_uses_defaults_when_file_is_absent() {
-    let path = unique_test_path("missing-default.toml");
-    let manager = ConfigManager::from_path_with_policy(&path, MissingConfigPolicy::UseDefaults)
-        .expect("missing default config should use built-in defaults");
-
-    assert_eq!(
-        manager
-            .handle()
-            .snapshot()
-            .expect("snapshot should succeed"),
-        AppConfig::default()
-    );
-}
-
-#[test]
-fn explicit_path_requires_existing_file() {
-    let path = unique_test_path("missing-explicit.toml");
-    let error = ConfigManager::from_path_with_policy(&path, MissingConfigPolicy::RequireFile)
-        .expect_err("explicit config should require a file");
-
-    assert!(error.to_string().contains("failed to read config"));
-}
-
-#[test]
-fn reload_switches_default_injection_schema_in_both_directions() {
-    let path = unique_test_path("thinking-schema-reload.toml");
-    write_config(
-        &path,
-        r#"
-[thinking]
-default_injection_schema = "canonical"
-"#,
-    );
-    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
-
-    write_config(
-        &path,
-        r#"
-[thinking]
-default_injection_schema = "vllm_native"
-"#,
-    );
-    let outcome = manager.reload().expect("vLLM native reload should succeed");
-    assert!(outcome.applied);
-    assert_eq!(
-        manager
-            .handle()
-            .snapshot()
-            .expect("snapshot should succeed")
-            .thinking
-            .default_injection_schema,
-        DefaultInjectionSchema::VllmNative
-    );
-
-    write_config(
-        &path,
-        r#"
-[thinking]
-default_injection_schema = "chat_template_kwargs"
-"#,
-    );
-    let outcome = manager.reload().expect("legacy reload should succeed");
-    assert!(outcome.applied);
-    assert_eq!(
-        manager
-            .handle()
-            .snapshot()
-            .expect("snapshot should succeed")
-            .thinking
-            .default_injection_schema,
-        DefaultInjectionSchema::ChatTemplateKwargs
-    );
-
-    remove_file(&path);
-}
-
-#[test]
-fn reload_applies_only_reloadable_fields() {
-    let path = unique_test_path("reload.toml");
-    write_config(
-        &path,
+fn config_handle_applies_reloadable_fields_and_preserves_restart_fields() {
+    let current = AppConfig::parse(
         r#"
 [server]
 port = 18009
 max_in_flight_requests = 4
-max_queued_generation_requests = 8
-generation_queue_timeout_ms = 2000
-generation_queue_full_status = 503
-max_control_plane_in_flight_requests = 3
-max_request_body_bytes = 1048576
-shutdown_drain_timeout_ms = 30000
 
 [heartbeat]
 mode = "sse"
 interval_secs = 15
-
-	[loop_guard]
-	mode = "enforce"
-	output_repeated_line_threshold = 24
-reasoning_semantic_detection_enabled = true
-reasoning_semantic_similarity_threshold_percent = 55
-reasoning_semantic_window_token_count = 24
-reasoning_semantic_minimum_token_count = 12
-reasoning_semantic_history_window_count = 16
 "#,
-    );
-    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
-
-    write_config(
-        &path,
+    )
+    .expect("current config should parse");
+    current.validate().expect("current config should validate");
+    let requested = AppConfig::parse(
         r#"
 [server]
 port = 19000
 max_in_flight_requests = 2
-max_queued_generation_requests = 1
-generation_queue_timeout_ms = 1000
-generation_queue_full_status = 429
-generation_queue_retry_after_secs = 30
-max_control_plane_in_flight_requests = 2
-max_request_body_bytes = 512
-shutdown_drain_timeout_ms = 15000
-
-[thinking]
-force_disable = true
-no_thinking_marker_policy = "respect_no_thinking_markers"
-default_injection_schema = "chat_template_kwargs"
-
-[upstream]
-request_timeout_ms = 90000
 
 [heartbeat]
 mode = "disabled"
-interval_secs = 3
-
-	[loop_guard]
-	mode = "monitor"
-	output_repeated_line_threshold = 7
-reasoning_semantic_detection_enabled = false
-reasoning_semantic_similarity_threshold_percent = 70
-reasoning_semantic_window_token_count = 32
-reasoning_semantic_minimum_token_count = 16
-reasoning_semantic_history_window_count = 20
+interval_secs = 4
 "#,
-    );
-    let outcome = manager.reload().expect("reload should succeed");
-    let snapshot = manager
-        .handle()
-        .snapshot()
-        .expect("snapshot should succeed");
+    )
+    .expect("requested config should parse");
+    requested
+        .validate()
+        .expect("requested config should validate");
+    let handle = ConfigHandle::new(current);
+
+    let outcome = handle
+        .apply_reloadable(&requested)
+        .expect("reloadable transition should succeed");
+    let snapshot = handle.snapshot().expect("snapshot should succeed");
 
     assert!(outcome.applied);
     assert_eq!(outcome.restart_required_changes.len(), 1);
     assert_eq!(outcome.restart_required_changes[0].field, "server.port");
     assert_eq!(snapshot.server.port, 18_009);
     assert_eq!(snapshot.server.max_in_flight_requests, 2);
-    assert_eq!(snapshot.server.max_queued_generation_requests, 1);
-    assert_eq!(snapshot.server.generation_queue_timeout_ms, 1_000);
-    assert_eq!(snapshot.server.generation_queue_full_status, 429);
-    assert_eq!(snapshot.server.generation_queue_retry_after_secs, Some(30));
-    assert_eq!(snapshot.server.max_control_plane_in_flight_requests, 2);
-    assert_eq!(snapshot.server.max_request_body_bytes, 512);
-    assert_eq!(snapshot.server.shutdown_drain_timeout_ms, 15_000);
-    assert!(snapshot.thinking.force_disable);
-    assert_eq!(
-        snapshot.thinking.no_thinking_marker_policy,
-        NoThinkingMarkerPolicy::RespectNoThinkingMarkers
-    );
-    assert_eq!(
-        snapshot.thinking.default_injection_schema,
-        DefaultInjectionSchema::ChatTemplateKwargs
-    );
-    assert_eq!(snapshot.upstream.request_timeout_ms, 90_000);
-    assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
-    assert_eq!(snapshot.heartbeat.interval_secs, 3);
-    assert_reloaded_loop_guard_fields(&snapshot);
-
-    remove_file(&path);
-}
-
-fn assert_reloaded_loop_guard_fields(snapshot: &AppConfig) {
-    assert_eq!(snapshot.loop_guard.mode, LoopGuardMode::Monitor);
-    assert_eq!(snapshot.loop_guard.output_repeated_line_threshold, 7);
-    assert!(!snapshot.loop_guard.reasoning_semantic_detection_enabled);
-    assert_eq!(
-        snapshot
-            .loop_guard
-            .reasoning_semantic_similarity_threshold_percent,
-        70
-    );
-    assert_eq!(
-        snapshot.loop_guard.reasoning_semantic_window_token_count,
-        32
-    );
-    assert_eq!(
-        snapshot.loop_guard.reasoning_semantic_minimum_token_count,
-        16
-    );
-    assert_eq!(
-        snapshot.loop_guard.reasoning_semantic_history_window_count,
-        20
-    );
-}
-
-#[test]
-fn reload_applies_safe_named_profile_fields_without_changing_topology() {
-    let path = unique_test_path("profile-reload.toml");
-    write_config(
-        &path,
-        r#"
-[[upstreams]]
-name = "aeon-chat"
-base_url = "http://aeon.example/v1"
-match_models = ["aeon-ultimate"]
-request_timeout_ms = 120000
-max_in_flight_requests = 4
-max_queued_generation_requests = 4
-
-[upstreams.metadata]
-context_length_override = 4096
-input_token_safety_margin = 64
-
-[upstreams.thinking]
-mode = "bounded_thinking"
-thinking_token_budget = 1024
-"#,
-    );
-    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
-
-    write_config(
-        &path,
-        r#"
-[[upstreams]]
-name = "aeon-chat"
-base_url = "http://aeon.example/v1"
-match_models = ["aeon-ultimate"]
-request_timeout_ms = 90000
-max_in_flight_requests = 8
-max_queued_generation_requests = 16
-
-[upstreams.metadata]
-context_length_override = 8192
-input_token_safety_margin = 128
-
-[upstreams.thinking]
-mode = "force_thinking"
-thinking_token_budget = 2048
-no_thinking_marker_policy = "escape_hatch_only"
-default_injection_schema = "chat_template_kwargs"
-"#,
-    );
-    let outcome = manager.reload().expect("profile reload should succeed");
-    let snapshot = manager
-        .handle()
-        .snapshot()
-        .expect("snapshot should succeed");
-    let profile = snapshot.select_upstream_profile(Some("aeon-ultimate"));
-
-    assert!(outcome.applied);
-    assert!(outcome.restart_required_changes.is_empty());
-    assert_eq!(profile.profile.request_timeout_ms, 90_000);
-    assert_eq!(profile.profile.max_in_flight_requests, Some(8));
-    assert_eq!(profile.profile.max_queued_generation_requests, Some(16));
-    assert_eq!(
-        profile.profile.metadata.context_length_override,
-        Some(8_192)
-    );
-    assert_eq!(profile.profile.metadata.input_token_safety_margin, 128);
-    assert_eq!(profile.profile.thinking.mode, ThinkingMode::ForceThinking);
-    assert_eq!(profile.profile.thinking.budget_tokens, 2_048);
-    assert_eq!(
-        profile.profile.thinking.no_thinking_marker_policy,
-        NoThinkingMarkerPolicy::EscapeHatchOnly
-    );
-    assert_eq!(
-        profile.profile.thinking.default_injection_schema,
-        DefaultInjectionSchema::ChatTemplateKwargs
-    );
-
-    remove_file(&path);
-}
-
-#[test]
-fn reload_reports_named_profile_topology_changes_without_half_updating_routes() {
-    let path = unique_test_path("profile-topology-reload.toml");
-    write_config(
-        &path,
-        r#"
-[[upstreams]]
-name = "aeon-chat"
-base_url = "http://aeon.example/v1"
-match_models = ["aeon-ultimate"]
-request_timeout_ms = 120000
-
-[upstreams.thinking]
-thinking_token_budget = 1024
-"#,
-    );
-    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
-
-    write_config(
-        &path,
-        r#"
-[[upstreams]]
-name = "aeon-chat"
-base_url = "http://new-aeon.example/v1"
-match_models = ["renamed-model"]
-request_timeout_ms = 90000
-
-[upstreams.thinking]
-thinking_token_budget = 2048
-"#,
-    );
-    let outcome = manager
-        .reload()
-        .expect("topology reload should report restart requirement");
-    let snapshot = manager
-        .handle()
-        .snapshot()
-        .expect("snapshot should succeed");
-    let old_route = snapshot.select_upstream_profile(Some("aeon-ultimate"));
-    let renamed_route = snapshot.select_upstream_profile(Some("renamed-model"));
-
-    assert!(!outcome.applied);
-    assert_eq!(outcome.restart_required_changes.len(), 1);
-    assert_eq!(
-        outcome.restart_required_changes[0].field,
-        "upstreams.topology"
-    );
-    assert_eq!(old_route.profile.name, "aeon-chat");
-    assert_eq!(old_route.profile.base_url, "http://aeon.example/v1");
-    assert_eq!(old_route.profile.thinking.budget_tokens, 1_024);
-    assert_eq!(renamed_route.profile.name, "default");
-
-    remove_file(&path);
-}
-
-#[test]
-fn reload_reports_listener_topology_changes_without_half_updating_listeners() {
-    let path = unique_test_path("listener-topology-reload.toml");
-    write_config(
-        &path,
-        r#"
-[[upstreams]]
-name = "embedding"
-base_url = "http://embedding.example/v1"
-match_models = ["embedding-model"]
-
-[[listeners]]
-name = "embedding-legacy"
-port = 18002
-allowed_upstreams = ["embedding"]
-"#,
-    );
-    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
-
-    write_config(
-        &path,
-        r#"
-[[upstreams]]
-name = "embedding"
-base_url = "http://embedding.example/v1"
-match_models = ["embedding-model"]
-
-[[listeners]]
-name = "embedding-legacy"
-port = 18003
-allowed_upstreams = ["embedding"]
-"#,
-    );
-    let outcome = manager
-        .reload()
-        .expect("listener topology reload should report restart requirement");
-    let snapshot = manager
-        .handle()
-        .snapshot()
-        .expect("snapshot should succeed");
-
-    assert!(!outcome.applied);
-    assert_eq!(outcome.restart_required_changes.len(), 1);
-    assert_eq!(
-        outcome.restart_required_changes[0].field,
-        "listeners.topology"
-    );
-    assert_eq!(snapshot.listeners[0].port, 18_002);
-
-    remove_file(&path);
-}
-
-#[test]
-fn reload_reports_match_model_topology_changes_with_delimiter_like_aliases() {
-    let path = unique_test_path("profile-topology-delimiter-reload.toml");
-    write_config(
-        &path,
-        r#"
-[[upstreams]]
-name = "aeon-chat"
-base_url = "http://aeon.example/v1"
-match_models = ["a,b"]
-
-[upstreams.thinking]
-thinking_token_budget = 1024
-"#,
-    );
-    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
-
-    write_config(
-        &path,
-        r#"
-[[upstreams]]
-name = "aeon-chat"
-base_url = "http://aeon.example/v1"
-match_models = ["a", "b"]
-
-[upstreams.thinking]
-thinking_token_budget = 1024
-"#,
-    );
-    let outcome = manager
-        .reload()
-        .expect("topology reload should report restart requirement");
-    let snapshot = manager
-        .handle()
-        .snapshot()
-        .expect("snapshot should succeed");
-    let old_route = snapshot.select_upstream_profile(Some("a,b"));
-    let split_route = snapshot.select_upstream_profile(Some("a"));
-
-    assert!(!outcome.applied);
-    assert_eq!(outcome.restart_required_changes.len(), 1);
-    assert_eq!(
-        outcome.restart_required_changes[0].field,
-        "upstreams.topology"
-    );
-    assert_eq!(old_route.profile.name, "aeon-chat");
-    assert_eq!(split_route.profile.name, "default");
-
-    remove_file(&path);
-}
-
-#[test]
-fn polling_watcher_applies_reloadable_file_changes() {
-    let path = unique_test_path("polling-reload.toml");
-    write_config(
-        &path,
-        r#"
-[server]
-port = 18009
-max_in_flight_requests = 4
-max_queued_generation_requests = 8
-generation_queue_timeout_ms = 2000
-generation_queue_full_status = 503
-max_control_plane_in_flight_requests = 3
-max_request_body_bytes = 1048576
-shutdown_drain_timeout_ms = 30000
-
-[heartbeat]
-mode = "sse"
-interval_secs = 15
-"#,
-    );
-    let manager = ConfigManager::from_explicit_path(&path).expect("initial config should load");
-    let handle = manager.handle();
-    let watcher = manager
-        .spawn_polling(Duration::from_millis(10))
-        .expect("polling watcher should start");
-
-    write_config(
-        &path,
-        r#"
-[server]
-port = 19000
-max_in_flight_requests = 2
-max_queued_generation_requests = 1
-generation_queue_timeout_ms = 1000
-generation_queue_full_status = 429
-generation_queue_retry_after_secs = 30
-max_control_plane_in_flight_requests = 2
-max_request_body_bytes = 512
-shutdown_drain_timeout_ms = 15000
-
-[heartbeat]
-mode = "disabled"
-interval_secs = 4
-"#,
-    );
-
-    let mut observed = None;
-    for _attempt in 0..50 {
-        let snapshot = handle.snapshot().expect("snapshot should succeed");
-        if snapshot.heartbeat.mode == HeartbeatMode::Disabled
-            && snapshot.heartbeat.interval_secs == 4
-        {
-            observed = Some(snapshot);
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    let snapshot = observed.expect("polling watcher should apply reload");
-    assert_eq!(snapshot.server.port, 18_009);
-    assert_eq!(snapshot.server.max_in_flight_requests, 2);
-    assert_eq!(snapshot.server.max_queued_generation_requests, 1);
-    assert_eq!(snapshot.server.generation_queue_timeout_ms, 1_000);
-    assert_eq!(snapshot.server.generation_queue_full_status, 429);
-    assert_eq!(snapshot.server.generation_queue_retry_after_secs, Some(30));
-    assert_eq!(snapshot.server.max_control_plane_in_flight_requests, 2);
-    assert_eq!(snapshot.server.max_request_body_bytes, 512);
-    assert_eq!(snapshot.server.shutdown_drain_timeout_ms, 15_000);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 4);
+}
 
-    watcher.stop().expect("watcher should stop cleanly");
-    remove_file(&path);
+#[test]
+fn pure_reload_transition_does_not_mutate_its_inputs() {
+    let current = AppConfig::default();
+    let current_max_in_flight = current.server.max_in_flight_requests;
+    let mut requested = current.clone();
+    requested.server.port = 19_000;
+    requested.server.max_in_flight_requests = 2;
+
+    let (next, outcome) = apply_reloadable(&current, &requested);
+
+    assert_eq!(current.server.port, 18_009);
+    assert_eq!(current.server.max_in_flight_requests, current_max_in_flight);
+    assert_eq!(next.server.port, 18_009);
+    assert_eq!(next.server.max_in_flight_requests, 2);
+    assert!(outcome.applied);
+    assert_eq!(outcome.restart_required_changes.len(), 1);
+    assert_eq!(outcome.restart_required_changes[0].field, "server.port");
 }
 
 #[test]
@@ -3652,30 +3147,6 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RESTART_REQUIRED_FIELDS.contains(&"evidence.blob_cache_dir"));
     #[cfg(feature = "guard")]
     assert!(RESTART_REQUIRED_FIELDS.contains(&"budget.sqlite_path"));
-}
-
-fn write_config(path: &Path, contents: &str) {
-    fs::write(path, contents).expect("test config should be writable");
-}
-
-fn unique_test_path(file_name: &str) -> PathBuf {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system time should be after unix epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!("llm-guard-proxy-{nanos}-{file_name}"))
-}
-
-fn remove_file(path: &Path) {
-    if let Err(error) = fs::remove_file(path) {
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-    }
-}
-
-fn remove_dir_all(path: &Path) {
-    if let Err(error) = fs::remove_dir_all(path) {
-        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-    }
 }
 
 fn _assert_error_types_are_send_sync() {

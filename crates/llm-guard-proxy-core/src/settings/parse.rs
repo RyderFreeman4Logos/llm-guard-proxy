@@ -73,7 +73,13 @@ enum Section {
 }
 
 pub(crate) fn parse_config_text(contents: &str) -> Result<AppConfig, ConfigParseError> {
-    let mut config = AppConfig::default();
+    parse_config_text_with_defaults(contents, AppConfig::default())
+}
+
+pub(crate) fn parse_config_text_with_defaults(
+    contents: &str,
+    mut config: AppConfig,
+) -> Result<AppConfig, ConfigParseError> {
     let mut section = Section::Root;
     let mut current_upstream_profile = None;
 
@@ -2185,7 +2191,6 @@ fn parse_u64(value: &str, line_number: usize, field: &str) -> Result<u64, Config
     })
 }
 
-#[cfg(feature = "param-override")]
 fn parse_f64(value: &str, line_number: usize, field: &str) -> Result<f64, ConfigParseError> {
     let normalized = value.replace('_', "");
     let number = normalized.parse::<f64>().map_err(|error| {

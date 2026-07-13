@@ -17,7 +17,7 @@ use super::{
     AttemptId, AttemptRecord, AttemptStatus, DownstreamMode, ObservabilityStore, RawPayloads,
     RequestId, RequestRecord, RequestStatus, StoreWrite, UpstreamMode, error::ObservabilityError,
 };
-use crate::ConfigManager;
+use llm_guard_proxy_core::{AppConfig, ConfigHandle, ReloadOutcome};
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;
@@ -102,10 +102,10 @@ fn rejects_existing_shared_parent_without_chmodding_it() {
         TEST_MAX_BYTES,
         TEST_PRUNE_TO_BYTES,
     );
-    let manager = ConfigManager::from_explicit_path(&config_path).expect("config should load");
+    let manager = config_handle_from_path(&config_path);
 
     let error =
-        ObservabilityStore::open(manager.handle()).expect_err("shared parent should be rejected");
+        ObservabilityStore::open(manager.clone()).expect_err("shared parent should be rejected");
 
     match error {
         ObservabilityError::UnsafeStoragePath { path, reason } => {
@@ -144,9 +144,9 @@ fn rejects_missing_parent_under_shared_ancestor_without_creating_it() {
         TEST_MAX_BYTES,
         TEST_PRUNE_TO_BYTES,
     );
-    let manager = ConfigManager::from_explicit_path(&config_path).expect("config should load");
+    let manager = config_handle_from_path(&config_path);
 
-    let error = ObservabilityStore::open(manager.handle())
+    let error = ObservabilityStore::open(manager.clone())
         .expect_err("shared ancestor should be rejected before directory creation");
 
     match error {
@@ -181,9 +181,9 @@ fn creates_sqlite_store_when_parent_is_missing_under_private_ancestor() {
         TEST_MAX_BYTES,
         TEST_PRUNE_TO_BYTES,
     );
-    let manager = ConfigManager::from_explicit_path(&config_path).expect("config should load");
+    let manager = config_handle_from_path(&config_path);
 
-    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("store should open");
 
     assert_eq!(
         file_mode(sqlite_path.parent().expect("sqlite parent")),
@@ -222,10 +222,10 @@ fn rejects_symlink_sqlite_path_without_chmodding_target() {
         TEST_MAX_BYTES,
         TEST_PRUNE_TO_BYTES,
     );
-    let manager = ConfigManager::from_explicit_path(&config_path).expect("config should load");
+    let manager = config_handle_from_path(&config_path);
 
     let error =
-        ObservabilityStore::open(manager.handle()).expect_err("sqlite symlink should be rejected");
+        ObservabilityStore::open(manager.clone()).expect_err("sqlite symlink should be rejected");
 
     match error {
         ObservabilityError::UnsafeStoragePath { path, reason } => {
@@ -243,7 +243,7 @@ fn rejects_symlink_sqlite_path_without_chmodding_target() {
 fn exclusive_writer_rejects_same_path_and_reopens_after_drop() {
     let fixture = StoreFixture::new("exclusive-writer");
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
-    let store = ObservabilityStore::open(manager.handle()).expect("first store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("first store should open");
     store
         .record_request(&request_record(
             "req-exclusive-writer",
@@ -265,9 +265,8 @@ fn exclusive_writer_rejects_same_path_and_reopens_after_drop() {
         TEST_MAX_BYTES,
         TEST_PRUNE_TO_BYTES,
     );
-    let alias_manager =
-        ConfigManager::from_explicit_path(&alias_config_path).expect("alias config should load");
-    let error = ObservabilityStore::open(alias_manager.handle())
+    let alias_manager = config_handle_from_path(&alias_config_path);
+    let error = ObservabilityStore::open(alias_manager.clone())
         .expect_err("second writer for the same SQLite path must be rejected");
     match error {
         ObservabilityError::WriterOwnershipHeld { path } => {
@@ -286,7 +285,7 @@ fn exclusive_writer_rejects_same_path_and_reopens_after_drop() {
         writer_lock_path.is_file(),
         "writer lock sidecar must persist"
     );
-    let reopened = ObservabilityStore::open(manager.handle())
+    let reopened = ObservabilityStore::open(manager.clone())
         .expect("writer ownership should release when the last store clone drops");
     assert_eq!(
         reopened
@@ -303,7 +302,7 @@ fn exclusive_writer_rejects_same_path_and_reopens_after_drop() {
 fn rejects_preexisting_hard_link_aliases_without_mutating_database() {
     let fixture = StoreFixture::new("writer-hard-link-existing");
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
-    let store = ObservabilityStore::open(manager.handle()).expect("initial store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("initial store should open");
     store
         .record_request(&request_record(
             "req-writer-hard-link-existing",
@@ -318,12 +317,12 @@ fn rejects_preexisting_hard_link_aliases_without_mutating_database() {
     let alias_path = fixture.storage_dir().join("hard-link-alias.sqlite3");
     fs::hard_link(&fixture.sqlite_path, &alias_path).expect("hard link should be created");
 
-    let original_error = ObservabilityStore::open(manager.handle())
+    let original_error = ObservabilityStore::open(manager.clone())
         .expect_err("original hard-link path should be rejected");
     assert_writer_link_count_error(original_error, &fixture.sqlite_path, 2);
 
     let alias_manager = fixture.manager_for_sqlite_path("hard-link-alias.toml", &alias_path);
-    let alias_error = ObservabilityStore::open(alias_manager.handle())
+    let alias_error = ObservabilityStore::open(alias_manager.clone())
         .expect_err("hard-link alias should be rejected");
     assert_writer_link_count_error(alias_error, &alias_path, 2);
 
@@ -346,7 +345,7 @@ fn rejects_preexisting_hard_link_aliases_without_mutating_database() {
 fn rejects_hard_link_alias_created_after_writer_open() {
     let fixture = StoreFixture::new("writer-hard-link-after-open");
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
-    let store = ObservabilityStore::open(manager.handle()).expect("initial store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("initial store should open");
     store
         .record_request(&request_record(
             "req-writer-hard-link-after-open",
@@ -361,7 +360,7 @@ fn rejects_hard_link_alias_created_after_writer_open() {
         fs::read(&fixture.sqlite_path).expect("database should be readable");
     let alias_manager = fixture.manager_for_sqlite_path("late-hard-link-alias.toml", &alias_path);
 
-    let alias_error = ObservabilityStore::open(alias_manager.handle())
+    let alias_error = ObservabilityStore::open(alias_manager.clone())
         .expect_err("late hard-link alias should not create a second writer");
     assert_writer_link_count_error(alias_error, &alias_path, 2);
     assert_eq!(
@@ -380,7 +379,7 @@ fn rejects_hard_link_alias_created_after_writer_open() {
 
     fs::remove_file(&alias_path).expect("hard-link alias should be removed");
     drop(store);
-    let reopened = ObservabilityStore::open(manager.handle())
+    let reopened = ObservabilityStore::open(manager.clone())
         .expect("single-link database should reopen after the owner drops");
     assert_eq!(
         reopened
@@ -409,7 +408,7 @@ fn rejects_symlink_writer_lock_without_chmodding_target() {
     symlink(&target_path, &lock_path).expect("writer lock symlink should be created");
 
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
-    let error = ObservabilityStore::open(manager.handle())
+    let error = ObservabilityStore::open(manager.clone())
         .expect_err("writer lock symlink should be rejected");
     match error {
         ObservabilityError::UnsafeStoragePath { path, reason } => {
@@ -433,11 +432,11 @@ fn writer_ownership_releases_when_store_initialization_fails() {
         .expect("invalid database fixture should be written");
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
 
-    ObservabilityStore::open(manager.handle())
+    ObservabilityStore::open(manager.clone())
         .expect_err("invalid SQLite content should fail after acquiring ownership");
     fs::remove_file(&fixture.sqlite_path).expect("invalid database should be removed");
 
-    ObservabilityStore::open(manager.handle())
+    ObservabilityStore::open(manager.clone())
         .expect("failed initialization must release writer ownership");
 }
 
@@ -629,7 +628,7 @@ fn metrics_snapshot_tracks_updates_pruning_and_reopen_exactly() {
     let fixture = StoreFixture::new("metrics-update-prune-reopen");
     let manager =
         fixture.manager_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 2);
-    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("store should open");
     let initial_request = RequestRecord {
         status: RequestStatus::Failed,
         http_status: Some(503),
@@ -722,7 +721,7 @@ fn metrics_snapshot_tracks_updates_pruning_and_reopen_exactly() {
     assert_eq!(pruned.pruning.pruned_attempts, 1);
 
     drop(store);
-    let reopened = ObservabilityStore::open(manager.handle()).expect("store should reopen");
+    let reopened = ObservabilityStore::open(manager.clone()).expect("store should reopen");
     assert_eq!(
         reopened.metrics_snapshot().expect("reopened snapshot"),
         pruned
@@ -734,7 +733,7 @@ fn metrics_snapshot_work_is_independent_of_retained_row_count() {
     let fixture = StoreFixture::new("metrics-snapshot-scaling");
     let manager =
         fixture.manager_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 1_000);
-    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("store should open");
     store
         .record_request(&request_record(
             "req-metrics-scaling-0",
@@ -849,7 +848,7 @@ fn incremental_metrics_match_sql_for_conflicts_disabled_writes_and_errors() {
     let fixture = StoreFixture::new("metrics-differential");
     let manager =
         fixture.manager_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 20);
-    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("store should open");
     let request = RequestRecord {
         status: RequestStatus::Aborted,
         http_status: Some(504),
@@ -929,11 +928,11 @@ fn incremental_metrics_match_sql_for_conflicts_disabled_writes_and_errors() {
 
 fn assert_disabled_and_failed_writes_do_not_change_metrics(
     fixture: &StoreFixture,
-    manager: &ConfigManager,
+    manager: &ConfigHandle,
     store: &ObservabilityStore,
 ) {
     fixture.write_config(false, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
-    assert!(manager.reload().expect("disable reload").applied);
+    apply_config_from_path(manager, &fixture.config_path, "disable reload");
     let before_disabled = store
         .metrics_snapshot()
         .expect("snapshot before disabled write");
@@ -955,7 +954,7 @@ fn assert_disabled_and_failed_writes_do_not_change_metrics(
     );
 
     fixture.write_config(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
-    assert!(manager.reload().expect("enable reload").applied);
+    apply_config_from_path(manager, &fixture.config_path, "enable reload");
     let missing_parent = RequestId::from_string("req-missing-parent")
         .expect("missing parent request id should be valid");
     let failed_write = attempt_record(
@@ -973,7 +972,7 @@ fn assert_disabled_and_failed_writes_do_not_change_metrics(
 fn histogram_sum_remains_reversible_after_reopen() {
     let fixture = StoreFixture::new("metrics-histogram-overflow");
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
-    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("store should open");
     let request = request_record(
         "req-metrics-histogram-overflow",
         RequestStatus::Succeeded,
@@ -998,7 +997,7 @@ fn histogram_sum_remains_reversible_after_reopen() {
     }
     drop(store);
 
-    let reopened = ObservabilityStore::open(manager.handle()).expect("store should reopen");
+    let reopened = ObservabilityStore::open(manager.clone()).expect("store should reopen");
     for attempt_number in 1..=2 {
         let replacement = AttemptRecord {
             response_metadata: BTreeMap::from([(
@@ -1357,7 +1356,7 @@ fn retention_max_records_counts_requests_and_attempts() {
         TEST_PRUNE_TO_BYTES,
         TEST_MAX_RECORDS,
     );
-    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("store should open");
 
     let first = request_record("req-record-count-old", RequestStatus::Succeeded, 1_000);
     store
@@ -1382,7 +1381,7 @@ fn retention_max_records_counts_requests_and_attempts() {
     assert_eq!(before.record_count, 8);
 
     fixture.write_config_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 5);
-    let outcome = manager.reload().expect("config reload should succeed");
+    let outcome = apply_config_from_path(&manager, &fixture.config_path, "config reload");
     assert!(outcome.applied);
 
     let second = request_record("req-record-count-new", RequestStatus::Succeeded, 2_000);
@@ -1424,7 +1423,7 @@ fn retention_max_records_prunes_to_configured_record_hysteresis() {
         10,
         6,
     );
-    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("store should open");
 
     for index in 0_u64..=10 {
         let request = request_record(
@@ -1476,7 +1475,7 @@ fn retention_default_record_hysteresis_skips_pruning_during_headroom_writes() {
     let fixture = StoreFixture::new("retention-record-hysteresis-default");
     let manager =
         fixture.manager_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 10);
-    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("store should open");
 
     for index in 0_u64..=10 {
         let request = request_record(
@@ -1536,7 +1535,7 @@ fn retention_default_record_hysteresis_skips_pruning_during_headroom_writes() {
 fn hot_reload_disabled_setting_stops_new_writes() {
     let fixture = StoreFixture::new("hot-reload-disable");
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
-    let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+    let store = ObservabilityStore::open(manager.clone()).expect("store should open");
 
     let first = request_record("req-before-disable", RequestStatus::Succeeded, 1_000);
     assert_eq!(
@@ -1545,7 +1544,7 @@ fn hot_reload_disabled_setting_stops_new_writes() {
     );
 
     fixture.write_config(false, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
-    let outcome = manager.reload().expect("reload should succeed");
+    let outcome = apply_config_from_path(&manager, &fixture.config_path, "reload");
     assert!(outcome.applied);
 
     let second = request_record("req-after-disable", RequestStatus::Succeeded, 2_000);
@@ -1597,7 +1596,7 @@ impl StoreFixture {
         prune_to_bytes: u64,
     ) -> ObservabilityStore {
         let manager = self.manager(enabled, capture_raw_payloads, max_bytes, prune_to_bytes);
-        ObservabilityStore::open(manager.handle()).expect("store should open")
+        ObservabilityStore::open(manager.clone()).expect("store should open")
     }
 
     fn manager(
@@ -1606,7 +1605,7 @@ impl StoreFixture {
         capture_raw_payloads: bool,
         max_bytes: u64,
         prune_to_bytes: u64,
-    ) -> ConfigManager {
+    ) -> ConfigHandle {
         self.manager_with_max_records(
             enabled,
             capture_raw_payloads,
@@ -1616,7 +1615,7 @@ impl StoreFixture {
         )
     }
 
-    fn manager_for_sqlite_path(&self, config_name: &str, sqlite_path: &Path) -> ConfigManager {
+    fn manager_for_sqlite_path(&self, config_name: &str, sqlite_path: &Path) -> ConfigHandle {
         let config_path = self.root.join(config_name);
         write_config_file(
             &config_path,
@@ -1626,7 +1625,7 @@ impl StoreFixture {
             TEST_MAX_BYTES,
             TEST_PRUNE_TO_BYTES,
         );
-        ConfigManager::from_explicit_path(&config_path).expect("alias config should load")
+        config_handle_from_path(&config_path)
     }
 
     fn manager_with_max_records(
@@ -1636,7 +1635,7 @@ impl StoreFixture {
         max_bytes: u64,
         prune_to_bytes: u64,
         max_records: u64,
-    ) -> ConfigManager {
+    ) -> ConfigHandle {
         self.write_config_with_max_records(
             enabled,
             capture_raw_payloads,
@@ -1644,7 +1643,7 @@ impl StoreFixture {
             prune_to_bytes,
             max_records,
         );
-        ConfigManager::from_explicit_path(&self.config_path).expect("config should load")
+        config_handle_from_path(&self.config_path)
     }
 
     fn manager_with_record_hysteresis(
@@ -1655,7 +1654,7 @@ impl StoreFixture {
         prune_to_bytes: u64,
         max_records: u64,
         prune_to_records: u64,
-    ) -> ConfigManager {
+    ) -> ConfigHandle {
         write_config_file_with_retention(
             &self.config_path,
             &self.sqlite_path,
@@ -1668,7 +1667,7 @@ impl StoreFixture {
                 prune_to_records: Some(prune_to_records),
             },
         );
-        ConfigManager::from_explicit_path(&self.config_path).expect("config should load")
+        config_handle_from_path(&self.config_path)
     }
 
     fn write_config(
@@ -1885,6 +1884,24 @@ fn writer_lock_path_for_test(sqlite_path: &Path) -> PathBuf {
     let mut lock_path = sqlite_path.as_os_str().to_os_string();
     lock_path.push(".writer.lock");
     PathBuf::from(lock_path)
+}
+
+fn config_handle_from_path(path: &Path) -> ConfigHandle {
+    let contents = fs::read_to_string(path).expect("test config should be readable");
+    let config = AppConfig::parse(&contents).expect("test config should parse");
+    config.validate().expect("test config should validate");
+    ConfigHandle::new(config)
+}
+
+fn apply_config_from_path(handle: &ConfigHandle, path: &Path, operation: &str) -> ReloadOutcome {
+    let contents = fs::read_to_string(path).expect("test config should be readable");
+    let config = AppConfig::parse(&contents).expect("test config should parse");
+    config.validate().expect("test config should validate");
+    let outcome = handle
+        .apply_reloadable(&config)
+        .expect("test config handle should update");
+    assert!(outcome.applied, "{operation} should apply a live change");
+    outcome
 }
 
 #[cfg(unix)]

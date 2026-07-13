@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::settings::HeartbeatMode;
+use llm_guard_proxy_core::HeartbeatMode;
 
 use super::model::{
     AttemptMetricCount, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram,

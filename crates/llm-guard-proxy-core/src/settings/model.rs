@@ -1,9 +1,5 @@
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashSet,
-    env, fs,
-    io::ErrorKind,
     path::{Path, PathBuf},
 };
 
@@ -24,7 +20,7 @@ use crate::profile::{ProfileKind, ShieldedBuffering};
 #[cfg(feature = "guard")]
 use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 
-use super::ValidationError;
+use super::{ConfigParseError, ValidationError};
 use serde_json::json;
 use url::Url;
 
@@ -95,6 +91,32 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
+    /// Parses the supported TOML configuration syntax without performing I/O.
+    ///
+    /// Call [`Self::validate`] before installing the returned configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigParseError`] when the input is not valid supported
+    /// configuration syntax.
+    pub fn parse(contents: &str) -> Result<Self, ConfigParseError> {
+        super::parse::parse_config_text(contents)
+    }
+
+    /// Parses configuration syntax on top of caller-supplied pure defaults.
+    ///
+    /// Adapters can use this to materialize environment-dependent defaults
+    /// before parsing while keeping parsing itself deterministic and free of
+    /// I/O. Explicit values in `contents` override `defaults`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigParseError`] when the input is not valid supported
+    /// configuration syntax.
+    pub fn parse_with_defaults(contents: &str, defaults: Self) -> Result<Self, ConfigParseError> {
+        super::parse::parse_config_text_with_defaults(contents, defaults)
+    }
+
     /// Validates cross-field and range constraints.
     ///
     /// # Errors
@@ -2116,12 +2138,6 @@ impl EvidenceConfig {
             "evidence.blob_cache_dir",
             "must include an explicit parent directory",
         )?;
-        if self.enabled || self.sqlite_path != default_evidence_sqlite_path() {
-            validate_evidence_sqlite_path(&self.sqlite_path)?;
-        }
-        if self.enabled || self.blob_cache_dir != default_evidence_blob_cache_dir() {
-            validate_evidence_blob_cache_dir(&self.blob_cache_dir)?;
-        }
         require(
             self.max_bytes > 0,
             "evidence.max_bytes",
@@ -2453,137 +2469,11 @@ fn path_has_explicit_parent(path: &Path) -> bool {
 }
 
 fn default_evidence_sqlite_path() -> PathBuf {
-    evidence_sqlite_path_from_xdg_state_home(env::var_os("XDG_STATE_HOME").map(PathBuf::from))
+    PathBuf::from("~/.local/state/llm-guard-proxy/evidence.sqlite3")
 }
 
 fn default_evidence_blob_cache_dir() -> PathBuf {
-    evidence_blob_cache_dir_from_xdg_cache_home(env::var_os("XDG_CACHE_HOME").map(PathBuf::from))
-}
-
-pub(super) fn evidence_sqlite_path_from_xdg_state_home(xdg_state_home: Option<PathBuf>) -> PathBuf {
-    xdg_state_home
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| PathBuf::from("~/.local/state"))
-        .join("llm-guard-proxy")
-        .join("evidence.sqlite3")
-}
-
-pub(super) fn evidence_blob_cache_dir_from_xdg_cache_home(
-    xdg_cache_home: Option<PathBuf>,
-) -> PathBuf {
-    xdg_cache_home
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| PathBuf::from("~/.cache"))
-        .join("llm-guard-proxy")
-        .join("evidence")
-        .join("blobs")
-}
-
-fn validate_evidence_sqlite_path(path: &Path) -> Result<(), ValidationError> {
-    const FIELD: &str = "evidence.sqlite_path";
-    let resolved = resolve_evidence_validation_path(path, FIELD)?;
-    reject_symlink_path_components(&resolved, FIELD)?;
-    if let Some(metadata) = path_metadata_if_exists(&resolved, FIELD)? {
-        require(
-            !metadata.file_type().is_symlink() && metadata.is_file(),
-            FIELD,
-            "must be a regular file when it already exists",
-        )?;
-    }
-    if let Some(parent) = resolved.parent() {
-        validate_existing_owner_private_directory(parent, FIELD)?;
-    }
-    Ok(())
-}
-
-fn validate_evidence_blob_cache_dir(path: &Path) -> Result<(), ValidationError> {
-    const FIELD: &str = "evidence.blob_cache_dir";
-    let resolved = resolve_evidence_validation_path(path, FIELD)?;
-    reject_symlink_path_components(&resolved, FIELD)?;
-    validate_existing_owner_private_directory(&resolved, FIELD)?;
-    if let Some(parent) = resolved.parent() {
-        validate_existing_owner_private_directory(parent, FIELD)?;
-    }
-    Ok(())
-}
-
-fn resolve_evidence_validation_path(
-    path: &Path,
-    field: &'static str,
-) -> Result<PathBuf, ValidationError> {
-    if path.starts_with("~") {
-        let home = env::var_os("HOME").ok_or_else(|| {
-            ValidationError::new(field, "HOME must be set when evidence path starts with ~")
-        })?;
-        let suffix = path.strip_prefix("~").unwrap_or(path);
-        return Ok(PathBuf::from(home).join(suffix));
-    }
-    Ok(path.to_path_buf())
-}
-
-fn reject_symlink_path_components(path: &Path, field: &'static str) -> Result<(), ValidationError> {
-    let mut inspected = PathBuf::new();
-    for component in path.components() {
-        inspected.push(component.as_os_str());
-        match fs::symlink_metadata(&inspected) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                return Err(ValidationError::new(
-                    field,
-                    format!(
-                        "must not contain symlink path component {}",
-                        inspected.display()
-                    ),
-                ));
-            }
-            Ok(_metadata) => {}
-            Err(error) if error.kind() == ErrorKind::NotFound => break,
-            Err(error) => {
-                return Err(ValidationError::new(
-                    field,
-                    format!("must be inspectable: {error}"),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_existing_owner_private_directory(
-    path: &Path,
-    field: &'static str,
-) -> Result<(), ValidationError> {
-    let Some(metadata) = path_metadata_if_exists(path, field)? else {
-        return Ok(());
-    };
-    require(
-        !metadata.file_type().is_symlink() && metadata.is_dir(),
-        field,
-        "existing storage parent must be a real directory",
-    )?;
-    #[cfg(unix)]
-    {
-        let mode = metadata.permissions().mode() & 0o777;
-        require(
-            mode.trailing_zeros() >= 6,
-            field,
-            "existing storage parent must not be accessible by group or other users",
-        )?;
-    }
-    Ok(())
-}
-
-fn path_metadata_if_exists(
-    path: &Path,
-    field: &'static str,
-) -> Result<Option<fs::Metadata>, ValidationError> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) => Ok(Some(metadata)),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(ValidationError::new(
-            field,
-            format!("must be inspectable: {error}"),
-        )),
-    }
+    PathBuf::from("~/.cache/llm-guard-proxy/evidence/blobs")
 }
 
 /// Thinking-budget behavior for requests that carry tool/function-calling hints.
@@ -3317,7 +3207,8 @@ pub enum HeartbeatMode {
 
 impl HeartbeatMode {
     /// Parses a persisted or operational heartbeat-mode label.
-    pub(crate) fn from_label(value: &str) -> Option<Self> {
+    #[must_use]
+    pub fn from_label(value: &str) -> Option<Self> {
         match value {
             "sse" => Some(Self::Sse),
             "json-whitespace" => Some(Self::JsonWhitespace),
