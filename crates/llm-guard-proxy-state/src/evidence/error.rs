@@ -2,14 +2,14 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use llm_guard_proxy_core::ConfigError;
+use llm_guard_proxy_core::ConfigHandleError;
 
 /// Evidence ledger storage failures.
 #[derive(Debug, Error)]
 pub enum EvidenceError {
     /// Current config could not be read.
     #[error("failed to read evidence config: {0}")]
-    Config(#[from] ConfigError),
+    Config(#[from] ConfigHandleError),
     /// HOME is required to expand a `~/` evidence path.
     #[error("could not determine home directory for evidence path")]
     HomeDirectoryUnavailable,

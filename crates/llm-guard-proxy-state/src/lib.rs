@@ -7,11 +7,13 @@
 
 #[cfg(feature = "guard")]
 pub mod budget;
+mod config_paths;
 pub mod evidence;
 mod observability;
 
 #[cfg(feature = "guard")]
 pub use budget::{BudgetCheck, BudgetError, BudgetStore, current_budget_date};
+pub use config_paths::{materialize_evidence_path_defaults, preflight_evidence_paths};
 pub use evidence::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceDatabaseStatus,
     EvidenceError, EvidenceExportArtifact, EvidenceExportPair, EvidenceGroupRecord,

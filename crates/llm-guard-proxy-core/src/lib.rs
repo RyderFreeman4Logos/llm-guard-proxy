@@ -76,16 +76,15 @@ pub use risk_combiner::{CombinedRisk, DetectorKind, DetectorSignal, RiskCombiner
 #[cfg(feature = "param-override")]
 pub use settings::ParamOverrideConfig;
 pub use settings::{
-    AppConfig, CloudflareConfig, ConfigError, ConfigHandle, ConfigManager, ConfigParseError,
-    DEFAULT_CONFIG_RELATIVE_PATH, DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig,
-    EvidencePairedComparisonConfig, EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode,
-    HotRestartConfig, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
-    LoopGuardMode, MetadataConfig, MissingConfigPolicy, NoThinkingMarkerPolicy,
-    ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ReloadOutcome, ReloadWatcher,
-    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
+    AppConfig, CloudflareConfig, ConfigHandle, ConfigHandleError, ConfigParseError,
+    DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig, EvidencePairedComparisonConfig,
+    EvidenceShadowConfig, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
+    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig,
+    NoThinkingMarkerPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
+    ReloadOutcome, RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
     SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
     ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, ValidationError, default_config_path,
+    UpstreamRouteReason, UpstreamStallConfig, ValidationError, apply_reloadable,
     redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]

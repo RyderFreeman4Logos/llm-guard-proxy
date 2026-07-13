@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod config_reload;
 mod embedding_backend;
 mod model_judge;
 mod proxy;
@@ -7,7 +8,8 @@ mod replay_calibrate;
 
 use std::{ffi::OsString, fs, future::pending, path::PathBuf, process::ExitCode, time::Duration};
 
-use llm_guard_proxy_core::{ConfigManager, redact_upstream_base_url};
+use config_reload::ConfigManager;
+use llm_guard_proxy_core::redact_upstream_base_url;
 #[cfg(feature = "guard")]
 use llm_guard_proxy_state::BudgetStore;
 use llm_guard_proxy_state::{

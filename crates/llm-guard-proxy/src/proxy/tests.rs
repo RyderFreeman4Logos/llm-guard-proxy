@@ -13,9 +13,9 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use crate::config_reload::ConfigManager;
 use axum::http::header::{AUTHORIZATION, CONNECTION, LOCATION};
 use futures_util::{Stream, StreamExt, stream};
-use llm_guard_proxy_core::ConfigManager;
 use rusqlite::{Connection, params};
 use tokio::{
     net::TcpListener,
@@ -4679,6 +4679,7 @@ thinking_mode = "force_disable"
 }
 
 #[tokio::test]
+#[cfg(feature = "param-override")]
 async fn vllm_native_retry_ladder_uses_each_budget_and_original_answer_headroom() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -4773,6 +4774,7 @@ max_tokens = 1024
     assert_vllm_native_retry_metadata(&attempts, &observed_bodies);
 }
 
+#[cfg(feature = "param-override")]
 fn assert_vllm_native_retry_bodies(observed_bodies: &[serde_json::Value]) {
     assert_eq!(observed_bodies.len(), 4);
     let budgets = [32_768_u64, 16_384, 8_192];
@@ -4803,6 +4805,7 @@ fn assert_vllm_native_retry_bodies(observed_bodies: &[serde_json::Value]) {
     assert_eq!(no_thinking["temperature"], 0.6);
 }
 
+#[cfg(feature = "param-override")]
 fn assert_vllm_native_retry_metadata(
     attempts: &[AttemptChainRow],
     observed_bodies: &[serde_json::Value],

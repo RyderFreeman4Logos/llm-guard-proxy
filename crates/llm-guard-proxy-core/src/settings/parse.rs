@@ -73,7 +73,13 @@ enum Section {
 }
 
 pub(crate) fn parse_config_text(contents: &str) -> Result<AppConfig, ConfigParseError> {
-    let mut config = AppConfig::default();
+    parse_config_text_with_defaults(contents, AppConfig::default())
+}
+
+pub(crate) fn parse_config_text_with_defaults(
+    contents: &str,
+    mut config: AppConfig,
+) -> Result<AppConfig, ConfigParseError> {
     let mut section = Section::Root;
     let mut current_upstream_profile = None;
 

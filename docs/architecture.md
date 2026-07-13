@@ -1,7 +1,7 @@
 # Architecture
 
-This document distinguishes the state boundary implemented by issue #141 from
-the remaining target ownership changes for configuration and workflow I/O.
+This document records the state and configuration-source boundaries implemented
+by issue #141 and distinguishes them from the remaining workflow-I/O target.
 
 ## Current implementation
 
@@ -21,7 +21,7 @@ llm-guard-proxy-state crate
            |
            v
 llm-guard-proxy-core crate
-  policy + config + workflow + data models
+  policy + config snapshots + workflow + data models
 ```
 
 `ProxyState` is presently a service-owned composition object. It holds the
@@ -31,9 +31,10 @@ share those bounded coordination objects; `for_listener` changes only listener
 scope.
 
 The state crate owns SQLite-backed observability and evidence stores, budget
-storage, redaction, retention, metrics, and live-request tracking. The core
-crate still owns configuration loading/reload and stdio workflow execution;
-moving those adapters to the service is outside the state-crate milestone.
+storage, redaction, retention, metrics, live-request tracking, and storage-path
+preflight. The service owns configuration-file discovery, loading, and polling.
+Core owns pure parsing, validation, immutable snapshots, and reload transitions;
+it still owns stdio workflow execution pending the final adapter extraction.
 
 ## Dependency direction
 
@@ -45,7 +46,7 @@ OpenAI-compatible clients                 Upstream model services
            | HTTP/SSE                                | HTTP/SSE
            v                                         |
 +--------------------------- service ----------------+|
-| Axum routes, CLI, listener/signal lifecycle         ||
+| Axum routes, CLI, config source, listener lifecycle ||
 | Reqwest upstream adapters                           ||
 +-----------------------------|----------------------+|
                               v                       |
@@ -55,12 +56,13 @@ OpenAI-compatible clients                 Upstream model services
 +-----------------------------|-----------------------+
                               v
 +----------------------------- core ------------------+
-| policy | configuration source/reload | stdio workflow|
-| thinking, loop detection, retry decisions, models   |
+| policy | config parse/validate/handle | stdio workflow|
+| thinking, loop detection, retry decisions, models    |
 +-----------------------------------------------------+
 
 state -> SQLite observability / SQLite evidence / budget database
-core  -> configuration files / stdio workflow processes
+service -> configuration files
+core  -> stdio workflow processes
 service -> core policy, configuration, and workflow contracts
 ```
 
@@ -69,12 +71,12 @@ that owns observability, evidence, and budget storage. It may depend on core
 contracts, but core must not depend on state or service. The service composes
 the state and core layers at the binary entry point.
 
-## Remaining target ownership
+## Ownership status
 
 | Area | Target owner | Responsibility |
 | --- | --- | --- |
 | HTTP/SSE, CLI, TCP listeners, signals | service | Translate the OpenAI-compatible protocol, manage process lifecycle, and render responses. |
-| Configuration source and reload | service | Locate/read configuration, watch or poll its source, validate new snapshots through core, and publish them to state. |
+| Configuration source and reload | service | Locate/read configuration, watch or poll its source, validate new snapshots through core and state preflight, and update the shared core handle. |
 | Upstream HTTP and embedding clients | service | Own Reqwest clients and translate upstream HTTP/SSE into core/state inputs and outputs. |
 | Stdio workflow execution | service | Implement the core workflow port with process/stdio I/O. |
 | Shared runtime and durable state | state | Own request coordination, limits, live registry, observability, evidence, budgets, SQLite access, retention, and redaction at persistence boundaries. |
@@ -116,6 +118,6 @@ retention before sensitive data reaches durable storage.
    ports, construct HTTP clients, spawn processes, or emit protocol responses.
 5. The stdio workflow adapter belongs in service; core owns only its port.
 
-The state boundary is implemented cohesively. Configuration-source and workflow
-adapter ownership remain future changes and must preserve the same dependency
-direction when implemented.
+The state and configuration-source boundaries are implemented cohesively. The
+workflow adapter remains in core until its execution port and service adapter
+can move together without changing fail-closed or subprocess semantics.
