@@ -11,7 +11,7 @@ description = "OpenAI-compatible LLM guard proxy service."
 default = ["upstream-hot-restart", "param-override"]
 upstream-hot-restart = ["llm-guard-proxy-core/upstream-hot-restart"]
 param-override = ["llm-guard-proxy-core/param-override"]
-guard = ["llm-guard-proxy-core/guard", "llm-guard-proxy-state/guard", "dep:nix"]
+guard = ["llm-guard-proxy-core/guard", "llm-guard-proxy-state/guard"]
 
 [dependencies]
 axum = "0.8"
@@ -20,7 +20,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 lexical-core = { version = "1", default-features = false, features = ["parse-floats"] }
 llm-guard-proxy-core = { path = "../llm-guard-proxy-core", default-features = false }
 llm-guard-proxy-state = { path = "../llm-guard-proxy-state", default-features = false }
-nix = { version = "0.29", features = ["signal", "process"], optional = true }
+nix = { version = "0.29", features = ["signal", "process"] }
 reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls", "stream", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }

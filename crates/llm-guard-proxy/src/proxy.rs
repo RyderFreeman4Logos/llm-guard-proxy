@@ -56,6 +56,18 @@ use llm_guard_proxy_state::{
 };
 #[cfg(feature = "guard")]
 use llm_guard_proxy_state::{BudgetError, BudgetStore, current_budget_date};
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    target_os = "linux"
+))]
+use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid};
+#[cfg(unix)]
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;
@@ -7265,7 +7277,7 @@ async fn run_local_recovery_restart_command(
         .stderr(Stdio::null());
     configure_recovery_command(&mut command);
     let mut child = match command.spawn() {
-        Ok(child) => child,
+        Ok(child) => RecoveryProcessGuard::new(child),
         Err(error) => {
             metadata.insert(
                 String::from("local_recovery_restart_status"),
@@ -7665,7 +7677,7 @@ async fn run_upstream_stall_recovery_command(
         .stderr(Stdio::null());
     configure_recovery_command(&mut command);
     let mut child = match command.spawn() {
-        Ok(child) => child,
+        Ok(child) => RecoveryProcessGuard::new(child),
         Err(error) => {
             metadata.insert(
                 String::from("upstream_stall_recovery_status"),
@@ -7678,7 +7690,17 @@ async fn run_upstream_stall_recovery_command(
             return metadata;
         }
     };
-    match timeout(policy.recovery_timeout, child.wait()).await {
+    metadata
+        .extend(wait_for_recovery_child_with_timeout(&mut child, policy.recovery_timeout).await);
+    metadata
+}
+
+async fn wait_for_recovery_child_with_timeout(
+    child: &mut RecoveryProcessGuard,
+    recovery_timeout: Duration,
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    match timeout(recovery_timeout, child.wait()).await {
         Ok(Ok(status)) => {
             metadata.insert(
                 String::from("upstream_stall_recovery_status"),
@@ -7710,10 +7732,111 @@ async fn run_upstream_stall_recovery_command(
                 String::from("upstream_stall_recovery_status"),
                 String::from("timeout_killed"),
             );
-            metadata.extend(terminate_timed_out_recovery_child(&mut child).await);
+            metadata.extend(terminate_timed_out_recovery_child(child).await);
         }
     }
     metadata
+}
+
+/// Owns a recovery child and its process group until the direct child is reaped.
+///
+/// Dropping an armed guard synchronously kills the group, then transfers direct-child reaping to
+/// a bounded OS thread so async executor workers never block during cancellation.
+struct RecoveryProcessGuard {
+    child: Option<tokio::process::Child>,
+    #[cfg(unix)]
+    process_group_id: Option<u32>,
+}
+
+impl RecoveryProcessGuard {
+    fn new(child: tokio::process::Child) -> Self {
+        Self {
+            #[cfg(unix)]
+            process_group_id: child.id(),
+            child: Some(child),
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_group_id(&self) -> Option<u32> {
+        self.process_group_id
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let Some(child) = self.child.as_mut() else {
+            return Err(std::io::Error::other("recovery child was already reaped"));
+        };
+        let result = child.wait().await;
+        if result.is_ok() {
+            self.disarm_after_reap();
+        }
+        result
+    }
+
+    /// Kills only the direct child when no validated process-group identity is available.
+    ///
+    /// The normal Unix timeout path signals the entire process group before waiting. This fallback
+    /// is used only for a missing group ID or on platforms without recovery process groups.
+    async fn kill_direct_child(&mut self) -> std::io::Result<()> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        let result = child.kill().await;
+        if result.is_ok() {
+            self.disarm_after_reap();
+        }
+        result
+    }
+
+    fn disarm_after_reap(&mut self) {
+        #[cfg(unix)]
+        {
+            self.process_group_id = None;
+        }
+        let _reaped_child = self.child.take();
+    }
+}
+
+impl Drop for RecoveryProcessGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        if let Some(process_group_id) = self.process_group_id.take() {
+            let _group_kill_sent =
+                send_recovery_process_group_signal(process_group_id, Signal::SIGKILL);
+        }
+        let _child_kill_started = child.start_kill();
+        spawn_recovery_child_reaper(child);
+    }
+}
+
+fn spawn_recovery_child_reaper(mut child: tokio::process::Child) {
+    // Tokio documents orphan-queue cleanup as best-effort with no speed or frequency guarantee.
+    // Retaining the owned child here gives cancellation a bounded `try_wait` loop; on Unix,
+    // `try_wait` reaps an exited child. If thread creation fails, `kill_on_drop` still requests
+    // direct-child termination and Tokio's orphan queue remains the best-effort fallback.
+    let _reaper = std::thread::Builder::new()
+        .name(String::from("llm-guard-recovery-reaper"))
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_status)) => return,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::Interrupted
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) | Err(_) => return,
+                }
+            }
+        });
 }
 
 #[cfg(unix)]
@@ -7726,62 +7849,41 @@ fn configure_recovery_command(_command: &mut Command) {}
 
 #[cfg(unix)]
 async fn terminate_timed_out_recovery_child(
-    child: &mut tokio::process::Child,
+    child: &mut RecoveryProcessGuard,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::from([(
         String::from("upstream_stall_recovery_timeout_cleanup_scope"),
         String::from("process_group"),
     )]);
-    let Some(pid) = child.id() else {
+    let Some(pid) = child.process_group_id() else {
         metadata.insert(
             String::from("upstream_stall_recovery_timeout_cleanup_status"),
             String::from("missing_child_pid"),
         );
-        let _kill_result = child.kill().await;
+        let _kill_result = child.kill_direct_child().await;
         return metadata;
     };
 
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_term_sent"),
-        send_recovery_process_group_signal(pid, "TERM")
-            .await
-            .to_string(),
+        send_recovery_process_group_signal(pid, Signal::SIGTERM).to_string(),
     );
     tokio::time::sleep(RECOVERY_PROCESS_GROUP_TERM_GRACE).await;
-    let child_reaped_after_term;
-    let term_child_wait_status = match child.try_wait() {
-        Ok(Some(_status)) => {
-            child_reaped_after_term = true;
-            "child_reaped_after_term"
-        }
-        Ok(None) => {
-            child_reaped_after_term = false;
-            "child_still_running_after_term"
-        }
-        Err(_error) => {
-            child_reaped_after_term = false;
-            "child_wait_failed_after_term"
-        }
-    };
+    // WNOWAIT keeps the leader PID reserved until the final group signal, so
+    // numeric PID reuse cannot redirect SIGKILL to an unrelated process group.
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_term_child_wait_status"),
-        String::from(term_child_wait_status),
+        String::from(observe_recovery_child_without_reaping(pid)),
     );
 
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_kill_sent"),
-        send_recovery_process_group_signal(pid, "KILL")
-            .await
-            .to_string(),
+        send_recovery_process_group_signal(pid, Signal::SIGKILL).to_string(),
     );
-    let cleanup_status = if child_reaped_after_term {
-        "group_killed_after_child_reaped"
-    } else {
-        match timeout(RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE, child.wait()).await {
-            Ok(Ok(_status)) => "terminated_after_kill",
-            Ok(Err(_error)) => "wait_failed_after_kill",
-            Err(_elapsed) => "wait_timeout_after_kill",
-        }
+    let cleanup_status = match timeout(RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE, child.wait()).await {
+        Ok(Ok(_status)) => "terminated_after_kill",
+        Ok(Err(_error)) => "wait_failed_after_kill",
+        Err(_elapsed) => "wait_timeout_after_kill",
     };
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_cleanup_status"),
@@ -7792,7 +7894,7 @@ async fn terminate_timed_out_recovery_child(
 
 #[cfg(not(unix))]
 async fn terminate_timed_out_recovery_child(
-    child: &mut tokio::process::Child,
+    child: &mut RecoveryProcessGuard,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::from([(
         String::from("upstream_stall_recovery_timeout_cleanup_scope"),
@@ -7800,23 +7902,55 @@ async fn terminate_timed_out_recovery_child(
     )]);
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_cleanup_status"),
-        child.kill().await.is_ok().to_string(),
+        child.kill_direct_child().await.is_ok().to_string(),
     );
     metadata
 }
 
 #[cfg(unix)]
-async fn send_recovery_process_group_signal(pid: u32, signal: &str) -> bool {
-    Command::new("kill")
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{pid}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await
-        .is_ok_and(|status| status.success())
+fn send_recovery_process_group_signal(pid: u32, signal: Signal) -> bool {
+    let Ok(process_group_id) = i32::try_from(pid) else {
+        return false;
+    };
+    if process_group_id == 0 {
+        return false;
+    }
+    kill(Pid::from_raw(-process_group_id), signal).is_ok()
+}
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "haiku",
+    target_os = "linux"
+))]
+fn observe_recovery_child_without_reaping(pid: u32) -> &'static str {
+    let Ok(pid) = i32::try_from(pid) else {
+        return "invalid_child_pid";
+    };
+    if pid == 0 {
+        return "invalid_child_pid";
+    }
+    let flags = WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT;
+    match waitid(Id::Pid(Pid::from_raw(pid)), flags) {
+        Ok(WaitStatus::Exited(..) | WaitStatus::Signaled(..)) => "child_exited_unreaped_after_term",
+        Ok(WaitStatus::StillAlive) => "child_still_running_after_term",
+        Ok(_) => "child_state_changed_unreaped_after_term",
+        Err(_) => "child_wait_failed_after_term",
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "haiku",
+        target_os = "linux"
+    ))
+))]
+fn observe_recovery_child_without_reaping(_pid: u32) -> &'static str {
+    "child_state_unavailable_before_kill"
 }
 
 async fn start_shielded_attempt(

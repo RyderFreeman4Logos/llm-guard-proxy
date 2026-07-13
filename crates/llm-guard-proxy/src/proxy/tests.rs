@@ -13,6 +13,12 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(unix)]
+use nix::{
+    sys::signal::{Signal, kill},
+    unistd::Pid,
+};
+
 use crate::config_reload::ConfigManager;
 use axum::http::header::{AUTHORIZATION, CONNECTION, LOCATION};
 use futures_util::{Stream, StreamExt, stream};
@@ -5914,10 +5920,232 @@ async fn upstream_stall_recovery_joiner_uses_completed_state_after_lost_notifica
 
 #[cfg(unix)]
 #[tokio::test]
-async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
-    let test_dir = unique_test_dir("recovery-process-group");
+async fn upstream_stall_recovery_command_wiring_times_out_and_cleans_process_group() {
+    let policy = UpstreamStallPolicy {
+        enabled: true,
+        first_chunk_timeout: Duration::from_millis(50),
+        idle_timeout: Duration::from_millis(50),
+        recovery_command: vec![
+            String::from("/bin/sh"),
+            String::from("-c"),
+            String::from("while :; do sleep 1; done"),
+        ],
+        recovery_timeout: Duration::from_millis(1),
+        recovery_cooldown: Duration::from_millis(1),
+        recovery_budget_window: Duration::from_secs(60),
+        recovery_max_per_window: 2,
+    };
+
+    let metadata = timeout(
+        Duration::from_secs(2),
+        run_upstream_stall_recovery_command(&policy),
+    )
+    .await
+    .expect("production recovery command cleanup should complete within its bounded grace");
+
+    assert_eq!(metadata["upstream_stall_recovery_ran"], "true");
+    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_term_sent"],
+        "true"
+    );
+    assert_ne!(
+        metadata["upstream_stall_recovery_timeout_cleanup_status"],
+        "wait_timeout_after_kill"
+    );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_cleanup_scope"],
+        "process_group"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_fixture_helpers_are_raii_bounded() {
+    let fixture = RecoveryProcessFixture::spawn_shell("while :; do sleep 1; done");
+    drop(fixture);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_process_group_signal_uses_typed_in_process_api() {
+    let fixture = RecoveryProcessFixture::spawn_shell("while :; do sleep 1; done");
+
+    assert!(send_recovery_process_group_signal(
+        fixture.process_group_id,
+        Signal::SIGTERM,
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn process_cleanup_refuses_changed_start_time_identity() {
+    let fixture = RecoveryProcessFixture::spawn_shell("while :; do sleep 1; done");
+    let identity = LinuxProcessIdentity::capture(fixture.process_group_id)
+        .expect("fixture process identity should be readable");
+    let stale_identity = LinuxProcessIdentity {
+        start_time_ticks: identity.start_time_ticks ^ 1,
+        ..identity
+    };
+
+    kill_process_if_running(stale_identity);
+
+    assert!(identity.is_running());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recovery_wait_abort_after_readiness_reaps_group_leader() {
+    let test_dir = unique_test_dir("recovery abort leader's path");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
+    let leader_pid_path = test_dir.join("leader.pid");
+    let ready_path = test_dir.join("leader.ready");
+    let script_path = test_dir.join("leader.sh");
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > \"$1\"\n: > \"$2\"\nwhile :; do sleep 1; done\n",
+    )
+    .expect("test recovery script should be written");
+
+    let fixture = RecoveryProcessFixture::spawn_with_args(
+        &script_path,
+        &[leader_pid_path.as_path(), ready_path.as_path()],
+    );
+    let leader = read_pid_file_after_ready(&leader_pid_path, &ready_path).await;
+    assert_eq!(leader.pid, fixture.process_group_id);
+    let waiting = tokio::spawn(fixture.wait_with_timeout(Duration::from_secs(30)));
+    tokio::task::yield_now().await;
+
+    waiting.abort();
+    assert!(
+        waiting
+            .await
+            .expect_err("aborted recovery wait should be cancelled")
+            .is_cancelled()
+    );
+
+    assert_process_reaped(leader).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recovery_wait_abort_after_readiness_kills_descendant() {
+    let test_dir = unique_test_dir("recovery abort descendant's path");
+    remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
+    let descendant_pid_path = test_dir.join("descendant.pid");
+    let ready_path = test_dir.join("descendant.ready");
+    let script_path = test_dir.join("descendant.sh");
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nset -eu\nsleep 30 &\ndescendant_pid=$!\nprintf '%s\\n' \"$descendant_pid\" > \"$1\"\n: > \"$2\"\nwait \"$descendant_pid\"\n",
+    )
+    .expect("test recovery script should be written");
+
+    let fixture = RecoveryProcessFixture::spawn_with_args(
+        &script_path,
+        &[descendant_pid_path.as_path(), ready_path.as_path()],
+    );
+    let leader = LinuxProcessIdentity::capture(fixture.process_group_id)
+        .expect("fixture process identity should be readable");
+    let descendant = read_pid_file_after_ready(&descendant_pid_path, &ready_path).await;
+    let waiting = tokio::spawn(fixture.wait_with_timeout(Duration::from_secs(30)));
+    tokio::task::yield_now().await;
+
+    waiting.abort();
+    assert!(
+        waiting
+            .await
+            .expect_err("aborted recovery wait should be cancelled")
+            .is_cancelled()
+    );
+
+    assert_process_reaped(leader).await;
+    assert_process_not_running(descendant).await;
+}
+
+#[cfg(unix)]
+struct RecoveryProcessFixture {
+    child: RecoveryProcessGuard,
+    process_group_id: u32,
+}
+
+#[cfg(unix)]
+struct TestDirectoryCleanup(PathBuf);
+
+#[cfg(unix)]
+impl TestDirectoryCleanup {
+    fn new(path: &Path) -> Self {
+        Self(path.to_path_buf())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TestDirectoryCleanup {
+    fn drop(&mut self) {
+        remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
+impl RecoveryProcessFixture {
+    fn spawn_with_args(program: &Path, args: &[&Path]) -> Self {
+        let mut command = Command::new("/bin/sh");
+        command.arg(program).args(args);
+        Self::spawn_command(&mut command)
+    }
+
+    fn spawn_shell(script: &str) -> Self {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        Self::spawn_command(&mut command)
+    }
+
+    fn spawn_command(command: &mut Command) -> Self {
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_recovery_command(command);
+        let child = command.spawn().expect("fixture child should spawn");
+        let process_group_id = child.id().expect("fixture child should have a PID");
+        Self {
+            child: RecoveryProcessGuard::new(child),
+            process_group_id,
+        }
+    }
+
+    async fn wait_with_timeout(mut self, recovery_timeout: Duration) -> BTreeMap<String, String> {
+        wait_for_recovery_child_with_timeout(&mut self.child, recovery_timeout).await
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_child_timeout_cleanup_can_be_exercised_after_fixture_readiness() {
+    for _ in 0..8 {
+        let fixture = RecoveryProcessFixture::spawn_shell("while :; do sleep 1; done");
+        let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
+
+        assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+        assert_eq!(
+            metadata["upstream_stall_recovery_timeout_cleanup_scope"],
+            "process_group"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
+    let test_dir = unique_test_dir("recovery descendant's process group");
+    remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
     let child_pid_path = test_dir.join("child.pid");
     let ready_path = test_dir.join("child.ready");
     let script_path = test_dir.join("spawn-descendant.sh");
@@ -5925,36 +6153,18 @@ async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
     // full-suite scheduler delay cannot race the recovery timeout.
     fs::write(
         &script_path,
-        format!(
-            "#!/bin/sh\nset -eu\nsleep 30 &\nchild_pid=$!\nprintf '%s\\n' \"$child_pid\" > {pid}\n: > {ready}\nsleep 30\n",
-            pid = child_pid_path.display(),
-            ready = ready_path.display()
-        ),
+        "#!/bin/sh\nset -eu\nsleep 30 &\nchild_pid=$!\nprintf '%s\\n' \"$child_pid\" > \"$1\"\n: > \"$2\"\nsleep 30\n",
     )
     .expect("test recovery script should be written");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("test recovery script should be executable");
 
-    let policy = UpstreamStallPolicy {
-        enabled: true,
-        first_chunk_timeout: Duration::from_millis(50),
-        idle_timeout: Duration::from_millis(50),
-        recovery_command: vec![script_path.display().to_string()],
-        // Startup allowance is separate from the timeout behavior under test:
-        // scripts still sleep far longer than this bound so recovery must kill.
-        recovery_timeout: Duration::from_secs(2),
-        recovery_cooldown: Duration::from_millis(1),
-        recovery_budget_window: Duration::from_secs(60),
-        recovery_max_per_window: 1,
-    };
-    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
-
-    // Observe readiness in parallel with recovery so suite-load kill cleanup
-    // cannot hide the PID file before the post-wait reader starts.
-    let (metadata, child_pid) = tokio::join!(
-        run_upstream_stall_recovery(&policy, &coordinator),
-        read_pid_file_after_ready(&child_pid_path, &ready_path)
+    let fixture = RecoveryProcessFixture::spawn_with_args(
+        &script_path,
+        &[child_pid_path.as_path(), ready_path.as_path()],
     );
+    let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
+    let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
@@ -5965,97 +6175,79 @@ async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
     remove_dir_all(&test_dir);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process_group() {
-    let test_dir = unique_test_dir("recovery-term-resistant-process-group");
+    let test_dir = unique_test_dir("recovery term-resistant descendant's path");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
     let child_pid_path = test_dir.join("child.pid");
     let ready_path = test_dir.join("child.ready");
     let script_path = test_dir.join("spawn-term-resistant-descendant.sh");
     fs::write(
         &script_path,
-        format!(
-            "#!/bin/sh\nset -eu\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > {pid}; : > {ready}; while :; do sleep 1; done' &\n# Parent waits for the descendant readiness handshake before sleeping so suite\n# load cannot kill the group before the PID under test exists.\nwhile [ ! -f {ready} ]; do sleep 0.01; done\nsleep 30\n",
-            pid = child_pid_path.display(),
-            ready = ready_path.display()
-        ),
+        "#!/bin/sh\nset -eu\ntrap 'exit 0' TERM\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"$1\"; : > \"$2\"; while :; do sleep 1; done' _ \"$1\" \"$2\" &\n# Parent waits for the descendant readiness handshake before sleeping so suite\n# load cannot kill the group before the PID under test exists.\nwhile [ ! -f \"$2\" ]; do sleep 0.01; done\nsleep 30\n",
     )
     .expect("test recovery script should be written");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("test recovery script should be executable");
 
-    let policy = UpstreamStallPolicy {
-        enabled: true,
-        first_chunk_timeout: Duration::from_millis(50),
-        idle_timeout: Duration::from_millis(50),
-        recovery_command: vec![script_path.display().to_string()],
-        recovery_timeout: Duration::from_secs(2),
-        recovery_cooldown: Duration::from_millis(1),
-        recovery_budget_window: Duration::from_secs(60),
-        recovery_max_per_window: 1,
-    };
-    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
-
-    let (metadata, child_pid) = tokio::join!(
-        run_upstream_stall_recovery(&policy, &coordinator),
-        read_pid_file_after_ready(&child_pid_path, &ready_path)
+    let fixture = RecoveryProcessFixture::spawn_with_args(
+        &script_path,
+        &[child_pid_path.as_path(), ready_path.as_path()],
     );
+    let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
+    let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
         metadata["upstream_stall_recovery_timeout_cleanup_scope"],
         "process_group"
     );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_term_child_wait_status"],
+        "child_exited_unreaped_after_term"
+    );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_cleanup_status"],
+        "terminated_after_kill"
+    );
     assert_process_not_running(child_pid).await;
     remove_dir_all(&test_dir);
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_before_join_timeout() {
-    let test_dir = unique_test_dir("recovery-term-resistant-group-leader");
+    let test_dir = unique_test_dir("recovery term-resistant leader's path");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
     let child_pid_path = test_dir.join("child.pid");
     let ready_path = test_dir.join("child.ready");
     let script_path = test_dir.join("term-resistant-leader.sh");
     fs::write(
         &script_path,
-        format!(
-            "#!/bin/sh\nset -eu\ntrap '' TERM\nprintf '%s\\n' \"$$\" > {pid}\n: > {ready}\nwhile :; do sleep 1; done\n",
-            pid = child_pid_path.display(),
-            ready = ready_path.display()
-        ),
+        "#!/bin/sh\nset -eu\ntrap '' TERM\nprintf '%s\\n' \"$$\" > \"$1\"\n: > \"$2\"\nwhile :; do sleep 1; done\n",
     )
     .expect("test recovery script should be written");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("test recovery script should be executable");
 
-    let policy = UpstreamStallPolicy {
-        enabled: true,
-        first_chunk_timeout: Duration::from_millis(50),
-        idle_timeout: Duration::from_millis(50),
-        recovery_command: vec![script_path.display().to_string()],
-        recovery_timeout: Duration::from_secs(2),
-        recovery_cooldown: Duration::from_millis(1),
-        recovery_budget_window: Duration::from_secs(60),
-        recovery_max_per_window: 1,
-    };
-    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
-
-    let (metadata, child_pid) = tokio::join!(
-        run_upstream_stall_recovery(&policy, &coordinator),
-        read_pid_file_after_ready(&child_pid_path, &ready_path)
+    let fixture = RecoveryProcessFixture::spawn_with_args(
+        &script_path,
+        &[child_pid_path.as_path(), ready_path.as_path()],
     );
+    let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
+    let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
     if metadata
         .get("upstream_stall_recovery_status")
         .map(String::as_str)
         != Some("timeout_killed")
     {
-        kill_process_if_running(child_pid).await;
+        kill_process_if_running(child_pid);
     }
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
@@ -19677,8 +19869,35 @@ fn remove_dir_all(path: &Path) {
     }
 }
 
-#[cfg(unix)]
-async fn read_pid_file_after_ready(pid_path: &Path, ready_path: &Path) -> u32 {
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+struct LinuxProcessIdentity {
+    pid: u32,
+    start_time_ticks: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxProcessIdentity {
+    fn capture(pid: u32) -> Option<Self> {
+        let (_state, start_time_ticks) = linux_process_state_and_start_time(pid)?;
+        if start_time_ticks == 0 {
+            return None;
+        }
+        Some(Self {
+            pid,
+            start_time_ticks,
+        })
+    }
+
+    fn is_running(self) -> bool {
+        linux_process_state_and_start_time(self.pid).is_some_and(|(state, start_time_ticks)| {
+            state != 'Z' && start_time_ticks == self.start_time_ticks
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn read_pid_file_after_ready(pid_path: &Path, ready_path: &Path) -> LinuxProcessIdentity {
     // Suite-load scheduling can delay shell startup well beyond 200ms.
     // Wait long enough for the readiness handshake, but fail closed with
     // cleanup-friendly diagnostics if the fixture still never appears.
@@ -19686,7 +19905,9 @@ async fn read_pid_file_after_ready(pid_path: &Path, ready_path: &Path) -> u32 {
         if ready_path.exists() {
             if let Ok(text) = fs::read_to_string(pid_path) {
                 if let Ok(pid) = text.trim().parse::<u32>() {
-                    return pid;
+                    if let Some(identity) = LinuxProcessIdentity::capture(pid) {
+                        return identity;
+                    }
                 }
             }
         }
@@ -19699,45 +19920,49 @@ async fn read_pid_file_after_ready(pid_path: &Path, ready_path: &Path) -> u32 {
     );
 }
 
-#[cfg(unix)]
-async fn assert_process_not_running(pid: u32) {
+#[cfg(target_os = "linux")]
+async fn assert_process_not_running(identity: LinuxProcessIdentity) {
     for _ in 0..20 {
-        match linux_process_state(pid) {
-            None | Some('Z') => return,
-            Some(_) => sleep(Duration::from_millis(50)).await,
+        if !identity.is_running() {
+            return;
         }
+        sleep(Duration::from_millis(50)).await;
     }
-    let _ = tokio::process::Command::new("kill")
-        .arg("-KILL")
-        .arg(pid.to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
-    panic!("process {pid} still appears to be running");
+    kill_process_if_running(identity);
+    panic!("process {} still appears to be running", identity.pid);
 }
 
-#[cfg(unix)]
-async fn kill_process_if_running(pid: u32) {
-    if matches!(linux_process_state(pid), None | Some('Z')) {
+#[cfg(target_os = "linux")]
+async fn assert_process_reaped(identity: LinuxProcessIdentity) {
+    for _ in 0..20 {
+        if linux_process_state_and_start_time(identity.pid).is_none() {
+            return;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    kill_process_if_running(identity);
+    panic!("process {} was not reaped", identity.pid);
+}
+
+#[cfg(target_os = "linux")]
+fn kill_process_if_running(identity: LinuxProcessIdentity) {
+    if !identity.is_running() {
         return;
     }
-    let _ = tokio::process::Command::new("kill")
-        .arg("-KILL")
-        .arg(pid.to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .await;
+    let Ok(pid) = i32::try_from(identity.pid) else {
+        return;
+    };
+    let _signal_result = kill(Pid::from_raw(pid), Signal::SIGKILL);
 }
 
-#[cfg(unix)]
-fn linux_process_state(pid: u32) -> Option<char> {
+#[cfg(target_os = "linux")]
+fn linux_process_state_and_start_time(pid: u32) -> Option<(char, u64)> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let (_prefix, suffix) = stat.rsplit_once(") ")?;
-    suffix.chars().next()
+    let state = suffix.chars().next()?;
+    // The suffix starts at field 3 (state); starttime is field 22.
+    let start_time_ticks = suffix.split_whitespace().nth(19)?.parse().ok()?;
+    Some((state, start_time_ticks))
 }
 
 async fn assert_no_upstream_request(fake: &mut FakeUpstream) {

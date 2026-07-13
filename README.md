@@ -1,5 +1,7 @@
 # llm-guard-proxy
 
+Supported platform: Linux. Windows and macOS are not supported targets.
+
 `llm-guard-proxy` is an Apache-2.0 Rust OpenAI-compatible guard proxy for local and GB10 vLLM deployments.
 
 The proxy sits between OpenAI-compatible clients and an upstream LLM service so debuggability, retries, loop protection, heartbeat behavior, and observability can be added without changing model quality.
