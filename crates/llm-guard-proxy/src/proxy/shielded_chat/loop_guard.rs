@@ -3,9 +3,10 @@ use std::{collections::BTreeMap, fmt};
 use axum::body::Bytes;
 use llm_guard_proxy_core::{
     ChannelizedLoopDetector, DetectorSummary, LoopDetector as CoreLoopDetector, LoopDetectorInput,
-    LoopGuardConfig, LoopGuardMode, LoopInputProfile, LoopSignal, RawPayloads, StreamChannel,
+    LoopGuardConfig, LoopGuardMode, LoopInputProfile, LoopSignal, StreamChannel,
     ToolCallFingerprintInput,
 };
+use llm_guard_proxy_state::RawPayloads;
 
 /// Stream aggregation failure with bounded response metadata for observability.
 #[derive(Clone, Debug)]

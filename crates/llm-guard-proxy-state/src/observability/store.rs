@@ -35,7 +35,7 @@ use super::{
         sanitize_raw_payloads,
     },
 };
-use crate::{ConfigHandle, RetentionConfig};
+use llm_guard_proxy_core::{ConfigHandle, RetentionConfig};
 
 const SCHEMA_VERSION: i64 = 2;
 #[cfg(test)]

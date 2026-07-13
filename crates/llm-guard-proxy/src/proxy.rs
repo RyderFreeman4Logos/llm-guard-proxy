@@ -36,24 +36,26 @@ use llm_guard_proxy_core::HotRestartConfig;
 use llm_guard_proxy_core::ParamOverrideConfig;
 #[cfg(feature = "guard")]
 use llm_guard_proxy_core::{
-    AliasTarget, BlockReason, BudgetError, BudgetStore, DEFAULT_PROFILE_NAME, GWP_PROTOCOL_VERSION,
-    GuardExecutor, GuardOutcome, GwpDecision, GwpHook, GwpInvocation, GwpResult, GwpTraceMode,
-    ModelAliasResolver, ProfileCheckResult, ProfileConfig, StdioRuntime, UnknownKeyPolicy,
-    current_budget_date,
+    AliasTarget, BlockReason, DEFAULT_PROFILE_NAME, GWP_PROTOCOL_VERSION, GuardExecutor,
+    GuardOutcome, GwpDecision, GwpHook, GwpInvocation, GwpResult, GwpTraceMode, ModelAliasResolver,
+    ProfileCheckResult, ProfileConfig, StdioRuntime, UnknownKeyPolicy,
 };
 use llm_guard_proxy_core::{
-    AppConfig, AttemptId, AttemptRecord, AttemptStatus, ConfigHandle, DebugRequestSummary,
-    DefaultInjectionSchema, DownstreamDropPolicy, DownstreamMode, EvidenceAttemptRecord,
-    EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord, EvidenceStore,
-    EvidenceStoreWrite, Health, HeartbeatMode, LICENSE, LatencyHistogram, ListenerConfig,
-    LiveRequestEntry, LiveRequestRegistry, LiveRequestState, LiveRequestSummary,
-    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, MetadataConfig,
-    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloads, RequestId, RequestRecord,
-    RequestStatus, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
-    ShadowComparisonAttempt, ShadowSkipReason, ThinkingConfig, ThinkingMode, UpstreamMode,
-    UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url,
-    validate_upstream_base_url,
+    AppConfig, ConfigHandle, DefaultInjectionSchema, DownstreamDropPolicy, Health, HeartbeatMode,
+    LICENSE, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
+    MetadataConfig, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
+    ShadowComparisonAttempt, ThinkingConfig, ThinkingMode, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
+use llm_guard_proxy_state::{
+    AttemptId, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
+    EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord,
+    EvidenceStore, EvidenceStoreWrite, LatencyHistogram, LiveRequestEntry, LiveRequestRegistry,
+    LiveRequestState, LiveRequestSummary, ObservabilityMetricsSnapshot, ObservabilityStore,
+    RawPayloads, RequestId, RequestRecord, RequestStatus, ShadowSkipReason, UpstreamMode,
+};
+#[cfg(feature = "guard")]
+use llm_guard_proxy_state::{BudgetError, BudgetStore, current_budget_date};
 use reqwest::{Client, Url};
 use serde_json::json;
 use thiserror::Error;

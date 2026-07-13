@@ -3317,7 +3317,8 @@ pub enum HeartbeatMode {
 
 impl HeartbeatMode {
     /// Parses a persisted or operational heartbeat-mode label.
-    pub(crate) fn from_label(value: &str) -> Option<Self> {
+    #[must_use]
+    pub fn from_label(value: &str) -> Option<Self> {
         match value {
             "sse" => Some(Self::Sse),
             "json-whitespace" => Some(Self::JsonWhitespace),

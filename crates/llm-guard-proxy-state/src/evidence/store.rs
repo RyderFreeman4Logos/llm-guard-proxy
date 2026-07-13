@@ -21,7 +21,9 @@ use super::{
     },
     redaction::{evidence_metadata_map, sanitize_raw_payloads, scrub_optional_text},
 };
-use crate::{ConfigHandle, RawPayloads};
+use llm_guard_proxy_core::{ConfigHandle, EvidenceConfig};
+
+use crate::RawPayloads;
 
 const SCHEMA_VERSION: i64 = 2;
 const SHA256_HEX_LEN: usize = 64;
@@ -355,7 +357,7 @@ impl PreparedAttempt {
     fn from_record(
         record: &EvidenceAttemptRecord,
         include_headers: bool,
-        config: &crate::EvidenceConfig,
+        config: &EvidenceConfig,
     ) -> Result<Self, EvidenceError> {
         require_nonempty(&record.group_id, "group")?;
         let request_metadata = evidence_metadata_map(&record.request_metadata, include_headers);
@@ -459,7 +461,7 @@ impl RawCapturePolicy {
         include_chunks: true,
     };
 
-    fn from_record(record: &EvidenceAttemptRecord, config: &crate::EvidenceConfig) -> Self {
+    fn from_record(record: &EvidenceAttemptRecord, config: &EvidenceConfig) -> Self {
         if config.include_raw_payloads {
             return Self::UNBOUNDED_ALL;
         }
@@ -1364,7 +1366,7 @@ impl RetentionPruneOutcome {
 
 fn enforce_retention(
     connection: &mut Connection,
-    config: &crate::EvidenceConfig,
+    config: &EvidenceConfig,
 ) -> Result<RetentionPruneOutcome, EvidenceError> {
     let mut outcome = enforce_raw_artifact_retention(connection, config)?;
     if outcome.deleted_any() {
@@ -1407,7 +1409,7 @@ struct RawArtifactPointer {
 
 fn enforce_raw_artifact_retention(
     connection: &mut Connection,
-    config: &crate::EvidenceConfig,
+    config: &EvidenceConfig,
 ) -> Result<RetentionPruneOutcome, EvidenceError> {
     if !table_exists(connection, "evidence_raw_artifacts")? {
         return Ok(RetentionPruneOutcome::default());

@@ -17,7 +17,7 @@ use super::{
     AttemptId, AttemptRecord, AttemptStatus, DownstreamMode, ObservabilityStore, RawPayloads,
     RequestId, RequestRecord, RequestStatus, StoreWrite, UpstreamMode, error::ObservabilityError,
 };
-use crate::ConfigManager;
+use llm_guard_proxy_core::ConfigManager;
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;

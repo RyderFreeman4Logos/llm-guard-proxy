@@ -14,7 +14,9 @@ use super::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord,
     EvidenceRawArtifactKind, EvidenceStore, EvidenceStoreWrite, ShadowSkipReason,
 };
-use crate::{AttemptId, ConfigManager, RawPayloadChunk, RawPayloads, RequestId, RequestStatus};
+use llm_guard_proxy_core::ConfigManager;
+
+use crate::{AttemptId, RawPayloadChunk, RawPayloads, RequestId, RequestStatus};
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;

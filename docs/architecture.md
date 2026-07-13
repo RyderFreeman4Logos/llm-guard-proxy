@@ -1,12 +1,12 @@
 # Architecture
 
-This document distinguishes the repository **as it exists today** from the
-target architecture for issue #141. The target introduces a dedicated state
-layer; it is not a claim that a state crate already exists.
+This document distinguishes the state boundary implemented by issue #141 from
+the remaining target ownership changes for configuration and workflow I/O.
 
 ## Current implementation
 
-The workspace currently has two crates:
+The workspace has three crates. The service depends directly on both state and
+core, while state depends one-way on core:
 
 ```text
 OpenAI-compatible clients
@@ -16,8 +16,12 @@ llm-guard-proxy service crate
   Axum + Tokio + Reqwest + ProxyState
            |
            v
+llm-guard-proxy-state crate
+  observability + evidence + budget
+           |
+           v
 llm-guard-proxy-core crate
-  policy + config + observability + evidence + budget + data models
+  policy + config + workflow + data models
 ```
 
 `ProxyState` is presently a service-owned composition object. It holds the
@@ -26,13 +30,14 @@ observability/evidence stores, counters, and live-request registry. Its clones
 share those bounded coordination objects; `for_listener` changes only listener
 scope.
 
-The core crate currently owns SQLite-backed observability and evidence stores,
-budget storage, configuration loading/reload types, policy, and shared models.
-This is the current code layout, not the intended final ownership boundary.
+The state crate owns SQLite-backed observability and evidence stores, budget
+storage, redaction, retention, metrics, and live-request tracking. The core
+crate still owns configuration loading/reload and stdio workflow execution;
+moving those adapters to the service is outside the state-crate milestone.
 
-## Target architecture
+## Dependency direction
 
-The intended dependency direction is service -> state -> core:
+The enforced dependency DAG is service -> {state, core} and state -> core:
 
 ```text
 OpenAI-compatible clients                 Upstream model services
@@ -41,33 +46,30 @@ OpenAI-compatible clients                 Upstream model services
            v                                         |
 +--------------------------- service ----------------+|
 | Axum routes, CLI, listener/signal lifecycle         ||
-| config source + reload driver                       ||
-| Reqwest and stdio workflow adapters                 ||
+| Reqwest upstream adapters                           ||
 +-----------------------------|----------------------+|
                               v                       |
 +---------------------------- state -----------------+|
-| request-scoped and shared runtime state             ||
 | observability | evidence | budget                   ||
-| stores, retention, live registry, limits, caches    ||
+| stores, retention, redaction, metrics, live registry||
 +-----------------------------|-----------------------+
                               v
 +----------------------------- core ------------------+
-| pure policy | ConfigHandle | workflow port          |
+| policy | configuration source/reload | stdio workflow|
 | thinking, loop detection, retry decisions, models   |
 +-----------------------------------------------------+
-                              |
-                              v
-                    no I/O or runtime framework
 
 state -> SQLite observability / SQLite evidence / budget database
+core  -> configuration files / stdio workflow processes
+service -> core policy, configuration, and workflow contracts
 ```
 
 The state layer owns durable and live operational state. It is the only layer
 that owns observability, evidence, and budget storage. It may depend on core
 contracts, but core must not depend on state or service. The service composes
-the state layer and provides concrete I/O adapters.
+the state and core layers at the binary entry point.
 
-## Target ownership
+## Remaining target ownership
 
 | Area | Target owner | Responsibility |
 | --- | --- | --- |
@@ -78,7 +80,7 @@ the state layer and provides concrete I/O adapters.
 | Shared runtime and durable state | state | Own request coordination, limits, live registry, observability, evidence, budgets, SQLite access, retention, and redaction at persistence boundaries. |
 | Policy, shared models, configuration handle | core | Own pure thinking/loop/retry policy, domain types, validated configuration snapshots/handle, and the workflow port contract. |
 
-## Ports and adapters
+## Target ports and adapters
 
 | Port | Core contract | Target adapter/owner |
 | --- | --- | --- |
@@ -86,9 +88,9 @@ the state layer and provides concrete I/O adapters.
 | Workflow | A workflow port describes the operations policy needs without process APIs. | Service supplies the stdio/process adapter. |
 | Inbound OpenAI-compatible API | Core defines request-policy and result models, not HTTP routes. | Service Axum routes parse/render HTTP, JSON, and SSE. |
 | Upstream generation, metadata, and embeddings | Core exposes typed inputs, decisions, and the embedding boundary. | Service HTTP adapters own Reqwest and network failure translation. |
-| Observability, evidence, and budget | Core supplies domain records and policy-facing interfaces only. | State owns storage implementations, retention, redaction, and live coordination. |
+| Observability, evidence, and budget | No core port; operational records belong to state. | State owns records, storage implementations, retention, redaction, and live coordination. |
 
-## Feature placement
+## Target feature placement
 
 - Core: thinking policy, loop detection, retry decisions, configuration handle,
   workflow port, and protocol-independent models.
@@ -102,7 +104,7 @@ the state layer and provides concrete I/O adapters.
 Raw payload capture remains opt-in. The state layer must enforce redaction and
 retention before sensitive data reaches durable storage.
 
-## Forbidden dependency edges
+## Target forbidden dependency edges
 
 1. Core must not depend on state or service, nor on Axum, Reqwest, Tokio,
    filesystem/process APIs, SQLite implementations, HTTP types, or routing.
@@ -114,6 +116,6 @@ retention before sensitive data reaches durable storage.
    ports, construct HTTP clients, spawn processes, or emit protocol responses.
 5. The stdio workflow adapter belongs in service; core owns only its port.
 
-When implementing this target, move an ownership boundary as a cohesive change:
-define or preserve the core contract, place operational state in state, then
-wire concrete I/O from service.
+The state boundary is implemented cohesively. Configuration-source and workflow
+adapter ownership remain future changes and must preserve the same dependency
+direction when implemented.

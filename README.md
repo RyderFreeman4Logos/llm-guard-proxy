@@ -12,14 +12,15 @@ The proxy sits between OpenAI-compatible clients and an upstream LLM service so 
 
 ## Workspace Layout
 
-- `crates/llm-guard-proxy-core`: headless core types shared by service code.
+- `crates/llm-guard-proxy-core`: headless contracts shared by state and service code.
+- `crates/llm-guard-proxy-state`: observability, evidence, and budget state.
 - `crates/llm-guard-proxy`: binary/service entry point.
 - `.github/workflows/ci.yml`: GitHub Actions quality gates.
 - `justfile` and `lefthook.yml`: local formatting, lint, test, and hook wiring.
 
-See [the architecture document](docs/architecture.md) for the current layout
-and the target service/state/core boundary, ownership, ports, feature placement,
-and forbidden dependency edges.
+See [the architecture document](docs/architecture.md) for the current
+service/state/core boundary, remaining target ownership, ports, feature
+placement, and forbidden dependency edges.
 
 ## Local Quality Gates
 

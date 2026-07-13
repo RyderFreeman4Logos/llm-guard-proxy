@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
-use crate::ConfigError;
+use llm_guard_proxy_core::ConfigError;
 
 /// Observability storage failures.
 #[derive(Debug, Error)]

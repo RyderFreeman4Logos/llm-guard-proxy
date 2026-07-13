@@ -2185,7 +2185,6 @@ fn parse_u64(value: &str, line_number: usize, field: &str) -> Result<u64, Config
     })
 }
 
-#[cfg(feature = "param-override")]
 fn parse_f64(value: &str, line_number: usize, field: &str) -> Result<f64, ConfigParseError> {
     let normalized = value.replace('_', "");
     let number = normalized.parse::<f64>().map_err(|error| {
