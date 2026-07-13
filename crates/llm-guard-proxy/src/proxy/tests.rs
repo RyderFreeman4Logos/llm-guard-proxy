@@ -5993,9 +5993,85 @@ async fn process_cleanup_refuses_changed_start_time_identity() {
     assert!(identity.is_running());
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recovery_wait_abort_after_readiness_reaps_group_leader() {
+    let test_dir = unique_test_dir("recovery-abort-leader");
+    remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
+    let leader_pid_path = test_dir.join("leader.pid");
+    let ready_path = test_dir.join("leader.ready");
+    let script_path = test_dir.join("leader.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > {pid}\n: > {ready}\nwhile :; do sleep 1; done\n",
+            pid = leader_pid_path.display(),
+            ready = ready_path.display()
+        ),
+    )
+    .expect("test recovery script should be written");
+
+    let fixture = RecoveryProcessFixture::spawn(&script_path);
+    let leader = read_pid_file_after_ready(&leader_pid_path, &ready_path).await;
+    assert_eq!(leader.pid, fixture.process_group_id);
+    let waiting = tokio::spawn(fixture.wait_with_timeout(Duration::from_secs(30)));
+    tokio::task::yield_now().await;
+
+    waiting.abort();
+    assert!(
+        waiting
+            .await
+            .expect_err("aborted recovery wait should be cancelled")
+            .is_cancelled()
+    );
+
+    assert_process_reaped(leader).await;
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn recovery_wait_abort_after_readiness_kills_descendant() {
+    let test_dir = unique_test_dir("recovery-abort-descendant");
+    remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
+    let descendant_pid_path = test_dir.join("descendant.pid");
+    let ready_path = test_dir.join("descendant.ready");
+    let script_path = test_dir.join("descendant.sh");
+    fs::write(
+        &script_path,
+        format!(
+            "#!/bin/sh\nset -eu\nsleep 30 &\ndescendant_pid=$!\nprintf '%s\\n' \"$descendant_pid\" > {pid}\n: > {ready}\nwait \"$descendant_pid\"\n",
+            pid = descendant_pid_path.display(),
+            ready = ready_path.display()
+        ),
+    )
+    .expect("test recovery script should be written");
+
+    let fixture = RecoveryProcessFixture::spawn(&script_path);
+    let leader = LinuxProcessIdentity::capture(fixture.process_group_id)
+        .expect("fixture process identity should be readable");
+    let descendant = read_pid_file_after_ready(&descendant_pid_path, &ready_path).await;
+    let waiting = tokio::spawn(fixture.wait_with_timeout(Duration::from_secs(30)));
+    tokio::task::yield_now().await;
+
+    waiting.abort();
+    assert!(
+        waiting
+            .await
+            .expect_err("aborted recovery wait should be cancelled")
+            .is_cancelled()
+    );
+
+    assert_process_reaped(leader).await;
+    assert_process_not_running(descendant).await;
+}
+
 #[cfg(unix)]
 struct RecoveryProcessFixture {
-    child: Option<tokio::process::Child>,
+    child: RecoveryProcessGuard,
     process_group_id: u32,
 }
 
@@ -6040,34 +6116,13 @@ impl RecoveryProcessFixture {
         let child = command.spawn().expect("fixture child should spawn");
         let process_group_id = child.id().expect("fixture child should have a PID");
         Self {
-            child: Some(child),
+            child: RecoveryProcessGuard::new(child),
             process_group_id,
         }
     }
 
     async fn wait_with_timeout(mut self, recovery_timeout: Duration) -> BTreeMap<String, String> {
-        let child = self.child.take().expect("fixture child should be owned");
-        wait_for_recovery_child_with_timeout(child, recovery_timeout).await
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RecoveryProcessFixture {
-    fn drop(&mut self) {
-        let Some(child) = self.child.as_mut() else {
-            return;
-        };
-        if let Ok(process_group_id) = i32::try_from(self.process_group_id) {
-            let _signal_result = kill(Pid::from_raw(-process_group_id), Signal::SIGKILL);
-        }
-        let _kill_result = child.start_kill();
-        let deadline = std::time::Instant::now() + RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE;
-        while std::time::Instant::now() < deadline {
-            if child.try_wait().is_ok_and(|status| status.is_some()) {
-                return;
-            }
-            std::thread::yield_now();
-        }
+        wait_for_recovery_child_with_timeout(&mut self.child, recovery_timeout).await
     }
 }
 
@@ -19880,6 +19935,18 @@ async fn assert_process_not_running(identity: LinuxProcessIdentity) {
     }
     kill_process_if_running(identity);
     panic!("process {} still appears to be running", identity.pid);
+}
+
+#[cfg(target_os = "linux")]
+async fn assert_process_reaped(identity: LinuxProcessIdentity) {
+    for _ in 0..20 {
+        if linux_process_state_and_start_time(identity.pid).is_none() {
+            return;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    kill_process_if_running(identity);
+    panic!("process {} was not reaped", identity.pid);
 }
 
 #[cfg(target_os = "linux")]

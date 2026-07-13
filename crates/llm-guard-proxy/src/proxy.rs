@@ -7277,7 +7277,7 @@ async fn run_local_recovery_restart_command(
         .stderr(Stdio::null());
     configure_recovery_command(&mut command);
     let mut child = match command.spawn() {
-        Ok(child) => child,
+        Ok(child) => RecoveryProcessGuard::new(child),
         Err(error) => {
             metadata.insert(
                 String::from("local_recovery_restart_status"),
@@ -7676,8 +7676,8 @@ async fn run_upstream_stall_recovery_command(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     configure_recovery_command(&mut command);
-    let child = match command.spawn() {
-        Ok(child) => child,
+    let mut child = match command.spawn() {
+        Ok(child) => RecoveryProcessGuard::new(child),
         Err(error) => {
             metadata.insert(
                 String::from("upstream_stall_recovery_status"),
@@ -7690,12 +7690,13 @@ async fn run_upstream_stall_recovery_command(
             return metadata;
         }
     };
-    metadata.extend(wait_for_recovery_child_with_timeout(child, policy.recovery_timeout).await);
+    metadata
+        .extend(wait_for_recovery_child_with_timeout(&mut child, policy.recovery_timeout).await);
     metadata
 }
 
 async fn wait_for_recovery_child_with_timeout(
-    mut child: tokio::process::Child,
+    child: &mut RecoveryProcessGuard,
     recovery_timeout: Duration,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
@@ -7731,10 +7732,105 @@ async fn wait_for_recovery_child_with_timeout(
                 String::from("upstream_stall_recovery_status"),
                 String::from("timeout_killed"),
             );
-            metadata.extend(terminate_timed_out_recovery_child(&mut child).await);
+            metadata.extend(terminate_timed_out_recovery_child(child).await);
         }
     }
     metadata
+}
+
+/// Owns a recovery child and its process group until the direct child is reaped.
+///
+/// Dropping an armed guard synchronously kills the group, then transfers direct-child reaping to
+/// a bounded OS thread so async executor workers never block during cancellation.
+struct RecoveryProcessGuard {
+    child: Option<tokio::process::Child>,
+    #[cfg(unix)]
+    process_group_id: Option<u32>,
+}
+
+impl RecoveryProcessGuard {
+    fn new(child: tokio::process::Child) -> Self {
+        Self {
+            #[cfg(unix)]
+            process_group_id: child.id(),
+            child: Some(child),
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_group_id(&self) -> Option<u32> {
+        self.process_group_id
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let Some(child) = self.child.as_mut() else {
+            return Err(std::io::Error::other("recovery child was already reaped"));
+        };
+        let result = child.wait().await;
+        if result.is_ok() {
+            self.disarm_after_reap();
+        }
+        result
+    }
+
+    async fn kill(&mut self) -> std::io::Result<()> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(());
+        };
+        let result = child.kill().await;
+        if result.is_ok() {
+            self.disarm_after_reap();
+        }
+        result
+    }
+
+    fn disarm_after_reap(&mut self) {
+        #[cfg(unix)]
+        {
+            self.process_group_id = None;
+        }
+        let _reaped_child = self.child.take();
+    }
+}
+
+impl Drop for RecoveryProcessGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        #[cfg(unix)]
+        if let Some(process_group_id) = self.process_group_id.take() {
+            let _group_kill_sent =
+                send_recovery_process_group_signal(process_group_id, Signal::SIGKILL);
+        }
+        let _child_kill_started = child.start_kill();
+        spawn_recovery_child_reaper(child);
+    }
+}
+
+fn spawn_recovery_child_reaper(mut child: tokio::process::Child) {
+    // `kill_on_drop` remains enabled, so failure to create the reaper thread still requests direct
+    // child termination and lets Tokio's orphan queue make a best-effort reap.
+    let _reaper = std::thread::Builder::new()
+        .name(String::from("llm-guard-recovery-reaper"))
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_status)) => return,
+                    Ok(None) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::Interrupted
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Ok(None) | Err(_) => return,
+                }
+            }
+        });
 }
 
 #[cfg(unix)]
@@ -7747,13 +7843,13 @@ fn configure_recovery_command(_command: &mut Command) {}
 
 #[cfg(unix)]
 async fn terminate_timed_out_recovery_child(
-    child: &mut tokio::process::Child,
+    child: &mut RecoveryProcessGuard,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::from([(
         String::from("upstream_stall_recovery_timeout_cleanup_scope"),
         String::from("process_group"),
     )]);
-    let Some(pid) = child.id() else {
+    let Some(pid) = child.process_group_id() else {
         metadata.insert(
             String::from("upstream_stall_recovery_timeout_cleanup_status"),
             String::from("missing_child_pid"),
@@ -7792,7 +7888,7 @@ async fn terminate_timed_out_recovery_child(
 
 #[cfg(not(unix))]
 async fn terminate_timed_out_recovery_child(
-    child: &mut tokio::process::Child,
+    child: &mut RecoveryProcessGuard,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::from([(
         String::from("upstream_stall_recovery_timeout_cleanup_scope"),
