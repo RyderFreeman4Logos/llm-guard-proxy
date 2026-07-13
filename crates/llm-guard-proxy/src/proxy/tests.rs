@@ -5996,7 +5996,7 @@ async fn process_cleanup_refuses_changed_start_time_identity() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn recovery_wait_abort_after_readiness_reaps_group_leader() {
-    let test_dir = unique_test_dir("recovery-abort-leader");
+    let test_dir = unique_test_dir("recovery abort leader's path");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
     let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
@@ -6005,15 +6005,14 @@ async fn recovery_wait_abort_after_readiness_reaps_group_leader() {
     let script_path = test_dir.join("leader.sh");
     fs::write(
         &script_path,
-        format!(
-            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > {pid}\n: > {ready}\nwhile :; do sleep 1; done\n",
-            pid = leader_pid_path.display(),
-            ready = ready_path.display()
-        ),
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > \"$1\"\n: > \"$2\"\nwhile :; do sleep 1; done\n",
     )
     .expect("test recovery script should be written");
 
-    let fixture = RecoveryProcessFixture::spawn(&script_path);
+    let fixture = RecoveryProcessFixture::spawn_with_args(
+        &script_path,
+        &[leader_pid_path.as_path(), ready_path.as_path()],
+    );
     let leader = read_pid_file_after_ready(&leader_pid_path, &ready_path).await;
     assert_eq!(leader.pid, fixture.process_group_id);
     let waiting = tokio::spawn(fixture.wait_with_timeout(Duration::from_secs(30)));
@@ -6033,7 +6032,7 @@ async fn recovery_wait_abort_after_readiness_reaps_group_leader() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn recovery_wait_abort_after_readiness_kills_descendant() {
-    let test_dir = unique_test_dir("recovery-abort-descendant");
+    let test_dir = unique_test_dir("recovery abort descendant's path");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
     let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
@@ -6042,15 +6041,14 @@ async fn recovery_wait_abort_after_readiness_kills_descendant() {
     let script_path = test_dir.join("descendant.sh");
     fs::write(
         &script_path,
-        format!(
-            "#!/bin/sh\nset -eu\nsleep 30 &\ndescendant_pid=$!\nprintf '%s\\n' \"$descendant_pid\" > {pid}\n: > {ready}\nwait \"$descendant_pid\"\n",
-            pid = descendant_pid_path.display(),
-            ready = ready_path.display()
-        ),
+        "#!/bin/sh\nset -eu\nsleep 30 &\ndescendant_pid=$!\nprintf '%s\\n' \"$descendant_pid\" > \"$1\"\n: > \"$2\"\nwait \"$descendant_pid\"\n",
     )
     .expect("test recovery script should be written");
 
-    let fixture = RecoveryProcessFixture::spawn(&script_path);
+    let fixture = RecoveryProcessFixture::spawn_with_args(
+        &script_path,
+        &[descendant_pid_path.as_path(), ready_path.as_path()],
+    );
     let leader = LinuxProcessIdentity::capture(fixture.process_group_id)
         .expect("fixture process identity should be readable");
     let descendant = read_pid_file_after_ready(&descendant_pid_path, &ready_path).await;
@@ -6094,9 +6092,9 @@ impl Drop for TestDirectoryCleanup {
 
 #[cfg(unix)]
 impl RecoveryProcessFixture {
-    fn spawn(program: &Path) -> Self {
+    fn spawn_with_args(program: &Path, args: &[&Path]) -> Self {
         let mut command = Command::new("/bin/sh");
-        command.arg(program);
+        command.arg(program).args(args);
         Self::spawn_command(&mut command)
     }
 
@@ -6144,7 +6142,7 @@ async fn recovery_child_timeout_cleanup_can_be_exercised_after_fixture_readiness
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
-    let test_dir = unique_test_dir("recovery-process-group");
+    let test_dir = unique_test_dir("recovery descendant's process group");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
     let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
@@ -6155,17 +6153,16 @@ async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
     // full-suite scheduler delay cannot race the recovery timeout.
     fs::write(
         &script_path,
-        format!(
-            "#!/bin/sh\nset -eu\nsleep 30 &\nchild_pid=$!\nprintf '%s\\n' \"$child_pid\" > {pid}\n: > {ready}\nsleep 30\n",
-            pid = child_pid_path.display(),
-            ready = ready_path.display()
-        ),
+        "#!/bin/sh\nset -eu\nsleep 30 &\nchild_pid=$!\nprintf '%s\\n' \"$child_pid\" > \"$1\"\n: > \"$2\"\nsleep 30\n",
     )
     .expect("test recovery script should be written");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("test recovery script should be executable");
 
-    let fixture = RecoveryProcessFixture::spawn(&script_path);
+    let fixture = RecoveryProcessFixture::spawn_with_args(
+        &script_path,
+        &[child_pid_path.as_path(), ready_path.as_path()],
+    );
     let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
     let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
@@ -6181,7 +6178,7 @@ async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process_group() {
-    let test_dir = unique_test_dir("recovery-term-resistant-process-group");
+    let test_dir = unique_test_dir("recovery term-resistant descendant's path");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
     let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
@@ -6190,17 +6187,16 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process
     let script_path = test_dir.join("spawn-term-resistant-descendant.sh");
     fs::write(
         &script_path,
-        format!(
-            "#!/bin/sh\nset -eu\ntrap 'exit 0' TERM\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > {pid}; : > {ready}; while :; do sleep 1; done' &\n# Parent waits for the descendant readiness handshake before sleeping so suite\n# load cannot kill the group before the PID under test exists.\nwhile [ ! -f {ready} ]; do sleep 0.01; done\nsleep 30\n",
-            pid = child_pid_path.display(),
-            ready = ready_path.display()
-        ),
+        "#!/bin/sh\nset -eu\ntrap 'exit 0' TERM\nsh -c 'trap \"\" TERM; printf \"%s\\n\" \"$$\" > \"$1\"; : > \"$2\"; while :; do sleep 1; done' _ \"$1\" \"$2\" &\n# Parent waits for the descendant readiness handshake before sleeping so suite\n# load cannot kill the group before the PID under test exists.\nwhile [ ! -f \"$2\" ]; do sleep 0.01; done\nsleep 30\n",
     )
     .expect("test recovery script should be written");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("test recovery script should be executable");
 
-    let fixture = RecoveryProcessFixture::spawn(&script_path);
+    let fixture = RecoveryProcessFixture::spawn_with_args(
+        &script_path,
+        &[child_pid_path.as_path(), ready_path.as_path()],
+    );
     let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
     let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
@@ -6224,7 +6220,7 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_before_join_timeout() {
-    let test_dir = unique_test_dir("recovery-term-resistant-group-leader");
+    let test_dir = unique_test_dir("recovery term-resistant leader's path");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
     let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
@@ -6233,17 +6229,16 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_befor
     let script_path = test_dir.join("term-resistant-leader.sh");
     fs::write(
         &script_path,
-        format!(
-            "#!/bin/sh\nset -eu\ntrap '' TERM\nprintf '%s\\n' \"$$\" > {pid}\n: > {ready}\nwhile :; do sleep 1; done\n",
-            pid = child_pid_path.display(),
-            ready = ready_path.display()
-        ),
+        "#!/bin/sh\nset -eu\ntrap '' TERM\nprintf '%s\\n' \"$$\" > \"$1\"\n: > \"$2\"\nwhile :; do sleep 1; done\n",
     )
     .expect("test recovery script should be written");
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("test recovery script should be executable");
 
-    let fixture = RecoveryProcessFixture::spawn(&script_path);
+    let fixture = RecoveryProcessFixture::spawn_with_args(
+        &script_path,
+        &[child_pid_path.as_path(), ready_path.as_path()],
+    );
     let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
     let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
