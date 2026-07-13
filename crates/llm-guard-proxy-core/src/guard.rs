@@ -1,11 +1,9 @@
 //! Guard workflow hook execution.
 
-use std::collections::HashMap;
-
 use crate::settings::GuardWorkflowConfig;
 use crate::{
-    GWP_PROTOCOL_VERSION, GwpDecision, GwpHook, GwpInvocation, GwpResult, GwpTraceMode,
-    ProfileConfig, StdioRuntime, WorkflowConfig,
+    GWP_PROTOCOL_VERSION, GuardWorkflowExecutor, GwpDecision, GwpHook, GwpInvocation, GwpResult,
+    GwpTraceMode, ProfileConfig,
 };
 
 /// Outcome of a guard check.
@@ -28,21 +26,22 @@ pub enum GuardOutcome {
 }
 
 /// Executes configured guard workflow hooks for a request.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct GuardExecutor {
+pub struct GuardExecutor<'executor> {
     config: GuardWorkflowConfig,
-    workflows: HashMap<String, StdioRuntime>,
+    workflow_executor: &'executor dyn GuardWorkflowExecutor,
 }
 
-impl GuardExecutor {
-    /// Builds a guard executor from hook configuration and workflow definitions.
+impl<'executor> GuardExecutor<'executor> {
+    /// Builds a guard executor from hook configuration and a workflow execution port.
     #[must_use]
-    pub fn new(config: GuardWorkflowConfig, workflows: HashMap<String, WorkflowConfig>) -> Self {
-        let workflows = workflows
-            .into_iter()
-            .map(|(id, config)| (id, StdioRuntime::new(config)))
-            .collect();
-        Self { config, workflows }
+    pub const fn new(
+        config: GuardWorkflowConfig,
+        workflow_executor: &'executor dyn GuardWorkflowExecutor,
+    ) -> Self {
+        Self {
+            config,
+            workflow_executor,
+        }
     }
 
     /// Run the `pre_request_guard` hook.
@@ -100,11 +99,6 @@ impl GuardExecutor {
         let Some(workflow_id) = workflow_id else {
             return GuardOutcome::Skipped;
         };
-        let Some(runtime) = self.workflows.get(workflow_id) else {
-            return GuardOutcome::Block {
-                reason: format!("guard workflow {workflow_id:?} is not configured"),
-            };
-        };
         let invocation = GwpInvocation {
             protocol_version: GWP_PROTOCOL_VERSION.to_owned(),
             hook,
@@ -116,7 +110,12 @@ impl GuardExecutor {
             budgets: serde_json::Value::Null,
             trace_mode: GwpTraceMode::Redacted,
         };
-        self.outcome_from_result(workflow_id, &invocation, runtime.execute(&invocation))
+        let Some(result) = self.workflow_executor.execute(workflow_id, &invocation) else {
+            return GuardOutcome::Block {
+                reason: format!("guard workflow {workflow_id:?} is not configured"),
+            };
+        };
+        self.outcome_from_result(workflow_id, &invocation, result)
     }
 
     fn outcome_from_result(
@@ -180,11 +179,33 @@ mod tests {
 
     use super::{GuardExecutor, GuardOutcome};
     use crate::settings::GuardWorkflowConfig;
-    use crate::{GwpAudit, GwpDecision, GwpResult, ProfileConfig};
+    use crate::{
+        GuardWorkflowExecutor, GwpAudit, GwpDecision, GwpInvocation, GwpResult, ProfileConfig,
+    };
+
+    #[derive(Default)]
+    struct FakeWorkflowExecutor {
+        results: HashMap<String, GwpResult>,
+    }
+
+    impl FakeWorkflowExecutor {
+        fn with_result(workflow_id: &str, result: GwpResult) -> Self {
+            Self {
+                results: HashMap::from([(workflow_id.to_owned(), result)]),
+            }
+        }
+    }
+
+    impl GuardWorkflowExecutor for FakeWorkflowExecutor {
+        fn execute(&self, workflow_id: &str, _invocation: &GwpInvocation) -> Option<GwpResult> {
+            self.results.get(workflow_id).cloned()
+        }
+    }
 
     #[test]
     fn skipped_when_no_hook_is_configured() {
-        let executor = GuardExecutor::new(GuardWorkflowConfig::default(), HashMap::new());
+        let workflow_executor = FakeWorkflowExecutor::default();
+        let executor = GuardExecutor::new(GuardWorkflowConfig::default(), &workflow_executor);
 
         let outcome = executor.pre_request_guard(
             "req-1",
@@ -199,13 +220,14 @@ mod tests {
 
     #[test]
     fn missing_configured_workflow_blocks() {
+        let workflow_executor = FakeWorkflowExecutor::default();
         let executor = GuardExecutor::new(
             GuardWorkflowConfig {
                 pre_request: Some(String::from("guard")),
                 post_response: None,
                 fail_closed_blocks: false,
             },
-            HashMap::new(),
+            &workflow_executor,
         );
 
         let outcome = executor.pre_request_guard(
@@ -226,29 +248,8 @@ mod tests {
 
     #[test]
     fn error_fail_closed_can_allow_when_configured_fail_open() {
-        let executor = GuardExecutor::new(
-            GuardWorkflowConfig {
-                pre_request: Some(String::from("guard")),
-                post_response: None,
-                fail_closed_blocks: false,
-            },
-            HashMap::new(),
-        );
-        let invocation = crate::GwpInvocation {
-            protocol_version: crate::GWP_PROTOCOL_VERSION.to_owned(),
-            hook: crate::GwpHook::PreRequestGuard,
-            request_id: String::from("req-1"),
-            profile: ProfileConfig::default().to_gwp_profile("default"),
-            model_alias: String::from("model"),
-            messages: vec![json!({"role": "user", "content": "hello"})],
-            policy: serde_json::Value::Null,
-            budgets: serde_json::Value::Null,
-            trace_mode: crate::GwpTraceMode::Redacted,
-        };
-
-        let outcome = executor.outcome_from_result(
+        let workflow_executor = FakeWorkflowExecutor::with_result(
             "guard",
-            &invocation,
             GwpResult {
                 decision: GwpDecision::ErrorFailClosed,
                 risk_level: String::from("error"),
@@ -260,6 +261,21 @@ mod tests {
                     notes: Vec::new(),
                 },
             },
+        );
+        let executor = GuardExecutor::new(
+            GuardWorkflowConfig {
+                pre_request: Some(String::from("guard")),
+                post_response: None,
+                fail_closed_blocks: false,
+            },
+            &workflow_executor,
+        );
+        let outcome = executor.pre_request_guard(
+            "req-1",
+            "model",
+            &[json!({"role": "user", "content": "hello"})],
+            "default",
+            &ProfileConfig::default(),
         );
 
         assert_eq!(outcome, GuardOutcome::Allow);

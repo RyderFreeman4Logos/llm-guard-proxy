@@ -628,6 +628,7 @@ dependencies = [
  "lexical-core",
  "llm-guard-proxy-core",
  "llm-guard-proxy-state",
+ "nix",
  "reqwest",
  "rusqlite",
  "serde",
@@ -640,7 +641,6 @@ dependencies = [
 name = "llm-guard-proxy-core"
 version = "0.1.0"
 dependencies = [
- "nix",
  "serde",
  "serde_json",
  "thiserror",

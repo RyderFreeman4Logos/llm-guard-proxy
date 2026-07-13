@@ -90,7 +90,7 @@ pub use settings::{
 #[cfg(feature = "guard")]
 pub use settings::{BudgetConfig, UnknownKeyPolicy, VirtualKeyConfig};
 #[cfg(feature = "guard")]
-pub use workflow::{StdioRuntime, WorkflowConfig, WorkflowRuntime};
+pub use workflow::{GuardWorkflowExecutor, WorkflowConfig, WorkflowRuntime};
 
 /// Public service name used by the binary and documentation.
 pub const SERVICE_NAME: &str = "llm-guard-proxy";

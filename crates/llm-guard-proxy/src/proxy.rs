@@ -37,8 +37,8 @@ use llm_guard_proxy_core::ParamOverrideConfig;
 #[cfg(feature = "guard")]
 use llm_guard_proxy_core::{
     AliasTarget, BlockReason, DEFAULT_PROFILE_NAME, GWP_PROTOCOL_VERSION, GuardExecutor,
-    GuardOutcome, GwpDecision, GwpHook, GwpInvocation, GwpResult, GwpTraceMode, ModelAliasResolver,
-    ProfileCheckResult, ProfileConfig, StdioRuntime, UnknownKeyPolicy,
+    GuardOutcome, GuardWorkflowExecutor, GwpDecision, GwpHook, GwpInvocation, GwpResult,
+    GwpTraceMode, ModelAliasResolver, ProfileCheckResult, ProfileConfig, UnknownKeyPolicy,
 };
 use llm_guard_proxy_core::{
     AppConfig, ConfigHandle, DefaultInjectionSchema, DownstreamDropPolicy, Health, HeartbeatMode,
@@ -67,6 +67,9 @@ use tokio::{
     sync::{Mutex as AsyncMutex, Notify, futures::OwnedNotified, oneshot},
     time::{Instant, Interval, MissedTickBehavior, Sleep, timeout},
 };
+
+#[cfg(feature = "guard")]
+use crate::workflow_runtime::WorkflowRuntimeAdapter;
 
 mod model_metadata;
 mod score_adapter;
@@ -3399,13 +3402,21 @@ async fn handle_workflow_alias_request(
         }),
         trace_mode: GwpTraceMode::Redacted,
     };
-    let workflow_config = workflow_config_for_alias(context.config, &context.workflow_alias)?;
     let workflow_id = context.workflow_alias.workflow_id.clone();
+    let workflow_config = workflow_config_for_alias(context.config, &context.workflow_alias)?;
+    let workflow_executor =
+        WorkflowRuntimeAdapter::new(HashMap::from([(workflow_id.clone(), workflow_config)]));
+    let execution_workflow_id = workflow_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        StdioRuntime::new(workflow_config).execute(&invocation)
+        workflow_executor.execute(&execution_workflow_id, &invocation)
     })
     .await
-    .map_err(|error| ProxyError::guard_blocked(format!("workflow worker failed: {error}")))?;
+    .map_err(|error| ProxyError::guard_blocked(format!("workflow worker failed: {error}")))?
+    .ok_or_else(|| {
+        ProxyError::guard_blocked(format!(
+            "workflow alias references unconfigured workflow {workflow_id:?}"
+        ))
+    })?;
 
     let workflow_output = workflow_alias_content_from_result(&workflow_id, result)?;
     let body = workflow_alias_chat_completion_body(
@@ -3638,7 +3649,8 @@ async fn run_pre_request_guard(
     let model = model.to_owned();
     let fail_closed_blocks = guard_config.fail_closed_blocks;
     tokio::task::spawn_blocking(move || {
-        GuardExecutor::new(guard_config, workflows).pre_request_guard(
+        let workflow_executor = WorkflowRuntimeAdapter::new(workflows);
+        GuardExecutor::new(guard_config, &workflow_executor).pre_request_guard(
             &request_id,
             &model,
             &messages,
@@ -3711,7 +3723,8 @@ async fn run_post_response_guard(
     let model = model.to_owned();
     let fail_closed_blocks = guard_config.fail_closed_blocks;
     tokio::task::spawn_blocking(move || {
-        GuardExecutor::new(guard_config, workflows).post_response_guard(
+        let workflow_executor = WorkflowRuntimeAdapter::new(workflows);
+        GuardExecutor::new(guard_config, &workflow_executor).post_response_guard(
             &request_id,
             &model,
             &response,

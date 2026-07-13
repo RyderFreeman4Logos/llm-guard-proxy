@@ -5,6 +5,8 @@ mod embedding_backend;
 mod model_judge;
 mod proxy;
 mod replay_calibrate;
+#[cfg(feature = "guard")]
+mod workflow_runtime;
 
 use std::{ffi::OsString, fs, future::pending, path::PathBuf, process::ExitCode, time::Duration};
 
