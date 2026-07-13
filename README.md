@@ -17,6 +17,10 @@ The proxy sits between OpenAI-compatible clients and an upstream LLM service so 
 - `.github/workflows/ci.yml`: GitHub Actions quality gates.
 - `justfile` and `lefthook.yml`: local formatting, lint, test, and hook wiring.
 
+See [the architecture document](docs/architecture.md) for the current layout
+and the target service/state/core boundary, ownership, ports, feature placement,
+and forbidden dependency edges.
+
 ## Local Quality Gates
 
 Run the same core checks as CI:
