@@ -7664,7 +7664,7 @@ async fn run_upstream_stall_recovery_command(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     configure_recovery_command(&mut command);
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             metadata.insert(
@@ -7678,7 +7678,16 @@ async fn run_upstream_stall_recovery_command(
             return metadata;
         }
     };
-    match timeout(policy.recovery_timeout, child.wait()).await {
+    metadata.extend(wait_for_recovery_child_with_timeout(child, policy.recovery_timeout).await);
+    metadata
+}
+
+async fn wait_for_recovery_child_with_timeout(
+    mut child: tokio::process::Child,
+    recovery_timeout: Duration,
+) -> BTreeMap<String, String> {
+    let mut metadata = BTreeMap::new();
+    match timeout(recovery_timeout, child.wait()).await {
         Ok(Ok(status)) => {
             metadata.insert(
                 String::from("upstream_stall_recovery_status"),

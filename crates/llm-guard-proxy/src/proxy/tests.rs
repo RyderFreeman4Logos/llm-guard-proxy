@@ -5914,10 +5914,111 @@ async fn upstream_stall_recovery_joiner_uses_completed_state_after_lost_notifica
 
 #[cfg(unix)]
 #[tokio::test]
+async fn recovery_fixture_helpers_are_raii_bounded() {
+    let fixture = RecoveryProcessFixture::spawn_shell("while :; do sleep 1; done");
+    drop(fixture);
+}
+
+#[cfg(unix)]
+struct RecoveryProcessFixture {
+    child: Option<tokio::process::Child>,
+    process_group_id: u32,
+}
+
+#[cfg(unix)]
+struct TestDirectoryCleanup(PathBuf);
+
+#[cfg(unix)]
+impl TestDirectoryCleanup {
+    fn new(path: &Path) -> Self {
+        Self(path.to_path_buf())
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TestDirectoryCleanup {
+    fn drop(&mut self) {
+        remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
+impl RecoveryProcessFixture {
+    fn spawn(program: &Path) -> Self {
+        let mut command = Command::new("/bin/sh");
+        command.arg(program);
+        Self::spawn_command(&mut command)
+    }
+
+    fn spawn_shell(script: &str) -> Self {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        Self::spawn_command(&mut command)
+    }
+
+    fn spawn_command(command: &mut Command) -> Self {
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_recovery_command(command);
+        let child = command.spawn().expect("fixture child should spawn");
+        let process_group_id = child.id().expect("fixture child should have a PID");
+        Self {
+            child: Some(child),
+            process_group_id,
+        }
+    }
+
+    async fn wait_with_timeout(mut self, recovery_timeout: Duration) -> BTreeMap<String, String> {
+        let child = self.child.take().expect("fixture child should be owned");
+        wait_for_recovery_child_with_timeout(child, recovery_timeout).await
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RecoveryProcessFixture {
+    fn drop(&mut self) {
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        let _status = std::process::Command::new("kill")
+            .args(["-KILL", "--", &format!("-{}", self.process_group_id)])
+            .status();
+        let _kill_result = child.start_kill();
+        let deadline = std::time::Instant::now() + RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().is_ok_and(|status| status.is_some()) {
+                return;
+            }
+            std::thread::yield_now();
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recovery_child_timeout_cleanup_can_be_exercised_after_fixture_readiness() {
+    for _ in 0..8 {
+        let fixture = RecoveryProcessFixture::spawn_shell("while :; do sleep 1; done");
+        let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
+
+        assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+        assert_eq!(
+            metadata["upstream_stall_recovery_timeout_cleanup_scope"],
+            "process_group"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
     let test_dir = unique_test_dir("recovery-process-group");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
     let child_pid_path = test_dir.join("child.pid");
     let ready_path = test_dir.join("child.ready");
     let script_path = test_dir.join("spawn-descendant.sh");
@@ -5935,26 +6036,9 @@ async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("test recovery script should be executable");
 
-    let policy = UpstreamStallPolicy {
-        enabled: true,
-        first_chunk_timeout: Duration::from_millis(50),
-        idle_timeout: Duration::from_millis(50),
-        recovery_command: vec![script_path.display().to_string()],
-        // Startup allowance is separate from the timeout behavior under test:
-        // scripts still sleep far longer than this bound so recovery must kill.
-        recovery_timeout: Duration::from_secs(2),
-        recovery_cooldown: Duration::from_millis(1),
-        recovery_budget_window: Duration::from_secs(60),
-        recovery_max_per_window: 1,
-    };
-    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
-
-    // Observe readiness in parallel with recovery so suite-load kill cleanup
-    // cannot hide the PID file before the post-wait reader starts.
-    let (metadata, child_pid) = tokio::join!(
-        run_upstream_stall_recovery(&policy, &coordinator),
-        read_pid_file_after_ready(&child_pid_path, &ready_path)
-    );
+    let fixture = RecoveryProcessFixture::spawn(&script_path);
+    let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
+    let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
@@ -5971,6 +6055,7 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process
     let test_dir = unique_test_dir("recovery-term-resistant-process-group");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
     let child_pid_path = test_dir.join("child.pid");
     let ready_path = test_dir.join("child.ready");
     let script_path = test_dir.join("spawn-term-resistant-descendant.sh");
@@ -5986,22 +6071,9 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("test recovery script should be executable");
 
-    let policy = UpstreamStallPolicy {
-        enabled: true,
-        first_chunk_timeout: Duration::from_millis(50),
-        idle_timeout: Duration::from_millis(50),
-        recovery_command: vec![script_path.display().to_string()],
-        recovery_timeout: Duration::from_secs(2),
-        recovery_cooldown: Duration::from_millis(1),
-        recovery_budget_window: Duration::from_secs(60),
-        recovery_max_per_window: 1,
-    };
-    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
-
-    let (metadata, child_pid) = tokio::join!(
-        run_upstream_stall_recovery(&policy, &coordinator),
-        read_pid_file_after_ready(&child_pid_path, &ready_path)
-    );
+    let fixture = RecoveryProcessFixture::spawn(&script_path);
+    let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
+    let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
@@ -6018,6 +6090,7 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_befor
     let test_dir = unique_test_dir("recovery-term-resistant-group-leader");
     remove_dir_all(&test_dir);
     fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
     let child_pid_path = test_dir.join("child.pid");
     let ready_path = test_dir.join("child.ready");
     let script_path = test_dir.join("term-resistant-leader.sh");
@@ -6033,22 +6106,9 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_befor
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
         .expect("test recovery script should be executable");
 
-    let policy = UpstreamStallPolicy {
-        enabled: true,
-        first_chunk_timeout: Duration::from_millis(50),
-        idle_timeout: Duration::from_millis(50),
-        recovery_command: vec![script_path.display().to_string()],
-        recovery_timeout: Duration::from_secs(2),
-        recovery_cooldown: Duration::from_millis(1),
-        recovery_budget_window: Duration::from_secs(60),
-        recovery_max_per_window: 1,
-    };
-    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
-
-    let (metadata, child_pid) = tokio::join!(
-        run_upstream_stall_recovery(&policy, &coordinator),
-        read_pid_file_after_ready(&child_pid_path, &ready_path)
-    );
+    let fixture = RecoveryProcessFixture::spawn(&script_path);
+    let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
+    let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
     if metadata
         .get("upstream_stall_recovery_status")
