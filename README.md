@@ -1,6 +1,6 @@
 # llm-guard-proxy
 
-Supported platform: Linux. Windows and macOS are not supported targets.
+Supported platform: Linux x86_64. ARM, Windows, and macOS are not supported targets.
 
 `llm-guard-proxy` is an Apache-2.0 Rust OpenAI-compatible guard proxy for local and GB10 vLLM deployments.
 
@@ -17,8 +17,7 @@ The proxy sits between OpenAI-compatible clients and an upstream LLM service so 
 - `crates/llm-guard-proxy-core`: headless contracts shared by state and service code.
 - `crates/llm-guard-proxy-state`: observability, evidence, and budget state.
 - `crates/llm-guard-proxy`: binary/service entry point.
-- `.github/workflows/ci.yml`: GitHub Actions quality gates.
-- `justfile` and `lefthook.yml`: local formatting, lint, test, and hook wiring.
+- `justfile` and `lefthook.yml`: authoritative local formatting, lint, test, and hook wiring.
 
 See [the architecture document](docs/architecture.md) for the current
 service/state/core boundary, remaining target ownership, ports, feature
@@ -26,7 +25,13 @@ placement, and forbidden dependency edges.
 
 ## Local Quality Gates
 
-Run the same core checks as CI:
+This repository does not use hosted CI. The `justfile` and Lefthook definitions
+are the authoritative local completion gate:
+
+Automated CSA review enforcement is intentionally not wired into pre-push while
+its review efficiency is being repaired. Repository feature development remains
+paused until the maintainer explicitly authorizes resumption; the mechanical
+local quality gate remains mandatory.
 
 ```bash
 just fmt
@@ -39,6 +44,7 @@ The aggregate local gates are:
 ```bash
 just pre-commit-fast
 just pre-commit
+just pre-push
 ```
 
 The local completion gates are:
@@ -47,6 +53,13 @@ The local completion gates are:
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
+```
+
+The default local build and test parallelism is bounded at two workers. Machines
+with sufficient memory can raise it explicitly without weakening any gate:
+
+```bash
+LLM_GUARD_LOCAL_JOBS=4 LLM_GUARD_LOCAL_TEST_THREADS=4 just pre-push
 ```
 
 ## GB10 Compatibility Smoke

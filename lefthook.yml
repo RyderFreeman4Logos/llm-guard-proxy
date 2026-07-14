@@ -13,9 +13,7 @@ pre-commit:
 
 pre-push:
   commands:
-    review-check:
-      run: scripts/hooks/review-check.sh
     branch-protection:
       run: scripts/hooks/branch-protection.sh
     quality-gates:
-      run: just pre-commit
+      run: just pre-push
