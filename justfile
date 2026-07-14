@@ -6,6 +6,8 @@ set tempdir := "."
 set dotenv-load := true
 
 _repo_root := `git rev-parse --show-superproject-working-tree 2>/dev/null | grep . || git rev-parse --show-toplevel`
+local_jobs := env_var_or_default("LLM_GUARD_LOCAL_JOBS", "2")
+local_test_threads := env_var_or_default("LLM_GUARD_LOCAL_TEST_THREADS", "2")
 
 default: pre-commit
 
@@ -31,19 +33,22 @@ fmt:
 fmt-check:
     cargo fmt --all -- --check
 
+contracts:
+    python3 -m unittest discover -s tests -p 'test_*.py' -v
+
 clippy: clippy-all-features clippy-feature-matrix
 
 clippy-all-features:
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
+    cargo clippy --workspace --all-targets --all-features --jobs {{local_jobs}} -- -D warnings
 
 clippy-feature-matrix:
-    cargo clippy -p llm-guard-proxy --all-targets --no-default-features -- -D warnings
-    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features guard -- -D warnings
-    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features param-override -- -D warnings
-    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features upstream-hot-restart -- -D warnings
+    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --jobs {{local_jobs}} -- -D warnings
+    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features guard --jobs {{local_jobs}} -- -D warnings
+    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features param-override --jobs {{local_jobs}} -- -D warnings
+    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features upstream-hot-restart --jobs {{local_jobs}} -- -D warnings
 
 test:
-    cargo test --workspace --all-features
+    RUST_TEST_THREADS={{local_test_threads}} cargo test --workspace --all-features --jobs {{local_jobs}}
 
 smoke-gb10:
     scripts/smoke-gb10.sh
@@ -51,9 +56,18 @@ smoke-gb10:
 pre-commit-fast:
     just check-branch
     just check-generated-artifacts
+    just contracts
     just fmt-check
     just clippy
 
 pre-commit:
     just pre-commit-fast
+    just test
+
+# Authoritative committed-HEAD gate replacing hosted CI.
+pre-push:
+    just check-branch
+    just contracts
+    just fmt-check
+    just clippy
     just test
