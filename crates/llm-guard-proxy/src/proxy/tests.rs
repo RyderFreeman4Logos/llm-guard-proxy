@@ -18058,10 +18058,10 @@ fn fake_upstream_endpoint_response(
         }
     }
 
-    if endpoint == "/v1/chat/completions" {
-        if let Some(response) = fake_chat_completion_response(path_and_query, state, body) {
-            return response;
-        }
+    if endpoint == "/v1/chat/completions"
+        && let Some(response) = fake_chat_completion_response(path_and_query, state, body)
+    {
+        return response;
     }
 
     let (label, body) = match endpoint {
@@ -18565,14 +18565,14 @@ impl Stream for CancellableResponseStream {
             return Poll::Ready(None);
         }
 
-        if this.next_index > 0 {
-            if let Some(delay) = &mut this.delay_after_first {
-                match delay.as_mut().poll(cx) {
-                    Poll::Ready(()) => {
-                        this.delay_after_first = None;
-                    }
-                    Poll::Pending => return Poll::Pending,
+        if this.next_index > 0
+            && let Some(delay) = &mut this.delay_after_first
+        {
+            match delay.as_mut().poll(cx) {
+                Poll::Ready(()) => {
+                    this.delay_after_first = None;
                 }
+                Poll::Pending => return Poll::Pending,
             }
         }
 
@@ -19902,14 +19902,12 @@ async fn read_pid_file_after_ready(pid_path: &Path, ready_path: &Path) -> LinuxP
     // Wait long enough for the readiness handshake, but fail closed with
     // cleanup-friendly diagnostics if the fixture still never appears.
     for _ in 0..500 {
-        if ready_path.exists() {
-            if let Ok(text) = fs::read_to_string(pid_path) {
-                if let Ok(pid) = text.trim().parse::<u32>() {
-                    if let Some(identity) = LinuxProcessIdentity::capture(pid) {
-                        return identity;
-                    }
-                }
-            }
+        if ready_path.exists()
+            && let Ok(text) = fs::read_to_string(pid_path)
+            && let Ok(pid) = text.trim().parse::<u32>()
+            && let Some(identity) = LinuxProcessIdentity::capture(pid)
+        {
+            return identity;
         }
         sleep(Duration::from_millis(10)).await;
     }

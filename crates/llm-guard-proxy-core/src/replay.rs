@@ -503,17 +503,17 @@ fn observe_event(
         ReplayChannel::ToolArgs => {
             // Try as a complete tool call first (deterministic detector).
             let mut emitted = false;
-            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&event.text) {
-                if json_value.is_object() || json_value.is_array() {
-                    let tool_signals = detector.observe_tool_call(ToolCallFingerprintInput {
-                        tool_name: "replay_tool",
-                        arguments: &event.text,
-                    });
-                    for signal in &tool_signals {
-                        push_signal(signal, signals, max_severity);
-                    }
-                    emitted |= !tool_signals.is_empty();
+            if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&event.text)
+                && (json_value.is_object() || json_value.is_array())
+            {
+                let tool_signals = detector.observe_tool_call(ToolCallFingerprintInput {
+                    tool_name: "replay_tool",
+                    arguments: &event.text,
+                });
+                for signal in &tool_signals {
+                    push_signal(signal, signals, max_severity);
                 }
+                emitted |= !tool_signals.is_empty();
             }
             // Also feed as a fragment so streaming repetition is caught.
             let frag_signals = detector.observe(LoopDetectorInput::fragment(
@@ -650,7 +650,7 @@ fn median_u64(values: &[u64]) -> u64 {
     let mut sorted: Vec<u64> = values.to_vec();
     sorted.sort_unstable();
     let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 0 {
+    if sorted.len().is_multiple_of(2) {
         // Average of two middle elements (rounded down).
         sorted[mid].saturating_add(sorted[mid - 1]) / 2
     } else {

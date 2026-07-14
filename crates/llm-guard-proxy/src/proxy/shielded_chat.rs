@@ -44,10 +44,10 @@ pub(super) fn prepare_non_stream_request(
 ) -> Option<PreparedChatRequest> {
     let mut value = serde_json::from_slice::<Value>(body).ok()?;
     let object = value.as_object_mut()?;
-    if let Some(stream) = object.get("stream") {
-        if !matches!(stream, Value::Bool(false)) {
-            return None;
-        }
+    if let Some(stream) = object.get("stream")
+        && !matches!(stream, Value::Bool(false))
+    {
+        return None;
     }
     if object
         .get("stream_options")
@@ -2695,10 +2695,8 @@ fn append_completion_sse_chunk(
             Value::String(system_fingerprint.clone()),
         );
     }
-    if include_usage {
-        if let Some(usage) = &fields.usage {
-            chunk.insert(String::from("usage"), usage.clone());
-        }
+    if include_usage && let Some(usage) = &fields.usage {
+        chunk.insert(String::from("usage"), usage.clone());
     }
 
     let serialized = serde_json::to_vec(&Value::Object(chunk))
@@ -2942,24 +2940,24 @@ impl ChoiceBuilder {
         if let Some(role) = delta.get("role").and_then(Value::as_str) {
             self.role.get_or_insert_with(|| role.to_owned());
         }
-        if let Some(content) = delta.get("content").and_then(Value::as_str) {
-            if !content.is_empty() {
-                self.content.push_str(content);
-                stats.content_delta_count = stats.content_delta_count.saturating_add(1);
-                mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
-                observe_fragment(loop_detector, StreamChannel::Content, content)?;
-                push_raw_stream_chunk(raw_stream_chunks, StreamChannel::Content, content);
-            }
+        if let Some(content) = delta.get("content").and_then(Value::as_str)
+            && !content.is_empty()
+        {
+            self.content.push_str(content);
+            stats.content_delta_count = stats.content_delta_count.saturating_add(1);
+            mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
+            observe_fragment(loop_detector, StreamChannel::Content, content)?;
+            push_raw_stream_chunk(raw_stream_chunks, StreamChannel::Content, content);
         }
         for field in ["reasoning_content", "reasoning", "thinking"] {
-            if let Some(reasoning) = delta.get(field).and_then(Value::as_str) {
-                if !reasoning.is_empty() {
-                    observe_fragment(loop_detector, StreamChannel::Reasoning, reasoning)?;
-                    self.reasoning.push_str(reasoning);
-                    stats.reasoning_delta_count = stats.reasoning_delta_count.saturating_add(1);
-                    mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
-                    push_raw_stream_chunk(raw_stream_chunks, StreamChannel::Reasoning, reasoning);
-                }
+            if let Some(reasoning) = delta.get(field).and_then(Value::as_str)
+                && !reasoning.is_empty()
+            {
+                observe_fragment(loop_detector, StreamChannel::Reasoning, reasoning)?;
+                self.reasoning.push_str(reasoning);
+                stats.reasoning_delta_count = stats.reasoning_delta_count.saturating_add(1);
+                mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
+                push_raw_stream_chunk(raw_stream_chunks, StreamChannel::Reasoning, reasoning);
             }
         }
         if let Some(function_call) = delta.get("function_call").and_then(Value::as_object) {
@@ -2970,11 +2968,11 @@ impl ChoiceBuilder {
         }
         if let Some(refusal) = delta.get("refusal") {
             self.saw_refusal = true;
-            if let Some(refusal) = refusal.as_str() {
-                if !refusal.is_empty() {
-                    self.refusal.push_str(refusal);
-                    mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
-                }
+            if let Some(refusal) = refusal.as_str()
+                && !refusal.is_empty()
+            {
+                self.refusal.push_str(refusal);
+                mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
             }
         }
         if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {

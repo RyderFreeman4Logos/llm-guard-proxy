@@ -199,40 +199,40 @@ impl LiveRequestRegistry {
     ///
     /// No-op if the request is not registered.
     pub fn update_state(&self, request_id: &str, state: LiveRequestState) {
-        if let Ok(mut entries) = self.entries.write() {
-            if let Some(entry) = entries.get_mut(request_id) {
-                let now = now_unix_millis();
-                entry.state = state;
-                entry.last_updated_at_ms = now;
-                entry.timeline.push(TimelineEvent {
-                    at_ms: now,
-                    event: state.as_str().to_owned(),
-                });
-                if matches!(
-                    state,
-                    LiveRequestState::FirstTokenSeen
-                        | LiveRequestState::Streaming
-                        | LiveRequestState::UpstreamHeadersReceived
-                ) {
-                    entry.last_progress_at_ms = Some(now);
-                }
+        if let Ok(mut entries) = self.entries.write()
+            && let Some(entry) = entries.get_mut(request_id)
+        {
+            let now = now_unix_millis();
+            entry.state = state;
+            entry.last_updated_at_ms = now;
+            entry.timeline.push(TimelineEvent {
+                at_ms: now,
+                event: state.as_str().to_owned(),
+            });
+            if matches!(
+                state,
+                LiveRequestState::FirstTokenSeen
+                    | LiveRequestState::Streaming
+                    | LiveRequestState::UpstreamHeadersReceived
+            ) {
+                entry.last_progress_at_ms = Some(now);
             }
         }
     }
 
     /// Records profile/model metadata for a request.
     pub fn update_profile(&self, request_id: &str, profile: Option<String>, model: Option<String>) {
-        if let Ok(mut entries) = self.entries.write() {
-            if let Some(entry) = entries.get_mut(request_id) {
-                let now = now_unix_millis();
-                if let Some(profile) = profile {
-                    entry.profile = Some(profile);
-                }
-                if let Some(model) = model {
-                    entry.model = Some(model);
-                }
-                entry.last_updated_at_ms = now;
+        if let Ok(mut entries) = self.entries.write()
+            && let Some(entry) = entries.get_mut(request_id)
+        {
+            let now = now_unix_millis();
+            if let Some(profile) = profile {
+                entry.profile = Some(profile);
             }
+            if let Some(model) = model {
+                entry.model = Some(model);
+            }
+            entry.last_updated_at_ms = now;
         }
     }
 
@@ -243,88 +243,88 @@ impl LiveRequestRegistry {
         listener: Option<String>,
         upstream_target: Option<String>,
     ) {
-        if let Ok(mut entries) = self.entries.write() {
-            if let Some(entry) = entries.get_mut(request_id) {
-                let now = now_unix_millis();
-                if let Some(listener) = listener {
-                    entry.listener = Some(listener);
-                }
-                if let Some(upstream_target) = upstream_target {
-                    entry.upstream_target = Some(upstream_target);
-                }
-                entry.last_updated_at_ms = now;
+        if let Ok(mut entries) = self.entries.write()
+            && let Some(entry) = entries.get_mut(request_id)
+        {
+            let now = now_unix_millis();
+            if let Some(listener) = listener {
+                entry.listener = Some(listener);
             }
+            if let Some(upstream_target) = upstream_target {
+                entry.upstream_target = Some(upstream_target);
+            }
+            entry.last_updated_at_ms = now;
         }
     }
 
     /// Records the queue wait time once a request is admitted.
     pub fn record_queue_wait(&self, request_id: &str, queue_wait_ms: u64) {
-        if let Ok(mut entries) = self.entries.write() {
-            if let Some(entry) = entries.get_mut(request_id) {
-                let now = now_unix_millis();
-                entry.queue_wait_ms = Some(queue_wait_ms);
-                entry.last_updated_at_ms = now;
-            }
+        if let Ok(mut entries) = self.entries.write()
+            && let Some(entry) = entries.get_mut(request_id)
+        {
+            let now = now_unix_millis();
+            entry.queue_wait_ms = Some(queue_wait_ms);
+            entry.last_updated_at_ms = now;
         }
     }
 
     /// Records first-token latency and transitions to `FirstTokenSeen`.
     pub fn record_first_token(&self, request_id: &str, latency_ms: u64) {
-        if let Ok(mut entries) = self.entries.write() {
-            if let Some(entry) = entries.get_mut(request_id) {
-                let now = now_unix_millis();
-                entry.first_token_latency_ms = Some(latency_ms);
-                entry.state = LiveRequestState::FirstTokenSeen;
-                entry.last_updated_at_ms = now;
-                entry.last_progress_at_ms = Some(now);
-                entry.timeline.push(TimelineEvent {
-                    at_ms: now,
-                    event: LiveRequestState::FirstTokenSeen.as_str().to_owned(),
-                });
-            }
+        if let Ok(mut entries) = self.entries.write()
+            && let Some(entry) = entries.get_mut(request_id)
+        {
+            let now = now_unix_millis();
+            entry.first_token_latency_ms = Some(latency_ms);
+            entry.state = LiveRequestState::FirstTokenSeen;
+            entry.last_updated_at_ms = now;
+            entry.last_progress_at_ms = Some(now);
+            entry.timeline.push(TimelineEvent {
+                at_ms: now,
+                event: LiveRequestState::FirstTokenSeen.as_str().to_owned(),
+            });
         }
     }
 
     /// Increments downstream chunk/byte counters.
     pub fn record_downstream_chunk(&self, request_id: &str, bytes: u64) {
-        if let Ok(mut entries) = self.entries.write() {
-            if let Some(entry) = entries.get_mut(request_id) {
-                let now = now_unix_millis();
-                entry.chunks_downstream = entry.chunks_downstream.saturating_add(1);
-                entry.bytes_downstream = entry.bytes_downstream.saturating_add(bytes);
-                entry.last_progress_at_ms = Some(now);
-                entry.last_updated_at_ms = now;
-            }
+        if let Ok(mut entries) = self.entries.write()
+            && let Some(entry) = entries.get_mut(request_id)
+        {
+            let now = now_unix_millis();
+            entry.chunks_downstream = entry.chunks_downstream.saturating_add(1);
+            entry.bytes_downstream = entry.bytes_downstream.saturating_add(bytes);
+            entry.last_progress_at_ms = Some(now);
+            entry.last_updated_at_ms = now;
         }
     }
 
     /// Increments upstream chunk/byte counters.
     pub fn record_upstream_chunk(&self, request_id: &str, bytes: u64) {
-        if let Ok(mut entries) = self.entries.write() {
-            if let Some(entry) = entries.get_mut(request_id) {
-                let now = now_unix_millis();
-                entry.chunks_upstream = entry.chunks_upstream.saturating_add(1);
-                entry.bytes_upstream = entry.bytes_upstream.saturating_add(bytes);
-                entry.last_progress_at_ms = Some(now);
-                entry.last_updated_at_ms = now;
-            }
+        if let Ok(mut entries) = self.entries.write()
+            && let Some(entry) = entries.get_mut(request_id)
+        {
+            let now = now_unix_millis();
+            entry.chunks_upstream = entry.chunks_upstream.saturating_add(1);
+            entry.bytes_upstream = entry.bytes_upstream.saturating_add(bytes);
+            entry.last_progress_at_ms = Some(now);
+            entry.last_updated_at_ms = now;
         }
     }
 
     /// Records a retry attempt with the active ladder rung and attempt index.
     pub fn record_retry(&self, request_id: &str, rung: &str, attempt_index: u32) {
-        if let Ok(mut entries) = self.entries.write() {
-            if let Some(entry) = entries.get_mut(request_id) {
-                let now = now_unix_millis();
-                entry.active_ladder_rung = Some(rung.to_owned());
-                entry.active_attempt_index = Some(attempt_index);
-                entry.state = LiveRequestState::Retrying;
-                entry.last_updated_at_ms = now;
-                entry.timeline.push(TimelineEvent {
-                    at_ms: now,
-                    event: format!("retrying:{rung}:{attempt_index}"),
-                });
-            }
+        if let Ok(mut entries) = self.entries.write()
+            && let Some(entry) = entries.get_mut(request_id)
+        {
+            let now = now_unix_millis();
+            entry.active_ladder_rung = Some(rung.to_owned());
+            entry.active_attempt_index = Some(attempt_index);
+            entry.state = LiveRequestState::Retrying;
+            entry.last_updated_at_ms = now;
+            entry.timeline.push(TimelineEvent {
+                at_ms: now,
+                event: format!("retrying:{rung}:{attempt_index}"),
+            });
         }
     }
 
