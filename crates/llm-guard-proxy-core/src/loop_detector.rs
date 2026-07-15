@@ -367,18 +367,17 @@ impl ToolLoopDetector {
             .fingerprint_counts
             .get(&fingerprint.fingerprint_hash)
             .copied()
+            && count >= TOOL_FINGERPRINT_REPEAT_THRESHOLD
         {
-            if count >= TOOL_FINGERPRINT_REPEAT_THRESHOLD {
-                let risk = fingerprint_repeat_risk(count);
-                let signal = ToolLoopSignal {
-                    reason_code: LoopReasonCode::ToolFingerprintRepeat,
-                    fingerprint_hash: fingerprint.fingerprint_hash,
-                    repeat_count: count,
-                    risk,
-                };
-                emitted.push(signal.clone());
-                self.signals.push(signal);
-            }
+            let risk = fingerprint_repeat_risk(count);
+            let signal = ToolLoopSignal {
+                reason_code: LoopReasonCode::ToolFingerprintRepeat,
+                fingerprint_hash: fingerprint.fingerprint_hash,
+                repeat_count: count,
+                risk,
+            };
+            emitted.push(signal.clone());
+            self.signals.push(signal);
         }
 
         if let Some(signal) = self.detect_alternation() {
@@ -422,12 +421,12 @@ impl ToolLoopDetector {
     fn push_fingerprint(&mut self, fingerprint_hash: u64) {
         self.fingerprints.push_back(fingerprint_hash);
         while self.fingerprints.len() > self.max_history {
-            if let Some(evicted) = self.fingerprints.pop_front() {
-                if let Some(count) = self.fingerprint_counts.get_mut(&evicted) {
-                    *count = count.saturating_sub(1);
-                    if *count == 0 {
-                        self.fingerprint_counts.remove(&evicted);
-                    }
+            if let Some(evicted) = self.fingerprints.pop_front()
+                && let Some(count) = self.fingerprint_counts.get_mut(&evicted)
+            {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.fingerprint_counts.remove(&evicted);
                 }
             }
         }
@@ -867,17 +866,16 @@ impl LoopInputProfile {
         token_window_counts: &mut BTreeMap<u64, u32>,
     ) {
         for line in text.lines() {
-            if let Some(hash) = normalized_line_hash(line) {
-                if let Some(count) = increment_count_with_cap(
+            if let Some(hash) = normalized_line_hash(line)
+                && let Some(count) = increment_count_with_cap(
                     line_counts,
                     hash,
                     LOOP_INPUT_LINE_COUNT_CAP,
                     &mut self.state_capping.input_lines,
-                ) {
-                    if count > 1 {
-                        self.repeated_line_hashes.insert(hash);
-                    }
-                }
+                )
+                && count > 1
+            {
+                self.repeated_line_hashes.insert(hash);
             }
         }
         observe_token_window_hashes(text, token_window_size, |window_hash| {
@@ -886,10 +884,9 @@ impl LoopInputProfile {
                 window_hash,
                 LOOP_INPUT_TOKEN_WINDOW_COUNT_CAP,
                 &mut self.state_capping.input_token_windows,
-            ) {
-                if count > 1 {
-                    self.repeated_token_window_hashes.insert(window_hash);
-                }
+            ) && count > 1
+            {
+                self.repeated_token_window_hashes.insert(window_hash);
             }
         });
     }
@@ -961,14 +958,13 @@ impl ChannelizedLoopDetector {
             argument_hash,
             LOOP_ARGUMENT_HASH_COUNT_CAP,
             &mut self.tool_argument_json_count_capped,
-        ) {
-            if count > 1 {
-                signals.push(repeated_tool_arguments_signal(
-                    argument_hash,
-                    u64::from(count),
-                    self.tool_argument_json_count_capped,
-                ));
-            }
+        ) && count > 1
+        {
+            signals.push(repeated_tool_arguments_signal(
+                argument_hash,
+                u64::from(count),
+                self.tool_argument_json_count_capped,
+            ));
         }
 
         let tool_name_hash = stable_hash(tool_name.as_bytes());
@@ -978,16 +974,15 @@ impl ChannelizedLoopDetector {
             fingerprint_hash,
             LOOP_FINGERPRINT_COUNT_CAP,
             &mut self.tool_fingerprint_count_capped,
-        ) {
-            if count > 1 {
-                signals.push(repeated_tool_fingerprint_signal(
-                    tool_name_hash,
-                    argument_hash,
-                    fingerprint_hash,
-                    u64::from(count),
-                    self.tool_fingerprint_count_capped,
-                ));
-            }
+        ) && count > 1
+        {
+            signals.push(repeated_tool_fingerprint_signal(
+                tool_name_hash,
+                argument_hash,
+                fingerprint_hash,
+                u64::from(count),
+                self.tool_fingerprint_count_capped,
+            ));
         }
         signals
     }

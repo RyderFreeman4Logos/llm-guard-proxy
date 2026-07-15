@@ -3142,15 +3142,16 @@ fn resolve_caller_profile(
         });
     }
 
-    if virtual_key.is_none() && config.profiles.len() == 1 {
-        if let Some((profile_name, profile)) = config.profiles.iter().next() {
-            return Ok(ResolvedCallerProfile {
-                name: profile_name.clone(),
-                config: profile.clone(),
-                resolution: CallerProfileResolution::SingleProfileDefault,
-                enforce_policy: true,
-            });
-        }
+    if virtual_key.is_none()
+        && config.profiles.len() == 1
+        && let Some((profile_name, profile)) = config.profiles.iter().next()
+    {
+        return Ok(ResolvedCallerProfile {
+            name: profile_name.clone(),
+            config: profile.clone(),
+            resolution: CallerProfileResolution::SingleProfileDefault,
+            enforce_policy: true,
+        });
     }
 
     match config.virtual_keys.unknown_key_policy {
@@ -9420,12 +9421,11 @@ impl ForwardedBodyObserver {
         if matches!(
             completion,
             BodyCompletion::DownstreamDropped | BodyCompletion::Shutdown
-        ) {
-            if let Some(progress) = &self.attempt_progress {
-                let progress = shielded_attempt_progress(progress);
-                attempts = progress.completed_attempt_records.clone();
-                final_attempt.clone_from(&progress.current_attempt);
-            }
+        ) && let Some(progress) = &self.attempt_progress
+        {
+            let progress = shielded_attempt_progress(progress);
+            attempts = progress.completed_attempt_records.clone();
+            final_attempt.clone_from(&progress.current_attempt);
         }
         let upstream_mode = final_attempt
             .as_ref()
@@ -12443,10 +12443,10 @@ fn admission_error_response(
     retry_after: Option<String>,
 ) -> Response<Body> {
     let mut response = proxy_error_response(status, error_type, message);
-    if let Some(retry_after) = retry_after {
-        if let Ok(value) = HeaderValue::from_str(&retry_after) {
-            response.headers_mut().insert(RETRY_AFTER, value);
-        }
+    if let Some(retry_after) = retry_after
+        && let Ok(value) = HeaderValue::from_str(&retry_after)
+    {
+        response.headers_mut().insert(RETRY_AFTER, value);
     }
     response
 }

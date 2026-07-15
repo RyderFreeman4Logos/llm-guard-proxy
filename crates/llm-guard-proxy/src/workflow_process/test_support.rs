@@ -301,10 +301,10 @@ where
     Sleep: FnMut(),
 {
     loop {
-        if let Some(identity) = read() {
-            if probe(identity) == IdentityProbe::Current {
-                return Some(identity);
-            }
+        if let Some(identity) = read()
+            && probe(identity) == IdentityProbe::Current
+        {
+            return Some(identity);
         }
         if Instant::now() >= deadline {
             return None;
