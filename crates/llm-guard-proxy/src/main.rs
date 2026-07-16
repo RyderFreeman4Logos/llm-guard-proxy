@@ -20,6 +20,8 @@ use config_reload::ConfigManager;
 use llm_guard_proxy_core::redact_upstream_base_url;
 #[cfg(feature = "memory-guardian")]
 use llm_guard_proxy_host_guardian::MemoryGuardian;
+#[cfg(feature = "host-telemetry")]
+use llm_guard_proxy_host_telemetry::HostTelemetry;
 #[cfg(feature = "guard")]
 use llm_guard_proxy_state::BudgetStore;
 use llm_guard_proxy_state::{
@@ -42,6 +44,10 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     let args = args.into_iter().collect::<Vec<_>>();
     if args.get(1).and_then(|arg| arg.to_str()) == Some("evidence") {
         return run_evidence_command(parse_evidence_command(&args[2..])?);
+    }
+    #[cfg(feature = "host-telemetry")]
+    if args.get(1).and_then(|arg| arg.to_str()) == Some("telemetry") {
+        return run_telemetry_command(parse_telemetry_command(&args[2..])?).await;
     }
     #[cfg(feature = "memory-guardian")]
     if args.get(1).and_then(|arg| arg.to_str()) == Some("guardian") {
@@ -111,6 +117,16 @@ async fn run_server(options: ProxyOptions) -> Result<(), String> {
         return serve_with_guardian(bound_listeners, state, guardian).await;
     }
     serve_bound_listeners(bound_listeners, state).await
+}
+
+#[cfg(feature = "host-telemetry")]
+async fn run_telemetry_command(command: TelemetryCommand) -> Result<(), String> {
+    let mut telemetry =
+        HostTelemetry::open(command.config_path).map_err(|error| error.to_string())?;
+    telemetry
+        .run_until(shutdown_signal())
+        .await
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "memory-guardian")]
@@ -365,6 +381,12 @@ struct GuardianCommand {
     runtime_dir: PathBuf,
 }
 
+#[cfg(feature = "host-telemetry")]
+#[derive(Debug, Eq, PartialEq)]
+struct TelemetryCommand {
+    config_path: PathBuf,
+}
+
 fn parse_proxy_options(args: impl IntoIterator<Item = OsString>) -> Result<ProxyOptions, String> {
     let mut args = args.into_iter();
     let _program = args.next();
@@ -455,6 +477,33 @@ fn parse_proxy_options(args: impl IntoIterator<Item = OsString>) -> Result<Proxy
         config_path,
         #[cfg(feature = "memory-guardian")]
         guardian,
+    })
+}
+
+#[cfg(feature = "host-telemetry")]
+fn parse_telemetry_command(args: &[OsString]) -> Result<TelemetryCommand, String> {
+    let mut config_path = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--config" {
+            index = index.saturating_add(1);
+            config_path = Some(required_path_arg(args, index, "--config")?);
+        } else if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--config="))
+        {
+            config_path = Some(nonempty_path_value(value, "--config")?);
+        } else {
+            return Err(format!(
+                "unknown telemetry argument: {}",
+                arg.to_string_lossy()
+            ));
+        }
+        index = index.saturating_add(1);
+    }
+    Ok(TelemetryCommand {
+        config_path: config_path.ok_or_else(|| String::from("telemetry requires --config"))?,
     })
 }
 
@@ -732,6 +781,8 @@ mod tests {
     };
     #[cfg(feature = "memory-guardian")]
     use super::{GuardianCommand, parse_guardian_command};
+    #[cfg(feature = "host-telemetry")]
+    use super::{TelemetryCommand, parse_telemetry_command};
 
     #[test]
     fn renders_health_with_config_summary() {
@@ -778,6 +829,18 @@ mod tests {
             GuardianCommand {
                 config_path: "guardian.toml".into(),
                 runtime_dir: "/run/user/1000/gb10-memory-guardian".into(),
+            }
+        );
+    }
+
+    #[cfg(feature = "host-telemetry")]
+    #[test]
+    fn parses_telemetry_subcommand_arguments() {
+        let args = [OsString::from("--config=telemetry.toml")];
+        assert_eq!(
+            parse_telemetry_command(&args).expect("telemetry args should parse"),
+            TelemetryCommand {
+                config_path: "telemetry.toml".into(),
             }
         );
     }
