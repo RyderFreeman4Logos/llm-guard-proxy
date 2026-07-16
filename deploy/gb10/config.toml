@@ -490,6 +490,46 @@ interval_secs = 15                         # Send heartbeat every 15s
 [cloudflare]
 enabled = true
 
+## ───────────────────────── Host memory guardian ────────────────────────────
+## `memory-guardian` is a default-on compile-time feature. The guardian has a
+## separate strict configuration file so proxy config reload cannot weaken its
+## registration-file ownership checks. Use deploy/gb10/memory-guardian.toml as
+## the operator template.
+##
+## Start it alongside the proxy:
+##   llm-guard-proxy --config /etc/llm-guard-proxy/config.toml \
+##     --guardian-config /etc/llm-guard-proxy/memory-guardian.toml \
+##     --guardian-runtime-dir /run/user/1000/gb10-memory-guardian
+##
+## Or run the guardian independently:
+##   llm-guard-proxy guardian --config /etc/llm-guard-proxy/memory-guardian.toml \
+##     --runtime-dir /run/user/1000/gb10-memory-guardian
+##
+## Fully commented guardian example. Both the guardian config and registration
+## file must be 0600 single-link regular files owned by the service user; the cgroup target is
+## validated and opened while healthy. The emergency path releases reserve
+## memory and writes `1` to that pre-opened cgroup.kill descriptor without
+## allocation. Tier 2 is disabled by default.
+# schema_version = 1
+#
+# [target]
+# label = "aeon-text"                        # Operator-facing target label
+# registration_file = "text-cgroup.v1"       # Filename below runtime-dir
+#
+# [thresholds]
+# mem_avail_stop_gib = 1                      # Tier 1 MemAvailable stop point
+# reserve_mib = 64                            # Pre-touched reserve to release
+#
+# [runtime]
+# cgroup_root = "/sys/fs/cgroup"             # cgroup-v2 root
+# poll_interval_secs = 1                      # Healthy-loop and hot-reload interval
+# retry_interval_secs = 5                     # Latched cgroup.events poll interval
+#
+# [escalation]
+# enabled = false                             # Tier 2 systemd escalation, opt-in
+# unit = "vllm-aeon-27b-dflash.service"      # Required only when enabled
+# grace_period_secs = 60                      # Delay after Tier 1 before Tier 2
+
 ## ───────────────────────── OPT-IN: Guard features ──────────────────────────
 ## The following sections require building with `--features guard`.
 ## They provide GWP (Guard Workflow Protocol) hooks, caller profiles,
