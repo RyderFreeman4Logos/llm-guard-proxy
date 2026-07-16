@@ -3,12 +3,71 @@
 use crate::config::{ConfigError, GuardianConfig, Thresholds};
 use notify::{RecursiveMode, Watcher};
 use std::{
+    fs::{File, OpenOptions},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::PathBuf,
     sync::{
         Arc, Mutex, RwLock,
         atomic::{AtomicBool, Ordering},
     },
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ConfigGeneration {
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl ConfigGeneration {
+    fn capture(path: &std::path::Path) -> Result<Self, ConfigError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+            .open(path)
+            .map_err(|source| ConfigError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        Self::from_file(&file, path)
+    }
+
+    fn from_file(file: &File, path: &std::path::Path) -> Result<Self, ConfigError> {
+        let metadata = file.metadata().map_err(|source| ConfigError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+}
+
+/// A parsed configuration that has not yet been published as live.
+///
+/// The guardian must pre-open and validate the candidate cgroup target before
+/// calling [`HotReloadableConfig::commit_candidate`].
+#[derive(Debug)]
+pub(crate) struct ReloadCandidate {
+    config: GuardianConfig,
+    generation: ConfigGeneration,
+}
+
+impl ReloadCandidate {
+    pub(crate) fn config(&self) -> &GuardianConfig {
+        &self.config
+    }
+}
 
 #[derive(Debug, Default)]
 struct ReloadSignal {
@@ -100,7 +159,17 @@ impl HotReloadableConfig {
             .thresholds()
     }
 
-    /// Reads and validates a pending candidate in the healthy loop.
+    /// Borrows the active configuration without cloning its strings or paths.
+    pub(crate) fn with_current<T>(&self, callback: impl FnOnce(&GuardianConfig) -> T) -> T {
+        let config = self
+            .live
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        callback(&config)
+    }
+
+    /// Reads and validates a pending candidate in the healthy loop without
+    /// publishing it. Candidates must be armed before commit.
     ///
     /// Invalid candidates are returned to the caller without changing live
     /// values, so a partially written or invalid file cannot disarm Tier 1.
@@ -109,7 +178,9 @@ impl HotReloadableConfig {
     ///
     /// Returns watcher or candidate-validation failures while retaining the
     /// last known-good live configuration.
-    pub fn reload_if_changed(&self) -> Result<Option<GuardianConfig>, ConfigError> {
+    pub(crate) fn pending_candidate_if_changed(
+        &self,
+    ) -> Result<Option<ReloadCandidate>, ConfigError> {
         let error = self
             .signal
             .error
@@ -122,16 +193,41 @@ impl HotReloadableConfig {
         if !self.signal.changed.swap(false, Ordering::AcqRel) {
             return Ok(None);
         }
+        let before = ConfigGeneration::capture(&self.config_path)?;
         let candidate = GuardianConfig::load(&self.config_path)?;
-        let mut live = self
+        let generation = ConfigGeneration::capture(&self.config_path)?;
+        if generation != before {
+            return Err(ConfigError::Invalid(String::from(
+                "guardian config changed while candidate was captured",
+            )));
+        }
+        let live = self
             .live
-            .write()
+            .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if *live == candidate {
             return Ok(None);
         }
-        *live = candidate.clone();
-        Ok(Some(candidate))
+        Ok(Some(ReloadCandidate {
+            config: candidate,
+            generation,
+        }))
+    }
+
+    /// Atomically publishes an already-armed candidate if it has not changed.
+    ///
+    /// A false result means the generation was superseded; the caller must
+    /// retain the current target and retry from a fresh candidate.
+    pub(crate) fn commit_candidate(&self, candidate: ReloadCandidate) -> Result<bool, ConfigError> {
+        if ConfigGeneration::capture(&self.config_path)? != candidate.generation {
+            return Ok(false);
+        }
+        let mut live = self
+            .live
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *live = candidate.config;
+        Ok(true)
     }
 
     #[cfg(test)]
@@ -164,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn publishes_new_coherent_snapshot() {
+    fn produces_new_coherent_candidate() {
         let path = temp_config();
         fs::write(&path, config(1)).expect("write config");
         secure(&path);
@@ -174,9 +270,10 @@ mod tests {
         watcher.mark_changed_for_test();
         assert_eq!(
             watcher
-                .reload_if_changed()
+                .pending_candidate_if_changed()
                 .expect("reload")
                 .expect("changed")
+                .config()
                 .thresholds()
                 .mem_avail_stop_gib(),
             3
@@ -192,7 +289,7 @@ mod tests {
         let watcher = HotReloadableConfig::new(&path).expect("watcher");
         fs::write(&path, "schema_version = 2").expect("replace config");
         watcher.mark_changed_for_test();
-        assert!(watcher.reload_if_changed().is_err());
+        assert!(watcher.pending_candidate_if_changed().is_err());
         assert_eq!(watcher.thresholds().mem_avail_stop_gib(), 1);
         fs::remove_file(path).expect("remove config");
     }
@@ -204,7 +301,32 @@ mod tests {
         secure(&path);
         let watcher = HotReloadableConfig::new(&path).expect("watcher");
         watcher.mark_changed_for_test();
-        assert!(watcher.reload_if_changed().expect("reload").is_none());
+        assert!(
+            watcher
+                .pending_candidate_if_changed()
+                .expect("reload")
+                .is_none()
+        );
+        fs::remove_file(path).expect("remove config");
+    }
+
+    #[test]
+    fn candidate_is_not_live_until_committed_after_arming() {
+        let path = temp_config();
+        fs::write(&path, config(1)).expect("write config");
+        secure(&path);
+        let watcher = HotReloadableConfig::new(&path).expect("watcher");
+        fs::write(&path, config(3)).expect("replace config");
+        secure(&path);
+        watcher.mark_changed_for_test();
+
+        let candidate = watcher
+            .pending_candidate_if_changed()
+            .expect("candidate")
+            .expect("changed");
+        assert_eq!(watcher.thresholds().mem_avail_stop_gib(), 1);
+        assert!(watcher.commit_candidate(candidate).expect("commit"));
+        assert_eq!(watcher.thresholds().mem_avail_stop_gib(), 3);
         fs::remove_file(path).expect("remove config");
     }
 }

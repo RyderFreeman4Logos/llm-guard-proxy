@@ -692,6 +692,7 @@ dependencies = [
 name = "llm-guard-proxy-host-guardian"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "nix",
  "notify",
  "serde",

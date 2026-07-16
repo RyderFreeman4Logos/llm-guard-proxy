@@ -527,7 +527,7 @@ enabled = true
 #
 # [escalation]
 # enabled = false                             # Tier 2 systemd escalation, opt-in
-# unit = "vllm-aeon-27b-dflash.service"      # Required only when enabled
+# unit = "gb10-stack-recovery.service"        # Required only when enabled
 # grace_period_secs = 60                      # Delay after Tier 1 before Tier 2
 
 ## ───────────────────────── OPT-IN: Guard features ──────────────────────────

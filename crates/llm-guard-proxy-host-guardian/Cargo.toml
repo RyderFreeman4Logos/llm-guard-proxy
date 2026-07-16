@@ -8,6 +8,7 @@ repository.workspace = true
 description = "GB10 host-memory emergency guardian for llm-guard-proxy."
 
 [dependencies]
+libc = "0.2"
 notify = { version = "8.2", default-features = false }
 nix = { version = "0.29", features = ["fs", "user"] }
 serde = { version = "1", features = ["derive"] }

@@ -20,7 +20,7 @@ pub struct EscalationEpisode {
 impl EscalationEpisode {
     /// Arms a fresh episode only when Tier 1 has successfully acted.
     pub fn arm(&mut self, config: &EscalationConfig, now: Instant) {
-        if config.enabled() {
+        if config.enabled() && self.armed_at.is_none() {
             self.armed_at = Some(now);
             self.attempted = false;
         }
@@ -189,6 +189,18 @@ mod tests {
                 .maybe_run(&config, now + Duration::from_secs(59))
                 .expect("grace")
         );
+    }
+
+    #[test]
+    fn replacement_tier_one_actions_preserve_the_original_episode_deadline() {
+        let mut episode = EscalationEpisode::default();
+        let started = Instant::now();
+        let config = config(true, Some("test.service"));
+        episode.arm(&config, started);
+        episode.arm(&config, started + Duration::from_secs(30));
+
+        assert_eq!(episode.armed_at, Some(started));
+        assert!(!episode.attempted);
     }
 
     #[test]

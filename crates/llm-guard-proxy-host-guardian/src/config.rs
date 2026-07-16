@@ -400,6 +400,10 @@ impl FileEscalation {
                 "escalation.unit is required when escalation.enabled is true",
             )));
         }
+        if let Some(unit) = unit.as_deref() {
+            crate::escalation::validate_unit_name(unit)
+                .map_err(|error| ConfigError::Invalid(error.to_string()))?;
+        }
         Ok(EscalationConfig {
             enabled,
             unit,
@@ -500,6 +504,15 @@ reserve_mib = 128
     fn escalation_is_disabled_by_default() {
         let config = parse(CONFIG).expect("config parses");
         assert!(!config.escalation().enabled());
+    }
+
+    #[test]
+    fn rejects_an_unsafe_escalation_unit_while_healthy() {
+        let error = parse(&format!(
+            "{CONFIG}\n[escalation]\nenabled = true\nunit = \"../recovery.service\"\n"
+        ))
+        .expect_err("unsafe unit must fail before emergency mode");
+        assert!(error.to_string().contains("systemd service unit"));
     }
 
     #[test]

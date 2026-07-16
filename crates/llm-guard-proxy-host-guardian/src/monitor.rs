@@ -2,16 +2,20 @@
 
 use crate::{
     config::{ConfigError, GuardianConfig, Thresholds},
+    emergency::{AttemptOutcome, EmergencyController, EmergencyReserve},
     escalation::EscalationEpisode,
-    hot_reload::HotReloadableConfig,
+    hot_reload::{HotReloadableConfig, ReloadCandidate},
 };
 use nix::unistd::Uid;
 use std::{
     fs::{File, OpenOptions},
-    io::{self, Read, Write},
-    os::unix::{fs::FileExt, fs::MetadataExt, fs::OpenOptionsExt},
+    io::{self, Read},
+    os::{
+        fd::AsRawFd,
+        unix::{fs::FileExt, fs::MetadataExt, fs::OpenOptionsExt},
+    },
     path::{Path, PathBuf},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use thiserror::Error;
 
@@ -83,6 +87,12 @@ pub const fn should_rearm(mem_available_bytes: u64, thresholds: Thresholds) -> b
 /// Errors decoding the kernel-provided memory information.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum MemInfoError {
+    /// The pre-opened meminfo descriptor could not be read.
+    #[error("MemAvailable could not be read")]
+    Read,
+    /// The fixed emergency buffer was insufficient.
+    #[error("MemAvailable exceeds the fixed buffer")]
+    TooLarge,
     /// `MemAvailable` was not present.
     #[error("MemAvailable is missing")]
     Missing,
@@ -214,7 +224,32 @@ pub struct CgroupTarget {
     events: File,
 }
 
+/// Compact cgroup state failures for the allocation-free emergency loop.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub(crate) enum CgroupStateError {
+    #[error("cgroup.events could not be read")]
+    Read,
+    #[error("cgroup.events is malformed")]
+    Invalid,
+}
+
 impl CgroupTarget {
+    /// Opens one validated registration with descriptors retained for Tier 1.
+    ///
+    /// This is a healthy-path operation; it parses untrusted registration data
+    /// and must complete before the target replaces the last-good descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GuardianError`] when the registration or its target cgroup
+    /// cannot be validated and opened.
+    pub fn open_registered(
+        registration_path: &Path,
+        cgroup_root: &Path,
+    ) -> Result<Self, GuardianError> {
+        Self::from_registration(registration_path, cgroup_root, Uid::effective().as_raw())
+    }
+
     fn from_registration(
         registration_path: &Path,
         cgroup_root: &Path,
@@ -258,9 +293,10 @@ impl CgroupTarget {
                 source,
             })?;
         let target = Self { kill, events };
-        if !target.is_populated().map_err(|source| GuardianError::Io {
-            operation: "read cgroup.events while arming",
-            source,
+        if !target.is_populated().map_err(|_error| {
+            GuardianError::InvalidRegistration(String::from(
+                "registered cgroup could not be verified as populated",
+            ))
         })? {
             return Err(GuardianError::InvalidRegistration(String::from(
                 "registered cgroup is not populated",
@@ -269,39 +305,29 @@ impl CgroupTarget {
         Ok(target)
     }
 
-    /// Releases the reserve and writes one byte to the already-open kill fd.
-    ///
-    /// This is the emergency path: it never opens files, parses strings, spawns
-    /// processes, sends IPC, or allocates. `Write::write_all` handles EINTR.
-    ///
-    /// # Errors
-    ///
-    /// Returns the kernel write error from the already-open `cgroup.kill` fd.
-    pub fn kill_direct(&mut self, reserve: &mut Option<Vec<u8>>) -> Result<(), io::Error> {
-        drop(reserve.take());
-        self.kill.write_all(b"1")
+    pub(crate) fn kill_fd(&self) -> std::os::fd::RawFd {
+        self.kill.as_raw_fd()
     }
 
-    fn is_empty(&self) -> Result<bool, io::Error> {
+    pub(crate) fn is_empty(&self) -> Result<bool, CgroupStateError> {
         Ok(!self.is_populated()?)
     }
 
-    fn is_populated(&self) -> Result<bool, io::Error> {
+    fn is_populated(&self) -> Result<bool, CgroupStateError> {
         let mut bytes = [0_u8; EVENTS_BUFFER_BYTES];
-        let length = self.events.read_at(&mut bytes, 0)?;
-        let text = std::str::from_utf8(&bytes[..length]).map_err(|_error| {
-            io::Error::new(io::ErrorKind::InvalidData, "cgroup.events is not UTF-8")
-        })?;
+        let length = self
+            .events
+            .read_at(&mut bytes, 0)
+            .map_err(|_error| CgroupStateError::Read)?;
+        let text =
+            std::str::from_utf8(&bytes[..length]).map_err(|_error| CgroupStateError::Invalid)?;
         match text.lines().map(str::trim).find_map(|line| match line {
             "populated 0" => Some(false),
             "populated 1" => Some(true),
             _ => None,
         }) {
             Some(populated) => Ok(populated),
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "cgroup.events does not contain populated state",
-            )),
+            None => Err(CgroupStateError::Invalid),
         }
     }
 }
@@ -347,6 +373,9 @@ pub enum GuardianError {
     /// Configuration load or hot-reload failure.
     #[error(transparent)]
     Config(#[from] ConfigError),
+    /// The pre-touched emergency reserve could not be allocated at startup.
+    #[error(transparent)]
+    Reserve(#[from] crate::emergency::ReserveError),
     /// Tier-2 was explicitly enabled but failed after the Tier-1 action.
     #[error(transparent)]
     Escalation(#[from] crate::escalation::EscalationError),
@@ -369,13 +398,14 @@ pub enum GuardianError {
 pub struct MemoryGuardian {
     reloader: HotReloadableConfig,
     runtime_dir: PathBuf,
-    registration_path: PathBuf,
-    cgroup_root: PathBuf,
     target: Option<CgroupTarget>,
+    pending_config: Option<ReloadCandidate>,
     proc_meminfo: File,
-    reserve: Option<Vec<u8>>,
+    controller: EmergencyController,
+    poll_interval: Duration,
+    retry_interval: Duration,
+    started: Instant,
     latched: bool,
-    verified: bool,
     escalation: EscalationEpisode,
 }
 
@@ -384,8 +414,9 @@ impl MemoryGuardian {
     ///
     /// # Errors
     ///
-    /// Returns an error when the config, registration, cgroup descriptors, or
-    /// `/proc/meminfo` cannot be safely opened.
+    /// Returns an error when the config, reserve mapping, or `/proc/meminfo`
+    /// cannot be safely opened. Missing registrations are retried by the
+    /// healthy loop so startup remains protected rather than failing closed.
     pub fn open(
         config_path: impl Into<PathBuf>,
         runtime_dir: impl Into<PathBuf>,
@@ -393,10 +424,7 @@ impl MemoryGuardian {
         let reloader = HotReloadableConfig::new(config_path.into())?;
         let runtime_dir = runtime_dir.into();
         let config = reloader.current();
-        let registration_path = registration_path(&config, &runtime_dir);
-        let cgroup_root = config.runtime().cgroup_root().to_path_buf();
-        let target = open_target_at(&registration_path, &cgroup_root)?;
-        let reserve = allocate_reserve(config.thresholds().reserve_bytes());
+        let reserve = EmergencyReserve::new(config.thresholds().reserve_bytes())?;
         let proc_meminfo = File::open("/proc/meminfo").map_err(|source| GuardianError::Io {
             operation: "open /proc/meminfo",
             source,
@@ -404,13 +432,17 @@ impl MemoryGuardian {
         Ok(Self {
             reloader,
             runtime_dir,
-            registration_path,
-            cgroup_root,
-            target: Some(target),
+            target: None,
+            pending_config: None,
             proc_meminfo,
-            reserve: Some(reserve),
+            controller: EmergencyController::new(
+                reserve,
+                duration_millis(config.runtime().retry_interval()),
+            ),
+            poll_interval: config.runtime().poll_interval(),
+            retry_interval: config.runtime().retry_interval(),
+            started: Instant::now(),
             latched: false,
-            verified: false,
             escalation: EscalationEpisode::default(),
         })
     }
@@ -425,20 +457,21 @@ impl MemoryGuardian {
     ///
     /// # Errors
     ///
-    /// Returns errors from the healthy reload/arming path, the pre-opened
-    /// kernel descriptors, or explicitly enabled Tier-2 escalation.
+    /// Recoverable meminfo, cgroup, and reload failures are retained in the
+    /// guardian state and never terminate the monitoring task.
     pub fn tick(&mut self) -> Result<GuardianIteration, GuardianError> {
         if self.latched {
-            return self.latched_iteration();
+            return Ok(self.latched_iteration());
         }
-        self.healthy_iteration()
+        Ok(self.healthy_iteration())
     }
 
     /// Runs until the supplied shutdown future resolves.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Self::tick`] or optional Tier-2 escalation.
+    /// Only shutdown completes this loop; recoverable protection failures are
+    /// logged and retried without taking down combined proxy mode.
     pub async fn run_until<F>(&mut self, shutdown: F) -> Result<(), GuardianError>
     where
         F: std::future::Future<Output = ()>,
@@ -446,18 +479,24 @@ impl MemoryGuardian {
         tokio::pin!(shutdown);
         loop {
             let iteration = self.tick()?;
-            let config = self.reloader.current();
             let delay = if self.latched {
-                config.runtime().retry_interval()
+                self.retry_interval
             } else {
-                config.runtime().poll_interval()
+                self.poll_interval
             };
             if matches!(iteration, GuardianIteration::Shed) {
-                self.escalation.arm(config.escalation(), Instant::now());
+                self.reloader.with_current(|config| {
+                    self.escalation.arm(config.escalation(), Instant::now());
+                });
             }
             if self.latched {
-                self.escalation
-                    .maybe_run(config.escalation(), Instant::now())?;
+                let result = self.reloader.with_current(|config| {
+                    self.escalation
+                        .maybe_run(config.escalation(), Instant::now())
+                });
+                if let Err(error) = result {
+                    eprintln!("memory guardian: Tier 2 escalation trigger failed: {error}");
+                }
             }
             tokio::select! {
                 () = &mut shutdown => return Ok(()),
@@ -466,101 +505,88 @@ impl MemoryGuardian {
         }
     }
 
-    fn healthy_iteration(&mut self) -> Result<GuardianIteration, GuardianError> {
-        let available = read_mem_available(&self.proc_meminfo)?;
+    fn healthy_iteration(&mut self) -> GuardianIteration {
+        let available = match read_mem_available(&self.proc_meminfo) {
+            Ok(available) => available,
+            Err(_error) => return GuardianIteration::Healthy,
+        };
         let thresholds = self.reloader.thresholds();
         if should_shed(available, thresholds) {
-            self.target
-                .as_mut()
-                .ok_or(GuardianError::NoTarget)?
-                .kill_direct(&mut self.reserve)
-                .map_err(|source| GuardianError::Io {
-                    operation: "write cgroup.kill",
-                    source,
-                })?;
             self.latched = true;
-            self.verified = false;
-            return Ok(GuardianIteration::Shed);
+            self.controller.enter_emergency();
+            return self.attempt_emergency(true);
         }
-        // A malformed replacement must retain and keep enforcing the last-good
-        // snapshot. The watcher reports the error once, but cannot turn a live
-        // guardian into an unprotected stopped process.
-        let _reload_error = self.reloader.reload_if_changed().err();
-        let config = self.reloader.current();
-        self.update_target_location(&config);
-        match self.open_configured_target() {
-            Ok(target) => self.target = Some(target),
-            Err(_error) => {
-                self.target = None;
-                return Ok(GuardianIteration::Unarmed);
-            }
-        }
-        Ok(GuardianIteration::Healthy)
-    }
-
-    fn latched_iteration(&mut self) -> Result<GuardianIteration, GuardianError> {
-        let available = read_mem_available(&self.proc_meminfo)?;
-        let thresholds = self.reloader.thresholds();
-        if should_rearm(available, thresholds) {
-            self.reserve = Some(allocate_reserve(thresholds.reserve_bytes()));
-            self.latched = false;
-            self.verified = false;
-            self.escalation.clear();
-            return Ok(GuardianIteration::Rearmed);
-        }
-        self.verified = self
-            .target
-            .as_ref()
-            .ok_or(GuardianError::NoTarget)?
-            .is_empty()
-            .map_err(|source| GuardianError::Io {
-                operation: "read cgroup.events",
-                source,
-            })?;
-        if !self.verified {
-            self.target
-                .as_mut()
-                .ok_or(GuardianError::NoTarget)?
-                .kill_direct(&mut self.reserve)
-                .map_err(|source| GuardianError::Io {
-                    operation: "retry cgroup.kill",
-                    source,
-                })?;
-            return Ok(GuardianIteration::Waiting);
-        }
-        if should_shed(available, thresholds) {
-            // A terminated container may be recreated while the host remains
-            // under pressure. This slow path is intentionally outside
-            // `kill_direct`: it reopens and validates a fresh descriptor only
-            // after the old cgroup has become empty.
-            if let Ok(replacement) = self.open_configured_target() {
-                self.target = Some(replacement);
-                self.target
-                    .as_mut()
-                    .ok_or(GuardianError::NoTarget)?
-                    .kill_direct(&mut self.reserve)
-                    .map_err(|source| GuardianError::Io {
-                        operation: "write replacement cgroup.kill",
-                        source,
-                    })?;
-                self.verified = false;
-                return Ok(GuardianIteration::Shed);
-            }
-        }
-        Ok(if self.verified {
-            GuardianIteration::Verified
+        self.reconcile_healthy_target();
+        if self.target.is_some() {
+            GuardianIteration::Healthy
         } else {
-            GuardianIteration::Waiting
-        })
+            GuardianIteration::Unarmed
+        }
     }
 
-    fn update_target_location(&mut self, config: &GuardianConfig) {
-        self.registration_path = registration_path(config, &self.runtime_dir);
-        self.cgroup_root = config.runtime().cgroup_root().to_path_buf();
+    fn latched_iteration(&mut self) -> GuardianIteration {
+        let available = read_mem_available_compact(&self.proc_meminfo);
+        let thresholds = self.reloader.thresholds();
+        if available.is_ok_and(|value| should_rearm(value, thresholds)) {
+            match self.controller.ensure_reserve(thresholds.reserve_bytes()) {
+                Ok(_) => {
+                    self.latched = false;
+                    self.escalation.clear();
+                    return GuardianIteration::Rearmed;
+                }
+                Err(_error) => return self.attempt_emergency(false),
+            }
+        }
+        self.attempt_emergency(false)
     }
 
-    fn open_configured_target(&self) -> Result<CgroupTarget, GuardianError> {
-        open_target_at(&self.registration_path, &self.cgroup_root)
+    fn attempt_emergency(&mut self, entering: bool) -> GuardianIteration {
+        let Some(target) = self.target.as_ref() else {
+            return GuardianIteration::Unarmed;
+        };
+        match self
+            .controller
+            .attempt(elapsed_millis(self.started), target)
+        {
+            AttemptOutcome::Verified => GuardianIteration::Verified,
+            AttemptOutcome::Waiting | AttemptOutcome::Retry if entering => GuardianIteration::Shed,
+            AttemptOutcome::Waiting | AttemptOutcome::Retry => GuardianIteration::Waiting,
+        }
+    }
+
+    fn reconcile_healthy_target(&mut self) {
+        if let Ok(Some(candidate)) = self.reloader.pending_candidate_if_changed() {
+            self.pending_config = Some(candidate);
+        }
+
+        if let Some(candidate) = self.pending_config.as_ref() {
+            let registration = registration_path(candidate.config(), &self.runtime_dir);
+            let cgroup_root = candidate.config().runtime().cgroup_root().to_path_buf();
+            let poll_interval = candidate.config().runtime().poll_interval();
+            let retry_interval = candidate.config().runtime().retry_interval();
+            if let Ok(target) = open_target_at(&registration, &cgroup_root) {
+                let candidate = self
+                    .pending_config
+                    .take()
+                    .expect("pending candidate exists");
+                if self.reloader.commit_candidate(candidate).unwrap_or(false) {
+                    self.target = Some(target);
+                    self.poll_interval = poll_interval;
+                    self.retry_interval = retry_interval;
+                    self.controller.reset_for_target_generation();
+                }
+            }
+            return;
+        }
+
+        let config = self.reloader.current();
+        let registration = registration_path(&config, &self.runtime_dir);
+        if let Ok(target) = open_target_at(&registration, config.runtime().cgroup_root()) {
+            self.target = Some(target);
+            self.poll_interval = config.runtime().poll_interval();
+            self.retry_interval = config.runtime().retry_interval();
+            self.controller.reset_for_target_generation();
+        }
     }
 }
 
@@ -569,35 +595,32 @@ fn registration_path(config: &GuardianConfig, runtime_dir: &Path) -> PathBuf {
 }
 
 fn open_target_at(registration: &Path, cgroup_root: &Path) -> Result<CgroupTarget, GuardianError> {
-    let uid = Uid::effective().as_raw();
-    CgroupTarget::from_registration(registration, cgroup_root, uid)
+    CgroupTarget::open_registered(registration, cgroup_root)
 }
 
 fn read_mem_available(file: &File) -> Result<u64, GuardianError> {
-    let mut bytes = [0_u8; MEMINFO_BUFFER_BYTES];
-    let length = file
-        .read_at(&mut bytes, 0)
-        .map_err(|source| GuardianError::Io {
-            operation: "read /proc/meminfo",
-            source,
-        })?;
-    if length == bytes.len() {
-        return Err(GuardianError::InvalidRegistration(String::from(
-            "/proc/meminfo exceeds fixed buffer",
-        )));
-    }
-    parse_mem_available(&bytes[..length]).map_err(|error| {
+    read_mem_available_compact(file).map_err(|error| {
         GuardianError::InvalidRegistration(format!("invalid /proc/meminfo: {error}"))
     })
 }
 
-fn allocate_reserve(bytes: usize) -> Vec<u8> {
-    let mut reserve = vec![0_u8; bytes];
-    let page_size = 4096;
-    for offset in (0..reserve.len()).step_by(page_size) {
-        reserve[offset] = 1;
+fn read_mem_available_compact(file: &File) -> Result<u64, MemInfoError> {
+    let mut bytes = [0_u8; MEMINFO_BUFFER_BYTES];
+    let length = file
+        .read_at(&mut bytes, 0)
+        .map_err(|_error| MemInfoError::Read)?;
+    if length == bytes.len() {
+        return Err(MemInfoError::TooLarge);
     }
-    reserve
+    parse_mem_available(&bytes[..length])
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -606,12 +629,12 @@ mod tests {
         CgroupTarget, MemInfoError, parse_mem_available, parse_registration, should_rearm,
         should_shed,
     };
-    use crate::Thresholds;
+    use crate::{EmergencyReserve, Thresholds, kill_direct};
     use nix::unistd::Uid;
     use std::{
-        fs,
+        fs::{self, File},
         os::unix::fs::PermissionsExt,
-        path::PathBuf,
+        path::{Path, PathBuf},
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -655,6 +678,19 @@ mod tests {
         fs::set_permissions(&registration_path, fs::Permissions::from_mode(0o600))
             .expect("secure registration");
         (root, registration_path)
+    }
+
+    fn guardian_config(registration_file: &str, cgroup_root: &Path) -> String {
+        format!(
+            "schema_version = 1\n[target]\nlabel = \"test\"\nregistration_file = \"{registration_file}\"\n[thresholds]\nmem_avail_stop_gib = 1\nreserve_mib = 1\n[runtime]\ncgroup_root = \"{}\"\npoll_interval_secs = 1\nretry_interval_secs = 1\n",
+            cgroup_root.display()
+        )
+    }
+
+    fn write_secure_config(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("write guardian config");
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .expect("secure guardian config");
     }
 
     #[test]
@@ -819,12 +855,12 @@ mod tests {
     #[test]
     fn cgroup_kill_releases_the_reserve_before_writing() {
         let (root, registration) = target_tree();
-        let mut target =
+        let target =
             CgroupTarget::from_registration(&registration, &root, Uid::effective().as_raw())
                 .expect("open target");
-        let mut reserve = Some(vec![1_u8; 4096]);
-        target.kill_direct(&mut reserve).expect("kill");
-        assert!(reserve.is_none());
+        let mut reserve = EmergencyReserve::with_page_size(4096, 4096).expect("reserve");
+        kill_direct(&mut reserve, &target).expect("kill");
+        assert!(!reserve.is_allocated());
         let kill_path = root.join(format!(
             "user.slice/user-{}.slice/user@{}.service/app.slice/docker-{}.scope/cgroup.kill",
             Uid::effective().as_raw(),
@@ -838,13 +874,13 @@ mod tests {
     #[test]
     fn cgroup_kill_can_be_retried_without_rearming_the_reserve() {
         let (root, registration) = target_tree();
-        let mut target =
+        let target =
             CgroupTarget::from_registration(&registration, &root, Uid::effective().as_raw())
                 .expect("open target");
-        let mut reserve = Some(vec![1_u8; 4096]);
-        target.kill_direct(&mut reserve).expect("first kill");
-        target.kill_direct(&mut reserve).expect("retry kill");
-        assert!(reserve.is_none());
+        let mut reserve = EmergencyReserve::with_page_size(4096, 4096).expect("reserve");
+        kill_direct(&mut reserve, &target).expect("first kill");
+        kill_direct(&mut reserve, &target).expect("retry kill");
+        assert!(!reserve.is_allocated());
         let kill_path = root.join(format!(
             "user.slice/user-{}.slice/user@{}.service/app.slice/docker-{}.scope/cgroup.kill",
             Uid::effective().as_raw(),
@@ -928,14 +964,106 @@ mod tests {
         )
         .expect("publish replacement registration");
 
-        let mut target =
+        let target =
             CgroupTarget::from_registration(&registration, &root, uid).expect("open replacement");
-        let mut reserve = None;
-        target.kill_direct(&mut reserve).expect("kill replacement");
+        let mut reserve = EmergencyReserve::with_page_size(4096, 4096).expect("reserve");
+        kill_direct(&mut reserve, &target).expect("kill replacement");
         assert_eq!(
             fs::read(replacement.join("cgroup.kill")).expect("read replacement kill"),
             b"1"
         );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn startup_waits_until_initial_registration_is_available() {
+        let root = temporary_tree();
+        let runtime = root.join("runtime");
+        fs::create_dir_all(&runtime).expect("create runtime");
+        let config_path = root.join("guardian.toml");
+        write_secure_config(&config_path, &guardian_config("target.v1", &root));
+
+        let mut guardian = super::MemoryGuardian::open(&config_path, &runtime)
+            .expect("missing registration must not abort startup");
+        guardian.reconcile_healthy_target();
+        assert!(guardian.target.is_none());
+
+        let id = "a".repeat(64);
+        let scope = format!("docker-{id}.scope");
+        let cgroup = root.join(format!(
+            "user.slice/user-{}.slice/user@{}.service/app.slice/{scope}",
+            Uid::effective().as_raw(),
+            Uid::effective().as_raw()
+        ));
+        fs::create_dir_all(&cgroup).expect("create cgroup");
+        fs::write(cgroup.join("cgroup.kill"), b"").expect("create kill");
+        fs::write(cgroup.join("cgroup.events"), b"populated 1\n").expect("create events");
+        let registration = format!(
+            "version=1\ncontainer_id={id}\nscope={scope}\ncontrol_group=/user.slice/user-{}.slice/user@{}.service/app.slice/{scope}\n",
+            Uid::effective().as_raw(),
+            Uid::effective().as_raw()
+        );
+        let registration_path = runtime.join("target.v1");
+        fs::write(&registration_path, registration).expect("publish registration");
+        fs::set_permissions(&registration_path, fs::Permissions::from_mode(0o600))
+            .expect("secure registration");
+
+        guardian.reconcile_healthy_target();
+        assert!(guardian.target.is_some());
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn invalid_hot_reload_candidate_retains_the_last_good_target() {
+        let (root, _registration) = target_tree();
+        let runtime = root.join("runtime");
+        let config_path = root.join("guardian.toml");
+        write_secure_config(&config_path, &guardian_config("target.v1", &root));
+        let mut guardian =
+            super::MemoryGuardian::open(&config_path, &runtime).expect("open guardian");
+        guardian.reconcile_healthy_target();
+        assert!(guardian.target.is_some());
+
+        write_secure_config(&config_path, &guardian_config("missing.v1", &root));
+        guardian.reloader.mark_changed_for_test();
+        guardian.reconcile_healthy_target();
+
+        assert!(guardian.target.is_some());
+        assert_eq!(
+            guardian.reloader.current().target().registration_file(),
+            "target.v1"
+        );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn latched_emergency_retries_after_meminfo_and_events_errors() {
+        let (root, registration) = target_tree();
+        let runtime = root.join("runtime");
+        let config_path = root.join("guardian.toml");
+        write_secure_config(&config_path, &guardian_config("target.v1", &root));
+        let mut guardian =
+            super::MemoryGuardian::open(&config_path, &runtime).expect("open guardian");
+        guardian.reconcile_healthy_target();
+
+        let malformed_meminfo = root.join("meminfo");
+        fs::write(&malformed_meminfo, b"malformed\n").expect("write meminfo");
+        guardian.proc_meminfo = File::open(&malformed_meminfo).expect("open meminfo");
+        let events = root.join(format!(
+            "user.slice/user-{}.slice/user@{}.service/app.slice/docker-{}.scope/cgroup.events",
+            Uid::effective().as_raw(),
+            Uid::effective().as_raw(),
+            "a".repeat(64)
+        ));
+        fs::write(events, b"malformed\n").expect("break events");
+        guardian.latched = true;
+        guardian.controller.enter_emergency();
+
+        assert_eq!(
+            guardian.tick().expect("recoverable failure"),
+            super::GuardianIteration::Waiting
+        );
+        assert!(registration.exists());
         fs::remove_dir_all(root).expect("remove root");
     }
 }
