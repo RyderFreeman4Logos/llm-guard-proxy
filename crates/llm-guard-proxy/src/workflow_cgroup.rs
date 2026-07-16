@@ -26,12 +26,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+use rustix::{
+    io::Errno,
+    process::{Pid, PidfdFlags, Signal, pidfd_open, pidfd_send_signal},
+};
+
 const CGROUP_MOUNTINFO: &str = "/proc/self/mountinfo";
 const CURRENT_CGROUP: &str = "/proc/self/cgroup";
 const CLEANUP_POLL: Duration = Duration::from_millis(10);
 const DROP_CLEANUP_GRACE: Duration = Duration::from_millis(500);
 const MAX_CREATE_ATTEMPTS: u64 = 64;
 const MAX_OWNED_CGROUPS: usize = 1_024;
+const MAX_OWNED_PROCESSES: usize = 65_536;
 const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 const SHELL_PATH: &CStr = c"/bin/sh";
 const SHELL_FLAG: &CStr = c"-c";
@@ -77,7 +83,7 @@ struct CgroupMount {
 /// An owned cgroup directory created for exactly one workflow execution.
 pub(crate) struct WorkflowCgroup {
     path: PathBuf,
-    directory: File,
+    directory: Option<File>,
 }
 
 /// Result of attempting the Linux atomic cgroup spawn path.
@@ -105,6 +111,14 @@ impl WorkflowCgroup {
     /// Creates an execution cgroup when the current process has a usable delegated cgroup v2 tree.
     pub(crate) fn prepare() -> io::Result<Option<Arc<Self>>> {
         optional_containment(Self::prepare_inner()).map(|cgroup| cgroup.map(Arc::new))
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test(path: PathBuf) -> Self {
+        Self {
+            path,
+            directory: None,
+        }
     }
 
     fn prepare_inner() -> Result<Self, SetupFailure> {
@@ -144,7 +158,10 @@ impl WorkflowCgroup {
                             ));
                         }
                     };
-                    let cgroup = Self { path, directory };
+                    let cgroup = Self {
+                        path,
+                        directory: Some(directory),
+                    };
                     cgroup.require_control_file("cgroup.procs")?;
                     cgroup.require_control_file("cgroup.events")?;
                     cgroup.require_control_file("cgroup.kill")?;
@@ -190,6 +207,10 @@ impl WorkflowCgroup {
         arguments: &[OsString],
         environment: &[(OsString, OsString)],
     ) -> io::Result<AtomicSpawnOutcome> {
+        let directory = self
+            .directory
+            .as_ref()
+            .ok_or_else(|| io::Error::other("workflow cgroup directory handle is unavailable"))?;
         let executable = ExecData::new(program, arguments, environment)?;
         let stdin_pipe = Pipe::new()?;
         let stdout_pipe = Pipe::new()?;
@@ -206,7 +227,7 @@ impl WorkflowCgroup {
             tls: 0,
             set_tid: 0,
             set_tid_size: 0,
-            cgroup: u64::try_from(self.directory.as_raw_fd())
+            cgroup: u64::try_from(directory.as_raw_fd())
                 .expect("an open cgroup descriptor should be non-negative"),
         };
 
@@ -276,7 +297,7 @@ impl WorkflowCgroup {
             Err(error) => match classify_setup_io("attach workflow child to cgroup", &error) {
                 SetupFailure::Unavailable(reason) => {
                     log_fallback_once(reason);
-                    let _cleanup = self.kill_and_remove(cleanup_deadline);
+                    self.kill_and_remove(cleanup_deadline)?;
                     Ok(false)
                 }
                 SetupFailure::Fatal(error) => Err(error),
@@ -302,6 +323,77 @@ impl WorkflowCgroup {
             (None, None) => Ok(()),
             (kill_error, finish_error) => Err(combine_cleanup_errors([kill_error, finish_error])),
         }
+    }
+
+    /// Escalates after bounded `cgroup.kill` retries by signalling every current member via pidfd.
+    pub(crate) fn force_kill_and_remove(&self, deadline: Instant) -> io::Result<()> {
+        let kill_error = self.force_kill_all_pids(deadline).err();
+        let finish_error = self.verify_empty_and_remove(deadline).err();
+
+        match (kill_error, finish_error) {
+            (None, None) => Ok(()),
+            (kill_error, finish_error) => Err(combine_cleanup_errors([kill_error, finish_error])),
+        }
+    }
+
+    fn force_kill_all_pids(&self, deadline: Instant) -> io::Result<()> {
+        if !self.path.exists() {
+            return Ok(());
+        }
+        let mut directories = vec![self.path.clone()];
+        match descendant_cgroup_dirs(&self.path) {
+            Ok(descendants) => directories.extend(descendants),
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !self.path.exists() => {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+
+        let mut process_count = 0_usize;
+        let mut failure_count = 0_usize;
+        let mut first_failure = None;
+        for directory in directories {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "forced workflow cgroup cleanup exceeded its deadline",
+                ));
+            }
+            let processes = match fs::read_to_string(directory.join("cgroup.procs")) {
+                Ok(contents) => parse_cgroup_procs(&contents)?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(io_with_context("read workflow cgroup process list", &error));
+                }
+            };
+            for pid in processes {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "forced workflow cgroup cleanup exceeded its deadline",
+                    ));
+                }
+                process_count += 1;
+                if process_count > MAX_OWNED_PROCESSES {
+                    return Err(io::Error::other(
+                        "workflow cgroup subtree exceeded forced cleanup process limit",
+                    ));
+                }
+                if let Err(error) = signal_current_cgroup_member(pid, &directory) {
+                    failure_count += 1;
+                    first_failure.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(first_failure) = first_failure {
+            return Err(io::Error::new(
+                first_failure.kind(),
+                format!(
+                    "failed to SIGKILL {failure_count} workflow cgroup processes; first failure: {first_failure}"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// Verifies recursive emptiness and removes the owned subtree after termination signals fire.
@@ -931,6 +1023,68 @@ fn workflow_cgroup_path(parent: &Path, pid: u32, sequence: u64) -> PathBuf {
     parent.join(format!("_llm_guard_proxy_workflow_{pid}_{sequence}"))
 }
 
+fn parse_cgroup_procs(contents: &str) -> io::Result<Vec<u32>> {
+    contents
+        .split_whitespace()
+        .map(|value| {
+            let pid = value.parse::<u32>().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "workflow cgroup process list contained an invalid PID",
+                )
+            })?;
+            if pid == 0 || i32::try_from(pid).is_err() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "workflow cgroup process list contained an out-of-range PID",
+                ));
+            }
+            Ok(pid)
+        })
+        .collect()
+}
+
+fn signal_current_cgroup_member(pid: u32, directory: &Path) -> io::Result<()> {
+    let pidfd = match open_pidfd(pid) {
+        Ok(pidfd) => pidfd,
+        Err(error) if error.raw_os_error() == Some(nix::libc::ESRCH) => return Ok(()),
+        Err(error) => return Err(io_with_context("open workflow process pidfd", &error)),
+    };
+    let current_members = match fs::read_to_string(directory.join("cgroup.procs")) {
+        Ok(contents) => parse_cgroup_procs(&contents)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(io_with_context(
+                "revalidate workflow cgroup process membership",
+                &error,
+            ));
+        }
+    };
+    if !current_members.contains(&pid) {
+        return Ok(());
+    }
+    pidfd_send_sigkill(&pidfd)
+}
+
+fn open_pidfd(pid: u32) -> io::Result<OwnedFd> {
+    let raw_pid = i32::try_from(pid).map_err(|_| io::Error::other("PID exceeded i32"))?;
+    let pid = Pid::from_raw(raw_pid).ok_or_else(|| io::Error::other("PID must be positive"))?;
+    pidfd_open(pid, PidfdFlags::empty()).map_err(Into::into)
+}
+
+fn pidfd_send_sigkill(pidfd: &OwnedFd) -> io::Result<()> {
+    match pidfd_send_signal(pidfd, Signal::KILL) {
+        Ok(()) | Err(Errno::SRCH) => Ok(()),
+        Err(error) => {
+            let error = io::Error::from(error);
+            Err(io_with_context(
+                "SIGKILL workflow process via pidfd",
+                &error,
+            ))
+        }
+    }
+}
+
 fn cgroup_is_empty(events: &str) -> io::Result<bool> {
     let value = events
         .lines()
@@ -1001,7 +1155,7 @@ fn combine_cleanup_errors<const N: usize>(errors: [Option<io::Error>; N]) -> io:
 mod tests {
     use std::{
         io::Write,
-        os::unix::{ffi::OsStrExt, fs::PermissionsExt},
+        os::unix::{ffi::OsStrExt, fs::PermissionsExt, process::ExitStatusExt},
         process::{Command, Stdio},
         time::Duration,
     };
@@ -1210,6 +1364,89 @@ mod tests {
                 Ok(_) => panic!("an injected clone3 error cannot be successful"),
             }
         }
+    }
+
+    #[test]
+    fn parses_cgroup_process_lists_strictly() {
+        assert_eq!(
+            parse_cgroup_procs("17\n23\n").expect("kernel process list should parse"),
+            vec![17, 23]
+        );
+        assert!(
+            parse_cgroup_procs("")
+                .expect("empty cgroup should parse")
+                .is_empty()
+        );
+        for invalid in ["0\n", "-1\n", "not-a-pid\n", "4294967295\n"] {
+            assert!(
+                parse_cgroup_procs(invalid).is_err(),
+                "invalid process list should be rejected: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_and_remove_reports_cgroup_kill_failure() {
+        let cgroup_path = std::env::temp_dir().join(format!(
+            "llm-guard-cgroup-kill-failure-test-{}",
+            process::id()
+        ));
+        let _stale_fixture = fs::remove_dir_all(&cgroup_path);
+        fs::create_dir_all(cgroup_path.join("cgroup.kill"))
+            .expect("fake cgroup kill directory should be created");
+        let cgroup = WorkflowCgroup::for_test(cgroup_path.clone());
+
+        let error = cgroup
+            .kill_and_remove(Instant::now())
+            .expect_err("a non-writable kill control must fail cleanup");
+        assert!(
+            error.to_string().contains("failed to kill workflow cgroup"),
+            "kill failure should be preserved: {error}"
+        );
+
+        fs::remove_dir_all(&cgroup_path).expect("fake cgroup should be removed");
+        drop(cgroup);
+    }
+
+    #[test]
+    fn forced_cleanup_sigkills_revalidated_cgroup_member() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("test child should spawn");
+        let mut child = TestChild(Some(child));
+        let child_pid = child.0.as_ref().expect("test child should be owned").id();
+        let cgroup_path = std::env::temp_dir().join(format!(
+            "llm-guard-forced-cgroup-test-{}-{child_pid}",
+            process::id()
+        ));
+        let _stale_fixture = fs::remove_dir_all(&cgroup_path);
+        fs::create_dir(&cgroup_path).expect("fake cgroup should be created");
+        fs::write(cgroup_path.join("cgroup.procs"), format!("{child_pid}\n"))
+            .expect("fake process list should be created");
+        let cgroup = WorkflowCgroup::for_test(cgroup_path.clone());
+
+        cgroup
+            .force_kill_all_pids(Instant::now() + Duration::from_secs(1))
+            .expect("forced cleanup should signal the revalidated child");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let status = loop {
+            if let Some(status) = child
+                .0
+                .as_mut()
+                .expect("test child should be owned")
+                .try_wait()
+                .expect("test child status should be readable")
+            {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "SIGKILL did not terminate child");
+            thread::sleep(CLEANUP_POLL);
+        };
+        assert_eq!(status.signal(), Some(9));
+        child.0.take();
+        fs::remove_dir_all(&cgroup_path).expect("fake cgroup should be removed");
+        drop(cgroup);
     }
 
     struct TestChild(Option<std::process::Child>);

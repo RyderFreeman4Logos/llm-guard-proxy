@@ -110,6 +110,8 @@ fn deferred_worker_sleeps_until_backoff_instead_of_polling_at_100hz() {
 
     drop(TestLocalDeferredReaper::new(SharedDeferredReaper {
         processes: Arc::new(Mutex::new(vec![process.into_process()])),
+        #[cfg(target_os = "linux")]
+        cgroups: Arc::new(Mutex::new(Vec::new())),
         pending_cleanups: Arc::new(AtomicUsize::new(1)),
         worker_available: false,
     }));
@@ -119,6 +121,8 @@ fn deferred_worker_sleeps_until_backoff_instead_of_polling_at_100hz() {
 fn deferred_cleanup_blocks_admission_until_the_child_is_reaped() {
     let reaper = TestLocalDeferredReaper::new(SharedDeferredReaper {
         processes: Arc::new(Mutex::new(Vec::new())),
+        #[cfg(target_os = "linux")]
+        cgroups: Arc::new(Mutex::new(Vec::new())),
         pending_cleanups: Arc::default(),
         worker_available: true,
     });

@@ -36,11 +36,17 @@ use crate::workflow_cgroup::{
 };
 use crate::workflow_execution::WorkflowExecutionLease;
 
+#[cfg(target_os = "linux")]
+use self::deferred_reaper::defer_workflow_cgroup_with_execution_lease;
 #[cfg(test)]
 use self::deferred_reaper::{
     DeferredPollOutcome, DeferredWorkflowProcess, SharedDeferredReaper, defer_workflow_process,
     grow_signal_retry_backoff, next_deferred_poll_delay, poll_deferred_cleanup_with,
     poll_deferred_processes,
+};
+#[cfg(all(test, target_os = "linux"))]
+use self::deferred_reaper::{
+    DeferredWorkflowCgroup, MAX_CGROUP_CLEANUP_RETRIES, poll_deferred_cgroups_with,
 };
 #[cfg(test)]
 pub(crate) use self::signal_authority::{linux_process_is_live, linux_process_start_time};
@@ -270,7 +276,9 @@ impl WorkflowProcess {
             &mut command,
             config,
             &environment,
-            workflow_cgroup.as_deref(),
+            workflow_cgroup.as_ref(),
+            startup_cleanup_deadline,
+            &execution_lease,
         )?;
         #[cfg(not(target_os = "linux"))]
         let child = WorkflowChild::from(command.spawn().map_err(WorkflowProcessStartError::Spawn)?);
@@ -482,11 +490,8 @@ impl ArmedWorkflowProcess {
         );
         #[cfg(target_os = "linux")]
         {
-            let cgroup_finish_result = self.finish_workflow_cgroup(cleanup_deadline);
-            combine_containment_cleanup(
-                combine_cgroup_cleanup(cgroup_kill_result, cgroup_finish_result),
-                process_group_result,
-            )
+            let cgroup_result = self.finish_workflow_cgroup(cgroup_kill_result, cleanup_deadline);
+            combine_containment_cleanup(cgroup_result, process_group_result)
         }
         #[cfg(not(target_os = "linux"))]
         process_group_result
@@ -497,19 +502,40 @@ impl ArmedWorkflowProcess {
         let Some(workflow_cgroup) = self.workflow_cgroup.as_ref() else {
             return Ok(());
         };
-        workflow_cgroup.kill_and_remove(cleanup_deadline)?;
-        self.workflow_cgroup.take();
-        Ok(())
+        let result = workflow_cgroup.kill_and_remove(cleanup_deadline);
+        if result.is_ok() {
+            self.workflow_cgroup.take();
+        } else {
+            self.transfer_workflow_cgroup_cleanup();
+        }
+        result
     }
 
     #[cfg(target_os = "linux")]
-    fn finish_workflow_cgroup(&mut self, cleanup_deadline: Instant) -> io::Result<()> {
-        let Some(workflow_cgroup) = self.workflow_cgroup.as_ref() else {
-            return Ok(());
-        };
-        workflow_cgroup.verify_empty_and_remove(cleanup_deadline)?;
-        self.workflow_cgroup.take();
-        Ok(())
+    fn finish_workflow_cgroup(
+        &mut self,
+        kill_result: io::Result<()>,
+        cleanup_deadline: Instant,
+    ) -> io::Result<()> {
+        let finish_result = self.workflow_cgroup.as_ref().map_or(Ok(()), |cgroup| {
+            cgroup.verify_empty_and_remove(cleanup_deadline)
+        });
+        let result = combine_cgroup_cleanup(kill_result, finish_result);
+        if result.is_ok() {
+            self.workflow_cgroup.take();
+        } else {
+            self.transfer_workflow_cgroup_cleanup();
+        }
+        result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn transfer_workflow_cgroup_cleanup(&mut self) {
+        transfer_workflow_cgroup_cleanup_with(
+            &mut self.workflow_cgroup,
+            self.execution_lease.clone(),
+            defer_workflow_cgroup_with_execution_lease,
+        );
     }
 
     fn cleanup_and_finish_drain(
@@ -636,22 +662,38 @@ fn spawn_workflow_child(
     command: &mut Command,
     config: &WorkflowConfig,
     environment: &[(OsString, OsString)],
-    workflow_cgroup: Option<&WorkflowCgroup>,
+    workflow_cgroup: Option<&Arc<WorkflowCgroup>>,
+    cleanup_deadline: Instant,
+    execution_lease: &WorkflowExecutionLease,
 ) -> Result<(WorkflowChild, bool), WorkflowProcessStartError> {
     let Some(workflow_cgroup) = workflow_cgroup else {
         let child = command.spawn().map_err(WorkflowProcessStartError::Spawn)?;
         return Ok((WorkflowChild::from(child), false));
     };
     let arguments = config.args.iter().map(OsString::from).collect::<Vec<_>>();
-    match workflow_cgroup
-        .spawn_atomic(config.command.as_ref(), &arguments, environment)
-        .map_err(WorkflowProcessStartError::Spawn)?
-    {
-        AtomicSpawnOutcome::Spawned(child) => Ok((WorkflowChild::from(child), true)),
-        AtomicSpawnOutcome::Fallback(error) => {
-            log_atomic_spawn_fallback_once(&error);
-            let child = command.spawn().map_err(WorkflowProcessStartError::Spawn)?;
-            Ok((WorkflowChild::from(child), false))
+    let spawn_result =
+        match workflow_cgroup.spawn_atomic(config.command.as_ref(), &arguments, environment) {
+            Ok(AtomicSpawnOutcome::Spawned(child)) => {
+                return Ok((WorkflowChild::from(child), true));
+            }
+            Ok(AtomicSpawnOutcome::Fallback(error)) => {
+                log_atomic_spawn_fallback_once(&error);
+                command
+                    .spawn()
+                    .map(|child| (WorkflowChild::from(child), false))
+            }
+            Err(error) => Err(error),
+        };
+    match spawn_result {
+        Ok(child) => Ok(child),
+        Err(error) => {
+            if workflow_cgroup.kill_and_remove(cleanup_deadline).is_err() {
+                defer_workflow_cgroup_with_execution_lease(
+                    Arc::clone(workflow_cgroup),
+                    execution_lease.clone(),
+                );
+            }
+            Err(WorkflowProcessStartError::Spawn(error))
         }
     }
 }
@@ -923,6 +965,19 @@ fn combine_containment_cleanup(
         (Err(cgroup_error), Err(process_group_error)) => Err(io::Error::other(format!(
             "workflow cgroup cleanup failed: {cgroup_error}; process-group cleanup failed: {process_group_error}"
         ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn transfer_workflow_cgroup_cleanup_with<Defer>(
+    workflow_cgroup: &mut Option<Arc<WorkflowCgroup>>,
+    execution_lease: WorkflowExecutionLease,
+    defer: Defer,
+) where
+    Defer: FnOnce(Arc<WorkflowCgroup>, WorkflowExecutionLease),
+{
+    if let Some(workflow_cgroup) = workflow_cgroup.take() {
+        defer(workflow_cgroup, execution_lease);
     }
 }
 

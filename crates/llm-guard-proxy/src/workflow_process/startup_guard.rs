@@ -21,6 +21,9 @@ use super::{
     },
 };
 
+#[cfg(target_os = "linux")]
+use super::deferred_reaper::defer_workflow_cgroup_with_execution_lease;
+
 enum StartupSignalAuthority {
     Provisional(ProvisionalGroupAuthority),
     Stable(SignalAuthority),
@@ -125,9 +128,11 @@ impl Drop for SpawnedChildGuard {
         #[cfg(target_os = "linux")]
         let workflow_cgroup = self.workflow_cgroup.take();
         #[cfg(target_os = "linux")]
-        if let Some(workflow_cgroup) = workflow_cgroup.as_ref() {
-            let _cgroup_kill = workflow_cgroup.kill();
-        }
+        let cgroup_kill_result = workflow_cgroup
+            .as_ref()
+            .map_or(Ok(()), |workflow_cgroup| workflow_cgroup.kill());
+        #[cfg(target_os = "linux")]
+        let cgroup_execution_lease = self.execution_lease.clone().unwrap_or_default();
         let execution_lease = self.execution_lease.take().unwrap_or_default();
         match self.signal_authority.take() {
             Some(StartupSignalAuthority::Stable(signal_authority)) => {
@@ -154,7 +159,11 @@ impl Drop for SpawnedChildGuard {
         }
         #[cfg(target_os = "linux")]
         if let Some(workflow_cgroup) = workflow_cgroup {
-            let _cgroup_cleanup = workflow_cgroup.verify_empty_and_remove(self.cleanup_deadline);
+            let cgroup_finish_result =
+                workflow_cgroup.verify_empty_and_remove(self.cleanup_deadline);
+            if cgroup_kill_result.is_err() || cgroup_finish_result.is_err() {
+                defer_workflow_cgroup_with_execution_lease(workflow_cgroup, cgroup_execution_lease);
+            }
         }
     }
 }

@@ -9,6 +9,8 @@ use std::{
 
 use nix::errno::Errno;
 
+#[cfg(target_os = "linux")]
+use crate::workflow_cgroup::WorkflowCgroup;
 use crate::workflow_execution::WorkflowExecutionLease;
 
 use super::{
@@ -19,6 +21,10 @@ use super::{
 
 const MAX_SIGNAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
 const IDLE_REAPER_POLL: Duration = Duration::from_millis(50);
+#[cfg(target_os = "linux")]
+const CGROUP_CLEANUP_ATTEMPT_GRACE: Duration = Duration::from_millis(500);
+#[cfg(target_os = "linux")]
+pub(super) const MAX_CGROUP_CLEANUP_RETRIES: usize = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DeferredPollOutcome {
@@ -222,6 +228,72 @@ impl DeferredWorkflowProcess {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(super) struct DeferredWorkflowCgroup {
+    cgroup: Arc<WorkflowCgroup>,
+    failed_cleanup_attempts: usize,
+    next_cleanup_attempt: Instant,
+    cleanup_retry_backoff: Duration,
+    _execution_lease: WorkflowExecutionLease,
+}
+
+#[cfg(target_os = "linux")]
+impl DeferredWorkflowCgroup {
+    pub(super) fn new(
+        cgroup: Arc<WorkflowCgroup>,
+        execution_lease: WorkflowExecutionLease,
+    ) -> Self {
+        Self {
+            cgroup,
+            failed_cleanup_attempts: 0,
+            next_cleanup_attempt: Instant::now() + PROCESS_REAP_POLL,
+            cleanup_retry_backoff: PROCESS_REAP_POLL,
+            _execution_lease: execution_lease,
+        }
+    }
+
+    fn poll(&mut self) -> DeferredPollOutcome {
+        let now = Instant::now();
+        let cgroup = Arc::clone(&self.cgroup);
+        self.poll_with(
+            now,
+            || cgroup.kill_and_remove(Instant::now() + CGROUP_CLEANUP_ATTEMPT_GRACE),
+            || cgroup.force_kill_and_remove(Instant::now() + CGROUP_CLEANUP_ATTEMPT_GRACE),
+        )
+    }
+
+    pub(super) fn poll_with<Cleanup, ForceCleanup>(
+        &mut self,
+        now: Instant,
+        cleanup: Cleanup,
+        force_cleanup: ForceCleanup,
+    ) -> DeferredPollOutcome
+    where
+        Cleanup: FnOnce() -> std::io::Result<()>,
+        ForceCleanup: FnOnce() -> std::io::Result<()>,
+    {
+        if now < self.next_cleanup_attempt {
+            return DeferredPollOutcome::Pending;
+        }
+        let forced = self.failed_cleanup_attempts >= MAX_CGROUP_CLEANUP_RETRIES;
+        let result = if forced { force_cleanup() } else { cleanup() };
+        if result.is_ok() {
+            return DeferredPollOutcome::Complete;
+        }
+        if !forced {
+            self.failed_cleanup_attempts += 1;
+            if self.failed_cleanup_attempts == MAX_CGROUP_CLEANUP_RETRIES {
+                eprintln!(
+                    "workflow cgroup cleanup exhausted {MAX_CGROUP_CLEANUP_RETRIES} retries; escalating to per-process SIGKILL cleanup"
+                );
+            }
+        }
+        self.cleanup_retry_backoff = grow_signal_retry_backoff(self.cleanup_retry_backoff);
+        self.next_cleanup_attempt = now + self.cleanup_retry_backoff;
+        DeferredPollOutcome::Pending
+    }
+}
+
 pub(super) fn grow_signal_retry_backoff(current: Duration) -> Duration {
     current.saturating_mul(2).min(MAX_SIGNAL_RETRY_BACKOFF)
 }
@@ -239,6 +311,31 @@ pub(super) fn poll_deferred_processes(
     });
 }
 
+#[cfg(target_os = "linux")]
+pub(super) fn poll_deferred_cgroups_with<Poll>(
+    cgroups: &mut Vec<DeferredWorkflowCgroup>,
+    pending_cleanups: &AtomicUsize,
+    mut poll: Poll,
+) where
+    Poll: FnMut(&mut DeferredWorkflowCgroup) -> DeferredPollOutcome,
+{
+    cgroups.retain_mut(|cgroup| {
+        let outcome = poll(cgroup);
+        if outcome == DeferredPollOutcome::Complete {
+            pending_cleanups.fetch_sub(1, Ordering::SeqCst);
+        }
+        outcome == DeferredPollOutcome::Pending
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn poll_deferred_cgroups(
+    cgroups: &mut Vec<DeferredWorkflowCgroup>,
+    pending_cleanups: &AtomicUsize,
+) {
+    poll_deferred_cgroups_with(cgroups, pending_cleanups, DeferredWorkflowCgroup::poll);
+}
+
 pub(super) fn next_deferred_poll_delay(
     processes: &[DeferredWorkflowProcess],
     now: Instant,
@@ -250,8 +347,19 @@ pub(super) fn next_deferred_poll_delay(
         .map_or(IDLE_REAPER_POLL, |delay| delay.max(IDLE_REAPER_POLL))
 }
 
+#[cfg(target_os = "linux")]
+fn next_deferred_cgroup_poll_delay(cgroups: &[DeferredWorkflowCgroup], now: Instant) -> Duration {
+    cgroups
+        .iter()
+        .map(|cgroup| cgroup.next_cleanup_attempt.saturating_duration_since(now))
+        .min()
+        .map_or(IDLE_REAPER_POLL, |delay| delay.max(IDLE_REAPER_POLL))
+}
+
 pub(super) struct SharedDeferredReaper {
     pub(super) processes: Arc<Mutex<Vec<DeferredWorkflowProcess>>>,
+    #[cfg(target_os = "linux")]
+    pub(super) cgroups: Arc<Mutex<Vec<DeferredWorkflowCgroup>>>,
     pub(super) pending_cleanups: Arc<AtomicUsize>,
     pub(super) worker_available: bool,
 }
@@ -260,25 +368,42 @@ impl SharedDeferredReaper {
     pub(super) fn start() -> Self {
         let processes = Arc::new(Mutex::new(Vec::<DeferredWorkflowProcess>::new()));
         let worker_processes = Arc::clone(&processes);
+        #[cfg(target_os = "linux")]
+        let cgroups = Arc::new(Mutex::new(Vec::<DeferredWorkflowCgroup>::new()));
+        #[cfg(target_os = "linux")]
+        let worker_cgroups = Arc::clone(&cgroups);
         let pending_cleanups = Arc::new(AtomicUsize::new(0));
         let worker_pending_cleanups = Arc::clone(&pending_cleanups);
         let worker_available = thread::Builder::new()
             .name(String::from("llm-guard-workflow-reaper"))
             .spawn(move || {
                 loop {
-                    let sleep_for = {
+                    let now = Instant::now();
+                    let process_sleep = {
                         let mut processes = worker_processes
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         poll_deferred_processes(&mut processes, &worker_pending_cleanups);
-                        next_deferred_poll_delay(&processes, Instant::now())
+                        next_deferred_poll_delay(&processes, now)
                     };
+                    #[cfg(target_os = "linux")]
+                    let sleep_for = {
+                        let mut cgroups = worker_cgroups
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        poll_deferred_cgroups(&mut cgroups, &worker_pending_cleanups);
+                        process_sleep.min(next_deferred_cgroup_poll_delay(&cgroups, now))
+                    };
+                    #[cfg(not(target_os = "linux"))]
+                    let sleep_for = process_sleep;
                     thread::sleep(sleep_for);
                 }
             })
             .is_ok();
         Self {
             processes,
+            #[cfg(target_os = "linux")]
+            cgroups,
             pending_cleanups,
             worker_available,
         }
@@ -291,6 +416,15 @@ impl SharedDeferredReaper {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push(process);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn submit_cgroup(&self, cgroup: DeferredWorkflowCgroup) {
+        self.pending_cleanups.fetch_add(1, Ordering::SeqCst);
+        self.cgroups
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(cgroup);
     }
 }
 
@@ -318,6 +452,14 @@ pub(super) fn defer_workflow_process_with_execution_lease(
         signal_state,
         execution_lease,
     ));
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn defer_workflow_cgroup_with_execution_lease(
+    cgroup: Arc<WorkflowCgroup>,
+    execution_lease: WorkflowExecutionLease,
+) {
+    shared_deferred_reaper().submit_cgroup(DeferredWorkflowCgroup::new(cgroup, execution_lease));
 }
 
 pub(super) fn shared_deferred_reaper() -> &'static SharedDeferredReaper {
