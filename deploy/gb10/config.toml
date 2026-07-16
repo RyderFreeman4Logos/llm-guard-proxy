@@ -542,10 +542,11 @@ enabled = true
 ##     --config /etc/llm-guard-proxy/host-telemetry.toml
 ##
 ## Fully commented host telemetry configuration. The default disk device is
-## `nvme0n1`; set a different device name for another host. Omit gpu_command
-## to disable GPU polling entirely. Every retained record has fixed numeric
-## fields; exceeding max_records deletes oldest rows down to prune_to_records
-## and compacts the SQLite file.
+## `nvme0n1`; set a different device name for another host. GPU telemetry is a
+## closed backend (`disabled` or `nvidia_smi`); the latter always runs the
+## internally selected `/usr/bin/nvidia-smi`. Every retained record has fixed
+## numeric fields; exceeding max_records deletes oldest rows down to
+## prune_to_records without full compaction on the sampling path.
 # schema_version = 1
 #
 # [storage]
@@ -557,7 +558,7 @@ enabled = true
 # proc_root = "/proc"                       # Linux procfs source root
 # disk_device = "nvme0n1"                   # /proc/diskstats device to sample
 # interval_secs = 5                         # Target interval for procfs samples
-# gpu_command = "/usr/bin/nvidia-smi"       # Optional read-only GPU probe; omit to disable
+# gpu_backend = "disabled"                    # `disabled` or fixed `/usr/bin/nvidia-smi` via `nvidia_smi`
 # gpu_timeout_secs = 2                      # Bounded wait for each optional GPU probe
 #
 # [swap_guard]

@@ -706,6 +706,7 @@ dependencies = [
 name = "llm-guard-proxy-host-telemetry"
 version = "0.1.0"
 dependencies = [
+ "nix",
  "rusqlite",
  "serde",
  "thiserror",

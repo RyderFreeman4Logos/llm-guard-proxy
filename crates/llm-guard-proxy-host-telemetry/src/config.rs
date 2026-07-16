@@ -2,7 +2,6 @@
 
 use serde::Deserialize;
 use std::{
-    ffi::OsStr,
     fs,
     path::{Path, PathBuf},
     time::Duration,
@@ -75,7 +74,7 @@ impl StorageConfig {
     /// # Errors
     ///
     /// Returns an error when the retention targets are not positive or the
-    /// lower target exceeds the upper target.
+    /// lower target is not strictly below the upper target.
     pub fn new(
         sqlite_path: PathBuf,
         max_records: u64,
@@ -86,9 +85,9 @@ impl StorageConfig {
                 "storage.max_records must be positive",
             )));
         }
-        if prune_to_records == 0 || prune_to_records > max_records {
+        if prune_to_records == 0 || prune_to_records >= max_records {
             return Err(ConfigError::Invalid(String::from(
-                "storage.prune_to_records must be positive and at most storage.max_records",
+                "storage.prune_to_records must be positive and less than storage.max_records",
             )));
         }
         Ok(Self {
@@ -117,12 +116,23 @@ impl StorageConfig {
     }
 }
 
+/// Closed set of optional GPU telemetry backends.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum GpuBackend {
+    /// Do not spawn a GPU telemetry process.
+    #[default]
+    Disabled,
+    /// Run the internally selected `/usr/bin/nvidia-smi` probe.
+    NvidiaSmi,
+}
+
 /// Linux data-source and cadence controls.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SamplerConfig {
     proc_root: PathBuf,
     disk_device: Option<String>,
-    gpu_command: Option<PathBuf>,
+    gpu_backend: GpuBackend,
     gpu_timeout: Duration,
     interval: Duration,
 }
@@ -140,10 +150,10 @@ impl SamplerConfig {
         self.disk_device.as_deref()
     }
 
-    /// Returns the optional `nvidia-smi` executable.
+    /// Returns the closed optional GPU telemetry backend.
     #[must_use]
-    pub fn gpu_command(&self) -> Option<&Path> {
-        self.gpu_command.as_deref()
+    pub const fn gpu_backend(&self) -> GpuBackend {
+        self.gpu_backend
     }
 
     /// Returns the bounded duration allowed for an optional GPU probe.
@@ -300,7 +310,8 @@ impl FileStorageConfig {
 struct FileSamplerConfig {
     proc_root: Option<PathBuf>,
     disk_device: Option<String>,
-    gpu_command: Option<PathBuf>,
+    #[serde(default)]
+    gpu_backend: GpuBackend,
     gpu_timeout_secs: Option<u64>,
     interval_secs: Option<u64>,
 }
@@ -320,13 +331,6 @@ impl FileSamplerConfig {
                 "sampler.disk_device must not be empty when set",
             )));
         }
-        if self.gpu_command.as_ref().is_some_and(|command| {
-            !command.is_absolute() || command.file_name() != Some(OsStr::new("nvidia-smi"))
-        }) {
-            return Err(ConfigError::Invalid(String::from(
-                "sampler.gpu_command must be an absolute nvidia-smi path",
-            )));
-        }
         let gpu_timeout = self
             .gpu_timeout_secs
             .map_or(DEFAULT_GPU_TIMEOUT, Duration::from_secs);
@@ -338,7 +342,7 @@ impl FileSamplerConfig {
         Ok(SamplerConfig {
             proc_root: self.proc_root.unwrap_or_else(|| PathBuf::from("/proc")),
             disk_device: self.disk_device.or_else(|| Some(String::from("nvme0n1"))),
-            gpu_command: self.gpu_command,
+            gpu_backend: self.gpu_backend,
             gpu_timeout,
             interval,
         })
@@ -376,7 +380,7 @@ impl FileSwapGuardConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigError, StorageConfig, SwapGuardConfig};
+    use super::{ConfigError, FileConfig, GpuBackend, StorageConfig, SwapGuardConfig};
     use std::{path::PathBuf, time::Duration};
 
     #[test]
@@ -384,6 +388,32 @@ mod tests {
         let error = StorageConfig::new(PathBuf::from("telemetry.sqlite3"), 10, 0)
             .expect_err("zero prune target must fail");
         assert!(matches!(error, ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn retention_requires_the_lower_target_to_be_strictly_below_the_maximum() {
+        let error = StorageConfig::new(PathBuf::from("telemetry.sqlite3"), 10, 10)
+            .expect_err("equal prune and maximum targets must fail");
+        assert!(matches!(error, ConfigError::Invalid(_)));
+    }
+
+    #[test]
+    fn gpu_selection_is_a_closed_backend_instead_of_an_executable_path() {
+        let config = toml::from_str::<FileConfig>(
+            "schema_version = 1\n[sampler]\ngpu_backend = \"nvidia_smi\"\n",
+        )
+        .expect("typed GPU backend parses")
+        .resolve()
+        .expect("typed GPU backend resolves");
+        assert_eq!(config.sampler().gpu_backend(), GpuBackend::NvidiaSmi);
+
+        let arbitrary_path = toml::from_str::<FileConfig>(
+            "schema_version = 1\n[sampler]\ngpu_command = \"/tmp/nvidia-smi\"\n",
+        );
+        assert!(
+            arbitrary_path.is_err(),
+            "executable paths must not be part of the configuration schema"
+        );
     }
 
     #[test]

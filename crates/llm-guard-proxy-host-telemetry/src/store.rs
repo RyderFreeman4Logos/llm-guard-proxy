@@ -37,7 +37,8 @@ impl TelemetryStore {
         })?;
         connection
             .execute_batch(
-                "PRAGMA foreign_keys = ON;
+                "PRAGMA auto_vacuum = INCREMENTAL;
+                 PRAGMA foreign_keys = ON;
                  CREATE TABLE IF NOT EXISTS samples (
                      id INTEGER PRIMARY KEY,
                      sampled_at_unix_ms INTEGER NOT NULL,
@@ -65,7 +66,9 @@ impl TelemetryStore {
                      sample_id INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
                      reason TEXT NOT NULL,
                      captured_at_unix_ms INTEGER NOT NULL
-                 );",
+                 );
+                 CREATE INDEX IF NOT EXISTS evidence_sample_id_idx
+                     ON evidence(sample_id);",
             )
             .map_err(|source| TelemetryStoreError::Sqlite {
                 action: "create telemetry schema",
@@ -200,13 +203,25 @@ impl TelemetryStore {
                 action: "prune telemetry samples",
                 source,
             })?;
-        self.connection
-            .execute_batch("VACUUM")
-            .map_err(|source| TelemetryStoreError::Sqlite {
-                action: "compact telemetry database after retention pruning",
-                source,
-            })?;
         Ok(())
+    }
+
+    /// Reclaims a bounded number of free pages during out-of-band maintenance.
+    ///
+    /// Sampling and retention pruning never invoke this method, so compaction
+    /// cannot block the sampling cadence. New databases are initialized for
+    /// incremental auto-vacuum; existing databases retain their prior mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `SQLite` rejects the incremental maintenance pass.
+    pub fn compact_incrementally(&mut self) -> Result<(), TelemetryStoreError> {
+        self.connection
+            .execute_batch("PRAGMA incremental_vacuum(256)")
+            .map_err(|source| TelemetryStoreError::Sqlite {
+                action: "incrementally compact telemetry database",
+                source,
+            })
     }
 }
 
@@ -276,7 +291,8 @@ pub enum TelemetryStoreError {
 mod tests {
     use super::TelemetryStore;
     use crate::{
-        HostSample, LoadAverage, MemorySample, PolicyDecision, StorageConfig, TelemetryState,
+        HostSample, LoadAverage, MemorySample, PolicyDecision, PressureReason, StorageConfig,
+        TelemetryEvent, TelemetryState,
     };
     use std::{
         fs,
@@ -325,6 +341,78 @@ mod tests {
                 .expect("sample persists");
         }
         assert_eq!(store.sample_count().expect("count reads"), 2);
+        drop(store);
+        fs::remove_file(path).expect("test database can be removed");
+    }
+
+    #[test]
+    fn retention_indexes_cascades_and_leaves_compaction_for_explicit_maintenance() {
+        let path = test_path();
+        let config = StorageConfig::new(path.clone(), 3, 2).expect("test retention is valid");
+        let mut store = TelemetryStore::open(config).expect("store opens");
+        let indexed: i64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'index' AND name = 'evidence_sample_id_idx'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("schema index query succeeds");
+        assert_eq!(indexed, 1, "retention cascades need a child-key index");
+        let auto_vacuum: i64 = store
+            .connection
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .expect("auto-vacuum mode reads");
+        assert_eq!(auto_vacuum, 2, "new stores use incremental vacuum mode");
+
+        let decision = PolicyDecision {
+            state: TelemetryState::Alert(PressureReason::MemoryAvailable),
+            event: Some(TelemetryEvent::Alert(PressureReason::MemoryAvailable)),
+        };
+        for timestamp in 1..=3 {
+            store
+                .record(sample(timestamp), None, decision)
+                .expect("sample persists");
+        }
+        store
+            .connection
+            .execute(
+                "INSERT INTO evidence (sample_id, reason, captured_at_unix_ms)
+                 VALUES (1, ?1, 1)",
+                ["x".repeat(1024 * 1024)],
+            )
+            .expect("large oldest-row evidence fixture inserts");
+        store
+            .record(sample(4), None, decision)
+            .expect("sample persists and triggers pruning");
+
+        let evidence_count: i64 = store
+            .connection
+            .query_row("SELECT COUNT(*) FROM evidence", [], |row| row.get(0))
+            .expect("evidence count reads");
+        assert_eq!(evidence_count, 2, "oldest evidence cascades with samples");
+        let free_before: i64 = store
+            .connection
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .expect("free-page count reads");
+        assert!(
+            free_before > 0,
+            "sampling-path pruning must not run a full compaction"
+        );
+
+        store
+            .compact_incrementally()
+            .expect("explicit incremental maintenance succeeds");
+        let free_after: i64 = store
+            .connection
+            .query_row("PRAGMA freelist_count", [], |row| row.get(0))
+            .expect("free-page count reads after maintenance");
+        assert!(
+            free_after < free_before,
+            "out-of-band maintenance should reclaim free pages incrementally"
+        );
+
         drop(store);
         fs::remove_file(path).expect("test database can be removed");
     }

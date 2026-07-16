@@ -2,7 +2,7 @@
 
 //! Bounded observer-only host telemetry for GB10-compatible Linux hosts.
 //!
-//! The Linux implementation reads procfs and an optional bounded GPU command,
+//! The Linux implementation reads procfs and an optional closed GPU backend,
 //! then persists numeric samples and alert evidence. It has no process, cgroup,
 //! systemd, or service-control API.
 
@@ -16,7 +16,9 @@ mod linux;
 #[cfg(not(target_os = "linux"))]
 mod stub;
 
-pub use config::{ConfigError, SamplerConfig, StorageConfig, SwapGuardConfig, TelemetryConfig};
+pub use config::{
+    ConfigError, GpuBackend, SamplerConfig, StorageConfig, SwapGuardConfig, TelemetryConfig,
+};
 #[cfg(target_os = "linux")]
 pub use linux::HostTelemetry;
 #[cfg(target_os = "linux")]

@@ -1,16 +1,21 @@
 //! Linux procfs sampler and observer-only runtime.
 
 use crate::{
-    DiskCounters, DiskRate, GpuSample, HostSample, LoadAverage, MemorySample, PolicyDecision,
+    DiskCounters, DiskRate, GpuBackend, GpuSample, HostSample, LoadAverage, MemorySample,
     SamplerConfig, SwapGuard, TelemetryConfig, TelemetryError, TelemetryEvent, TelemetryIteration,
     TelemetryStore,
+};
+use nix::{
+    sys::signal::{Signal, killpg},
+    unistd::Pid,
 };
 use std::{
     fs::File,
     io::Read,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Stdio,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tokio::{io::AsyncReadExt, process::Command, time};
@@ -20,6 +25,8 @@ const MAX_PROC_SOURCE_BYTES: usize = 1024 * 1024;
 const MAX_PROC_SOURCE_BYTES_U64: u64 = 1024 * 1024;
 const MAX_GPU_OUTPUT_BYTES: usize = 1024;
 const MAX_GPU_OUTPUT_BYTES_U64: u64 = 1024;
+const NVIDIA_SMI_PATH: &str = "/usr/bin/nvidia-smi";
+const GPU_TERMINATION_GRACE: Duration = Duration::from_millis(100);
 const GPU_QUERY_ARGS: [&str; 3] = [
     "--query-gpu=temperature.gpu,power.draw,utilization.gpu,clocks.gr",
     "--format=csv,noheader,nounits",
@@ -56,24 +63,41 @@ impl HostTelemetry {
         })
     }
 
-    /// Reads, evaluates, and persists one host sample.
+    /// Reads, evaluates, emits, and persists one host sample.
+    ///
+    /// Alert transitions are emitted before persistence so a degraded local
+    /// database cannot suppress observer events.
     ///
     /// # Errors
     ///
     /// Returns an error for a failed mandatory procfs read or persistence
     /// operation. It never invokes service management or a recovery action.
     pub async fn tick(&mut self) -> Result<TelemetryIteration, TelemetryError> {
+        self.tick_at(Instant::now(), emit_event).await
+    }
+
+    async fn tick_at<F>(
+        &mut self,
+        observed_at: Instant,
+        mut emit: F,
+    ) -> Result<TelemetryIteration, TelemetryError>
+    where
+        F: FnMut(TelemetryEvent),
+    {
         let sample = self.sampler.sample().await?;
         let disk_rate = self
             .previous
             .and_then(|previous| derive_disk_rate(previous, sample));
         let decision = self.guard.observe(
-            sample.sampled_at_unix_ms,
+            observed_at,
             sample.memory.available_kib,
             sample.memory.swap_used_kib(),
         );
-        self.store.record(sample, disk_rate, decision)?;
+        if let Some(event) = decision.event {
+            emit(event);
+        }
         self.previous = Some(sample);
+        self.store.record(sample, disk_rate, decision)?;
         Ok(TelemetryIteration::Sampled(decision))
     }
 
@@ -91,9 +115,6 @@ impl HostTelemetry {
         tokio::pin!(shutdown);
         loop {
             match self.tick().await {
-                Ok(TelemetryIteration::Sampled(PolicyDecision {
-                    event: Some(event), ..
-                })) => eprintln!("host telemetry: {}", render_event(event)),
                 Ok(TelemetryIteration::Sampled(_) | TelemetryIteration::Unsupported) => {}
                 Err(error) => eprintln!("host telemetry: observer read failed: {error}"),
             }
@@ -135,32 +156,72 @@ impl LinuxSampler {
     }
 
     async fn sample_gpu(&self) -> Option<GpuSample> {
-        let command = self.config.gpu_command()?;
-        let mut child = Command::new(command)
-            .args(GPU_QUERY_ARGS)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .ok()?;
-        let stdout = child.stdout.take()?;
-        let output = time::timeout(self.config.gpu_timeout(), async {
-            let mut output = Vec::with_capacity(MAX_GPU_OUTPUT_BYTES.saturating_add(1));
-            stdout
-                .take(MAX_GPU_OUTPUT_BYTES_U64.saturating_add(1))
-                .read_to_end(&mut output)
-                .await
-                .ok()?;
-            if output.len() > MAX_GPU_OUTPUT_BYTES || !child.wait().await.ok()?.success() {
-                return None;
+        match self.config.gpu_backend() {
+            GpuBackend::Disabled => None,
+            GpuBackend::NvidiaSmi => {
+                run_gpu_probe(Path::new(NVIDIA_SMI_PATH), self.config.gpu_timeout()).await
             }
-            Some(output)
-        })
-        .await
-        .ok()??;
-        let text = std::str::from_utf8(&output).ok()?;
-        parse_gpu_csv(text).ok()
+        }
     }
+}
+
+async fn run_gpu_probe(command: &Path, timeout: Duration) -> Option<GpuSample> {
+    let mut command = Command::new(command);
+    command
+        .args(GPU_QUERY_ARGS)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    command.as_std_mut().process_group(0);
+    let mut child = command.spawn().ok()?;
+    let Some(group_id) = child.id().and_then(|id| i32::try_from(id).ok()) else {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return None;
+    };
+    let Some(stdout) = child.stdout.take() else {
+        terminate_gpu_process_group(&mut child, group_id).await;
+        return None;
+    };
+
+    let result = time::timeout(timeout, async {
+        let mut output = Vec::with_capacity(MAX_GPU_OUTPUT_BYTES.saturating_add(1));
+        let read_result = stdout
+            .take(MAX_GPU_OUTPUT_BYTES_U64.saturating_add(1))
+            .read_to_end(&mut output)
+            .await;
+        let status = child.wait().await;
+        match (read_result, status) {
+            (Ok(_), Ok(status)) if output.len() <= MAX_GPU_OUTPUT_BYTES && status.success() => {
+                Some(output)
+            }
+            _ => None,
+        }
+    })
+    .await;
+
+    let output = if let Ok(output) = result {
+        output?
+    } else {
+        terminate_gpu_process_group(&mut child, group_id).await;
+        return None;
+    };
+    let text = std::str::from_utf8(&output).ok()?;
+    parse_gpu_csv(text).ok()
+}
+
+async fn terminate_gpu_process_group(child: &mut tokio::process::Child, group_id: i32) {
+    let group = Pid::from_raw(group_id);
+    if killpg(group, Signal::SIGTERM).is_err() {
+        let _ = child.start_kill();
+    }
+    time::sleep(GPU_TERMINATION_GRACE).await;
+    if killpg(group, Signal::SIGKILL).is_err() {
+        let _ = child.start_kill();
+    }
+    let _ = child.wait().await;
 }
 
 fn read_memory_sample(path: &Path) -> Result<MemorySample, SamplerError> {
@@ -368,6 +429,10 @@ fn rate_per_second(delta: u64, multiplier: u64, elapsed_ms: u64) -> u64 {
         .unwrap_or(0)
 }
 
+fn emit_event(event: TelemetryEvent) {
+    eprintln!("host telemetry: {}", render_event(event));
+}
+
 fn render_event(event: TelemetryEvent) -> &'static str {
     match event {
         TelemetryEvent::SwapWarning => "swap warning",
@@ -418,8 +483,24 @@ pub enum SamplerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_disk_rate, parse_diskstats, parse_gpu_csv, parse_loadavg, parse_meminfo};
-    use crate::{DiskCounters, HostSample, LoadAverage, MemorySample};
+    use super::{
+        HostTelemetry, derive_disk_rate, parse_diskstats, parse_gpu_csv, parse_loadavg,
+        parse_meminfo, run_gpu_probe,
+    };
+    use crate::{
+        DiskCounters, HostSample, LoadAverage, MemorySample, PressureReason, TelemetryError,
+        TelemetryEvent,
+    };
+    use nix::{errno::Errno, sys::signal::kill, unistd::Pid};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
+        time::{Duration, Instant},
+    };
+
+    static NEXT_PATH_ID: AtomicU64 = AtomicU64::new(0);
 
     #[test]
     fn parses_memory_load_disk_and_gpu_sources() {
@@ -470,6 +551,125 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn gpu_timeout_scrubs_environment_and_terminates_the_process_group() {
+        assert!(
+            std::env::var_os("HOME").is_some(),
+            "test requires inherited HOME"
+        );
+        let directory = test_directory("gpu-timeout");
+        fs::create_dir_all(&directory).expect("fixture directory creates");
+        let command = directory.join("nvidia-smi");
+        let leader_pid_path = directory.join("leader.pid");
+        let child_pid_path = directory.join("child.pid");
+        let leaked_env_path = directory.join("leaked-home");
+        let script = format!(
+            "#!/bin/sh\n\
+             child=\n\
+             cleanup() {{\n\
+               /bin/kill \"$child\" 2>/dev/null || true\n\
+               wait \"$child\" 2>/dev/null || true\n\
+               exit 0\n\
+             }}\n\
+             trap cleanup TERM\n\
+             if [ -n \"${{HOME+x}}\" ]; then : > {}; fi\n\
+             printf '%s\\n' \"$$\" > {}\n\
+             /bin/sleep 30 &\n\
+             child=$!\n\
+             printf '%s\\n' \"$child\" > {}\n\
+             wait \"$child\"\n",
+            leaked_env_path.display(),
+            leader_pid_path.display(),
+            child_pid_path.display(),
+        );
+        fs::write(&command, script).expect("GPU fixture writes");
+        let mut permissions = fs::metadata(&command)
+            .expect("GPU fixture metadata reads")
+            .permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&command, permissions).expect("GPU fixture becomes executable");
+
+        assert_eq!(
+            run_gpu_probe(&command, Duration::from_millis(250)).await,
+            None,
+            "hanging GPU probe must degrade to a missing sample"
+        );
+        assert!(
+            !leaked_env_path.exists(),
+            "the GPU command must not inherit the observer environment"
+        );
+        let leader_pid = read_pid(&leader_pid_path);
+        let child_pid = read_pid(&child_pid_path);
+        wait_for_group_exit(leader_pid).await;
+        assert!(
+            !PathBuf::from(format!("/proc/{leader_pid}")).exists(),
+            "GPU leader must be reaped"
+        );
+        assert!(
+            !PathBuf::from(format!("/proc/{child_pid}")).exists(),
+            "GPU descendant must be terminated and reaped"
+        );
+        fs::remove_dir_all(directory).expect("GPU fixture directory removes");
+    }
+
+    #[tokio::test]
+    async fn persistence_failure_does_not_suppress_the_alert_event() {
+        let directory = test_directory("sink-failure");
+        let proc_root = directory.join("proc");
+        fs::create_dir_all(&proc_root).expect("proc fixture directory creates");
+        fs::write(
+            proc_root.join("meminfo"),
+            "MemTotal: 1048576 kB\nMemAvailable: 512 kB\nSwapTotal: 0 kB\nSwapFree: 0 kB\n",
+        )
+        .expect("meminfo fixture writes");
+        fs::write(proc_root.join("loadavg"), "1.0 1.0 1.0 1/1 1\n")
+            .expect("loadavg fixture writes");
+        fs::write(proc_root.join("diskstats"), "").expect("diskstats fixture writes");
+        let database_path = directory.join("telemetry.sqlite3");
+        let config_path = directory.join("telemetry.toml");
+        fs::write(
+            &config_path,
+            format!(
+                "schema_version = 1\n\
+                 [storage]\n\
+                 sqlite_path = \"{}\"\n\
+                 max_records = 3\n\
+                 prune_to_records = 2\n\
+                 [sampler]\n\
+                 proc_root = \"{}\"\n\
+                 gpu_backend = \"disabled\"\n\
+                 [swap_guard]\n\
+                 warn_swap_mib = 2\n\
+                 alert_swap_mib = 4\n\
+                 alert_mem_available_mib = 1\n\
+                 alert_repeat_secs = 60\n",
+                database_path.display(),
+                proc_root.display(),
+            ),
+        )
+        .expect("telemetry config writes");
+        let mut telemetry = HostTelemetry::open(config_path).expect("telemetry runtime opens");
+        let sabotage =
+            rusqlite::Connection::open(&database_path).expect("sabotage connection opens");
+        sabotage
+            .execute_batch("DROP TABLE evidence; DROP TABLE samples;")
+            .expect("persistence sink is made unavailable");
+        drop(sabotage);
+
+        let mut events = Vec::new();
+        let result = telemetry
+            .tick_at(Instant::now(), |event| events.push(event))
+            .await;
+        assert!(matches!(result, Err(TelemetryError::Store(_))));
+        assert_eq!(
+            events,
+            vec![TelemetryEvent::Alert(PressureReason::MemoryAvailable)],
+            "alert emission must happen even when SQLite rejects the sample"
+        );
+        drop(telemetry);
+        fs::remove_dir_all(directory).expect("sink-failure fixture directory removes");
+    }
+
     fn sample(sampled_at_unix_ms: u64, disk: DiskCounters) -> HostSample {
         HostSample {
             sampled_at_unix_ms,
@@ -486,6 +686,38 @@ mod tests {
             },
             disk: Some(disk),
             gpu: None,
+        }
+    }
+
+    fn test_directory(label: &str) -> PathBuf {
+        let id = NEXT_PATH_ID.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "llm-guard-proxy-host-telemetry-{label}-{}-{id}",
+            std::process::id()
+        ))
+    }
+
+    fn read_pid(path: &Path) -> i32 {
+        fs::read_to_string(path)
+            .expect("PID marker reads")
+            .trim()
+            .parse()
+            .expect("PID marker is numeric")
+    }
+
+    async fn wait_for_group_exit(group_id: i32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match kill(Pid::from_raw(-group_id), None) {
+                Err(Errno::ESRCH) => return,
+                Ok(()) => {}
+                Err(error) => panic!("probe GPU process group {group_id}: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "GPU process group {group_id} survived timeout cleanup"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }

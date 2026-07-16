@@ -1,13 +1,14 @@
 //! Stateless-threshold and bounded-repeat policy for swap alerts.
 
 use crate::{PolicyDecision, PressureReason, SwapGuardConfig, TelemetryEvent, TelemetryState};
+use std::time::Instant;
 
 /// Observer-only policy state; it never owns a recovery action.
 #[derive(Debug)]
 pub struct SwapGuard {
     config: SwapGuardConfig,
     state: TelemetryState,
-    last_alert_at_unix_ms: Option<u64>,
+    last_alert_at: Option<Instant>,
 }
 
 impl SwapGuard {
@@ -17,7 +18,7 @@ impl SwapGuard {
         Self {
             config,
             state: TelemetryState::Healthy,
-            last_alert_at_unix_ms: None,
+            last_alert_at: None,
         }
     }
 
@@ -25,24 +26,18 @@ impl SwapGuard {
     #[must_use]
     pub fn observe(
         &mut self,
-        sampled_at_unix_ms: u64,
+        observed_at: Instant,
         mem_available_kib: u64,
         swap_used_kib: u64,
     ) -> PolicyDecision {
         let state = self.state_for(mem_available_kib, swap_used_kib);
         let event = match state {
             TelemetryState::Alert(reason) => {
-                let repeat_due = self.last_alert_at_unix_ms.is_none_or(|previous| {
-                    sampled_at_unix_ms.saturating_sub(previous)
-                        >= self
-                            .config
-                            .alert_repeat()
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX)
+                let repeat_due = self.last_alert_at.is_none_or(|previous| {
+                    observed_at.duration_since(previous) >= self.config.alert_repeat()
                 });
                 if self.state != state || repeat_due {
-                    self.last_alert_at_unix_ms = Some(sampled_at_unix_ms);
+                    self.last_alert_at = Some(observed_at);
                     Some(TelemetryEvent::Alert(reason))
                 } else {
                     None
@@ -50,7 +45,7 @@ impl SwapGuard {
             }
             TelemetryState::SwapWarning if self.state != state => Some(TelemetryEvent::SwapWarning),
             TelemetryState::Healthy if self.state != TelemetryState::Healthy => {
-                self.last_alert_at_unix_ms = None;
+                self.last_alert_at = None;
                 Some(TelemetryEvent::Cleared)
             }
             _ => None,
@@ -82,7 +77,7 @@ impl SwapGuard {
 mod tests {
     use super::SwapGuard;
     use crate::{PressureReason, SwapGuardConfig, TelemetryEvent, TelemetryState};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn guard() -> SwapGuard {
         SwapGuard::new(
@@ -94,19 +89,29 @@ mod tests {
     #[test]
     fn emits_bounded_alert_evidence_and_a_clear_transition() {
         let mut guard = guard();
-        let alert = guard.observe(0, 512, 0);
+        let started_at = Instant::now();
+        let alert = guard.observe(started_at, 512, 0);
         assert_eq!(
             alert.event,
             Some(TelemetryEvent::Alert(PressureReason::MemoryAvailable))
         );
         assert!(alert.event.is_some_and(TelemetryEvent::collects_evidence));
-        assert_eq!(guard.observe(1_000, 512, 0).event, None);
         assert_eq!(
-            guard.observe(60_000, 512, 0).event,
+            guard
+                .observe(started_at + Duration::from_secs(1), 512, 0)
+                .event,
+            None
+        );
+        assert_eq!(
+            guard
+                .observe(started_at + Duration::from_secs(60), 512, 0)
+                .event,
             Some(TelemetryEvent::Alert(PressureReason::MemoryAvailable))
         );
         assert_eq!(
-            guard.observe(61_000, 2_048, 0).event,
+            guard
+                .observe(started_at + Duration::from_secs(61), 2_048, 0)
+                .event,
             Some(TelemetryEvent::Cleared)
         );
     }
@@ -114,8 +119,28 @@ mod tests {
     #[test]
     fn warning_does_not_collect_alert_evidence() {
         let mut guard = guard();
-        let warning = guard.observe(0, 2_048, 2 * 1024);
+        let warning = guard.observe(Instant::now(), 2_048, 2 * 1024);
         assert_eq!(warning.state, TelemetryState::SwapWarning);
         assert_eq!(warning.event, Some(TelemetryEvent::SwapWarning));
+    }
+
+    #[test]
+    fn alert_repeat_uses_monotonic_elapsed_time() {
+        let mut guard = guard();
+        let started_at = Instant::now();
+        assert!(guard.observe(started_at, 512, 0).event.is_some());
+        assert_eq!(
+            guard
+                .observe(started_at + Duration::from_secs(59), 512, 0)
+                .event,
+            None
+        );
+        assert!(
+            guard
+                .observe(started_at + Duration::from_secs(60), 512, 0)
+                .event
+                .is_some(),
+            "wall-clock metadata is not an input to alert cadence"
+        );
     }
 }
