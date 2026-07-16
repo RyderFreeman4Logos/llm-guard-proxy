@@ -11,7 +11,10 @@
 
 use std::{
     env,
+    ffi::OsString,
+    fs::File,
     io::{self},
+    os::fd::OwnedFd,
     process::{Child, Command, ExitStatus, Stdio},
     sync::{
         Arc,
@@ -28,7 +31,9 @@ use std::os::unix::process::CommandExt;
 use llm_guard_proxy_core::WorkflowConfig;
 
 #[cfg(target_os = "linux")]
-use crate::workflow_cgroup::WorkflowCgroup;
+use crate::workflow_cgroup::{
+    AtomicSpawnOutcome, AtomicWorkflowChild, WorkflowCgroup, log_atomic_spawn_fallback_once,
+};
 use crate::workflow_execution::WorkflowExecutionLease;
 
 #[cfg(test)]
@@ -72,6 +77,75 @@ const IDENTITY_RETRY_POLL: Duration = Duration::from_millis(1);
 
 const ALLOWED_ENV_VARS: [&str; 4] = ["PATH", "LANG", "LC_ALL", "HOME"];
 
+pub(crate) struct WorkflowChild {
+    inner: WorkflowChildInner,
+    stdin: Option<File>,
+    stdout: Option<File>,
+    stderr: Option<File>,
+}
+
+enum WorkflowChildInner {
+    Standard(Child),
+    #[cfg(target_os = "linux")]
+    Atomic(AtomicWorkflowChild),
+}
+
+impl WorkflowChild {
+    fn id(&self) -> u32 {
+        match &self.inner {
+            WorkflowChildInner::Standard(child) => child.id(),
+            #[cfg(target_os = "linux")]
+            WorkflowChildInner::Atomic(child) => child.id(),
+        }
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        match &mut self.inner {
+            WorkflowChildInner::Standard(child) => child.try_wait(),
+            #[cfg(target_os = "linux")]
+            WorkflowChildInner::Atomic(child) => child.try_wait(),
+        }
+    }
+}
+
+impl From<Child> for WorkflowChild {
+    fn from(mut child: Child) -> Self {
+        let stdin = child
+            .stdin
+            .take()
+            .map(|pipe| File::from(OwnedFd::from(pipe)));
+        let stdout = child
+            .stdout
+            .take()
+            .map(|pipe| File::from(OwnedFd::from(pipe)));
+        let stderr = child
+            .stderr
+            .take()
+            .map(|pipe| File::from(OwnedFd::from(pipe)));
+        Self {
+            inner: WorkflowChildInner::Standard(child),
+            stdin,
+            stdout,
+            stderr,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl From<AtomicWorkflowChild> for WorkflowChild {
+    fn from(mut child: AtomicWorkflowChild) -> Self {
+        let stdin = child.stdin.take();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        Self {
+            inner: WorkflowChildInner::Atomic(child),
+            stdin,
+            stdout,
+            stderr,
+        }
+    }
+}
+
 /// One armed workflow subprocess owner.
 ///
 /// Dropping an armed value synchronously performs bounded cleanup or transfers the unique child
@@ -82,7 +156,7 @@ pub(super) struct WorkflowProcess {
 }
 
 struct ArmedWorkflowProcess {
-    child: Option<Child>,
+    child: Option<WorkflowChild>,
     #[cfg(target_os = "linux")]
     workflow_cgroup: Option<Arc<WorkflowCgroup>>,
     signal_authority: SignalAuthority,
@@ -187,17 +261,19 @@ impl WorkflowProcess {
         #[cfg(target_os = "linux")]
         let workflow_cgroup =
             WorkflowCgroup::prepare().map_err(WorkflowProcessStartError::Cgroup)?;
-        let mut command = Command::new(&config.command);
-        command
-            .args(&config.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        apply_allowed_environment(&mut command);
-        configure_process_group(&mut command);
+        let environment = allowed_environment();
+        let mut command = workflow_command(config, &environment);
 
         let startup_cleanup_deadline = abort_cleanup_deadline(execution_deadline, Instant::now());
-        let child = command.spawn().map_err(WorkflowProcessStartError::Spawn)?;
+        #[cfg(target_os = "linux")]
+        let (child, atomically_placed) = spawn_workflow_child(
+            &mut command,
+            config,
+            &environment,
+            workflow_cgroup.as_deref(),
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        let child = WorkflowChild::from(command.spawn().map_err(WorkflowProcessStartError::Spawn)?);
         let mut spawned = SpawnedChildGuard::new_with_execution_lease(
             child,
             startup_cleanup_deadline,
@@ -206,9 +282,10 @@ impl WorkflowProcess {
         #[cfg(target_os = "linux")]
         if let Some(workflow_cgroup) = workflow_cgroup {
             spawned.set_workflow_cgroup(Arc::clone(&workflow_cgroup));
-            if !workflow_cgroup
-                .attach_or_fallback(spawned.pid(), startup_cleanup_deadline)
-                .map_err(WorkflowProcessStartError::Cgroup)?
+            if !atomically_placed
+                && !workflow_cgroup
+                    .attach_or_fallback(spawned.pid(), startup_cleanup_deadline)
+                    .map_err(WorkflowProcessStartError::Cgroup)?
             {
                 spawned.clear_workflow_cgroup();
             }
@@ -368,7 +445,7 @@ impl WorkflowProcess {
         self.armed
             .as_ref()
             .and_then(|armed| armed.child.as_ref())
-            .map(Child::id)
+            .map(WorkflowChild::id)
     }
 }
 
@@ -528,11 +605,53 @@ fn cleanup_worker_available() -> bool {
     )
 }
 
-fn apply_allowed_environment(command: &mut Command) {
+fn allowed_environment() -> Vec<(OsString, OsString)> {
+    ALLOWED_ENV_VARS
+        .into_iter()
+        .filter_map(|key| env::var_os(key).map(|value| (OsString::from(key), value)))
+        .collect()
+}
+
+fn apply_allowed_environment(command: &mut Command, environment: &[(OsString, OsString)]) {
     command.env_clear();
-    for key in ALLOWED_ENV_VARS {
-        if let Some(value) = env::var_os(key) {
-            command.env(key, value);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+}
+
+fn workflow_command(config: &WorkflowConfig, environment: &[(OsString, OsString)]) -> Command {
+    let mut command = Command::new(&config.command);
+    command
+        .args(&config.args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_allowed_environment(&mut command, environment);
+    configure_process_group(&mut command);
+    command
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_workflow_child(
+    command: &mut Command,
+    config: &WorkflowConfig,
+    environment: &[(OsString, OsString)],
+    workflow_cgroup: Option<&WorkflowCgroup>,
+) -> Result<(WorkflowChild, bool), WorkflowProcessStartError> {
+    let Some(workflow_cgroup) = workflow_cgroup else {
+        let child = command.spawn().map_err(WorkflowProcessStartError::Spawn)?;
+        return Ok((WorkflowChild::from(child), false));
+    };
+    let arguments = config.args.iter().map(OsString::from).collect::<Vec<_>>();
+    match workflow_cgroup
+        .spawn_atomic(config.command.as_ref(), &arguments, environment)
+        .map_err(WorkflowProcessStartError::Spawn)?
+    {
+        AtomicSpawnOutcome::Spawned(child) => Ok((WorkflowChild::from(child), true)),
+        AtomicSpawnOutcome::Fallback(error) => {
+            log_atomic_spawn_fallback_once(&error);
+            let child = command.spawn().map_err(WorkflowProcessStartError::Spawn)?;
+            Ok((WorkflowChild::from(child), false))
         }
     }
 }
@@ -684,7 +803,7 @@ fn observe_child_exit_without_reaping(
 }
 
 fn finalize_owned_child(
-    child: Child,
+    child: WorkflowChild,
     signal_authority: SignalAuthority,
     cleanup_deadline: Instant,
     execution_lease: WorkflowExecutionLease,
@@ -759,7 +878,7 @@ where
 }
 
 fn reap_child_bounded(
-    mut child: Child,
+    mut child: WorkflowChild,
     cleanup_deadline: Instant,
     deferred_state: DeferredSignalState,
     execution_lease: WorkflowExecutionLease,

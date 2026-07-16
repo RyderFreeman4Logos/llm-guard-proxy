@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 pub mod config_reload;
 mod embedding_backend;
@@ -6,6 +6,7 @@ mod model_judge;
 mod proxy;
 mod replay_calibrate;
 #[cfg(all(feature = "guard", target_os = "linux"))]
+#[allow(unsafe_code)]
 mod workflow_cgroup;
 #[cfg(feature = "guard")]
 mod workflow_execution;

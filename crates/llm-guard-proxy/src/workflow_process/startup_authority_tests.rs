@@ -2,7 +2,7 @@ use std::{
     cell::{Cell, RefCell},
     fs,
     path::PathBuf,
-    process::{Child, Command},
+    process::Command,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -11,10 +11,10 @@ use nix::{errno::Errno, sys::signal::Signal};
 
 use super::{
     DeferredPollOutcome, DeferredSignalState, LinuxProcessIdentity, NonReapingChildState,
-    ProcessGroupSignalError, SignalAuthority, WorkflowProcess, WorkflowProcessStartError,
-    WorkflowSignalOutcome, cleanup_permits_spawn, cleanup_worker_available,
-    configure_process_group, finalize_provisional_child_with, linux_process_is_live,
-    linux_process_start_time, poll_deferred_cleanup_with,
+    ProcessGroupSignalError, SignalAuthority, WorkflowChild, WorkflowProcess,
+    WorkflowProcessStartError, WorkflowSignalOutcome, cleanup_permits_spawn,
+    cleanup_worker_available, configure_process_group, finalize_provisional_child_with,
+    linux_process_is_live, linux_process_start_time, poll_deferred_cleanup_with,
     signal_authority::ProvisionalGroupAuthority,
     signal_owned_workflow,
     test_support::{
@@ -360,7 +360,7 @@ fn spawn_sleep_group() -> (super::SpawnedChildGuard, LinuxProcessIdentity) {
 
 struct CapturedDeferred {
     identity: LinuxProcessIdentity,
-    process: RefCell<Option<(Child, DeferredSignalState)>>,
+    process: RefCell<Option<(WorkflowChild, DeferredSignalState)>>,
 }
 
 impl CapturedDeferred {
@@ -371,7 +371,7 @@ impl CapturedDeferred {
         }
     }
 
-    fn store(&self, child: Child, state: DeferredSignalState) {
+    fn store(&self, child: WorkflowChild, state: DeferredSignalState) {
         assert!(self.process.borrow_mut().replace((child, state)).is_none());
     }
 
