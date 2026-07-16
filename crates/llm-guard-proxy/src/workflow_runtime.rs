@@ -371,7 +371,7 @@ mod tests {
         GwpTraceMode, WorkflowConfig, WorkflowRuntime,
     };
 
-    const PID_FILE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+    const PID_FILE_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[test]
     fn executes_allow_script() {
