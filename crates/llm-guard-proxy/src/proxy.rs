@@ -92,6 +92,7 @@ const IN_FLIGHT_CAPACITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100)
 const ADMISSION_RETRY_AFTER_SECS: u32 = 1;
 const COT_SALVAGE_PREFIX_MAX_BYTES: usize = 4_096;
 const COT_SALVAGE_THINKING_BUDGET_TOKENS: u32 = 1_024;
+const TOKEN_USAGE_BODY_CAP: usize = 64 * 1024;
 const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
 const PAIRED_SAMPLE_DENOMINATOR: u64 = 1_000_000;
 const SERVER_SHUTDOWN_ABORT_REASON: &str = "server_shutdown";
@@ -9211,7 +9212,7 @@ struct ForwardedBodyObserver {
 }
 
 impl ForwardedBodyObserver {
-    fn record(self, body_bytes: u64, completion: &BodyCompletion) {
+    fn record(self, body_bytes: u64, completion: &BodyCompletion, response_body: &Bytes) {
         let finished_at_unix_ms = unix_time_millis();
         let mut attempts = self.completed_attempt_records;
         let mut final_attempt = self.final_attempt;
@@ -9228,6 +9229,11 @@ impl ForwardedBodyObserver {
         let upstream_mode = final_attempt
             .as_ref()
             .map_or(self.upstream_mode, |attempt| attempt.upstream_mode);
+        if let Some(final_attempt) = &mut final_attempt
+            && final_attempt.response_body.is_empty()
+        {
+            final_attempt.response_body = response_body.clone();
+        }
         if let Some(final_attempt) = final_attempt {
             attempts.push(final_attempt_record(
                 final_attempt,
@@ -9570,6 +9576,7 @@ struct ObservedUpstreamBody {
     _in_flight_permit: InFlightPermit,
     shutdown: ShutdownSubscription,
     bytes_seen: u64,
+    body_buffer: BytesMut,
     terminal_completion: BodyCompletion,
     deadline: Option<Pin<Box<Sleep>>>,
 }
@@ -9623,6 +9630,7 @@ impl ObservedUpstreamBody {
             _in_flight_permit: in_flight_permit,
             shutdown,
             bytes_seen: 0,
+            body_buffer: BytesMut::new(),
             terminal_completion,
             deadline: deadline
                 .map(|deadline| deadline.remaining().unwrap_or(Duration::ZERO))
@@ -9632,8 +9640,9 @@ impl ObservedUpstreamBody {
     }
 
     fn record_once(&mut self, completion: &BodyCompletion) {
+        let response_body = self.body_buffer.split().freeze();
         if let Some(observer) = self.observer.take() {
-            observer.record(self.bytes_seen, completion);
+            observer.record(self.bytes_seen, completion, &response_body);
         }
     }
 }
@@ -9657,6 +9666,11 @@ impl Stream for ObservedUpstreamBody {
             Poll::Ready(Some(Ok(bytes))) => {
                 let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 this.bytes_seen = this.bytes_seen.saturating_add(chunk_len);
+                if this.body_buffer.len() < TOKEN_USAGE_BODY_CAP {
+                    let remaining = TOKEN_USAGE_BODY_CAP - this.body_buffer.len();
+                    let take = remaining.min(bytes.len());
+                    this.body_buffer.extend_from_slice(&bytes[..take]);
+                }
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(error))) => {
@@ -9724,9 +9738,9 @@ impl ObservedBufferedBody {
         }
     }
 
-    fn record_once(&mut self, completion: &BodyCompletion) {
+    fn record_once(&mut self, completion: &BodyCompletion, response_body: &Bytes) {
         if let Some(observer) = self.observer.take() {
-            observer.record(self.bytes_seen, completion);
+            observer.record(self.bytes_seen, completion, response_body);
         }
     }
 }
@@ -9741,25 +9755,26 @@ impl Stream for ObservedBufferedBody {
             this.bytes_seen = this.bytes_seen.saturating_add(body_len);
             let completion =
                 std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded);
-            this.record_once(&completion);
+            this.record_once(&completion, &body);
             return Poll::Ready(Some(Ok(body)));
         }
 
         if this.shutdown.poll_shutdown(cx).is_ready() {
-            this.record_once(&BodyCompletion::Shutdown);
+            this.record_once(&BodyCompletion::Shutdown, &Bytes::new());
             return Poll::Ready(None);
         }
 
         let completion =
             std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded);
-        this.record_once(&completion);
+        this.record_once(&completion, &Bytes::new());
         Poll::Ready(None)
     }
 }
 
 impl Drop for ObservedBufferedBody {
     fn drop(&mut self) {
-        self.record_once(&BodyCompletion::DownstreamDropped);
+        let response_body = self.body.take().unwrap_or_default();
+        self.record_once(&BodyCompletion::DownstreamDropped, &response_body);
     }
 }
 
@@ -9840,7 +9855,7 @@ impl ShieldedLivenessBody {
 
     fn record_once(&mut self, completion: &BodyCompletion) {
         if let Some(observer) = self.observer.take() {
-            observer.record(self.bytes_seen, completion);
+            observer.record(self.bytes_seen, completion, &Bytes::new());
         }
     }
 
