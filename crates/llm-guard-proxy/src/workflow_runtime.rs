@@ -193,6 +193,12 @@ fn workflow_process_start_error(error: WorkflowProcessStartError) -> WorkflowExe
             "workflow cleanup worker is unavailable",
             "workflow cleanup worker is unavailable or still owns a group awaiting termination",
         ),
+        #[cfg(target_os = "linux")]
+        WorkflowProcessStartError::Cgroup(error) => WorkflowExecutionError::new(
+            "runtime",
+            "failed to initialize workflow cgroup containment",
+            format!("failed to initialize workflow cgroup containment: {error}"),
+        ),
         WorkflowProcessStartError::Spawn(error) => WorkflowExecutionError::new(
             "spawn",
             "failed to spawn workflow process",

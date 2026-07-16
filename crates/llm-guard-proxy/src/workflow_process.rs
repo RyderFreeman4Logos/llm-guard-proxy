@@ -1,10 +1,9 @@
 //! Owned workflow subprocess lifecycle and bounded cleanup.
 //!
-//! The runtime owns and terminates the process group rooted at the spawned leader. A descendant
-//! that calls `setsid(2)` or `setpgid(2)` escapes that signal boundary and is not killed by this
-//! module. Guaranteed whole-tree termination requires stronger containment such as a cgroup.
-//! Deadline-driven local pipe I/O still closes inherited stdin/stdout/stderr file descriptors on
-//! time, so escaped descendants cannot hold a request open past its cleanup grace.
+//! The runtime always owns and terminates the process group rooted at the spawned leader. On Linux
+//! it also attempts to place each execution in a delegated cgroup v2 subtree, allowing descendants
+//! that call `setsid(2)` or `setpgid(2)` to be killed authoritatively. When delegation is unavailable,
+//! deadline-driven local pipe I/O and process-group cleanup preserve the previous bounded behavior.
 //!
 //! This module must be the sole waiter for its private workflow children. Embedders must not use
 //! process-global `SIGCHLD = SIG_IGN` or `SA_NOCLDWAIT`, and must not run a competing waiter for
@@ -28,6 +27,8 @@ use std::os::unix::process::CommandExt;
 
 use llm_guard_proxy_core::WorkflowConfig;
 
+#[cfg(target_os = "linux")]
+use crate::workflow_cgroup::WorkflowCgroup;
 use crate::workflow_execution::WorkflowExecutionLease;
 
 #[cfg(test)]
@@ -82,6 +83,8 @@ pub(super) struct WorkflowProcess {
 
 struct ArmedWorkflowProcess {
     child: Option<Child>,
+    #[cfg(target_os = "linux")]
+    workflow_cgroup: Option<Arc<WorkflowCgroup>>,
     signal_authority: SignalAuthority,
     watchdog: Option<Watchdog>,
     stderr_handle: Option<PipeDrainHandle>,
@@ -96,6 +99,8 @@ pub(super) struct WorkflowProcessCompletion {
 
 pub(super) enum WorkflowProcessStartError {
     CleanupUnavailable,
+    #[cfg(target_os = "linux")]
+    Cgroup(io::Error),
     Spawn(io::Error),
     IdentityCapture(&'static str),
     IdentityChanged(&'static str),
@@ -179,6 +184,9 @@ impl WorkflowProcess {
             return Err(WorkflowProcessStartError::CleanupUnavailable);
         }
         let execution_deadline = Instant::now() + timeout;
+        #[cfg(target_os = "linux")]
+        let workflow_cgroup =
+            WorkflowCgroup::prepare().map_err(WorkflowProcessStartError::Cgroup)?;
         let mut command = Command::new(&config.command);
         command
             .args(&config.args)
@@ -195,6 +203,16 @@ impl WorkflowProcess {
             startup_cleanup_deadline,
             execution_lease,
         );
+        #[cfg(target_os = "linux")]
+        if let Some(workflow_cgroup) = workflow_cgroup {
+            spawned.set_workflow_cgroup(Arc::clone(&workflow_cgroup));
+            if !workflow_cgroup
+                .attach_or_fallback(spawned.pid(), startup_cleanup_deadline)
+                .map_err(WorkflowProcessStartError::Cgroup)?
+            {
+                spawned.clear_workflow_cgroup();
+            }
+        }
         let process_identity = match capture_process_identity_bounded_with(
             spawned.pid(),
             capture_identity,
@@ -223,6 +241,8 @@ impl WorkflowProcess {
         let timed_out = Arc::new(AtomicBool::new(false));
         let watchdog = spawn_timeout_watchdog(
             signal_authority.clone(),
+            #[cfg(target_os = "linux")]
+            spawned.workflow_cgroup(),
             execution_deadline,
             Arc::clone(&timed_out),
         )
@@ -236,6 +256,8 @@ impl WorkflowProcess {
             Ok(handle) => handle,
             Err(error) => return Err(WorkflowProcessStartError::StderrDrain(error)),
         };
+        #[cfg(target_os = "linux")]
+        let workflow_cgroup = spawned.take_workflow_cgroup();
         let Some((child, execution_lease)) = spawned.disarm_with_execution_lease() else {
             return Err(WorkflowProcessStartError::IdentityChanged(
                 "spawned_child_missing",
@@ -245,6 +267,8 @@ impl WorkflowProcess {
         Ok(Self {
             armed: Some(ArmedWorkflowProcess {
                 child: Some(child),
+                #[cfg(target_os = "linux")]
+                workflow_cgroup,
                 signal_authority,
                 watchdog: Some(watchdog),
                 stderr_handle,
@@ -302,6 +326,8 @@ impl WorkflowProcess {
             observe_child_exit_without_reaping(&armed.signal_authority, cleanup_deadline);
         if observation == ExitObservation::OwnershipLost {
             armed.cancel_watchdog();
+            #[cfg(target_os = "linux")]
+            let _cgroup_cleanup = armed.cleanup_workflow_cgroup(cleanup_deadline);
             if let Some(child) = armed.child.take() {
                 defer_workflow_process_with_execution_lease(
                     child,
@@ -363,15 +389,50 @@ impl ArmedWorkflowProcess {
 
     fn cleanup_child(&mut self, cleanup_deadline: Instant) -> io::Result<ExitStatus> {
         self.cancel_watchdog();
+        #[cfg(target_os = "linux")]
+        let cgroup_kill_result = self
+            .workflow_cgroup
+            .as_ref()
+            .map_or(Ok(()), |workflow_cgroup| workflow_cgroup.kill());
         let Some(child) = self.child.take() else {
             return Err(io::Error::other("workflow child was already disarmed"));
         };
-        finalize_owned_child(
+        let process_group_result = finalize_owned_child(
             child,
             self.signal_authority.clone(),
             cleanup_deadline,
             self.execution_lease.clone(),
-        )
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let cgroup_finish_result = self.finish_workflow_cgroup(cleanup_deadline);
+            combine_containment_cleanup(
+                combine_cgroup_cleanup(cgroup_kill_result, cgroup_finish_result),
+                process_group_result,
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        process_group_result
+    }
+
+    #[cfg(target_os = "linux")]
+    fn cleanup_workflow_cgroup(&mut self, cleanup_deadline: Instant) -> io::Result<()> {
+        let Some(workflow_cgroup) = self.workflow_cgroup.as_ref() else {
+            return Ok(());
+        };
+        workflow_cgroup.kill_and_remove(cleanup_deadline)?;
+        self.workflow_cgroup.take();
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn finish_workflow_cgroup(&mut self, cleanup_deadline: Instant) -> io::Result<()> {
+        let Some(workflow_cgroup) = self.workflow_cgroup.as_ref() else {
+            return Ok(());
+        };
+        workflow_cgroup.verify_empty_and_remove(cleanup_deadline)?;
+        self.workflow_cgroup.take();
+        Ok(())
     }
 
     fn cleanup_and_finish_drain(
@@ -485,6 +546,7 @@ fn configure_process_group(command: &mut Command) {
 
 fn spawn_timeout_watchdog(
     signal_authority: SignalAuthority,
+    #[cfg(target_os = "linux")] workflow_cgroup: Option<Arc<WorkflowCgroup>>,
     execution_deadline: Instant,
     timed_out: Arc<AtomicBool>,
 ) -> io::Result<Watchdog> {
@@ -498,6 +560,10 @@ fn spawn_timeout_watchdog(
                 Instant::now,
             ) {
                 timed_out.store(true, Ordering::SeqCst);
+                #[cfg(target_os = "linux")]
+                if let Some(workflow_cgroup) = workflow_cgroup {
+                    let _cgroup_kill = workflow_cgroup.kill();
+                }
                 terminate_child_group(&signal_authority);
             }
         })?;
@@ -725,6 +791,31 @@ fn process_group_signal_io_error(error: ProcessGroupSignalError) -> io::Error {
 
 fn terminate_child_group(signal_authority: &SignalAuthority) {
     let _signal = signal_owned_workflow(signal_authority, nix::sys::signal::Signal::SIGKILL);
+}
+
+#[cfg(target_os = "linux")]
+fn combine_containment_cleanup(
+    cgroup_result: io::Result<()>,
+    process_group_result: io::Result<ExitStatus>,
+) -> io::Result<ExitStatus> {
+    match (cgroup_result, process_group_result) {
+        (Ok(()), Ok(status)) => Ok(status),
+        (Err(error), Ok(_)) | (Ok(()), Err(error)) => Err(error),
+        (Err(cgroup_error), Err(process_group_error)) => Err(io::Error::other(format!(
+            "workflow cgroup cleanup failed: {cgroup_error}; process-group cleanup failed: {process_group_error}"
+        ))),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn combine_cgroup_cleanup(kill: io::Result<()>, finish: io::Result<()>) -> io::Result<()> {
+    match (kill, finish) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+        (Err(kill_error), Err(finish_error)) => Err(io::Error::other(format!(
+            "workflow cgroup kill failed: {kill_error}; cleanup failed: {finish_error}"
+        ))),
+    }
 }
 
 #[cfg(test)]
