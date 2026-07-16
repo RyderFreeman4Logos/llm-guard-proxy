@@ -28,7 +28,8 @@ use super::{
     },
     model::{
         AttemptRecord, DebugRequestSummary, ObservabilityMetricsSnapshot, RawPayloads,
-        RequestRecord, RetentionPruningStats, RetentionUsage, StoreWrite,
+        RequestRecord, RetentionPruningStats, RetentionUsage, StoreWrite, TokenUsage,
+        TokenUsageByEndpoint,
     },
     redaction::{
         debug_safe_metadata_map, redacted_metadata_json, sanitize_optional_text,
@@ -37,7 +38,7 @@ use super::{
 };
 use llm_guard_proxy_core::{ConfigHandle, RetentionConfig};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 #[cfg(test)]
 const HISTOGRAM_BUCKETS_MS: &[u64] = &[
     10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
@@ -89,14 +90,14 @@ impl ObservabilityStore {
         validate_single_link_writer_identity(sqlite_file.as_ref(), &sqlite_path)?;
         let writer_ownership = acquire_writer_ownership(&sqlite_path)?.map(Arc::new);
         drop(sqlite_file);
-        let connection = open_sqlite_connection(&sqlite_path)?;
+        let mut connection = open_sqlite_connection(&sqlite_path)?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|source| ObservabilityError::Sqlite {
                 action: "enable SQLite foreign keys",
                 source,
             })?;
-        migrate(&connection)?;
+        migrate(&mut connection)?;
         let metrics = reconstruct_metrics_accumulator(&connection)?;
 
         Ok(Self {
@@ -211,6 +212,27 @@ impl ObservabilityStore {
     pub fn retention_usage(&self) -> Result<RetentionUsage, ObservabilityError> {
         let connection = self.lock_connection()?;
         read_retention_usage(&connection)
+    }
+
+    /// Returns token totals grouped by upstream endpoint and model for a half-open time range.
+    ///
+    /// The endpoint is the configured upstream profile recorded in attempt
+    /// metadata; it intentionally is not the upstream base URL.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ObservabilityError`] when a range bound exceeds `SQLite`'s
+    /// integer range, the database lock is poisoned, or the aggregate cannot
+    /// be read.
+    pub fn token_usage_by_endpoint(
+        &self,
+        started_at_unix_ms: u64,
+        ended_at_unix_ms: u64,
+    ) -> Result<Vec<TokenUsageByEndpoint>, ObservabilityError> {
+        let started_at_unix_ms = to_sqlite_i64(started_at_unix_ms, "started_at_unix_ms")?;
+        let ended_at_unix_ms = to_sqlite_i64(ended_at_unix_ms, "ended_at_unix_ms")?;
+        let connection = self.lock_connection()?;
+        read_token_usage_by_endpoint(&connection, started_at_unix_ms, ended_at_unix_ms)
     }
 
     /// Returns aggregate metrics derived from retained observability rows.
@@ -475,6 +497,10 @@ struct PreparedAttempt {
     error_reason: Option<String>,
     retry_reason: Option<String>,
     abort_reason: Option<String>,
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    reasoning_tokens: Option<i64>,
     request_metadata_json: String,
     response_metadata_json: String,
     raw_payloads: RawPayloads,
@@ -517,6 +543,19 @@ impl PreparedAttempt {
             error_reason: sanitize_optional_text(record.error_reason.as_ref()),
             retry_reason: sanitize_optional_text(record.retry_reason.as_ref()),
             abort_reason: sanitize_optional_text(record.abort_reason.as_ref()),
+            input_tokens: optional_to_sqlite_i64(record.token_usage.input_tokens, "input_tokens")?,
+            output_tokens: optional_to_sqlite_i64(
+                record.token_usage.output_tokens,
+                "output_tokens",
+            )?,
+            cached_input_tokens: optional_to_sqlite_i64(
+                record.token_usage.cached_input_tokens,
+                "cached_input_tokens",
+            )?,
+            reasoning_tokens: optional_to_sqlite_i64(
+                record.token_usage.reasoning_tokens,
+                "reasoning_tokens",
+            )?,
             request_metadata_json,
             response_metadata_json,
             raw_payloads,
@@ -536,7 +575,7 @@ impl PreparedAttempt {
     }
 }
 
-fn migrate(connection: &Connection) -> Result<(), ObservabilityError> {
+fn migrate(connection: &mut Connection) -> Result<(), ObservabilityError> {
     let version = read_schema_version(connection)?;
     if version > SCHEMA_VERSION {
         return Err(ObservabilityError::UnsupportedSchemaVersion {
@@ -553,6 +592,9 @@ fn migrate(connection: &Connection) -> Result<(), ObservabilityError> {
     }
     if version < 2 {
         migrate_to_schema_v2(connection)?;
+    }
+    if version < 3 {
+        migrate_to_schema_v3(connection)?;
     }
     Ok(())
 }
@@ -652,6 +694,44 @@ PRAGMA user_version = 2;
         )
         .map_err(|source| ObservabilityError::Sqlite {
             action: "migrate SQLite observability schema to v2",
+            source,
+        })
+}
+
+fn migrate_to_schema_v3(connection: &mut Connection) -> Result<(), ObservabilityError> {
+    // Wrap the DDL in an explicit transaction so a crash between ALTERs
+    // cannot leave the database with partial columns at version 2.
+    let transaction = connection
+        .transaction()
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "begin transaction for schema v3 migration",
+            source,
+        })?;
+    transaction
+        .execute_batch(
+            r"
+ALTER TABLE attempts ADD COLUMN input_tokens INTEGER;
+ALTER TABLE attempts ADD COLUMN output_tokens INTEGER;
+ALTER TABLE attempts ADD COLUMN cached_input_tokens INTEGER;
+ALTER TABLE attempts ADD COLUMN reasoning_tokens INTEGER;
+",
+        )
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "migrate SQLite observability schema to v3",
+            source,
+        })?;
+    transaction
+        .commit()
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "commit schema v3 migration",
+            source,
+        })?;
+    // PRAGMA user_version is a no-op outside transactions and must be set
+    // after the DDL transaction commits.
+    connection
+        .execute_batch("PRAGMA user_version = 3;")
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "set schema version to 3",
             source,
         })
 }
@@ -782,6 +862,10 @@ INSERT OR REPLACE INTO attempts (
     error_reason,
     retry_reason,
     abort_reason,
+    input_tokens,
+    output_tokens,
+    cached_input_tokens,
+    reasoning_tokens,
     request_metadata_json,
     response_metadata_json,
     raw_input,
@@ -791,7 +875,8 @@ INSERT OR REPLACE INTO attempts (
     estimated_bytes
 ) VALUES (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
-    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19
+    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+    ?21, ?22, ?23
 )",
             params![
                 record.attempt_id,
@@ -806,6 +891,10 @@ INSERT OR REPLACE INTO attempts (
                 record.error_reason,
                 record.retry_reason,
                 record.abort_reason,
+                record.input_tokens,
+                record.output_tokens,
+                record.cached_input_tokens,
+                record.reasoning_tokens,
                 record.request_metadata_json,
                 record.response_metadata_json,
                 record.raw_payloads.input,
@@ -825,6 +914,95 @@ INSERT OR REPLACE INTO attempts (
             action: "commit attempt observability transaction",
             source,
         })
+}
+
+fn read_token_usage_by_endpoint(
+    connection: &Connection,
+    started_at_unix_ms: i64,
+    ended_at_unix_ms: i64,
+) -> Result<Vec<TokenUsageByEndpoint>, ObservabilityError> {
+    let mut statement = connection
+        .prepare(
+            r"
+SELECT
+    attempts.request_metadata_json,
+    requests.model_id,
+    attempts.input_tokens,
+    attempts.output_tokens,
+    attempts.cached_input_tokens,
+    attempts.reasoning_tokens
+FROM attempts
+INNER JOIN requests ON requests.request_id = attempts.request_id
+WHERE attempts.started_at_unix_ms >= ?1
+  AND attempts.started_at_unix_ms < ?2
+",
+        )
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "prepare token usage aggregate query",
+            source,
+        })?;
+    let mut rows = statement
+        .query(params![started_at_unix_ms, ended_at_unix_ms])
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "query token usage aggregates",
+            source,
+        })?;
+    let mut totals_by_endpoint_and_model = BTreeMap::new();
+
+    while let Some(row) = rows.next().map_err(|source| ObservabilityError::Sqlite {
+        action: "read token usage aggregate row",
+        source,
+    })? {
+        let request_metadata_json: String =
+            row.get(0).map_err(|source| ObservabilityError::Sqlite {
+                action: "decode token usage upstream profile",
+                source,
+            })?;
+        let upstream_endpoint =
+            metadata_map_from_json(&request_metadata_json).remove("upstream_profile");
+        let model_id: Option<String> = row.get(1).map_err(|source| ObservabilityError::Sqlite {
+            action: "decode token usage model id",
+            source,
+        })?;
+        let token_usage = TokenUsage {
+            input_tokens: read_optional_u64_column(row, 2, "decode input token usage")?,
+            output_tokens: read_optional_u64_column(row, 3, "decode output token usage")?,
+            cached_input_tokens: read_optional_u64_column(
+                row,
+                4,
+                "decode cached input token usage",
+            )?,
+            reasoning_tokens: read_optional_u64_column(row, 5, "decode reasoning token usage")?,
+        };
+        let totals = totals_by_endpoint_and_model
+            .entry((upstream_endpoint, model_id))
+            .or_default();
+        add_token_usage_totals(totals, &token_usage);
+    }
+
+    Ok(totals_by_endpoint_and_model
+        .into_iter()
+        .map(
+            |((upstream_endpoint, model_id), token_usage)| TokenUsageByEndpoint {
+                upstream_endpoint,
+                model_id,
+                token_usage,
+            },
+        )
+        .collect())
+}
+
+fn add_token_usage_totals(total: &mut TokenUsage, usage: &TokenUsage) {
+    add_optional_token_total(&mut total.input_tokens, usage.input_tokens);
+    add_optional_token_total(&mut total.output_tokens, usage.output_tokens);
+    add_optional_token_total(&mut total.cached_input_tokens, usage.cached_input_tokens);
+    add_optional_token_total(&mut total.reasoning_tokens, usage.reasoning_tokens);
+}
+
+fn add_optional_token_total(total: &mut Option<u64>, usage: Option<u64>) {
+    if let Some(usage) = usage {
+        *total = Some(total.unwrap_or(0).saturating_add(usage));
+    }
 }
 
 fn read_request_metric_observation(
@@ -2011,10 +2189,27 @@ fn estimate_attempt_bytes(
     add_optional_len(&mut bytes, record.error_reason.as_ref());
     add_optional_len(&mut bytes, record.retry_reason.as_ref());
     add_optional_len(&mut bytes, record.abort_reason.as_ref());
+    add_optional_token_usage_bytes(&mut bytes, &record.token_usage);
     add_len(&mut bytes, request_metadata_json);
     add_len(&mut bytes, response_metadata_json);
     add_payload_lens(&mut bytes, raw_payloads);
     to_sqlite_i64(bytes, "estimated_bytes")
+}
+
+fn add_optional_token_usage_bytes(bytes: &mut u64, token_usage: &TokenUsage) {
+    const SQLITE_INTEGER_ESTIMATE_BYTES: u64 = 8;
+    let reported_field_count = [
+        token_usage.input_tokens,
+        token_usage.output_tokens,
+        token_usage.cached_input_tokens,
+        token_usage.reasoning_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    .count();
+    let reported_field_count = u64::try_from(reported_field_count).unwrap_or(u64::MAX);
+    *bytes =
+        bytes.saturating_add(reported_field_count.saturating_mul(SQLITE_INTEGER_ESTIMATE_BYTES));
 }
 
 fn add_len(bytes: &mut u64, value: &str) {

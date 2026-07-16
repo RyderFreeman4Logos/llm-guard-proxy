@@ -52,7 +52,8 @@ use llm_guard_proxy_state::{
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord,
     EvidenceStore, EvidenceStoreWrite, LatencyHistogram, LiveRequestEntry, LiveRequestRegistry,
     LiveRequestState, LiveRequestSummary, ObservabilityMetricsSnapshot, ObservabilityStore,
-    RawPayloads, RequestId, RequestRecord, RequestStatus, ShadowSkipReason, UpstreamMode,
+    RawPayloads, RequestId, RequestRecord, RequestStatus, ShadowSkipReason, TokenUsage,
+    UpstreamMode,
 };
 #[cfg(feature = "guard")]
 use llm_guard_proxy_state::{BudgetError, BudgetStore, current_budget_date};
@@ -8659,6 +8660,7 @@ fn attempt_failure_record(
         error_reason: Some(format!("{}: {}", failure.error_type, failure.error_message)),
         retry_reason: retry_cause.map(|cause| cause.retry_reason().to_owned()),
         abort_reason: failure.abort_reason.clone(),
+        token_usage: TokenUsage::default(),
         request_metadata: failure.request_metadata.clone(),
         response_metadata,
         raw_payloads: failure.raw_payloads.clone(),
@@ -9363,6 +9365,7 @@ fn final_attempt_record(
         error_reason: completion.error_reason(),
         retry_reason: None,
         abort_reason: completion.abort_reason(),
+        token_usage: TokenUsage::default(),
         request_metadata,
         response_metadata,
         raw_payloads: attempt.raw_payloads,
@@ -10961,6 +10964,7 @@ fn failed_attempt_record(input: FailedAttemptRecordInput<'_>) -> AttemptRecord {
         error_reason: Some(format!("{}: {}", input.error_type, input.error_reason)),
         retry_reason: None,
         abort_reason: None,
+        token_usage: TokenUsage::default(),
         request_metadata: input.request_metadata,
         response_metadata,
         raw_payloads: RawPayloads::default(),

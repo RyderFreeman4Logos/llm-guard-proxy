@@ -26,6 +26,6 @@ pub use observability::{
     LiveRequestRegistry, LiveRequestState, LiveRequestSummary, ObservabilityError,
     ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloadChunk, RawPayloads, RequestId,
     RequestMetricCount, RequestRecord, RequestStatus, RequestTerminalMetricCount,
-    RetentionPruningStats, RetentionUsage, StoreWrite, TimelineEvent, UpstreamErrorMetricCount,
-    UpstreamMode,
+    RetentionPruningStats, RetentionUsage, StoreWrite, TimelineEvent, TokenUsage,
+    TokenUsageByEndpoint, UpstreamErrorMetricCount, UpstreamMode,
 };

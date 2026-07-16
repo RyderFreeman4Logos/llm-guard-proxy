@@ -15,7 +15,8 @@ use rusqlite::params;
 
 use super::{
     AttemptId, AttemptRecord, AttemptStatus, DownstreamMode, ObservabilityStore, RawPayloads,
-    RequestId, RequestRecord, RequestStatus, StoreWrite, UpstreamMode, error::ObservabilityError,
+    RequestId, RequestRecord, RequestStatus, StoreWrite, TokenUsage, TokenUsageByEndpoint,
+    UpstreamMode, error::ObservabilityError,
 };
 use llm_guard_proxy_core::{AppConfig, ConfigHandle, ReloadOutcome};
 
@@ -28,7 +29,7 @@ fn creates_sqlite_schema_in_test_temp_directory() {
     let fixture = StoreFixture::new("schema");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
 
-    assert_eq!(store.schema_version().expect("schema version"), 2);
+    assert_eq!(store.schema_version().expect("schema version"), 3);
     assert!(fixture.sqlite_path.exists());
 
     let connection = store.lock_connection().expect("connection lock");
@@ -49,6 +50,109 @@ fn creates_sqlite_schema_in_test_temp_directory() {
 
     assert_eq!(request_table_count, 1);
     assert_eq!(attempt_table_count, 1);
+    connection
+        .prepare(
+            "SELECT input_tokens, output_tokens, cached_input_tokens, reasoning_tokens FROM attempts",
+        )
+        .expect("token usage columns should exist");
+}
+
+#[test]
+fn migrates_v2_attempt_rows_with_null_token_usage() {
+    let fixture = StoreFixture::new("schema-v2-token-usage");
+    fs::create_dir_all(fixture.storage_dir()).expect("storage directory should be created");
+    #[cfg(unix)]
+    fs::set_permissions(fixture.storage_dir(), fs::Permissions::from_mode(0o700))
+        .expect("storage directory should be owner-only");
+
+    let connection = rusqlite::Connection::open(&fixture.sqlite_path)
+        .expect("legacy SQLite database should open");
+    connection
+        .execute_batch(
+            r"
+CREATE TABLE requests (
+    request_id TEXT PRIMARY KEY,
+    started_at_unix_ms INTEGER NOT NULL,
+    finished_at_unix_ms INTEGER,
+    duration_ms INTEGER,
+    downstream_mode TEXT NOT NULL,
+    upstream_mode TEXT NOT NULL,
+    model_id TEXT,
+    input_fingerprint TEXT,
+    status TEXT NOT NULL,
+    http_status INTEGER,
+    error_reason TEXT,
+    abort_reason TEXT,
+    request_metadata_json TEXT NOT NULL,
+    response_metadata_json TEXT NOT NULL,
+    raw_input TEXT,
+    raw_output TEXT,
+    raw_reasoning TEXT,
+    raw_tool_calls TEXT,
+    estimated_bytes INTEGER NOT NULL
+);
+
+CREATE TABLE attempts (
+    attempt_id TEXT PRIMARY KEY,
+    request_id TEXT NOT NULL REFERENCES requests(request_id) ON DELETE CASCADE,
+    attempt_number INTEGER NOT NULL,
+    started_at_unix_ms INTEGER NOT NULL,
+    finished_at_unix_ms INTEGER,
+    duration_ms INTEGER,
+    upstream_mode TEXT NOT NULL,
+    status TEXT NOT NULL,
+    http_status INTEGER,
+    error_reason TEXT,
+    retry_reason TEXT,
+    abort_reason TEXT,
+    request_metadata_json TEXT NOT NULL,
+    response_metadata_json TEXT NOT NULL,
+    raw_input TEXT,
+    raw_output TEXT,
+    raw_reasoning TEXT,
+    raw_tool_calls TEXT,
+    estimated_bytes INTEGER NOT NULL,
+    UNIQUE(request_id, attempt_number)
+);
+
+CREATE TABLE retention_pruning_stats (
+    stats_key TEXT PRIMARY KEY,
+    prune_events INTEGER NOT NULL,
+    pruned_requests INTEGER NOT NULL,
+    pruned_attempts INTEGER NOT NULL,
+    last_pruned_at_unix_ms INTEGER
+);
+
+INSERT INTO requests VALUES (
+    'req-legacy', 1_000, 1_100, 100, 'streaming', 'streaming',
+    'legacy-model', NULL, 'succeeded', 200, NULL, NULL, '{}', '{}',
+    NULL, NULL, NULL, NULL, 0
+);
+INSERT INTO attempts VALUES (
+    'attempt-legacy', 'req-legacy', 1, 1_010, 1_090, 80, 'streaming',
+    'succeeded', 200, NULL, NULL, NULL, '{}', '{}', NULL, NULL, NULL,
+    NULL, 0
+);
+INSERT INTO retention_pruning_stats VALUES ('global', 0, 0, 0, NULL);
+PRAGMA user_version = 2;
+",
+        )
+        .expect("legacy schema should be created");
+    drop(connection);
+
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let store = ObservabilityStore::open(manager).expect("legacy schema should migrate");
+    assert_eq!(store.schema_version().expect("schema version"), 3);
+
+    let connection = store.lock_connection().expect("connection lock");
+    let migrated_usage: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT input_tokens, output_tokens, cached_input_tokens, reasoning_tokens FROM attempts WHERE attempt_id = 'attempt-legacy'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("migrated attempt should be readable");
+    assert_eq!(migrated_usage, (None, None, None, None));
 }
 
 #[cfg(unix)]
@@ -518,6 +622,137 @@ fn writes_success_and_failure_request_and_attempt_rows() {
     assert_eq!(failed_requests, 1);
     assert_eq!(succeeded_attempts, 1);
     assert_eq!(failed_attempts, 1);
+}
+
+#[test]
+fn token_usage_defaults_to_empty() {
+    assert_eq!(
+        TokenUsage::default(),
+        TokenUsage {
+            input_tokens: None,
+            output_tokens: None,
+            cached_input_tokens: None,
+            reasoning_tokens: None,
+        }
+    );
+}
+
+fn request_and_attempt_with_token_usage(
+    request_id: &str,
+    attempt_id: &str,
+    model_id: &str,
+    request_started_at_unix_ms: u64,
+    attempt_started_at_unix_ms: u64,
+    upstream_profile: &str,
+    token_usage: TokenUsage,
+) -> (RequestRecord, AttemptRecord) {
+    let request = RequestRecord {
+        model_id: Some(String::from(model_id)),
+        ..request_record(
+            request_id,
+            RequestStatus::Succeeded,
+            request_started_at_unix_ms,
+        )
+    };
+    let attempt = AttemptRecord {
+        token_usage,
+        request_metadata: BTreeMap::from([(
+            String::from("upstream_profile"),
+            String::from(upstream_profile),
+        )]),
+        ..attempt_record(
+            attempt_id,
+            &request.request_id,
+            AttemptStatus::Succeeded,
+            1,
+            attempt_started_at_unix_ms,
+        )
+    };
+
+    (request, attempt)
+}
+
+#[test]
+fn token_usage_round_trips_and_aggregates_by_upstream_endpoint_and_model() {
+    let fixture = StoreFixture::new("token-usage");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+
+    let (first_request, first_attempt) = request_and_attempt_with_token_usage(
+        "req-token-1",
+        "attempt-token-1",
+        "model-a",
+        1_000,
+        1_010,
+        "primary",
+        TokenUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(20),
+            cached_input_tokens: Some(70),
+            reasoning_tokens: Some(10),
+        },
+    );
+    let (second_request, second_attempt) = request_and_attempt_with_token_usage(
+        "req-token-2",
+        "attempt-token-2",
+        "model-a",
+        2_000,
+        2_010,
+        "primary",
+        TokenUsage {
+            input_tokens: Some(30),
+            output_tokens: None,
+            cached_input_tokens: Some(10),
+            reasoning_tokens: None,
+        },
+    );
+    let (out_of_range_request, out_of_range_attempt) = request_and_attempt_with_token_usage(
+        "req-token-3",
+        "attempt-token-3",
+        "model-b",
+        3_000,
+        3_010,
+        "secondary",
+        TokenUsage {
+            input_tokens: Some(999),
+            output_tokens: Some(999),
+            cached_input_tokens: Some(999),
+            reasoning_tokens: Some(999),
+        },
+    );
+
+    for request in [&first_request, &second_request, &out_of_range_request] {
+        store.record_request(request).expect("request should write");
+    }
+    for attempt in [&first_attempt, &second_attempt, &out_of_range_attempt] {
+        store.record_attempt(attempt).expect("attempt should write");
+    }
+
+    let connection = store.lock_connection().expect("connection lock");
+    let persisted_usage: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT input_tokens, output_tokens, cached_input_tokens, reasoning_tokens FROM attempts WHERE attempt_id = 'attempt-token-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("token usage should persist");
+    assert_eq!(persisted_usage, (Some(100), Some(20), Some(70), Some(10)));
+    drop(connection);
+
+    assert_eq!(
+        store
+            .token_usage_by_endpoint(1_000, 3_000)
+            .expect("token usage aggregate should read"),
+        vec![TokenUsageByEndpoint {
+            upstream_endpoint: Some(String::from("primary")),
+            model_id: Some(String::from("model-a")),
+            token_usage: TokenUsage {
+                input_tokens: Some(130),
+                output_tokens: Some(20),
+                cached_input_tokens: Some(80),
+                reasoning_tokens: Some(10),
+            },
+        }]
+    );
 }
 
 #[test]
@@ -1753,6 +1988,7 @@ fn attempt_record(
         error_reason: None,
         retry_reason: None,
         abort_reason: None,
+        token_usage: TokenUsage::default(),
         request_metadata: BTreeMap::from([(
             String::from("accept"),
             String::from("text/event-stream"),
