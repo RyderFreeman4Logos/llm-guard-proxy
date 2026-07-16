@@ -132,6 +132,19 @@ pub struct RawPayloads {
     pub chunks: Vec<RawPayloadChunk>,
 }
 
+/// Token usage reported by the upstream for a single attempt.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TokenUsage {
+    /// Prompt tokens (input).
+    pub input_tokens: Option<u64>,
+    /// Completion tokens (output). N/A for embedding/reranker.
+    pub output_tokens: Option<u64>,
+    /// KV-cache hit tokens (cached input).
+    pub cached_input_tokens: Option<u64>,
+    /// Reasoning/thinking tokens consumed, if reported.
+    pub reasoning_tokens: Option<u64>,
+}
+
 /// Metadata captured for one completed downstream request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RequestRecord {
@@ -190,12 +203,28 @@ pub struct AttemptRecord {
     pub retry_reason: Option<String>,
     /// Abort/cancellation reason, if any.
     pub abort_reason: Option<String>,
+    /// Token usage reported by the upstream, when available.
+    pub token_usage: TokenUsage,
     /// Request-side upstream headers and metadata.
     pub request_metadata: BTreeMap<String, String>,
     /// Response-side upstream headers and metadata.
     pub response_metadata: BTreeMap<String, String>,
     /// Optional raw payload fragments.
     pub raw_payloads: RawPayloads,
+}
+
+/// Token totals grouped by the selected upstream endpoint and model.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TokenUsageByEndpoint {
+    /// Selected upstream profile name, when one was recorded for the attempt.
+    ///
+    /// The proxy stores profile names rather than base URLs so diagnostics do
+    /// not expose endpoint credentials or topology.
+    pub upstream_endpoint: Option<String>,
+    /// OpenAI-compatible model id from the parent request, if known.
+    pub model_id: Option<String>,
+    /// Aggregate token totals for this endpoint/model pair.
+    pub token_usage: TokenUsage,
 }
 
 /// Result of a store write after checking the current hot-reloadable settings.

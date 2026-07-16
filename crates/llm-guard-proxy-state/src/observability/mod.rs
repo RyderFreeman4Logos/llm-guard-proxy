@@ -25,7 +25,7 @@ pub use model::{
     AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
     HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram, ObservabilityMetricsSnapshot,
     RawPayloadChunk, RawPayloads, RequestMetricCount, RequestRecord, RequestStatus,
-    RequestTerminalMetricCount, RetentionPruningStats, RetentionUsage, StoreWrite,
-    UpstreamErrorMetricCount, UpstreamMode,
+    RequestTerminalMetricCount, RetentionPruningStats, RetentionUsage, StoreWrite, TokenUsage,
+    TokenUsageByEndpoint, UpstreamErrorMetricCount, UpstreamMode,
 };
 pub use store::ObservabilityStore;

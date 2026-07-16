@@ -5,6 +5,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 JUSTFILE = ROOT / "justfile"
 LEFTHOOK = ROOT / "lefthook.yml"
+REVIEW_CHECK = ROOT / "scripts" / "hooks" / "review-check.sh"
 README = ROOT / "README.md"
 WORKFLOWS = ROOT / ".github" / "workflows"
 
@@ -20,12 +21,15 @@ class LocalGateContractTests(unittest.TestCase):
     def test_pre_push_is_the_authoritative_local_gate(self) -> None:
         justfile = JUSTFILE.read_text()
         lefthook = LEFTHOOK.read_text()
+        review_check = REVIEW_CHECK.read_text()
 
         self.assertIn("pre-push:", justfile)
         self.assertIn("LLM_GUARD_LOCAL_JOBS", justfile)
         self.assertIn("LLM_GUARD_LOCAL_TEST_THREADS", justfile)
+        self.assertIn("review-check:", lefthook)
+        self.assertIn("run: scripts/hooks/review-check.sh", lefthook)
         self.assertIn("run: just pre-push", lefthook)
-        self.assertNotIn("review-check:", lefthook)
+        self.assertIn("CSA_SKIP_REVIEW_CHECK", review_check)
 
     def test_readme_documents_local_only_linux_x86_64_policy(self) -> None:
         readme = README.read_text()
