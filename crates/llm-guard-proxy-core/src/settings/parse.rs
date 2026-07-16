@@ -17,7 +17,8 @@ use super::{
     LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig,
     NoThinkingMarkerPolicy, ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig,
     ServerConfig, ShadowComparisonAttempt, ShieldingConfig, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig, UpstreamStallConfig,
+    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamEndpointConfig, UpstreamPriority,
+    UpstreamProfileConfig, UpstreamStallConfig,
 };
 #[cfg(feature = "guard")]
 use super::{UnknownKeyPolicy, VirtualKeyConfig};
@@ -32,6 +33,10 @@ enum Section {
     UpstreamHotRestart,
     UpstreamLocalRecovery,
     UpstreamProfile(usize),
+    UpstreamProfileEndpoint {
+        profile: usize,
+        endpoint: usize,
+    },
     UpstreamProfileMetadata(usize),
     UpstreamProfileHotRestart(usize),
     UpstreamProfileLocalRecovery(usize),
@@ -144,13 +149,26 @@ fn parse_section(
             "section header must end with ]",
         ));
     }
-    if line == "[[upstreams]]" {
+    if line == "[[upstreams]]" || line == "[[profile]]" {
         config
             .upstream_profiles
             .push(UpstreamProfileConfig::default());
         let index = config.upstream_profiles.len() - 1;
         *current_upstream_profile = Some(index);
         return Ok(Section::UpstreamProfile(index));
+    }
+    if line == "[[profile.upstream]]" || line == "[[upstreams.upstream]]" {
+        let profile = current_upstream_profile.ok_or_else(|| {
+            ConfigParseError::new(
+                line_number,
+                "[[profile.upstream]] must follow a [[profile]] or [[upstreams]] profile",
+            )
+        })?;
+        config.upstream_profiles[profile]
+            .endpoints
+            .push(UpstreamEndpointConfig::default());
+        let endpoint = config.upstream_profiles[profile].endpoints.len() - 1;
+        return Ok(Section::UpstreamProfileEndpoint { profile, endpoint });
     }
     if line == "[[listeners]]" {
         config.listeners.push(ListenerConfig::default());
@@ -412,6 +430,7 @@ fn assign_value(
         | Section::UpstreamHotRestart
         | Section::UpstreamLocalRecovery
         | Section::UpstreamProfile(_)
+        | Section::UpstreamProfileEndpoint { .. }
         | Section::UpstreamProfileMetadata(_)
         | Section::UpstreamProfileHotRestart(_)
         | Section::UpstreamProfileLocalRecovery(_)
@@ -463,6 +482,26 @@ fn assign_upstream_value(
             value,
             line_number,
         )),
+        Section::UpstreamProfileEndpoint { profile, endpoint } => {
+            let profile = &mut config.upstream_profiles[*profile];
+            let result = if matches!(
+                key,
+                "health_probe_interval"
+                    | "health_probe_interval_ms"
+                    | "health_probe_timeout"
+                    | "health_probe_timeout_ms"
+                    | "health_probe_max_wait"
+                    | "health_probe_max_wait_ms"
+            ) {
+                assign_upstream_profile(profile, key, value, line_number)
+            } else {
+                assign_upstream_endpoint(&mut profile.endpoints[*endpoint], key, value, line_number)
+            };
+            if result.is_ok() {
+                synchronize_primary_base_url(profile);
+            }
+            Some(result)
+        }
         Section::UpstreamProfileMetadata(index) => Some(assign_metadata(
             &mut config.upstream_profiles[*index].metadata,
             key,
@@ -878,8 +917,37 @@ fn assign_upstream_profile(
 ) -> Result<(), ConfigParseError> {
     match key {
         "name" => config.name = parse_string(value, line_number)?,
+        "model" => {
+            let model = parse_string(value, line_number)?;
+            config.name.clone_from(&model);
+            config.match_models = vec![model];
+        }
         "base_url" => config.base_url = parse_string(value, line_number)?,
         "match_models" => config.match_models = parse_string_array(value, line_number)?,
+        "health_probe_interval" => {
+            config.health_probe_interval_ms =
+                parse_duration_ms(value, line_number, "profile.health_probe_interval")?;
+        }
+        "health_probe_timeout" => {
+            config.health_probe_timeout_ms =
+                parse_duration_ms(value, line_number, "profile.health_probe_timeout")?;
+        }
+        "health_probe_max_wait" => {
+            config.health_probe_max_wait_ms =
+                parse_duration_ms(value, line_number, "profile.health_probe_max_wait")?;
+        }
+        "health_probe_interval_ms" => {
+            config.health_probe_interval_ms =
+                parse_u64(value, line_number, "profile.health_probe_interval_ms")?;
+        }
+        "health_probe_timeout_ms" => {
+            config.health_probe_timeout_ms =
+                parse_u64(value, line_number, "profile.health_probe_timeout_ms")?;
+        }
+        "health_probe_max_wait_ms" => {
+            config.health_probe_max_wait_ms =
+                parse_u64(value, line_number, "profile.health_probe_max_wait_ms")?;
+        }
         "request_timeout_ms" => {
             config.request_timeout_ms =
                 parse_u64(value, line_number, "upstreams.request_timeout_ms")?;
@@ -901,6 +969,46 @@ fn assign_upstream_profile(
         _ => return unknown_key("upstreams", key, line_number),
     }
     Ok(())
+}
+
+fn assign_upstream_endpoint(
+    config: &mut UpstreamEndpointConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "base_url" => config.base_url = parse_string(value, line_number)?,
+        "priority" => config.priority = parse_upstream_priority(value, line_number)?,
+        _ => return unknown_key("profile.upstream", key, line_number),
+    }
+    Ok(())
+}
+
+fn parse_upstream_priority(
+    value: &str,
+    line_number: usize,
+) -> Result<UpstreamPriority, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "primary" => Ok(UpstreamPriority::Primary),
+        "failover" | "backup" => Ok(UpstreamPriority::Failover),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid profile.upstream.priority {other:?}; expected \"primary\" or \"failover\""
+            ),
+        )),
+    }
+}
+
+fn synchronize_primary_base_url(profile: &mut UpstreamProfileConfig) {
+    if let Some(primary) = profile
+        .endpoints
+        .iter()
+        .find(|endpoint| endpoint.priority == UpstreamPriority::Primary)
+    {
+        profile.base_url.clone_from(&primary.base_url);
+    }
 }
 
 fn assign_server(
@@ -2116,6 +2224,33 @@ fn parse_heartbeat_mode(
         ConfigParseError::new(
             line_number,
             "heartbeat.mode must be sse, json-whitespace, or disabled",
+        )
+    })
+}
+
+fn parse_duration_ms(
+    value: &str,
+    line_number: usize,
+    field: &str,
+) -> Result<u64, ConfigParseError> {
+    let duration = parse_string(value, line_number)?;
+    let (number, multiplier) = if let Some(number) = duration.strip_suffix("ms") {
+        (number, 1_u64)
+    } else if let Some(number) = duration.strip_suffix('s') {
+        (number, 1_000_u64)
+    } else if let Some(number) = duration.strip_suffix('m') {
+        (number, 60_000_u64)
+    } else {
+        return Err(ConfigParseError::new(
+            line_number,
+            format!("{field} must use a duration suffix: ms, s, or m"),
+        ));
+    };
+    let amount = parse_u64(number.trim(), line_number, field)?;
+    amount.checked_mul(multiplier).ok_or_else(|| {
+        ConfigParseError::new(
+            line_number,
+            format!("{field} is outside the supported duration range"),
         )
     })
 }

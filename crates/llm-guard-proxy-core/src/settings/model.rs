@@ -600,6 +600,10 @@ impl AppConfig {
             name: DEFAULT_UPSTREAM_PROFILE_NAME.to_owned(),
             match_models: Vec::new(),
             base_url: self.upstream.base_url.clone(),
+            endpoints: Vec::new(),
+            health_probe_interval_ms: 2_000,
+            health_probe_timeout_ms: 1_000,
+            health_probe_max_wait_ms: 120_000,
             request_timeout_ms: self.upstream.request_timeout_ms,
             max_in_flight_requests: None,
             max_queued_generation_requests: None,
@@ -855,6 +859,9 @@ impl AppConfig {
             .zip(requested.upstream_profiles.iter())
         {
             active.request_timeout_ms = requested.request_timeout_ms;
+            active.health_probe_interval_ms = requested.health_probe_interval_ms;
+            active.health_probe_timeout_ms = requested.health_probe_timeout_ms;
+            active.health_probe_max_wait_ms = requested.health_probe_max_wait_ms;
             active.max_in_flight_requests = requested.max_in_flight_requests;
             active.max_queued_generation_requests = requested.max_queued_generation_requests;
             active.metadata = requested.metadata.clone();
@@ -1072,6 +1079,7 @@ struct UpstreamProfileTopology {
     name: String,
     base_url: String,
     match_models: Vec<String>,
+    endpoints: Vec<UpstreamEndpointConfig>,
 }
 
 impl From<&UpstreamProfileConfig> for UpstreamProfileTopology {
@@ -1080,6 +1088,7 @@ impl From<&UpstreamProfileConfig> for UpstreamProfileTopology {
             name: profile.name.clone(),
             base_url: profile.base_url.clone(),
             match_models: profile.match_models.clone(),
+            endpoints: profile.endpoints.clone(),
         }
     }
 }
@@ -1628,6 +1637,36 @@ impl Default for HotRestartConfig {
     }
 }
 
+/// Priority assigned to one endpoint in a same-model upstream profile.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UpstreamPriority {
+    /// Preferred endpoint used whenever its health probe succeeds.
+    #[default]
+    Primary,
+    /// Backup endpoint considered after the primary is unavailable.
+    Failover,
+}
+
+impl UpstreamPriority {
+    /// Returns the TOML-compatible priority label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Failover => "failover",
+        }
+    }
+}
+
+/// One OpenAI-compatible endpoint serving the model aliases in a profile.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UpstreamEndpointConfig {
+    /// Base URL for OpenAI-compatible requests.
+    pub base_url: String,
+    /// Endpoint selection priority.
+    pub priority: UpstreamPriority,
+}
+
 /// Named upstream profile with model routing and per-upstream policy.
 #[derive(Clone, Debug, PartialEq)]
 pub struct UpstreamProfileConfig {
@@ -1635,8 +1674,16 @@ pub struct UpstreamProfileConfig {
     pub name: String,
     /// Request JSON `model` aliases routed to this profile.
     pub match_models: Vec<String>,
-    /// Base URL for OpenAI-compatible requests.
+    /// Legacy single base URL for OpenAI-compatible requests.
     pub base_url: String,
+    /// Ordered same-model endpoints. Empty preserves the legacy single `base_url` behavior.
+    pub endpoints: Vec<UpstreamEndpointConfig>,
+    /// Milliseconds between `/v1/models` health probes while waiting for readiness.
+    pub health_probe_interval_ms: u64,
+    /// Timeout in milliseconds for one `/v1/models` health probe.
+    pub health_probe_timeout_ms: u64,
+    /// Maximum milliseconds one request may wait for an endpoint to become ready.
+    pub health_probe_max_wait_ms: u64,
     /// Total upstream request timeout, including streamed response body reads.
     pub request_timeout_ms: u64,
     /// Optional per-profile in-flight generation request limit.
@@ -1690,7 +1737,9 @@ impl UpstreamProfileConfig {
                 "model aliases must be at most 256 bytes",
             )?;
         }
-        validate_upstream_base_url(&self.base_url)?;
+        validate_upstream_base_url(self.primary_base_url())?;
+        self.validate_endpoints()?;
+        self.validate_health_probe_fields()?;
         require(
             self.request_timeout_ms > 0,
             "upstreams.request_timeout_ms",
@@ -1726,6 +1775,58 @@ impl UpstreamProfileConfig {
         Ok(())
     }
 
+    fn validate_endpoints(&self) -> Result<(), ValidationError> {
+        if self.endpoints.is_empty() {
+            return Ok(());
+        }
+        require(
+            self.endpoints
+                .iter()
+                .filter(|e| e.priority == UpstreamPriority::Primary)
+                .count()
+                == 1,
+            "profile.upstream.priority",
+            "must contain exactly one primary endpoint",
+        )?;
+        for endpoint in &self.endpoints {
+            validate_upstream_base_url(&endpoint.base_url)?;
+        }
+        for (index, endpoint) in self.endpoints.iter().enumerate() {
+            require(
+                !self.endpoints[..index]
+                    .iter()
+                    .any(|earlier| earlier.base_url == endpoint.base_url),
+                "profile.upstream.base_url",
+                "must not contain duplicate endpoints",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_health_probe_fields(&self) -> Result<(), ValidationError> {
+        require(
+            self.health_probe_interval_ms > 0,
+            "profile.health_probe_interval",
+            "must be greater than zero",
+        )?;
+        require(
+            self.health_probe_timeout_ms > 0,
+            "profile.health_probe_timeout",
+            "must be greater than zero",
+        )?;
+        require(
+            self.health_probe_max_wait_ms > 0,
+            "profile.health_probe_max_wait",
+            "must be greater than zero",
+        )?;
+        require(
+            self.health_probe_interval_ms <= self.health_probe_max_wait_ms,
+            "profile.health_probe_interval",
+            "must be less than or equal to health_probe_max_wait",
+        )?;
+        Ok(())
+    }
+
     /// Returns true when this profile uses an independent generation admission limiter.
     #[must_use]
     pub const fn has_generation_limits(&self) -> bool {
@@ -1755,7 +1856,24 @@ impl UpstreamProfileConfig {
     /// Returns a display-safe upstream base URL.
     #[must_use]
     pub fn redacted_base_url(&self) -> String {
-        redact_upstream_base_url(&self.base_url)
+        redact_upstream_base_url(self.primary_base_url())
+    }
+
+    /// Returns true when same-model health probing and failover are configured.
+    #[must_use]
+    pub fn has_endpoint_failover(&self) -> bool {
+        !self.endpoints.is_empty()
+    }
+
+    /// Returns the configured primary endpoint, or the legacy profile base URL.
+    #[must_use]
+    pub fn primary_base_url(&self) -> &str {
+        self.endpoints
+            .iter()
+            .find(|endpoint| endpoint.priority == UpstreamPriority::Primary)
+            .map_or(self.base_url.as_str(), |endpoint| {
+                endpoint.base_url.as_str()
+            })
     }
 }
 
@@ -1766,6 +1884,10 @@ impl Default for UpstreamProfileConfig {
             name: String::new(),
             match_models: Vec::new(),
             base_url: upstream.base_url,
+            endpoints: Vec::new(),
+            health_probe_interval_ms: 2_000,
+            health_probe_timeout_ms: 1_000,
+            health_probe_max_wait_ms: 120_000,
             request_timeout_ms: upstream.request_timeout_ms,
             max_in_flight_requests: None,
             max_queued_generation_requests: None,

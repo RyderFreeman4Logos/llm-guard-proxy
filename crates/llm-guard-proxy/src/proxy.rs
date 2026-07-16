@@ -76,6 +76,9 @@ mod model_metadata;
 mod recovery;
 mod score_adapter;
 mod shielded_chat;
+mod upstream_failover;
+
+use upstream_failover::{EndpointSelectionError, UpstreamHealthRegistry};
 
 #[cfg(all(test, unix))]
 use recovery::send_recovery_process_group_signal;
@@ -121,6 +124,7 @@ pub(crate) struct ProxyState {
     #[cfg(feature = "guard")]
     workflow_execution_requests: Arc<InFlightLimiter>,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
+    upstream_health: Arc<UpstreamHealthRegistry>,
     local_recovery: Arc<LocalRecoveryCoordinatorSet>,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
@@ -249,6 +253,7 @@ impl ProxyState {
             #[cfg(feature = "guard")]
             workflow_execution_requests: Arc::new(InFlightLimiter::default()),
             upstream_stall_recovery: Arc::new(UpstreamStallRecoveryCoordinator::default()),
+            upstream_health: Arc::new(UpstreamHealthRegistry::default()),
             local_recovery: Arc::new(LocalRecoveryCoordinatorSet::default()),
             #[cfg(feature = "upstream-hot-restart")]
             hot_restart_recovery: Arc::new(HotRestartCoordinator::default()),
@@ -623,6 +628,11 @@ pub(crate) async fn serve_until_shutdown(
     state: ProxyState,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    state.upstream_health.start_background_polling(
+        state.config.clone(),
+        state.client.clone(),
+        Arc::clone(&state.shutdown),
+    );
     let config = state.config.clone();
     let shutdown_gate = Arc::clone(&state.shutdown);
     let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
@@ -2589,6 +2599,44 @@ async fn forward_openai_request(
     )
     .await
     .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    if prepared_request.upstream_profile.has_endpoint_failover() {
+        let selected = state
+            .upstream_health
+            .select_endpoint(
+                &state.client,
+                &prepared_request.upstream_profile,
+                &state.shutdown,
+            )
+            .await
+            .map_err(|error| match error {
+                EndpointSelectionError::Shutdown => ProxyError::server_shutdown(),
+                EndpointSelectionError::Unavailable { profile, waited_ms } => {
+                    ProxyError::upstream_unavailable(profile, waited_ms)
+                }
+            })
+            .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+        prepared_request.upstream_url = build_upstream_url(&selected.base_url, &uri)
+            .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+        prepared_request
+            .upstream_profile
+            .base_url
+            .clone_from(&selected.base_url);
+        request_metadata.insert(
+            String::from("upstream_endpoint_priority"),
+            match selected.priority {
+                llm_guard_proxy_core::UpstreamPriority::Primary => String::from("primary"),
+                llm_guard_proxy_core::UpstreamPriority::Failover => String::from("failover"),
+            },
+        );
+        request_metadata.insert(
+            String::from("upstream_failover_selected"),
+            (selected.priority == llm_guard_proxy_core::UpstreamPriority::Failover).to_string(),
+        );
+        request_metadata.insert(
+            String::from("upstream_endpoint_base_url"),
+            redact_upstream_base_url(&selected.base_url),
+        );
+    }
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry, &config.loop_guard);
     let upstream_stall_policy = UpstreamStallPolicy::from_config(&config.upstream_stall);
     let upstream_timeout =
@@ -4183,6 +4231,14 @@ async fn forward_generic_openai_request(
         request_metadata: &context.request_metadata,
         attempt_request_metadata: &attempt_request_metadata,
         shutdown: context.state.shutdown.subscribe(),
+        failover_retry: context.upstream_profile.has_endpoint_failover().then_some(
+            UpstreamFailoverRetryContext {
+                registry: context.state.upstream_health.as_ref(),
+                profile: &context.upstream_profile,
+                uri: &context.uri,
+                shutdown: context.state.shutdown.as_ref(),
+            },
+        ),
     })
     .await?;
     let upstream_status = upstream_response.status();
@@ -4372,6 +4428,7 @@ async fn fetch_models_upstream_group(
         request_metadata: &context.request_metadata,
         attempt_request_metadata: &attempt_request_metadata,
         shutdown: context.state.shutdown.subscribe(),
+        failover_retry: None,
     })
     .await?;
     let upstream_mode = upstream_mode_from_headers(upstream_response.headers());
@@ -4453,6 +4510,13 @@ fn upstream_body_error_with_observability(
     error.with_observability(request_metadata, attempt_record)
 }
 
+struct UpstreamFailoverRetryContext<'request> {
+    registry: &'request UpstreamHealthRegistry,
+    profile: &'request UpstreamProfileConfig,
+    uri: &'request Uri,
+    shutdown: &'request ShutdownGate,
+}
+
 struct UpstreamAttemptContext<'request> {
     client: &'request Client,
     method: reqwest::Method,
@@ -4467,12 +4531,15 @@ struct UpstreamAttemptContext<'request> {
     request_metadata: &'request BTreeMap<String, String>,
     attempt_request_metadata: &'request BTreeMap<String, String>,
     shutdown: ShutdownSubscription,
+    failover_retry: Option<UpstreamFailoverRetryContext<'request>>,
 }
 
 async fn send_first_upstream_attempt(
     context: UpstreamAttemptContext<'_>,
 ) -> Result<reqwest::Response, ProxyError> {
-    match send_upstream_request_until_shutdown(
+    let retry_method = context.method.clone();
+    let retry_body = context.upstream_body.clone();
+    let mut result = send_upstream_request_until_shutdown(
         context.client,
         context.method,
         context.upstream_url,
@@ -4481,8 +4548,45 @@ async fn send_first_upstream_attempt(
         context.upstream_timeout,
         context.shutdown,
     )
-    .await
+    .await;
+
+    if matches!(
+        result,
+        Err(ProxyError::UpstreamTransport {
+            failure: ReqwestFailureKind::Connect,
+            ..
+        })
+    ) && let Some(retry) = context.failover_retry.as_ref()
     {
+        retry.registry.mark_unhealthy(&retry.profile.base_url);
+        result = match retry
+            .registry
+            .select_endpoint(context.client, retry.profile, retry.shutdown)
+            .await
+        {
+            Ok(selected) => match build_upstream_url(&selected.base_url, retry.uri) {
+                Ok(upstream_url) => {
+                    send_upstream_request_until_shutdown(
+                        context.client,
+                        retry_method,
+                        upstream_url,
+                        context.downstream_headers,
+                        retry_body,
+                        context.upstream_timeout,
+                        retry.shutdown.subscribe(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            },
+            Err(EndpointSelectionError::Shutdown) => Err(ProxyError::server_shutdown()),
+            Err(EndpointSelectionError::Unavailable { profile, waited_ms }) => {
+                Err(ProxyError::upstream_unavailable(profile, waited_ms))
+            }
+        };
+    }
+
+    match result {
         Ok(response) => Ok(response),
         Err(error) => {
             let finished_at_unix_ms = unix_time_millis();
@@ -12391,6 +12495,12 @@ enum ProxyError {
         reason: String,
         request_metadata: Option<BTreeMap<String, String>>,
     },
+    #[error("no healthy upstream endpoint for profile {profile} after {waited_ms}ms")]
+    UpstreamUnavailable {
+        profile: String,
+        waited_ms: u64,
+        request_metadata: Option<BTreeMap<String, String>>,
+    },
     #[error("upstream request failed: {failure}")]
     UpstreamTransport {
         failure: ReqwestFailureKind,
@@ -12458,6 +12568,14 @@ impl ProxyError {
         Self::Shutdown {
             request_metadata: None,
             attempts: Vec::new(),
+        }
+    }
+
+    fn upstream_unavailable(profile: String, waited_ms: u64) -> Self {
+        Self::UpstreamUnavailable {
+            profile,
+            waited_ms,
+            request_metadata: None,
         }
     }
 
@@ -12531,7 +12649,9 @@ impl ProxyError {
             | Self::InvalidMethod { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::InvalidRequestPath(error) => error.status(),
             Self::Admission { failure, .. } => failure.status(),
-            Self::Shutdown { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Shutdown { .. } | Self::UpstreamUnavailable { .. } => {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
             #[cfg(feature = "guard")]
             Self::VirtualKeyUnauthorized { .. } => StatusCode::UNAUTHORIZED,
             #[cfg(feature = "guard")]
@@ -12557,6 +12677,7 @@ impl ProxyError {
             Self::Admission { failure, .. } => failure.error_type(),
             Self::ListenerUpstreamDenied { .. } => "listener_upstream_not_allowed",
             Self::Shutdown { .. } => PROXY_SHUTTING_DOWN_ERROR_TYPE,
+            Self::UpstreamUnavailable { .. } => "upstream_unavailable",
             #[cfg(feature = "guard")]
             Self::VirtualKeyUnauthorized { .. } => "virtual_key_unauthorized",
             #[cfg(feature = "guard")]
@@ -12581,6 +12702,7 @@ impl ProxyError {
             | Self::InvalidRequestPath(_)
             | Self::InvalidMethod { .. }
             | Self::ListenerUpstreamDenied { .. }
+            | Self::UpstreamUnavailable { .. }
             | Self::UpstreamTransport { .. }
             | Self::UpstreamBody { .. }
             | Self::ContextBudgetExceeded { .. } => RequestStatus::Failed,
@@ -12602,6 +12724,7 @@ impl ProxyError {
             | Self::InvalidRequestPath(_)
             | Self::InvalidMethod { .. }
             | Self::ListenerUpstreamDenied { .. }
+            | Self::UpstreamUnavailable { .. }
             | Self::UpstreamTransport { .. }
             | Self::UpstreamBody { .. }
             | Self::ContextBudgetExceeded { .. } => None,
@@ -12669,6 +12792,9 @@ impl ProxyError {
             | Self::ListenerUpstreamDenied {
                 request_metadata, ..
             }
+            | Self::UpstreamUnavailable {
+                request_metadata, ..
+            }
             | Self::Shutdown {
                 request_metadata, ..
             }
@@ -12716,6 +12842,7 @@ impl ProxyError {
             | Self::InvalidMethod { .. }
             | Self::Admission { .. }
             | Self::ListenerUpstreamDenied { .. }
+            | Self::UpstreamUnavailable { .. }
             | Self::ContextBudgetExceeded { .. }
             | Self::UpstreamTransport {
                 observability: None,
@@ -12762,6 +12889,13 @@ impl ProxyError {
             },
             Self::ListenerUpstreamDenied { failure, .. } => Self::ListenerUpstreamDenied {
                 failure,
+                request_metadata: Some(request_metadata),
+            },
+            Self::UpstreamUnavailable {
+                profile, waited_ms, ..
+            } => Self::UpstreamUnavailable {
+                profile,
+                waited_ms,
                 request_metadata: Some(request_metadata),
             },
             Self::Shutdown { attempts, .. } => Self::Shutdown {
@@ -12860,6 +12994,7 @@ impl ProxyError {
             | Self::InvalidMethod { .. }
             | Self::Admission { .. }
             | Self::ListenerUpstreamDenied { .. }
+            | Self::UpstreamUnavailable { .. }
             | Self::ContextBudgetExceeded { .. }) => error,
             #[cfg(feature = "guard")]
             error @ (Self::GuardBlocked { .. }

@@ -219,6 +219,25 @@ name = "qwen3-reranker-8b"
 base_url = "http://gb10:18013/v1"
 match_models = ["rerank-model"]
 
+# For same-model high availability, use a profile with ordered endpoints. The
+# legacy [upstream] and [[upstreams]] single-base-url forms above remain valid.
+# Health is checked at <base_url>/models (for example /v1/models). Requests
+# wait while all endpoints are unavailable and fail with HTTP 503 only after
+# health_probe_max_wait expires.
+[[profile]]
+model = "aeon-27b"
+health_probe_interval = "2s" # probe-result cache TTL and on-demand poll interval
+health_probe_timeout = "1s"  # timeout for one probe
+health_probe_max_wait = "120s"
+
+[[profile.upstream]]
+base_url = "http://localhost:18010/v1"
+priority = "primary"
+
+[[profile.upstream]]
+base_url = "http://gb10:18010/v1"
+priority = "failover"
+
 [shielding]
 enabled = true
 

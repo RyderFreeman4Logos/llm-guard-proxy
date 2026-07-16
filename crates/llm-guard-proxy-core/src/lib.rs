@@ -83,9 +83,10 @@ pub use settings::{
     NoThinkingMarkerPolicy, ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS,
     ReloadOutcome, RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
     SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
-    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, ValidationError, apply_reloadable,
-    redact_upstream_base_url, validate_upstream_base_url,
+    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamEndpointConfig, UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason,
+    UpstreamStallConfig, ValidationError, apply_reloadable, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 pub use settings::{BudgetConfig, UnknownKeyPolicy, VirtualKeyConfig};
