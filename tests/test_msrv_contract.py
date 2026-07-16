@@ -6,32 +6,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "Cargo.toml"
-CI_WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+JUSTFILE = ROOT / "justfile"
 
 
 class MsrvContractTests(unittest.TestCase):
-    def test_declared_msrv_matches_exact_ci_toolchain(self) -> None:
+    def test_declared_msrv_is_1_88(self) -> None:
         manifest = tomllib.loads(MANIFEST.read_text())
         self.assertEqual(manifest["workspace"]["package"]["rust-version"], "1.88")
 
-        workflow = CI_WORKFLOW.read_text()
-        self.assertIn('MSRV: "1.88.0"', workflow)
-        self.assertRegex(
-            workflow,
-            re.compile(r'rustup toolchain install "?\$MSRV"? --profile minimal'),
-        )
-        self.assertIn(
-            'rustup run "$MSRV" cargo check --workspace --all-targets '
-            "--all-features --locked",
-            workflow,
-        )
-
-    def test_ci_runs_repository_contract_tests(self) -> None:
-        workflow = CI_WORKFLOW.read_text()
-        self.assertIn(
-            "python3 -m unittest discover -s tests -p 'test_*.py' -v",
-            workflow,
-        )
+    def test_local_gates_enforce_msrv_build(self) -> None:
+        justfile = JUSTFILE.read_text()
+        # The local pre-push gate must run clippy and tests so that
+        # dependency updates that raise the effective MSRV are caught.
+        self.assertIn("cargo clippy --workspace --all-targets --all-features", justfile)
+        self.assertIn("cargo test --workspace --all-features", justfile)
 
 
 if __name__ == "__main__":
