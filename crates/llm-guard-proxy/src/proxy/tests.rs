@@ -70,6 +70,84 @@ const REPEATED_INPUT_LOOP_LINE: &str = "legitimate repeated input line for issue
 const LARGE_MODEL_METADATA_EXTRA_BYTES: usize = 1024 * 1024;
 static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+#[test]
+fn parse_token_usage_reads_non_streaming_completion_usage() {
+    let usage = parse_token_usage(
+        br#"{
+            "usage": {
+                "prompt_tokens": 11,
+                "completion_tokens": 7,
+                "prompt_tokens_details": {"cached_tokens": 3},
+                "completion_tokens_details": {"reasoning_tokens": 5}
+            }
+        }"#,
+        b"",
+    );
+
+    assert_eq!(
+        usage,
+        TokenUsage {
+            input_tokens: Some(11),
+            output_tokens: Some(7),
+            cached_input_tokens: Some(3),
+            reasoning_tokens: Some(5),
+        }
+    );
+}
+
+#[test]
+fn parse_token_usage_reads_last_usage_sse_data_line() {
+    let usage = parse_token_usage(
+        b"not JSON",
+        br#"data: {"choices":[{"delta":{"content":"answer"}}]}
+
+data: {"usage":{"prompt_tokens":13,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":2},"completion_tokens_details":{"reasoning_tokens":4}}}
+
+data: [DONE]
+"#,
+    );
+
+    assert_eq!(
+        usage,
+        TokenUsage {
+            input_tokens: Some(13),
+            output_tokens: Some(8),
+            cached_input_tokens: Some(2),
+            reasoning_tokens: Some(4),
+        }
+    );
+}
+
+#[test]
+fn parse_token_usage_reads_embedding_prompt_tokens() {
+    let usage = parse_token_usage(
+        br#"{"data":[],"usage":{"prompt_tokens":17,"total_tokens":17}}"#,
+        b"",
+    );
+
+    assert_eq!(
+        usage,
+        TokenUsage {
+            input_tokens: Some(17),
+            ..TokenUsage::default()
+        }
+    );
+}
+
+#[test]
+fn parse_token_usage_returns_default_when_usage_is_missing() {
+    let usage = parse_token_usage(br#"{"id":"chatcmpl-without-usage"}"#, b"data: [DONE]\n\n");
+
+    assert_eq!(usage, TokenUsage::default());
+}
+
+#[test]
+fn parse_token_usage_returns_default_for_malformed_json() {
+    let usage = parse_token_usage(b"{\"usage\":", b"data: {\"usage\":\n\n");
+
+    assert_eq!(usage, TokenUsage::default());
+}
+
 #[tokio::test]
 async fn health_reports_process_and_upstream_readiness() {
     let mut fake = FakeUpstream::spawn().await;

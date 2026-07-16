@@ -4409,6 +4409,8 @@ async fn fetch_models_upstream_group(
             request_metadata: attempt_request_metadata,
             extra_response_metadata: BTreeMap::new(),
             raw_payloads: RawPayloads::default(),
+            response_body: body.clone(),
+            sse_body: Bytes::new(),
         },
         context.request_id,
         unix_time_millis(),
@@ -5432,6 +5434,8 @@ impl ForwardedResponseParts {
             request_metadata: self.attempt_request_metadata,
             extra_response_metadata: attempt_response_metadata,
             raw_payloads: raw_payloads.clone(),
+            response_body: Bytes::new(),
+            sse_body: Bytes::new(),
         };
         ForwardedBodyObserver {
             config: self.config,
@@ -5906,12 +5910,12 @@ fn shielded_liveness_stream_response(
     let attempt_progress = Arc::new(Mutex::new(ShieldedAttemptProgress {
         extra_response_metadata: extra_metadata.clone(),
         completed_attempt_records: prior_attempt_records.clone(),
-        current_attempt: Some(
-            started
-                .info
-                .clone()
-                .into_final_context(extra_metadata.clone(), RawPayloads::default()),
-        ),
+        current_attempt: Some(started.info.clone().into_final_context(
+            extra_metadata.clone(),
+            RawPayloads::default(),
+            Bytes::new(),
+            Bytes::new(),
+        )),
     }));
     let observer = shielded_retry_observer(
         runtime,
@@ -6351,6 +6355,8 @@ async fn aggregate_shielded_attempt(
             final_attempt: started.info.into_final_context(
                 aggregated.response_metadata.clone(),
                 aggregated.raw_payloads.clone(),
+                aggregated.body.clone(),
+                aggregated.sse_body.clone(),
             ),
             body: aggregated.body,
             sse_body: aggregated.sse_body,
@@ -7992,6 +7998,8 @@ impl ShieldedAttemptInfo {
         self,
         extra_response_metadata: BTreeMap<String, String>,
         raw_payloads: RawPayloads,
+        response_body: Bytes,
+        sse_body: Bytes,
     ) -> FinalAttemptContext {
         let mut raw_payloads = raw_payloads;
         if raw_payloads.input.is_none() {
@@ -8008,6 +8016,8 @@ impl ShieldedAttemptInfo {
             request_metadata: self.request_metadata,
             extra_response_metadata,
             raw_payloads,
+            response_body,
+            sse_body,
         }
     }
 }
@@ -8975,11 +8985,12 @@ async fn shielded_retry_terminal_forward_response(
     let request_path = runtime.downstream_uri.path().to_owned();
     let request_id = runtime.request_id.clone();
     let malformed_counter = runtime.malformed_response_counter.clone();
-    let final_attempt = terminal
-        .started
-        .info
-        .clone()
-        .into_final_context(BTreeMap::new(), RawPayloads::default());
+    let final_attempt = terminal.started.info.clone().into_final_context(
+        BTreeMap::new(),
+        RawPayloads::default(),
+        Bytes::new(),
+        Bytes::new(),
+    );
     let observer = shielded_retry_observer(
         runtime,
         ShieldedRetryObserverInput {
@@ -9024,11 +9035,12 @@ async fn shielded_retry_direct_relay_response(
     let request_path = runtime.downstream_uri.path().to_owned();
     let request_id = runtime.request_id.clone();
     let malformed_counter = runtime.malformed_response_counter.clone();
-    let final_attempt = outcome
-        .started
-        .info
-        .clone()
-        .into_final_context(outcome.response_metadata.clone(), RawPayloads::default());
+    let final_attempt = outcome.started.info.clone().into_final_context(
+        outcome.response_metadata.clone(),
+        RawPayloads::default(),
+        Bytes::new(),
+        Bytes::new(),
+    );
     let observer = shielded_retry_observer(
         runtime,
         ShieldedRetryObserverInput {
@@ -9128,6 +9140,8 @@ struct FinalAttemptContext {
     request_metadata: BTreeMap<String, String>,
     extra_response_metadata: BTreeMap<String, String>,
     raw_payloads: RawPayloads,
+    response_body: Bytes,
+    sse_body: Bytes,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -9163,8 +9177,12 @@ fn update_shielded_attempt_progress(
         progress.completed_attempt_records = completed_attempt_records.to_vec();
         let extra_response_metadata = progress.extra_response_metadata.clone();
         progress.current_attempt = current_attempt.map(|info| {
-            info.clone()
-                .into_final_context(extra_response_metadata, RawPayloads::default())
+            info.clone().into_final_context(
+                extra_response_metadata,
+                RawPayloads::default(),
+                Bytes::new(),
+                Bytes::new(),
+            )
         });
     }
 }
@@ -9365,11 +9383,46 @@ fn final_attempt_record(
         error_reason: completion.error_reason(),
         retry_reason: None,
         abort_reason: completion.abort_reason(),
-        token_usage: TokenUsage::default(),
+        token_usage: parse_token_usage(&attempt.response_body, &attempt.sse_body),
         request_metadata,
         response_metadata,
         raw_payloads: attempt.raw_payloads,
     }
+}
+
+fn parse_token_usage(body: &[u8], sse_body: &[u8]) -> TokenUsage {
+    parse_token_usage_json(body)
+        .or_else(|| {
+            std::str::from_utf8(sse_body).ok().and_then(|sse_body| {
+                sse_body.lines().rev().find_map(|line| {
+                    line.trim_end_matches('\r')
+                        .strip_prefix("data:")
+                        .and_then(|data| parse_token_usage_json(data.trim_start().as_bytes()))
+                })
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn parse_token_usage_json(body: &[u8]) -> Option<TokenUsage> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let usage = value.get("usage")?.as_object()?;
+    Some(TokenUsage {
+        input_tokens: usage
+            .get("prompt_tokens")
+            .and_then(serde_json::Value::as_u64),
+        output_tokens: usage
+            .get("completion_tokens")
+            .and_then(serde_json::Value::as_u64),
+        cached_input_tokens: usage
+            .get("prompt_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .and_then(serde_json::Value::as_u64),
+        reasoning_tokens: usage
+            .get("completion_tokens_details")
+            .and_then(|details| details.get("reasoning_tokens"))
+            .and_then(serde_json::Value::as_u64),
+    })
 }
 
 fn retry_chain_metadata(
@@ -9834,10 +9887,12 @@ impl ShieldedLivenessBody {
     }
 
     fn start_direct_relay(&mut self, outcome: ShieldedDirectRelayOutcome) -> Option<Bytes> {
-        let mut final_attempt = outcome
-            .started
-            .info
-            .into_final_context(outcome.response_metadata.clone(), RawPayloads::default());
+        let mut final_attempt = outcome.started.info.into_final_context(
+            outcome.response_metadata.clone(),
+            RawPayloads::default(),
+            Bytes::new(),
+            Bytes::new(),
+        );
         if let Some(observer) = &mut self.observer {
             observer
                 .completed_attempt_records
