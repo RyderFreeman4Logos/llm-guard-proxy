@@ -13,6 +13,8 @@ fn public_threshold_contract_preserves_gib_and_mib_units() {
 fn public_shed_and_rearm_contracts_have_distinct_boundaries() {
     let thresholds = Thresholds::new(1, 64).expect("thresholds");
     assert!(should_shed(thresholds.threshold_bytes() - 1, thresholds));
+    assert!(should_shed(thresholds.threshold_bytes(), thresholds));
+    assert!(!should_shed(thresholds.threshold_bytes() + 1, thresholds));
     assert!(!should_rearm(thresholds.threshold_bytes(), thresholds));
     assert!(should_rearm(
         thresholds.threshold_bytes() + thresholds.reserve_bytes() as u64,

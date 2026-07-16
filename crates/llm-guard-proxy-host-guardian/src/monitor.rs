@@ -75,7 +75,7 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 /// Returns whether Tier 1 must shed the registered cgroup.
 #[must_use]
 pub const fn should_shed(mem_available_bytes: u64, thresholds: Thresholds) -> bool {
-    mem_available_bytes < thresholds.threshold_bytes()
+    mem_available_bytes <= thresholds.threshold_bytes()
 }
 
 /// Returns whether the reserve may be reallocated and the latch cleared.
@@ -941,10 +941,11 @@ mod tests {
     }
 
     #[test]
-    fn sheds_only_below_threshold() {
+    fn sheds_at_or_below_threshold() {
         let thresholds = Thresholds::new(1, 64).expect("thresholds");
         assert!(should_shed(thresholds.threshold_bytes() - 1, thresholds));
-        assert!(!should_shed(thresholds.threshold_bytes(), thresholds));
+        assert!(should_shed(thresholds.threshold_bytes(), thresholds));
+        assert!(!should_shed(thresholds.threshold_bytes() + 1, thresholds));
     }
 
     #[test]
