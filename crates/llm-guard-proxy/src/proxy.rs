@@ -95,6 +95,8 @@ const DEBUG_SUMMARY_PATH: &str = "/debug/recent-requests";
 const IN_FLIGHT_CAPACITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 const ADMISSION_RETRY_AFTER_SECS: u32 = 1;
 const RECOVERY_PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(100);
+const RECOVERY_PROCESS_GROUP_TERM_MAX_WAIT: Duration = Duration::from_secs(2);
+const RECOVERY_PROCESS_GROUP_TERM_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE: Duration = Duration::from_millis(500);
 const COT_SALVAGE_PREFIX_MAX_BYTES: usize = 4_096;
 const COT_SALVAGE_THINKING_BUDGET_TOKENS: u32 = 1_024;
@@ -7937,12 +7939,18 @@ async fn terminate_timed_out_recovery_child(
         String::from("upstream_stall_recovery_timeout_term_sent"),
         send_recovery_process_group_signal(pid, Signal::SIGTERM).to_string(),
     );
-    tokio::time::sleep(RECOVERY_PROCESS_GROUP_TERM_GRACE).await;
     // WNOWAIT keeps the leader PID reserved until the final group signal, so
     // numeric PID reuse cannot redirect SIGKILL to an unrelated process group.
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_term_child_wait_status"),
-        String::from(observe_recovery_child_without_reaping(pid)),
+        String::from(
+            wait_for_term_child_exit_or_deadline(
+                pid,
+                RECOVERY_PROCESS_GROUP_TERM_GRACE,
+                RECOVERY_PROCESS_GROUP_TERM_MAX_WAIT,
+            )
+            .await,
+        ),
     );
 
     metadata.insert(
@@ -7985,6 +7993,31 @@ fn send_recovery_process_group_signal(pid: u32, signal: Signal) -> bool {
         return false;
     }
     kill(Pid::from_raw(-process_group_id), signal).is_ok()
+}
+
+/// Waits for a TERM-signalled direct child to exit without reaping it.
+///
+/// The initial grace preserves the normal TERM-only path. Subsequent bounded polling gives the
+/// scheduler time to observe an exit under load while keeping the leader PID reserved by WNOWAIT
+/// until the final process-group SIGKILL is sent.
+#[cfg(unix)]
+async fn wait_for_term_child_exit_or_deadline(
+    pid: u32,
+    minimum_grace: Duration,
+    maximum_wait: Duration,
+) -> &'static str {
+    let deadline = Instant::now() + maximum_wait;
+    tokio::time::sleep(minimum_grace.min(maximum_wait)).await;
+
+    loop {
+        let status = observe_recovery_child_without_reaping(pid);
+        if status != "child_still_running_after_term" || Instant::now() >= deadline {
+            return status;
+        }
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        tokio::time::sleep(RECOVERY_PROCESS_GROUP_TERM_POLL_INTERVAL.min(remaining)).await;
+    }
 }
 
 #[cfg(any(
