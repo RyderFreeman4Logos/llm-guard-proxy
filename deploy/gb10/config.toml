@@ -491,44 +491,39 @@ interval_secs = 15                         # Send heartbeat every 15s
 enabled = true
 
 ## ───────────────────────── Host memory guardian ────────────────────────────
-## `memory-guardian` is a default-on compile-time feature. The guardian has a
-## separate strict configuration file so proxy config reload cannot weaken its
-## registration-file ownership checks. Use deploy/gb10/memory-guardian.toml as
-## the operator template.
+## `memory-guardian` is a default-on compile-time feature. The proxy always
+## runs the observer and reads this section from the same hot-reloaded config.
+## `enabled = false` is observer-only: low-memory events are logged but no kill
+## action is issued. A valid candidate is installed atomically; malformed
+## reloads leave the last-known-good policy active.
 ##
-## Start it alongside the proxy:
+## The cgroup action resolves `registration_file` below the guardian runtime
+## directory. By default that directory is
+## `$XDG_RUNTIME_DIR/gb10-memory-guardian` (or `/run/user/<uid>/...`); override
+## it only when needed:
 ##   llm-guard-proxy --config /etc/llm-guard-proxy/config.toml \
-##     --guardian-config /etc/llm-guard-proxy/memory-guardian.toml \
 ##     --guardian-runtime-dir /run/user/1000/gb10-memory-guardian
 ##
-## Or run the guardian independently:
-##   llm-guard-proxy guardian --config /etc/llm-guard-proxy/memory-guardian.toml \
+## The optional compatibility subcommand consumes this same proxy config:
+##   llm-guard-proxy guardian --config /etc/llm-guard-proxy/config.toml \
 ##     --runtime-dir /run/user/1000/gb10-memory-guardian
 ##
-## Fully commented guardian example. Both the guardian config and registration
-## file must be 0600 single-link regular files owned by the service user; the cgroup target is
-## validated and opened while healthy. The emergency path releases reserve
-## memory and writes `1` to that pre-opened cgroup.kill descriptor without
-## allocation. Tier 2 is disabled by default.
-# schema_version = 1
-#
-# [target]
-# label = "aeon-text"                        # Operator-facing target label
-# registration_file = "text-cgroup.v1"       # Filename below runtime-dir
-#
-# [thresholds]
-# mem_avail_stop_gib = 1                      # Tier 1 MemAvailable stop point
-# reserve_mib = 64                            # Pre-touched reserve to release
-#
-# [runtime]
-# cgroup_root = "/sys/fs/cgroup"             # cgroup-v2 root
-# poll_interval_secs = 1                      # Healthy-loop and hot-reload interval
-# retry_interval_secs = 5                     # Latched cgroup.events poll interval
-#
-# [escalation]
-# enabled = false                             # Tier 2 systemd escalation, opt-in
-# unit = "gb10-stack-recovery.service"        # Required only when enabled
-# grace_period_secs = 60                      # Delay after Tier 1 before Tier 2
+## Registration files remain 0600, single-link regular files owned by the
+## service user. Cgroup targets are validated/opened while healthy. The direct
+## cgroup emergency path releases pre-touched reserve memory and writes `1` to
+## a pre-opened cgroup.kill descriptor without allocation.
+
+[guardian]
+enabled = false                              # Observer-only until explicitly armed
+target_label = "aeon-text"                  # Deployment-specific target label
+mem_threshold_gib = 1                       # Act when MemAvailable falls below this value
+kill_action = "cgroup.kill"                 # `cgroup.kill` or `systemctl_restart`
+poll_interval_secs = 1                      # Memory sampling interval; hot reload checks stay at 1s
+registration_file = "text-cgroup.v1"        # Optional; defaults to `<target_label>.v1`
+# systemd_unit = "vllm-aeon-text.service"    # Optional override for systemctl_restart
+reserve_mib = 64                            # Pre-touched emergency reserve
+retry_interval_secs = 5                     # Retry while pressure remains latched
+cgroup_root = "/sys/fs/cgroup"             # cgroup-v2 root
 
 ## ───────────────────────── Host telemetry sampler ──────────────────────────
 ## `host-telemetry` is a default-on compile-time feature that ports the GB10

@@ -107,9 +107,27 @@ pub fn validate_unit_name(unit: &str) -> Result<(), EscalationError> {
 /// Returns an error when the unit is invalid, `systemctl` cannot be run, it
 /// exits unsuccessfully, or the timeout expires.
 pub fn start_unit_with_timeout(unit: &str, timeout: Duration) -> Result<(), EscalationError> {
+    run_systemctl_unit_action("start", unit, timeout)
+}
+
+/// Restarts one validated user service with a bounded wait and reaping.
+///
+/// # Errors
+///
+/// Returns an error when the unit is invalid, `systemctl` cannot be run, it
+/// exits unsuccessfully, or the timeout expires.
+pub fn restart_user_unit(unit: &str, timeout: Duration) -> Result<(), EscalationError> {
+    run_systemctl_unit_action("restart", unit, timeout)
+}
+
+fn run_systemctl_unit_action(
+    action: &'static str,
+    unit: &str,
+    timeout: Duration,
+) -> Result<(), EscalationError> {
     validate_unit_name(unit)?;
     let mut child = Command::new("systemctl")
-        .args(["--user", "start", "--", unit])
+        .args(["--user", action, "--", unit])
         .spawn()
         .map_err(EscalationError::Spawn)?;
     let started = Instant::now();
@@ -129,7 +147,7 @@ pub fn start_unit_with_timeout(unit: &str, timeout: Duration) -> Result<(), Esca
 
 #[cfg(test)]
 mod tests {
-    use super::{EscalationEpisode, validate_unit_name};
+    use super::{EscalationEpisode, restart_user_unit, validate_unit_name};
     use crate::config::EscalationConfig;
     use std::time::{Duration, Instant};
 
@@ -164,6 +182,11 @@ mod tests {
     #[test]
     fn rejects_path_separator() {
         assert!(validate_unit_name("dir/x.service").is_err());
+    }
+
+    #[test]
+    fn restart_rejects_an_unsafe_unit_before_spawning_systemctl() {
+        assert!(restart_user_unit("dir/x.service", Duration::from_secs(1)).is_err());
     }
 
     #[test]

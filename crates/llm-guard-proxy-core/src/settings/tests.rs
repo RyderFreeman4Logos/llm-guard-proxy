@@ -2,10 +2,10 @@
 use super::GuardWorkflowConfig;
 use super::{
     AppConfig, ConfigHandle, ConfigParseError, DefaultInjectionSchema, DownstreamDropPolicy,
-    HeartbeatMode, LoopFailurePolicy, LoopGuardMode, NoThinkingMarkerPolicy, RELOADABLE_FIELDS,
-    RESTART_REQUIRED_FIELDS, ShadowComparisonAttempt, ThinkingMode, ToolRequestThinkingPolicy,
-    UpstreamPriority, UpstreamRouteReason, ValidationError, apply_reloadable,
-    parse::parse_config_text, redact_upstream_base_url,
+    GuardianKillAction, HeartbeatMode, LoopFailurePolicy, LoopGuardMode, NoThinkingMarkerPolicy,
+    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ShadowComparisonAttempt, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamPriority, UpstreamRouteReason, ValidationError,
+    apply_reloadable, parse::parse_config_text, redact_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 use crate::{
@@ -3137,6 +3137,169 @@ interval_secs = 4
 }
 
 #[test]
+fn parses_and_validates_guardian_policy_from_the_shared_config() {
+    let config = AppConfig::parse(
+        r#"
+[guardian]
+enabled = true
+target_label = "aeon-text"
+mem_threshold_gib = 2
+kill_action = "cgroup.kill"
+poll_interval_secs = 3
+registration_file = "text-cgroup.v1"
+reserve_mib = 32
+retry_interval_secs = 7
+cgroup_root = "/test/cgroup"
+"#,
+    )
+    .expect("guardian config should parse");
+
+    config.validate().expect("guardian config should validate");
+    assert!(config.guardian.enabled);
+    assert_eq!(config.guardian.target_label, "aeon-text");
+    assert_eq!(config.guardian.mem_threshold_gib, 2);
+    assert_eq!(config.guardian.kill_action, GuardianKillAction::CgroupKill);
+    assert_eq!(config.guardian.poll_interval_secs, 3);
+    assert_eq!(
+        config.guardian.effective_registration_file(),
+        "text-cgroup.v1"
+    );
+    assert_eq!(config.guardian.reserve_mib, 32);
+    assert_eq!(config.guardian.retry_interval_secs, 7);
+    assert_eq!(
+        config.guardian.cgroup_root,
+        std::path::PathBuf::from("/test/cgroup")
+    );
+}
+
+#[test]
+fn guardian_policy_supports_systemctl_restart_and_derived_targets() {
+    let config = AppConfig::parse(
+        r#"
+[guardian]
+enabled = true
+target_label = "vllm-aeon"
+mem_threshold_gib = 4
+kill_action = "systemctl_restart"
+poll_interval_secs = 1
+"#,
+    )
+    .expect("guardian config should parse");
+
+    config.validate().expect("guardian config should validate");
+    assert_eq!(
+        config.guardian.kill_action,
+        GuardianKillAction::SystemctlRestart
+    );
+    assert_eq!(
+        config.guardian.effective_systemd_unit(),
+        "vllm-aeon.service"
+    );
+    assert_eq!(
+        config.guardian.effective_registration_file(),
+        "vllm-aeon.v1"
+    );
+}
+
+#[test]
+fn guardian_policy_rejects_unsafe_enabled_configuration() {
+    let missing_target = AppConfig::parse(
+        r#"
+[guardian]
+enabled = true
+mem_threshold_gib = 2
+kill_action = "cgroup.kill"
+poll_interval_secs = 1
+"#,
+    )
+    .expect("config should parse")
+    .validate()
+    .expect_err("enabled guardian requires a target");
+    assert_eq!(missing_target.field(), "guardian.target_label");
+
+    let zero_threshold = AppConfig::parse(
+        r#"
+[guardian]
+target_label = "aeon-text"
+mem_threshold_gib = 0
+"#,
+    )
+    .expect("config should parse")
+    .validate()
+    .expect_err("zero threshold must fail");
+    assert_eq!(zero_threshold.field(), "guardian.mem_threshold_gib");
+
+    let mut oversized_reserve = AppConfig::default();
+    oversized_reserve.guardian.mem_threshold_gib = 1;
+    oversized_reserve.guardian.reserve_mib = 1024;
+    let oversized_reserve = oversized_reserve
+        .validate()
+        .expect_err("reserve must stay below threshold");
+    assert_eq!(oversized_reserve.field(), "guardian.reserve_mib");
+
+    let mut unsafe_unit = AppConfig::default();
+    unsafe_unit.guardian.systemd_unit = Some("unsafe:unit.service".to_owned());
+    let unsafe_unit = unsafe_unit
+        .validate()
+        .expect_err("systemd unit override must be constrained");
+    assert_eq!(unsafe_unit.field(), "guardian.systemd_unit");
+}
+
+#[test]
+fn config_handle_hot_reloads_the_complete_guardian_policy() {
+    let current = AppConfig::parse(
+        r#"
+[guardian]
+enabled = true
+target_label = "aeon-text"
+mem_threshold_gib = 2
+kill_action = "cgroup.kill"
+poll_interval_secs = 1
+registration_file = "text-cgroup.v1"
+"#,
+    )
+    .expect("current config should parse");
+    current.validate().expect("current config should validate");
+    let requested = AppConfig::parse(
+        r#"
+[guardian]
+enabled = true
+target_label = "replacement-text"
+mem_threshold_gib = 5
+kill_action = "systemctl restart"
+poll_interval_secs = 4
+systemd_unit = "replacement-vllm.service"
+"#,
+    )
+    .expect("requested config should parse");
+    requested
+        .validate()
+        .expect("requested config should validate");
+    let handle = ConfigHandle::new(current);
+
+    let outcome = handle
+        .apply_reloadable(&requested)
+        .expect("guardian policy should hot reload");
+    let snapshot = handle.snapshot().expect("snapshot should succeed");
+
+    assert!(outcome.applied);
+    assert!(outcome.restart_required_changes.is_empty());
+    assert_eq!(snapshot.guardian, requested.guardian);
+    assert_eq!(
+        handle.guardian_snapshot().expect("guardian snapshot"),
+        requested.guardian
+    );
+    assert_eq!(
+        snapshot.guardian.kill_action,
+        GuardianKillAction::SystemctlRestart
+    );
+    assert_eq!(
+        snapshot.guardian.effective_systemd_unit(),
+        "replacement-vllm.service"
+    );
+}
+
+#[test]
 fn pure_reload_transition_does_not_mutate_its_inputs() {
     let current = AppConfig::default();
     let current_max_in_flight = current.server.max_in_flight_requests;
@@ -3153,6 +3316,24 @@ fn pure_reload_transition_does_not_mutate_its_inputs() {
     assert!(outcome.applied);
     assert_eq!(outcome.restart_required_changes.len(), 1);
     assert_eq!(outcome.restart_required_changes[0].field, "server.port");
+}
+
+#[test]
+fn guardian_reload_metadata_lists_all_policy_fields() {
+    for field in [
+        "guardian.enabled",
+        "guardian.target_label",
+        "guardian.mem_threshold_gib",
+        "guardian.kill_action",
+        "guardian.poll_interval_secs",
+        "guardian.registration_file",
+        "guardian.systemd_unit",
+        "guardian.reserve_mib",
+        "guardian.retry_interval_secs",
+        "guardian.cgroup_root",
+    ] {
+        assert!(RELOADABLE_FIELDS.contains(&field), "missing {field}");
+    }
 }
 
 #[test]

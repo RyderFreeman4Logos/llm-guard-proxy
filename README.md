@@ -350,7 +350,30 @@ interval_secs = 15
 
 [cloudflare]
 enabled = true
+
+# Host memory guardian. Disabled means observer-only; no process is killed.
+[guardian]
+enabled = false
+target_label = "aeon-text"
+mem_threshold_gib = 2
+kill_action = "cgroup.kill" # or systemctl_restart
+poll_interval_secs = 1
+# registration_file = "text-cgroup.v1" # defaults to <target_label>.v1
+# systemd_unit = "vllm-aeon-text.service" # optional action target override
+# reserve_mib = 64
+# retry_interval_secs = 5
+# cgroup_root = "/sys/fs/cgroup"
 ```
+
+The guardian runs inside the proxy and consumes the same hot-reloaded
+configuration snapshot. Invalid edits keep the last-known-good policy. Policy
+changes are prepared while memory is healthy and published as a complete unit;
+the latched emergency path deliberately defers reloads. The `cgroup.kill`
+action preserves the allocation-free pre-opened-fd path. `systemctl_restart`
+restarts the configured user service instead. The runtime registration
+directory defaults to `$XDG_RUNTIME_DIR/gb10-memory-guardian` (falling back to
+`/run/user/<uid>/gb10-memory-guardian`) and can be overridden with
+`--guardian-runtime-dir`.
 
 Retention byte limits apply to actual SQLite page storage. SQLite has a
 schema/page-size minimum footprint, so limits below that floor prune retained
