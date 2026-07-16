@@ -1,10 +1,12 @@
 //! The allocation-aware Tier-1 memory monitoring loop.
 
 use crate::{
-    config::{ConfigError, GuardianConfig, Thresholds},
+    config::{ConfigError, Thresholds},
     emergency::{AttemptOutcome, EmergencyController, EmergencyReserve},
-    escalation::EscalationEpisode,
-    hot_reload::{HotReloadableConfig, ReloadCandidate},
+    escalation::restart_user_unit,
+};
+use llm_guard_proxy_core::{
+    ConfigHandle, ConfigHandleError, GuardianConfig, GuardianKillAction, ValidationError,
 };
 use nix::unistd::Uid;
 use std::{
@@ -22,6 +24,7 @@ use thiserror::Error;
 const MEMINFO_BUFFER_BYTES: usize = 8 * 1024;
 const REGISTRATION_MAX_BYTES: usize = 1024;
 const EVENTS_BUFFER_BYTES: usize = 512;
+const CONFIG_SYNC_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Parses the exact `MemAvailable: <integer> kB` field from `/proc/meminfo`.
 ///
@@ -354,6 +357,9 @@ fn validate_registration_metadata(file: &File, expected_uid: u32) -> Result<(), 
 pub enum GuardianIteration {
     /// Healthy memory; no action was required.
     Healthy,
+    /// Memory pressure crossed the configured threshold, but recovery actions
+    /// are disabled and the guardian only reported the event.
+    ObserverOnly,
     /// The registration or cgroup target is temporarily unavailable; Tier 1 is
     /// disarmed until a later healthy iteration validates and opens a target.
     Unarmed,
@@ -373,6 +379,12 @@ pub enum GuardianError {
     /// Configuration load or hot-reload failure.
     #[error(transparent)]
     Config(#[from] ConfigError),
+    /// The shared proxy configuration could not be read.
+    #[error(transparent)]
+    ConfigHandle(#[from] ConfigHandleError),
+    /// The shared proxy configuration is not safe to install.
+    #[error(transparent)]
+    Validation(#[from] ValidationError),
     /// The pre-touched emergency reserve could not be allocated at startup.
     #[error(transparent)]
     Reserve(#[from] crate::emergency::ReserveError),
@@ -393,58 +405,87 @@ pub enum GuardianError {
     NoTarget,
 }
 
+#[derive(Debug)]
+enum RecoveryTarget {
+    Cgroup(CgroupTarget),
+    Systemd { unit: String },
+}
+
 /// Runs Tier 1 continuously and owns all state which may allocate while healthy.
 #[derive(Debug)]
 pub struct MemoryGuardian {
-    reloader: HotReloadableConfig,
+    config_handle: ConfigHandle,
+    active_policy: GuardianConfig,
+    thresholds: Thresholds,
     runtime_dir: PathBuf,
-    target: Option<CgroupTarget>,
-    pending_config: Option<ReloadCandidate>,
+    target: Option<RecoveryTarget>,
     proc_meminfo: File,
-    controller: EmergencyController,
+    controller: Option<EmergencyController>,
     poll_interval: Duration,
     retry_interval: Duration,
     started: Instant,
     latched: bool,
-    escalation: EscalationEpisode,
+    systemd_next_attempt_millis: u64,
+    systemd_verified: bool,
+    observer_pressure_reported: bool,
+    last_rejected_policy: Option<GuardianConfig>,
 }
 
 impl MemoryGuardian {
-    /// Arms a guardian using registrations from `runtime_dir`.
+    /// Opens a guardian backed by the proxy's shared validated configuration.
     ///
     /// # Errors
     ///
-    /// Returns an error when the config, reserve mapping, or `/proc/meminfo`
-    /// cannot be safely opened. Missing registrations are retried by the
-    /// healthy loop so startup remains protected rather than failing closed.
+    /// Returns an error when the shared config, an enabled reserve mapping, or
+    /// `/proc/meminfo` cannot be opened. Missing cgroup registrations are
+    /// retried by the healthy loop without taking down the proxy.
     pub fn open(
-        config_path: impl Into<PathBuf>,
+        config_handle: ConfigHandle,
         runtime_dir: impl Into<PathBuf>,
     ) -> Result<Self, GuardianError> {
-        let reloader = HotReloadableConfig::new(config_path.into())?;
+        let snapshot = config_handle.snapshot()?;
+        snapshot.validate()?;
+        let active_policy = snapshot.guardian;
+        let thresholds = thresholds_from_policy(&active_policy)?;
         let runtime_dir = runtime_dir.into();
-        let config = reloader.current();
-        let reserve = EmergencyReserve::new(config.thresholds().reserve_bytes())?;
+        let controller = if active_policy.enabled {
+            Some(EmergencyController::new(
+                EmergencyReserve::new(thresholds.reserve_bytes())?,
+                active_policy.retry_interval_secs.saturating_mul(1000),
+            ))
+        } else {
+            None
+        };
         let proc_meminfo = File::open("/proc/meminfo").map_err(|source| GuardianError::Io {
             operation: "open /proc/meminfo",
             source,
         })?;
         Ok(Self {
-            reloader,
+            config_handle,
+            poll_interval: Duration::from_secs(active_policy.poll_interval_secs),
+            retry_interval: Duration::from_secs(active_policy.retry_interval_secs),
+            active_policy,
+            thresholds,
             runtime_dir,
             target: None,
-            pending_config: None,
             proc_meminfo,
-            controller: EmergencyController::new(
-                reserve,
-                duration_millis(config.runtime().retry_interval()),
-            ),
-            poll_interval: config.runtime().poll_interval(),
-            retry_interval: config.runtime().retry_interval(),
+            controller,
             started: Instant::now(),
             latched: false,
-            escalation: EscalationEpisode::default(),
+            systemd_next_attempt_millis: 0,
+            systemd_verified: false,
+            observer_pressure_reported: false,
+            last_rejected_policy: None,
         })
+    }
+
+    /// Returns the policy currently armed by the guardian.
+    ///
+    /// A shared configuration update is exposed here only after any required
+    /// cgroup target and emergency reserve have been prepared successfully.
+    #[must_use]
+    pub const fn active_policy(&self) -> &GuardianConfig {
+        &self.active_policy
     }
 
     /// Returns whether the emergency path is currently latched.
@@ -478,46 +519,57 @@ impl MemoryGuardian {
     {
         tokio::pin!(shutdown);
         loop {
-            let iteration = self.tick()?;
+            self.tick()?;
             let delay = if self.latched {
                 self.retry_interval
             } else {
                 self.poll_interval
             };
-            if matches!(iteration, GuardianIteration::Shed) {
-                self.reloader.with_current(|config| {
-                    self.escalation.arm(config.escalation(), Instant::now());
-                });
-            }
-            if self.latched {
-                let result = self.reloader.with_current(|config| {
-                    self.escalation
-                        .maybe_run(config.escalation(), Instant::now())
-                });
-                if let Err(error) = result {
-                    eprintln!("memory guardian: Tier 2 escalation trigger failed: {error}");
+            let mut remaining = delay;
+            while !remaining.is_zero() {
+                let slice = if self.latched {
+                    remaining
+                } else {
+                    remaining.min(CONFIG_SYNC_INTERVAL)
+                };
+                let wait_started = Instant::now();
+                tokio::select! {
+                    () = &mut shutdown => return Ok(()),
+                    () = tokio::time::sleep(slice) => {}
                 }
-            }
-            tokio::select! {
-                () = &mut shutdown => return Ok(()),
-                () = tokio::time::sleep(delay) => {}
+                remaining = remaining.saturating_sub(wait_started.elapsed());
+                if !self.latched && self.reconcile_healthy_target() {
+                    break;
+                }
             }
         }
     }
 
     fn healthy_iteration(&mut self) -> GuardianIteration {
+        let _changed = self.reconcile_healthy_target();
         let available = match read_mem_available(&self.proc_meminfo) {
             Ok(available) => available,
             Err(_error) => return GuardianIteration::Healthy,
         };
-        let thresholds = self.reloader.thresholds();
-        if should_shed(available, thresholds) {
+        if should_shed(available, self.thresholds) {
+            if !self.active_policy.enabled {
+                if !self.observer_pressure_reported {
+                    eprintln!(
+                        "memory guardian: MemAvailable crossed the configured threshold; observer-only mode leaves target {:?} untouched",
+                        self.active_policy.target_label
+                    );
+                    self.observer_pressure_reported = true;
+                }
+                return GuardianIteration::ObserverOnly;
+            }
             self.latched = true;
-            self.controller.enter_emergency();
+            if let Some(controller) = self.controller.as_mut() {
+                controller.enter_emergency();
+            }
             return self.attempt_emergency(true);
         }
-        self.reconcile_healthy_target();
-        if self.target.is_some() {
+        self.observer_pressure_reported = false;
+        if !self.active_policy.enabled || self.target.is_some() {
             GuardianIteration::Healthy
         } else {
             GuardianIteration::Unarmed
@@ -526,15 +578,23 @@ impl MemoryGuardian {
 
     fn latched_iteration(&mut self) -> GuardianIteration {
         let available = read_mem_available_compact(&self.proc_meminfo);
-        let thresholds = self.reloader.thresholds();
-        if available.is_ok_and(|value| should_rearm(value, thresholds)) {
-            match self.controller.ensure_reserve(thresholds.reserve_bytes()) {
-                Ok(_) => {
+        if available.is_ok_and(|value| should_rearm(value, self.thresholds)) {
+            let reserve = self
+                .controller
+                .as_mut()
+                .map(|controller| controller.ensure_reserve(self.thresholds.reserve_bytes()));
+            match reserve {
+                Some(Ok(_)) => {
                     self.latched = false;
-                    self.escalation.clear();
+                    self.systemd_next_attempt_millis = 0;
+                    self.systemd_verified = false;
                     return GuardianIteration::Rearmed;
                 }
-                Err(_error) => return self.attempt_emergency(false),
+                None => {
+                    self.latched = false;
+                    return GuardianIteration::Rearmed;
+                }
+                Some(Err(_error)) => return self.attempt_emergency(false),
             }
         }
         self.attempt_emergency(false)
@@ -544,58 +604,158 @@ impl MemoryGuardian {
         let Some(target) = self.target.as_ref() else {
             return GuardianIteration::Unarmed;
         };
-        match self
-            .controller
-            .attempt(elapsed_millis(self.started), target)
-        {
+        let now_millis = elapsed_millis(self.started);
+        let outcome = match target {
+            RecoveryTarget::Cgroup(target) => self
+                .controller
+                .as_mut()
+                .map_or(AttemptOutcome::Waiting, |controller| {
+                    controller.attempt(now_millis, target)
+                }),
+            RecoveryTarget::Systemd { unit } => {
+                let unit = unit.clone();
+                self.attempt_systemd_restart(now_millis, &unit)
+            }
+        };
+        match outcome {
             AttemptOutcome::Verified => GuardianIteration::Verified,
             AttemptOutcome::Waiting | AttemptOutcome::Retry if entering => GuardianIteration::Shed,
             AttemptOutcome::Waiting | AttemptOutcome::Retry => GuardianIteration::Waiting,
         }
     }
 
-    fn reconcile_healthy_target(&mut self) {
-        if let Ok(Some(candidate)) = self.reloader.pending_candidate_if_changed() {
-            self.pending_config = Some(candidate);
+    fn attempt_systemd_restart(&mut self, now_millis: u64, unit: &str) -> AttemptOutcome {
+        if self.systemd_verified || now_millis < self.systemd_next_attempt_millis {
+            return AttemptOutcome::Waiting;
         }
+        if restart_user_unit(unit, Duration::from_secs(15)).is_ok() {
+            self.systemd_verified = true;
+            return AttemptOutcome::Verified;
+        }
+        self.systemd_next_attempt_millis = now_millis
+            .saturating_add(u64::try_from(self.retry_interval.as_millis()).unwrap_or(u64::MAX));
+        AttemptOutcome::Retry
+    }
 
-        if let Some(candidate) = self.pending_config.as_ref() {
-            let registration = registration_path(candidate.config(), &self.runtime_dir);
-            let cgroup_root = candidate.config().runtime().cgroup_root().to_path_buf();
-            let poll_interval = candidate.config().runtime().poll_interval();
-            let retry_interval = candidate.config().runtime().retry_interval();
-            if let Ok(target) = open_target_at(&registration, &cgroup_root) {
-                let candidate = self
-                    .pending_config
-                    .take()
-                    .expect("pending candidate exists");
-                if self.reloader.commit_candidate(candidate).unwrap_or(false) {
+    fn reconcile_healthy_target(&mut self) -> bool {
+        let Ok(requested) = self.config_handle.guardian_snapshot() else {
+            return false;
+        };
+        if requested != self.active_policy {
+            return self.try_apply_policy(requested);
+        }
+        if self.active_policy.enabled && self.target.is_none() {
+            match open_recovery_target(&self.active_policy, &self.runtime_dir) {
+                Ok(target) => {
                     self.target = Some(target);
-                    self.poll_interval = poll_interval;
-                    self.retry_interval = retry_interval;
-                    self.controller.reset_for_target_generation();
+                    self.last_rejected_policy = None;
+                    if let Some(controller) = self.controller.as_mut() {
+                        controller.reset_for_target_generation();
+                    }
+                    return true;
+                }
+                Err(error) => {
+                    let policy = self.active_policy.clone();
+                    self.note_policy_rejection(&policy, &error);
                 }
             }
-            return;
+        }
+        false
+    }
+
+    fn try_apply_policy(&mut self, requested: GuardianConfig) -> bool {
+        let thresholds = match thresholds_from_policy(&requested) {
+            Ok(thresholds) => thresholds,
+            Err(error) => {
+                self.note_policy_rejection(&requested, &error);
+                return false;
+            }
+        };
+        if !requested.enabled {
+            self.active_policy = requested;
+            self.thresholds = thresholds;
+            self.target = None;
+            self.controller = None;
+            self.poll_interval = Duration::from_secs(self.active_policy.poll_interval_secs);
+            self.retry_interval = Duration::from_secs(self.active_policy.retry_interval_secs);
+            self.systemd_next_attempt_millis = 0;
+            self.systemd_verified = false;
+            self.observer_pressure_reported = false;
+            self.last_rejected_policy = None;
+            return true;
         }
 
-        let config = self.reloader.current();
-        let registration = registration_path(&config, &self.runtime_dir);
-        if let Ok(target) = open_target_at(&registration, config.runtime().cgroup_root()) {
-            self.target = Some(target);
-            self.poll_interval = config.runtime().poll_interval();
-            self.retry_interval = config.runtime().retry_interval();
-            self.controller.reset_for_target_generation();
+        let target = match open_recovery_target(&requested, &self.runtime_dir) {
+            Ok(target) => target,
+            Err(error) => {
+                self.note_policy_rejection(&requested, &error);
+                return false;
+            }
+        };
+        let reserve = match EmergencyReserve::new(thresholds.reserve_bytes()) {
+            Ok(reserve) => reserve,
+            Err(error) => {
+                self.note_policy_rejection(&requested, &error);
+                return false;
+            }
+        };
+        let retry_millis = requested.retry_interval_secs.saturating_mul(1000);
+        self.poll_interval = Duration::from_secs(requested.poll_interval_secs);
+        self.retry_interval = Duration::from_secs(requested.retry_interval_secs);
+        self.active_policy = requested;
+        self.thresholds = thresholds;
+        self.target = Some(target);
+        self.controller = Some(EmergencyController::new(reserve, retry_millis));
+        self.systemd_next_attempt_millis = 0;
+        self.systemd_verified = false;
+        self.observer_pressure_reported = false;
+        self.last_rejected_policy = None;
+        true
+    }
+
+    fn note_policy_rejection(
+        &mut self,
+        requested: &GuardianConfig,
+        error: &impl std::fmt::Display,
+    ) {
+        if self.last_rejected_policy.as_ref() != Some(requested) {
+            eprintln!(
+                "memory guardian: retaining target {:?}; requested policy for {:?} could not be armed: {error}",
+                self.active_policy.target_label, requested.target_label
+            );
+            self.last_rejected_policy = Some(requested.clone());
         }
     }
 }
 
-fn registration_path(config: &GuardianConfig, runtime_dir: &Path) -> PathBuf {
-    runtime_dir.join(config.target().registration_file())
+/// Returns the default runtime registration directory for the effective user.
+#[must_use]
+pub fn default_runtime_dir() -> PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", Uid::effective().as_raw())))
+        .join("gb10-memory-guardian")
 }
 
-fn open_target_at(registration: &Path, cgroup_root: &Path) -> Result<CgroupTarget, GuardianError> {
-    CgroupTarget::open_registered(registration, cgroup_root)
+fn thresholds_from_policy(policy: &GuardianConfig) -> Result<Thresholds, ConfigError> {
+    Thresholds::new(policy.mem_threshold_gib, policy.reserve_mib)
+}
+
+fn open_recovery_target(
+    policy: &GuardianConfig,
+    runtime_dir: &Path,
+) -> Result<RecoveryTarget, GuardianError> {
+    match policy.kill_action {
+        GuardianKillAction::CgroupKill => {
+            let registration = runtime_dir.join(policy.effective_registration_file());
+            CgroupTarget::open_registered(&registration, &policy.cgroup_root)
+                .map(RecoveryTarget::Cgroup)
+        }
+        GuardianKillAction::SystemctlRestart => Ok(RecoveryTarget::Systemd {
+            unit: policy.effective_systemd_unit(),
+        }),
+    }
 }
 
 fn read_mem_available(file: &File) -> Result<u64, GuardianError> {
@@ -619,10 +779,6 @@ fn elapsed_millis(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
-fn duration_millis(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -630,6 +786,7 @@ mod tests {
         should_shed,
     };
     use crate::{EmergencyReserve, Thresholds, kill_direct};
+    use llm_guard_proxy_core::{AppConfig, ConfigHandle, GuardianKillAction};
     use nix::unistd::Uid;
     use std::{
         fs::{self, File},
@@ -680,17 +837,21 @@ mod tests {
         (root, registration_path)
     }
 
-    fn guardian_config(registration_file: &str, cgroup_root: &Path) -> String {
-        format!(
-            "schema_version = 1\n[target]\nlabel = \"test\"\nregistration_file = \"{registration_file}\"\n[thresholds]\nmem_avail_stop_gib = 1\nreserve_mib = 1\n[runtime]\ncgroup_root = \"{}\"\npoll_interval_secs = 1\nretry_interval_secs = 1\n",
-            cgroup_root.display()
-        )
+    fn guardian_config(registration_file: &str, cgroup_root: &Path) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.guardian.enabled = true;
+        config.guardian.target_label = String::from("test");
+        config.guardian.registration_file = Some(registration_file.to_owned());
+        config.guardian.mem_threshold_gib = 1;
+        config.guardian.reserve_mib = 1;
+        config.guardian.poll_interval_secs = 1;
+        config.guardian.retry_interval_secs = 1;
+        config.guardian.cgroup_root = cgroup_root.to_path_buf();
+        config
     }
 
-    fn write_secure_config(path: &Path, contents: &str) {
-        fs::write(path, contents).expect("write guardian config");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .expect("secure guardian config");
+    fn guardian_handle(registration_file: &str, cgroup_root: &Path) -> ConfigHandle {
+        ConfigHandle::new(guardian_config(registration_file, cgroup_root))
     }
 
     #[test]
@@ -976,14 +1137,35 @@ mod tests {
     }
 
     #[test]
+    fn disabled_policy_observes_pressure_without_latching_or_arming() {
+        let root = temporary_tree();
+        let meminfo = root.join("meminfo");
+        fs::write(&meminfo, b"MemAvailable: 0 kB\n").expect("write meminfo");
+        let mut config = AppConfig::default();
+        config.guardian.mem_threshold_gib = 1;
+        config.guardian.reserve_mib = 1;
+        let mut guardian = super::MemoryGuardian::open(ConfigHandle::new(config), &root)
+            .expect("open observer guardian");
+        guardian.proc_meminfo = File::open(&meminfo).expect("open meminfo");
+
+        assert_eq!(
+            guardian.tick().expect("observer tick"),
+            super::GuardianIteration::ObserverOnly
+        );
+        assert!(!guardian.latched);
+        assert!(guardian.controller.is_none());
+        assert!(guardian.target.is_none());
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
     fn startup_waits_until_initial_registration_is_available() {
         let root = temporary_tree();
         let runtime = root.join("runtime");
         fs::create_dir_all(&runtime).expect("create runtime");
-        let config_path = root.join("guardian.toml");
-        write_secure_config(&config_path, &guardian_config("target.v1", &root));
+        let handle = guardian_handle("target.v1", &root);
 
-        let mut guardian = super::MemoryGuardian::open(&config_path, &runtime)
+        let mut guardian = super::MemoryGuardian::open(handle, &runtime)
             .expect("missing registration must not abort startup");
         guardian.reconcile_healthy_target();
         assert!(guardian.target.is_none());
@@ -1017,22 +1199,52 @@ mod tests {
     fn invalid_hot_reload_candidate_retains_the_last_good_target() {
         let (root, _registration) = target_tree();
         let runtime = root.join("runtime");
-        let config_path = root.join("guardian.toml");
-        write_secure_config(&config_path, &guardian_config("target.v1", &root));
+        let handle = guardian_handle("target.v1", &root);
         let mut guardian =
-            super::MemoryGuardian::open(&config_path, &runtime).expect("open guardian");
+            super::MemoryGuardian::open(handle.clone(), &runtime).expect("open guardian");
         guardian.reconcile_healthy_target();
         assert!(guardian.target.is_some());
 
-        write_secure_config(&config_path, &guardian_config("missing.v1", &root));
-        guardian.reloader.mark_changed_for_test();
+        let requested = guardian_config("missing.v1", &root);
+        handle
+            .apply_reloadable(&requested)
+            .expect("publish requested policy");
         guardian.reconcile_healthy_target();
 
         assert!(guardian.target.is_some());
         assert_eq!(
-            guardian.reloader.current().target().registration_file(),
-            "target.v1"
+            guardian.active_policy.registration_file.as_deref(),
+            Some("target.v1")
         );
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn hot_reload_applies_a_complete_systemctl_policy_without_restart() {
+        let (root, _registration) = target_tree();
+        let runtime = root.join("runtime");
+        let handle = guardian_handle("target.v1", &root);
+        let mut guardian =
+            super::MemoryGuardian::open(handle.clone(), &runtime).expect("open guardian");
+        guardian.reconcile_healthy_target();
+
+        let mut requested = guardian_config("unused.v1", &root);
+        requested.guardian.target_label = String::from("replacement");
+        requested.guardian.mem_threshold_gib = 3;
+        requested.guardian.kill_action = GuardianKillAction::SystemctlRestart;
+        requested.guardian.poll_interval_secs = 4;
+        requested.guardian.systemd_unit = Some(String::from("replacement.service"));
+        handle
+            .apply_reloadable(&requested)
+            .expect("publish requested policy");
+        guardian.reconcile_healthy_target();
+
+        assert_eq!(guardian.active_policy(), &requested.guardian);
+        assert!(matches!(
+            guardian.target,
+            Some(super::RecoveryTarget::Systemd { .. })
+        ));
+        assert_eq!(guardian.poll_interval, std::time::Duration::from_secs(4));
         fs::remove_dir_all(root).expect("remove root");
     }
 
@@ -1040,10 +1252,8 @@ mod tests {
     fn latched_emergency_retries_after_meminfo_and_events_errors() {
         let (root, registration) = target_tree();
         let runtime = root.join("runtime");
-        let config_path = root.join("guardian.toml");
-        write_secure_config(&config_path, &guardian_config("target.v1", &root));
-        let mut guardian =
-            super::MemoryGuardian::open(&config_path, &runtime).expect("open guardian");
+        let handle = guardian_handle("target.v1", &root);
+        let mut guardian = super::MemoryGuardian::open(handle, &runtime).expect("open guardian");
         guardian.reconcile_healthy_target();
 
         let malformed_meminfo = root.join("meminfo");
@@ -1057,7 +1267,11 @@ mod tests {
         ));
         fs::write(events, b"malformed\n").expect("break events");
         guardian.latched = true;
-        guardian.controller.enter_emergency();
+        guardian
+            .controller
+            .as_mut()
+            .expect("enabled policy controller")
+            .enter_emergency();
 
         assert_eq!(
             guardian.tick().expect("recoverable failure"),

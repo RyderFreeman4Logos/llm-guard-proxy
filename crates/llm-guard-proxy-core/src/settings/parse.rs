@@ -13,12 +13,12 @@ use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 use super::ParamOverrideConfig;
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DefaultInjectionSchema,
-    DownstreamDropPolicy, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
-    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig,
-    NoThinkingMarkerPolicy, ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig,
-    ServerConfig, ShadowComparisonAttempt, ShieldingConfig, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamEndpointConfig, UpstreamPriority,
-    UpstreamProfileConfig, UpstreamStallConfig,
+    DownstreamDropPolicy, GuardianConfig, GuardianKillAction, HeartbeatConfig, HeartbeatMode,
+    HotRestartConfig, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
+    LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig, RetentionConfig,
+    RetryConfig, RetryLadderConfig, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
+    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamEndpointConfig, UpstreamPriority, UpstreamProfileConfig, UpstreamStallConfig,
 };
 #[cfg(feature = "guard")]
 use super::{UnknownKeyPolicy, VirtualKeyConfig};
@@ -75,6 +75,7 @@ enum Section {
     UpstreamStall,
     Heartbeat,
     Cloudflare,
+    Guardian,
 }
 
 pub(crate) fn parse_config_text(contents: &str) -> Result<AppConfig, ConfigParseError> {
@@ -326,6 +327,7 @@ fn parse_section(
         "upstream.stall" => Ok(Section::UpstreamStall),
         "heartbeat" => Ok(Section::Heartbeat),
         "cloudflare" => Ok(Section::Cloudflare),
+        "guardian" => Ok(Section::Guardian),
         _ => Err(ConfigParseError::new(
             line_number,
             format!("unknown config section [{section}]"),
@@ -413,6 +415,7 @@ fn assign_value(
         }
         Section::Heartbeat => assign_heartbeat(&mut config.heartbeat, key, value, line_number),
         Section::Cloudflare => assign_cloudflare(&mut config.cloudflare, key, value, line_number),
+        Section::Guardian => assign_guardian(&mut config.guardian, key, value, line_number),
         #[cfg(feature = "guard")]
         Section::ModelAlias(_)
         | Section::Profile(_)
@@ -2076,6 +2079,55 @@ fn assign_cloudflare(
         _ => return unknown_key("cloudflare", key, line_number),
     }
     Ok(())
+}
+
+fn assign_guardian(
+    config: &mut GuardianConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "target_label" => config.target_label = parse_string(value, line_number)?,
+        "mem_threshold_gib" => {
+            config.mem_threshold_gib = parse_u64(value, line_number, "guardian.mem_threshold_gib")?;
+        }
+        "kill_action" => config.kill_action = parse_guardian_kill_action(value, line_number)?,
+        "poll_interval_secs" => {
+            config.poll_interval_secs =
+                parse_u64(value, line_number, "guardian.poll_interval_secs")?;
+        }
+        "registration_file" => {
+            config.registration_file = parse_optional_string(value, line_number)?;
+        }
+        "systemd_unit" => config.systemd_unit = parse_optional_string(value, line_number)?,
+        "reserve_mib" => {
+            config.reserve_mib = parse_u64(value, line_number, "guardian.reserve_mib")?;
+        }
+        "retry_interval_secs" => {
+            config.retry_interval_secs =
+                parse_u64(value, line_number, "guardian.retry_interval_secs")?;
+        }
+        "cgroup_root" => {
+            config.cgroup_root = PathBuf::from(parse_string(value, line_number)?);
+        }
+        _ => return unknown_key("guardian", key, line_number),
+    }
+    Ok(())
+}
+
+fn parse_guardian_kill_action(
+    value: &str,
+    line_number: usize,
+) -> Result<GuardianKillAction, ConfigParseError> {
+    let action = parse_string(value, line_number)?;
+    GuardianKillAction::from_label(&action).ok_or_else(|| {
+        ConfigParseError::new(
+            line_number,
+            "guardian.kill_action must be cgroup.kill or systemctl_restart",
+        )
+    })
 }
 
 fn parse_string(value: &str, line_number: usize) -> Result<String, ConfigParseError> {

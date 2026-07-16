@@ -31,6 +31,12 @@ const LOOP_GUARD_MAX_SEMANTIC_HISTORY_WINDOWS: u32 = 256;
 const DEFAULT_UPSTREAM_PROFILE_NAME: &str = "default";
 const MAX_UPSTREAM_PROFILE_NAME_BYTES: usize = 128;
 const MAX_UPSTREAM_MODEL_ALIAS_BYTES: usize = 256;
+const GIB_BYTES: u64 = 1024 * 1024 * 1024;
+const MIB_BYTES: u64 = 1024 * 1024;
+const MAX_GUARDIAN_LABEL_BYTES: usize = 128;
+const MAX_GUARDIAN_FILE_BYTES: usize = 255;
+const MAX_GUARDIAN_INTERVAL_SECS: u64 = 3600;
+const MAX_GUARDIAN_RESERVE_MIB: u64 = 4096;
 #[cfg(feature = "guard")]
 const MAX_CALLER_PROFILE_NAME_BYTES: usize = 128;
 #[cfg(feature = "guard")]
@@ -88,6 +94,180 @@ pub struct AppConfig {
     pub heartbeat: HeartbeatConfig,
     /// Cloudflare compatibility policy for later timeout shielding.
     pub cloudflare: CloudflareConfig,
+    /// Host memory anti-freeze policy.
+    pub guardian: GuardianConfig,
+}
+
+/// Low-memory recovery action selected by the host guardian.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum GuardianKillAction {
+    /// Write directly to a pre-opened cgroup v2 `cgroup.kill` descriptor.
+    #[default]
+    CgroupKill,
+    /// Ask the user systemd manager to restart the configured service unit.
+    SystemctlRestart,
+}
+
+impl GuardianKillAction {
+    /// Returns the canonical TOML label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CgroupKill => "cgroup.kill",
+            Self::SystemctlRestart => "systemctl_restart",
+        }
+    }
+
+    pub(crate) fn from_label(label: &str) -> Option<Self> {
+        match label {
+            "cgroup.kill" | "cgroup_kill" | "cgroup-kill" => Some(Self::CgroupKill),
+            "systemctl_restart" | "systemctl restart" | "systemctl-restart" => {
+                Some(Self::SystemctlRestart)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Configurable host guardian policy embedded in the main proxy configuration.
+///
+/// `registration_file` and `systemd_unit` are optional deployment-specific
+/// overrides. When omitted, they are derived from `target_label` so the four
+/// primary policy fields remain sufficient for simple deployments.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GuardianConfig {
+    /// Enables recovery actions. Disabled mode remains observer-only.
+    pub enabled: bool,
+    /// Stable deployment-local label for the workload to shed.
+    pub target_label: String,
+    /// Trigger when `MemAvailable` falls strictly below this many GiB.
+    pub mem_threshold_gib: u64,
+    /// Recovery action to perform at the threshold.
+    pub kill_action: GuardianKillAction,
+    /// Healthy monitoring cadence.
+    pub poll_interval_secs: u64,
+    /// Optional runtime registration filename for `cgroup.kill` mode.
+    pub registration_file: Option<String>,
+    /// Optional user systemd service unit for restart mode.
+    pub systemd_unit: Option<String>,
+    /// Pre-touched reserve released before an enabled recovery action.
+    pub reserve_mib: u64,
+    /// Retry cadence while a recovery episode is latched.
+    pub retry_interval_secs: u64,
+    /// Cgroup v2 mount used to validate an operator-published registration.
+    pub cgroup_root: PathBuf,
+}
+
+impl GuardianConfig {
+    /// Resolves the registration filename for `cgroup.kill` mode.
+    #[must_use]
+    pub fn effective_registration_file(&self) -> String {
+        self.registration_file.clone().unwrap_or_else(|| {
+            if has_registration_suffix(&self.target_label) {
+                self.target_label.clone()
+            } else {
+                format!("{}.v1", self.target_label)
+            }
+        })
+    }
+
+    /// Resolves the user service unit for `systemctl_restart` mode.
+    #[must_use]
+    pub fn effective_systemd_unit(&self) -> String {
+        self.systemd_unit.clone().unwrap_or_else(|| {
+            if self.target_label.ends_with(".service") {
+                self.target_label.clone()
+            } else {
+                format!("{}.service", self.target_label)
+            }
+        })
+    }
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            self.mem_threshold_gib > 0,
+            "guardian.mem_threshold_gib",
+            "must be greater than zero",
+        )?;
+        let threshold_bytes = self
+            .mem_threshold_gib
+            .checked_mul(GIB_BYTES)
+            .ok_or_else(|| {
+                ValidationError::new(
+                    "guardian.mem_threshold_gib",
+                    "must fit in the supported byte range",
+                )
+            })?;
+        require(
+            usize::try_from(threshold_bytes).is_ok(),
+            "guardian.mem_threshold_gib",
+            "must fit in the supported byte range",
+        )?;
+        require(
+            (1..=MAX_GUARDIAN_INTERVAL_SECS).contains(&self.poll_interval_secs),
+            "guardian.poll_interval_secs",
+            "must be between 1 and 3600",
+        )?;
+        require(
+            (1..=MAX_GUARDIAN_INTERVAL_SECS).contains(&self.retry_interval_secs),
+            "guardian.retry_interval_secs",
+            "must be between 1 and 3600",
+        )?;
+        require(
+            (1..=MAX_GUARDIAN_RESERVE_MIB).contains(&self.reserve_mib),
+            "guardian.reserve_mib",
+            "must be between 1 and 4096",
+        )?;
+        require(
+            self.reserve_mib.saturating_mul(MIB_BYTES) < threshold_bytes,
+            "guardian.reserve_mib",
+            "must be smaller than guardian.mem_threshold_gib",
+        )?;
+        require(
+            self.cgroup_root.is_absolute(),
+            "guardian.cgroup_root",
+            "must be an absolute path",
+        )?;
+
+        if self.enabled || !self.target_label.is_empty() {
+            validate_guardian_label(&self.target_label)?;
+        }
+
+        if let Some(registration_file) = &self.registration_file {
+            validate_guardian_registration_file(registration_file)?;
+        }
+        if let Some(systemd_unit) = &self.systemd_unit {
+            validate_guardian_systemd_unit(systemd_unit)?;
+        }
+        if self.enabled {
+            match self.kill_action {
+                GuardianKillAction::CgroupKill => {
+                    validate_guardian_registration_file(&self.effective_registration_file())?;
+                }
+                GuardianKillAction::SystemctlRestart => {
+                    validate_guardian_systemd_unit(&self.effective_systemd_unit())?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for GuardianConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            target_label: String::new(),
+            mem_threshold_gib: 2,
+            kill_action: GuardianKillAction::CgroupKill,
+            poll_interval_secs: 1,
+            registration_file: None,
+            systemd_unit: None,
+            reserve_mib: 64,
+            retry_interval_secs: 5,
+            cgroup_root: PathBuf::from("/sys/fs/cgroup"),
+        }
+    }
 }
 
 impl AppConfig {
@@ -146,7 +326,8 @@ impl AppConfig {
         self.retry.validate()?;
         self.upstream_stall.validate()?;
         self.validate_upstream_stall_timeout_order()?;
-        self.heartbeat.validate()
+        self.heartbeat.validate()?;
+        self.guardian.validate()
     }
 
     fn validate_upstream_profiles(&self) -> Result<(), ValidationError> {
@@ -736,6 +917,7 @@ impl AppConfig {
         self.upstream_stall = requested.upstream_stall.clone();
         self.heartbeat = requested.heartbeat.clone();
         self.cloudflare = requested.cloudflare.clone();
+        self.guardian.clone_from(&requested.guardian);
         #[cfg(feature = "guard")]
         {
             self.profiles.clone_from(&requested.profiles);
@@ -3424,6 +3606,88 @@ fn push_structural_change<T>(
             requested: format!("{requested:?}"),
         });
     }
+}
+
+fn validate_guardian_label(label: &str) -> Result<(), ValidationError> {
+    require(
+        !label.is_empty(),
+        "guardian.target_label",
+        "must not be empty when guardian is enabled",
+    )?;
+    require(
+        label == label.trim(),
+        "guardian.target_label",
+        "must not have leading or trailing whitespace",
+    )?;
+    require(
+        label.len() <= MAX_GUARDIAN_LABEL_BYTES,
+        "guardian.target_label",
+        "must be at most 128 bytes",
+    )?;
+    require(
+        label.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@' | b':')
+        }),
+        "guardian.target_label",
+        "must contain only ASCII letters, digits, '-', '_', '.', '@', or ':'",
+    )
+}
+
+fn validate_guardian_registration_file(registration_file: &str) -> Result<(), ValidationError> {
+    require(
+        !registration_file.is_empty(),
+        "guardian.registration_file",
+        "must not be empty",
+    )?;
+    require(
+        registration_file.len() <= MAX_GUARDIAN_FILE_BYTES,
+        "guardian.registration_file",
+        "must be at most 255 bytes",
+    )?;
+    require(
+        has_registration_suffix(registration_file),
+        "guardian.registration_file",
+        "must end in .v1",
+    )?;
+    require(
+        registration_file != "." && registration_file != "..",
+        "guardian.registration_file",
+        "must be a single filename",
+    )?;
+    require(
+        !registration_file.contains('/') && !registration_file.contains('\\'),
+        "guardian.registration_file",
+        "must be a single filename without path separators",
+    )
+}
+
+fn has_registration_suffix(value: &str) -> bool {
+    value.as_bytes().ends_with(b".v1")
+}
+
+fn validate_guardian_systemd_unit(systemd_unit: &str) -> Result<(), ValidationError> {
+    require(
+        !systemd_unit.is_empty(),
+        "guardian.systemd_unit",
+        "must not be empty",
+    )?;
+    require(
+        systemd_unit.len() <= MAX_GUARDIAN_FILE_BYTES,
+        "guardian.systemd_unit",
+        "must be at most 255 bytes",
+    )?;
+    require(
+        systemd_unit.ends_with(".service"),
+        "guardian.systemd_unit",
+        "must end in .service",
+    )?;
+    require(
+        systemd_unit
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'@')),
+        "guardian.systemd_unit",
+        "must be a valid single user service unit name",
+    )
 }
 
 fn require(

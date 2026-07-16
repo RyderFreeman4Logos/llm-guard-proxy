@@ -1,6 +1,6 @@
 use std::sync::{Arc, RwLock};
 
-use super::{AppConfig, RestartRequiredChange};
+use super::{AppConfig, GuardianConfig, RestartRequiredChange};
 
 /// Failure to access the shared configuration snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -37,6 +37,23 @@ impl ConfigHandle {
             .read()
             .map_err(|_error| ConfigHandleError::LockPoisoned)?;
         Ok(guard.clone())
+    }
+
+    /// Returns only the host guardian policy from the current coherent snapshot.
+    ///
+    /// This avoids cloning unrelated routing, evidence, and workflow state from
+    /// the guardian's one-second healthy-path configuration check.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigHandleError::LockPoisoned`] if another thread panicked while
+    /// holding the configuration lock.
+    pub fn guardian_snapshot(&self) -> Result<GuardianConfig, ConfigHandleError> {
+        let guard = self
+            .current
+            .read()
+            .map_err(|_error| ConfigHandleError::LockPoisoned)?;
+        Ok(guard.guardian.clone())
     }
 
     /// Atomically applies the reloadable portion of a validated config.

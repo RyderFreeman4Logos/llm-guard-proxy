@@ -285,7 +285,7 @@ mod tests {
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
 
-    use llm_guard_proxy_core::{AppConfig, HeartbeatMode};
+    use llm_guard_proxy_core::{AppConfig, GuardianKillAction, HeartbeatMode};
     use llm_guard_proxy_state::materialize_evidence_path_defaults;
 
     use super::{
@@ -508,6 +508,67 @@ mod tests {
         assert!(
             recovered,
             "successful polling reload should clear health error"
+        );
+
+        watcher.stop().expect("watcher should stop");
+        remove_file(&path);
+    }
+
+    #[test]
+    fn polling_watcher_hot_reloads_guardian_policy_and_retains_last_good() {
+        let path = unique_test_path("guardian-polling.toml");
+        fs::write(
+            &path,
+            "[guardian]\nenabled = true\ntarget_label = \"aeon-text\"\nmem_threshold_gib = 2\nkill_action = \"cgroup.kill\"\npoll_interval_secs = 1\nregistration_file = \"text-cgroup.v1\"\n",
+        )
+        .expect("write initial guardian config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let handle = manager.handle();
+        let watcher = manager
+            .spawn_polling(Duration::from_millis(10))
+            .expect("start watcher");
+
+        fs::write(
+            &path,
+            "[guardian]\nenabled = true\ntarget_label = \"replacement\"\nmem_threshold_gib = 5\nkill_action = \"systemctl_restart\"\npoll_interval_secs = 4\nsystemd_unit = \"replacement.service\"\n",
+        )
+        .expect("write replacement guardian config");
+        let mut observed = false;
+        for _attempt in 0..50 {
+            let snapshot = handle.snapshot().expect("snapshot");
+            if snapshot.guardian.target_label == "replacement"
+                && snapshot.guardian.mem_threshold_gib == 5
+                && snapshot.guardian.kill_action == GuardianKillAction::SystemctlRestart
+                && snapshot.guardian.poll_interval_secs == 4
+            {
+                observed = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(observed, "guardian policy should be hot reloaded");
+        let last_good = handle.snapshot().expect("last-good snapshot");
+
+        fs::write(
+            &path,
+            "[guardian]\nenabled = true\ntarget_label = \"\"\nmem_threshold_gib = 0\n",
+        )
+        .expect("write invalid guardian config");
+        let mut observed_error = false;
+        for _attempt in 0..50 {
+            if manager.last_error().expect("reload health").is_some() {
+                observed_error = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            observed_error,
+            "invalid policy should surface reload health"
+        );
+        assert_eq!(
+            handle.snapshot().expect("retained snapshot").guardian,
+            last_good.guardian
         );
 
         watcher.stop().expect("watcher should stop");
