@@ -225,6 +225,7 @@ pub fn parse_registration(input: &[u8], uid: u32) -> Result<Registration, Regist
 pub struct CgroupTarget {
     kill: File,
     events: File,
+    registration: Registration,
 }
 
 /// Compact cgroup state failures for the allocation-free emergency loop.
@@ -295,7 +296,11 @@ impl CgroupTarget {
                 operation: "open cgroup.events",
                 source,
             })?;
-        let target = Self { kill, events };
+        let target = Self {
+            kill,
+            events,
+            registration,
+        };
         if !target.is_populated().map_err(|_error| {
             GuardianError::InvalidRegistration(String::from(
                 "registered cgroup could not be verified as populated",
@@ -314,6 +319,10 @@ impl CgroupTarget {
 
     pub(crate) fn is_empty(&self) -> Result<bool, CgroupStateError> {
         Ok(!self.is_populated()?)
+    }
+
+    fn has_same_registration(&self, other: &Self) -> bool {
+        self.registration == other.registration
     }
 
     fn is_populated(&self) -> Result<bool, CgroupStateError> {
@@ -644,9 +653,22 @@ impl MemoryGuardian {
         if requested != self.active_policy {
             return self.try_apply_policy(requested);
         }
-        if self.active_policy.enabled && self.target.is_none() {
+        let target_needs_reconciliation = self.active_policy.enabled
+            && (self.target.is_none()
+                || self.active_policy.kill_action == GuardianKillAction::CgroupKill);
+        if target_needs_reconciliation {
             match open_recovery_target(&self.active_policy, &self.runtime_dir) {
                 Ok(target) => {
+                    if matches!(
+                        (&self.target, &target),
+                        (
+                            Some(RecoveryTarget::Cgroup(active)),
+                            RecoveryTarget::Cgroup(candidate)
+                        ) if active.has_same_registration(candidate)
+                    ) {
+                        self.last_rejected_policy = None;
+                        return false;
+                    }
                     self.target = Some(target);
                     self.last_rejected_policy = None;
                     if let Some(controller) = self.controller.as_mut() {
@@ -1192,6 +1214,55 @@ mod tests {
 
         guardian.reconcile_healthy_target();
         assert!(guardian.target.is_some());
+        fs::remove_dir_all(root).expect("remove root");
+    }
+
+    #[test]
+    fn published_registration_replacement_rearms_the_new_cgroup_generation() {
+        let (root, registration) = target_tree();
+        let runtime = root.join("runtime");
+        let handle = guardian_handle("target.v1", &root);
+        let mut guardian = super::MemoryGuardian::open(handle, &runtime).expect("open guardian");
+        guardian.reconcile_healthy_target();
+
+        let uid = Uid::effective().as_raw();
+        let replacement_id = "b".repeat(64);
+        let replacement_scope = format!("docker-{replacement_id}.scope");
+        let replacement = root.join(format!(
+            "user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{replacement_scope}"
+        ));
+        fs::create_dir_all(&replacement).expect("create replacement cgroup");
+        fs::write(replacement.join("cgroup.kill"), b"").expect("create replacement kill");
+        fs::write(replacement.join("cgroup.events"), b"populated 1\n")
+            .expect("create replacement events");
+        fs::write(
+            &registration,
+            format!(
+                "version=1\ncontainer_id={replacement_id}\nscope={replacement_scope}\ncontrol_group=/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{replacement_scope}\n"
+            ),
+        )
+        .expect("publish replacement registration");
+        fs::set_permissions(&registration, fs::Permissions::from_mode(0o600))
+            .expect("secure replacement registration");
+
+        assert!(guardian.reconcile_healthy_target());
+        let super::RecoveryTarget::Cgroup(target) =
+            guardian.target.as_ref().expect("replacement target")
+        else {
+            panic!("expected cgroup target");
+        };
+        let mut reserve = EmergencyReserve::with_page_size(4096, 4096).expect("reserve");
+        kill_direct(&mut reserve, target).expect("kill replacement");
+
+        assert_eq!(
+            fs::read(replacement.join("cgroup.kill")).expect("read replacement kill"),
+            b"1"
+        );
+        let original = root.join(format!(
+            "user.slice/user-{uid}.slice/user@{uid}.service/app.slice/docker-{}.scope/cgroup.kill",
+            "a".repeat(64)
+        ));
+        assert_eq!(fs::read(original).expect("read original kill"), b"");
         fs::remove_dir_all(root).expect("remove root");
     }
 

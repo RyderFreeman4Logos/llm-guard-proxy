@@ -514,11 +514,11 @@ enabled = true
 ## a pre-opened cgroup.kill descriptor without allocation.
 
 [guardian]
-enabled = false                              # Observer-only until explicitly armed
+enabled = true                               # Integrated guardian supersedes the standalone service
 target_label = "aeon-text"                  # Deployment-specific target label
-mem_threshold_gib = 1                       # Act when MemAvailable falls below this value
-kill_action = "cgroup.kill"                 # `cgroup.kill` or `systemctl_restart`
-poll_interval_secs = 1                      # Memory sampling interval; hot reload checks stay at 1s
+mem_threshold_gib = 5                       # Crash analysis: act before the observed +7.4 GiB spike
+kill_action = "cgroup-kill"                 # Direct cgroup.kill; do not allocate through systemctl
+poll_interval_secs = 3                      # Faster than the retired 5-second standalone poll
 registration_file = "text-cgroup.v1"        # Optional; defaults to `<target_label>.v1`
 # systemd_unit = "vllm-aeon-text.service"    # Optional override for systemctl_restart
 reserve_mib = 64                            # Pre-touched emergency reserve
