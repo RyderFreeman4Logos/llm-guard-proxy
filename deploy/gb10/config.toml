@@ -530,6 +530,42 @@ enabled = true
 # unit = "gb10-stack-recovery.service"        # Required only when enabled
 # grace_period_secs = 60                      # Delay after Tier 1 before Tier 2
 
+## ───────────────────────── Host telemetry sampler ──────────────────────────
+## `host-telemetry` is a default-on compile-time feature that ports the GB10
+## sysmon and swap-guard observer role. It reads procfs plus an optional
+## bounded nvidia-smi probe; it never kills, stops, restarts, or modifies a
+## service. Samples and alert-only numeric evidence are retained in a separate
+## bounded SQLite database, never in request observability or raw evidence.
+##
+## Run it independently so an observer failure cannot affect proxy serving:
+##   llm-guard-proxy telemetry \
+##     --config /etc/llm-guard-proxy/host-telemetry.toml
+##
+## Fully commented host telemetry configuration. The default disk device is
+## `nvme0n1`; set a different device name for another host. Omit gpu_command
+## to disable GPU polling entirely. Every retained record has fixed numeric
+## fields; exceeding max_records deletes oldest rows down to prune_to_records
+## and compacts the SQLite file.
+# schema_version = 1
+#
+# [storage]
+# sqlite_path = "/home/obj/.local/state/llm-guard-proxy/host-telemetry.sqlite3" # Bounded numeric host samples
+# max_records = 172800                     # Upper retained row bound (10 days at 5s)
+# prune_to_records = 144000                # Row count after retention pruning
+#
+# [sampler]
+# proc_root = "/proc"                       # Linux procfs source root
+# disk_device = "nvme0n1"                   # /proc/diskstats device to sample
+# interval_secs = 5                         # Target interval for procfs samples
+# gpu_command = "/usr/bin/nvidia-smi"       # Optional read-only GPU probe; omit to disable
+# gpu_timeout_secs = 2                      # Bounded wait for each optional GPU probe
+#
+# [swap_guard]
+# warn_swap_mib = 7680                       # Swap warning threshold (7.5 GiB)
+# alert_swap_mib = 12288                     # Swap pressure alert threshold (12 GiB)
+# alert_mem_available_mib = 1024             # Alert below this MemAvailable value (1 GiB)
+# alert_repeat_secs = 60                     # Minimum seconds between repeat alert evidence
+
 ## ───────────────────────── OPT-IN: Guard features ──────────────────────────
 ## The following sections require building with `--features guard`.
 ## They provide GWP (Guard Workflow Protocol) hooks, caller profiles,

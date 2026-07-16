@@ -8,8 +8,14 @@ repository.workspace = true
 description = "OpenAI-compatible LLM guard proxy service."
 
 [features]
-default = ["memory-guardian", "upstream-hot-restart", "param-override"]
+default = [
+    "memory-guardian",
+    "host-telemetry",
+    "upstream-hot-restart",
+    "param-override",
+]
 memory-guardian = ["dep:llm-guard-proxy-host-guardian"]
+host-telemetry = ["dep:llm-guard-proxy-host-telemetry"]
 upstream-hot-restart = ["llm-guard-proxy-core/upstream-hot-restart"]
 param-override = ["llm-guard-proxy-core/param-override"]
 guard = [
@@ -24,6 +30,7 @@ bytes = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 lexical-core = { version = "1", default-features = false, features = ["parse-floats"] }
 llm-guard-proxy-host-guardian = { path = "../llm-guard-proxy-host-guardian", optional = true }
+llm-guard-proxy-host-telemetry = { path = "../llm-guard-proxy-host-telemetry", optional = true }
 llm-guard-proxy-core = { path = "../llm-guard-proxy-core", default-features = false }
 llm-guard-proxy-state = { path = "../llm-guard-proxy-state", default-features = false }
 nix = { version = "0.29", features = ["signal", "process"] }

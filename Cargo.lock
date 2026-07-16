@@ -668,6 +668,7 @@ dependencies = [
  "lexical-core",
  "llm-guard-proxy-core",
  "llm-guard-proxy-host-guardian",
+ "llm-guard-proxy-host-telemetry",
  "llm-guard-proxy-state",
  "nix",
  "reqwest",
@@ -695,6 +696,17 @@ dependencies = [
  "libc",
  "nix",
  "notify",
+ "serde",
+ "thiserror",
+ "tokio",
+ "toml",
+]
+
+[[package]]
+name = "llm-guard-proxy-host-telemetry"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
  "serde",
  "thiserror",
  "tokio",

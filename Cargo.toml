@@ -3,6 +3,7 @@ members = [
     "crates/llm-guard-proxy",
     "crates/llm-guard-proxy-core",
     "crates/llm-guard-proxy-host-guardian",
+    "crates/llm-guard-proxy-host-telemetry",
     "crates/llm-guard-proxy-state",
 ]
 resolver = "2"
