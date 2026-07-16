@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use std::sync::Arc;
 use std::{
     io,
     process::{Child, ExitStatus},
@@ -6,6 +8,8 @@ use std::{
 
 use nix::sys::signal::Signal;
 
+#[cfg(target_os = "linux")]
+use crate::workflow_cgroup::WorkflowCgroup;
 use crate::workflow_execution::WorkflowExecutionLease;
 
 use super::{
@@ -24,6 +28,8 @@ enum StartupSignalAuthority {
 
 pub(crate) struct SpawnedChildGuard {
     child: Option<Child>,
+    #[cfg(target_os = "linux")]
+    workflow_cgroup: Option<Arc<WorkflowCgroup>>,
     signal_authority: Option<StartupSignalAuthority>,
     cleanup_deadline: Instant,
     execution_lease: Option<WorkflowExecutionLease>,
@@ -43,6 +49,8 @@ impl SpawnedChildGuard {
         let pid = child.id();
         Self {
             child: Some(child),
+            #[cfg(target_os = "linux")]
+            workflow_cgroup: None,
             signal_authority: Some(StartupSignalAuthority::Provisional(
                 ProvisionalGroupAuthority::new(pid),
             )),
@@ -61,6 +69,26 @@ impl SpawnedChildGuard {
 
     pub(super) fn set_signal_authority(&mut self, signal_authority: SignalAuthority) {
         self.signal_authority = Some(StartupSignalAuthority::Stable(signal_authority));
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn set_workflow_cgroup(&mut self, workflow_cgroup: Arc<WorkflowCgroup>) {
+        self.workflow_cgroup = Some(workflow_cgroup);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn workflow_cgroup(&self) -> Option<Arc<WorkflowCgroup>> {
+        self.workflow_cgroup.clone()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn clear_workflow_cgroup(&mut self) {
+        self.workflow_cgroup.take();
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn take_workflow_cgroup(&mut self) -> Option<Arc<WorkflowCgroup>> {
+        self.workflow_cgroup.take()
     }
 
     pub(super) fn revoke_provisional_authority(&mut self) {
@@ -90,6 +118,12 @@ impl Drop for SpawnedChildGuard {
         let Some(child) = self.child.take() else {
             return;
         };
+        #[cfg(target_os = "linux")]
+        let workflow_cgroup = self.workflow_cgroup.take();
+        #[cfg(target_os = "linux")]
+        if let Some(workflow_cgroup) = workflow_cgroup.as_ref() {
+            let _cgroup_kill = workflow_cgroup.kill();
+        }
         let execution_lease = self.execution_lease.take().unwrap_or_default();
         match self.signal_authority.take() {
             Some(StartupSignalAuthority::Stable(signal_authority)) => {
@@ -113,6 +147,10 @@ impl Drop for SpawnedChildGuard {
                 DeferredSignalState::Unresolved,
                 execution_lease,
             ),
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(workflow_cgroup) = workflow_cgroup {
+            let _cgroup_cleanup = workflow_cgroup.verify_empty_and_remove(self.cleanup_deadline);
         }
     }
 }
