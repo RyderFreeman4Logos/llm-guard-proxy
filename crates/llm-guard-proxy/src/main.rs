@@ -18,6 +18,8 @@ use std::{ffi::OsString, fs, future::pending, path::PathBuf, process::ExitCode, 
 
 use config_reload::ConfigManager;
 use llm_guard_proxy_core::redact_upstream_base_url;
+#[cfg(feature = "memory-guardian")]
+use llm_guard_proxy_host_guardian::MemoryGuardian;
 #[cfg(feature = "guard")]
 use llm_guard_proxy_state::BudgetStore;
 use llm_guard_proxy_state::{
@@ -41,12 +43,16 @@ async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
     if args.get(1).and_then(|arg| arg.to_str()) == Some("evidence") {
         return run_evidence_command(parse_evidence_command(&args[2..])?);
     }
-    let config_path = parse_config_path(args)?;
-    run_server(config_path).await
+    #[cfg(feature = "memory-guardian")]
+    if args.get(1).and_then(|arg| arg.to_str()) == Some("guardian") {
+        return run_guardian_command(parse_guardian_command(&args[2..])?).await;
+    }
+    let options = parse_proxy_options(args)?;
+    run_server(options).await
 }
 
-async fn run_server(config_path: Option<PathBuf>) -> Result<(), String> {
-    let manager = match config_path {
+async fn run_server(options: ProxyOptions) -> Result<(), String> {
+    let manager = match options.config_path {
         Some(path) => ConfigManager::from_explicit_path(path),
         None => ConfigManager::from_default_path(),
     }
@@ -100,7 +106,63 @@ async fn run_server(config_path: Option<PathBuf>) -> Result<(), String> {
         budget_store,
         proxy::build_http_client().map_err(|error| error.to_string())?,
     );
+    #[cfg(feature = "memory-guardian")]
+    if let Some(guardian) = options.guardian {
+        return serve_with_guardian(bound_listeners, state, guardian).await;
+    }
     serve_bound_listeners(bound_listeners, state).await
+}
+
+#[cfg(feature = "memory-guardian")]
+async fn run_guardian_command(command: GuardianCommand) -> Result<(), String> {
+    let mut guardian = MemoryGuardian::open(command.config_path, command.runtime_dir)
+        .map_err(|error| error.to_string())?;
+    guardian
+        .run_until(shutdown_signal())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "memory-guardian")]
+async fn serve_with_guardian(
+    bound_listeners: Vec<(
+        llm_guard_proxy_core::ListenerConfig,
+        TcpListener,
+        std::net::SocketAddr,
+    )>,
+    state: proxy::ProxyState,
+    command: GuardianCommand,
+) -> Result<(), String> {
+    let guardian = MemoryGuardian::open(command.config_path, command.runtime_dir)
+        .map_err(|error| error.to_string())?;
+    let mut server = tokio::spawn(serve_bound_listeners(bound_listeners, state));
+    let mut guardian = tokio::spawn(async move {
+        let mut guardian = guardian;
+        guardian.run_until(shutdown_signal()).await
+    });
+    let result = tokio::select! {
+        server_result = &mut server => match server_result {
+            Ok(result) => result,
+            Err(error) => Err(format!("server task failed: {error}")),
+        },
+        guardian_result = &mut guardian => match guardian_result {
+            Ok(Ok(())) => match (&mut server).await {
+                Ok(result) => result,
+                Err(error) => Err(format!("server task failed: {error}")),
+            },
+            Ok(Err(error)) => {
+                server.abort();
+                Err(format!("memory guardian failed: {error}"))
+            }
+            Err(error) => {
+                server.abort();
+                Err(format!("memory guardian task failed: {error}"))
+            }
+        },
+    };
+    server.abort();
+    guardian.abort();
+    result
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -289,10 +351,28 @@ fn render_listening(
     )
 }
 
-fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> Result<Option<PathBuf>, String> {
+#[derive(Debug, Eq, PartialEq)]
+struct ProxyOptions {
+    config_path: Option<PathBuf>,
+    #[cfg(feature = "memory-guardian")]
+    guardian: Option<GuardianCommand>,
+}
+
+#[cfg(feature = "memory-guardian")]
+#[derive(Debug, Eq, PartialEq)]
+struct GuardianCommand {
+    config_path: PathBuf,
+    runtime_dir: PathBuf,
+}
+
+fn parse_proxy_options(args: impl IntoIterator<Item = OsString>) -> Result<ProxyOptions, String> {
     let mut args = args.into_iter();
     let _program = args.next();
     let mut config_path = None;
+    #[cfg(feature = "memory-guardian")]
+    let mut guardian_config_path = None;
+    #[cfg(feature = "memory-guardian")]
+    let mut guardian_runtime_dir = None;
 
     while let Some(arg) = args.next() {
         if arg == "--config" {
@@ -300,7 +380,9 @@ fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> Result<Option<
                 return Err(String::from("--config requires a path"));
             };
             config_path = Some(PathBuf::from(path));
-        } else if let Some(value) = arg
+            continue;
+        }
+        if let Some(value) = arg
             .to_str()
             .and_then(|value| value.strip_prefix("--config="))
         {
@@ -308,12 +390,109 @@ fn parse_config_path(args: impl IntoIterator<Item = OsString>) -> Result<Option<
                 return Err(String::from("--config requires a path"));
             }
             config_path = Some(PathBuf::from(value));
-        } else {
-            return Err(format!("unknown argument: {}", arg.to_string_lossy()));
+            continue;
         }
+        #[cfg(feature = "memory-guardian")]
+        if arg == "--guardian-config" {
+            let Some(path) = args.next() else {
+                return Err(String::from("--guardian-config requires a path"));
+            };
+            guardian_config_path = Some(PathBuf::from(path));
+            continue;
+        }
+        #[cfg(feature = "memory-guardian")]
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--guardian-config="))
+        {
+            if value.is_empty() {
+                return Err(String::from("--guardian-config requires a path"));
+            }
+            guardian_config_path = Some(PathBuf::from(value));
+            continue;
+        }
+        #[cfg(feature = "memory-guardian")]
+        if arg == "--guardian-runtime-dir" {
+            let Some(path) = args.next() else {
+                return Err(String::from("--guardian-runtime-dir requires a path"));
+            };
+            guardian_runtime_dir = Some(PathBuf::from(path));
+            continue;
+        }
+        #[cfg(feature = "memory-guardian")]
+        if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--guardian-runtime-dir="))
+        {
+            if value.is_empty() {
+                return Err(String::from("--guardian-runtime-dir requires a path"));
+            }
+            guardian_runtime_dir = Some(PathBuf::from(value));
+            continue;
+        }
+        return Err(format!("unknown argument: {}", arg.to_string_lossy()));
     }
 
-    Ok(config_path)
+    #[cfg(feature = "memory-guardian")]
+    let guardian = match (guardian_config_path, guardian_runtime_dir) {
+        (None, None) => None,
+        (Some(config_path), Some(runtime_dir)) => Some(GuardianCommand {
+            config_path,
+            runtime_dir,
+        }),
+        (Some(_), None) => {
+            return Err(String::from(
+                "--guardian-runtime-dir is required with --guardian-config",
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(String::from(
+                "--guardian-config is required with --guardian-runtime-dir",
+            ));
+        }
+    };
+    Ok(ProxyOptions {
+        config_path,
+        #[cfg(feature = "memory-guardian")]
+        guardian,
+    })
+}
+
+#[cfg(feature = "memory-guardian")]
+fn parse_guardian_command(args: &[OsString]) -> Result<GuardianCommand, String> {
+    let mut config_path = None;
+    let mut runtime_dir = None;
+    let mut index = 0;
+    while index < args.len() {
+        let arg = &args[index];
+        if arg == "--config" {
+            index = index.saturating_add(1);
+            config_path = Some(required_path_arg(args, index, "--config")?);
+        } else if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--config="))
+        {
+            config_path = Some(nonempty_path_value(value, "--config")?);
+        } else if arg == "--runtime-dir" {
+            index = index.saturating_add(1);
+            runtime_dir = Some(required_path_arg(args, index, "--runtime-dir")?);
+        } else if let Some(value) = arg
+            .to_str()
+            .and_then(|value| value.strip_prefix("--runtime-dir="))
+        {
+            runtime_dir = Some(nonempty_path_value(value, "--runtime-dir")?);
+        } else {
+            return Err(format!(
+                "unknown guardian argument: {}",
+                arg.to_string_lossy()
+            ));
+        }
+        index = index.saturating_add(1);
+    }
+    Ok(GuardianCommand {
+        config_path: config_path.ok_or_else(|| String::from("guardian requires --config"))?,
+        runtime_dir: runtime_dir.ok_or_else(|| String::from("guardian requires --runtime-dir"))?,
+    })
 }
 
 fn parse_evidence_command(args: &[OsString]) -> Result<EvidenceCommand, String> {
@@ -548,9 +727,11 @@ mod tests {
     use llm_guard_proxy_state::RequestId;
 
     use super::{
-        EvidenceCommand, parse_config_path, parse_evidence_command, proxy::render_health,
+        EvidenceCommand, parse_evidence_command, parse_proxy_options, proxy::render_health,
         render_listening,
     };
+    #[cfg(feature = "memory-guardian")]
+    use super::{GuardianCommand, parse_guardian_command};
 
     #[test]
     fn renders_health_with_config_summary() {
@@ -576,9 +757,49 @@ mod tests {
             OsString::from("dev.toml"),
         ];
         assert_eq!(
-            parse_config_path(args).expect("args should parse"),
+            parse_proxy_options(args)
+                .expect("args should parse")
+                .config_path,
             Some("dev.toml".into()),
         );
+    }
+
+    #[cfg(feature = "memory-guardian")]
+    #[test]
+    fn parses_guardian_subcommand_arguments() {
+        let args = [
+            OsString::from("--config"),
+            OsString::from("guardian.toml"),
+            OsString::from("--runtime-dir"),
+            OsString::from("/run/user/1000/gb10-memory-guardian"),
+        ];
+        assert_eq!(
+            parse_guardian_command(&args).expect("guardian args should parse"),
+            GuardianCommand {
+                config_path: "guardian.toml".into(),
+                runtime_dir: "/run/user/1000/gb10-memory-guardian".into(),
+            }
+        );
+    }
+
+    #[cfg(feature = "memory-guardian")]
+    #[test]
+    fn guardian_subcommand_requires_runtime_directory() {
+        let args = [OsString::from("--config"), OsString::from("guardian.toml")];
+        let error = parse_guardian_command(&args).expect_err("runtime dir is required");
+        assert!(error.contains("--runtime-dir"));
+    }
+
+    #[cfg(feature = "memory-guardian")]
+    #[test]
+    fn proxy_guardian_arguments_must_be_paired() {
+        let args = [
+            OsString::from("llm-guard-proxy"),
+            OsString::from("--guardian-config"),
+            OsString::from("guardian.toml"),
+        ];
+        let error = parse_proxy_options(args).expect_err("guardian args must be paired");
+        assert!(error.contains("--guardian-runtime-dir"));
     }
 
     #[test]
