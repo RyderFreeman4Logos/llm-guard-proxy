@@ -1086,6 +1086,43 @@ async fn enriched_models_observability_records_success_after_body_consumption() 
 }
 
 #[tokio::test]
+async fn forwarded_embedding_observability_records_upstream_token_usage() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/embeddings?test=token-usage", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-embedding","input":"ping"}"#)
+        .send()
+        .await
+        .expect("embedding request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = response
+        .bytes()
+        .await
+        .expect("embedding response body should be readable");
+    assert_eq!(
+        response_body.as_ref(),
+        br#"{"object":"list","data":[{"embedding":[0.0]}],"usage":{"prompt_tokens":17,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}"#
+    );
+    let observed = fake.recv_next().await;
+    assert_eq!(observed.path_and_query, "/v1/embeddings?test=token-usage");
+
+    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    let token_usage: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = connection
+        .query_row(
+            "SELECT input_tokens, output_tokens, cached_input_tokens, reasoning_tokens FROM attempts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .expect("attempt token usage should be stored");
+    assert_eq!(token_usage, (Some(17), Some(4), Some(3), Some(2)));
+}
+
+#[tokio::test]
 async fn enriched_models_observability_records_abort_when_body_is_dropped() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
@@ -18140,6 +18177,15 @@ fn fake_upstream_endpoint_response(
         && let Some(response) = fake_chat_completion_response(path_and_query, state, body)
     {
         return response;
+    }
+
+    if endpoint == "/v1/embeddings" && path_and_query.contains("test=token-usage") {
+        return json_response(
+            "embeddings-token-usage",
+            String::from(
+                r#"{"object":"list","data":[{"embedding":[0.0]}],"usage":{"prompt_tokens":17,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}"#,
+            ),
+        );
     }
 
     let (label, body) = match endpoint {
