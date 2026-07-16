@@ -1,10 +1,9 @@
 #[cfg(target_os = "linux")]
 use std::sync::Arc;
-use std::{
-    io,
-    process::{Child, ExitStatus},
-    time::Instant,
-};
+use std::{io, process::ExitStatus, time::Instant};
+
+#[cfg(test)]
+use std::process::Child;
 
 use nix::sys::signal::Signal;
 
@@ -13,6 +12,7 @@ use crate::workflow_cgroup::WorkflowCgroup;
 use crate::workflow_execution::WorkflowExecutionLease;
 
 use super::{
+    WorkflowChild,
     deferred_reaper::{DeferredSignalState, defer_workflow_process_with_execution_lease},
     finalize_owned_child, process_group_signal_io_error, reap_child_bounded,
     signal_authority::{
@@ -27,7 +27,7 @@ enum StartupSignalAuthority {
 }
 
 pub(crate) struct SpawnedChildGuard {
-    child: Option<Child>,
+    child: Option<WorkflowChild>,
     #[cfg(target_os = "linux")]
     workflow_cgroup: Option<Arc<WorkflowCgroup>>,
     signal_authority: Option<StartupSignalAuthority>,
@@ -38,11 +38,15 @@ pub(crate) struct SpawnedChildGuard {
 impl SpawnedChildGuard {
     #[cfg(test)]
     pub(crate) fn new(child: Child, cleanup_deadline: Instant) -> Self {
-        Self::new_with_execution_lease(child, cleanup_deadline, WorkflowExecutionLease::default())
+        Self::new_with_execution_lease(
+            child.into(),
+            cleanup_deadline,
+            WorkflowExecutionLease::default(),
+        )
     }
 
     pub(super) fn new_with_execution_lease(
-        child: Child,
+        child: WorkflowChild,
         cleanup_deadline: Instant,
         execution_lease: WorkflowExecutionLease,
     ) -> Self {
@@ -60,10 +64,10 @@ impl SpawnedChildGuard {
     }
 
     pub(crate) fn pid(&self) -> u32 {
-        self.child.as_ref().map_or(0, Child::id)
+        self.child.as_ref().map_or(0, WorkflowChild::id)
     }
 
-    pub(super) fn child_mut(&mut self) -> Option<&mut Child> {
+    pub(super) fn child_mut(&mut self) -> Option<&mut WorkflowChild> {
         self.child.as_mut()
     }
 
@@ -99,7 +103,7 @@ impl SpawnedChildGuard {
     }
 
     #[cfg(test)]
-    pub(crate) fn disarm(&mut self) -> Option<Child> {
+    pub(crate) fn disarm(&mut self) -> Option<WorkflowChild> {
         self.signal_authority.take();
         self.execution_lease.take();
         self.child.take()
@@ -107,7 +111,7 @@ impl SpawnedChildGuard {
 
     pub(super) fn disarm_with_execution_lease(
         &mut self,
-    ) -> Option<(Child, WorkflowExecutionLease)> {
+    ) -> Option<(WorkflowChild, WorkflowExecutionLease)> {
         self.signal_authority.take();
         Some((self.child.take()?, self.execution_lease.take()?))
     }
@@ -165,7 +169,7 @@ pub(super) fn startup_error_revokes_provisional_authority(error: ProcessGroupSig
 }
 
 fn finalize_provisional_child(
-    child: Child,
+    child: WorkflowChild,
     provisional_authority: ProvisionalGroupAuthority,
     cleanup_deadline: Instant,
     execution_lease: WorkflowExecutionLease,
@@ -182,8 +186,8 @@ fn finalize_provisional_child(
 }
 
 #[cfg(test)]
-pub(super) fn finalize_provisional_child_with<Observe, SignalGroup, Defer>(
-    child: Child,
+pub(super) fn finalize_provisional_child_with<ChildHandle, Observe, SignalGroup, Defer>(
+    child: ChildHandle,
     authority: ProvisionalGroupAuthority,
     cleanup_deadline: Instant,
     observe: Observe,
@@ -191,16 +195,17 @@ pub(super) fn finalize_provisional_child_with<Observe, SignalGroup, Defer>(
     defer: Defer,
 ) -> io::Result<ExitStatus>
 where
+    ChildHandle: Into<WorkflowChild>,
     Observe: FnOnce(
         &mut ProvisionalGroupAuthority,
     ) -> Result<NonReapingChildState, ProcessGroupSignalError>,
     SignalGroup: FnOnce(
         &mut ProvisionalGroupAuthority,
     ) -> Result<WorkflowSignalOutcome, ProcessGroupSignalError>,
-    Defer: FnOnce(Child, DeferredSignalState),
+    Defer: FnOnce(WorkflowChild, DeferredSignalState),
 {
     finalize_provisional_child_with_execution_lease(
-        child,
+        child.into(),
         authority,
         cleanup_deadline,
         WorkflowExecutionLease::default(),
@@ -211,7 +216,7 @@ where
 }
 
 fn finalize_provisional_child_with_execution_lease<Observe, SignalGroup, Defer>(
-    child: Child,
+    child: WorkflowChild,
     mut authority: ProvisionalGroupAuthority,
     cleanup_deadline: Instant,
     execution_lease: WorkflowExecutionLease,
@@ -226,7 +231,7 @@ where
     SignalGroup: FnOnce(
         &mut ProvisionalGroupAuthority,
     ) -> Result<WorkflowSignalOutcome, ProcessGroupSignalError>,
-    Defer: FnOnce(Child, DeferredSignalState, WorkflowExecutionLease),
+    Defer: FnOnce(WorkflowChild, DeferredSignalState, WorkflowExecutionLease),
 {
     if !authority.is_active() {
         defer(child, DeferredSignalState::Unresolved, execution_lease);

@@ -10,8 +10,9 @@ use std::{
 
 use super::{
     DeferredSignalState, DeferredWorkflowProcess, LinuxProcessIdentity, SharedDeferredReaper,
-    SignalAuthority, SpawnedChildGuard, configure_process_group, poll_deferred_processes,
-    signal_authority::ProvisionalGroupAuthority, test_raii::TestLocalDeferredReaper,
+    SignalAuthority, SpawnedChildGuard, WorkflowChild, configure_process_group,
+    poll_deferred_processes, signal_authority::ProvisionalGroupAuthority,
+    test_raii::TestLocalDeferredReaper,
 };
 use crate::workflow_execution::WorkflowExecutionLease;
 
@@ -96,18 +97,18 @@ enum DeferredLeaseState {
     Unresolved,
 }
 
-fn spawn_sleep_group() -> (std::process::Child, LinuxProcessIdentity) {
+fn spawn_sleep_group() -> (WorkflowChild, LinuxProcessIdentity) {
     let mut command = Command::new("/bin/sleep");
     command.arg("30");
     spawn_group(&mut command)
 }
 
-fn spawn_true_group() -> (std::process::Child, LinuxProcessIdentity) {
+fn spawn_true_group() -> (WorkflowChild, LinuxProcessIdentity) {
     let mut command = Command::new("/bin/true");
     spawn_group(&mut command)
 }
 
-fn spawn_group(command: &mut Command) -> (std::process::Child, LinuxProcessIdentity) {
+fn spawn_group(command: &mut Command) -> (WorkflowChild, LinuxProcessIdentity) {
     configure_process_group(command);
     let child = command.spawn().expect("lease fixture should spawn");
     let mut spawned = SpawnedChildGuard::new(child, Instant::now() + Duration::from_secs(1));

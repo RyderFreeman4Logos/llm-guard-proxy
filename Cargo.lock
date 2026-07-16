@@ -666,6 +666,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "lexical-core",
+ "libc",
  "llm-guard-proxy-core",
  "llm-guard-proxy-host-guardian",
  "llm-guard-proxy-host-telemetry",

@@ -1,5 +1,4 @@
 use std::{
-    process::Child,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -14,7 +13,8 @@ use crate::workflow_execution::WorkflowExecutionLease;
 
 use super::{
     NonReapingChildState, PROCESS_REAP_POLL, ProcessGroupSignalError, SignalAuthority,
-    WorkflowSignalOutcome, signal_authority::ProvisionalGroupAuthority, signal_owned_workflow,
+    WorkflowChild, WorkflowSignalOutcome, signal_authority::ProvisionalGroupAuthority,
+    signal_owned_workflow,
 };
 
 const MAX_SIGNAL_RETRY_BACKOFF: Duration = Duration::from_secs(1);
@@ -117,7 +117,7 @@ where
 }
 
 pub(super) struct DeferredWorkflowProcess {
-    pub(super) child: Child,
+    pub(super) child: WorkflowChild,
     pub(super) signal_state: DeferredSignalState,
     pub(super) next_signal_attempt: Instant,
     pub(super) signal_retry_backoff: Duration,
@@ -126,15 +126,22 @@ pub(super) struct DeferredWorkflowProcess {
 
 impl DeferredWorkflowProcess {
     #[cfg(test)]
-    pub(super) fn new(child: Child, signal_state: DeferredSignalState) -> Self {
+    pub(super) fn new<ChildHandle>(child: ChildHandle, signal_state: DeferredSignalState) -> Self
+    where
+        ChildHandle: Into<WorkflowChild>,
+    {
         Self::new_with_execution_lease(child, signal_state, WorkflowExecutionLease::default())
     }
 
-    pub(super) fn new_with_execution_lease(
-        mut child: Child,
+    pub(super) fn new_with_execution_lease<ChildHandle>(
+        child: ChildHandle,
         signal_state: DeferredSignalState,
         execution_lease: WorkflowExecutionLease,
-    ) -> Self {
+    ) -> Self
+    where
+        ChildHandle: Into<WorkflowChild>,
+    {
+        let mut child = child.into();
         child.stdin.take();
         child.stdout.take();
         child.stderr.take();
@@ -288,16 +295,21 @@ impl SharedDeferredReaper {
 }
 
 #[cfg(test)]
-pub(super) fn defer_workflow_process(child: Child, signal_state: DeferredSignalState) {
+pub(super) fn defer_workflow_process<ChildHandle>(
+    child: ChildHandle,
+    signal_state: DeferredSignalState,
+) where
+    ChildHandle: Into<WorkflowChild>,
+{
     defer_workflow_process_with_execution_lease(
-        child,
+        child.into(),
         signal_state,
         WorkflowExecutionLease::default(),
     );
 }
 
 pub(super) fn defer_workflow_process_with_execution_lease(
-    child: Child,
+    child: WorkflowChild,
     signal_state: DeferredSignalState,
     execution_lease: WorkflowExecutionLease,
 ) {

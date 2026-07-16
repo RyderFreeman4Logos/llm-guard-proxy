@@ -1,6 +1,6 @@
 use std::{
     ops::{Deref, DerefMut},
-    process::{Child, Command},
+    process::Command,
     thread,
     time::{Duration, Instant},
 };
@@ -9,7 +9,8 @@ use nix::sys::signal::Signal;
 
 use super::{
     DeferredSignalState, DeferredWorkflowProcess, LinuxProcessIdentity, SharedDeferredReaper,
-    SignalAuthority, SpawnedChildGuard, configure_process_group, signal_owned_workflow,
+    SignalAuthority, SpawnedChildGuard, WorkflowChild, configure_process_group,
+    signal_owned_workflow,
 };
 
 pub(super) struct TestDeferredProcess {
@@ -126,7 +127,7 @@ impl Drop for TestLocalDeferredReaper {
 }
 
 pub(super) struct TestProcessGroup {
-    child: Option<Child>,
+    child: Option<WorkflowChild>,
     identity: LinuxProcessIdentity,
 }
 
@@ -151,7 +152,7 @@ impl TestProcessGroup {
         self.identity
     }
 
-    pub(super) fn child_mut(&mut self) -> &mut Child {
+    pub(super) fn child_mut(&mut self) -> &mut WorkflowChild {
         self.child.as_mut().expect("test child should remain armed")
     }
 

@@ -1,8 +1,8 @@
 use std::{
+    fs::File,
     io,
     os::unix::net::UnixStream,
     panic::{AssertUnwindSafe, catch_unwind},
-    process::ChildStderr,
     sync::mpsc,
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -110,7 +110,7 @@ impl Drop for StderrDrainCompletionProbeGuard {
 }
 
 pub(super) fn spawn_pipe_drain(
-    pipe: ChildStderr,
+    pipe: File,
     execution_deadline: Instant,
 ) -> io::Result<PipeDrainHandle> {
     let (cancel_endpoint, cancel_receiver) = UnixStream::pair()?;
