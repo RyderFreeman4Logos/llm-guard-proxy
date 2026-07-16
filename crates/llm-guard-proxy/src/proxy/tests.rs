@@ -1024,6 +1024,7 @@ async fn models_burst_above_old_control_plane_cap_succeeds_and_health_stays_resp
 }
 
 mod score_endpoint;
+mod upstream_failover;
 #[tokio::test]
 async fn enriched_models_observability_records_success_after_body_consumption() {
     let mut fake = FakeUpstream::spawn().await;

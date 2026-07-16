@@ -4,8 +4,8 @@ use super::{
     AppConfig, ConfigHandle, ConfigParseError, DefaultInjectionSchema, DownstreamDropPolicy,
     HeartbeatMode, LoopFailurePolicy, LoopGuardMode, NoThinkingMarkerPolicy, RELOADABLE_FIELDS,
     RESTART_REQUIRED_FIELDS, ShadowComparisonAttempt, ThinkingMode, ToolRequestThinkingPolicy,
-    UpstreamRouteReason, ValidationError, apply_reloadable, parse::parse_config_text,
-    redact_upstream_base_url,
+    UpstreamPriority, UpstreamRouteReason, ValidationError, apply_reloadable,
+    parse::parse_config_text, redact_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 use crate::{
@@ -407,6 +407,69 @@ readiness_endpoint = "v1/chat/completions"
 
     assert_eq!(error.field(), "upstream.local_recovery.readiness_endpoint");
     assert_eq!(error.message(), "must start with /");
+}
+
+#[test]
+fn parses_same_model_upstream_failover_profiles() {
+    let config = parse_config_text(
+        r#"
+[[profile]]
+model = "aeon-27b"
+health_probe_interval = "25ms"
+health_probe_timeout = "10ms"
+health_probe_max_wait = "250ms"
+
+[[profile.upstream]]
+base_url = "http://gb10:18010/v1"
+priority = "primary"
+
+[[profile.upstream]]
+base_url = "http://gb10:18011/v1"
+priority = "failover"
+"#,
+    )
+    .expect("same-model upstream profile should parse");
+
+    config
+        .validate()
+        .expect("same-model upstream profile should validate");
+    let profile = config.select_upstream_profile(Some("aeon-27b")).profile;
+    assert_eq!(profile.name, "aeon-27b");
+    assert_eq!(profile.match_models, ["aeon-27b"]);
+    assert_eq!(profile.health_probe_interval_ms, 25);
+    assert_eq!(profile.health_probe_timeout_ms, 10);
+    assert_eq!(profile.health_probe_max_wait_ms, 250);
+    assert_eq!(profile.endpoints.len(), 2);
+    assert_eq!(profile.endpoints[0].base_url, "http://gb10:18010/v1");
+    assert_eq!(profile.endpoints[0].priority, UpstreamPriority::Primary);
+    assert_eq!(profile.endpoints[1].base_url, "http://gb10:18011/v1");
+    assert_eq!(profile.endpoints[1].priority, UpstreamPriority::Failover);
+    assert_eq!(profile.primary_base_url(), "http://gb10:18010/v1");
+}
+
+#[test]
+fn same_model_upstream_profile_rejects_duplicate_primary_endpoints() {
+    let config = parse_config_text(
+        r#"
+[[profile]]
+model = "aeon-27b"
+
+[[profile.upstream]]
+base_url = "http://gb10:18010/v1"
+priority = "primary"
+
+[[profile.upstream]]
+base_url = "http://gb10:18011/v1"
+priority = "primary"
+"#,
+    )
+    .expect("duplicate primary endpoints should parse before validation");
+    let error = config
+        .validate()
+        .expect_err("duplicate primary endpoints should fail validation");
+
+    assert_eq!(error.field(), "profile.upstream.priority");
+    assert_eq!(error.message(), "must contain exactly one primary endpoint");
 }
 
 fn assert_default_loop_guard_fields(config: &AppConfig) {

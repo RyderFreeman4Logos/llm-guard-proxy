@@ -22,8 +22,9 @@ pub use model::{
     LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig,
     RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
     SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
-    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamEndpointConfig, UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason,
+    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 pub use model::{BudgetConfig, GuardWorkflowConfig};
@@ -166,6 +167,9 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstream.local_recovery.budget_window_ms",
     "upstream.local_recovery.max_per_window",
     "upstreams.request_timeout_ms",
+    "upstreams.health_probe_interval",
+    "upstreams.health_probe_timeout",
+    "upstreams.health_probe_max_wait",
     "upstreams.max_in_flight_requests",
     "upstreams.max_queued_generation_requests",
     "upstreams.metadata.discovery_enabled",
