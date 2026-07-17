@@ -1,9 +1,9 @@
 use super::{guardian_handle, target_tree, temporary_tree};
-use crate::{EmergencyReserve, kill_direct};
+use crate::{EmergencyReserve, emergency::AttemptOutcome, kill_direct};
 use nix::unistd::Uid;
 use std::{fs, os::unix::fs::PermissionsExt};
 
-use super::super::{CgroupTarget, MemoryGuardian, RecoveryTarget};
+use super::super::{CgroupTarget, GuardianIteration, MemoryGuardian, RecoveryTarget};
 
 #[test]
 fn opens_and_kills_a_recreated_cgroup_after_the_original_becomes_empty() {
@@ -125,5 +125,66 @@ fn published_registration_replacement_rearms_the_new_cgroup_generation() {
         "a".repeat(64)
     ));
     assert_eq!(fs::read(original).expect("read original kill"), b"");
+    fs::remove_dir_all(root).expect("remove root");
+}
+
+#[test]
+fn same_registration_recreation_reopens_and_rearms_new_cgroup_generation() {
+    let (root, _registration) = target_tree();
+    let runtime = root.join("runtime");
+    let handle = guardian_handle("target.v1", &root);
+    let mut guardian = MemoryGuardian::open(handle, &runtime).expect("open guardian");
+    assert!(guardian.reconcile_healthy_target());
+
+    let uid = Uid::effective().as_raw();
+    let id = "a".repeat(64);
+    let cgroup = root.join(format!(
+        "user.slice/user-{uid}.slice/user@{uid}.service/app.slice/docker-{id}.scope"
+    ));
+    fs::write(cgroup.join("cgroup.events"), b"populated 0\n").expect("mark original empty");
+    assert_eq!(
+        guardian.attempt_emergency(false),
+        GuardianIteration::Verified
+    );
+    fs::write(cgroup.join("cgroup.kill"), b"").expect("clear original kill fixture");
+
+    let retired = cgroup.with_extension("retired");
+    fs::rename(&cgroup, &retired).expect("retire original cgroup generation");
+    fs::create_dir(&cgroup).expect("recreate cgroup at the registered path");
+    fs::write(cgroup.join("cgroup.kill"), b"").expect("create replacement kill");
+    fs::write(cgroup.join("cgroup.events"), b"populated 1\n").expect("create replacement events");
+
+    assert!(
+        guardian.reconcile_healthy_target(),
+        "same registration must not hide a new cgroup object"
+    );
+    assert_eq!(
+        guardian.attempt_emergency(false),
+        GuardianIteration::Waiting
+    );
+    assert_eq!(
+        fs::read(cgroup.join("cgroup.kill")).expect("read replacement kill"),
+        b"1"
+    );
+    assert_eq!(
+        fs::read(retired.join("cgroup.kill")).expect("read retired kill"),
+        b""
+    );
+
+    fs::write(cgroup.join("cgroup.events"), b"populated 0\n").expect("mark replacement empty");
+    let MemoryGuardian {
+        target, controller, ..
+    } = &mut guardian;
+    let RecoveryTarget::Cgroup(target) = target.as_ref().expect("replacement target") else {
+        panic!("expected cgroup target");
+    };
+    assert_eq!(
+        controller
+            .as_mut()
+            .expect("emergency controller")
+            .attempt(u64::MAX, target),
+        AttemptOutcome::Verified
+    );
+
     fs::remove_dir_all(root).expect("remove root");
 }

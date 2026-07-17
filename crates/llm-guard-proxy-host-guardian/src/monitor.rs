@@ -8,6 +8,7 @@ use crate::{
 use llm_guard_proxy_core::{
     ConfigHandle, ConfigHandleError, GuardianConfig, GuardianKillAction, ValidationError,
 };
+use nix::fcntl::OFlag;
 use nix::unistd::Uid;
 use std::{
     fs::{File, OpenOptions},
@@ -223,6 +224,7 @@ pub fn parse_registration(input: &[u8], uid: u32) -> Result<Registration, Regist
 /// Owns pre-opened descriptors used by the allocation-free Tier-1 action.
 #[derive(Debug)]
 pub struct CgroupTarget {
+    directory: File,
     kill: File,
     events: File,
     registration: Registration,
@@ -283,20 +285,18 @@ impl CgroupTarget {
         let registration = parse_registration(&bytes[..length], expected_uid)
             .map_err(|error| GuardianError::InvalidRegistration(error.to_string()))?;
         let cgroup_path = cgroup_root.join(registration.control_group.trim_start_matches('/'));
-        let kill = OpenOptions::new()
-            .write(true)
-            .custom_flags(0)
-            .open(cgroup_path.join("cgroup.kill"))
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+            .open(cgroup_path)
             .map_err(|source| GuardianError::Io {
-                operation: "open cgroup.kill",
+                operation: "open cgroup directory",
                 source,
             })?;
-        let events =
-            File::open(cgroup_path.join("cgroup.events")).map_err(|source| GuardianError::Io {
-                operation: "open cgroup.events",
-                source,
-            })?;
+        let kill = open_cgroup_control(&directory, "cgroup.kill", true, "open cgroup.kill")?;
+        let events = open_cgroup_control(&directory, "cgroup.events", false, "open cgroup.events")?;
         let target = Self {
+            directory,
             kill,
             events,
             registration,
@@ -321,8 +321,15 @@ impl CgroupTarget {
         Ok(!self.is_populated()?)
     }
 
-    fn has_same_registration(&self, other: &Self) -> bool {
-        self.registration == other.registration
+    fn has_same_target_generation(&self, other: &Self) -> bool {
+        if self.registration != other.registration {
+            return false;
+        }
+        let (Ok(active), Ok(candidate)) = (self.directory.metadata(), other.directory.metadata())
+        else {
+            return false;
+        };
+        active.dev() == candidate.dev() && active.ino() == candidate.ino()
     }
 
     fn is_populated(&self) -> Result<bool, CgroupStateError> {
@@ -342,6 +349,25 @@ impl CgroupTarget {
             None => Err(CgroupStateError::Invalid),
         }
     }
+}
+
+fn open_cgroup_control(
+    directory: &File,
+    name: &'static str,
+    write: bool,
+    operation: &'static str,
+) -> Result<File, GuardianError> {
+    // The retained directory descriptor pins one cgroup object even when its
+    // registered path is concurrently replaced by a new generation.
+    let descriptor_path = PathBuf::from("/proc/self/fd")
+        .join(directory.as_raw_fd().to_string())
+        .join(name);
+    OpenOptions::new()
+        .read(!write)
+        .write(write)
+        .custom_flags(OFlag::O_NOFOLLOW.bits())
+        .open(descriptor_path)
+        .map_err(|source| GuardianError::Io { operation, source })
 }
 
 fn validate_registration_metadata(file: &File, expected_uid: u32) -> Result<(), GuardianError> {
@@ -664,7 +690,7 @@ impl MemoryGuardian {
                         (
                             Some(RecoveryTarget::Cgroup(active)),
                             RecoveryTarget::Cgroup(candidate)
-                        ) if active.has_same_registration(candidate)
+                        ) if active.has_same_target_generation(candidate)
                     ) {
                         self.last_rejected_policy = None;
                         return false;

@@ -512,6 +512,13 @@ enabled = true
 ## service user. Cgroup targets are validated/opened while healthy. The direct
 ## cgroup emergency path releases pre-touched reserve memory and writes `1` to
 ## a pre-opened cgroup.kill descriptor without allocation.
+##
+## GB10 production requires the AEON text unit's reviewed ExecStartPost helper
+## to atomically publish `text-cgroup.v1` after every Docker generation. Verify
+## that file before stopping `gb10-memory-guardian.service`; then stop the
+## standalone guardian immediately before starting this integrated one. Rollback
+## stops the proxy first and restores the standalone guardian last, so the two
+## recovery actors are never active together.
 
 [guardian]
 enabled = true                               # Integrated guardian supersedes the standalone service
