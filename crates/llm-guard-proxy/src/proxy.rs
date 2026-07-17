@@ -2763,7 +2763,7 @@ async fn read_body_and_admit_generation(
         request.shielding_enabled_hint,
     );
     add_listener_metadata(&mut pre_body_request_metadata, &state.listener);
-    let body = read_body_with_score_limit(
+    let body = read_body_with_adapter_limit(
         body,
         max_request_body_bytes,
         request.method,
@@ -2846,7 +2846,7 @@ async fn read_body_and_admit_generation(
     })
 }
 
-async fn read_body_with_score_limit(
+async fn read_body_with_adapter_limit(
     body: Body,
     max_request_body_bytes: usize,
     method: &Method,
@@ -2855,9 +2855,16 @@ async fn read_body_with_score_limit(
     request_metadata: BTreeMap<String, String>,
 ) -> Result<Bytes, ProxyError> {
     let is_score_request = score_adapter::is_score_request(method, uri);
-    let score_limit_applies =
-        is_score_request && max_request_body_bytes >= score_adapter::MAX_SCORE_BODY_BYTES;
-    let body_limit = if is_score_request {
+    let adapter_label = if is_score_request {
+        Some("score")
+    } else if deepinfra_rerank_adapter::is_request(method, uri) {
+        Some("DeepInfra rerank")
+    } else {
+        None
+    };
+    let adapter_limit_applies =
+        adapter_label.filter(|_| max_request_body_bytes >= score_adapter::MAX_SCORE_BODY_BYTES);
+    let body_limit = if adapter_label.is_some() {
         max_request_body_bytes.min(score_adapter::MAX_SCORE_BODY_BYTES)
     } else {
         max_request_body_bytes
@@ -2865,13 +2872,15 @@ async fn read_body_with_score_limit(
     read_body_bytes_until_shutdown(body, body_limit, shutdown)
         .await
         .map_err(|error| {
-            let score_body_limit_exceeded = matches!(
+            let adapter_body_limit_exceeded = matches!(
                 &error,
                 ProxyError::RequestBody { reason, .. } if reason.contains("length limit exceeded")
             );
-            let error = if score_limit_applies && score_body_limit_exceeded {
+            let error = if let Some(adapter_label) = adapter_limit_applies
+                && adapter_body_limit_exceeded
+            {
                 ProxyError::request_body(format!(
-                    "score request exceeded adapter limit of {} bytes",
+                    "{adapter_label} request exceeded adapter limit of {} bytes",
                     score_adapter::MAX_SCORE_BODY_BYTES
                 ))
             } else {
@@ -4230,7 +4239,10 @@ async fn rewrite_buffered_adapter_response_from_upstream(
             }
         }
     } else {
-        (body, response_parts.upstream_headers.clone())
+        (
+            body,
+            transformed_error_response_headers(&response_parts.upstream_headers),
+        )
     };
     let stream_cancel = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer_with(
@@ -10526,6 +10538,16 @@ fn sanitize_transformed_request_headers(headers: &HeaderMap) -> HeaderMap {
 fn transformed_json_response_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    headers
+}
+
+fn transformed_error_response_headers(upstream_headers: &HeaderMap) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for name in [CONTENT_TYPE, RETRY_AFTER] {
+        if let Some(value) = upstream_headers.get(&name) {
+            headers.insert(name, value.clone());
+        }
+    }
     headers
 }
 

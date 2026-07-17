@@ -135,6 +135,26 @@ The shielded chat core is enabled by default for non-streaming chat completions:
 - Downstream `stream=true` chat requests currently stay on the generic streaming path to preserve first-chunk timing and backpressure behavior while later issues add release-after-inspection streaming.
 - Set `[shielding] enabled = false` and hot reload the config to fall back to generic forwarding for rollback or compatibility testing.
 
+## DeepInfra Qwen3 reranker compatibility
+
+`POST /v1/inference/Qwen/Qwen3-Reranker-8B` accepts DeepInfra's native
+pairwise `queries` and `documents` arrays and converts them to one vLLM
+`/v1/score` N:N batch. Both arrays must be non-empty, have the same length,
+contain only strings, and contain at most 1,024 items. Request bodies are
+limited to 1 MiB before JSON validation.
+
+The documented default `instruction` may be omitted or supplied explicitly.
+Other instructions fail locally because the current deployment score template
+does not consume vLLM's forwarded instruction variable. A non-null `webhook`
+also fails locally because the adapter is synchronous. `service_tier` accepts
+`default`, `priority`, and `flex`, but all three are compatibility no-ops: the
+adapter has a local single scheduling tier, so these values affect only
+observability metadata and never local scheduling.
+
+Successful responses contain `scores`, trusted upstream `input_tokens`, and an
+optional `request_id`. The optional cloud `inference_status` object is omitted:
+the local adapter does not fabricate DeepInfra runtime or billing metrics.
+
 ## Operational Endpoints
 
 - `GET /health` returns a small JSON status object with `process = "alive"` and upstream readiness. By default it performs a bounded `GET /v1/models` readiness probe against the configured upstream and returns `503` when the proxy process is alive but upstream is unavailable. Set `observability.health_upstream_probe_enabled = false` to skip the upstream probe and report `upstream = "not_checked"`.

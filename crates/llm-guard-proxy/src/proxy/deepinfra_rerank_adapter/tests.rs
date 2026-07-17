@@ -79,7 +79,20 @@ fn rejects_custom_instruction_instead_of_ignoring_it() {
         .expect_err("custom instruction needs real upstream plumbing");
 
     assert!(error.to_string().contains("custom instruction"), "{error}");
-    assert!(error.to_string().contains("/v1/score"), "{error}");
+    assert!(
+        error.to_string().contains("deployment score template"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("forwarded instruction"),
+        "{error}"
+    );
+    assert!(
+        !error
+            .to_string()
+            .contains("no per-request instruction field"),
+        "{error}"
+    );
 }
 
 #[test]
@@ -155,6 +168,24 @@ fn rejects_wrong_input_and_optional_field_types() {
 }
 
 #[test]
+fn rejects_unknown_fields_without_echoing_attacker_controlled_names() {
+    let attacker_controlled_field = "sensitive-field-name".repeat(256);
+    let body = serde_json::to_vec(&json!({
+        "queries": ["q"],
+        "documents": ["d"],
+        attacker_controlled_field.clone(): null,
+    }))
+    .expect("serialize request with unknown field");
+
+    let error = adapt(&Bytes::from(body)).expect_err("unknown field should fail validation");
+    assert_eq!(
+        error.to_string(),
+        "DeepInfra rerank body contains an unsupported field"
+    );
+    assert!(!error.to_string().contains(&attacker_controlled_field));
+}
+
+#[test]
 fn validates_all_documented_service_tier_values() {
     for (raw, expected) in [
         ("default", ServiceTier::Default),
@@ -201,12 +232,7 @@ fn maps_scalar_head_endpoints_order_and_ties_to_probabilities() {
     assert_eq!(value["scores"], json!([0.0, 1.0, 0.5, 0.5]));
     assert_eq!(value["input_tokens"], 27);
     assert_eq!(value["request_id"], "score-upstream-123");
-    assert_eq!(value["inference_status"]["status"], "succeeded");
-    assert_eq!(value["inference_status"]["runtime_ms"], 0);
-    assert_eq!(value["inference_status"]["cost"], 0.0);
-    assert_eq!(value["inference_status"]["tokens_generated"], 0);
-    assert_eq!(value["inference_status"]["tokens_input"], 27);
-    assert_eq!(value["inference_status"]["output_length"], 0);
+    assert!(value.get("inference_status").is_none());
 }
 
 #[test]

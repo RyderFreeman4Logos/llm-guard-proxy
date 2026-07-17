@@ -98,10 +98,10 @@ pub(crate) fn model_id_from_path(method: &Method, uri: &Uri) -> Option<&'static 
 
 /// Validate and convert one synchronous `DeepInfra` request to one vLLM N:N score batch.
 ///
-/// vLLM's score protocol has no instruction field. This adapter requires the target
-/// template to implement `DeepInfra`'s documented default; the deployment canary must
-/// prove that precondition. Any custom instruction fails closed until the live server
-/// exposes an exact per-request template input.
+/// vLLM forwards its per-request instruction into the score template. This adapter
+/// requires the deployed template to implement `DeepInfra`'s documented default; the
+/// deployment canary must prove that precondition. Any custom instruction fails closed
+/// while the current Qwen/Querit templates ignore that forwarded variable.
 pub(crate) fn adapt_request(uri: &Uri, body: &Bytes) -> Result<AdaptedRequest, RequestError> {
     let value: Value = serde_json::from_slice(body).map_err(|error| {
         RequestError::Invalid(format!("invalid DeepInfra rerank JSON: {error}"))
@@ -149,12 +149,12 @@ fn reject_unknown_fields(object: &serde_json::Map<String, Value>) -> Result<(), 
         "service_tier",
         "webhook",
     ];
-    if let Some(field) = object
+    if object
         .keys()
-        .find(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
+        .any(|field| !ALLOWED_FIELDS.contains(&field.as_str()))
     {
-        return Err(format!(
-            "DeepInfra rerank body contains unsupported field {field:?}"
+        return Err(String::from(
+            "DeepInfra rerank body contains an unsupported field",
         ));
     }
     Ok(())
@@ -206,7 +206,7 @@ fn validate_instruction(instruction: Option<&Value>) -> Result<(), RequestError>
     }
     if instruction != DEFAULT_INSTRUCTION {
         return Err(RequestError::Unsupported(String::from(
-            "custom instruction is unsupported because vLLM /v1/score has no per-request instruction field",
+            "custom instruction is unsupported because the current deployment score template does not consume vLLM's forwarded instruction variable",
         )));
     }
     Ok(())
@@ -325,17 +325,6 @@ pub(crate) fn score_response_to_deepinfra_response(
     if let Some(request_id) = request_id {
         output.insert(String::from("request_id"), Value::String(request_id));
     }
-    output.insert(
-        String::from("inference_status"),
-        json!({
-            "status": "succeeded",
-            "runtime_ms": 0,
-            "cost": 0.0,
-            "tokens_generated": 0,
-            "tokens_input": input_tokens,
-            "output_length": 0,
-        }),
-    );
     serde_json::to_vec(&Value::Object(output))
         .map(Bytes::from)
         .map_err(|error| format!("serialize DeepInfra rerank response failed: {error}"))

@@ -69,8 +69,7 @@ discovery_enabled = false
     assert_eq!(value["scores"], json!([0.0, 1.0, 0.5]));
     assert_eq!(value["input_tokens"], 19);
     assert_eq!(value["request_id"], "score-native-123");
-    assert_eq!(value["inference_status"]["status"], "succeeded");
-    assert_eq!(value["inference_status"]["tokens_input"], 19);
+    assert!(value.get("inference_status").is_none());
 
     let observed = reranker
         .recv_within(STREAM_HEADER_TIMEOUT)
@@ -137,11 +136,89 @@ async fn deepinfra_rerank_rejects_unsupported_instruction_before_upstream() {
     assert!(
         value["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("custom instruction"))
+            .is_some_and(|message| message.contains("deployment score template")
+                && message.contains("forwarded instruction"))
     );
     assert_no_upstream_request(&mut fake).await;
     let connection = rusqlite::Connection::open(&proxy.sqlite_path).expect("sqlite open");
     assert_eq!(count_rows(&connection, "SELECT COUNT(*) FROM attempts"), 0);
+}
+
+#[tokio::test]
+async fn deepinfra_rerank_bounds_oversized_unknown_field_before_json_validation() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let attacker_controlled_field = "x".repeat(score_adapter::MAX_SCORE_BODY_BYTES);
+    let request_body =
+        format!(r#"{{"queries":["q"],"documents":["d"],"{attacker_controlled_field}":null}}"#);
+
+    let response = proxy
+        .client
+        .post(format!("{}{DEEPINFRA_PATH}", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(request_body)
+        .send()
+        .await
+        .expect("oversized DeepInfra request should receive a bounded local error");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let body = response.text().await.expect("error body should drain");
+    assert!(
+        body.contains("DeepInfra rerank request exceeded adapter limit"),
+        "{body}"
+    );
+    assert!(body.len() < 1_024, "error body was not bounded");
+    assert_no_upstream_request(&mut fake).await;
+}
+
+#[tokio::test]
+async fn deepinfra_rerank_sanitizes_non_success_upstream_headers() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}{DEEPINFRA_PATH}?test=deepinfra-rerank-upstream-error",
+            proxy.base_url
+        ))
+        .json(&json!({
+            "queries": ["q"],
+            "documents": ["d"],
+        }))
+        .send()
+        .await
+        .expect("upstream error should be forwarded with sanitized headers");
+
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/problem+json")
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("17")
+    );
+    assert!(response.headers().get("server").is_none());
+    assert!(response.headers().get("x-upstream-endpoint").is_none());
+    assert!(response.headers().get("x-upstream-only").is_none());
+    let value = response_json(response).await;
+    assert_eq!(value["error"]["message"], "local reranker busy");
+
+    let observed = fake
+        .recv_within(STREAM_HEADER_TIMEOUT)
+        .await
+        .expect("request should reach the score endpoint");
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/score?test=deepinfra-rerank-upstream-error"
+    );
 }
 
 #[tokio::test]

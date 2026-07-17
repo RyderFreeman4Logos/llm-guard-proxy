@@ -18222,6 +18222,29 @@ fn fake_upstream_endpoint_response(
 }
 
 fn fake_deepinfra_score_response(path_and_query: &str) -> Response<Body> {
+    if path_and_query.contains("test=deepinfra-rerank-upstream-error") {
+        let mut response = json_response(
+            "deepinfra-score-error",
+            r#"{"error":{"message":"local reranker busy"}}"#.to_owned(),
+        );
+        *response.status_mut() = StatusCode::TOO_MANY_REQUESTS;
+        response.headers_mut().insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/problem+json"),
+        );
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("17"));
+        response.headers_mut().insert(
+            HeaderName::from_static("server"),
+            HeaderValue::from_static("private-vllm-score"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-upstream-only"),
+            HeaderValue::from_static("must-not-leak"),
+        );
+        return response;
+    }
     let body = if path_and_query.contains("test=deepinfra-rerank-malformed") {
         r#"{"id":"score-native-malformed","data":[{"index":0,"score":0.0},{"index":0,"score":0.5},{"index":2,"score":1.0}],"usage":{"prompt_tokens":19}}"#
     } else {
@@ -18276,6 +18299,13 @@ fn fake_rerank_response(path_and_query: &str, body: &Bytes) -> Response<Body> {
         response.headers_mut().insert(
             CONTENT_TYPE,
             HeaderValue::from_static("application/problem+json"),
+        );
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("13"));
+        response.headers_mut().insert(
+            HeaderName::from_static("server"),
+            HeaderValue::from_static("private-vllm-rerank"),
         );
         return response;
     }

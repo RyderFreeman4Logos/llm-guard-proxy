@@ -296,6 +296,15 @@ async fn score_endpoint_passthrough_non_success_rerank_status() {
             .and_then(|value| value.to_str().ok()),
         Some("application/problem+json")
     );
+    assert_eq!(
+        response
+            .headers()
+            .get(RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("13")
+    );
+    assert!(response.headers().get("server").is_none());
+    assert!(response.headers().get("x-upstream-endpoint").is_none());
     let body = response.text().await.expect("body");
     assert!(body.contains("upstream boom"), "{body}");
 
