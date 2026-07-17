@@ -191,20 +191,15 @@ curl --fail --silent --show-error http://gb10:18010/v1/models >/dev/null
 
 registration_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gb10-memory-guardian"
 registration="${registration_dir}/text-cgroup.v1"
-test -f "${registration}" && test ! -L "${registration}"
-test "$(stat -c '%a:%u:%h' "${registration}")" = "600:$(id -u):1"
-grep -Eq '^container_id=[0-9a-f]{64}$' "${registration}"
-grep -Eq '^scope=docker-[0-9a-f]{64}\.scope$' "${registration}"
-
-# Cut recovery ownership over only after the registration is valid.
-systemctl --user disable --now gb10-memory-guardian.service
-systemctl --user enable --now llm-guard-proxy.service
-systemctl --user is-active llm-guard-proxy.service
+deploy/gb10/cutover-guardian.sh "${registration}"
 ```
 
-If the standalone unit is not installed, omit its `disable --now` command. If
-the proxy fails to become active, stop it and restore the previously enabled
-standalone guardian before continuing; never leave both recovery actors active.
+The helper validates the complete registration contract before any guardian
+`systemctl` call. It treats a `not-found` standalone unit as a fresh install;
+otherwise it disables the standalone guardian before enabling the integrated
+guardian, so recovery has only one owner. If the proxy fails to become active,
+stop it and restore the previously enabled standalone guardian before
+continuing; never leave both recovery actors active.
 
 The current gb10 AEON profile needs enough KV cache for the advertised 256000
 context window. If a cold restart fails with a vLLM error like `26.69 GiB KV

@@ -629,9 +629,10 @@ impl MemoryGuardian {
                     self.latched = false;
                     return GuardianIteration::Rearmed;
                 }
-                Some(Err(_error)) => return self.attempt_emergency(false),
+                Some(Err(_error)) => {}
             }
         }
+        let _changed = self.reconcile_active_target();
         self.attempt_emergency(false)
     }
 
@@ -679,6 +680,14 @@ impl MemoryGuardian {
         if requested != self.active_policy {
             return self.try_apply_policy(requested);
         }
+        self.reconcile_active_target()
+    }
+
+    /// Reopens only the target selected by the installed policy.
+    ///
+    /// Latched retries use this path so a registration or cgroup generation
+    /// can appear under pressure without applying a pending hot-reload.
+    fn reconcile_active_target(&mut self) -> bool {
         let target_needs_reconciliation = self.active_policy.enabled
             && (self.target.is_none()
                 || self.active_policy.kill_action == GuardianKillAction::CgroupKill);

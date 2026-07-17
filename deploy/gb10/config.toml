@@ -1,8 +1,9 @@
 ################################################################################
 # llm-guard-proxy reviewed configuration snapshot — GB10 deployment            #
 #                                                                              #
-# Active values mirror the authoritative gb10-services production config.      #
-# The reviewed native-thinking schema is the only intentional semantic delta.  #
+# This is a reviewed deployment snapshot, not byte-identical authority.         #
+# Intentional deployment-specific deltas are documented and contract-tested     #
+# below.                                                                         #
 #                                                                              #
 # Commented sections document optional features and parseable examples.         #
 ################################################################################
