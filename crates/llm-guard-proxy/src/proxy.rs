@@ -72,6 +72,7 @@ use tokio::{
 #[cfg(feature = "guard")]
 use crate::{workflow_execution::WorkflowExecutionLease, workflow_runtime::WorkflowRuntimeAdapter};
 
+mod deepinfra_rerank_adapter;
 mod model_metadata;
 mod recovery;
 mod score_adapter;
@@ -2615,8 +2616,9 @@ async fn forward_openai_request(
                 }
             })
             .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
-        prepared_request.upstream_url = build_upstream_url(&selected.base_url, &uri)
-            .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+        prepared_request.upstream_url =
+            build_upstream_url(&selected.base_url, &prepared_request.forward_uri)
+                .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
         prepared_request
             .upstream_profile
             .base_url
@@ -2710,6 +2712,7 @@ async fn forward_openai_request(
         uri,
         downstream_headers,
         reqwest_method: prepared_request.reqwest_method,
+        upstream_uri: prepared_request.forward_uri,
         upstream_url: prepared_request.upstream_url,
         upstream_body: prepared_request.shielded_chat_plan.upstream_body,
         upstream_timeout,
@@ -2723,8 +2726,7 @@ async fn forward_openai_request(
         model_id: prepared_request.model_id,
         request_metadata,
         in_flight_permit,
-        score_via_rerank: prepared_request.score_via_rerank,
-        score_expected_count: prepared_request.score_expected_count,
+        response_adapter: prepared_request.response_adapter,
     })
     .await
 }
@@ -2889,13 +2891,37 @@ struct PreparedOpenAiRequest {
     workflow_alias: Option<ResolvedWorkflowAlias>,
     upstream_profile: UpstreamProfileConfig,
     route_reason: UpstreamRouteReason,
+    forward_uri: Uri,
     upstream_url: Url,
     reqwest_method: reqwest::Method,
     shielded_chat_plan: ShieldedChatPlan,
-    /// Request was adapted from `/v1/score`; rewrite response from rerank shape.
-    score_via_rerank: bool,
-    /// Expected result cardinality and document-index domain for response validation.
-    score_expected_count: Option<score_adapter::ScoreExpectations>,
+    response_adapter: Option<BufferedResponseAdapter>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BufferedResponseAdapter {
+    ScoreFromRerank(Option<score_adapter::ScoreExpectations>),
+    DeepInfraQwen3Rerank(deepinfra_rerank_adapter::ResponseExpectations),
+}
+
+impl BufferedResponseAdapter {
+    fn rewrite(self, body: &Bytes, model_id: Option<&str>) -> Result<Bytes, String> {
+        match self {
+            Self::ScoreFromRerank(expected) => {
+                score_adapter::rerank_response_to_score_response(body, model_id, expected)
+            }
+            Self::DeepInfraQwen3Rerank(expected) => {
+                deepinfra_rerank_adapter::score_response_to_deepinfra_response(body, expected)
+            }
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ScoreFromRerank(_) => "score from rerank",
+            Self::DeepInfraQwen3Rerank(_) => "DeepInfra rerank from score",
+        }
+    }
 }
 
 #[cfg(feature = "guard")]
@@ -2930,6 +2956,70 @@ struct AdaptedScoreRequest {
     score_expected_count: Option<score_adapter::ScoreExpectations>,
 }
 
+struct AdaptedOpenAiRequest {
+    forward_uri: Uri,
+    adapted_body: Bytes,
+    response_adapter: Option<BufferedResponseAdapter>,
+}
+
+fn adapt_openai_request_if_needed(
+    method: &Method,
+    uri: &Uri,
+    downstream_headers: &HeaderMap,
+    body: &Bytes,
+    request_metadata: &mut BTreeMap<String, String>,
+) -> Result<AdaptedOpenAiRequest, ProxyError> {
+    if deepinfra_rerank_adapter::is_request(method, uri) {
+        request_metadata.insert(
+            String::from("deepinfra_rerank_adapter"),
+            String::from("true"),
+        );
+        ensure_transform_headers_supported(downstream_headers, request_metadata)?;
+        let adapted = deepinfra_rerank_adapter::adapt_request(uri, body).map_err(|error| {
+            let code = error.code();
+            ProxyError::ContextBudgetExceeded {
+                message: format!("invalid DeepInfra rerank request: {error}"),
+                param: "body",
+                code,
+                request_metadata: None,
+            }
+        })?;
+        request_metadata.insert(
+            String::from("deepinfra_expected_count"),
+            adapted.response_expectations.result_count.to_string(),
+        );
+        request_metadata.insert(
+            String::from("deepinfra_service_tier"),
+            adapted.service_tier.as_str().to_owned(),
+        );
+        request_metadata.insert(
+            String::from("deepinfra_service_tier_local_behavior"),
+            String::from("single_tier"),
+        );
+        return Ok(AdaptedOpenAiRequest {
+            forward_uri: adapted.forward_uri,
+            adapted_body: adapted.body,
+            response_adapter: Some(BufferedResponseAdapter::DeepInfraQwen3Rerank(
+                adapted.response_expectations,
+            )),
+        });
+    }
+
+    let adapted =
+        adapt_score_request_if_needed(method, uri, downstream_headers, body, request_metadata)?;
+    let response_adapter =
+        adapted
+            .score_via_rerank
+            .then_some(BufferedResponseAdapter::ScoreFromRerank(
+                adapted.score_expected_count,
+            ));
+    Ok(AdaptedOpenAiRequest {
+        forward_uri: adapted.forward_uri,
+        adapted_body: adapted.adapted_body,
+        response_adapter,
+    })
+}
+
 fn adapt_score_request_if_needed(
     method: &Method,
     uri: &Uri,
@@ -2962,7 +3052,7 @@ fn adapt_score_request_if_needed(
             score_expected_count: None,
         });
     }
-    ensure_score_transform_headers_supported(downstream_headers, request_metadata)?;
+    ensure_transform_headers_supported(downstream_headers, request_metadata)?;
     let adapted_body = score_adapter::score_body_to_rerank_body(body).map_err(invalid)?;
     let forward_uri = score_adapter::score_uri_to_rerank_uri(uri).map_err(|error| {
         ProxyError::ContextBudgetExceeded {
@@ -2992,7 +3082,7 @@ fn adapt_score_request_if_needed(
     })
 }
 
-fn ensure_score_transform_headers_supported(
+fn ensure_transform_headers_supported(
     downstream_headers: &HeaderMap,
     request_metadata: &mut BTreeMap<String, String>,
 ) -> Result<(), ProxyError> {
@@ -3006,7 +3096,7 @@ fn ensure_score_transform_headers_supported(
         );
         return Err(ProxyError::ContextBudgetExceeded {
             message: String::from(
-                "signed score requests cannot be transformed without invalidating the signature",
+                "signed requests cannot be transformed without invalidating the signature",
             ),
             param: "headers",
             code: "signed_request_transformation_unsupported",
@@ -3066,17 +3156,16 @@ fn prepare_openai_forward_request(
     enforce_caller_profile_budget(state, config, &caller_profile)?;
     #[cfg(feature = "guard")]
     let workflow_alias = workflow_alias_for_model(config, model_id.as_deref())?;
-    let adapted_score =
-        adapt_score_request_if_needed(method, uri, downstream_headers, body, request_metadata)?;
+    let adapted_request =
+        adapt_openai_request_if_needed(method, uri, downstream_headers, body, request_metadata)?;
     let selected_profile =
         select_profile_for_request(config, &state.listener, method, uri, model_id.as_deref())?;
     let upstream_profile = selected_profile.profile;
     let route_reason = selected_profile.route_reason;
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
-    let score_via_rerank = adapted_score.score_via_rerank;
-    let score_expected_count = adapted_score.score_expected_count;
-    let forward_uri = adapted_score.forward_uri;
-    let adapted_body = adapted_score.adapted_body;
+    let response_adapter = adapted_request.response_adapter;
+    let forward_uri = adapted_request.forward_uri;
+    let adapted_body = adapted_request.adapted_body;
     let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
     let reqwest_method = upstream_method(method)?;
     let body = adapted_body;
@@ -3120,11 +3209,11 @@ fn prepare_openai_forward_request(
         workflow_alias,
         upstream_profile,
         route_reason,
+        forward_uri,
         upstream_url,
         reqwest_method,
         shielded_chat_plan,
-        score_via_rerank,
-        score_expected_count,
+        response_adapter,
     })
 }
 
@@ -4076,6 +4165,7 @@ struct GenericForwardContext<'request> {
     uri: Uri,
     downstream_headers: HeaderMap,
     reqwest_method: reqwest::Method,
+    upstream_uri: Uri,
     upstream_url: Url,
     upstream_body: Bytes,
     upstream_timeout: Duration,
@@ -4089,16 +4179,15 @@ struct GenericForwardContext<'request> {
     model_id: Option<String>,
     request_metadata: BTreeMap<String, String>,
     in_flight_permit: InFlightPermit,
-    score_via_rerank: bool,
-    score_expected_count: Option<score_adapter::ScoreExpectations>,
+    response_adapter: Option<BufferedResponseAdapter>,
 }
 
-async fn rewrite_score_response_from_upstream(
+async fn rewrite_buffered_adapter_response_from_upstream(
     response_parts: ForwardedResponseParts,
     upstream_response: reqwest::Response,
     in_flight_permit: InFlightPermit,
+    adapter: BufferedResponseAdapter,
     model_id: Option<&str>,
-    expected_count: Option<score_adapter::ScoreExpectations>,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
     let body = match read_upstream_body_bytes_until_shutdown(
@@ -4120,17 +4209,18 @@ async fn rewrite_score_response_from_upstream(
     };
     let upstream_body_bytes = body.len();
     let (body, response_headers) = if upstream_status.is_success() {
-        match score_adapter::rerank_response_to_score_response(&body, model_id, expected_count) {
+        match adapter.rewrite(&body, model_id) {
             Ok(body) => {
                 // Transformed body: clean downstream headers only; keep original
                 // upstream headers on response_parts for attempt observability.
-                let headers = transformed_score_response_headers();
+                let headers = transformed_json_response_headers();
                 (body, headers)
             }
             Err(error) => {
                 return Err(response_parts.into_response_process_error(
                     ProxyError::upstream_body(format!(
-                        "score from rerank response rewrite failed: {error}"
+                        "{} response rewrite failed: {error}",
+                        adapter.label()
                     )),
                     BTreeMap::from([(
                         String::from("response_body_bytes"),
@@ -4165,8 +4255,9 @@ fn prepare_generic_attempt_request(
     context: &GenericForwardContext<'_>,
 ) -> (Option<HeaderMap>, BTreeMap<String, String>) {
     let override_headers = context
-        .score_via_rerank
-        .then(|| sanitize_score_adapt_request_headers(&context.downstream_headers));
+        .response_adapter
+        .is_some()
+        .then(|| sanitize_transformed_request_headers(&context.downstream_headers));
     let headers = override_headers
         .as_ref()
         .unwrap_or(&context.downstream_headers);
@@ -4175,7 +4266,7 @@ fn prepare_generic_attempt_request(
         String::from("upstream_request_body_bytes"),
         context.upstream_body.len().to_string(),
     );
-    if context.score_via_rerank {
+    if context.response_adapter.is_some() {
         metadata.insert(String::from("path"), context.upstream_url.path().to_owned());
         metadata.insert(
             String::from("query_present"),
@@ -4198,9 +4289,9 @@ async fn forward_generic_openai_request(
 
     let attempt_id = AttemptId::for_request(context.request_id, 1);
     let attempt_started_at_unix_ms = unix_time_millis();
-    let (score_identity_headers, mut attempt_request_metadata) =
+    let (transformed_request_headers, mut attempt_request_metadata) =
         prepare_generic_attempt_request(&context);
-    let downstream_headers = match score_identity_headers.as_ref() {
+    let downstream_headers = match transformed_request_headers.as_ref() {
         Some(headers) => headers,
         None => &context.downstream_headers,
     };
@@ -4235,7 +4326,7 @@ async fn forward_generic_openai_request(
             UpstreamFailoverRetryContext {
                 registry: context.state.upstream_health.as_ref(),
                 profile: &context.upstream_profile,
-                uri: &context.uri,
+                uri: &context.upstream_uri,
                 shutdown: context.state.shutdown.as_ref(),
             },
         ),
@@ -4260,13 +4351,13 @@ async fn forward_generic_openai_request(
         attempt_request_metadata,
         shutdown: Arc::clone(&context.state.shutdown),
     };
-    if context.score_via_rerank {
-        return rewrite_score_response_from_upstream(
+    if let Some(adapter) = context.response_adapter {
+        return rewrite_buffered_adapter_response_from_upstream(
             response_parts,
             upstream_response,
             context.in_flight_permit,
+            adapter,
             context.model_id.as_deref(),
-            context.score_expected_count,
         )
         .await;
     }
@@ -10407,7 +10498,7 @@ fn classify_shielded_error_message_cause(message: &str) -> Option<UpstreamFailur
     }
 }
 
-fn sanitize_score_adapt_request_headers(headers: &HeaderMap) -> HeaderMap {
+fn sanitize_transformed_request_headers(headers: &HeaderMap) -> HeaderMap {
     let mut forwarded = forwarded_request_headers(headers);
     forwarded.remove(axum::http::header::ACCEPT_ENCODING);
     forwarded.insert(
@@ -10432,7 +10523,7 @@ fn sanitize_score_adapt_request_headers(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
-fn transformed_score_response_headers() -> HeaderMap {
+fn transformed_json_response_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     headers
@@ -10918,6 +11009,9 @@ fn header_value(value: &HeaderValue) -> String {
 }
 
 fn extract_model_id(method: &Method, uri: &Uri, body: &Bytes) -> Option<String> {
+    if let Some(model) = deepinfra_rerank_adapter::model_id_from_path(method, uri) {
+        return Some(model.to_owned());
+    }
     if score_adapter::is_score_request(method, uri) {
         return score_adapter::model_id_from_score_body(body);
     }

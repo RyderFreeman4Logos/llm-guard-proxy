@@ -1023,6 +1023,7 @@ async fn models_burst_above_old_control_plane_cap_succeeds_and_health_stays_resp
     drop(active_model_responses);
 }
 
+mod deepinfra_rerank_endpoint;
 mod score_endpoint;
 mod upstream_failover;
 #[tokio::test]
@@ -18189,6 +18190,10 @@ fn fake_upstream_endpoint_response(
         );
     }
 
+    if endpoint == "/v1/score" && path_and_query.contains("test=deepinfra-rerank") {
+        return fake_deepinfra_score_response(path_and_query);
+    }
+
     let (label, body) = match endpoint {
         "/v1/models" => ("models", r#"{"object":"list","data":[]}"#),
         "/v1/chat/completions" => (
@@ -18213,6 +18218,32 @@ fn fake_upstream_endpoint_response(
     };
     let mut response = json_response(label, body.to_owned());
     *response.status_mut() = status;
+    response
+}
+
+fn fake_deepinfra_score_response(path_and_query: &str) -> Response<Body> {
+    let body = if path_and_query.contains("test=deepinfra-rerank-malformed") {
+        r#"{"id":"score-native-malformed","data":[{"index":0,"score":0.0},{"index":0,"score":0.5},{"index":2,"score":1.0}],"usage":{"prompt_tokens":19}}"#
+    } else {
+        r#"{"id":"score-native-123","object":"list","model":"qwen3-reranker-8b","data":[{"index":2,"object":"score","score":0.0},{"index":0,"object":"score","score":-1.0},{"index":1,"object":"score","score":1.0}],"usage":{"prompt_tokens":19,"total_tokens":19,"completion_tokens":0}}"#
+    };
+    let mut response = json_response("deepinfra-score", body.to_owned());
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.vllm.score+json"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("server"),
+        HeaderValue::from_static("private-vllm-score"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-request-id"),
+        HeaderValue::from_static("private-vllm-request-id"),
+    );
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-only"),
+        HeaderValue::from_static("must-not-leak"),
+    );
     response
 }
 

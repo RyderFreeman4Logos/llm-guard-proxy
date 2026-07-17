@@ -123,6 +123,79 @@ async fn connection_refused_after_ready_probe_retries_on_failover() {
 }
 
 #[tokio::test]
+async fn deepinfra_adapted_score_path_survives_initial_failover_selection() {
+    let primary_base_url = closed_upstream_base_url().await;
+    let mut backup = FakeUpstream::spawn().await;
+    let extra_config = failover_profile_config_for_model(
+        deepinfra_rerank_adapter::MODEL_ID,
+        &primary_base_url,
+        Some(&backup.base_url),
+        "20ms",
+        "10ms",
+        "400ms",
+    );
+    let proxy = spawn_failover_proxy(&backup.base_url, &extra_config).await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}{path}?test=deepinfra-rerank-initial-failover",
+            proxy.base_url,
+            path = deepinfra_rerank_adapter::INFERENCE_PATH,
+        ))
+        .json(&json!({"queries": ["q1", "q2", "q3"], "documents": ["d1", "d2", "d3"]}))
+        .send()
+        .await
+        .expect("adapted request should fail over");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response body should drain");
+    assert_eq!(backup.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(
+        backup.recv_next().await.path_and_query,
+        "/v1/score?test=deepinfra-rerank-initial-failover"
+    );
+}
+
+#[tokio::test]
+async fn deepinfra_adapted_score_path_survives_connect_retry_failover() {
+    let (primary_base_url, primary_probe_seen) = spawn_probe_then_stop_upstream().await;
+    let mut backup = FakeUpstream::spawn().await;
+    let extra_config = failover_profile_config_for_model(
+        deepinfra_rerank_adapter::MODEL_ID,
+        &primary_base_url,
+        Some(&backup.base_url),
+        "20ms",
+        "50ms",
+        "1s",
+    );
+    let proxy = spawn_failover_proxy(&backup.base_url, &extra_config).await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}{path}?test=deepinfra-rerank-retry-failover",
+            proxy.base_url,
+            path = deepinfra_rerank_adapter::INFERENCE_PATH,
+        ))
+        .json(&json!({"queries": ["q1", "q2", "q3"], "documents": ["d1", "d2", "d3"]}))
+        .send()
+        .await
+        .expect("adapted request should retry on failover");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response body should drain");
+    primary_probe_seen
+        .await
+        .expect("primary should receive the initial readiness probe");
+    assert_eq!(backup.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(
+        backup.recv_next().await.path_and_query,
+        "/v1/score?test=deepinfra-rerank-retry-failover"
+    );
+}
+
+#[tokio::test]
 async fn burst_requests_share_cached_health_probe() {
     let primary_base_url = closed_upstream_base_url().await;
     let mut backup = FakeUpstream::spawn().await;
@@ -263,6 +336,24 @@ fn failover_profile_config(
     probe_timeout: &str,
     max_wait: &str,
 ) -> String {
+    failover_profile_config_for_model(
+        "same-model",
+        primary_base_url,
+        backup_base_url,
+        interval,
+        probe_timeout,
+        max_wait,
+    )
+}
+
+fn failover_profile_config_for_model(
+    model: &str,
+    primary_base_url: &str,
+    backup_base_url: Option<&str>,
+    interval: &str,
+    probe_timeout: &str,
+    max_wait: &str,
+) -> String {
     let backup = backup_base_url.map_or_else(String::new, |base_url| {
         format!(
             r#"
@@ -275,7 +366,7 @@ priority = "failover"
     format!(
         r#"
 [[profile]]
-model = "same-model"
+model = "{model}"
 health_probe_interval = "{interval}"
 health_probe_timeout = "{probe_timeout}"
 health_probe_max_wait = "{max_wait}"
