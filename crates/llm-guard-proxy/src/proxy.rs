@@ -44,8 +44,9 @@ use llm_guard_proxy_core::{
     AppConfig, ConfigHandle, DefaultInjectionSchema, DownstreamDropPolicy, Health, HeartbeatMode,
     LICENSE, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
     MetadataConfig, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
-    ShadowComparisonAttempt, ThinkingConfig, ThinkingMode, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    ShadowComparisonAttempt, ThinkingConfig, ThinkingMode, UpstreamEndpointProtocol,
+    UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url,
+    validate_upstream_base_url,
 };
 use llm_guard_proxy_state::{
     AttemptId, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
@@ -76,6 +77,7 @@ mod buffered_adapter;
 mod deepinfra_rerank_adapter;
 mod model_metadata;
 mod recovery;
+mod reranker_protocol;
 mod score_adapter;
 mod shielded_chat;
 mod upstream_failover;
@@ -86,6 +88,7 @@ use buffered_adapter::{
     BufferedResponseAdapter, adapt_openai_request_if_needed,
     rewrite_buffered_adapter_response_from_upstream, sanitize_transformed_request_headers,
 };
+use reranker_protocol::{CanonicalRerankerRequest, RenderedEndpointRequest};
 
 #[cfg(all(test, unix))]
 use recovery::send_recovery_process_group_signal;
@@ -2629,6 +2632,26 @@ async fn forward_openai_request(
             .upstream_profile
             .base_url
             .clone_from(&selected.base_url);
+        if selected.endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
+            let canonical = prepared_request
+                .canonical_reranker
+                .as_ref()
+                .ok_or_else(|| ProxyError::ContextBudgetExceeded {
+                    message: String::from(
+                        "selected DeepInfra endpoint only supports normalized reranker requests",
+                    ),
+                    param: "path",
+                    code: "unsupported_reranker_endpoint_request",
+                    request_metadata: None,
+                })?;
+            let rendered =
+                reranker_protocol::render(&selected.endpoint, canonical, &downstream_headers)
+                    .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+            prepared_request.forward_uri = rendered.uri;
+            prepared_request.upstream_url = rendered.url;
+            prepared_request.shielded_chat_plan.upstream_body = rendered.body;
+            prepared_request.upstream_headers = Some(rendered.headers);
+        }
         request_metadata.insert(
             String::from("upstream_endpoint_priority"),
             match selected.priority {
@@ -2643,6 +2666,18 @@ async fn forward_openai_request(
         request_metadata.insert(
             String::from("upstream_endpoint_base_url"),
             redact_upstream_base_url(&selected.base_url),
+        );
+        request_metadata.insert(
+            String::from("upstream_endpoint_protocol"),
+            selected.endpoint.protocol.as_str().to_owned(),
+        );
+        request_metadata.insert(
+            String::from("upstream_endpoint_selection"),
+            prepared_request
+                .upstream_profile
+                .endpoint_selection
+                .as_str()
+                .to_owned(),
         );
     }
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry, &config.loop_guard);
@@ -2733,6 +2768,9 @@ async fn forward_openai_request(
         request_metadata,
         in_flight_permit,
         response_adapter: prepared_request.response_adapter,
+        canonical_reranker: prepared_request.canonical_reranker,
+        transformed_request_headers: prepared_request.transformed_request_headers,
+        upstream_headers: prepared_request.upstream_headers,
     })
     .await
 }
@@ -2911,6 +2949,9 @@ struct PreparedOpenAiRequest {
     reqwest_method: reqwest::Method,
     shielded_chat_plan: ShieldedChatPlan,
     response_adapter: Option<BufferedResponseAdapter>,
+    canonical_reranker: Option<CanonicalRerankerRequest>,
+    transformed_request_headers: bool,
+    upstream_headers: Option<HeaderMap>,
 }
 
 #[cfg(feature = "guard")]
@@ -2965,7 +3006,26 @@ fn prepare_openai_forward_request(
     let upstream_profile = selected_profile.profile;
     let route_reason = selected_profile.route_reason;
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
-    let response_adapter = adapted_request.response_adapter;
+    let canonical_reranker = reranker_protocol::capture_request(
+        method,
+        uri,
+        body,
+        &adapted_request.forward_uri,
+        &adapted_request.adapted_body,
+    );
+    let transformed_request_headers = adapted_request.response_adapter.is_some();
+    let response_adapter = if upstream_profile
+        .endpoints
+        .iter()
+        .any(|endpoint| endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank)
+        && let Some(canonical) = canonical_reranker.as_ref()
+    {
+        Some(BufferedResponseAdapter::HeterogeneousReranker(
+            reranker_protocol::response_contract(canonical)?,
+        ))
+    } else {
+        adapted_request.response_adapter
+    };
     let forward_uri = adapted_request.forward_uri;
     let adapted_body = adapted_request.adapted_body;
     let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
@@ -3016,6 +3076,9 @@ fn prepare_openai_forward_request(
         reqwest_method,
         shielded_chat_plan,
         response_adapter,
+        canonical_reranker,
+        transformed_request_headers,
+        upstream_headers: None,
     })
 }
 
@@ -3982,15 +4045,19 @@ struct GenericForwardContext<'request> {
     request_metadata: BTreeMap<String, String>,
     in_flight_permit: InFlightPermit,
     response_adapter: Option<BufferedResponseAdapter>,
+    canonical_reranker: Option<CanonicalRerankerRequest>,
+    transformed_request_headers: bool,
+    upstream_headers: Option<HeaderMap>,
 }
 
 fn prepare_generic_attempt_request(
     context: &GenericForwardContext<'_>,
 ) -> (Option<HeaderMap>, BTreeMap<String, String>) {
-    let override_headers = context
-        .response_adapter
-        .is_some()
-        .then(|| sanitize_transformed_request_headers(&context.downstream_headers));
+    let override_headers = context.upstream_headers.clone().or_else(|| {
+        context
+            .transformed_request_headers
+            .then(|| sanitize_transformed_request_headers(&context.downstream_headers))
+    });
     let headers = override_headers
         .as_ref()
         .unwrap_or(&context.downstream_headers);
@@ -4009,14 +4076,32 @@ fn prepare_generic_attempt_request(
     (override_headers, metadata)
 }
 
+fn merged_models_groups(context: &GenericForwardContext<'_>) -> Option<Vec<ModelsUpstreamGroup>> {
+    let groups = listener_models_upstream_groups(context.config, &context.state.listener)?;
+    (is_control_plane_models_request(&context.method, &context.uri) && groups.len() > 1)
+        .then_some(groups)
+}
+
+fn copy_endpoint_selection_metadata(
+    source: &BTreeMap<String, String>,
+    target: &mut BTreeMap<String, String>,
+) {
+    for key in [
+        "upstream_endpoint_priority",
+        "upstream_failover_selected",
+        "upstream_endpoint_protocol",
+        "upstream_endpoint_selection",
+    ] {
+        if let Some(value) = source.get(key) {
+            target.insert(String::from(key), value.clone());
+        }
+    }
+}
+
 async fn forward_generic_openai_request(
     context: GenericForwardContext<'_>,
 ) -> Result<Response<Body>, ProxyError> {
-    if is_control_plane_models_request(&context.method, &context.uri)
-        && let Some(groups) =
-            listener_models_upstream_groups(context.config, &context.state.listener)
-        && groups.len() > 1
-    {
+    if let Some(groups) = merged_models_groups(&context) {
         return forward_merged_models_response(context, groups).await;
     }
 
@@ -4041,6 +4126,7 @@ async fn forward_generic_openai_request(
         &context.liveness,
         &context.thinking_metadata,
     );
+    copy_endpoint_selection_metadata(&context.request_metadata, &mut attempt_request_metadata);
     let upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
         client: &context.state.client,
         method: context.reqwest_method,
@@ -4059,7 +4145,10 @@ async fn forward_generic_openai_request(
             UpstreamFailoverRetryContext {
                 registry: context.state.upstream_health.as_ref(),
                 profile: &context.upstream_profile,
-                uri: &context.upstream_uri,
+                local_forward_uri: context.upstream_uri.clone(),
+                original_downstream_headers: &context.downstream_headers,
+                canonical_reranker: context.canonical_reranker.as_ref(),
+                transformed_request_headers: context.transformed_request_headers,
                 shutdown: context.state.shutdown.as_ref(),
             },
         ),
@@ -4337,7 +4426,10 @@ fn upstream_body_error_with_observability(
 struct UpstreamFailoverRetryContext<'request> {
     registry: &'request UpstreamHealthRegistry,
     profile: &'request UpstreamProfileConfig,
-    uri: &'request Uri,
+    local_forward_uri: Uri,
+    original_downstream_headers: &'request HeaderMap,
+    canonical_reranker: Option<&'request CanonicalRerankerRequest>,
+    transformed_request_headers: bool,
     shutdown: &'request ShutdownGate,
 }
 
@@ -4358,6 +4450,24 @@ struct UpstreamAttemptContext<'request> {
     failover_retry: Option<UpstreamFailoverRetryContext<'request>>,
 }
 
+fn render_retry_openai_request(
+    retry: &UpstreamFailoverRetryContext<'_>,
+    base_url: &str,
+    body: &Bytes,
+) -> Result<RenderedEndpointRequest, ProxyError> {
+    let headers = if retry.transformed_request_headers {
+        sanitize_transformed_request_headers(retry.original_downstream_headers)
+    } else {
+        retry.original_downstream_headers.clone()
+    };
+    Ok(RenderedEndpointRequest {
+        url: build_upstream_url(base_url, &retry.local_forward_uri)?,
+        uri: retry.local_forward_uri.clone(),
+        body: body.clone(),
+        headers,
+    })
+}
+
 async fn send_first_upstream_attempt(
     context: UpstreamAttemptContext<'_>,
 ) -> Result<reqwest::Response, ProxyError> {
@@ -4374,40 +4484,60 @@ async fn send_first_upstream_attempt(
     )
     .await;
 
-    if matches!(
-        result,
-        Err(ProxyError::UpstreamTransport {
-            failure: ReqwestFailureKind::Connect,
-            ..
-        })
-    ) && let Some(retry) = context.failover_retry.as_ref()
-    {
-        retry.registry.mark_unhealthy(&retry.profile.base_url);
-        result = match retry
-            .registry
-            .select_endpoint(context.client, retry.profile, retry.shutdown)
-            .await
+    if let Some(retry) = context.failover_retry.as_ref() {
+        let mut attempted_base_urls = vec![retry.profile.base_url.clone()];
+        while is_retryable_endpoint_result(&result)
+            && attempted_base_urls.len() < retry.profile.endpoints.len()
         {
-            Ok(selected) => match build_upstream_url(&selected.base_url, retry.uri) {
-                Ok(upstream_url) => {
+            let last = attempted_base_urls
+                .last()
+                .expect("attempted endpoint list is initialized");
+            retry.registry.mark_unhealthy(last);
+            let selected = match retry
+                .registry
+                .select_endpoint_excluding(
+                    context.client,
+                    retry.profile,
+                    retry.shutdown,
+                    &attempted_base_urls,
+                )
+                .await
+            {
+                Ok(selected) => selected,
+                Err(EndpointSelectionError::Shutdown) => {
+                    result = Err(ProxyError::server_shutdown());
+                    break;
+                }
+                Err(EndpointSelectionError::Unavailable { profile, waited_ms }) => {
+                    result = Err(ProxyError::upstream_unavailable(profile, waited_ms));
+                    break;
+                }
+            };
+            attempted_base_urls.push(selected.base_url.clone());
+            let rendered = match retry.canonical_reranker {
+                Some(canonical) => reranker_protocol::render(
+                    &selected.endpoint,
+                    canonical,
+                    retry.original_downstream_headers,
+                ),
+                None => render_retry_openai_request(retry, &selected.base_url, &retry_body),
+            };
+            result = match rendered {
+                Ok(rendered) => {
                     send_upstream_request_until_shutdown(
                         context.client,
-                        retry_method,
-                        upstream_url,
-                        context.downstream_headers,
-                        retry_body,
+                        retry_method.clone(),
+                        rendered.url,
+                        &rendered.headers,
+                        rendered.body,
                         context.upstream_timeout,
                         retry.shutdown.subscribe(),
                     )
                     .await
                 }
                 Err(error) => Err(error),
-            },
-            Err(EndpointSelectionError::Shutdown) => Err(ProxyError::server_shutdown()),
-            Err(EndpointSelectionError::Unavailable { profile, waited_ms }) => {
-                Err(ProxyError::upstream_unavailable(profile, waited_ms))
-            }
-        };
+            };
+        }
     }
 
     match result {
@@ -4428,6 +4558,25 @@ async fn send_first_upstream_attempt(
             });
             Err(error.with_observability(context.request_metadata.clone(), attempt_record))
         }
+    }
+}
+
+fn is_retryable_endpoint_result(result: &Result<reqwest::Response, ProxyError>) -> bool {
+    match result {
+        Err(ProxyError::UpstreamTransport { failure, .. }) => {
+            matches!(
+                failure,
+                ReqwestFailureKind::Connect | ReqwestFailureKind::Timeout
+            )
+        }
+        Ok(response) => matches!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::GATEWAY_TIMEOUT
+        ),
+        Err(_) => false,
     }
 }
 

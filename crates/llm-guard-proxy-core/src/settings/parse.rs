@@ -13,12 +13,13 @@ use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 use super::ParamOverrideConfig;
 use super::{
     AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DefaultInjectionSchema,
-    DownstreamDropPolicy, GuardianConfig, GuardianKillAction, HeartbeatConfig, HeartbeatMode,
-    HotRestartConfig, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
-    LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig, RetentionConfig,
-    RetryConfig, RetryLadderConfig, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
-    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
-    UpstreamEndpointConfig, UpstreamPriority, UpstreamProfileConfig, UpstreamStallConfig,
+    DownstreamDropPolicy, EndpointSelectionMode, GuardianConfig, GuardianKillAction,
+    HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig, LocalRecoveryConfig,
+    LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy,
+    ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig, ServerConfig,
+    ShadowComparisonAttempt, ShieldingConfig, ThinkingConfig, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamEndpointConfig, UpstreamEndpointProtocol,
+    UpstreamPriority, UpstreamProfileConfig, UpstreamStallConfig,
 };
 #[cfg(feature = "guard")]
 use super::{UnknownKeyPolicy, VirtualKeyConfig};
@@ -158,7 +159,13 @@ fn parse_section(
         *current_upstream_profile = Some(index);
         return Ok(Section::UpstreamProfile(index));
     }
-    if line == "[[profile.upstream]]" || line == "[[upstreams.upstream]]" {
+    if matches!(
+        line,
+        "[[profile.upstream]]"
+            | "[[upstreams.upstream]]"
+            | "[[profile.endpoints]]"
+            | "[[upstreams.endpoints]]"
+    ) {
         let profile = current_upstream_profile.ok_or_else(|| {
             ConfigParseError::new(
                 line_number,
@@ -927,6 +934,9 @@ fn assign_upstream_profile(
         }
         "base_url" => config.base_url = parse_string(value, line_number)?,
         "match_models" => config.match_models = parse_string_array(value, line_number)?,
+        "endpoint_selection" => {
+            config.endpoint_selection = parse_endpoint_selection_mode(value, line_number)?;
+        }
         "health_probe_interval" => {
             config.health_probe_interval_ms =
                 parse_duration_ms(value, line_number, "profile.health_probe_interval")?;
@@ -983,9 +993,44 @@ fn assign_upstream_endpoint(
     match key {
         "base_url" => config.base_url = parse_string(value, line_number)?,
         "priority" => config.priority = parse_upstream_priority(value, line_number)?,
+        "protocol" => config.protocol = parse_upstream_endpoint_protocol(value, line_number)?,
+        "model" => config.model = parse_optional_string(value, line_number)?,
+        "api_key_env" => config.api_key_env = parse_optional_string(value, line_number)?,
         _ => return unknown_key("profile.upstream", key, line_number),
     }
     Ok(())
+}
+
+fn parse_endpoint_selection_mode(
+    value: &str,
+    line_number: usize,
+) -> Result<EndpointSelectionMode, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "priority_failover" => Ok(EndpointSelectionMode::PriorityFailover),
+        "round_robin" => Ok(EndpointSelectionMode::RoundRobin),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid upstreams.endpoint_selection {other:?}; expected \"priority_failover\" or \"round_robin\""
+            ),
+        )),
+    }
+}
+
+fn parse_upstream_endpoint_protocol(
+    value: &str,
+    line_number: usize,
+) -> Result<UpstreamEndpointProtocol, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "openai" => Ok(UpstreamEndpointProtocol::OpenAi),
+        "deepinfra_qwen3_rerank" => Ok(UpstreamEndpointProtocol::DeepInfraQwen3Rerank),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid profile.upstream.protocol {other:?}; expected \"openai\" or \"deepinfra_qwen3_rerank\""
+            ),
+        )),
+    }
 }
 
 fn parse_upstream_priority(

@@ -14,13 +14,15 @@ use llm_guard_proxy_state::RawPayloads;
 use super::{
     ForwardedResponseParts, InFlightPermit, ObservedBufferedBody, ProxyError,
     deepinfra_rerank_adapter, downstream_mode_from_headers, downstream_response,
-    forwarded_request_headers, read_upstream_body_bytes_until_shutdown, score_adapter,
+    forwarded_request_headers, read_upstream_body_bytes_until_shutdown, reranker_protocol,
+    score_adapter,
 };
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum BufferedResponseAdapter {
     ScoreFromRerank(Option<score_adapter::ScoreExpectations>),
     DeepInfraQwen3Rerank(deepinfra_rerank_adapter::ResponseExpectations),
+    HeterogeneousReranker(reranker_protocol::ResponseContract),
 }
 
 impl BufferedResponseAdapter {
@@ -32,6 +34,9 @@ impl BufferedResponseAdapter {
             Self::DeepInfraQwen3Rerank(expected) => {
                 deepinfra_rerank_adapter::score_response_to_deepinfra_response(body, expected)
             }
+            Self::HeterogeneousReranker(contract) => {
+                reranker_protocol::rewrite_response(body, contract, model_id)
+            }
         }
     }
 
@@ -39,6 +44,7 @@ impl BufferedResponseAdapter {
         match self {
             Self::ScoreFromRerank(_) => "score from rerank",
             Self::DeepInfraQwen3Rerank(_) => "DeepInfra rerank from score",
+            Self::HeterogeneousReranker(_) => "heterogeneous reranker response",
         }
     }
 }

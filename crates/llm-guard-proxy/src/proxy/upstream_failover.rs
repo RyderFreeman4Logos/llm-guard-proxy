@@ -6,7 +6,8 @@ use std::{
 
 use axum::http::Uri;
 use llm_guard_proxy_core::{
-    ConfigHandle, UpstreamEndpointConfig, UpstreamPriority, UpstreamProfileConfig,
+    ConfigHandle, EndpointSelectionMode, UpstreamEndpointConfig, UpstreamEndpointProtocol,
+    UpstreamPriority, UpstreamProfileConfig,
 };
 use reqwest::Client;
 use tokio::{
@@ -22,6 +23,7 @@ const HEALTH_PROBE_HEADER: &str = "x-llm-guard-proxy-probe";
 #[derive(Debug, Default)]
 pub(super) struct UpstreamHealthRegistry {
     endpoints: Mutex<HashMap<String, Arc<EndpointHealth>>>,
+    round_robin_positions: Mutex<HashMap<String, usize>>,
     background_started: std::sync::atomic::AtomicBool,
 }
 
@@ -41,6 +43,7 @@ struct ProbeSnapshot {
 pub(super) struct SelectedUpstreamEndpoint {
     pub(super) base_url: String,
     pub(super) priority: UpstreamPriority,
+    pub(super) endpoint: UpstreamEndpointConfig,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -56,23 +59,42 @@ impl UpstreamHealthRegistry {
         profile: &UpstreamProfileConfig,
         shutdown: &ShutdownGate,
     ) -> Result<SelectedUpstreamEndpoint, EndpointSelectionError> {
+        self.select_endpoint_excluding(client, profile, shutdown, &[])
+            .await
+    }
+
+    pub(super) async fn select_endpoint_excluding(
+        &self,
+        client: &Client,
+        profile: &UpstreamProfileConfig,
+        shutdown: &ShutdownGate,
+        excluded_base_urls: &[String],
+    ) -> Result<SelectedUpstreamEndpoint, EndpointSelectionError> {
         if !profile.has_endpoint_failover() {
+            let endpoint = UpstreamEndpointConfig {
+                base_url: profile.base_url.clone(),
+                priority: UpstreamPriority::Primary,
+                ..UpstreamEndpointConfig::default()
+            };
             return Ok(SelectedUpstreamEndpoint {
                 base_url: profile.base_url.clone(),
                 priority: UpstreamPriority::Primary,
+                endpoint,
             });
         }
 
         let started_at = Instant::now();
         let deadline = started_at + Duration::from_millis(profile.health_probe_max_wait_ms);
-        let mut endpoints = profile.endpoints.clone();
-        endpoints.sort_by_key(|endpoint| match endpoint.priority {
-            UpstreamPriority::Primary => 0_u8,
-            UpstreamPriority::Failover => 1_u8,
-        });
+        let endpoints = self.selection_order(profile);
 
         loop {
             for endpoint in &endpoints {
+                if excluded_base_urls
+                    .iter()
+                    .any(|base_url| base_url == &endpoint.base_url)
+                {
+                    continue;
+                }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -90,6 +112,7 @@ impl UpstreamHealthRegistry {
                     return Ok(SelectedUpstreamEndpoint {
                         base_url: endpoint.base_url.clone(),
                         priority: endpoint.priority,
+                        endpoint: endpoint.clone(),
                     });
                 }
             }
@@ -121,6 +144,9 @@ impl UpstreamHealthRegistry {
         probe_timeout: Duration,
         shutdown: &ShutdownGate,
     ) -> Result<bool, EndpointSelectionError> {
+        if endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
+            return Ok(super::reranker_protocol::has_runtime_credential(endpoint));
+        }
         let health = self.endpoint_health(&endpoint.base_url);
         if let Some(healthy) = recent_health(&health, probe_interval) {
             return Ok(healthy);
@@ -154,6 +180,28 @@ impl UpstreamHealthRegistry {
                 .entry(base_url.to_owned())
                 .or_insert_with(|| Arc::new(EndpointHealth::default())),
         )
+    }
+
+    fn selection_order(&self, profile: &UpstreamProfileConfig) -> Vec<UpstreamEndpointConfig> {
+        let mut endpoints = profile.endpoints.clone();
+        endpoints.sort_by_key(|endpoint| match endpoint.priority {
+            UpstreamPriority::Primary => 0_u8,
+            UpstreamPriority::Failover => 1_u8,
+        });
+        if profile.endpoint_selection != EndpointSelectionMode::RoundRobin || endpoints.len() < 2 {
+            return endpoints;
+        }
+        let offset = self.next_round_robin_offset(&profile.name, endpoints.len());
+        endpoints.rotate_left(offset);
+        endpoints
+    }
+
+    fn next_round_robin_offset(&self, profile_name: &str, endpoint_count: usize) -> usize {
+        let mut positions = mutex_guard(&self.round_robin_positions);
+        let next = positions.entry(profile_name.to_owned()).or_insert(0);
+        let offset = *next % endpoint_count;
+        *next = next.wrapping_add(1);
+        offset
     }
 
     pub(super) fn mark_unhealthy(&self, base_url: &str) {

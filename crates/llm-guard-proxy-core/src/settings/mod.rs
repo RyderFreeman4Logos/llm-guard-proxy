@@ -16,15 +16,15 @@ pub use error::{ConfigParseError, ValidationError};
 pub use model::ParamOverrideConfig;
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, DefaultInjectionSchema, DownstreamDropPolicy,
-    EmbeddingProvider, EmbeddingQueuePolicy, EvidenceConfig, EvidencePairedComparisonConfig,
-    EvidenceShadowConfig, GuardianConfig, GuardianKillAction, HeartbeatConfig, HeartbeatMode,
-    HotRestartConfig, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
-    LoopGuardEmbeddingConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy,
-    ObservabilityConfig, RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
-    SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
-    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
-    UpstreamEndpointConfig, UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason,
-    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    EmbeddingProvider, EmbeddingQueuePolicy, EndpointSelectionMode, EvidenceConfig,
+    EvidencePairedComparisonConfig, EvidenceShadowConfig, GuardianConfig, GuardianKillAction,
+    HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig, LocalRecoveryConfig,
+    LoopFailurePolicy, LoopGuardConfig, LoopGuardEmbeddingConfig, LoopGuardMode, MetadataConfig,
+    NoThinkingMarkerPolicy, ObservabilityConfig, RestartRequiredChange, RetentionConfig,
+    RetryConfig, RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt,
+    ShieldingConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 pub use model::{BudgetConfig, GuardWorkflowConfig};
@@ -169,6 +169,10 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstream.local_recovery.restart_timeout_ms",
     "upstream.local_recovery.readiness_endpoint",
     "upstream.local_recovery.readiness_body",
+    "upstreams.endpoint_selection",
+    "upstreams.endpoints.protocol",
+    "upstreams.endpoints.model",
+    "upstreams.endpoints.api_key_env",
     "upstream.local_recovery.readiness_request_timeout_ms",
     "upstream.local_recovery.readiness_deadline_ms",
     "upstream.local_recovery.readiness_interval_ms",

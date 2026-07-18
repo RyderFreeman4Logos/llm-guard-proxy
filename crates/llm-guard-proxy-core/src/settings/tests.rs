@@ -2,10 +2,11 @@
 use super::GuardWorkflowConfig;
 use super::{
     AppConfig, ConfigHandle, ConfigParseError, DefaultInjectionSchema, DownstreamDropPolicy,
-    GuardianKillAction, HeartbeatMode, LoopFailurePolicy, LoopGuardMode, NoThinkingMarkerPolicy,
-    RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ShadowComparisonAttempt, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamPriority, UpstreamRouteReason, ValidationError,
-    apply_reloadable, parse::parse_config_text, redact_upstream_base_url,
+    EndpointSelectionMode, GuardianKillAction, HeartbeatMode, LoopFailurePolicy, LoopGuardMode,
+    NoThinkingMarkerPolicy, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ShadowComparisonAttempt,
+    ThinkingMode, ToolRequestThinkingPolicy, UpstreamEndpointProtocol, UpstreamPriority,
+    UpstreamRouteReason, ValidationError, apply_reloadable, parse::parse_config_text,
+    redact_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 use crate::{
@@ -445,6 +446,126 @@ priority = "failover"
     assert_eq!(profile.endpoints[1].base_url, "http://gb10:18011/v1");
     assert_eq!(profile.endpoints[1].priority, UpstreamPriority::Failover);
     assert_eq!(profile.primary_base_url(), "http://gb10:18010/v1");
+}
+
+#[test]
+fn parses_heterogeneous_reranker_endpoints_with_round_robin_selection() {
+    let config = parse_config_text(
+        r#"
+[[upstreams]]
+name = "qwen3-reranker-8b"
+base_url = "http://gb10:18013/v1"
+match_models = ["Querit/Querit-4B", "Qwen/Qwen3-Reranker-8B", "qwen3-reranker-8b"]
+endpoint_selection = "round_robin"
+
+[[upstreams.endpoints]]
+base_url = "http://gb10:18013/v1"
+priority = "primary"
+
+[[upstreams.endpoints]]
+base_url = "https://api.deepinfra.com"
+priority = "failover"
+protocol = "deepinfra_qwen3_rerank"
+model = "Qwen/Qwen3-Reranker-8B"
+api_key_env = "LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY"
+"#,
+    )
+    .expect("heterogeneous endpoint configuration should parse");
+
+    config
+        .validate()
+        .expect("heterogeneous endpoint configuration should validate");
+    let profile = &config.upstream_profiles[0];
+    assert_eq!(
+        profile.endpoint_selection,
+        EndpointSelectionMode::RoundRobin
+    );
+    assert_eq!(
+        profile.endpoints[0].protocol,
+        UpstreamEndpointProtocol::OpenAi
+    );
+    assert_eq!(
+        profile.endpoints[1].protocol,
+        UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+    );
+    assert_eq!(
+        profile.endpoints[1].model.as_deref(),
+        Some("Qwen/Qwen3-Reranker-8B")
+    );
+    assert_eq!(
+        profile.endpoints[1].api_key_env.as_deref(),
+        Some("LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY")
+    );
+}
+
+#[test]
+fn rejects_invalid_heterogeneous_reranker_endpoint_fields() {
+    let unknown_protocol = parse_config_text(
+        r#"
+[[profile]]
+model = "qwen3-reranker-8b"
+
+[[profile.endpoints]]
+base_url = "http://127.0.0.1:18013/v1"
+priority = "primary"
+protocol = "unsupported"
+"#,
+    )
+    .expect_err("unknown endpoint protocol must fail while parsing");
+    assert!(
+        unknown_protocol
+            .to_string()
+            .contains("invalid profile.upstream.protocol")
+    );
+
+    for (field, configuration) in [
+        (
+            "profile.upstream.model",
+            r#"
+[[profile]]
+model = "qwen3-reranker-8b"
+
+[[profile.endpoints]]
+base_url = "https://api.deepinfra.com"
+priority = "primary"
+protocol = "deepinfra_qwen3_rerank"
+api_key_env = "LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY"
+"#,
+        ),
+        (
+            "profile.upstream.api_key_env",
+            r#"
+[[profile]]
+model = "qwen3-reranker-8b"
+
+[[profile.endpoints]]
+base_url = "https://api.deepinfra.com"
+priority = "primary"
+protocol = "deepinfra_qwen3_rerank"
+model = "Qwen/Qwen3-Reranker-8B"
+api_key_env = "not-a-valid-environment-name"
+"#,
+        ),
+        (
+            "profile.upstream.protocol",
+            r#"
+[[profile]]
+model = "qwen3-reranker-8b"
+
+[[profile.endpoints]]
+base_url = "http://127.0.0.1:18013/v1"
+priority = "primary"
+model = "Qwen/Qwen3-Reranker-8B"
+"#,
+        ),
+    ] {
+        let config = parse_config_text(configuration)
+            .expect("recognized heterogeneous endpoint fields should parse");
+        let error = config
+            .validate()
+            .expect_err("invalid heterogeneous endpoint fields should fail validation");
+        assert_eq!(error.field(), field);
+    }
 }
 
 #[test]
