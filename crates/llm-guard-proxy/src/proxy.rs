@@ -44,9 +44,9 @@ use llm_guard_proxy_core::{
     AppConfig, ConfigHandle, DefaultInjectionSchema, DownstreamDropPolicy, Health, HeartbeatMode,
     LICENSE, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
     MetadataConfig, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
-    ShadowComparisonAttempt, ThinkingConfig, ThinkingMode, UpstreamEndpointProtocol,
-    UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url,
-    validate_upstream_base_url,
+    ShadowComparisonAttempt, ThinkingConfig, ThinkingMode, UpstreamEndpointConfig,
+    UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason,
+    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 use llm_guard_proxy_state::{
     AttemptId, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
@@ -82,7 +82,9 @@ mod score_adapter;
 mod shielded_chat;
 mod upstream_failover;
 
-use upstream_failover::{EndpointSelectionError, UpstreamHealthRegistry};
+use upstream_failover::{
+    EndpointSelectionConstraints, EndpointSelectionError, UpstreamHealthRegistry,
+};
 
 use buffered_adapter::{
     BufferedResponseAdapter, adapt_openai_request_if_needed,
@@ -2610,16 +2612,30 @@ async fn forward_openai_request(
     .await
     .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
     if prepared_request.upstream_profile.has_endpoint_failover() {
+        let upstream_deadline = Instant::now()
+            + Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
         let selected = state
             .upstream_health
             .select_endpoint(
                 &state.client,
                 &prepared_request.upstream_profile,
                 &state.shutdown,
+                prepared_request.canonical_reranker.as_ref(),
+                Some(upstream_deadline),
             )
             .await
             .map_err(|error| match error {
                 EndpointSelectionError::Shutdown => ProxyError::server_shutdown(),
+                EndpointSelectionError::Incompatible { profile } => {
+                    ProxyError::ContextBudgetExceeded {
+                        message: format!(
+                            "no configured endpoint can losslessly represent this request for profile {profile}"
+                        ),
+                        param: "body",
+                        code: "unsupported_reranker_endpoint_request",
+                        request_metadata: None,
+                    }
+                }
                 EndpointSelectionError::Unavailable { profile, waited_ms } => {
                     ProxyError::upstream_unavailable(profile, waited_ms)
                 }
@@ -2632,6 +2648,12 @@ async fn forward_openai_request(
             .upstream_profile
             .base_url
             .clone_from(&selected.base_url);
+        prepared_request.terminal_endpoint_protocol = selected.endpoint.protocol;
+        prepared_request.terminal_endpoint = selected.endpoint.clone();
+        prepared_request
+            .endpoint_retry_order
+            .clone_from(&selected.selection_order);
+        prepared_request.upstream_deadline = Some(upstream_deadline);
         if selected.endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
             let canonical = prepared_request
                 .canonical_reranker
@@ -2661,7 +2683,7 @@ async fn forward_openai_request(
         );
         request_metadata.insert(
             String::from("upstream_failover_selected"),
-            (selected.priority == llm_guard_proxy_core::UpstreamPriority::Failover).to_string(),
+            String::from("false"),
         );
         request_metadata.insert(
             String::from("upstream_endpoint_base_url"),
@@ -2771,6 +2793,10 @@ async fn forward_openai_request(
         canonical_reranker: prepared_request.canonical_reranker,
         transformed_request_headers: prepared_request.transformed_request_headers,
         upstream_headers: prepared_request.upstream_headers,
+        terminal_endpoint_protocol: prepared_request.terminal_endpoint_protocol,
+        terminal_endpoint: prepared_request.terminal_endpoint,
+        upstream_deadline: prepared_request.upstream_deadline,
+        endpoint_retry_order: prepared_request.endpoint_retry_order,
     })
     .await
 }
@@ -2952,6 +2978,10 @@ struct PreparedOpenAiRequest {
     canonical_reranker: Option<CanonicalRerankerRequest>,
     transformed_request_headers: bool,
     upstream_headers: Option<HeaderMap>,
+    terminal_endpoint_protocol: UpstreamEndpointProtocol,
+    terminal_endpoint: UpstreamEndpointConfig,
+    upstream_deadline: Option<Instant>,
+    endpoint_retry_order: Vec<String>,
 }
 
 #[cfg(feature = "guard")]
@@ -3020,9 +3050,10 @@ fn prepare_openai_forward_request(
         .any(|endpoint| endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank)
         && let Some(canonical) = canonical_reranker.as_ref()
     {
-        Some(BufferedResponseAdapter::HeterogeneousReranker(
-            reranker_protocol::response_contract(canonical)?,
-        ))
+        Some(BufferedResponseAdapter::HeterogeneousReranker {
+            request: canonical.clone(),
+            terminal_protocol: UpstreamEndpointProtocol::OpenAi,
+        })
     } else {
         adapted_request.response_adapter
     };
@@ -3061,6 +3092,7 @@ fn prepare_openai_forward_request(
         &upstream_profile,
     )?);
 
+    let (terminal_endpoint, endpoint_retry_order) = initial_endpoint_retry_state(&upstream_profile);
     Ok(PreparedOpenAiRequest {
         model_id,
         #[cfg(feature = "guard")]
@@ -3079,7 +3111,24 @@ fn prepare_openai_forward_request(
         canonical_reranker,
         transformed_request_headers,
         upstream_headers: None,
+        terminal_endpoint_protocol: UpstreamEndpointProtocol::OpenAi,
+        terminal_endpoint,
+        upstream_deadline: None,
+        endpoint_retry_order,
     })
+}
+
+fn initial_endpoint_retry_state(
+    upstream_profile: &UpstreamProfileConfig,
+) -> (UpstreamEndpointConfig, Vec<String>) {
+    (
+        UpstreamEndpointConfig {
+            base_url: upstream_profile.base_url.clone(),
+            priority: UpstreamPriority::Primary,
+            ..UpstreamEndpointConfig::default()
+        },
+        vec![upstream_profile.base_url.clone()],
+    )
 }
 
 #[cfg(feature = "guard")]
@@ -4048,16 +4097,27 @@ struct GenericForwardContext<'request> {
     canonical_reranker: Option<CanonicalRerankerRequest>,
     transformed_request_headers: bool,
     upstream_headers: Option<HeaderMap>,
+    terminal_endpoint_protocol: UpstreamEndpointProtocol,
+    terminal_endpoint: UpstreamEndpointConfig,
+    upstream_deadline: Option<Instant>,
+    endpoint_retry_order: Vec<String>,
 }
+
+#[derive(Clone, Copy)]
+struct TerminalEndpointProtocol(UpstreamEndpointProtocol);
 
 fn prepare_generic_attempt_request(
     context: &GenericForwardContext<'_>,
 ) -> (Option<HeaderMap>, BTreeMap<String, String>) {
-    let override_headers = context.upstream_headers.clone().or_else(|| {
+    let mut override_headers = context.upstream_headers.clone().or_else(|| {
         context
             .transformed_request_headers
             .then(|| sanitize_transformed_request_headers(&context.downstream_headers))
     });
+    if context.response_adapter.is_some() {
+        let headers = override_headers.get_or_insert_with(|| context.downstream_headers.clone());
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    }
     let headers = override_headers
         .as_ref()
         .unwrap_or(&context.downstream_headers);
@@ -4127,12 +4187,12 @@ async fn forward_generic_openai_request(
         &context.thinking_metadata,
     );
     copy_endpoint_selection_metadata(&context.request_metadata, &mut attempt_request_metadata);
-    let upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
+    let sent_upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
         client: &context.state.client,
-        method: context.reqwest_method,
-        upstream_url: context.upstream_url,
+        method: context.reqwest_method.clone(),
+        upstream_url: context.upstream_url.clone(),
         downstream_headers,
-        upstream_body: context.upstream_body,
+        upstream_body: context.upstream_body.clone(),
         upstream_timeout: context.upstream_timeout,
         attempt_id: attempt_id.clone(),
         attempt_number: 1,
@@ -4149,31 +4209,25 @@ async fn forward_generic_openai_request(
                 original_downstream_headers: &context.downstream_headers,
                 canonical_reranker: context.canonical_reranker.as_ref(),
                 transformed_request_headers: context.transformed_request_headers,
+                initial_endpoint: &context.terminal_endpoint,
+                request_deadline: context.upstream_deadline,
+                endpoint_retry_order: &context.endpoint_retry_order,
                 shutdown: context.state.shutdown.as_ref(),
             },
         ),
+        terminal_endpoint_protocol: context.terminal_endpoint_protocol,
+        request_deadline: context.upstream_deadline,
     })
     .await?;
-    let upstream_status = upstream_response.status();
-    let upstream_headers = upstream_response.headers().clone();
-    let response_parts = ForwardedResponseParts {
-        config: context.state.config.clone(),
-        store: context.state.store.clone(),
-        evidence_store: context.state.evidence_store.clone(),
-        request_id: context.request_id.clone(),
-        started_at_unix_ms: context.started_at_unix_ms,
-        attempt_id,
-        attempt_started_at_unix_ms,
-        upstream_mode: upstream_mode_from_headers(&upstream_headers),
-        model_id: context.model_id.clone(),
-        input_fingerprint: context.liveness.input_fingerprint.clone(),
-        upstream_status,
-        upstream_headers: upstream_headers.clone(),
-        request_metadata: context.request_metadata,
-        attempt_request_metadata,
-        shutdown: Arc::clone(&context.state.shutdown),
-    };
-    if let Some(adapter) = context.response_adapter {
+    let GenericForwardedResponse {
+        response_parts,
+        upstream_response,
+        terminal_endpoint_protocol,
+    } = generic_forwarded_response(&context, sent_upstream_response);
+    if let Some(adapter) = context
+        .response_adapter
+        .map(|adapter| adapter.with_terminal_protocol(terminal_endpoint_protocol))
+    {
         return rewrite_buffered_adapter_response_from_upstream(
             response_parts,
             upstream_response,
@@ -4197,6 +4251,59 @@ async fn forward_generic_openai_request(
         context.in_flight_permit,
     )
     .await
+}
+
+struct GenericForwardedResponse {
+    response_parts: ForwardedResponseParts,
+    upstream_response: reqwest::Response,
+    terminal_endpoint_protocol: UpstreamEndpointProtocol,
+}
+
+fn generic_forwarded_response(
+    context: &GenericForwardContext<'_>,
+    sent_upstream_response: SentUpstreamResponse,
+) -> GenericForwardedResponse {
+    let terminal_endpoint_protocol = sent_upstream_response
+        .response
+        .extensions()
+        .get::<TerminalEndpointProtocol>()
+        .map_or(context.terminal_endpoint_protocol, |protocol| protocol.0);
+    let upstream_status = sent_upstream_response.response.status();
+    let upstream_headers = sent_upstream_response.response.headers().clone();
+    let mut request_metadata = context.request_metadata.clone();
+    if sent_upstream_response.did_failover {
+        request_metadata.insert(
+            String::from("upstream_failover_selected"),
+            String::from("true"),
+        );
+    }
+    let response_parts = ForwardedResponseParts {
+        config: context.state.config.clone(),
+        store: context.state.store.clone(),
+        evidence_store: context.state.evidence_store.clone(),
+        request_id: context.request_id.clone(),
+        started_at_unix_ms: context.started_at_unix_ms,
+        attempt_id: sent_upstream_response.attempt_id,
+        attempt_number: sent_upstream_response.attempt_number,
+        attempt_max_attempts: u32::try_from(context.upstream_profile.endpoints.len())
+            .unwrap_or(u32::MAX)
+            .max(1),
+        attempt_started_at_unix_ms: sent_upstream_response.attempt_started_at_unix_ms,
+        upstream_mode: upstream_mode_from_headers(&upstream_headers),
+        model_id: context.model_id.clone(),
+        input_fingerprint: context.liveness.input_fingerprint.clone(),
+        upstream_status,
+        upstream_headers,
+        request_metadata,
+        attempt_request_metadata: sent_upstream_response.attempt_request_metadata,
+        completed_attempt_records: sent_upstream_response.completed_attempt_records,
+        shutdown: Arc::clone(&context.state.shutdown),
+    };
+    GenericForwardedResponse {
+        response_parts,
+        upstream_response: sent_upstream_response.response,
+        terminal_endpoint_protocol,
+    }
 }
 
 #[derive(Clone)]
@@ -4272,6 +4379,8 @@ async fn forward_merged_models_response(
         request_id: context.request_id.clone(),
         started_at_unix_ms: context.started_at_unix_ms,
         attempt_id: AttemptId::for_request(context.request_id, 1),
+        attempt_number: 1,
+        attempt_max_attempts: u32::try_from(groups.len()).unwrap_or(u32::MAX).max(1),
         attempt_started_at_unix_ms: context.started_at_unix_ms,
         upstream_mode,
         model_id: context.model_id,
@@ -4280,6 +4389,7 @@ async fn forward_merged_models_response(
         upstream_headers: upstream_headers.clone(),
         request_metadata: context.request_metadata,
         attempt_request_metadata: BTreeMap::new(),
+        completed_attempt_records: Vec::new(),
         shutdown: Arc::clone(&context.state.shutdown),
     };
     let shutdown = response_parts.shutdown_subscription();
@@ -4327,7 +4437,7 @@ async fn fetch_models_upstream_group(
     );
 
     let upstream_url = build_upstream_url(&group.base_url, &context.uri)?;
-    let upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
+    let sent_upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
         client: &context.state.client,
         method: context.reqwest_method.clone(),
         upstream_url,
@@ -4342,8 +4452,11 @@ async fn fetch_models_upstream_group(
         attempt_request_metadata: &attempt_request_metadata,
         shutdown: context.state.shutdown.subscribe(),
         failover_retry: None,
+        terminal_endpoint_protocol: UpstreamEndpointProtocol::OpenAi,
+        request_deadline: None,
     })
     .await?;
+    let upstream_response = sent_upstream_response.response;
     let upstream_mode = upstream_mode_from_headers(upstream_response.headers());
     let upstream_status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
@@ -4430,6 +4543,9 @@ struct UpstreamFailoverRetryContext<'request> {
     original_downstream_headers: &'request HeaderMap,
     canonical_reranker: Option<&'request CanonicalRerankerRequest>,
     transformed_request_headers: bool,
+    initial_endpoint: &'request UpstreamEndpointConfig,
+    request_deadline: Option<Instant>,
+    endpoint_retry_order: &'request [String],
     shutdown: &'request ShutdownGate,
 }
 
@@ -4448,6 +4564,47 @@ struct UpstreamAttemptContext<'request> {
     attempt_request_metadata: &'request BTreeMap<String, String>,
     shutdown: ShutdownSubscription,
     failover_retry: Option<UpstreamFailoverRetryContext<'request>>,
+    terminal_endpoint_protocol: UpstreamEndpointProtocol,
+    request_deadline: Option<Instant>,
+}
+
+struct SentUpstreamResponse {
+    response: reqwest::Response,
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    attempt_started_at_unix_ms: u64,
+    attempt_request_metadata: BTreeMap<String, String>,
+    completed_attempt_records: Vec<AttemptRecord>,
+    did_failover: bool,
+}
+
+struct PhysicalEndpointAttempt {
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    started_at_unix_ms: u64,
+    request_metadata: BTreeMap<String, String>,
+    endpoint: Option<UpstreamEndpointConfig>,
+    protocol: UpstreamEndpointProtocol,
+}
+
+struct EndpointFailoverOutcome {
+    result: Result<reqwest::Response, ProxyError>,
+    terminal_attempt: PhysicalEndpointAttempt,
+    completed_attempt_records: Vec<AttemptRecord>,
+}
+
+struct EndpointFailoverRuntime<'request> {
+    client: &'request Client,
+    retry: &'request UpstreamFailoverRetryContext<'request>,
+    retry_method: reqwest::Method,
+    retry_body: &'request Bytes,
+    upstream_timeout: Duration,
+    request_id: &'request RequestId,
+}
+
+struct EndpointFailoverProgress {
+    result: Result<reqwest::Response, ProxyError>,
+    terminal_attempt: PhysicalEndpointAttempt,
 }
 
 fn render_retry_openai_request(
@@ -4455,11 +4612,14 @@ fn render_retry_openai_request(
     base_url: &str,
     body: &Bytes,
 ) -> Result<RenderedEndpointRequest, ProxyError> {
-    let headers = if retry.transformed_request_headers {
+    let mut headers = if retry.transformed_request_headers {
         sanitize_transformed_request_headers(retry.original_downstream_headers)
     } else {
         retry.original_downstream_headers.clone()
     };
+    if retry.canonical_reranker.is_some() {
+        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    }
     Ok(RenderedEndpointRequest {
         url: build_upstream_url(base_url, &retry.local_forward_uri)?,
         uri: retry.local_forward_uri.clone(),
@@ -4470,114 +4630,428 @@ fn render_retry_openai_request(
 
 async fn send_first_upstream_attempt(
     context: UpstreamAttemptContext<'_>,
-) -> Result<reqwest::Response, ProxyError> {
-    let retry_method = context.method.clone();
-    let retry_body = context.upstream_body.clone();
-    let mut result = send_upstream_request_until_shutdown(
-        context.client,
-        context.method,
-        context.upstream_url,
-        context.downstream_headers,
-        context.upstream_body,
-        context.upstream_timeout,
-        context.shutdown,
-    )
-    .await;
-
-    if let Some(retry) = context.failover_retry.as_ref() {
-        let mut attempted_base_urls = vec![retry.profile.base_url.clone()];
-        while is_retryable_endpoint_result(&result)
-            && attempted_base_urls.len() < retry.profile.endpoints.len()
-        {
-            let last = attempted_base_urls
-                .last()
-                .expect("attempted endpoint list is initialized");
-            retry.registry.mark_unhealthy(last);
-            let selected = match retry
-                .registry
-                .select_endpoint_excluding(
-                    context.client,
-                    retry.profile,
-                    retry.shutdown,
-                    &attempted_base_urls,
-                )
-                .await
-            {
-                Ok(selected) => selected,
-                Err(EndpointSelectionError::Shutdown) => {
-                    result = Err(ProxyError::server_shutdown());
-                    break;
-                }
-                Err(EndpointSelectionError::Unavailable { profile, waited_ms }) => {
-                    result = Err(ProxyError::upstream_unavailable(profile, waited_ms));
-                    break;
-                }
-            };
-            attempted_base_urls.push(selected.base_url.clone());
-            let rendered = match retry.canonical_reranker {
-                Some(canonical) => reranker_protocol::render(
-                    &selected.endpoint,
-                    canonical,
-                    retry.original_downstream_headers,
-                ),
-                None => render_retry_openai_request(retry, &selected.base_url, &retry_body),
-            };
-            result = match rendered {
-                Ok(rendered) => {
-                    send_upstream_request_until_shutdown(
-                        context.client,
-                        retry_method.clone(),
-                        rendered.url,
-                        &rendered.headers,
-                        rendered.body,
-                        context.upstream_timeout,
-                        retry.shutdown.subscribe(),
-                    )
-                    .await
-                }
-                Err(error) => Err(error),
-            };
+) -> Result<SentUpstreamResponse, ProxyError> {
+    let terminal_endpoint = context
+        .failover_retry
+        .as_ref()
+        .map(|retry| (*retry.initial_endpoint).clone());
+    let mut initial_attempt = PhysicalEndpointAttempt {
+        attempt_id: context.attempt_id.clone(),
+        attempt_number: context.attempt_number,
+        started_at_unix_ms: context.attempt_started_at_unix_ms,
+        request_metadata: context.attempt_request_metadata.clone(),
+        endpoint: terminal_endpoint,
+        protocol: context.terminal_endpoint_protocol,
+    };
+    annotate_physical_endpoint_attempt(
+        &mut initial_attempt.request_metadata,
+        initial_attempt.endpoint.as_ref(),
+        context.terminal_endpoint_protocol,
+        &context.upstream_url,
+        context.upstream_body.len(),
+        false,
+    );
+    let initial_timeout =
+        upstream_timeout_within_deadline(context.upstream_timeout, context.request_deadline);
+    let mut result = match initial_timeout {
+        Ok(timeout) => {
+            send_upstream_request_until_shutdown(
+                context.client,
+                context.method.clone(),
+                context.upstream_url.clone(),
+                context.downstream_headers,
+                context.upstream_body.clone(),
+                timeout,
+                context.shutdown,
+            )
+            .await
         }
+        Err(error) => Err(error),
+    };
+    if let Ok(response) = &mut result {
+        response
+            .extensions_mut()
+            .insert(TerminalEndpointProtocol(context.terminal_endpoint_protocol));
     }
 
+    let EndpointFailoverOutcome {
+        result,
+        terminal_attempt,
+        completed_attempt_records,
+    } = match context.failover_retry.as_ref() {
+        Some(retry) => {
+            continue_endpoint_failover(
+                EndpointFailoverRuntime {
+                    client: context.client,
+                    retry,
+                    retry_method: context.method.clone(),
+                    retry_body: &context.upstream_body,
+                    upstream_timeout: context.upstream_timeout,
+                    request_id: context.request_id,
+                },
+                EndpointFailoverProgress {
+                    result,
+                    terminal_attempt: initial_attempt,
+                },
+            )
+            .await
+        }
+        None => EndpointFailoverOutcome {
+            result,
+            terminal_attempt: initial_attempt,
+            completed_attempt_records: Vec::new(),
+        },
+    };
+
+    finalize_sent_upstream_response(
+        result,
+        terminal_attempt,
+        completed_attempt_records,
+        context.request_id,
+        context.request_metadata,
+    )
+}
+
+fn finalize_sent_upstream_response(
+    result: Result<reqwest::Response, ProxyError>,
+    terminal_attempt: PhysicalEndpointAttempt,
+    completed_attempt_records: Vec<AttemptRecord>,
+    request_id: &RequestId,
+    request_metadata: &BTreeMap<String, String>,
+) -> Result<SentUpstreamResponse, ProxyError> {
     match result {
-        Ok(response) => Ok(response),
+        Ok(response) => Ok(SentUpstreamResponse {
+            response,
+            attempt_id: terminal_attempt.attempt_id,
+            attempt_number: terminal_attempt.attempt_number,
+            attempt_started_at_unix_ms: terminal_attempt.started_at_unix_ms,
+            attempt_request_metadata: terminal_attempt.request_metadata,
+            did_failover: !completed_attempt_records.is_empty(),
+            completed_attempt_records,
+        }),
         Err(error) => {
             let finished_at_unix_ms = unix_time_millis();
             let error_reason = error.to_string();
             let attempt_record = failed_attempt_record(FailedAttemptRecordInput {
-                attempt_id: context.attempt_id,
-                attempt_number: context.attempt_number,
-                request_id: context.request_id.clone(),
-                started_at_unix_ms: context.attempt_started_at_unix_ms,
+                attempt_id: terminal_attempt.attempt_id,
+                attempt_number: terminal_attempt.attempt_number,
+                request_id: request_id.clone(),
+                started_at_unix_ms: terminal_attempt.started_at_unix_ms,
                 finished_at_unix_ms,
                 error_type: error.error_type(),
                 error_reason: &error_reason,
-                request_metadata: context.attempt_request_metadata.clone(),
+                request_metadata: terminal_attempt.request_metadata,
                 extra_response_metadata: BTreeMap::new(),
             });
-            Err(error.with_observability(context.request_metadata.clone(), attempt_record))
+            Err(error
+                .with_observability(request_metadata.clone(), attempt_record)
+                .with_completed_attempt_records(completed_attempt_records))
         }
+    }
+}
+
+async fn continue_endpoint_failover(
+    runtime: EndpointFailoverRuntime<'_>,
+    progress: EndpointFailoverProgress,
+) -> EndpointFailoverOutcome {
+    let EndpointFailoverProgress {
+        mut result,
+        mut terminal_attempt,
+    } = progress;
+    let mut attempted_base_urls = vec![runtime.retry.initial_endpoint.base_url.clone()];
+    let mut completed_attempt_records = Vec::new();
+    while is_retryable_endpoint_result(&result)
+        && attempted_base_urls.len() < runtime.retry.profile.endpoints.len()
+    {
+        let selected = match runtime
+            .retry
+            .registry
+            .select_endpoint_excluding(
+                runtime.client,
+                runtime.retry.profile,
+                runtime.retry.shutdown,
+                EndpointSelectionConstraints {
+                    request: runtime.retry.canonical_reranker,
+                    request_deadline: runtime.retry.request_deadline,
+                    preferred_base_urls: Some(runtime.retry.endpoint_retry_order),
+                    excluded_base_urls: &attempted_base_urls,
+                },
+            )
+            .await
+        {
+            Ok(selected) => selected,
+            Err(
+                EndpointSelectionError::Shutdown
+                | EndpointSelectionError::Incompatible { .. }
+                | EndpointSelectionError::Unavailable { .. },
+            ) => break,
+        };
+        completed_attempt_records.push(retried_endpoint_attempt_record(
+            &result,
+            terminal_attempt.attempt_id.clone(),
+            terminal_attempt.attempt_number,
+            runtime.request_id.clone(),
+            terminal_attempt.started_at_unix_ms,
+            terminal_attempt.request_metadata.clone(),
+        ));
+        if (terminal_attempt.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+            || !is_caller_scoped_rate_limit(&result))
+            && let Some(endpoint) = terminal_attempt.endpoint.as_ref()
+        {
+            runtime.retry.registry.mark_unhealthy(endpoint);
+        }
+        attempted_base_urls.push(selected.base_url.clone());
+        let (next_result, next_attempt) = send_selected_failover_endpoint(
+            &runtime,
+            terminal_attempt.attempt_number.saturating_add(1),
+            context_attempt_metadata(&terminal_attempt),
+            selected,
+        )
+        .await;
+        result = next_result;
+        terminal_attempt = next_attempt;
+    }
+    EndpointFailoverOutcome {
+        result,
+        terminal_attempt,
+        completed_attempt_records,
+    }
+}
+
+fn context_attempt_metadata(attempt: &PhysicalEndpointAttempt) -> BTreeMap<String, String> {
+    let mut metadata = attempt.request_metadata.clone();
+    for key in [
+        "upstream_endpoint_protocol",
+        "upstream_endpoint_base_url",
+        "upstream_endpoint_priority",
+        "upstream_failover_selected",
+        "path",
+        "upstream_request_body_bytes",
+    ] {
+        metadata.remove(key);
+    }
+    metadata
+}
+
+async fn send_selected_failover_endpoint(
+    runtime: &EndpointFailoverRuntime<'_>,
+    attempt_number: u32,
+    request_metadata: BTreeMap<String, String>,
+    selected: upstream_failover::SelectedUpstreamEndpoint,
+) -> (
+    Result<reqwest::Response, ProxyError>,
+    PhysicalEndpointAttempt,
+) {
+    let rendered = match (selected.endpoint.protocol, runtime.retry.canonical_reranker) {
+        (UpstreamEndpointProtocol::DeepInfraQwen3Rerank, Some(canonical)) => {
+            reranker_protocol::render(
+                &selected.endpoint,
+                canonical,
+                runtime.retry.original_downstream_headers,
+            )
+        }
+        _ => render_retry_openai_request(runtime.retry, &selected.base_url, runtime.retry_body),
+    };
+    let attempt_id = AttemptId::for_request(runtime.request_id, attempt_number);
+    let started_at_unix_ms = unix_time_millis();
+    let mut attempt = PhysicalEndpointAttempt {
+        attempt_id,
+        attempt_number,
+        started_at_unix_ms,
+        request_metadata,
+        endpoint: Some(selected.endpoint.clone()),
+        protocol: selected.endpoint.protocol,
+    };
+    let result = match rendered {
+        Ok(rendered) => {
+            annotate_physical_endpoint_attempt(
+                &mut attempt.request_metadata,
+                attempt.endpoint.as_ref(),
+                attempt.protocol,
+                &rendered.url,
+                rendered.body.len(),
+                true,
+            );
+            match upstream_timeout_within_deadline(
+                runtime.upstream_timeout,
+                runtime.retry.request_deadline,
+            ) {
+                Ok(timeout) => send_upstream_request_until_shutdown(
+                    runtime.client,
+                    runtime.retry_method.clone(),
+                    rendered.url,
+                    &rendered.headers,
+                    rendered.body,
+                    timeout,
+                    runtime.retry.shutdown.subscribe(),
+                )
+                .await
+                .map(|mut response| {
+                    response
+                        .extensions_mut()
+                        .insert(TerminalEndpointProtocol(attempt.protocol));
+                    response
+                }),
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    };
+    (result, attempt)
+}
+
+fn upstream_timeout_within_deadline(
+    configured_timeout: Duration,
+    request_deadline: Option<Instant>,
+) -> Result<Duration, ProxyError> {
+    let Some(request_deadline) = request_deadline else {
+        return Ok(configured_timeout);
+    };
+    let remaining = request_deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(ProxyError::UpstreamTransport {
+            failure: ReqwestFailureKind::Timeout,
+            observability: None,
+        });
+    }
+    Ok(configured_timeout.min(remaining))
+}
+
+fn annotate_physical_endpoint_attempt(
+    metadata: &mut BTreeMap<String, String>,
+    endpoint: Option<&UpstreamEndpointConfig>,
+    protocol: UpstreamEndpointProtocol,
+    url: &Url,
+    body_len: usize,
+    failover_selected: bool,
+) {
+    metadata.insert(
+        String::from("upstream_endpoint_protocol"),
+        protocol.as_str().to_owned(),
+    );
+    metadata.insert(
+        String::from("upstream_endpoint_base_url"),
+        endpoint.map_or_else(
+            || redact_upstream_base_url(url.as_str()),
+            |endpoint| redact_upstream_base_url(&endpoint.base_url),
+        ),
+    );
+    metadata.insert(
+        String::from("upstream_endpoint_priority"),
+        endpoint
+            .map_or("primary", |endpoint| endpoint.priority.as_str())
+            .to_owned(),
+    );
+    metadata.insert(
+        String::from("upstream_failover_selected"),
+        failover_selected.to_string(),
+    );
+    metadata.insert(String::from("path"), url.path().to_owned());
+    metadata.insert(
+        String::from("upstream_request_body_bytes"),
+        body_len.to_string(),
+    );
+}
+
+fn retried_endpoint_attempt_record(
+    result: &Result<reqwest::Response, ProxyError>,
+    attempt_id: AttemptId,
+    attempt_number: u32,
+    request_id: RequestId,
+    started_at_unix_ms: u64,
+    request_metadata: BTreeMap<String, String>,
+) -> AttemptRecord {
+    let finished_at_unix_ms = unix_time_millis();
+    match result {
+        Ok(response) => {
+            let upstream_mode = upstream_mode_from_headers(response.headers());
+            let mut response_metadata = response_metadata(
+                response.status(),
+                response.headers(),
+                0,
+                finished_at_unix_ms.saturating_sub(started_at_unix_ms),
+            );
+            response_metadata.insert(String::from("attempt_outcome"), String::from("retried"));
+            response_metadata.insert(
+                String::from("retry_reason"),
+                retry_reason_for_endpoint_result(result),
+            );
+            AttemptRecord {
+                attempt_id,
+                request_id,
+                attempt_number,
+                started_at_unix_ms,
+                finished_at_unix_ms: Some(finished_at_unix_ms),
+                upstream_mode,
+                status: AttemptStatus::Retried,
+                http_status: Some(response.status().as_u16()),
+                error_reason: Some(format!(
+                    "upstream HTTP {} selected for failover",
+                    response.status()
+                )),
+                retry_reason: Some(retry_reason_for_endpoint_result(result)),
+                abort_reason: None,
+                token_usage: TokenUsage::default(),
+                request_metadata,
+                response_metadata,
+                raw_payloads: RawPayloads::default(),
+            }
+        }
+        Err(error) => {
+            let error_reason = error.to_string();
+            let mut record = failed_attempt_record(FailedAttemptRecordInput {
+                attempt_id,
+                attempt_number,
+                request_id,
+                started_at_unix_ms,
+                finished_at_unix_ms,
+                error_type: error.error_type(),
+                error_reason: &error_reason,
+                request_metadata,
+                extra_response_metadata: BTreeMap::from([(
+                    String::from("attempt_outcome"),
+                    String::from("retried"),
+                )]),
+            });
+            record.status = AttemptStatus::Retried;
+            record.retry_reason = Some(retry_reason_for_endpoint_result(result));
+            record
+        }
+    }
+}
+
+fn retry_reason_for_endpoint_result(result: &Result<reqwest::Response, ProxyError>) -> String {
+    match result {
+        Ok(response) => format!("endpoint_http_{}", response.status().as_u16()),
+        Err(ProxyError::UpstreamTransport { failure, .. }) => {
+            format!("endpoint_{}", failure.as_str())
+        }
+        Err(_) => String::from("endpoint_retry"),
     }
 }
 
 fn is_retryable_endpoint_result(result: &Result<reqwest::Response, ProxyError>) -> bool {
     match result {
         Err(ProxyError::UpstreamTransport { failure, .. }) => {
-            matches!(
-                failure,
-                ReqwestFailureKind::Connect | ReqwestFailureKind::Timeout
-            )
+            matches!(failure, ReqwestFailureKind::Connect)
         }
         Ok(response) => matches!(
             response.status(),
-            StatusCode::TOO_MANY_REQUESTS
+            StatusCode::UNAUTHORIZED
+                | StatusCode::FORBIDDEN
+                | StatusCode::REQUEST_TIMEOUT
+                | StatusCode::TOO_MANY_REQUESTS
+                | StatusCode::INTERNAL_SERVER_ERROR
                 | StatusCode::BAD_GATEWAY
                 | StatusCode::SERVICE_UNAVAILABLE
                 | StatusCode::GATEWAY_TIMEOUT
         ),
         Err(_) => false,
     }
+}
+
+fn is_caller_scoped_rate_limit(result: &Result<reqwest::Response, ProxyError>) -> bool {
+    matches!(result, Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS)
 }
 
 struct ResponseDispatch<'request> {
@@ -5465,6 +5939,8 @@ struct ForwardedResponseParts {
     request_id: RequestId,
     started_at_unix_ms: u64,
     attempt_id: AttemptId,
+    attempt_number: u32,
+    attempt_max_attempts: u32,
     attempt_started_at_unix_ms: u64,
     upstream_mode: UpstreamMode,
     model_id: Option<String>,
@@ -5473,6 +5949,7 @@ struct ForwardedResponseParts {
     upstream_headers: HeaderMap,
     request_metadata: BTreeMap<String, String>,
     attempt_request_metadata: BTreeMap<String, String>,
+    completed_attempt_records: Vec<AttemptRecord>,
     shutdown: Arc<ShutdownGate>,
 }
 
@@ -5503,8 +5980,8 @@ impl ForwardedResponseParts {
     ) -> ForwardedBodyObserver {
         let final_attempt = FinalAttemptContext {
             attempt_id: self.attempt_id,
-            attempt_number: 1,
-            attempt_max_attempts: 1,
+            attempt_number: self.attempt_number,
+            attempt_max_attempts: self.attempt_max_attempts,
             started_at_unix_ms: self.attempt_started_at_unix_ms,
             upstream_mode: self.upstream_mode,
             upstream_status: self.upstream_status,
@@ -5532,7 +6009,7 @@ impl ForwardedResponseParts {
             request_metadata: self.request_metadata,
             extra_response_metadata,
             raw_payloads,
-            completed_attempt_records: Vec::new(),
+            completed_attempt_records: self.completed_attempt_records,
             final_attempt: Some(final_attempt),
             retry_observation: None,
             attempt_progress: None,
@@ -5552,7 +6029,7 @@ impl ForwardedResponseParts {
         let error_reason = error.to_string();
         let attempt_record = failed_attempt_record(FailedAttemptRecordInput {
             attempt_id: self.attempt_id,
-            attempt_number: 1,
+            attempt_number: self.attempt_number,
             request_id: self.request_id,
             started_at_unix_ms: self.attempt_started_at_unix_ms,
             finished_at_unix_ms,
@@ -5561,7 +6038,9 @@ impl ForwardedResponseParts {
             request_metadata: self.attempt_request_metadata,
             extra_response_metadata,
         });
-        error.with_observability(self.request_metadata, attempt_record)
+        error
+            .with_observability(self.request_metadata, attempt_record)
+            .with_completed_attempt_records(self.completed_attempt_records)
     }
 
     fn into_response_process_error(
@@ -5575,7 +6054,7 @@ impl ForwardedResponseParts {
             .insert(String::from("response_process_error"), String::from("true"));
         let mut attempt_record = failed_attempt_record(FailedAttemptRecordInput {
             attempt_id: self.attempt_id,
-            attempt_number: 1,
+            attempt_number: self.attempt_number,
             request_id: self.request_id,
             started_at_unix_ms: self.attempt_started_at_unix_ms,
             finished_at_unix_ms,
@@ -5604,7 +6083,9 @@ impl ForwardedResponseParts {
             &self.upstream_headers,
             "response",
         );
-        error.with_observability(self.request_metadata, attempt_record)
+        error
+            .with_observability(self.request_metadata, attempt_record)
+            .with_completed_attempt_records(self.completed_attempt_records)
     }
 }
 

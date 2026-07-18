@@ -1894,6 +1894,8 @@ pub struct UpstreamEndpointConfig {
     pub protocol: UpstreamEndpointProtocol,
     /// Required remote model name for non-OpenAI endpoint protocols.
     pub model: Option<String>,
+    /// Required immutable remote model revision for non-OpenAI endpoint protocols.
+    pub model_revision: Option<String>,
     /// Runtime environment variable containing the non-OpenAI endpoint credential.
     pub api_key_env: Option<String>,
 }
@@ -2140,9 +2142,9 @@ impl UpstreamEndpointConfig {
     fn validate(&self) -> Result<(), ValidationError> {
         match self.protocol {
             UpstreamEndpointProtocol::OpenAi => require(
-                self.model.is_none() && self.api_key_env.is_none(),
+                self.model.is_none() && self.model_revision.is_none() && self.api_key_env.is_none(),
                 "profile.upstream.protocol",
-                "openai endpoints must not set model or api_key_env",
+                "openai endpoints must not set model, model_revision, or api_key_env",
             ),
             UpstreamEndpointProtocol::DeepInfraQwen3Rerank => {
                 let model = self.model.as_deref().unwrap_or_default();
@@ -2162,6 +2164,24 @@ impl UpstreamEndpointConfig {
                     }),
                     "profile.upstream.model",
                     "must contain only ASCII letters, digits, '/', '-', '_', or '.'",
+                )?;
+                let revision = self.model_revision.as_deref().unwrap_or_default();
+                require(
+                    !revision.is_empty() && revision == revision.trim(),
+                    "profile.upstream.model_revision",
+                    "must be a non-empty trimmed immutable revision for deepinfra_qwen3_rerank",
+                )?;
+                require(
+                    revision.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+                    "profile.upstream.model_revision",
+                    "must be at most 256 bytes",
+                )?;
+                require(
+                    revision.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                    }),
+                    "profile.upstream.model_revision",
+                    "must contain only ASCII letters, digits, '-', '_', or '.'",
                 )?;
                 let environment_name = self.api_key_env.as_deref().unwrap_or_default();
                 require(

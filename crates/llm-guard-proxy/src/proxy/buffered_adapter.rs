@@ -9,6 +9,7 @@ use axum::{
         header::{ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE, RETRY_AFTER},
     },
 };
+use llm_guard_proxy_core::UpstreamEndpointProtocol;
 use llm_guard_proxy_state::RawPayloads;
 
 use super::{
@@ -18,33 +19,55 @@ use super::{
     score_adapter,
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum BufferedResponseAdapter {
     ScoreFromRerank(Option<score_adapter::ScoreExpectations>),
     DeepInfraQwen3Rerank(deepinfra_rerank_adapter::ResponseExpectations),
-    HeterogeneousReranker(reranker_protocol::ResponseContract),
+    HeterogeneousReranker {
+        request: reranker_protocol::CanonicalRerankerRequest,
+        terminal_protocol: UpstreamEndpointProtocol,
+    },
 }
 
 impl BufferedResponseAdapter {
-    fn rewrite(self, body: &Bytes, model_id: Option<&str>) -> Result<Bytes, String> {
+    fn rewrite(&self, body: &Bytes, model_id: Option<&str>) -> Result<Bytes, String> {
         match self {
             Self::ScoreFromRerank(expected) => {
-                score_adapter::rerank_response_to_score_response(body, model_id, expected)
+                score_adapter::rerank_response_to_score_response(body, model_id, *expected)
             }
             Self::DeepInfraQwen3Rerank(expected) => {
-                deepinfra_rerank_adapter::score_response_to_deepinfra_response(body, expected)
+                deepinfra_rerank_adapter::score_response_to_deepinfra_response(body, *expected)
             }
-            Self::HeterogeneousReranker(contract) => {
-                reranker_protocol::rewrite_response(body, contract, model_id)
-            }
+            Self::HeterogeneousReranker {
+                request,
+                terminal_protocol,
+            } => reranker_protocol::rewrite_response_for_endpoint(
+                body,
+                request,
+                *terminal_protocol,
+                model_id,
+            ),
         }
     }
 
-    const fn label(self) -> &'static str {
+    fn label(&self) -> &'static str {
         match self {
             Self::ScoreFromRerank(_) => "score from rerank",
             Self::DeepInfraQwen3Rerank(_) => "DeepInfra rerank from score",
-            Self::HeterogeneousReranker(_) => "heterogeneous reranker response",
+            Self::HeterogeneousReranker { .. } => "heterogeneous reranker response",
+        }
+    }
+
+    pub(super) fn with_terminal_protocol(
+        self,
+        terminal_protocol: UpstreamEndpointProtocol,
+    ) -> Self {
+        match self {
+            Self::HeterogeneousReranker { request, .. } => Self::HeterogeneousReranker {
+                request,
+                terminal_protocol,
+            },
+            adapter => adapter,
         }
     }
 }

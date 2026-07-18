@@ -467,6 +467,7 @@ base_url = "https://api.deepinfra.com"
 priority = "failover"
 protocol = "deepinfra_qwen3_rerank"
 model = "Qwen/Qwen3-Reranker-8B"
+model_revision = "2026.07.18"
 api_key_env = "LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY"
 "#,
     )
@@ -491,6 +492,10 @@ api_key_env = "LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY"
     assert_eq!(
         profile.endpoints[1].model.as_deref(),
         Some("Qwen/Qwen3-Reranker-8B")
+    );
+    assert_eq!(
+        profile.endpoints[1].model_revision.as_deref(),
+        Some("2026.07.18")
     );
     assert_eq!(
         profile.endpoints[1].api_key_env.as_deref(),
@@ -543,7 +548,23 @@ base_url = "https://api.deepinfra.com"
 priority = "primary"
 protocol = "deepinfra_qwen3_rerank"
 model = "Qwen/Qwen3-Reranker-8B"
+model_revision = "2026.07.18"
 api_key_env = "not-a-valid-environment-name"
+"#,
+        ),
+        (
+            "profile.upstream.model_revision",
+            r#"
+[[profile]]
+model = "qwen3-reranker-8b"
+
+[[profile.endpoints]]
+base_url = "https://api.deepinfra.com"
+priority = "primary"
+protocol = "deepinfra_qwen3_rerank"
+model = "Qwen/Qwen3-Reranker-8B"
+model_revision = "stable?override=true"
+api_key_env = "LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY"
 "#,
         ),
         (
@@ -781,6 +802,7 @@ fn gb10_deploy_uncomment_ready_examples_parse() {
         "upstream-stall-recovery",
         "upstream-local-recovery",
         "upstream-profile",
+        "heterogeneous-reranker-replicas",
     ] {
         assert_deploy_example_parses(name);
     }

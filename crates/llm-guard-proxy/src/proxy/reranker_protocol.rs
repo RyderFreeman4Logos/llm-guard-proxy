@@ -6,7 +6,7 @@ use axum::{
     body::Bytes,
     http::{
         HeaderMap, HeaderValue, Method, Uri,
-        header::{AUTHORIZATION, CONTENT_TYPE},
+        header::{ACCEPT, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_TYPE},
     },
 };
 use llm_guard_proxy_core::{UpstreamEndpointConfig, UpstreamEndpointProtocol};
@@ -20,6 +20,7 @@ use super::{
 
 const MAX_PAIR_COUNT: usize = 1_024;
 const MAX_REQUEST_ID_BYTES: usize = 256;
+const MAX_DEEPINFRA_RENDERED_BODY_BYTES: usize = 1_048_576;
 
 /// Preserved public request data used to render each selected replica.
 #[derive(Clone, Debug)]
@@ -35,15 +36,22 @@ pub(super) enum CanonicalRerankerRequest {
 }
 
 /// Buffered response conversion chosen from the public request contract.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(super) enum ResponseContract {
     /// Preserve an `OpenAI` `/v1/rerank` response locally, or create one from `DeepInfra`.
-    OpenAiRerank { document_count: usize, top_n: usize },
+    OpenAiRerank {
+        documents: Vec<String>,
+        top_n: usize,
+        return_documents: bool,
+        model: Option<String>,
+    },
     /// Preserve the local score-adapter response, or create it from `DeepInfra`.
     Score {
         document_count: usize,
         top_n: usize,
         expected: Option<score_adapter::ScoreExpectations>,
+        documents: Vec<String>,
+        return_documents: bool,
     },
     /// Preserve the local native-adapter response, or normalize `DeepInfra`'s response.
     DeepInfraNative { expected_count: usize },
@@ -99,8 +107,10 @@ pub(super) fn response_contract(
         CanonicalRerankerRequest::OpenAiRerank { body, .. } => {
             let input = parse_openai_rerank(body)?;
             Ok(ResponseContract::OpenAiRerank {
-                document_count: input.documents.len(),
+                documents: input.documents,
                 top_n: input.top_n,
+                return_documents: input.return_documents,
+                model: input.model,
             })
         }
         CanonicalRerankerRequest::Score { body, .. } => {
@@ -109,6 +119,8 @@ pub(super) fn response_contract(
                 document_count: input.documents.len(),
                 top_n: input.top_n,
                 expected: score_adapter::score_expectations_from_rerank_body(body),
+                documents: input.documents,
+                return_documents: input.return_documents,
             })
         }
         CanonicalRerankerRequest::DeepInfraNative { uri, body } => {
@@ -136,6 +148,21 @@ pub(super) fn render(
     }
 }
 
+/// Whether an endpoint can receive this request without changing its public protocol semantics.
+/// `OpenAI` endpoints deliberately remain eligible for opaque/future request shapes.
+pub(super) fn is_compatible_with_endpoint(
+    endpoint: &UpstreamEndpointConfig,
+    request: Option<&CanonicalRerankerRequest>,
+) -> bool {
+    match endpoint.protocol {
+        UpstreamEndpointProtocol::OpenAi => true,
+        UpstreamEndpointProtocol::DeepInfraQwen3Rerank => {
+            request.is_some_and(|request| response_contract(request).is_ok())
+                && deepinfra_inference_uri(endpoint).is_ok()
+        }
+    }
+}
+
 /// Runtime eligibility is intentionally credential-presence-only: `DeepInfra` inference must
 /// never be sent as a health probe.
 pub(super) fn has_runtime_credential(endpoint: &UpstreamEndpointConfig) -> bool {
@@ -145,49 +172,93 @@ pub(super) fn has_runtime_credential(endpoint: &UpstreamEndpointConfig) -> bool 
     }
 }
 
-/// Rewrite a `DeepInfra` response into the public contract. Local `OpenAI`-compatible responses
-/// are identified structurally and keep their pre-existing adapter conversion.
+/// Rewrite a validated `DeepInfra` response into the public contract.
+///
+/// Callers must select this function from the terminal endpoint protocol; response-body shape is
+/// untrusted data and is never a protocol discriminator.
 pub(super) fn rewrite_response(
     body: &Bytes,
     contract: ResponseContract,
     model_id: Option<&str>,
 ) -> Result<Bytes, String> {
-    if !looks_like_deepinfra_response(body) {
-        return match contract {
-            ResponseContract::OpenAiRerank { .. } => Ok(body.clone()),
-            ResponseContract::Score { expected, .. } => {
-                score_adapter::rerank_response_to_score_response(body, model_id, expected)
-            }
-            ResponseContract::DeepInfraNative { expected_count } => {
-                let expected = deepinfra_rerank_adapter::ResponseExpectations {
-                    result_count: expected_count,
-                };
-                deepinfra_rerank_adapter::score_response_to_deepinfra_response(body, expected)
-            }
-        };
-    }
-
     let response = parse_deepinfra_response(body)?;
     match contract {
         ResponseContract::OpenAiRerank {
-            document_count,
+            documents,
             top_n,
+            return_documents,
+            model,
         } => {
-            ensure_exact_score_count(&response, document_count)?;
-            openai_rerank_response(&response, top_n)
+            ensure_exact_score_count(&response, documents.len())?;
+            openai_rerank_response(
+                &response,
+                top_n,
+                &documents,
+                return_documents,
+                model.as_deref().or(model_id),
+            )
         }
         ResponseContract::Score {
             document_count,
             top_n,
             expected,
+            documents,
+            return_documents,
         } => {
             ensure_exact_score_count(&response, document_count)?;
-            score_response(&response, top_n, expected, model_id)
+            score_response(
+                &response,
+                top_n,
+                expected,
+                model_id,
+                &documents,
+                return_documents,
+            )
         }
         ResponseContract::DeepInfraNative { expected_count } => {
             ensure_exact_score_count(&response, expected_count)?;
             deepinfra_native_response(&response)
         }
+    }
+}
+
+/// Rewrite a buffered response according to the endpoint that actually produced it.
+pub(super) fn rewrite_response_for_endpoint(
+    body: &Bytes,
+    request: &CanonicalRerankerRequest,
+    endpoint_protocol: UpstreamEndpointProtocol,
+    model_id: Option<&str>,
+) -> Result<Bytes, String> {
+    match endpoint_protocol {
+        UpstreamEndpointProtocol::DeepInfraQwen3Rerank => rewrite_response(
+            body,
+            response_contract(request).map_err(|error| error.to_string())?,
+            model_id,
+        ),
+        UpstreamEndpointProtocol::OpenAi => match request {
+            CanonicalRerankerRequest::OpenAiRerank { .. } => Ok(body.clone()),
+            CanonicalRerankerRequest::Score {
+                body: request_body, ..
+            } => score_adapter::rerank_response_to_score_response(
+                body,
+                model_id,
+                score_adapter::score_expectations_from_rerank_body(request_body),
+            ),
+            CanonicalRerankerRequest::DeepInfraNative {
+                uri,
+                body: request_body,
+            } => {
+                let adapted = deepinfra_rerank_adapter::adapt_request(uri, request_body)
+                    .map_err(|error| error.to_string())?;
+                deepinfra_rerank_adapter::score_response_to_deepinfra_response(
+                    body,
+                    adapted.response_expectations,
+                )
+            }
+            CanonicalRerankerRequest::UnsupportedScore => Err(String::from(
+                "selected OpenAI endpoint cannot normalize this score request",
+            )),
+        },
     }
 }
 
@@ -245,10 +316,12 @@ fn render_deepinfra_with_authorization(
     downstream_headers: &HeaderMap,
     authorization: HeaderValue,
 ) -> Result<RenderedEndpointRequest, ProxyError> {
+    ensure_deepinfra_transformation_is_unsigned(downstream_headers)?;
     let (body, uri) = match request {
         CanonicalRerankerRequest::OpenAiRerank { body, .. }
         | CanonicalRerankerRequest::Score { body, .. } => {
             let input = parse_openai_rerank(body)?;
+            ensure_generated_body_fits(&input)?;
             let queries = vec![input.query; input.documents.len()];
             let body = serde_json::to_vec(&json!({
                 "queries": queries,
@@ -261,13 +334,27 @@ fn render_deepinfra_with_authorization(
             })?;
             (body, deepinfra_inference_uri(endpoint)?)
         }
-        CanonicalRerankerRequest::DeepInfraNative { body, .. } => {
-            (body.clone(), deepinfra_inference_uri(endpoint)?)
+        CanonicalRerankerRequest::DeepInfraNative { uri, body } => {
+            let target = deepinfra_inference_uri(endpoint)?;
+            if let Some(query) = uri.query()
+                && target.query() != Some(query)
+            {
+                return Err(invalid_request_error(
+                    "DeepInfra native query must match the configured pinned revision",
+                ));
+            }
+            if body.len() > MAX_DEEPINFRA_RENDERED_BODY_BYTES {
+                return Err(invalid_request_error(
+                    "DeepInfra native body exceeds the rendered endpoint body limit",
+                ));
+            }
+            (body.clone(), target)
         }
         CanonicalRerankerRequest::UnsupportedScore => return Err(unsupported_request_error()),
     };
-    let mut headers = sanitize_transformed_request_headers(downstream_headers);
-    headers.remove(AUTHORIZATION);
+    let mut headers = HeaderMap::new();
+    headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
     headers.insert(AUTHORIZATION, authorization);
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     let url = super::build_upstream_url(&endpoint.base_url, &uri)?;
@@ -279,14 +366,83 @@ fn render_deepinfra_with_authorization(
     })
 }
 
+fn ensure_deepinfra_transformation_is_unsigned(headers: &HeaderMap) -> Result<(), ProxyError> {
+    for header in [
+        "signature",
+        "signature-input",
+        "digest",
+        "content-digest",
+        "repr-digest",
+    ] {
+        if headers.contains_key(header) {
+            return Err(ProxyError::ContextBudgetExceeded {
+                message: String::from(
+                    "signed or integrity-protected requests cannot be transformed for DeepInfra",
+                ),
+                param: "headers",
+                code: "signed_request_transformation_unsupported",
+                request_metadata: None,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn deepinfra_inference_uri(endpoint: &UpstreamEndpointConfig) -> Result<Uri, ProxyError> {
     let model = endpoint
         .model
         .as_deref()
         .ok_or_else(unsupported_request_error)?;
-    format!("/v1/inference/{model}").parse().map_err(|error| {
-        invalid_request_error(&format!("invalid DeepInfra inference path: {error}"))
-    })
+    let revision = endpoint
+        .model_revision
+        .as_deref()
+        .ok_or_else(unsupported_request_error)?;
+    format!("/v1/inference/{model}?revision={revision}")
+        .parse()
+        .map_err(|error| {
+            invalid_request_error(&format!("invalid DeepInfra inference path: {error}"))
+        })
+}
+
+fn ensure_generated_body_fits(input: &OpenAiRerankInput) -> Result<(), ProxyError> {
+    let escaped_query_bytes = input
+        .query
+        .len()
+        .checked_mul(6)
+        .ok_or_else(|| invalid_request_error("DeepInfra query size overflow"))?;
+    let repeated_queries = escaped_query_bytes
+        .checked_mul(input.documents.len())
+        .ok_or_else(|| invalid_request_error("DeepInfra query repetition size overflow"))?;
+    let escaped_documents = input
+        .documents
+        .iter()
+        .try_fold(0_usize, |total, document| {
+            let escaped = document
+                .len()
+                .checked_mul(6)
+                .ok_or_else(|| invalid_request_error("DeepInfra document size overflow"))?;
+            total
+                .checked_add(escaped)
+                .ok_or_else(|| invalid_request_error("DeepInfra document total size overflow"))
+        })?;
+    let json_overhead = 256_usize
+        .checked_add(
+            deepinfra_rerank_adapter::DEFAULT_INSTRUCTION
+                .len()
+                .checked_mul(6)
+                .ok_or_else(|| invalid_request_error("DeepInfra instruction size overflow"))?,
+        )
+        .ok_or_else(|| invalid_request_error("DeepInfra JSON overhead overflow"))?;
+    let upper_bound = repeated_queries
+        .checked_add(escaped_documents)
+        .and_then(|size| size.checked_add(json_overhead))
+        .ok_or_else(|| invalid_request_error("DeepInfra rendered body size overflow"))?;
+    if upper_bound > MAX_DEEPINFRA_RENDERED_BODY_BYTES {
+        return Err(invalid_request_error(
+            "DeepInfra rendered body would exceed the endpoint body limit",
+        ));
+    }
+    Ok(())
 }
 
 fn authorization_header(endpoint: &UpstreamEndpointConfig) -> Result<HeaderValue, ProxyError> {
@@ -302,9 +458,11 @@ fn authorization_header(endpoint: &UpstreamEndpointConfig) -> Result<HeaderValue
 }
 
 struct OpenAiRerankInput {
+    model: Option<String>,
     query: String,
     documents: Vec<String>,
     top_n: usize,
+    return_documents: bool,
 }
 
 fn parse_openai_rerank(body: &Bytes) -> Result<OpenAiRerankInput, ProxyError> {
@@ -313,6 +471,14 @@ fn parse_openai_rerank(body: &Bytes) -> Result<OpenAiRerankInput, ProxyError> {
     let object = value
         .as_object()
         .ok_or_else(|| invalid_request_error("rerank body must be a JSON object"))?;
+    let model = match object.get("model") {
+        None => None,
+        Some(Value::String(model)) if !model.trim().is_empty() => Some(model.clone()),
+        Some(Value::String(_)) => {
+            return Err(invalid_request_error("rerank model must not be empty"));
+        }
+        Some(_) => return Err(invalid_request_error("rerank model must be a string")),
+    };
     let query = object
         .get("query")
         .and_then(Value::as_str)
@@ -348,10 +514,21 @@ fn parse_openai_rerank(body: &Bytes) -> Result<OpenAiRerankInput, ProxyError> {
                 )
             })?,
     };
+    let return_documents = match object.get("return_documents") {
+        None => false,
+        Some(Value::Bool(return_documents)) => *return_documents,
+        Some(_) => {
+            return Err(invalid_request_error(
+                "rerank return_documents must be a boolean",
+            ));
+        }
+    };
     Ok(OpenAiRerankInput {
+        model,
         query,
         documents,
         top_n,
+        return_documents,
     })
 }
 
@@ -397,7 +574,7 @@ fn parse_deepinfra_response(body: &Bytes) -> Result<DeepInfraResponse, String> {
             String::from("DeepInfra rerank response input_tokens must be a non-negative integer")
         })?;
     let request_id = match object.get("request_id") {
-        None => None,
+        None | Some(Value::Null) => None,
         Some(Value::String(request_id))
             if !request_id.is_empty()
                 && request_id.len() <= MAX_REQUEST_ID_BYTES
@@ -418,12 +595,43 @@ fn parse_deepinfra_response(body: &Bytes) -> Result<DeepInfraResponse, String> {
     })
 }
 
-fn openai_rerank_response(response: &DeepInfraResponse, top_n: usize) -> Result<Bytes, String> {
+fn openai_rerank_response(
+    response: &DeepInfraResponse,
+    top_n: usize,
+    documents: &[String],
+    return_documents: bool,
+    model: Option<&str>,
+) -> Result<Bytes, String> {
     let results = selected_scores(&response.scores, top_n)?
         .into_iter()
-        .map(|(index, score)| json!({"index": index, "relevance_score": score}))
+        .map(|(index, score)| {
+            let mut result = serde_json::Map::from_iter([
+                (String::from("index"), Value::from(index)),
+                (String::from("relevance_score"), Value::from(score)),
+            ]);
+            if return_documents {
+                result.insert(
+                    String::from("document"),
+                    Value::String(documents[index].clone()),
+                );
+            }
+            Value::Object(result)
+        })
         .collect::<Vec<_>>();
-    serialize(&json!({"object": "list", "data": results}))
+    serialize(&json!({
+        "id": response.request_id.as_deref().unwrap_or("rerank-adapted"),
+        "object": "list",
+        "created": unix_time_seconds(),
+        "model": model.filter(|model| !model.is_empty()).unwrap_or("qwen3-reranker-8b"),
+        "results": results,
+        "data": results,
+        "usage": {
+            "prompt_tokens": response.input_tokens,
+            "total_tokens": response.input_tokens,
+            "completion_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": null},
+        },
+    }))
 }
 
 fn score_response(
@@ -431,8 +639,11 @@ fn score_response(
     top_n: usize,
     expected: Option<score_adapter::ScoreExpectations>,
     model_id: Option<&str>,
+    documents: &[String],
+    return_documents: bool,
 ) -> Result<Bytes, String> {
-    let scores = selected_scores(&response.scores, top_n)?;
+    let mut scores = selected_scores(&response.scores, top_n)?;
+    scores.sort_by_key(|(index, _score)| *index);
     if let Some(expected) = expected
         && scores.len() != expected.result_count
     {
@@ -445,7 +656,23 @@ fn score_response(
     let model = model_id.ok_or_else(|| String::from("score request is missing model"))?;
     let data = scores
         .into_iter()
-        .map(|(index, score)| json!({"index": index, "object": "score", "score": score}))
+        .map(|(index, probability)| {
+            let mut result = serde_json::Map::from_iter([
+                (String::from("index"), Value::from(index)),
+                (String::from("object"), Value::String(String::from("score"))),
+                (
+                    String::from("score"),
+                    Value::from(probability.mul_add(2.0, -1.0)),
+                ),
+            ]);
+            if return_documents {
+                result.insert(
+                    String::from("document"),
+                    Value::String(documents[index].clone()),
+                );
+            }
+            Value::Object(result)
+        })
         .collect::<Vec<_>>();
     serialize(&json!({
         "id": "score-adapted",
@@ -453,7 +680,12 @@ fn score_response(
         "created": unix_time_seconds(),
         "model": model,
         "data": data,
-        "usage": {"prompt_tokens": response.input_tokens},
+        "usage": {
+            "prompt_tokens": response.input_tokens,
+            "total_tokens": response.input_tokens,
+            "completion_tokens": 0,
+            "prompt_tokens_details": {"cached_tokens": null},
+        },
     }))
 }
 
@@ -488,17 +720,6 @@ fn selected_scores(scores: &[f64], top_n: usize) -> Result<Vec<(usize, f64)>, St
     });
     indexed.truncate(top_n);
     Ok(indexed)
-}
-
-fn looks_like_deepinfra_response(body: &Bytes) -> bool {
-    serde_json::from_slice::<Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .as_object()
-                .map(|object| object.contains_key("scores"))
-        })
-        .unwrap_or(false)
 }
 
 fn ensure_exact_score_count(
@@ -560,6 +781,7 @@ fn credential_error() -> ProxyError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::HeaderName;
     use llm_guard_proxy_core::{UpstreamEndpointConfig, UpstreamEndpointProtocol};
 
     const SENTINEL: &str = "LLM_GUARD_PROXY_NOT_A_REAL_CREDENTIAL_195";
@@ -572,8 +794,14 @@ mod tests {
         let response = rewrite_response(
             &body,
             ResponseContract::OpenAiRerank {
-                document_count: 3,
+                documents: vec![
+                    String::from("one"),
+                    String::from("two"),
+                    String::from("three"),
+                ],
                 top_n: 2,
+                return_documents: false,
+                model: Some(String::from("qwen3-reranker-8b")),
             },
             None,
         )
@@ -591,6 +819,7 @@ mod tests {
             base_url: String::from("https://api.deepinfra.com"),
             protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
             model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
+            model_revision: Some(String::from("2026.07.18")),
             ..UpstreamEndpointConfig::default()
         };
         let request = CanonicalRerankerRequest::OpenAiRerank {
@@ -610,6 +839,7 @@ mod tests {
         )
         .expect("request should render");
         assert_eq!(rendered.uri.path(), "/v1/inference/Qwen/Qwen3-Reranker-8B");
+        assert_eq!(rendered.uri.query(), Some("revision=2026.07.18"));
         assert_eq!(
             rendered
                 .headers
@@ -626,5 +856,240 @@ mod tests {
         );
         let debug = format!("{endpoint:?}");
         assert!(!debug.contains(SENTINEL));
+    }
+
+    #[test]
+    fn accepts_nullable_deepinfra_request_id() {
+        let body = Bytes::from_static(br#"{"scores":[0.25],"input_tokens":19,"request_id":null}"#);
+        let response = rewrite_response(
+            &body,
+            ResponseContract::DeepInfraNative { expected_count: 1 },
+            None,
+        )
+        .expect("provider-valid null request_id should be accepted");
+        let response: Value = serde_json::from_slice(&response).expect("response should be JSON");
+        assert!(response.get("request_id").is_none());
+    }
+
+    #[test]
+    fn converts_deepinfra_probability_to_signed_score() {
+        let body = Bytes::from_static(br#"{"scores":[0.9],"input_tokens":19}"#);
+        let response = rewrite_response(
+            &body,
+            ResponseContract::Score {
+                document_count: 1,
+                top_n: 1,
+                expected: Some(score_adapter::ScoreExpectations {
+                    result_count: 1,
+                    document_count: 1,
+                }),
+                documents: vec![String::from("d")],
+                return_documents: false,
+            },
+            Some("qwen3-reranker-8b"),
+        )
+        .expect("valid DeepInfra response should convert");
+        let response: Value = serde_json::from_slice(&response).expect("response should be JSON");
+        assert_eq!(response["data"][0]["score"], 0.8);
+    }
+
+    #[test]
+    fn deepinfra_renderer_drops_all_downstream_credentials_and_proxy_headers() {
+        let endpoint = UpstreamEndpointConfig {
+            base_url: String::from("https://api.deepinfra.com"),
+            protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
+            model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
+            model_revision: Some(String::from("2026.07.18")),
+            ..UpstreamEndpointConfig::default()
+        };
+        let request = CanonicalRerankerRequest::OpenAiRerank {
+            forward_uri: Uri::from_static("/v1/rerank"),
+            body: Bytes::from_static(br#"{"query":"q","documents":["d"]}"#),
+        };
+        let mut headers = HeaderMap::new();
+        for name in [
+            "authorization",
+            "x-api-key",
+            "x-virtual-key",
+            "cookie",
+            "proxy-authorization",
+            "x-forwarded-for",
+        ] {
+            headers.insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static("downstream-secret"),
+            );
+        }
+        let rendered = render_deepinfra_with_authorization(
+            &endpoint,
+            &request,
+            &headers,
+            HeaderValue::from_static("Bearer provider-secret"),
+        )
+        .expect("request should render");
+        for name in [
+            "x-api-key",
+            "x-virtual-key",
+            "cookie",
+            "proxy-authorization",
+            "x-forwarded-for",
+        ] {
+            assert!(
+                !rendered.headers.contains_key(name),
+                "{name} must not cross the DeepInfra trust boundary"
+            );
+        }
+        assert_eq!(
+            rendered.headers.get(AUTHORIZATION),
+            Some(&HeaderValue::from_static("Bearer provider-secret"))
+        );
+    }
+
+    #[test]
+    fn deepinfra_renderer_rejects_signed_transformation() {
+        let endpoint = UpstreamEndpointConfig {
+            base_url: String::from("https://api.deepinfra.com"),
+            protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
+            model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
+            model_revision: Some(String::from("2026.07.18")),
+            ..UpstreamEndpointConfig::default()
+        };
+        let request = CanonicalRerankerRequest::OpenAiRerank {
+            forward_uri: Uri::from_static("/v1/rerank"),
+            body: Bytes::from_static(br#"{"query":"q","documents":["d"]}"#),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("signature", HeaderValue::from_static("sig"));
+        let result = render_deepinfra_with_authorization(
+            &endpoint,
+            &request,
+            &headers,
+            HeaderValue::from_static("Bearer provider-secret"),
+        );
+        let Err(error) = result else {
+            panic!("a transformed signed request must fail closed");
+        };
+        assert!(error.to_string().contains("integrity-protected"));
+    }
+
+    #[test]
+    fn deepinfra_renderer_retains_only_the_exact_pinned_native_query() {
+        let endpoint = UpstreamEndpointConfig {
+            base_url: String::from("https://api.deepinfra.com"),
+            protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
+            model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
+            model_revision: Some(String::from("2026.07.18")),
+            ..UpstreamEndpointConfig::default()
+        };
+        let request = CanonicalRerankerRequest::DeepInfraNative {
+            uri: Uri::from_static("/v1/inference/Qwen/Qwen3-Reranker-8B?revision=2026.07.18"),
+            body: Bytes::from_static(br#"{"queries":["q"],"documents":["d"]}"#),
+        };
+        let rendered = render_deepinfra_with_authorization(
+            &endpoint,
+            &request,
+            &HeaderMap::new(),
+            HeaderValue::from_static("Bearer provider-secret"),
+        )
+        .expect("matching native revision should render");
+        assert_eq!(rendered.uri.query(), Some("revision=2026.07.18"));
+
+        let mismatched = CanonicalRerankerRequest::DeepInfraNative {
+            uri: Uri::from_static("/v1/inference/Qwen/Qwen3-Reranker-8B?revision=other"),
+            body: Bytes::from_static(br#"{"queries":["q"],"documents":["d"]}"#),
+        };
+        assert!(
+            render_deepinfra_with_authorization(
+                &endpoint,
+                &mismatched,
+                &HeaderMap::new(),
+                HeaderValue::from_static("Bearer provider-secret"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn deepinfra_rerank_envelope_preserves_model_aliases_and_returned_documents() {
+        let body =
+            Bytes::from_static(br#"{"scores":[0.2,0.9],"input_tokens":19,"request_id":"req-195"}"#);
+        let response = rewrite_response(
+            &body,
+            ResponseContract::OpenAiRerank {
+                documents: vec![String::from("low"), String::from("high")],
+                top_n: 2,
+                return_documents: true,
+                model: Some(String::from("public-reranker")),
+            },
+            None,
+        )
+        .expect("valid DeepInfra response should convert");
+        let response: Value = serde_json::from_slice(&response).expect("response should be JSON");
+        assert_eq!(response["id"], "req-195");
+        assert_eq!(response["model"], "public-reranker");
+        assert_eq!(response["results"], response["data"]);
+        assert_eq!(response["results"][0]["index"], 1);
+        assert_eq!(response["results"][0]["document"], "high");
+        assert_eq!(response["usage"]["total_tokens"], 19);
+    }
+
+    #[test]
+    fn oversized_deepinfra_rendering_is_rejected_before_query_repetition() {
+        let endpoint = UpstreamEndpointConfig {
+            base_url: String::from("https://api.deepinfra.com"),
+            protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
+            model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
+            model_revision: Some(String::from("2026.07.18")),
+            ..UpstreamEndpointConfig::default()
+        };
+        let documents = std::iter::repeat_n("d", MAX_PAIR_COUNT).collect::<Vec<_>>();
+        let body = serde_json::to_vec(&json!({
+            "query": "q".repeat(1024),
+            "documents": documents,
+        }))
+        .expect("test request JSON");
+        let request = CanonicalRerankerRequest::OpenAiRerank {
+            forward_uri: Uri::from_static("/v1/rerank"),
+            body: Bytes::from(body),
+        };
+        assert!(
+            render_deepinfra_with_authorization(
+                &endpoint,
+                &request,
+                &HeaderMap::new(),
+                HeaderValue::from_static("Bearer provider-secret"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn terminal_protocol_not_response_shape_selects_the_converter() {
+        let request = CanonicalRerankerRequest::OpenAiRerank {
+            forward_uri: Uri::from_static("/v1/rerank"),
+            body: Bytes::from_static(
+                br#"{"model":"public-reranker","query":"q","documents":["d"]}"#,
+            ),
+        };
+        let body = Bytes::from_static(br#"{"scores":"not-an-array"}"#);
+        assert_eq!(
+            rewrite_response_for_endpoint(
+                &body,
+                &request,
+                UpstreamEndpointProtocol::OpenAi,
+                Some("public-reranker"),
+            )
+            .expect("an OpenAI endpoint response must not be guessed from body shape"),
+            body,
+        );
+        assert!(
+            rewrite_response_for_endpoint(
+                &body,
+                &request,
+                UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
+                Some("public-reranker"),
+            )
+            .is_err()
+        );
     }
 }

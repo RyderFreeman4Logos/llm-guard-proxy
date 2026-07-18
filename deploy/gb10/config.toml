@@ -228,6 +228,32 @@ enabled = false
 [upstreams.param_override]
 enabled = false
 
+# BEGIN PARSEABLE EXAMPLE: heterogeneous-reranker-replicas
+# A local OpenAI-compatible reranker remains the preferred endpoint. The optional
+# DeepInfra replica is selected only for losslessly representable rerank/score calls;
+# generic OpenAI APIs and opaque or future score bodies never reach this endpoint.
+#| [[upstreams]]
+#| name = "example-heterogeneous-reranker"                             # Stable profile name for routing and observability
+#| base_url = "http://127.0.0.1:18013/v1"                              # Legacy fallback; first endpoint is authoritative when replicas are configured
+#| match_models = ["example-reranker"]                                 # Public model aliases served by this profile
+#| request_timeout_ms = 600000                                          # One total deadline shared by selection and physical attempts
+#| endpoint_selection = "priority_failover"                            # Or "round_robin" across currently eligible replicas
+#| health_probe_interval_ms = 2000                                     # Local probe cache and cloud passive cooldown duration
+#| health_probe_timeout_ms = 1000                                      # Bound one local /v1/models health probe
+#| health_probe_max_wait_ms = 120000                                   # Bound endpoint-selection wait within the request deadline
+#| [[upstreams.endpoints]]
+#| base_url = "http://100.105.4.92:18013/v1"                           # OpenAI-compatible local replica
+#| priority = "primary"                                                # Preferred while healthy
+#| protocol = "openai"                                                 # Preserves arbitrary OpenAI request shapes
+#| [[upstreams.endpoints]]
+#| base_url = "https://api.deepinfra.com"                              # DeepInfra API origin, without caller credentials
+#| priority = "failover"                                               # Used only after a compatible retry/failover decision
+#| protocol = "deepinfra_qwen3_rerank"                                # Native Qwen3 reranker protocol
+#| model = "Qwen/Qwen3-Reranker-8B"                                   # Exact DeepInfra model path component
+#| model_revision = "2026.07.18"                                      # Required immutable revision; rendered as the exact revision query
+#| api_key_env = "LLM_GUARD_PROXY_DEEPINFRA_API_KEY"                   # Runtime credential environment variable; never put the secret here
+# END PARSEABLE EXAMPLE: heterogeneous-reranker-replicas
+
 # BEGIN PARSEABLE EXAMPLE: upstream-profile
 #| [[upstreams]]
 #| name = "example-model"

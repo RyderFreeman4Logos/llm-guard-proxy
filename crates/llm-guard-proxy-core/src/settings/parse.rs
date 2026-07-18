@@ -995,6 +995,7 @@ fn assign_upstream_endpoint(
         "priority" => config.priority = parse_upstream_priority(value, line_number)?,
         "protocol" => config.protocol = parse_upstream_endpoint_protocol(value, line_number)?,
         "model" => config.model = parse_optional_string(value, line_number)?,
+        "model_revision" => config.model_revision = parse_optional_string(value, line_number)?,
         "api_key_env" => config.api_key_env = parse_optional_string(value, line_number)?,
         _ => return unknown_key("profile.upstream", key, line_number),
     }
