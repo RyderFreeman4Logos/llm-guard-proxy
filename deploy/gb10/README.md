@@ -189,14 +189,16 @@ systemctl --user restart vllm-aeon-27b-dflash-n12.service
 
 curl --fail --silent --show-error http://gb10:18010/v1/models >/dev/null
 
-registration_dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gb10-memory-guardian"
-registration="${registration_dir}/text-cgroup.v1"
-deploy/gb10/cutover-guardian.sh "${registration}"
+deploy/gb10/cutover-guardian.sh
 ```
 
-The helper validates the complete registration contract, the referenced live
-cgroup, and `cgroup.events` (`populated 1`) before any guardian `systemctl` call.
-Every unit operation has a deadline. It treats a `not-found` standalone unit as
+The unit and helper share the fixed `%t/gb10-memory-guardian` runtime directory;
+the helper intentionally accepts no registration-path override. It validates the
+complete registration contract, the referenced live cgroup, `cgroup.events`
+(`populated 1`), and `cgroup.kill` before any guardian `systemctl` call. Every
+unit operation has a deadline. After starting the integrated service, cutover
+also verifies its `MainPID` holds the registered `cgroup.events` descriptor and
+a writable `cgroup.kill` descriptor. It treats a `not-found` standalone unit as
 a fresh install; otherwise it disables the standalone guardian before enabling
 the integrated guardian, so recovery has only one owner. Any failure or signal
 after mutation begins automatically restores both units' prior enablement and

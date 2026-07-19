@@ -8,6 +8,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 CUTOVER = ROOT / "deploy" / "gb10" / "cutover-guardian.sh"
+SERVICE = ROOT / "deploy" / "gb10" / "llm-guard-proxy.service"
 
 
 class Gb10GuardianCutoverTests(unittest.TestCase):
@@ -27,10 +28,14 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
         target_state: str = "populated",
         integrated_enable_failure: bool = False,
         integrated_active_hang: bool = False,
+        registration_argument: bool = False,
+        attestation_state: str = "ready",
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            registration_path = root / "text-cgroup.v1"
+            runtime_root = root / "runtime"
+            registration_path = runtime_root / "gb10-memory-guardian" / "text-cgroup.v1"
+            registration_path.parent.mkdir(parents=True)
             registration_source = (
                 root / "registration-source.v1"
                 if metadata_violation == "symlink"
@@ -59,6 +64,20 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                 target.mkdir(parents=True)
                 populated = "1" if target_state == "populated" else "0"
                 (target / "cgroup.events").write_text(f"populated {populated}\n")
+                (target / "cgroup.kill").write_text("")
+
+                proc_root = root / "proc"
+                process = proc_root / "4242"
+                (process / "fd").mkdir(parents=True)
+                (process / "fdinfo").mkdir()
+                if attestation_state != "missing-events":
+                    (process / "fd" / "7").symlink_to(target / "cgroup.events")
+                if attestation_state != "missing-kill":
+                    (process / "fd" / "8").symlink_to(target / "cgroup.kill")
+                    flags = "00" if attestation_state == "readonly-kill" else "01"
+                    (process / "fdinfo" / "8").write_text(f"flags:\t{flags}\n")
+            else:
+                proc_root = root / "proc"
 
             systemctl_log = root / "systemctl.log"
             fake_bin = root / "bin"
@@ -79,6 +98,8 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                 'printf \'%s\\n\' "${INTEGRATED_UNIT_FILE_STATE}" ;;\n'
                 '  *"show --property=ActiveState"*"llm-guard-proxy.service"*) '
                 'printf \'%s\\n\' "${INTEGRATED_ACTIVE_STATE}" ;;\n'
+                '  *"show --property=MainPID"*"llm-guard-proxy.service"*) '
+                'printf \'%s\\n\' "${INTEGRATED_MAIN_PID}" ;;\n'
                 '  *"enable --now llm-guard-proxy.service"*) '
                 '[[ "${INTEGRATED_ENABLE_FAILURE}" != 1 ]] ;;\n'
                 '  *"is-active llm-guard-proxy.service"*) '
@@ -98,9 +119,14 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
             env["INTEGRATED_ACTIVE_STATE"] = integrated_active_state
             env["INTEGRATED_ENABLE_FAILURE"] = "1" if integrated_enable_failure else "0"
             env["INTEGRATED_ACTIVE_HANG"] = "1" if integrated_active_hang else "0"
+            env["INTEGRATED_MAIN_PID"] = "0" if attestation_state == "missing-pid" else "4242"
             env["LLM_GUARD_CGROUP_ROOT"] = str(cgroup_root)
+            env["LLM_GUARD_PROC_ROOT"] = str(proc_root)
             env["LLM_GUARD_SYSTEMCTL_TIMEOUT"] = "0.1s"
-            command = [str(CUTOVER), str(registration_path)]
+            env["XDG_RUNTIME_DIR"] = str(runtime_root)
+            command = [str(CUTOVER)]
+            if registration_argument:
+                command.append(str(registration_path))
             try:
                 completed = subprocess.run(
                     command,
@@ -169,6 +195,52 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
         self.assertFalse(any("disable --now gb10-memory-guardian.service" in call for call in calls))
         self.assertTrue(any("enable --now llm-guard-proxy.service" in call for call in calls))
         self.assertTrue(any("is-active llm-guard-proxy.service" in call for call in calls))
+        self.assertTrue(
+            any("show --property=MainPID" in call for call in calls),
+            "cutover success must be gated on integrated guardian ownership attestation",
+        )
+
+    def test_registration_override_is_rejected_before_any_systemctl_call(self) -> None:
+        completed, calls = self.run_cutover(
+            self.registration("a" * 64, "a" * 64), registration_argument=True
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertEqual(calls, [])
+
+    def test_service_binds_guardian_runtime_to_cutover_registration_directory(self) -> None:
+        service = SERVICE.read_text()
+
+        self.assertIn("--guardian-runtime-dir %t/gb10-memory-guardian", service)
+
+    def test_missing_guardian_fd_attestation_rolls_back_cutover(self) -> None:
+        registration = self.registration("a" * 64, "a" * 64)
+        for attestation_state in (
+            "missing-pid",
+            "missing-events",
+            "missing-kill",
+            "readonly-kill",
+        ):
+            with self.subTest(attestation_state=attestation_state):
+                completed, calls = self.run_cutover(
+                    registration,
+                    legacy_load_state="loaded",
+                    attestation_state=attestation_state,
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                attestation_index = next(
+                    index
+                    for index, call in enumerate(calls)
+                    if "show --property=MainPID" in call
+                )
+                self.assertTrue(
+                    any(
+                        index > attestation_index
+                        and call.endswith("start gb10-memory-guardian.service")
+                        for index, call in enumerate(calls)
+                    )
+                )
 
     def test_existing_legacy_guardian_is_disabled_before_integrated_enable(self) -> None:
         completed, calls = self.run_cutover(

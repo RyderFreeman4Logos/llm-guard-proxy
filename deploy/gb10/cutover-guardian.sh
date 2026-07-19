@@ -5,6 +5,7 @@ readonly legacy_unit="gb10-memory-guardian.service"
 readonly integrated_unit="llm-guard-proxy.service"
 readonly registration_max_bytes=1024
 readonly cgroup_root="${LLM_GUARD_CGROUP_ROOT:-/sys/fs/cgroup}"
+readonly proc_root="${LLM_GUARD_PROC_ROOT:-/proc}"
 readonly systemctl_timeout="${LLM_GUARD_SYSTEMCTL_TIMEOUT:-15s}"
 
 die() {
@@ -54,13 +55,54 @@ restore_unit_state() {
     return "${failed}"
 }
 
-if (( $# > 1 )); then
-    die "usage: $0 [registration-file]"
+attest_integrated_guardian() {
+    local pid
+    pid="$(
+        systemctl_bounded --user show --property=MainPID --value "${integrated_unit}"
+    )"
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || die "integrated guardian has no running main process"
+
+    local process_dir="${proc_root}/${pid}"
+    [[ -d "${process_dir}/fd" && -d "${process_dir}/fdinfo" ]] \
+        || die "integrated guardian process descriptors are unavailable"
+    local expected_events expected_kill
+    expected_events="$(readlink -f -- "${cgroup_events}")"
+    expected_kill="$(readlink -f -- "${cgroup_kill}")"
+    local events_open=false
+    local writable_kill_open=false
+    local fd_link fd_target fd_number flags key value extra
+    for fd_link in "${process_dir}"/fd/[0-9]*; do
+        [[ -e "${fd_link}" || -L "${fd_link}" ]] || continue
+        fd_target="$(readlink -f -- "${fd_link}" 2>/dev/null || true)"
+        if [[ "${fd_target}" == "${expected_events}" ]]; then
+            events_open=true
+        fi
+        [[ "${fd_target}" == "${expected_kill}" ]] || continue
+        fd_number="${fd_link##*/}"
+        flags=""
+        while read -r key value extra; do
+            if [[ "${key}" == "flags:" && -z "${extra:-}" ]]; then
+                flags="${value}"
+                break
+            fi
+        done <"${process_dir}/fdinfo/${fd_number}"
+        if [[ "${flags}" =~ ^0?[0-7]*[123567]$ ]]; then
+            writable_kill_open=true
+        fi
+    done
+    [[ "${events_open}" == "true" ]] \
+        || die "integrated guardian has not opened the registered cgroup.events"
+    [[ "${writable_kill_open}" == "true" ]] \
+        || die "integrated guardian has not opened registered cgroup.kill for writing"
+}
+
+if (( $# != 0 )); then
+    die "usage: $0"
 fi
 
 uid="$(id -u)"
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/${uid}}/gb10-memory-guardian"
-registration="${1:-${runtime_dir}/text-cgroup.v1}"
+registration="${runtime_dir}/text-cgroup.v1"
 
 [[ -f "${registration}" && ! -L "${registration}" ]] \
     || die "registration must be a regular, non-symlink file"
@@ -118,12 +160,16 @@ expected_group="/user.slice/user-${uid}.slice/user@${uid}.service/app.slice/${sc
     || die "control_group must match the current user and scope"
 
 [[ "${cgroup_root}" == /* ]] || die "cgroup root must be absolute"
+[[ "${proc_root}" == /* ]] || die "proc root must be absolute"
 cgroup_path="${cgroup_root}${control_group}"
 [[ -d "${cgroup_path}" && ! -L "${cgroup_path}" ]] \
     || die "registered cgroup does not exist"
 cgroup_events="${cgroup_path}/cgroup.events"
 [[ -f "${cgroup_events}" && ! -L "${cgroup_events}" ]] \
     || die "registered cgroup.events is unavailable"
+cgroup_kill="${cgroup_path}/cgroup.kill"
+[[ -f "${cgroup_kill}" && ! -L "${cgroup_kill}" ]] \
+    || die "registered cgroup.kill is unavailable"
 populated=""
 while read -r event_key event_value event_extra; do
     if [[ "${event_key}" == "populated" ]]; then
@@ -198,5 +244,6 @@ if [[ "${legacy_load_state}" != "not-found" ]]; then
 fi
 systemctl_bounded --user enable --now "${integrated_unit}"
 systemctl_bounded --user is-active "${integrated_unit}"
+attest_integrated_guardian
 cutover_complete=true
 trap - EXIT INT TERM
