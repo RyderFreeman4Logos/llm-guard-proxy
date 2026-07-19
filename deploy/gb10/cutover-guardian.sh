@@ -38,6 +38,7 @@ restore_unit_state() {
             systemctl_bounded --user enable "${unit}" || failed=1
             ;;
         enabled-runtime)
+            systemctl_bounded --user disable "${unit}" || failed=1
             systemctl_bounded --user enable --runtime "${unit}" || failed=1
             ;;
         disabled)

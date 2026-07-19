@@ -256,13 +256,13 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
 
     def test_rollback_restores_every_accepted_unit_file_state_exactly(self) -> None:
         expected_commands = {
-            "enabled": "enable",
-            "enabled-runtime": "enable --runtime",
-            "disabled": "disable",
-            "static": None,
-            "indirect": None,
-            "generated": None,
-            "transient": None,
+            "enabled": ["enable"],
+            "enabled-runtime": ["disable", "enable --runtime"],
+            "disabled": ["disable"],
+            "static": [],
+            "indirect": [],
+            "generated": [],
+            "transient": [],
         }
         valid_registration = self.registration("a" * 64, "a" * 64)
         for unit_kind in ("integrated", "legacy"):
@@ -295,13 +295,10 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                         if call.endswith(unit)
                         and (" enable " in f" {call} " or " disable " in f" {call} ")
                     ]
-                    if expected_command is None:
-                        self.assertEqual(enablement_calls, [])
-                    else:
-                        self.assertEqual(
-                            enablement_calls,
-                            [f"--user {expected_command} {unit}"],
-                        )
+                    self.assertEqual(
+                        enablement_calls,
+                        [f"--user {command} {unit}" for command in expected_command],
+                    )
 
     def test_rollback_restores_every_accepted_activity_state_exactly(self) -> None:
         valid_registration = self.registration("a" * 64, "a" * 64)
