@@ -3545,6 +3545,20 @@ fn guardian_reload_metadata_lists_all_policy_fields() {
 }
 
 #[test]
+fn reload_metadata_lists_all_applied_endpoint_fields() {
+    for field in [
+        "upstreams.endpoints.base_url",
+        "upstreams.endpoints.priority",
+        "upstreams.endpoints.protocol",
+        "upstreams.endpoints.model",
+        "upstreams.endpoints.model_revision",
+        "upstreams.endpoints.api_key_env",
+    ] {
+        assert!(RELOADABLE_FIELDS.contains(&field), "missing {field}");
+    }
+}
+
+#[test]
 fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"thinking.enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"thinking.force_disable"));
