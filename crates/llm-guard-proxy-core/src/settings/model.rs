@@ -1043,6 +1043,7 @@ impl AppConfig {
         {
             active.request_timeout_ms = requested.request_timeout_ms;
             active.endpoint_selection = requested.endpoint_selection;
+            active.base_url.clone_from(&requested.base_url);
             active.endpoints.clone_from(&requested.endpoints);
             active.health_probe_interval_ms = requested.health_probe_interval_ms;
             active.health_probe_timeout_ms = requested.health_probe_timeout_ms;
@@ -1262,7 +1263,6 @@ impl From<&ListenerConfig> for ListenerTopology {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct UpstreamProfileTopology {
     name: String,
-    base_url: String,
     match_models: Vec<String>,
 }
 
@@ -1270,7 +1270,6 @@ impl From<&UpstreamProfileConfig> for UpstreamProfileTopology {
     fn from(profile: &UpstreamProfileConfig) -> Self {
         Self {
             name: profile.name.clone(),
-            base_url: profile.base_url.clone(),
             match_models: profile.match_models.clone(),
         }
     }
