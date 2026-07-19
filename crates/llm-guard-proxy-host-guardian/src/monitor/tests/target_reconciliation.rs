@@ -286,3 +286,39 @@ fn same_registration_recreation_reopens_and_rearms_new_cgroup_generation() {
 
     fs::remove_dir_all(root).expect("remove root");
 }
+
+#[test]
+fn same_cgroup_inode_repopulation_rearms_verified_controller() {
+    let (root, _registration) = target_tree();
+    let runtime = root.join("runtime");
+    let handle = guardian_handle("target.v1", &root);
+    let mut guardian = MemoryGuardian::open(handle, &runtime).expect("open guardian");
+    assert!(guardian.reconcile_healthy_target());
+
+    let uid = Uid::effective().as_raw();
+    let id = "a".repeat(64);
+    let cgroup = root.join(format!(
+        "user.slice/user-{uid}.slice/user@{uid}.service/app.slice/docker-{id}.scope"
+    ));
+    fs::write(cgroup.join("cgroup.events"), b"populated 0\n").expect("mark target empty");
+    assert_eq!(
+        guardian.attempt_emergency(false),
+        GuardianIteration::Verified
+    );
+    fs::write(cgroup.join("cgroup.events"), b"populated 1\n")
+        .expect("repopulate the same cgroup object");
+    assert!(
+        guardian.reconcile_healthy_target(),
+        "a verified target becoming populated on the same inode must re-arm the controller"
+    );
+    assert_eq!(
+        guardian.attempt_emergency(false),
+        GuardianIteration::Waiting
+    );
+    assert_eq!(
+        fs::read(cgroup.join("cgroup.kill")).expect("read repopulated target kill"),
+        b"11"
+    );
+
+    fs::remove_dir_all(root).expect("remove root");
+}

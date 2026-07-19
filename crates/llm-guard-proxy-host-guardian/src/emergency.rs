@@ -231,6 +231,10 @@ impl EmergencyController {
         self.verified = false;
     }
 
+    pub(crate) const fn target_is_verified(&self) -> bool {
+        self.verified
+    }
+
     /// Performs one error-tolerant retained-descriptor attempt.
     #[must_use]
     pub fn attempt(&mut self, now_millis: u64, target: &CgroupTarget) -> AttemptOutcome {

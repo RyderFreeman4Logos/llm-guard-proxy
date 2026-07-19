@@ -694,15 +694,23 @@ impl MemoryGuardian {
         if target_needs_reconciliation {
             match open_recovery_target(&self.active_policy, &self.runtime_dir) {
                 Ok(target) => {
-                    if matches!(
+                    let same_target_generation = matches!(
                         (&self.target, &target),
                         (
                             Some(RecoveryTarget::Cgroup(active)),
                             RecoveryTarget::Cgroup(candidate)
                         ) if active.has_same_target_generation(candidate)
-                    ) {
+                    );
+                    if same_target_generation {
+                        let repopulated = self
+                            .controller
+                            .as_ref()
+                            .is_some_and(EmergencyController::target_is_verified);
                         self.last_rejected_policy = None;
-                        return false;
+                        if repopulated && let Some(controller) = self.controller.as_mut() {
+                            controller.reset_for_target_generation();
+                        }
+                        return repopulated;
                     }
                     self.target = Some(target);
                     self.last_rejected_policy = None;
