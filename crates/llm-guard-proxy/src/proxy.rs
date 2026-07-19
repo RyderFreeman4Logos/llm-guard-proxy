@@ -4134,10 +4134,60 @@ fn prepare_generic_attempt_request(
     (override_headers, metadata)
 }
 
-fn merged_models_groups(context: &GenericForwardContext<'_>) -> Option<Vec<ModelsUpstreamGroup>> {
-    let groups = listener_models_upstream_groups(context.config, &context.state.listener)?;
-    (is_control_plane_models_request(&context.method, &context.uri) && groups.len() > 1)
-        .then_some(groups)
+async fn merged_models_groups(
+    context: &GenericForwardContext<'_>,
+) -> Result<Option<Vec<ModelsUpstreamGroup>>, ProxyError> {
+    if !is_control_plane_models_request(&context.method, &context.uri) {
+        return Ok(None);
+    }
+    let mut groups = Vec::<ModelsUpstreamGroup>::new();
+    for profile in listener_models_upstream_profiles(context.config, &context.state.listener) {
+        let request_deadline = Instant::now() + Duration::from_millis(profile.request_timeout_ms);
+        let selected = context
+            .state
+            .upstream_health
+            .select_endpoint(
+                &context.state.client,
+                &profile,
+                &context.state.shutdown,
+                None,
+                Some(request_deadline),
+            )
+            .await
+            .map_err(|error| match error {
+                EndpointSelectionError::Shutdown => ProxyError::server_shutdown(),
+                EndpointSelectionError::Incompatible { profile } => {
+                    ProxyError::ContextBudgetExceeded {
+                        message: format!(
+                            "no OpenAI-compatible model discovery endpoint for profile {profile}"
+                        ),
+                        param: "path",
+                        code: "unsupported_models_endpoint",
+                        request_metadata: None,
+                    }
+                }
+                EndpointSelectionError::Unavailable { profile, waited_ms } => {
+                    ProxyError::upstream_unavailable(profile, waited_ms)
+                }
+            })?;
+        if let Some(group) = groups
+            .iter_mut()
+            .find(|group| group.base_url == selected.base_url)
+        {
+            group.request_timeout_ms = group.request_timeout_ms.max(profile.request_timeout_ms);
+            continue;
+        }
+        groups.push(ModelsUpstreamGroup {
+            base_url: selected.base_url,
+            request_timeout_ms: profile.request_timeout_ms,
+            metadata: profile.metadata.clone(),
+            profile,
+            terminal_endpoint: selected.endpoint,
+            endpoint_retry_order: selected.selection_order,
+            request_deadline,
+        });
+    }
+    Ok((groups.len() > 1).then_some(groups))
 }
 
 fn copy_endpoint_selection_metadata(
@@ -4159,7 +4209,7 @@ fn copy_endpoint_selection_metadata(
 async fn forward_generic_openai_request(
     context: GenericForwardContext<'_>,
 ) -> Result<Response<Body>, ProxyError> {
-    if let Some(groups) = merged_models_groups(&context) {
+    if let Some(groups) = merged_models_groups(&context).await? {
         return forward_merged_models_response(context, groups).await;
     }
 
@@ -4365,6 +4415,9 @@ struct ModelsUpstreamGroup {
     base_url: String,
     request_timeout_ms: u64,
     metadata: MetadataConfig,
+    terminal_endpoint: UpstreamEndpointConfig,
+    endpoint_retry_order: Vec<String>,
+    request_deadline: Instant,
 }
 
 struct CompletedModelsFetch {
@@ -4464,6 +4517,28 @@ fn models_success_response_headers() -> HeaderMap {
     headers
 }
 
+fn models_failover_retry_context<'request>(
+    context: &'request GenericForwardContext<'_>,
+    group: &'request ModelsUpstreamGroup,
+    downstream_headers: &'request HeaderMap,
+) -> Option<UpstreamFailoverRetryContext<'request>> {
+    group
+        .profile
+        .has_endpoint_failover()
+        .then_some(UpstreamFailoverRetryContext {
+            registry: context.state.upstream_health.as_ref(),
+            profile: &group.profile,
+            local_forward_uri: context.upstream_uri.clone(),
+            original_downstream_headers: downstream_headers,
+            canonical_reranker: None,
+            transformed_request_headers: false,
+            initial_endpoint: &group.terminal_endpoint,
+            request_deadline: Some(group.request_deadline),
+            endpoint_retry_order: &group.endpoint_retry_order,
+            shutdown: context.state.shutdown.as_ref(),
+        })
+}
+
 async fn fetch_models_upstream_group(
     context: &GenericForwardContext<'_>,
     group: &ModelsUpstreamGroup,
@@ -4472,8 +4547,9 @@ async fn fetch_models_upstream_group(
 ) -> Result<CompletedModelsFetch, ProxyError> {
     let attempt_id = AttemptId::for_request(context.request_id, attempt_number);
     let attempt_started_at_unix_ms = unix_time_millis();
+    let downstream_headers = model_discovery_request_headers(&context.downstream_headers);
     let mut attempt_request_metadata =
-        attempt_request_metadata(&context.method, &context.uri, &context.downstream_headers);
+        attempt_request_metadata(&context.method, &context.uri, &downstream_headers);
     attempt_request_metadata.insert(String::from("attempt_number"), attempt_number.to_string());
     add_listener_metadata(&mut attempt_request_metadata, &context.state.listener);
     add_upstream_profile_metadata(
@@ -4494,7 +4570,7 @@ async fn fetch_models_upstream_group(
         client: &context.state.client,
         method: context.reqwest_method.clone(),
         upstream_url,
-        downstream_headers: &context.downstream_headers,
+        downstream_headers: &downstream_headers,
         upstream_body: context.upstream_body.clone(),
         upstream_timeout: Duration::from_millis(group.request_timeout_ms),
         attempt_id: attempt_id.clone(),
@@ -4504,12 +4580,12 @@ async fn fetch_models_upstream_group(
         request_metadata: &context.request_metadata,
         attempt_request_metadata: &attempt_request_metadata,
         shutdown: context.state.shutdown.subscribe(),
-        failover_retry: None,
+        failover_retry: models_failover_retry_context(context, group, &downstream_headers),
         terminal_endpoint_protocol: UpstreamEndpointProtocol::OpenAi,
         canonical_reranker: None,
         decode_heterogeneous_reranker: false,
         model_id: None,
-        request_deadline: None,
+        request_deadline: Some(group.request_deadline),
     })
     .await?;
     let upstream_response = models_upstream_response(sent_upstream_response.response)?;
@@ -6388,33 +6464,10 @@ fn filter_models_body_for_listener(
     })
 }
 
-fn listener_models_upstream_groups(
-    config: &AppConfig,
-    listener: &ListenerConfig,
-) -> Option<Vec<ModelsUpstreamGroup>> {
-    let upstream_profiles = listener_models_upstream_profiles(config, listener);
-    let mut groups = Vec::<ModelsUpstreamGroup>::new();
-    for profile in upstream_profiles {
-        if let Some(group) = groups
-            .iter_mut()
-            .find(|group| group.base_url == profile.base_url)
-        {
-            group.request_timeout_ms = group.request_timeout_ms.max(profile.request_timeout_ms);
-            continue;
-        }
-        groups.push(ModelsUpstreamGroup {
-            base_url: profile.base_url.clone(),
-            request_timeout_ms: profile.request_timeout_ms,
-            metadata: profile.metadata.clone(),
-            profile,
-        });
-    }
-
-    if groups.is_empty() {
-        None
-    } else {
-        Some(groups)
-    }
+fn model_discovery_request_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut headers = headers.clone();
+    headers.remove(AUTHORIZATION);
+    headers
 }
 
 fn listener_models_upstream_profiles(
