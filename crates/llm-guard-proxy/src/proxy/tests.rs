@@ -6034,6 +6034,67 @@ async fn upstream_stall_recovery_joiner_uses_completed_state_after_lost_notifica
     assert_eq!(joined["upstream_stall_recovery_joined_status"], "succeeded");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn upstream_stall_recovery_public_path_returns_term_resistant_leader_cleanup_result() {
+    let test_dir = unique_test_dir("public recovery term-resistant leader");
+    remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
+    let leader_pid_path = test_dir.join("leader.pid");
+    let ready_path = test_dir.join("leader.ready");
+    let script_path = test_dir.join("term-resistant-leader.sh");
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nset -eu\ntrap '' TERM\nprintf '%s\\n' \"$$\" > \"$1\"\n: > \"$2\"\nwhile :; do sleep 1; done\n",
+    )
+    .expect("test recovery script should be written");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+        .expect("test recovery script should be executable");
+
+    let policy = UpstreamStallPolicy {
+        enabled: true,
+        first_chunk_timeout: Duration::from_millis(50),
+        idle_timeout: Duration::from_millis(50),
+        recovery_command: vec![
+            String::from("/bin/sh"),
+            script_path.display().to_string(),
+            leader_pid_path.display().to_string(),
+            ready_path.display().to_string(),
+        ],
+        recovery_timeout: Duration::from_millis(1),
+        recovery_cooldown: Duration::from_millis(1),
+        recovery_budget_window: Duration::from_secs(60),
+        recovery_max_per_window: 2,
+    };
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    let recovery = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move { run_upstream_stall_recovery(&policy, &coordinator).await }
+    });
+    let leader = read_pid_file_after_ready(&leader_pid_path, &ready_path).await;
+    let metadata = recovery.await.expect("public recovery task should join");
+
+    // The legacy early public return leaves the background cleanup running.
+    // Let that bounded cleanup finish before asserting so this RED test cannot leak its leader.
+    sleep(Duration::from_millis(1_250)).await;
+    assert_process_reaped(leader).await;
+    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_term_sent"],
+        "true"
+    );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_kill_sent"],
+        "true"
+    );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_cleanup_status"],
+        "terminated_after_kill"
+    );
+    remove_dir_all(&test_dir);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn upstream_stall_recovery_command_wiring_times_out_and_cleans_process_group() {

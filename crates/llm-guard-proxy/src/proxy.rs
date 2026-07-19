@@ -83,7 +83,8 @@ use upstream_failover::{EndpointSelectionError, UpstreamHealthRegistry};
 #[cfg(all(test, unix))]
 use recovery::send_recovery_process_group_signal;
 use recovery::{
-    RecoveryProcessGuard, configure_recovery_command, terminate_timed_out_recovery_child,
+    RecoveryProcessGuard, configure_recovery_command, recovery_join_timeout,
+    recovery_result_poll_interval, terminate_timed_out_recovery_child,
 };
 
 const MAX_PROXY_BODY_BYTES: usize = 64 * 1024 * 1024;
@@ -7741,7 +7742,7 @@ async fn wait_for_upstream_stall_recovery_result(
     joined_inflight: bool,
 ) -> BTreeMap<String, String> {
     let mut metadata = upstream_stall_recovery_metadata(true);
-    let deadline = Instant::now() + recovery_join_timeout(policy);
+    let deadline = Instant::now() + recovery_join_timeout(policy.recovery_timeout);
     loop {
         let notified = coordinator.notify.notified();
         tokio::pin!(notified);
@@ -7754,7 +7755,7 @@ async fn wait_for_upstream_stall_recovery_result(
         drop(state);
 
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() || timeout(remaining, notified).await.is_err() {
+        if remaining.is_zero() {
             let state = coordinator.state.lock().await;
             if !state.running {
                 return completed_upstream_stall_recovery_metadata(
@@ -7775,6 +7776,12 @@ async fn wait_for_upstream_stall_recovery_result(
             );
             return metadata;
         }
+
+        // A result publication can race a waiter that has already prepared its notification.
+        // Poll within the budgeted handoff margin so that race cannot defer a completed result
+        // until the full public join deadline.
+        let poll_interval = recovery_result_poll_interval();
+        let _notified = timeout(remaining.min(poll_interval), notified).await;
     }
 }
 
@@ -7806,12 +7813,6 @@ fn completed_upstream_stall_recovery_metadata(
         );
     }
     joined
-}
-
-const fn recovery_join_timeout(policy: &UpstreamStallPolicy) -> Duration {
-    policy
-        .recovery_timeout
-        .saturating_add(Duration::from_secs(1))
 }
 
 async fn finish_upstream_stall_recovery(

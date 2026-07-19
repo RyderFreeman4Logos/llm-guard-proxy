@@ -1,6 +1,6 @@
-use std::collections::BTreeMap;
 #[cfg(unix)]
-use std::time::{Duration, Instant};
+use std::time::Instant;
+use std::{collections::BTreeMap, time::Duration};
 
 #[cfg(any(
     target_os = "android",
@@ -19,9 +19,47 @@ use tokio::process::Command;
 use tokio::time::timeout;
 
 const RECOVERY_PROCESS_GROUP_TERM_GRACE: Duration = Duration::from_millis(100);
-const RECOVERY_PROCESS_GROUP_TERM_MAX_WAIT: Duration = Duration::from_secs(2);
 const RECOVERY_PROCESS_GROUP_TERM_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE: Duration = Duration::from_millis(500);
+
+/// Bounds every cleanup step after a recovery command has timed out.
+///
+/// The public coordinator starts its join deadline before the background task has been scheduled,
+/// so `coordinator_handoff` also reserves a small scheduling and result-publication margin.
+#[derive(Clone, Copy, Debug)]
+struct RecoveryProcessGroupCleanupBudget {
+    term_observation: Duration,
+    kill_and_final_reap: Duration,
+    coordinator_handoff: Duration,
+}
+
+impl RecoveryProcessGroupCleanupBudget {
+    const fn bounded_cleanup_time(self) -> Duration {
+        self.term_observation
+            .saturating_add(self.kill_and_final_reap)
+            .saturating_add(self.coordinator_handoff)
+    }
+
+    const fn public_join_timeout(self, recovery_timeout: Duration) -> Duration {
+        recovery_timeout.saturating_add(self.bounded_cleanup_time())
+    }
+}
+
+const RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET: RecoveryProcessGroupCleanupBudget =
+    RecoveryProcessGroupCleanupBudget {
+        term_observation: Duration::from_secs(2),
+        kill_and_final_reap: Duration::from_millis(500),
+        coordinator_handoff: Duration::from_millis(100),
+    };
+
+/// Returns the complete public wait bound for a timed recovery command and its cleanup.
+pub(super) const fn recovery_join_timeout(recovery_timeout: Duration) -> Duration {
+    RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET.public_join_timeout(recovery_timeout)
+}
+
+/// Bounds state polling when a recovery-result notification is lost.
+pub(super) const fn recovery_result_poll_interval() -> Duration {
+    RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET.coordinator_handoff
+}
 
 /// Owns a recovery child and its process group until the direct child is reaped.
 ///
@@ -105,7 +143,8 @@ fn spawn_recovery_child_reaper(mut child: tokio::process::Child) {
     let _reaper = std::thread::Builder::new()
         .name(String::from("llm-guard-recovery-reaper"))
         .spawn(move || {
-            let deadline = std::time::Instant::now() + RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE;
+            let deadline = std::time::Instant::now()
+                + RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET.kill_and_final_reap;
             loop {
                 match child.try_wait() {
                     Ok(Some(_status)) => return,
@@ -161,7 +200,7 @@ pub(super) async fn terminate_timed_out_recovery_child(
             wait_for_term_child_exit_or_deadline(
                 pid,
                 RECOVERY_PROCESS_GROUP_TERM_GRACE,
-                RECOVERY_PROCESS_GROUP_TERM_MAX_WAIT,
+                RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET.term_observation,
             )
             .await,
         ),
@@ -171,7 +210,12 @@ pub(super) async fn terminate_timed_out_recovery_child(
         String::from("upstream_stall_recovery_timeout_kill_sent"),
         send_recovery_process_group_signal(pid, Signal::SIGKILL).to_string(),
     );
-    let cleanup_status = match timeout(RECOVERY_PROCESS_GROUP_KILL_REAP_GRACE, child.wait()).await {
+    let cleanup_status = match timeout(
+        RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET.kill_and_final_reap,
+        child.wait(),
+    )
+    .await
+    {
         Ok(Ok(_status)) => "terminated_after_kill",
         Ok(Err(_error)) => "wait_failed_after_kill",
         Err(_elapsed) => "wait_timeout_after_kill",
@@ -267,4 +311,25 @@ fn observe_recovery_child_without_reaping(pid: u32) -> &'static str {
 ))]
 fn observe_recovery_child_without_reaping(_pid: u32) -> &'static str {
     "child_state_unavailable_before_kill"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET, recovery_join_timeout};
+    use std::time::Duration;
+
+    #[test]
+    fn public_join_timeout_covers_every_bounded_process_group_cleanup_phase() {
+        let recovery_timeout = Duration::from_millis(1);
+        let budget = RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET;
+        let required = recovery_timeout
+            .saturating_add(budget.term_observation)
+            .saturating_add(budget.kill_and_final_reap)
+            .saturating_add(budget.coordinator_handoff);
+
+        assert!(
+            recovery_join_timeout(recovery_timeout) >= required,
+            "public join must outlive every bounded cleanup phase"
+        );
+    }
 }
