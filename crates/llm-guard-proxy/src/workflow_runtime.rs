@@ -486,6 +486,7 @@ printf '%s\n' '{"decision":"block","risk_level":"high","tags":["policy"],"summar
     fn successful_execution_kills_descendant_processes() {
         let temp = TempWorkflowDir::new("descendant");
         let child_pid_path = temp.path.join("child.pid");
+        let release_path = temp.path.join("release");
         // The background sleep must redirect its stdout/stderr so the
         // main script's stdout pipe closes promptly, allowing the runtime
         // to read the result and exit. The process group kill then cleans
@@ -493,20 +494,27 @@ printf '%s\n' '{"decision":"block","risk_level":"high","tags":["policy"],"summar
         let script = temp.write_script(
             "descendant.sh",
             &format!(
-                "read ignored\nsleep 30 >'{idle}' 2>&1 &\nchild=$!\nstart=$(awk '{{print $22}}' /proc/$child/stat)\nmarker='{pid}'\ntmp=\"${{marker}}.tmp.$$\"\nif [ \"$child\" -le 0 ] || [ -z \"$start\" ] || [ \"$start\" -le 0 ]; then exit 90; fi\nprintf '%s %s\\n' \"$child\" \"$start\" > \"$tmp\"\nmv -f \"$tmp\" \"$marker\"\nprintf '%s\\n' '{{\"decision\":\"allow\",\"risk_level\":\"low\",\"tags\":[\"ok\"],\"summary\":\"ok\",\"replacement_messages\":null,\"audit\":{{\"evidence_spans\":[],\"notes\":[\"ok\"]}}}}'\n",
+                "read ignored\nsleep 30 >'{idle}' 2>&1 &\nchild=$!\nstart=$(awk '{{print $22}}' /proc/$child/stat)\nmarker='{pid}'\ntmp=\"${{marker}}.tmp.$$\"\nif [ \"$child\" -le 0 ] || [ -z \"$start\" ] || [ \"$start\" -le 0 ]; then exit 90; fi\nprintf '%s %s\\n' \"$child\" \"$start\" > \"$tmp\"\nmv -f \"$tmp\" \"$marker\"\nwhile [ ! -e '{release}' ]; do sleep 0.01; done\nprintf '%s\\n' '{{\"decision\":\"allow\",\"risk_level\":\"low\",\"tags\":[\"ok\"],\"summary\":\"ok\",\"replacement_messages\":null,\"audit\":{{\"evidence_spans\":[],\"notes\":[\"ok\"]}}}}'\n",
                 idle = temp.path.join("idle.log").display(),
-                pid = child_pid_path.display()
+                pid = child_pid_path.display(),
+                release = release_path.display()
             ),
         );
         let cleanup = TestPidFileCleanup::new(child_pid_path.clone());
+        let runtime = runtime(&script, Vec::new(), 5_000, 4096);
+        let invocation = invocation();
 
-        let result = runtime(&script, Vec::new(), 5_000, 4096).execute(&invocation());
+        thread::scope(|scope| {
+            let execution = scope.spawn(|| runtime.execute(&invocation));
+            let child_identity = cleanup
+                .wait_for_identity(Instant::now() + Duration::from_secs(1))
+                .expect("script should publish its child identity");
+            fs::write(&release_path, b"").expect("test should release the workflow script");
+            let result = execution.join().expect("workflow execution should join");
 
-        assert_eq!(result.decision, GwpDecision::Allow);
-        let child_identity = cleanup
-            .identity()
-            .expect("script should persist child identity");
-        assert_process_exits(child_identity);
+            assert_eq!(result.decision, GwpDecision::Allow);
+            assert_process_exits(child_identity);
+        });
     }
 
     #[test]
@@ -703,10 +711,6 @@ fi
     impl TestPidFileCleanup {
         const fn new(path: PathBuf) -> Self {
             Self { path }
-        }
-
-        fn identity(&self) -> Option<TestProcessIdentity> {
-            self.wait_for_identity(Instant::now() + PID_FILE_CLEANUP_TIMEOUT)
         }
 
         fn wait_for_identity(&self, deadline: Instant) -> Option<TestProcessIdentity> {
