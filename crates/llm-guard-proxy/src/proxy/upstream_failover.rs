@@ -49,12 +49,28 @@ struct RoundRobinState {
     next: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct SelectedUpstreamEndpoint {
     pub(super) base_url: String,
     pub(super) priority: UpstreamPriority,
     pub(super) endpoint: UpstreamEndpointConfig,
     pub(super) selection_order: Vec<String>,
+    pub(super) recovery_trial_lease: Option<RecoveryTrialLease>,
+}
+
+pub(super) struct RecoveryTrialLease {
+    health: Arc<EndpointHealth>,
+}
+
+enum RecoveryTrialReservation {
+    Available,
+    Acquired(RecoveryTrialLease),
+    ReservedByAnotherRequest,
+}
+
+impl Drop for RecoveryTrialLease {
+    fn drop(&mut self) {
+        health_snapshot_mut(&self.health).recovery_trial_in_progress = false;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -159,7 +175,6 @@ impl UpstreamHealthRegistry {
                         Duration::from_millis(profile.health_probe_interval_ms),
                         Duration::from_millis(profile.health_probe_timeout_ms).min(remaining),
                         shutdown,
-                        true,
                     )
                     .await?
                 {
@@ -173,16 +188,18 @@ impl UpstreamHealthRegistry {
                 constraints.excluded_base_urls.is_empty(),
                 constraints.preferred_base_urls.is_some(),
             );
-            if let Some(endpoint) = eligible.first().cloned() {
-                return Ok(SelectedUpstreamEndpoint {
-                    base_url: endpoint.base_url.clone(),
-                    priority: endpoint.priority,
-                    endpoint,
-                    selection_order: eligible
-                        .into_iter()
-                        .map(|endpoint| endpoint.base_url)
-                        .collect(),
-                });
+            let selection_order = eligible
+                .iter()
+                .map(|endpoint| endpoint.base_url.clone())
+                .collect::<Vec<_>>();
+            for endpoint in eligible {
+                if let Some(selected) = self.selected_endpoint_with_recovery_lease(
+                    &endpoint,
+                    &selection_order,
+                    Duration::from_millis(profile.health_probe_interval_ms),
+                ) {
+                    return Ok(selected);
+                }
             }
 
             let now = Instant::now();
@@ -211,7 +228,6 @@ impl UpstreamHealthRegistry {
         probe_interval: Duration,
         probe_timeout: Duration,
         shutdown: &ShutdownGate,
-        reserve_passive_trial: bool,
     ) -> Result<bool, EndpointSelectionError> {
         if endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
             if !super::reranker_protocol::has_runtime_credential(endpoint) {
@@ -220,11 +236,7 @@ impl UpstreamHealthRegistry {
             let health = self.endpoint_health(endpoint);
             // Cloud health is passive: a cooldown blocks selection, expiry grants one real
             // request as the recovery trial, and no paid inference health probe is issued.
-            return Ok(passive_cloud_eligible(
-                &health,
-                probe_interval,
-                reserve_passive_trial,
-            ));
+            return Ok(passive_cloud_eligible(&health, probe_interval));
         }
         let health = self.endpoint_health(endpoint);
         if let Some(healthy) = recent_health(&health, probe_interval) {
@@ -250,6 +262,51 @@ impl UpstreamHealthRegistry {
         snapshot.checked_at = Some(Instant::now());
         snapshot.healthy = healthy;
         Ok(healthy)
+    }
+
+    fn selected_endpoint_with_recovery_lease(
+        &self,
+        endpoint: &UpstreamEndpointConfig,
+        selection_order: &[String],
+        probe_interval: Duration,
+    ) -> Option<SelectedUpstreamEndpoint> {
+        let recovery_trial_lease = match self.reserve_recovery_trial(endpoint, probe_interval) {
+            RecoveryTrialReservation::Available => None,
+            RecoveryTrialReservation::Acquired(lease) => Some(lease),
+            RecoveryTrialReservation::ReservedByAnotherRequest => return None,
+        };
+        Some(SelectedUpstreamEndpoint {
+            base_url: endpoint.base_url.clone(),
+            priority: endpoint.priority,
+            endpoint: endpoint.clone(),
+            selection_order: selection_order.to_vec(),
+            recovery_trial_lease,
+        })
+    }
+
+    fn reserve_recovery_trial(
+        &self,
+        endpoint: &UpstreamEndpointConfig,
+        probe_interval: Duration,
+    ) -> RecoveryTrialReservation {
+        if endpoint.protocol != UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
+            return RecoveryTrialReservation::Available;
+        }
+        let health = self.endpoint_health(endpoint);
+        let mut snapshot = health_snapshot_mut(&health);
+        if snapshot.checked_at.is_none() || snapshot.healthy {
+            return RecoveryTrialReservation::Available;
+        }
+        if snapshot.recovery_trial_in_progress
+            || snapshot
+                .checked_at
+                .is_some_and(|checked_at| checked_at.elapsed() < probe_interval)
+        {
+            return RecoveryTrialReservation::ReservedByAnotherRequest;
+        }
+        snapshot.recovery_trial_in_progress = true;
+        drop(snapshot);
+        RecoveryTrialReservation::Acquired(RecoveryTrialLease { health })
     }
 
     fn endpoint_health(&self, endpoint: &UpstreamEndpointConfig) -> Arc<EndpointHealth> {
@@ -345,11 +402,6 @@ impl UpstreamHealthRegistry {
         snapshot.recovery_trial_in_progress = false;
     }
 
-    pub(super) fn release_recovery_trial(&self, endpoint: &UpstreamEndpointConfig) {
-        let health = self.endpoint_health(endpoint);
-        health_snapshot_mut(&health).recovery_trial_in_progress = false;
-    }
-
     pub(super) fn start_background_polling(
         self: &Arc<Self>,
         config: ConfigHandle,
@@ -394,7 +446,6 @@ impl UpstreamHealthRegistry {
                                 Duration::from_millis(profile.health_probe_interval_ms),
                                 Duration::from_millis(profile.health_probe_timeout_ms),
                                 &shutdown,
-                                false,
                             )
                             .await
                             .is_err()
@@ -446,6 +497,7 @@ fn legacy_selected_endpoint(profile: &UpstreamProfileConfig) -> SelectedUpstream
         priority: UpstreamPriority::Primary,
         endpoint,
         selection_order: vec![profile.base_url.clone()],
+        recovery_trial_lease: None,
     }
 }
 
@@ -496,12 +548,8 @@ async fn probe_models(
     }
 }
 
-fn passive_cloud_eligible(
-    health: &EndpointHealth,
-    interval: Duration,
-    reserve_trial: bool,
-) -> bool {
-    let mut snapshot = health_snapshot_mut(health);
+fn passive_cloud_eligible(health: &EndpointHealth, interval: Duration) -> bool {
+    let snapshot = health_snapshot(health);
     if snapshot.checked_at.is_none() || snapshot.healthy {
         return true;
     }
@@ -511,9 +559,6 @@ fn passive_cloud_eligible(
         || snapshot.recovery_trial_in_progress
     {
         return false;
-    }
-    if reserve_trial {
-        snapshot.recovery_trial_in_progress = true;
     }
     true
 }
@@ -689,5 +734,154 @@ mod tests {
         };
         let order = UpstreamHealthRegistry::selection_order(&profile, Some(&request), None);
         assert_eq!(order.len(), 2);
+    }
+
+    fn deepinfra_endpoint(base_url: &str, priority: UpstreamPriority) -> UpstreamEndpointConfig {
+        UpstreamEndpointConfig {
+            base_url: String::from(base_url),
+            priority,
+            protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
+            model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
+            model_revision: Some(String::from("5fa94080caafeaa45a15d11f969d7978e087a3db")),
+            api_key_env: Some(String::from("PATH")),
+        }
+    }
+
+    fn passive_cloud_profile(endpoints: Vec<UpstreamEndpointConfig>) -> UpstreamProfileConfig {
+        UpstreamProfileConfig {
+            name: String::from("passive-cloud"),
+            endpoints,
+            health_probe_interval_ms: 1,
+            health_probe_timeout_ms: 10,
+            health_probe_max_wait_ms: 20,
+            ..UpstreamProfileConfig::default()
+        }
+    }
+
+    fn rerank_request() -> CanonicalRerankerRequest {
+        CanonicalRerankerRequest::OpenAiRerank {
+            forward_uri: Uri::from_static("/v1/rerank"),
+            body: Bytes::from_static(br#"{"model":"same-model","query":"q","documents":["d"]}"#),
+        }
+    }
+
+    fn make_passive_recovery_ready(
+        registry: &UpstreamHealthRegistry,
+        endpoint: &UpstreamEndpointConfig,
+    ) {
+        let health = registry.endpoint_health(endpoint);
+        let mut snapshot = health_snapshot_mut(&health);
+        snapshot.checked_at = Some(Instant::now() - Duration::from_millis(10));
+        snapshot.healthy = false;
+        snapshot.recovery_trial_in_progress = false;
+    }
+
+    async fn select_passive_cloud(
+        registry: &UpstreamHealthRegistry,
+        profile: &UpstreamProfileConfig,
+        request: &CanonicalRerankerRequest,
+        excluded_base_urls: &[String],
+    ) -> Result<SelectedUpstreamEndpoint, EndpointSelectionError> {
+        registry
+            .select_endpoint_excluding(
+                &Client::new(),
+                profile,
+                &ShutdownGate::new(),
+                EndpointSelectionConstraints {
+                    request: Some(request),
+                    request_headers: Some(&HeaderMap::new()),
+                    request_deadline: None,
+                    preferred_base_urls: None,
+                    excluded_base_urls,
+                },
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn unselected_passive_cloud_candidate_remains_available() {
+        let registry = UpstreamHealthRegistry::default();
+        let primary = deepinfra_endpoint("https://primary.example", UpstreamPriority::Primary);
+        let fallback = deepinfra_endpoint("https://fallback.example", UpstreamPriority::Failover);
+        let profile = passive_cloud_profile(vec![primary.clone(), fallback.clone()]);
+        let request = rerank_request();
+        make_passive_recovery_ready(&registry, &primary);
+        make_passive_recovery_ready(&registry, &fallback);
+
+        let selected = select_passive_cloud(&registry, &profile, &request, &[])
+            .await
+            .expect("primary recovery trial should be selected");
+        assert_eq!(selected.base_url, primary.base_url);
+        drop(selected);
+
+        let selected = select_passive_cloud(
+            &registry,
+            &profile,
+            &request,
+            std::slice::from_ref(&primary.base_url),
+        )
+        .await
+        .expect("unselected fallback must not retain a recovery reservation");
+        assert_eq!(selected.base_url, fallback.base_url);
+    }
+
+    #[tokio::test]
+    async fn passive_recovery_reservation_releases_after_render_failure() {
+        let registry = UpstreamHealthRegistry::default();
+        let cloud = deepinfra_endpoint("https://cloud.example", UpstreamPriority::Primary);
+        let mut ineligible =
+            deepinfra_endpoint("https://ineligible.example", UpstreamPriority::Failover);
+        ineligible.api_key_env = Some(String::from("MISSING_RECOVERY_TEST_KEY"));
+        let profile = passive_cloud_profile(vec![cloud.clone(), ineligible]);
+        let request = rerank_request();
+        make_passive_recovery_ready(&registry, &cloud);
+
+        let mut selected = select_passive_cloud(&registry, &profile, &request, &[])
+            .await
+            .expect("cloud recovery trial should be selected");
+        selected.endpoint.api_key_env = Some(String::from("MISSING_RECOVERY_TEST_KEY"));
+        assert!(
+            reranker_protocol::render(&selected.endpoint, &request, &HeaderMap::new()).is_err()
+        );
+        drop(selected);
+
+        let selected = select_passive_cloud(&registry, &profile, &request, &[])
+            .await
+            .expect("render failure must release the recovery reservation");
+        assert_eq!(selected.base_url, cloud.base_url);
+    }
+
+    #[tokio::test]
+    async fn passive_recovery_reservation_releases_when_request_is_cancelled() {
+        let registry = UpstreamHealthRegistry::default();
+        let cloud = deepinfra_endpoint("https://cloud.example", UpstreamPriority::Primary);
+        let mut ineligible =
+            deepinfra_endpoint("https://ineligible.example", UpstreamPriority::Failover);
+        ineligible.api_key_env = Some(String::from("MISSING_RECOVERY_TEST_KEY"));
+        let profile = passive_cloud_profile(vec![cloud.clone(), ineligible]);
+        let request = rerank_request();
+        make_passive_recovery_ready(&registry, &cloud);
+
+        let selected = select_passive_cloud(&registry, &profile, &request, &[])
+            .await
+            .expect("cloud recovery trial should be selected");
+        let held_request = tokio::spawn(async move {
+            let _selected = selected;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        held_request.abort();
+        assert!(
+            held_request
+                .await
+                .expect_err("request should be cancelled")
+                .is_cancelled(),
+            "the held request must stop by cancellation"
+        );
+
+        let selected = select_passive_cloud(&registry, &profile, &request, &[])
+            .await
+            .expect("cancellation must release the recovery reservation");
+        assert_eq!(selected.base_url, cloud.base_url);
     }
 }

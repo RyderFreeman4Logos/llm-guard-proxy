@@ -2612,6 +2612,7 @@ async fn forward_openai_request(
     )
     .await
     .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    let mut _initial_recovery_trial_lease = None;
     if prepared_request.upstream_profile.has_endpoint_failover() {
         let upstream_deadline = Instant::now()
             + Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
@@ -2703,6 +2704,7 @@ async fn forward_openai_request(
                 .as_str()
                 .to_owned(),
         );
+        _initial_recovery_trial_lease = selected.recovery_trial_lease;
     }
     let retry_policy = ShieldedRetryPolicy::from_config(&config.retry, &config.loop_guard);
     let upstream_stall_policy = UpstreamStallPolicy::from_config(&config.upstream_stall);
@@ -5440,8 +5442,6 @@ fn finish_passive_recovery_trial(
     };
     if result.is_ok() {
         registry.mark_healthy(endpoint);
-    } else {
-        registry.release_recovery_trial(endpoint);
     }
 }
 
