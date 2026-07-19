@@ -1,8 +1,49 @@
 use super::*;
 
+const MODEL_DISCOVERY_SENSITIVE_HEADERS: [&str; 12] = [
+    "authorization",
+    "x-api-key",
+    "x-virtual-key",
+    "cookie",
+    "proxy-authorization",
+    "signature",
+    "signature-input",
+    "digest",
+    "content-digest",
+    "forwarded",
+    "x-forwarded-for",
+    "x-real-ip",
+];
+
+fn assert_model_discovery_headers_are_safe(headers: &HeaderMap) {
+    assert_eq!(
+        headers.get("accept").and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    for name in MODEL_DISCOVERY_SENSITIVE_HEADERS {
+        assert!(
+            !headers.contains_key(name),
+            "model discovery leaked sensitive caller header {name}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn aggregate_models_uses_openai_failover_without_forwarding_caller_credentials() {
-    let caller_token = "aggregate-models-caller-token-unique";
+    let sensitive_headers = [
+        ("authorization", "Bearer aggregate-authorization-unique"),
+        ("x-api-key", "aggregate-api-key-unique"),
+        ("x-virtual-key", "aggregate-virtual-key-unique"),
+        ("cookie", "aggregate-cookie-unique"),
+        ("proxy-authorization", "aggregate-proxy-auth-unique"),
+        ("signature", "aggregate-signature-unique"),
+        ("signature-input", "aggregate-signature-input-unique"),
+        ("digest", "aggregate-digest-unique"),
+        ("content-digest", "aggregate-content-digest-unique"),
+        ("forwarded", "for=aggregate-forwarded-unique"),
+        ("x-forwarded-for", "aggregate-forwarded-for-unique"),
+        ("x-real-ip", "aggregate-real-ip-unique"),
+    ];
     let mut chat = FakeUpstream::spawn().await;
     let mut deepinfra = FakeUpstream::spawn().await;
     let mut openai = FakeUpstream::spawn().await;
@@ -10,13 +51,17 @@ async fn aggregate_models_uses_openai_failover_without_forwarding_caller_credent
         heterogeneous_reranker_failover_profile_config(&deepinfra.base_url, &openai.base_url);
     let proxy = spawn_failover_proxy(&chat.base_url, &extra_config).await;
 
-    let response = proxy
+    let mut request = proxy
         .client
         .get(format!(
             "{}/v1/models?test=aggregate-credential-boundary",
             proxy.base_url
         ))
-        .bearer_auth(caller_token)
+        .header("accept", "application/json");
+    for (name, value) in sensitive_headers {
+        request = request.header(name, value);
+    }
+    let response = request
         .send()
         .await
         .expect("aggregate model discovery should use the OpenAI failover");
@@ -39,17 +84,19 @@ async fn aggregate_models_uses_openai_failover_without_forwarding_caller_credent
         chat_request.path_and_query,
         "/v1/models?test=aggregate-credential-boundary"
     );
-    assert!(chat_request.headers.get(AUTHORIZATION).is_none());
+    assert_model_discovery_headers_are_safe(&chat_request.headers);
 
     let openai_probe = openai.recv_next().await;
     assert_eq!(openai_probe.path_and_query, "/v1/models");
-    assert!(openai_probe.headers.get(AUTHORIZATION).is_none());
+    for name in MODEL_DISCOVERY_SENSITIVE_HEADERS {
+        assert!(!openai_probe.headers.contains_key(name));
+    }
     let openai_request = openai.recv_next().await;
     assert_eq!(
         openai_request.path_and_query,
         "/v1/models?test=aggregate-credential-boundary"
     );
-    assert!(openai_request.headers.get(AUTHORIZATION).is_none());
+    assert_model_discovery_headers_are_safe(&openai_request.headers);
 }
 
 #[tokio::test]

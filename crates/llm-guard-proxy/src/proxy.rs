@@ -6465,9 +6465,11 @@ fn filter_models_body_for_listener(
 }
 
 fn model_discovery_request_headers(headers: &HeaderMap) -> HeaderMap {
-    let mut headers = headers.clone();
-    headers.remove(AUTHORIZATION);
-    headers
+    let mut safe_headers = HeaderMap::new();
+    if let Some(accept) = headers.get(ACCEPT) {
+        safe_headers.insert(ACCEPT, accept.clone());
+    }
+    safe_headers
 }
 
 fn listener_models_upstream_profiles(
