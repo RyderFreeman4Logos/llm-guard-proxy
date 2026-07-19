@@ -4,7 +4,7 @@ use std::{
     time::Duration,
 };
 
-use axum::http::Uri;
+use axum::http::{HeaderMap, Uri};
 use llm_guard_proxy_core::{
     ConfigHandle, EndpointSelectionMode, UpstreamEndpointConfig, UpstreamEndpointProtocol,
     UpstreamPriority, UpstreamProfileConfig,
@@ -65,6 +65,7 @@ pub(super) enum EndpointSelectionError {
 
 pub(super) struct EndpointSelectionConstraints<'request> {
     pub(super) request: Option<&'request CanonicalRerankerRequest>,
+    pub(super) request_headers: Option<&'request HeaderMap>,
     pub(super) request_deadline: Option<Instant>,
     pub(super) preferred_base_urls: Option<&'request [String]>,
     pub(super) excluded_base_urls: &'request [String],
@@ -77,6 +78,7 @@ impl UpstreamHealthRegistry {
         profile: &UpstreamProfileConfig,
         shutdown: &ShutdownGate,
         request: Option<&CanonicalRerankerRequest>,
+        request_headers: Option<&HeaderMap>,
         request_deadline: Option<Instant>,
     ) -> Result<SelectedUpstreamEndpoint, EndpointSelectionError> {
         self.select_endpoint_excluding(
@@ -85,6 +87,7 @@ impl UpstreamHealthRegistry {
             shutdown,
             EndpointSelectionConstraints {
                 request,
+                request_headers,
                 request_deadline,
                 preferred_base_urls: None,
                 excluded_base_urls: &[],
@@ -112,14 +115,19 @@ impl UpstreamHealthRegistry {
                 profile_deadline.min(request_deadline)
             });
         let protocol_compatible = profile.endpoints.iter().any(|endpoint| {
-            reranker_protocol::is_compatible_with_endpoint(endpoint, constraints.request)
+            reranker_protocol::is_compatible_with_endpoint(
+                endpoint,
+                constraints.request,
+                constraints.request_headers,
+            )
         });
         if !protocol_compatible {
             return Err(EndpointSelectionError::Incompatible {
                 profile: profile.name.clone(),
             });
         }
-        let mut candidates = Self::selection_order(profile, constraints.request);
+        let mut candidates =
+            Self::selection_order(profile, constraints.request, constraints.request_headers);
         if let Some(preferred_base_urls) = constraints.preferred_base_urls {
             order_preferred_endpoints(&mut candidates, preferred_base_urls);
         }
@@ -251,11 +259,14 @@ impl UpstreamHealthRegistry {
     fn selection_order(
         profile: &UpstreamProfileConfig,
         request: Option<&CanonicalRerankerRequest>,
+        request_headers: Option<&HeaderMap>,
     ) -> Vec<UpstreamEndpointConfig> {
         let mut endpoints = profile
             .endpoints
             .iter()
-            .filter(|endpoint| reranker_protocol::is_compatible_with_endpoint(endpoint, request))
+            .filter(|endpoint| {
+                reranker_protocol::is_compatible_with_endpoint(endpoint, request, request_headers)
+            })
             .filter(|endpoint| reranker_protocol::has_runtime_credential(endpoint))
             .cloned()
             .collect::<Vec<_>>();
@@ -581,7 +592,7 @@ mod tests {
             model_revision: Some(String::from("5fa94080caafeaa45a15d11f969d7978e087a3db")),
             api_key_env: Some(String::from("UNSET_TEST_DEEPINFRA_KEY")),
         });
-        let order = UpstreamHealthRegistry::selection_order(&profile, None);
+        let order = UpstreamHealthRegistry::selection_order(&profile, None, None);
         assert!(
             order
                 .iter()
@@ -591,10 +602,12 @@ mod tests {
         assert!(reranker_protocol::is_compatible_with_endpoint(
             &profile.endpoints[0],
             Some(&opaque_score),
+            None,
         ));
         assert!(!reranker_protocol::is_compatible_with_endpoint(
             &profile.endpoints[2],
             Some(&opaque_score),
+            None,
         ));
     }
 
@@ -623,7 +636,7 @@ mod tests {
             forward_uri: Uri::from_static("/v1/score"),
             body: Bytes::from_static(br#"{"future":"opaque"}"#),
         };
-        let order = UpstreamHealthRegistry::selection_order(&profile, Some(&request));
+        let order = UpstreamHealthRegistry::selection_order(&profile, Some(&request), None);
         assert_eq!(order.len(), 2);
     }
 }

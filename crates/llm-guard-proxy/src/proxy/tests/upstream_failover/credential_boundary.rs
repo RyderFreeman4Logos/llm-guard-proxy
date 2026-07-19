@@ -149,6 +149,63 @@ async fn aggregate_models_succeeds_when_deepinfra_primary_is_unreachable() {
 }
 
 #[tokio::test]
+async fn signed_rerank_skips_transforming_endpoint_and_preserves_openai_headers() {
+    let chat = FakeUpstream::spawn().await;
+    let mut deepinfra = FakeUpstream::spawn().await;
+    let mut openai = FakeUpstream::spawn_with_rerank_status(StatusCode::OK).await;
+    let extra_config =
+        heterogeneous_reranker_failover_profile_config(&deepinfra.base_url, &openai.base_url);
+    let proxy = spawn_failover_proxy(&chat.base_url, &extra_config).await;
+    let body = serde_json::json!({
+        "model": "same-model",
+        "query": "signed query",
+        "documents": ["signed document"],
+        "top_n": 1,
+    })
+    .to_string();
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/rerank", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .header("accept-encoding", "gzip")
+        .header("content-digest", "sha-256=:signed-content-digest:")
+        .header("signature-input", "sig=(\"content-digest\")")
+        .header("signature", "sig=:signed-signature:")
+        .body(body)
+        .send()
+        .await
+        .expect("signed rerank request should use the OpenAI endpoint");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let transformed = deepinfra.recv_within(Duration::from_millis(100)).await;
+    assert!(
+        transformed.is_none(),
+        "integrity-bound request must not be transformed for DeepInfra: {transformed:?}"
+    );
+    let probe = openai
+        .recv_within(Duration::from_secs(1))
+        .await
+        .expect("OpenAI endpoint should receive a health probe");
+    assert_eq!(probe.path_and_query, "/v1/models");
+    let request = openai
+        .recv_within(Duration::from_secs(1))
+        .await
+        .expect("OpenAI endpoint should receive the signed rerank request");
+    assert_eq!(request.path_and_query, "/v1/rerank");
+    assert_eq!(request.headers["accept-encoding"], "gzip");
+    assert_eq!(
+        request.headers["content-digest"],
+        "sha-256=:signed-content-digest:"
+    );
+    assert_eq!(
+        request.headers["signature-input"],
+        "sig=(\"content-digest\")"
+    );
+    assert_eq!(request.headers["signature"], "sig=:signed-signature:");
+}
+
+#[tokio::test]
 async fn openai_caller_auth_errors_do_not_fail_over_or_cool_down_shared_endpoint() {
     for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
         let mut primary = FakeUpstream::spawn_with_rerank_status(status).await;

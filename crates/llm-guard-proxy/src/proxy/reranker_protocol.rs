@@ -155,12 +155,14 @@ pub(super) fn render(
 pub(super) fn is_compatible_with_endpoint(
     endpoint: &UpstreamEndpointConfig,
     request: Option<&CanonicalRerankerRequest>,
+    request_headers: Option<&HeaderMap>,
 ) -> bool {
     match endpoint.protocol {
         UpstreamEndpointProtocol::OpenAi => true,
         UpstreamEndpointProtocol::DeepInfraQwen3Rerank => {
             request.is_some_and(|request| response_contract(request).is_ok())
                 && deepinfra_inference_uri(endpoint).is_ok()
+                && !request_headers.is_some_and(has_integrity_headers)
         }
     }
 }
@@ -369,25 +371,29 @@ fn render_deepinfra_with_authorization(
 }
 
 fn ensure_deepinfra_transformation_is_unsigned(headers: &HeaderMap) -> Result<(), ProxyError> {
-    for header in [
+    if has_integrity_headers(headers) {
+        return Err(ProxyError::ContextBudgetExceeded {
+            message: String::from(
+                "signed or integrity-protected requests cannot be transformed for DeepInfra",
+            ),
+            param: "headers",
+            code: "signed_request_transformation_unsupported",
+            request_metadata: None,
+        });
+    }
+    Ok(())
+}
+
+fn has_integrity_headers(headers: &HeaderMap) -> bool {
+    [
         "signature",
         "signature-input",
         "digest",
         "content-digest",
         "repr-digest",
-    ] {
-        if headers.contains_key(header) {
-            return Err(ProxyError::ContextBudgetExceeded {
-                message: String::from(
-                    "signed or integrity-protected requests cannot be transformed for DeepInfra",
-                ),
-                param: "headers",
-                code: "signed_request_transformation_unsupported",
-                request_metadata: None,
-            });
-        }
-    }
-    Ok(())
+    ]
+    .into_iter()
+    .any(|header| headers.contains_key(header))
 }
 
 fn deepinfra_inference_uri(endpoint: &UpstreamEndpointConfig) -> Result<Uri, ProxyError> {
@@ -860,8 +866,12 @@ mod tests {
         ];
 
         for request in &requests {
-            assert!(!is_compatible_with_endpoint(&deepinfra, Some(request)));
-            assert!(is_compatible_with_endpoint(&openai, Some(request)));
+            assert!(!is_compatible_with_endpoint(
+                &deepinfra,
+                Some(request),
+                None
+            ));
+            assert!(is_compatible_with_endpoint(&openai, Some(request), None));
             assert!(
                 render_deepinfra_with_authorization(
                     &deepinfra,

@@ -2622,6 +2622,7 @@ async fn forward_openai_request(
                 &prepared_request.upstream_profile,
                 &state.shutdown,
                 prepared_request.canonical_reranker.as_ref(),
+                Some(&downstream_headers),
                 Some(upstream_deadline),
             )
             .await
@@ -4107,15 +4108,11 @@ struct GenericForwardContext<'request> {
 fn prepare_generic_attempt_request(
     context: &GenericForwardContext<'_>,
 ) -> (Option<HeaderMap>, BTreeMap<String, String>) {
-    let mut override_headers = context.upstream_headers.clone().or_else(|| {
+    let override_headers = context.upstream_headers.clone().or_else(|| {
         context
             .transformed_request_headers
             .then(|| sanitize_transformed_request_headers(&context.downstream_headers))
     });
-    if context.response_adapter.is_some() {
-        let headers = override_headers.get_or_insert_with(|| context.downstream_headers.clone());
-        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    }
     let headers = override_headers
         .as_ref()
         .unwrap_or(&context.downstream_headers);
@@ -4150,6 +4147,7 @@ async fn merged_models_groups(
                 &context.state.client,
                 &profile,
                 &context.state.shutdown,
+                None,
                 None,
                 Some(request_deadline),
             )
@@ -4793,14 +4791,11 @@ fn render_retry_openai_request(
     base_url: &str,
     body: &Bytes,
 ) -> Result<RenderedEndpointRequest, ProxyError> {
-    let mut headers = if retry.transformed_request_headers {
+    let headers = if retry.transformed_request_headers {
         sanitize_transformed_request_headers(retry.original_downstream_headers)
     } else {
         retry.original_downstream_headers.clone()
     };
-    if retry.canonical_reranker.is_some() {
-        headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    }
     Ok(RenderedEndpointRequest {
         url: build_upstream_url(base_url, &retry.local_forward_uri)?,
         uri: retry.local_forward_uri.clone(),
@@ -4995,6 +4990,7 @@ async fn continue_endpoint_failover(
                 runtime.retry.shutdown,
                 EndpointSelectionConstraints {
                     request: runtime.retry.canonical_reranker,
+                    request_headers: Some(runtime.retry.original_downstream_headers),
                     request_deadline: runtime.retry.request_deadline,
                     preferred_base_urls: Some(runtime.retry.endpoint_retry_order),
                     excluded_base_urls: &attempted_base_urls,
