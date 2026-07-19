@@ -7,6 +7,8 @@ readonly registration_max_bytes=1024
 readonly cgroup_root="${LLM_GUARD_CGROUP_ROOT:-/sys/fs/cgroup}"
 readonly proc_root="${LLM_GUARD_PROC_ROOT:-/proc}"
 readonly systemctl_timeout="${LLM_GUARD_SYSTEMCTL_TIMEOUT:-15s}"
+readonly readiness_timeout_seconds="${LLM_GUARD_READINESS_TIMEOUT_SECONDS:-5}"
+readonly readiness_poll_interval="${LLM_GUARD_READINESS_POLL_INTERVAL:-0.1}"
 
 die() {
     printf 'guardian cutover: %s\n' "$1" >&2
@@ -57,17 +59,28 @@ restore_unit_state() {
 
 attest_integrated_guardian() {
     local pid
-    pid="$(
+    if ! pid="$(
         systemctl_bounded --user show --property=MainPID --value "${integrated_unit}"
-    )"
-    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || die "integrated guardian has no running main process"
+    )"; then
+        attestation_error="integrated guardian main process query failed"
+        return 1
+    fi
+    if [[ ! "${pid}" =~ ^[1-9][0-9]*$ ]]; then
+        attestation_error="integrated guardian has no running main process"
+        return 1
+    fi
 
     local process_dir="${proc_root}/${pid}"
-    [[ -d "${process_dir}/fd" && -d "${process_dir}/fdinfo" ]] \
-        || die "integrated guardian process descriptors are unavailable"
+    if [[ ! -d "${process_dir}/fd" || ! -d "${process_dir}/fdinfo" ]]; then
+        attestation_error="integrated guardian process descriptors are unavailable"
+        return 1
+    fi
     local expected_events expected_kill
-    expected_events="$(readlink -f -- "${cgroup_events}")"
-    expected_kill="$(readlink -f -- "${cgroup_kill}")"
+    if ! expected_events="$(readlink -f -- "${cgroup_events}")" \
+        || ! expected_kill="$(readlink -f -- "${cgroup_kill}")"; then
+        attestation_error="registered cgroup descriptors are unavailable"
+        return 1
+    fi
     local events_open=false
     local writable_kill_open=false
     local fd_link fd_target fd_number flags key value extra
@@ -79,6 +92,7 @@ attest_integrated_guardian() {
         fi
         [[ "${fd_target}" == "${expected_kill}" ]] || continue
         fd_number="${fd_link##*/}"
+        [[ -r "${process_dir}/fdinfo/${fd_number}" ]] || continue
         flags=""
         while read -r key value extra; do
             if [[ "${key}" == "flags:" && -z "${extra:-}" ]]; then
@@ -90,15 +104,48 @@ attest_integrated_guardian() {
             writable_kill_open=true
         fi
     done
-    [[ "${events_open}" == "true" ]] \
-        || die "integrated guardian has not opened the registered cgroup.events"
-    [[ "${writable_kill_open}" == "true" ]] \
-        || die "integrated guardian has not opened registered cgroup.kill for writing"
+    if [[ "${events_open}" != "true" ]]; then
+        attestation_error="integrated guardian has not opened the registered cgroup.events"
+        return 1
+    fi
+    if [[ "${writable_kill_open}" != "true" ]]; then
+        attestation_error="integrated guardian has not opened registered cgroup.kill for writing"
+        return 1
+    fi
+
+    local confirmed_pid
+    if ! confirmed_pid="$(
+        systemctl_bounded --user show --property=MainPID --value "${integrated_unit}"
+    )"; then
+        attestation_error="integrated guardian main process confirmation failed"
+        return 1
+    fi
+    if [[ "${confirmed_pid}" != "${pid}" ]]; then
+        attestation_error="integrated guardian main process changed during readiness attestation"
+        return 1
+    fi
+    return 0
+}
+
+wait_for_integrated_guardian() {
+    local deadline=$((SECONDS + readiness_timeout_seconds))
+    attestation_error="integrated guardian readiness was not observed"
+    while ! attest_integrated_guardian; do
+        if (( SECONDS >= deadline )); then
+            die "integrated guardian did not become ready before deadline: ${attestation_error}"
+        fi
+        sleep "${readiness_poll_interval}"
+    done
 }
 
 if (( $# != 0 )); then
     die "usage: $0"
 fi
+[[ "${readiness_timeout_seconds}" =~ ^[1-9][0-9]*$ ]] \
+    || die "readiness timeout seconds must be a positive integer"
+(( readiness_timeout_seconds <= 60 )) || die "readiness timeout seconds must not exceed 60"
+[[ "${readiness_poll_interval}" =~ ^(0\.[0-9]+|[1-9][0-9]*(\.[0-9]+)?)$ ]] \
+    || die "readiness poll interval must be a positive duration in seconds"
 
 uid="$(id -u)"
 runtime_dir="${XDG_RUNTIME_DIR:-/run/user/${uid}}/gb10-memory-guardian"
@@ -244,6 +291,6 @@ if [[ "${legacy_load_state}" != "not-found" ]]; then
 fi
 systemctl_bounded --user enable --now "${integrated_unit}"
 systemctl_bounded --user is-active "${integrated_unit}"
-attest_integrated_guardian
+wait_for_integrated_guardian
 cutover_complete=true
 trap - EXIT INT TERM

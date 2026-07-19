@@ -59,6 +59,7 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                 ),
                 "",
             )
+            target: Path | None = None
             if target_state != "missing" and control_group:
                 target = cgroup_root / control_group.removeprefix("/")
                 target.mkdir(parents=True)
@@ -68,14 +69,15 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
 
                 proc_root = root / "proc"
                 process = proc_root / "4242"
-                (process / "fd").mkdir(parents=True)
-                (process / "fdinfo").mkdir()
-                if attestation_state != "missing-events":
-                    (process / "fd" / "7").symlink_to(target / "cgroup.events")
-                if attestation_state != "missing-kill":
-                    (process / "fd" / "8").symlink_to(target / "cgroup.kill")
-                    flags = "00" if attestation_state == "readonly-kill" else "01"
-                    (process / "fdinfo" / "8").write_text(f"flags:\t{flags}\n")
+                if attestation_state != "delayed-ready":
+                    (process / "fd").mkdir(parents=True)
+                    (process / "fdinfo").mkdir()
+                    if attestation_state != "missing-events":
+                        (process / "fd" / "7").symlink_to(target / "cgroup.events")
+                    if attestation_state != "missing-kill":
+                        (process / "fd" / "8").symlink_to(target / "cgroup.kill")
+                        flags = "00" if attestation_state == "readonly-kill" else "01"
+                        (process / "fdinfo" / "8").write_text(f"flags:\t{flags}\n")
             else:
                 proc_root = root / "proc"
 
@@ -86,6 +88,13 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
             fake_systemctl.write_text(
                 "#!/usr/bin/env bash\n"
                 "set -euo pipefail\n"
+                "publish_guardian_fds() {\n"
+                '  local pid="$1" process_dir="${PROC_ROOT}/$1"\n'
+                '  mkdir -p "${process_dir}/fd" "${process_dir}/fdinfo"\n'
+                '  ln -sfn "${CGROUP_EVENTS}" "${process_dir}/fd/7"\n'
+                '  ln -sfn "${CGROUP_KILL}" "${process_dir}/fd/8"\n'
+                '  printf \'flags:\\t01\\n\' >"${process_dir}/fdinfo/8"\n'
+                "}\n"
                 'printf \'%s\\n\' "$*" >>"${SYSTEMCTL_LOG}"\n'
                 'case "$*" in\n'
                 '  *"show --property=LoadState"*"gb10-memory-guardian.service"*) '
@@ -99,7 +108,14 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                 '  *"show --property=ActiveState"*"llm-guard-proxy.service"*) '
                 'printf \'%s\\n\' "${INTEGRATED_ACTIVE_STATE}" ;;\n'
                 '  *"show --property=MainPID"*"llm-guard-proxy.service"*) '
-                'printf \'%s\\n\' "${INTEGRATED_MAIN_PID}" ;;\n'
+                'count="$(cat "${MAIN_PID_QUERY_COUNT}" 2>/dev/null || printf \'0\')"; '
+                'count="$((count + 1))"; printf \'%s\\n\' "${count}" >"${MAIN_PID_QUERY_COUNT}"; '
+                'case "${ATTESTATION_STATE}" in '
+                'delayed-ready) if (( count >= 2 )); then publish_guardian_fds 4242; fi; '
+                'printf \'4242\\n\' ;; '
+                'pid-changes) if (( count >= 2 )); then publish_guardian_fds 4343; '
+                'printf \'4343\\n\'; else printf \'4242\\n\'; fi ;; '
+                '*) printf \'%s\\n\' "${INTEGRATED_MAIN_PID}" ;; esac ;;\n'
                 '  *"enable --now llm-guard-proxy.service"*) '
                 '[[ "${INTEGRATED_ENABLE_FAILURE}" != 1 ]] ;;\n'
                 '  *"is-active llm-guard-proxy.service"*) '
@@ -120,9 +136,16 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
             env["INTEGRATED_ENABLE_FAILURE"] = "1" if integrated_enable_failure else "0"
             env["INTEGRATED_ACTIVE_HANG"] = "1" if integrated_active_hang else "0"
             env["INTEGRATED_MAIN_PID"] = "0" if attestation_state == "missing-pid" else "4242"
+            env["ATTESTATION_STATE"] = attestation_state
+            env["MAIN_PID_QUERY_COUNT"] = str(root / "main-pid-query-count")
+            env["PROC_ROOT"] = str(proc_root)
+            env["CGROUP_EVENTS"] = str(target / "cgroup.events") if target else ""
+            env["CGROUP_KILL"] = str(target / "cgroup.kill") if target else ""
             env["LLM_GUARD_CGROUP_ROOT"] = str(cgroup_root)
             env["LLM_GUARD_PROC_ROOT"] = str(proc_root)
             env["LLM_GUARD_SYSTEMCTL_TIMEOUT"] = "0.1s"
+            env["LLM_GUARD_READINESS_TIMEOUT_SECONDS"] = "1"
+            env["LLM_GUARD_READINESS_POLL_INTERVAL"] = "0.01"
             env["XDG_RUNTIME_DIR"] = str(runtime_root)
             command = [str(CUTOVER)]
             if registration_argument:
@@ -134,7 +157,7 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     env=env,
-                    timeout=1,
+                    timeout=2,
                 )
             except subprocess.TimeoutExpired as error:
                 completed = subprocess.CompletedProcess(
@@ -199,6 +222,24 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
             any("show --property=MainPID" in call for call in calls),
             "cutover success must be gated on integrated guardian ownership attestation",
         )
+
+    def test_cutover_waits_for_guardian_descriptors_after_service_activation(self) -> None:
+        completed, calls = self.run_cutover(
+            self.registration("a" * 64, "a" * 64), attestation_state="delayed-ready"
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        main_pid_queries = [call for call in calls if "show --property=MainPID" in call]
+        self.assertGreaterEqual(len(main_pid_queries), 2)
+
+    def test_cutover_restarts_attestation_when_main_pid_changes_during_startup(self) -> None:
+        completed, calls = self.run_cutover(
+            self.registration("a" * 64, "a" * 64), attestation_state="pid-changes"
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        main_pid_queries = [call for call in calls if "show --property=MainPID" in call]
+        self.assertGreaterEqual(len(main_pid_queries), 4)
 
     def test_registration_override_is_rejected_before_any_systemctl_call(self) -> None:
         completed, calls = self.run_cutover(
