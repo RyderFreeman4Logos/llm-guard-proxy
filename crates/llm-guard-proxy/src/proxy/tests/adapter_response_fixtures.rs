@@ -9,7 +9,7 @@ use axum::{
 };
 use futures_util::StreamExt;
 
-use super::json_response;
+use super::{body_contains_text, json_response};
 
 pub(super) fn fake_deepinfra_score_response(path_and_query: &str) -> Response<Body> {
     if path_and_query.contains("test=deepinfra-rerank-upstream-error") {
@@ -61,6 +61,13 @@ pub(super) fn fake_deepinfra_score_response(path_and_query: &str) -> Response<Bo
 }
 
 pub(super) fn fake_rerank_response(path_and_query: &str, body: &Bytes) -> Response<Body> {
+    if body_contains_text(body, "malformed-openai-failover") {
+        return json_response(
+            "rerank-malformed",
+            r#"{"id":"rerank-malformed","results":[{"index":0,"score":0.9},{"index":0,"score":0.8}]}"#
+                .to_owned(),
+        );
+    }
     if path_and_query.contains("test=score-body-read-error") {
         let stream = futures_util::stream::once(async {
             Ok::<Bytes, std::io::Error>(Bytes::from_static(b"{"))

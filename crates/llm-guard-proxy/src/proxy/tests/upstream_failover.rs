@@ -5,6 +5,7 @@ use tokio::{
 };
 
 mod credential_boundary;
+mod response_and_recovery;
 
 #[tokio::test]
 async fn same_model_request_fails_over_when_primary_is_down() {

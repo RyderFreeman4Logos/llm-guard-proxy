@@ -5390,9 +5390,7 @@ fn is_retryable_endpoint_result(
                 ReqwestFailureKind::Connect | ReqwestFailureKind::Timeout
             )
         }
-        Err(ProxyError::UpstreamBody { .. }) => {
-            protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
-        }
+        Err(ProxyError::UpstreamBody { .. }) => true,
         Ok(response) => match response.status() {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
