@@ -5261,17 +5261,18 @@ fn is_retryable_endpoint_result(
         Err(ProxyError::UpstreamBody { .. }) => {
             protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
         }
-        Ok(response) => matches!(
-            response.status(),
-            StatusCode::UNAUTHORIZED
-                | StatusCode::FORBIDDEN
-                | StatusCode::REQUEST_TIMEOUT
-                | StatusCode::TOO_MANY_REQUESTS
-                | StatusCode::INTERNAL_SERVER_ERROR
-                | StatusCode::BAD_GATEWAY
-                | StatusCode::SERVICE_UNAVAILABLE
-                | StatusCode::GATEWAY_TIMEOUT
-        ),
+        Ok(response) => match response.status() {
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
+                protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+            }
+            StatusCode::REQUEST_TIMEOUT
+            | StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+            | StatusCode::GATEWAY_TIMEOUT => true,
+            _ => false,
+        },
         Err(_) => false,
     }
 }

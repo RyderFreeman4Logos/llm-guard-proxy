@@ -288,6 +288,8 @@ async fn terminal_timeout_cools_down_a_singleton_endpoint() {
 #[tokio::test]
 async fn terminal_cloud_retryable_statuses_enter_passive_cooldown() {
     for status in [
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
         StatusCode::TOO_MANY_REQUESTS,
         StatusCode::SERVICE_UNAVAILABLE,
     ] {
@@ -357,6 +359,52 @@ async fn nonretryable_local_client_error_fails_closed_without_backup_attempt() {
             .await
             .is_none()
     );
+}
+
+#[tokio::test]
+async fn openai_caller_auth_errors_do_not_fail_over_or_cool_down_shared_endpoint() {
+    for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
+        let mut primary = FakeUpstream::spawn_with_rerank_status(status).await;
+        let mut cloud = FakeUpstream::spawn().await;
+        let extra_config = openai_to_deepinfra_reranker_failover_profile_config(
+            &primary.base_url,
+            &cloud.base_url,
+        );
+        let proxy = spawn_failover_proxy(&primary.base_url, &extra_config).await;
+
+        let first = proxy
+            .client
+            .post(format!("{}/v1/rerank", proxy.base_url))
+            .bearer_auth("caller-a")
+            .json(&json!({"model": "same-model", "query": "auth", "documents": ["d"]}))
+            .send()
+            .await
+            .expect("first caller auth response should return directly");
+        assert_eq!(first.status(), status);
+        first
+            .bytes()
+            .await
+            .expect("first caller auth response body should drain");
+        assert_eq!(primary.recv_next().await.path_and_query, "/v1/models");
+        assert_eq!(primary.recv_next().await.path_and_query, "/v1/rerank");
+        assert!(cloud.recv_within(Duration::from_millis(30)).await.is_none());
+
+        let second = proxy
+            .client
+            .post(format!("{}/v1/rerank", proxy.base_url))
+            .bearer_auth("caller-b")
+            .json(&json!({"model": "same-model", "query": "auth", "documents": ["d"]}))
+            .send()
+            .await
+            .expect("second caller should still reach the shared primary");
+        assert_eq!(second.status(), status);
+        second
+            .bytes()
+            .await
+            .expect("second caller auth response body should drain");
+        assert_eq!(primary.recv_next().await.path_and_query, "/v1/rerank");
+        assert!(cloud.recv_within(Duration::from_millis(30)).await.is_none());
+    }
 }
 
 #[tokio::test]
@@ -641,6 +689,35 @@ api_key_env = "PATH"
 base_url = "{backup_base_url}"
 priority = "failover"
 protocol = "openai"
+"#
+    )
+}
+
+fn openai_to_deepinfra_reranker_failover_profile_config(
+    primary_base_url: &str,
+    deepinfra_base_url: &str,
+) -> String {
+    format!(
+        r#"
+[[profile]]
+model = "same-model"
+request_timeout_ms = 400
+health_probe_interval = "200ms"
+health_probe_timeout = "20ms"
+health_probe_max_wait = "400ms"
+
+[[profile.upstream]]
+base_url = "{primary_base_url}"
+priority = "primary"
+protocol = "openai"
+
+[[profile.upstream]]
+base_url = "{deepinfra_base_url}"
+priority = "failover"
+protocol = "deepinfra_qwen3_rerank"
+model = "Qwen/Qwen3-Reranker-8B"
+model_revision = "5fa94080caafeaa45a15d11f969d7978e087a3db"
+api_key_env = "PATH"
 "#
     )
 }
