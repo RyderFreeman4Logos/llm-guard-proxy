@@ -148,3 +148,112 @@ async fn deepinfra_cooldown_recovery_admits_exactly_one_concurrent_trial() {
         "passive cooldown recovery must admit only one concurrent DeepInfra trial"
     );
 }
+
+#[tokio::test]
+async fn deepinfra_recovery_lease_remains_held_until_retry_classification() {
+    let mut openai = FakeUpstream::spawn().await;
+    let mut deepinfra = FakeUpstream::spawn_with_deepinfra_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        r#"{"error":"deepinfra unavailable"}"#,
+    )
+    .await;
+    let extra_config =
+        openai_to_deepinfra_reranker_failover_profile_config(&openai.base_url, &deepinfra.base_url);
+    let proxy = spawn_observed_failover_proxy(&openai.base_url, &extra_config).await;
+
+    prime_failed_deepinfra_recovery(&proxy, &mut openai, &mut deepinfra).await;
+
+    sleep(Duration::from_millis(225)).await;
+    let gate = Arc::new(crate::proxy::upstream_failover::EndpointClassificationGate::new());
+    proxy
+        .state
+        .upstream_health
+        .block_next_endpoint_classification(Arc::clone(&gate));
+
+    let first_client = proxy.client.clone();
+    let first_url = format!("{}/v1/score", proxy.base_url);
+    let first = tokio::spawn(async move {
+        first_client
+            .post(first_url)
+            .json(&json!({
+                "model": "same-model",
+                "text_1": "malformed-openai-failover",
+                "text_2": ["first", "second"],
+            }))
+            .send()
+            .await
+            .expect("held recovery request should complete")
+    });
+    timeout(Duration::from_secs(1), gate.wait_until_arrived())
+        .await
+        .expect("recovery request should reach the post-send classification gate");
+    assert_eq!(openai.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(openai.recv_next().await.path_and_query, "/v1/rerank");
+    assert_eq!(
+        deepinfra.recv_next().await.path_and_query,
+        "/v1/inference/Qwen/Qwen3-Reranker-8B?version=5fa94080caafeaa45a15d11f969d7978e087a3db"
+    );
+
+    let competing_client = proxy.client.clone();
+    let competing_url = format!("{}/v1/score", proxy.base_url);
+    let competing = tokio::spawn(async move {
+        competing_client
+            .post(competing_url)
+            .json(&json!({
+                "model": "same-model",
+                "text_1": "malformed-openai-failover",
+                "text_2": ["first", "second"],
+            }))
+            .send()
+            .await
+            .expect("competing recovery request should complete")
+    });
+    let overlapping_trial = deepinfra.recv_within(Duration::from_millis(100)).await;
+
+    gate.release().await;
+    assert!(
+        overlapping_trial.is_none(),
+        "a completed recovery send must retain exclusivity until its health result is classified"
+    );
+    let first_response = timeout(Duration::from_secs(2), first)
+        .await
+        .expect("held recovery task should finish after classification resumes")
+        .expect("held recovery task should join");
+    let competing_response = timeout(Duration::from_secs(2), competing)
+        .await
+        .expect("competing recovery task should finish")
+        .expect("competing recovery task should join");
+    first_response
+        .bytes()
+        .await
+        .expect("held recovery body should drain");
+    competing_response
+        .bytes()
+        .await
+        .expect("competing recovery body should drain");
+}
+
+async fn prime_failed_deepinfra_recovery(
+    proxy: &ProxyFixture,
+    openai: &mut FakeUpstream,
+    deepinfra: &mut FakeUpstream,
+) {
+    let response = proxy
+        .client
+        .post(format!("{}/v1/score", proxy.base_url))
+        .json(&json!({
+            "model": "same-model",
+            "text_1": "malformed-openai-failover",
+            "text_2": ["first", "second"],
+        }))
+        .send()
+        .await
+        .expect("priming request should complete");
+    response.bytes().await.expect("priming body should drain");
+    assert_eq!(openai.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(openai.recv_next().await.path_and_query, "/v1/rerank");
+    assert_eq!(
+        deepinfra.recv_next().await.path_and_query,
+        "/v1/inference/Qwen/Qwen3-Reranker-8B?version=5fa94080caafeaa45a15d11f969d7978e087a3db"
+    );
+}

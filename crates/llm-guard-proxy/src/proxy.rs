@@ -5038,6 +5038,7 @@ async fn continue_endpoint_failover(
         runtime.retry.canonical_reranker,
         Some(runtime.retry.original_downstream_headers),
     );
+    let mut terminal_recovery_trial_lease = None;
     while is_retryable_endpoint_result(&result, terminal_attempt.protocol) {
         mark_retryable_endpoint_failure(runtime.retry.registry, &terminal_attempt, &result);
         if attempted_base_urls.len() >= eligible_endpoint_count {
@@ -5079,7 +5080,7 @@ async fn continue_endpoint_failover(
         let endpoint_attempts_remaining =
             eligible_endpoint_count.saturating_sub(attempted_base_urls.len());
         attempted_base_urls.push(selected.base_url.clone());
-        let (next_result, next_attempt) = send_selected_failover_endpoint(
+        let next = send_selected_failover_endpoint(
             &runtime,
             terminal_attempt.attempt_number.saturating_add(1),
             endpoint_attempts_remaining,
@@ -5087,10 +5088,18 @@ async fn continue_endpoint_failover(
             selected,
         )
         .await;
-        result = next_result;
-        terminal_attempt = next_attempt;
+        #[cfg(test)]
+        runtime
+            .retry
+            .registry
+            .wait_before_endpoint_classification()
+            .await;
+        result = next.result;
+        terminal_attempt = next.attempt;
+        terminal_recovery_trial_lease = next.recovery_trial_lease;
     }
     finish_passive_recovery_trial(runtime.retry.registry, &terminal_attempt, &result);
+    drop(terminal_recovery_trial_lease);
     EndpointFailoverOutcome {
         result,
         terminal_attempt,
@@ -5113,16 +5122,19 @@ fn context_attempt_metadata(attempt: &PhysicalEndpointAttempt) -> BTreeMap<Strin
     metadata
 }
 
+struct CompletedFailoverEndpointSend {
+    result: Result<EndpointResponse, ProxyError>,
+    attempt: PhysicalEndpointAttempt,
+    recovery_trial_lease: Option<upstream_failover::RecoveryTrialLease>,
+}
+
 async fn send_selected_failover_endpoint(
     runtime: &EndpointFailoverRuntime<'_>,
     attempt_number: u32,
     endpoint_attempts_remaining: usize,
     request_metadata: BTreeMap<String, String>,
-    selected: upstream_failover::SelectedUpstreamEndpoint,
-) -> (
-    Result<EndpointResponse, ProxyError>,
-    PhysicalEndpointAttempt,
-) {
+    mut selected: upstream_failover::SelectedUpstreamEndpoint,
+) -> CompletedFailoverEndpointSend {
     let rendered = match runtime.retry.canonical_reranker {
         Some(canonical) => reranker_protocol::render(
             &selected.endpoint,
@@ -5183,7 +5195,11 @@ async fn send_selected_failover_endpoint(
         Some(runtime.retry.shutdown),
     )
     .await;
-    (result, attempt)
+    CompletedFailoverEndpointSend {
+        result,
+        attempt,
+        recovery_trial_lease: selected.recovery_trial_lease.take(),
+    }
 }
 
 async fn finalize_endpoint_response(

@@ -28,6 +28,38 @@ pub(super) struct UpstreamHealthRegistry {
     endpoints: Mutex<HashMap<String, Arc<EndpointHealth>>>,
     round_robin_positions: Mutex<HashMap<String, RoundRobinState>>,
     background_started: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    before_classification: Mutex<Option<Arc<EndpointClassificationGate>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct EndpointClassificationGate {
+    arrived: tokio::sync::Barrier,
+    release: tokio::sync::Barrier,
+}
+
+#[cfg(test)]
+impl EndpointClassificationGate {
+    pub(super) fn new() -> Self {
+        Self {
+            arrived: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+        }
+    }
+
+    pub(super) async fn wait_until_arrived(&self) {
+        self.arrived.wait().await;
+    }
+
+    pub(super) async fn release(&self) {
+        self.release.wait().await;
+    }
+
+    async fn pause_classification(&self) {
+        self.arrived.wait().await;
+        self.release.wait().await;
+    }
 }
 
 #[derive(Debug, Default)]
@@ -89,6 +121,19 @@ pub(super) struct EndpointSelectionConstraints<'request> {
 }
 
 impl UpstreamHealthRegistry {
+    #[cfg(test)]
+    pub(super) fn block_next_endpoint_classification(&self, gate: Arc<EndpointClassificationGate>) {
+        *mutex_guard(&self.before_classification) = Some(gate);
+    }
+
+    #[cfg(test)]
+    pub(super) async fn wait_before_endpoint_classification(&self) {
+        let gate = mutex_guard(&self.before_classification).take();
+        if let Some(gate) = gate {
+            gate.pause_classification().await;
+        }
+    }
+
     pub(super) async fn select_endpoint(
         &self,
         client: &Client,
