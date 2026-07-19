@@ -876,6 +876,45 @@ mod tests {
     }
 
     #[test]
+    fn deepinfra_decoder_rejects_malformed_scores_and_bounded_metadata() {
+        let invalid_cases = [
+            (
+                Bytes::from_static(br#"{"input_tokens":1}"#),
+                "scores must be an array",
+            ),
+            (
+                Bytes::from_static(br#"{"scores":[0.2],"input_tokens":1}"#),
+                "does not match expected",
+            ),
+            (
+                Bytes::from_static(br#"{"scores":[0.2,1.5],"input_tokens":1}"#),
+                "finite value in [0, 1]",
+            ),
+            (
+                Bytes::from_static(br#"{"scores":[0.2,"NaN"],"input_tokens":1}"#),
+                "finite value in [0, 1]",
+            ),
+            (
+                Bytes::from(format!(
+                    r#"{{"scores":[0.2,0.9],"input_tokens":1,"request_id":"{}"}}"#,
+                    "x".repeat(MAX_REQUEST_ID_BYTES + 1)
+                )),
+                "bounded non-empty string",
+            ),
+        ];
+
+        for (body, expected_error) in invalid_cases {
+            let error = rewrite_response(
+                &body,
+                ResponseContract::DeepInfraNative { expected_count: 2 },
+                None,
+            )
+            .expect_err("malformed DeepInfra response must be rejected");
+            assert!(error.contains(expected_error), "unexpected error: {error}");
+        }
+    }
+
+    #[test]
     fn converts_deepinfra_probability_to_signed_score() {
         let body = Bytes::from_static(br#"{"scores":[0.9],"input_tokens":19}"#);
         let response = rewrite_response(

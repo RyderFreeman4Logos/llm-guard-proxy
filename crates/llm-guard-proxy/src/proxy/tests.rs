@@ -17722,6 +17722,9 @@ struct FakeUpstreamState {
     models_status: StatusCode,
     models_label: &'static str,
     models_delay: Option<Duration>,
+    pre_response_delay: Option<Duration>,
+    rerank_status: Option<StatusCode>,
+    deepinfra_response: Option<(StatusCode, &'static str)>,
 }
 
 impl FakeUpstream {
@@ -17777,6 +17780,73 @@ impl FakeUpstream {
         models_label: &'static str,
         models_delay: Option<Duration>,
     ) -> Self {
+        Self::spawn_with_options(
+            models_body,
+            models_status,
+            models_label,
+            models_delay,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_with_pre_response_delay(pre_response_delay: Duration) -> Self {
+        Self::spawn_with_options(
+            None,
+            StatusCode::OK,
+            "models",
+            None,
+            Some(pre_response_delay),
+            None,
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_with_rerank_status(rerank_status: StatusCode) -> Self {
+        Self::spawn_with_options(
+            None,
+            StatusCode::OK,
+            "models",
+            None,
+            None,
+            Some(rerank_status),
+            None,
+        )
+        .await
+    }
+
+    async fn spawn_with_deepinfra_response_body(deepinfra_response_body: &'static str) -> Self {
+        Self::spawn_with_deepinfra_response(StatusCode::OK, deepinfra_response_body).await
+    }
+
+    async fn spawn_with_deepinfra_response(
+        deepinfra_response_status: StatusCode,
+        deepinfra_response_body: &'static str,
+    ) -> Self {
+        Self::spawn_with_options(
+            None,
+            StatusCode::OK,
+            "models",
+            None,
+            None,
+            None,
+            Some((deepinfra_response_status, deepinfra_response_body)),
+        )
+        .await
+    }
+
+    async fn spawn_with_options(
+        models_body: Option<&'static str>,
+        models_status: StatusCode,
+        models_label: &'static str,
+        models_delay: Option<Duration>,
+        pre_response_delay: Option<Duration>,
+        rerank_status: Option<StatusCode>,
+        deepinfra_response: Option<(StatusCode, &'static str)>,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(10);
         let app = Router::new()
             .fallback(fake_upstream_handler)
@@ -17788,6 +17858,9 @@ impl FakeUpstream {
                 models_status,
                 models_label,
                 models_delay,
+                pre_response_delay,
+                rerank_status,
+                deepinfra_response,
             });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -18095,7 +18168,11 @@ async fn fake_upstream_handler(
             );
         }
     }
-    if path_and_query.contains("test=pre-response-hang") {
+    if endpoint != "/v1/models"
+        && let Some(pre_response_delay) = state.pre_response_delay
+    {
+        sleep(pre_response_delay).await;
+    } else if path_and_query.contains("test=pre-response-hang") {
         sleep(STREAM_COMPLETION_TIMEOUT.saturating_mul(5)).await;
     }
 
@@ -18195,6 +18272,20 @@ fn fake_upstream_endpoint_response(
 
     if endpoint == "/v1/score" && path_and_query.contains("test=deepinfra-rerank") {
         return fake_deepinfra_score_response(path_and_query);
+    }
+
+    if endpoint == "/v1/inference/Qwen/Qwen3-Reranker-8B"
+        && let Some((status, body)) = state.deepinfra_response
+    {
+        let mut response = json_response("deepinfra-inference", body.to_owned());
+        *response.status_mut() = status;
+        return response;
+    }
+
+    if endpoint == "/v1/rerank"
+        && let Some(status) = state.rerank_status
+    {
+        return upstream_status_json_response(status);
     }
 
     let (label, body) = match endpoint {
