@@ -4448,12 +4448,12 @@ async fn forward_merged_models_response(
     let mut response_mode = None;
     let mut filtered_bodies = Vec::with_capacity(groups.len());
     let mut attempt_records = Vec::with_capacity(groups.len());
-    for (index, group) in groups.iter().enumerate() {
-        let attempt_number = u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1);
+    let mut next_attempt_number = 1;
+    for group in &groups {
         let fetch = match fetch_models_upstream_group(
             &context,
             group,
-            attempt_number,
+            next_attempt_number,
             u32::try_from(groups.len()).unwrap_or(u32::MAX),
         )
         .await
@@ -4461,6 +4461,7 @@ async fn forward_merged_models_response(
             Ok(fetch) => fetch,
             Err(error) => return Err(error.with_completed_attempt_records(attempt_records)),
         };
+        next_attempt_number = fetch.attempt_record.attempt_number.saturating_add(1);
         if response_status.is_none() {
             response_status = Some(fetch.upstream_status);
             response_headers = Some(fetch.upstream_headers.clone());

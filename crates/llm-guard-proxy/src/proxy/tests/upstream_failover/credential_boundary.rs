@@ -220,6 +220,87 @@ async fn aggregate_models_persists_each_physical_failover_attempt() {
 }
 
 #[tokio::test]
+async fn aggregate_models_allocates_attempts_across_failover_before_later_group() {
+    let (primary_base_url, primary_probe_seen) = spawn_probe_then_stop_upstream().await;
+    let mut backup = FakeUpstream::spawn().await;
+    let mut second = FakeUpstream::spawn().await;
+    let extra_config = format!(
+        r#"
+[[upstreams]]
+name = "first"
+base_url = "{primary_base_url}"
+match_models = ["first-model"]
+request_timeout_ms = 400
+health_probe_interval_ms = 200
+health_probe_timeout_ms = 20
+health_probe_max_wait_ms = 400
+
+[[upstreams.endpoints]]
+base_url = "{primary_base_url}"
+priority = "primary"
+
+[[upstreams.endpoints]]
+base_url = "{backup_base_url}"
+priority = "failover"
+
+[[upstreams]]
+name = "second"
+base_url = "{second_base_url}"
+match_models = ["second-model"]
+
+[[listeners]]
+name = "failover-first-models"
+bind_host = "127.0.0.1"
+port = 18018
+allowed_upstreams = ["first", "second"]
+"#,
+        backup_base_url = backup.base_url,
+        second_base_url = second.base_url,
+    );
+    let proxy = spawn_observed_failover_proxy(&second.base_url, &extra_config).await;
+    let listener = listener_config(&proxy, "failover-first-models");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=request-wide-physical-attempts"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("aggregate model response should drain");
+    primary_probe_seen
+        .await
+        .expect("first profile primary should pass readiness before disconnecting");
+    assert_eq!(backup.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(
+        backup.recv_next().await.path_and_query,
+        "/v1/models?test=request-wide-physical-attempts"
+    );
+    assert_eq!(
+        second.recv_next().await.path_and_query,
+        "/v1/models?test=request-wide-physical-attempts"
+    );
+
+    let attempts = read_attempt_request_metadata_rows(&proxy.sqlite_path);
+    let attempt_profiles = attempts
+        .iter()
+        .map(|attempt| {
+            (
+                attempt.attempt_number,
+                attempt.request_metadata["upstream_profile"]
+                    .as_str()
+                    .expect("attempt should identify its upstream profile"),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempt_profiles,
+        [(1, "first"), (2, "first"), (3, "second")]
+    );
+}
+
+#[tokio::test]
 async fn model_discovery_round_robin_advances_once_per_request() {
     let mut first = FakeUpstream::spawn().await;
     let mut second = FakeUpstream::spawn().await;
