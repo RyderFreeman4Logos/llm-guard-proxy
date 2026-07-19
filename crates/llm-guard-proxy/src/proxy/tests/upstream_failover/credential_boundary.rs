@@ -149,6 +149,151 @@ async fn aggregate_models_succeeds_when_deepinfra_primary_is_unreachable() {
 }
 
 #[tokio::test]
+async fn aggregate_models_persists_each_physical_failover_attempt() {
+    let mut chat = FakeUpstream::spawn().await;
+    let (primary_base_url, primary_probe_seen) = spawn_probe_then_stop_upstream().await;
+    let mut backup = FakeUpstream::spawn().await;
+    let extra_config = failover_profile_config(
+        &primary_base_url,
+        Some(&backup.base_url),
+        "200ms",
+        "20ms",
+        "400ms",
+    );
+    let proxy = spawn_observed_failover_proxy(&chat.base_url, &extra_config).await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=aggregate-physical-attempts",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("model discovery should fail over after the selected endpoint disconnects");
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .bytes()
+        .await
+        .expect("aggregate model response should drain");
+    primary_probe_seen
+        .await
+        .expect("primary should receive the readiness probe before disconnecting");
+    assert_eq!(
+        chat.recv_next().await.path_and_query,
+        "/v1/models?test=aggregate-physical-attempts"
+    );
+    assert_eq!(backup.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(
+        backup.recv_next().await.path_and_query,
+        "/v1/models?test=aggregate-physical-attempts"
+    );
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(
+        attempts.len(),
+        3,
+        "every physical attempt must be persisted"
+    );
+    assert_eq!(attempts[0].status, "succeeded");
+    assert_eq!(attempts[1].status, "retried");
+    assert_eq!(attempts[2].status, "succeeded");
+    assert_eq!(
+        attempts[1].retry_reason.as_deref(),
+        Some("endpoint_connect_failure")
+    );
+    let request_metadata = read_attempt_request_metadata_rows(&proxy.sqlite_path);
+    assert_eq!(request_metadata.len(), 3);
+    assert_eq!(
+        request_metadata[1].request_metadata["upstream_failover_selected"],
+        "false"
+    );
+    assert_eq!(
+        request_metadata[2].request_metadata["upstream_failover_selected"],
+        "true"
+    );
+    assert_ne!(
+        request_metadata[1].request_metadata["upstream_endpoint_base_url"],
+        request_metadata[2].request_metadata["upstream_endpoint_base_url"],
+        "terminal success must be attributed to the failover endpoint"
+    );
+}
+
+#[tokio::test]
+async fn model_discovery_round_robin_advances_once_per_request() {
+    let mut first = FakeUpstream::spawn().await;
+    let mut second = FakeUpstream::spawn().await;
+    let extra_config = round_robin_models_profile_config(&first.base_url, &second.base_url);
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &first.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &extra_config,
+    )
+    .await;
+    let listener = listener_config(&proxy, "round-robin-models");
+    let state = proxy.state.for_listener(listener);
+
+    for path in ["/v1/models?sequence=first", "/v1/models?sequence=second"] {
+        let response = proxy_handler(State(state.clone()), empty_get_request(path)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+            .await
+            .expect("round-robin model response should drain");
+    }
+
+    let first_control_requests = drain_matching_requests(&mut first, "sequence=");
+    let second_control_requests = drain_matching_requests(&mut second, "sequence=");
+    assert_eq!(
+        first_control_requests.len(),
+        1,
+        "the first endpoint should receive one physical models request"
+    );
+    assert_eq!(
+        second_control_requests.len(),
+        1,
+        "the second endpoint should receive one physical models request"
+    );
+    assert_ne!(first_control_requests, second_control_requests);
+}
+
+fn drain_matching_requests(upstream: &mut FakeUpstream, marker: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    while let Ok(request) = upstream.receiver.try_recv() {
+        if request.path_and_query.contains(marker) {
+            paths.push(request.path_and_query);
+        }
+    }
+    paths
+}
+
+fn round_robin_models_profile_config(first_base_url: &str, second_base_url: &str) -> String {
+    format!(
+        r#"
+[[upstreams]]
+name = "round-robin-models"
+base_url = "{first_base_url}"
+match_models = ["round-robin-model"]
+endpoint_selection = "round_robin"
+
+[[upstreams.endpoints]]
+base_url = "{first_base_url}"
+priority = "primary"
+
+[[upstreams.endpoints]]
+base_url = "{second_base_url}"
+priority = "failover"
+
+[[listeners]]
+name = "round-robin-models"
+bind_host = "127.0.0.1"
+port = 18017
+allowed_upstreams = ["round-robin-models"]
+"#
+    )
+}
+
+#[tokio::test]
 async fn signed_rerank_skips_transforming_endpoint_and_preserves_openai_headers() {
     let chat = FakeUpstream::spawn().await;
     let mut deepinfra = FakeUpstream::spawn().await;

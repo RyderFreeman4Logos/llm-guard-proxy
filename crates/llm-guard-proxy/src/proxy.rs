@@ -4140,48 +4140,60 @@ async fn merged_models_groups(
     let mut groups = Vec::<ModelsUpstreamGroup>::new();
     for profile in listener_models_upstream_profiles(context.config, &context.state.listener) {
         let request_deadline = Instant::now() + Duration::from_millis(profile.request_timeout_ms);
-        let selected = context
-            .state
-            .upstream_health
-            .select_endpoint(
-                &context.state.client,
-                &profile,
-                &context.state.shutdown,
-                None,
-                None,
-                Some(request_deadline),
-            )
-            .await
-            .map_err(|error| match error {
-                EndpointSelectionError::Shutdown => ProxyError::server_shutdown(),
-                EndpointSelectionError::Incompatible { profile } => {
-                    ProxyError::ContextBudgetExceeded {
-                        message: format!(
-                            "no OpenAI-compatible model discovery endpoint for profile {profile}"
-                        ),
-                        param: "path",
-                        code: "unsupported_models_endpoint",
-                        request_metadata: None,
-                    }
-                }
-                EndpointSelectionError::Unavailable { profile, waited_ms } => {
-                    ProxyError::upstream_unavailable(profile, waited_ms)
-                }
-            })?;
-        if let Some(group) = groups
-            .iter_mut()
-            .find(|group| group.base_url == selected.base_url)
+        let (base_url, terminal_endpoint, endpoint_retry_order) = if profile.name
+            == context.upstream_profile.name
         {
+            (
+                context.terminal_endpoint.base_url.clone(),
+                context.terminal_endpoint.clone(),
+                context.endpoint_retry_order.clone(),
+            )
+        } else {
+            let selected = context
+                    .state
+                    .upstream_health
+                    .select_endpoint(
+                        &context.state.client,
+                        &profile,
+                        &context.state.shutdown,
+                        None,
+                        None,
+                        Some(request_deadline),
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        EndpointSelectionError::Shutdown => ProxyError::server_shutdown(),
+                        EndpointSelectionError::Incompatible { profile } => {
+                            ProxyError::ContextBudgetExceeded {
+                                message: format!(
+                                    "no OpenAI-compatible model discovery endpoint for profile {profile}"
+                                ),
+                                param: "path",
+                                code: "unsupported_models_endpoint",
+                                request_metadata: None,
+                            }
+                        }
+                        EndpointSelectionError::Unavailable { profile, waited_ms } => {
+                            ProxyError::upstream_unavailable(profile, waited_ms)
+                        }
+                    })?;
+            (
+                selected.base_url,
+                selected.endpoint,
+                selected.selection_order,
+            )
+        };
+        if let Some(group) = groups.iter_mut().find(|group| group.base_url == base_url) {
             group.request_timeout_ms = group.request_timeout_ms.max(profile.request_timeout_ms);
             continue;
         }
         groups.push(ModelsUpstreamGroup {
-            base_url: selected.base_url,
+            base_url,
             request_timeout_ms: profile.request_timeout_ms,
             metadata: profile.metadata.clone(),
             profile,
-            terminal_endpoint: selected.endpoint,
-            endpoint_retry_order: selected.selection_order,
+            terminal_endpoint,
+            endpoint_retry_order,
             request_deadline,
         });
     }
@@ -4420,6 +4432,7 @@ struct ModelsUpstreamGroup {
 
 struct CompletedModelsFetch {
     body: Bytes,
+    completed_attempt_records: Vec<AttemptRecord>,
     attempt_record: AttemptRecord,
     upstream_status: reqwest::StatusCode,
     upstream_headers: HeaderMap,
@@ -4454,6 +4467,7 @@ async fn forward_merged_models_response(
             response_mode = Some(fetch.upstream_mode);
         }
         filtered_bodies.push(fetch.body);
+        attempt_records.extend(fetch.completed_attempt_records);
         attempt_records.push(fetch.attempt_record);
     }
 
@@ -4537,6 +4551,30 @@ fn models_failover_retry_context<'request>(
         })
 }
 
+fn models_attempt_request(
+    context: &GenericForwardContext<'_>,
+    group: &ModelsUpstreamGroup,
+    attempt_number: u32,
+) -> (HeaderMap, BTreeMap<String, String>) {
+    let downstream_headers = model_discovery_request_headers(&context.downstream_headers);
+    let mut metadata = attempt_request_metadata(&context.method, &context.uri, &downstream_headers);
+    metadata.insert(String::from("attempt_number"), attempt_number.to_string());
+    add_listener_metadata(&mut metadata, &context.state.listener);
+    add_upstream_profile_metadata(
+        &mut metadata,
+        &group.profile,
+        UpstreamRouteReason::MatchedModel,
+    );
+    add_shielded_request_metadata(
+        &mut metadata,
+        false,
+        context.thinking_policy_applied,
+        &context.liveness,
+        &context.thinking_metadata,
+    );
+    (downstream_headers, metadata)
+}
+
 async fn fetch_models_upstream_group(
     context: &GenericForwardContext<'_>,
     group: &ModelsUpstreamGroup,
@@ -4545,23 +4583,8 @@ async fn fetch_models_upstream_group(
 ) -> Result<CompletedModelsFetch, ProxyError> {
     let attempt_id = AttemptId::for_request(context.request_id, attempt_number);
     let attempt_started_at_unix_ms = unix_time_millis();
-    let downstream_headers = model_discovery_request_headers(&context.downstream_headers);
-    let mut attempt_request_metadata =
-        attempt_request_metadata(&context.method, &context.uri, &downstream_headers);
-    attempt_request_metadata.insert(String::from("attempt_number"), attempt_number.to_string());
-    add_listener_metadata(&mut attempt_request_metadata, &context.state.listener);
-    add_upstream_profile_metadata(
-        &mut attempt_request_metadata,
-        &group.profile,
-        UpstreamRouteReason::MatchedModel,
-    );
-    add_shielded_request_metadata(
-        &mut attempt_request_metadata,
-        false,
-        context.thinking_policy_applied,
-        &context.liveness,
-        &context.thinking_metadata,
-    );
+    let (downstream_headers, attempt_request_metadata) =
+        models_attempt_request(context, group, attempt_number);
 
     let upstream_url = build_upstream_url(&group.base_url, &context.uri)?;
     let sent_upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
@@ -4586,7 +4609,16 @@ async fn fetch_models_upstream_group(
         request_deadline: Some(group.request_deadline),
     })
     .await?;
-    let upstream_response = models_upstream_response(sent_upstream_response.response)?;
+    let SentUpstreamResponse {
+        response,
+        attempt_id,
+        attempt_number,
+        attempt_started_at_unix_ms,
+        attempt_request_metadata,
+        completed_attempt_records,
+        ..
+    } = sent_upstream_response;
+    let upstream_response = models_upstream_response(response)?;
     let upstream_mode = upstream_mode_from_headers(upstream_response.headers());
     let upstream_status = upstream_response.status();
     let upstream_headers = upstream_response.headers().clone();
@@ -4606,7 +4638,8 @@ async fn fetch_models_upstream_group(
                 attempt_number,
                 context.request_id.clone(),
                 attempt_started_at_unix_ms,
-            ));
+            )
+            .with_completed_attempt_records(completed_attempt_records));
         }
     };
     let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
@@ -4615,7 +4648,7 @@ async fn fetch_models_upstream_group(
         FinalAttemptContext {
             attempt_id,
             attempt_number,
-            attempt_max_attempts,
+            attempt_max_attempts: attempt_max_attempts.max(attempt_number),
             started_at_unix_ms: attempt_started_at_unix_ms,
             upstream_mode,
             upstream_status,
@@ -4634,6 +4667,7 @@ async fn fetch_models_upstream_group(
 
     Ok(CompletedModelsFetch {
         body,
+        completed_attempt_records,
         attempt_record,
         upstream_status,
         upstream_headers,
