@@ -40,6 +40,7 @@ struct EndpointHealth {
 struct ProbeSnapshot {
     checked_at: Option<Instant>,
     healthy: bool,
+    recovery_trial_in_progress: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -158,6 +159,7 @@ impl UpstreamHealthRegistry {
                         Duration::from_millis(profile.health_probe_interval_ms),
                         Duration::from_millis(profile.health_probe_timeout_ms).min(remaining),
                         shutdown,
+                        true,
                     )
                     .await?
                 {
@@ -209,6 +211,7 @@ impl UpstreamHealthRegistry {
         probe_interval: Duration,
         probe_timeout: Duration,
         shutdown: &ShutdownGate,
+        reserve_passive_trial: bool,
     ) -> Result<bool, EndpointSelectionError> {
         if endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
             if !super::reranker_protocol::has_runtime_credential(endpoint) {
@@ -217,7 +220,11 @@ impl UpstreamHealthRegistry {
             let health = self.endpoint_health(endpoint);
             // Cloud health is passive: a cooldown blocks selection, expiry grants one real
             // request as the recovery trial, and no paid inference health probe is issued.
-            return Ok(recent_health(&health, probe_interval).unwrap_or(true));
+            return Ok(passive_cloud_eligible(
+                &health,
+                probe_interval,
+                reserve_passive_trial,
+            ));
         }
         let health = self.endpoint_health(endpoint);
         if let Some(healthy) = recent_health(&health, probe_interval) {
@@ -327,6 +334,20 @@ impl UpstreamHealthRegistry {
         let mut snapshot = health_snapshot_mut(&health);
         snapshot.checked_at = Some(Instant::now());
         snapshot.healthy = false;
+        snapshot.recovery_trial_in_progress = false;
+    }
+
+    pub(super) fn mark_healthy(&self, endpoint: &UpstreamEndpointConfig) {
+        let health = self.endpoint_health(endpoint);
+        let mut snapshot = health_snapshot_mut(&health);
+        snapshot.checked_at = Some(Instant::now());
+        snapshot.healthy = true;
+        snapshot.recovery_trial_in_progress = false;
+    }
+
+    pub(super) fn release_recovery_trial(&self, endpoint: &UpstreamEndpointConfig) {
+        let health = self.endpoint_health(endpoint);
+        health_snapshot_mut(&health).recovery_trial_in_progress = false;
     }
 
     pub(super) fn start_background_polling(
@@ -373,6 +394,7 @@ impl UpstreamHealthRegistry {
                                 Duration::from_millis(profile.health_probe_interval_ms),
                                 Duration::from_millis(profile.health_probe_timeout_ms),
                                 &shutdown,
+                                false,
                             )
                             .await
                             .is_err()
@@ -472,6 +494,28 @@ async fn probe_models(
         }
         () = shutdown_subscription.cancelled() => Err(EndpointSelectionError::Shutdown),
     }
+}
+
+fn passive_cloud_eligible(
+    health: &EndpointHealth,
+    interval: Duration,
+    reserve_trial: bool,
+) -> bool {
+    let mut snapshot = health_snapshot_mut(health);
+    if snapshot.checked_at.is_none() || snapshot.healthy {
+        return true;
+    }
+    if snapshot
+        .checked_at
+        .is_some_and(|checked_at| checked_at.elapsed() < interval)
+        || snapshot.recovery_trial_in_progress
+    {
+        return false;
+    }
+    if reserve_trial {
+        snapshot.recovery_trial_in_progress = true;
+    }
+    true
 }
 
 fn recent_health(health: &EndpointHealth, interval: Duration) -> Option<bool> {

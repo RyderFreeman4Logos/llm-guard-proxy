@@ -5088,6 +5088,7 @@ async fn continue_endpoint_failover(
         result = next_result;
         terminal_attempt = next_attempt;
     }
+    finish_passive_recovery_trial(runtime.retry.registry, &terminal_attempt, &result);
     EndpointFailoverOutcome {
         result,
         terminal_attempt,
@@ -5421,6 +5422,26 @@ fn mark_retryable_endpoint_failure(
         && let Some(endpoint) = attempt.endpoint.as_ref()
     {
         registry.mark_unhealthy(endpoint);
+    }
+}
+
+fn finish_passive_recovery_trial(
+    registry: &UpstreamHealthRegistry,
+    attempt: &PhysicalEndpointAttempt,
+    result: &Result<EndpointResponse, ProxyError>,
+) {
+    if attempt.protocol != UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+        || is_retryable_endpoint_result(result, attempt.protocol)
+    {
+        return;
+    }
+    let Some(endpoint) = attempt.endpoint.as_ref() else {
+        return;
+    };
+    if result.is_ok() {
+        registry.mark_healthy(endpoint);
+    } else {
+        registry.release_recovery_trial(endpoint);
     }
 }
 
