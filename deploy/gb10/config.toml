@@ -250,7 +250,7 @@ enabled = false
 #| priority = "failover"                                               # Used only after a compatible retry/failover decision
 #| protocol = "deepinfra_qwen3_rerank"                                # Native Qwen3 reranker protocol
 #| model = "Qwen/Qwen3-Reranker-8B"                                   # Exact DeepInfra model path component
-#| model_revision = "2026.07.18"                                      # Required immutable revision; rendered as the exact revision query
+#| model_revision = "5fa94080caafeaa45a15d11f969d7978e087a3db"        # Required immutable DeepInfra version; rendered as the exact version query
 #| api_key_env = "LLM_GUARD_PROXY_DEEPINFRA_API_KEY"                   # Runtime credential environment variable; never put the secret here
 # END PARSEABLE EXAMPLE: heterogeneous-reranker-replicas
 

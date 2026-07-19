@@ -1894,7 +1894,7 @@ pub struct UpstreamEndpointConfig {
     pub protocol: UpstreamEndpointProtocol,
     /// Required remote model name for non-OpenAI endpoint protocols.
     pub model: Option<String>,
-    /// Required immutable remote model revision for non-OpenAI endpoint protocols.
+    /// Required immutable remote model version for non-OpenAI endpoint protocols.
     pub model_revision: Option<String>,
     /// Runtime environment variable containing the non-OpenAI endpoint credential.
     pub api_key_env: Option<String>,
@@ -2165,23 +2165,19 @@ impl UpstreamEndpointConfig {
                     "profile.upstream.model",
                     "must contain only ASCII letters, digits, '/', '-', '_', or '.'",
                 )?;
-                let revision = self.model_revision.as_deref().unwrap_or_default();
+                let version = self.model_revision.as_deref().unwrap_or_default();
                 require(
-                    !revision.is_empty() && revision == revision.trim(),
+                    !version.is_empty() && version == version.trim(),
                     "profile.upstream.model_revision",
-                    "must be a non-empty trimmed immutable revision for deepinfra_qwen3_rerank",
+                    "must be a non-empty trimmed immutable version for deepinfra_qwen3_rerank",
                 )?;
                 require(
-                    revision.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+                    version.len() == 40
+                        && version
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase()),
                     "profile.upstream.model_revision",
-                    "must be at most 256 bytes",
-                )?;
-                require(
-                    revision.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-                    }),
-                    "profile.upstream.model_revision",
-                    "must contain only ASCII letters, digits, '-', '_', or '.'",
+                    "must be a 40-character lowercase hexadecimal DeepInfra model version",
                 )?;
                 let environment_name = self.api_key_env.as_deref().unwrap_or_default();
                 require(

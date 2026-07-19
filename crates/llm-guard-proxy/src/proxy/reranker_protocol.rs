@@ -340,7 +340,7 @@ fn render_deepinfra_with_authorization(
                 && target.query() != Some(query)
             {
                 return Err(invalid_request_error(
-                    "DeepInfra native query must match the configured pinned revision",
+                    "DeepInfra native query must match the configured pinned version",
                 ));
             }
             if body.len() > MAX_DEEPINFRA_RENDERED_BODY_BYTES {
@@ -393,11 +393,11 @@ fn deepinfra_inference_uri(endpoint: &UpstreamEndpointConfig) -> Result<Uri, Pro
         .model
         .as_deref()
         .ok_or_else(unsupported_request_error)?;
-    let revision = endpoint
+    let version = endpoint
         .model_revision
         .as_deref()
         .ok_or_else(unsupported_request_error)?;
-    format!("/v1/inference/{model}?revision={revision}")
+    format!("/v1/inference/{model}?version={version}")
         .parse()
         .map_err(|error| {
             invalid_request_error(&format!("invalid DeepInfra inference path: {error}"))
@@ -785,6 +785,7 @@ mod tests {
     use llm_guard_proxy_core::{UpstreamEndpointConfig, UpstreamEndpointProtocol};
 
     const SENTINEL: &str = "LLM_GUARD_PROXY_NOT_A_REAL_CREDENTIAL_195";
+    const DEEPINFRA_QWEN3_RERANK_VERSION: &str = "5fa94080caafeaa45a15d11f969d7978e087a3db";
 
     #[test]
     fn converts_deepinfra_scores_to_indexed_openai_rerank_results() {
@@ -819,7 +820,7 @@ mod tests {
             base_url: String::from("https://api.deepinfra.com"),
             protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
             model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
-            model_revision: Some(String::from("2026.07.18")),
+            model_revision: Some(String::from(DEEPINFRA_QWEN3_RERANK_VERSION)),
             ..UpstreamEndpointConfig::default()
         };
         let request = CanonicalRerankerRequest::OpenAiRerank {
@@ -839,7 +840,10 @@ mod tests {
         )
         .expect("request should render");
         assert_eq!(rendered.uri.path(), "/v1/inference/Qwen/Qwen3-Reranker-8B");
-        assert_eq!(rendered.uri.query(), Some("revision=2026.07.18"));
+        assert_eq!(
+            rendered.uri.query(),
+            Some("version=5fa94080caafeaa45a15d11f969d7978e087a3db")
+        );
         assert_eq!(
             rendered
                 .headers
@@ -899,7 +903,7 @@ mod tests {
             base_url: String::from("https://api.deepinfra.com"),
             protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
             model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
-            model_revision: Some(String::from("2026.07.18")),
+            model_revision: Some(String::from(DEEPINFRA_QWEN3_RERANK_VERSION)),
             ..UpstreamEndpointConfig::default()
         };
         let request = CanonicalRerankerRequest::OpenAiRerank {
@@ -951,7 +955,7 @@ mod tests {
             base_url: String::from("https://api.deepinfra.com"),
             protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
             model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
-            model_revision: Some(String::from("2026.07.18")),
+            model_revision: Some(String::from(DEEPINFRA_QWEN3_RERANK_VERSION)),
             ..UpstreamEndpointConfig::default()
         };
         let request = CanonicalRerankerRequest::OpenAiRerank {
@@ -973,16 +977,18 @@ mod tests {
     }
 
     #[test]
-    fn deepinfra_renderer_retains_only_the_exact_pinned_native_query() {
+    fn deepinfra_renderer_retains_only_the_exact_pinned_native_version_query() {
         let endpoint = UpstreamEndpointConfig {
             base_url: String::from("https://api.deepinfra.com"),
             protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
             model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
-            model_revision: Some(String::from("2026.07.18")),
+            model_revision: Some(String::from(DEEPINFRA_QWEN3_RERANK_VERSION)),
             ..UpstreamEndpointConfig::default()
         };
         let request = CanonicalRerankerRequest::DeepInfraNative {
-            uri: Uri::from_static("/v1/inference/Qwen/Qwen3-Reranker-8B?revision=2026.07.18"),
+            uri: Uri::from_static(
+                "/v1/inference/Qwen/Qwen3-Reranker-8B?version=5fa94080caafeaa45a15d11f969d7978e087a3db",
+            ),
             body: Bytes::from_static(br#"{"queries":["q"],"documents":["d"]}"#),
         };
         let rendered = render_deepinfra_with_authorization(
@@ -991,11 +997,14 @@ mod tests {
             &HeaderMap::new(),
             HeaderValue::from_static("Bearer provider-secret"),
         )
-        .expect("matching native revision should render");
-        assert_eq!(rendered.uri.query(), Some("revision=2026.07.18"));
+        .expect("matching native version should render");
+        assert_eq!(
+            rendered.uri.query(),
+            Some("version=5fa94080caafeaa45a15d11f969d7978e087a3db")
+        );
 
         let mismatched = CanonicalRerankerRequest::DeepInfraNative {
-            uri: Uri::from_static("/v1/inference/Qwen/Qwen3-Reranker-8B?revision=other"),
+            uri: Uri::from_static("/v1/inference/Qwen/Qwen3-Reranker-8B?version=other"),
             body: Bytes::from_static(br#"{"queries":["q"],"documents":["d"]}"#),
         };
         assert!(
@@ -1039,7 +1048,7 @@ mod tests {
             base_url: String::from("https://api.deepinfra.com"),
             protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
             model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
-            model_revision: Some(String::from("2026.07.18")),
+            model_revision: Some(String::from(DEEPINFRA_QWEN3_RERANK_VERSION)),
             ..UpstreamEndpointConfig::default()
         };
         let documents = std::iter::repeat_n("d", MAX_PAIR_COUNT).collect::<Vec<_>>();

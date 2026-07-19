@@ -578,7 +578,7 @@ mod tests {
             priority: UpstreamPriority::Failover,
             protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
             model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
-            model_revision: Some(String::from("2026.07.18")),
+            model_revision: Some(String::from("5fa94080caafeaa45a15d11f969d7978e087a3db")),
             api_key_env: Some(String::from("UNSET_TEST_DEEPINFRA_KEY")),
         });
         let order = UpstreamHealthRegistry::selection_order(&profile, None);
@@ -605,13 +605,13 @@ mod tests {
             priority: UpstreamPriority::Failover,
             protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
             model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
-            model_revision: Some(String::from("2026.07.18")),
+            model_revision: Some(String::from("5fa94080caafeaa45a15d11f969d7978e087a3db")),
             api_key_env: Some(String::from("FIRST_KEY")),
         };
         let original = endpoint_identity(&endpoint);
-        endpoint.model_revision = Some(String::from("2026.07.19"));
+        endpoint.model_revision = Some(String::from("6fa94080caafeaa45a15d11f969d7978e087a3db"));
         assert_ne!(original, endpoint_identity(&endpoint));
-        endpoint.model_revision = Some(String::from("2026.07.18"));
+        endpoint.model_revision = Some(String::from("5fa94080caafeaa45a15d11f969d7978e087a3db"));
         endpoint.api_key_env = Some(String::from("SECOND_KEY"));
         assert_ne!(original, endpoint_identity(&endpoint));
     }
