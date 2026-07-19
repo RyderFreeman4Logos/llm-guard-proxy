@@ -3,6 +3,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,10 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
         self,
         registration: str,
         legacy_load_state: str = "not-found",
+        legacy_unit_file_state: str = "enabled",
+        legacy_active_state: str = "active",
+        integrated_unit_file_state: str = "disabled",
+        integrated_active_state: str = "inactive",
         metadata_violation: str | None = None,
         target_state: str = "populated",
         integrated_enable_failure: bool = False,
@@ -87,10 +92,10 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
             env["PATH"] = f"{fake_bin}:{env['PATH']}"
             env["SYSTEMCTL_LOG"] = str(systemctl_log)
             env["LEGACY_LOAD_STATE"] = legacy_load_state
-            env["LEGACY_UNIT_FILE_STATE"] = "enabled"
-            env["LEGACY_ACTIVE_STATE"] = "active"
-            env["INTEGRATED_UNIT_FILE_STATE"] = "disabled"
-            env["INTEGRATED_ACTIVE_STATE"] = "inactive"
+            env["LEGACY_UNIT_FILE_STATE"] = legacy_unit_file_state
+            env["LEGACY_ACTIVE_STATE"] = legacy_active_state
+            env["INTEGRATED_UNIT_FILE_STATE"] = integrated_unit_file_state
+            env["INTEGRATED_ACTIVE_STATE"] = integrated_active_state
             env["INTEGRATED_ENABLE_FAILURE"] = "1" if integrated_enable_failure else "0"
             env["INTEGRATED_ACTIVE_HANG"] = "1" if integrated_active_hang else "0"
             env["LLM_GUARD_CGROUP_ROOT"] = str(cgroup_root)
@@ -248,6 +253,111 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                 for index, call in enumerate(calls)
             )
         )
+
+    def test_rollback_restores_every_accepted_unit_file_state_exactly(self) -> None:
+        expected_commands = {
+            "enabled": "enable",
+            "enabled-runtime": "enable --runtime",
+            "disabled": "disable",
+            "static": None,
+            "indirect": None,
+            "generated": None,
+            "transient": None,
+        }
+        valid_registration = self.registration("a" * 64, "a" * 64)
+        for unit_kind in ("integrated", "legacy"):
+            for unit_file_state, expected_command in expected_commands.items():
+                with self.subTest(unit=unit_kind, unit_file_state=unit_file_state):
+                    arguments: dict[str, Any] = {
+                        "legacy_load_state": "loaded",
+                        "legacy_active_state": "inactive",
+                        "integrated_active_state": "inactive",
+                        "integrated_enable_failure": True,
+                    }
+                    arguments[f"{unit_kind}_unit_file_state"] = unit_file_state
+                    completed, calls = self.run_cutover(valid_registration, **arguments)
+
+                    self.assertNotEqual(completed.returncode, 0)
+                    failed_enable_index = next(
+                        index
+                        for index, call in enumerate(calls)
+                        if call.endswith("enable --now llm-guard-proxy.service")
+                    )
+                    rollback_calls = calls[failed_enable_index + 1 :]
+                    unit = (
+                        "llm-guard-proxy.service"
+                        if unit_kind == "integrated"
+                        else "gb10-memory-guardian.service"
+                    )
+                    enablement_calls = [
+                        call
+                        for call in rollback_calls
+                        if call.endswith(unit)
+                        and (" enable " in f" {call} " or " disable " in f" {call} ")
+                    ]
+                    if expected_command is None:
+                        self.assertEqual(enablement_calls, [])
+                    else:
+                        self.assertEqual(
+                            enablement_calls,
+                            [f"--user {expected_command} {unit}"],
+                        )
+
+    def test_rollback_restores_every_accepted_activity_state_exactly(self) -> None:
+        valid_registration = self.registration("a" * 64, "a" * 64)
+        for unit_kind in ("integrated", "legacy"):
+            for active_state, expected_command in (
+                ("active", "start"),
+                ("inactive", "stop"),
+            ):
+                with self.subTest(unit=unit_kind, active_state=active_state):
+                    arguments: dict[str, Any] = {
+                        "legacy_load_state": "loaded",
+                        "legacy_unit_file_state": "disabled",
+                        "integrated_unit_file_state": "disabled",
+                        "integrated_enable_failure": True,
+                    }
+                    arguments[f"{unit_kind}_active_state"] = active_state
+                    completed, calls = self.run_cutover(valid_registration, **arguments)
+
+                    self.assertNotEqual(completed.returncode, 0)
+                    failed_enable_index = next(
+                        index
+                        for index, call in enumerate(calls)
+                        if call.endswith("enable --now llm-guard-proxy.service")
+                    )
+                    rollback_calls = calls[failed_enable_index + 1 :]
+                    unit = (
+                        "llm-guard-proxy.service"
+                        if unit_kind == "integrated"
+                        else "gb10-memory-guardian.service"
+                    )
+                    activity_calls = [
+                        call
+                        for call in rollback_calls
+                        if call.endswith(unit)
+                        and (" start " in f" {call} " or " stop " in f" {call} ")
+                    ]
+                    self.assertEqual(activity_calls, [f"--user {expected_command} {unit}"])
+
+    def test_failed_activity_state_is_rejected_before_mutation(self) -> None:
+        valid_registration = self.registration("a" * 64, "a" * 64)
+        for unit_kind in ("integrated", "legacy"):
+            with self.subTest(unit=unit_kind):
+                arguments: dict[str, Any] = {"legacy_load_state": "loaded"}
+                arguments[f"{unit_kind}_active_state"] = "failed"
+                completed, calls = self.run_cutover(valid_registration, **arguments)
+
+                self.assertNotEqual(completed.returncode, 0)
+                mutating_calls = [
+                    call
+                    for call in calls
+                    if any(
+                        f" {command} " in f" {call} "
+                        for command in ("enable", "disable", "start", "stop")
+                    )
+                ]
+                self.assertEqual(mutating_calls, [])
 
 
 if __name__ == "__main__":

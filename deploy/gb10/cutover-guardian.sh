@@ -34,19 +34,22 @@ restore_unit_state() {
     local failed=0
 
     case "${unit_file_state}" in
-        enabled | enabled-runtime)
+        enabled)
             systemctl_bounded --user enable "${unit}" || failed=1
+            ;;
+        enabled-runtime)
+            systemctl_bounded --user enable --runtime "${unit}" || failed=1
             ;;
         disabled)
             systemctl_bounded --user disable "${unit}" || failed=1
             ;;
         static | indirect | generated | transient) ;;
     esac
-    if [[ "${active_state}" == "active" ]]; then
-        systemctl_bounded --user start "${unit}" || failed=1
-    else
-        systemctl_bounded --user stop "${unit}" || failed=1
-    fi
+    case "${active_state}" in
+        active) systemctl_bounded --user start "${unit}" || failed=1 ;;
+        inactive) systemctl_bounded --user stop "${unit}" || failed=1 ;;
+        *) failed=1 ;;
+    esac
     return "${failed}"
 }
 
@@ -148,7 +151,7 @@ if [[ "${legacy_load_state}" != "not-found" ]]; then
     validate_unit_state "legacy guardian unit file" "${legacy_unit_file_state}" \
         enabled enabled-runtime disabled static indirect generated transient
     validate_unit_state "legacy guardian activity" "${legacy_active_state}" \
-        active inactive failed
+        active inactive
 fi
 integrated_unit_file_state="$(
     systemctl_bounded --user show --property=UnitFileState --value "${integrated_unit}"
@@ -159,7 +162,7 @@ integrated_active_state="$(
 validate_unit_state "integrated guardian unit file" "${integrated_unit_file_state}" \
     enabled enabled-runtime disabled static indirect generated transient
 validate_unit_state "integrated guardian activity" "${integrated_active_state}" \
-    active inactive failed
+    active inactive
 
 cutover_started=false
 cutover_complete=false
