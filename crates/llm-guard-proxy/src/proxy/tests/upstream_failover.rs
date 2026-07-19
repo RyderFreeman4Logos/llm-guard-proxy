@@ -5,6 +5,7 @@ use tokio::{
 };
 
 mod credential_boundary;
+mod models_attempt_preservation;
 mod response_and_recovery;
 
 #[tokio::test]

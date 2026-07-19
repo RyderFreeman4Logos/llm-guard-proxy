@@ -2637,6 +2637,7 @@ async fn forward_openai_request(
                         param: "body",
                         code: "unsupported_reranker_endpoint_request",
                         request_metadata: None,
+                        attempts: Vec::new(),
                     }
                 }
                 EndpointSelectionError::Unavailable { profile, waited_ms } => {
@@ -2668,6 +2669,7 @@ async fn forward_openai_request(
                     param: "path",
                     code: "unsupported_reranker_endpoint_request",
                     request_metadata: None,
+                    attempts: Vec::new(),
                 })?;
             let rendered =
                 reranker_protocol::render(&selected.endpoint, canonical, &downstream_headers)
@@ -3380,6 +3382,7 @@ fn validate_vllm_native_request_controls(
                 String::from("vllm_native"),
             ),
         ])),
+        attempts: Vec::new(),
     })
 }
 
@@ -4184,6 +4187,7 @@ async fn begin_models_upstream_group(
                         param: "path",
                         code: "unsupported_models_endpoint",
                         request_metadata: None,
+                        attempts: Vec::new(),
                     }
                 }
                 EndpointSelectionError::Unavailable { profile, waited_ms } => {
@@ -13326,6 +13330,7 @@ enum ProxyError {
         profile: String,
         waited_ms: u64,
         request_metadata: Option<BTreeMap<String, String>>,
+        attempts: Vec<AttemptRecord>,
     },
     #[error("upstream request failed: {failure}")]
     UpstreamTransport {
@@ -13343,7 +13348,17 @@ enum ProxyError {
         param: &'static str,
         code: &'static str,
         request_metadata: Option<BTreeMap<String, String>>,
+        attempts: Vec<AttemptRecord>,
     },
+}
+
+fn merge_request_metadata(
+    existing: Option<BTreeMap<String, String>>,
+    additional: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    let mut merged = existing.unwrap_or_default();
+    merged.extend(additional);
+    merged
 }
 
 impl ProxyError {
@@ -13402,6 +13417,7 @@ impl ProxyError {
             profile,
             waited_ms,
             request_metadata: None,
+            attempts: Vec::new(),
         }
     }
 
@@ -13464,6 +13480,7 @@ impl ProxyError {
             param: estimate.param,
             code: "context_budget_exceeded",
             request_metadata: Some(estimate.metadata("rejected")),
+            attempts: Vec::new(),
         }
     }
 
@@ -13660,7 +13677,9 @@ impl ProxyError {
                 attempts.push(observability.attempt_record.clone());
                 attempts
             }
-            Self::Shutdown { attempts, .. } => attempts.clone(),
+            Self::Shutdown { attempts, .. }
+            | Self::UpstreamUnavailable { attempts, .. }
+            | Self::ContextBudgetExceeded { attempts, .. } => attempts.clone(),
             Self::RequestBody { .. }
             | Self::ConfigSnapshot { .. }
             | Self::InvalidUpstreamUrl { .. }
@@ -13668,8 +13687,6 @@ impl ProxyError {
             | Self::InvalidMethod { .. }
             | Self::Admission { .. }
             | Self::ListenerUpstreamDenied { .. }
-            | Self::UpstreamUnavailable { .. }
-            | Self::ContextBudgetExceeded { .. }
             | Self::UpstreamTransport {
                 observability: None,
                 ..
@@ -13718,11 +13735,15 @@ impl ProxyError {
                 request_metadata: Some(request_metadata),
             },
             Self::UpstreamUnavailable {
-                profile, waited_ms, ..
+                profile,
+                waited_ms,
+                attempts,
+                ..
             } => Self::UpstreamUnavailable {
                 profile,
                 waited_ms,
                 request_metadata: Some(request_metadata),
+                attempts,
             },
             Self::Shutdown { attempts, .. } => Self::Shutdown {
                 request_metadata: Some(request_metadata),
@@ -13748,16 +13769,14 @@ impl ProxyError {
                 param,
                 code,
                 request_metadata: existing_metadata,
-            } => {
-                let mut merged = existing_metadata.unwrap_or_default();
-                merged.extend(request_metadata);
-                Self::ContextBudgetExceeded {
-                    message,
-                    param,
-                    code,
-                    request_metadata: Some(merged),
-                }
-            }
+                attempts,
+            } => Self::ContextBudgetExceeded {
+                message,
+                param,
+                code,
+                request_metadata: Some(merge_request_metadata(existing_metadata, request_metadata)),
+                attempts,
+            },
             #[cfg(feature = "guard")]
             Self::BudgetExceeded {
                 profile,
@@ -13865,6 +13884,36 @@ impl ProxyError {
             } => {
                 attempts.splice(0..0, completed_attempt_records);
                 Self::Shutdown {
+                    request_metadata,
+                    attempts,
+                }
+            }
+            Self::UpstreamUnavailable {
+                profile,
+                waited_ms,
+                request_metadata,
+                mut attempts,
+            } => {
+                attempts.splice(0..0, completed_attempt_records);
+                Self::UpstreamUnavailable {
+                    profile,
+                    waited_ms,
+                    request_metadata,
+                    attempts,
+                }
+            }
+            Self::ContextBudgetExceeded {
+                message,
+                param,
+                code,
+                request_metadata,
+                mut attempts,
+            } => {
+                attempts.splice(0..0, completed_attempt_records);
+                Self::ContextBudgetExceeded {
+                    message,
+                    param,
+                    code,
                     request_metadata,
                     attempts,
                 }

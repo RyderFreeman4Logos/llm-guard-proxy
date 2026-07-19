@@ -379,6 +379,7 @@ fn ensure_deepinfra_transformation_is_unsigned(headers: &HeaderMap) -> Result<()
             param: "headers",
             code: "signed_request_transformation_unsupported",
             request_metadata: None,
+            attempts: Vec::new(),
         });
     }
     Ok(())
@@ -783,6 +784,7 @@ fn invalid_request_error(message: &str) -> ProxyError {
         param: "body",
         code: "invalid_reranker_endpoint_request",
         request_metadata: None,
+        attempts: Vec::new(),
     }
 }
 
@@ -794,6 +796,7 @@ fn unsupported_request_error() -> ProxyError {
         param: "body",
         code: "unsupported_reranker_endpoint_request",
         request_metadata: None,
+        attempts: Vec::new(),
     }
 }
 
@@ -803,6 +806,7 @@ fn credential_error() -> ProxyError {
         param: "api_key_env",
         code: "upstream_endpoint_credential_unavailable",
         request_metadata: None,
+        attempts: Vec::new(),
     }
 }
 

@@ -105,6 +105,7 @@ pub(super) fn adapt_openai_request_if_needed(
                 param: "body",
                 code,
                 request_metadata: None,
+                attempts: Vec::new(),
             }
         })?;
         request_metadata.insert(
@@ -163,6 +164,7 @@ fn adapt_score_request_if_needed(
         param: "body",
         code: "invalid_score_request",
         request_metadata: None,
+        attempts: Vec::new(),
     };
     let adapt = score_adapter::can_adapt_score_body_to_rerank(body).map_err(invalid)?;
     if !adapt {
@@ -183,6 +185,7 @@ fn adapt_score_request_if_needed(
             param: "path",
             code: "invalid_score_request",
             request_metadata: None,
+            attempts: Vec::new(),
         }
     })?;
     let score_expected_count = score_adapter::score_expectations_from_rerank_body(&adapted_body);
@@ -224,6 +227,7 @@ fn ensure_transform_headers_supported(
             param: "headers",
             code: "signed_request_transformation_unsupported",
             request_metadata: None,
+            attempts: Vec::new(),
         });
     }
     Ok(())
