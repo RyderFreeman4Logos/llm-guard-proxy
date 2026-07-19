@@ -6038,6 +6038,67 @@ async fn upstream_stall_recovery_joiner_uses_completed_state_after_lost_notifica
     assert_eq!(joined["upstream_stall_recovery_joined_status"], "succeeded");
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn upstream_stall_recovery_public_path_returns_term_resistant_leader_cleanup_result() {
+    let test_dir = unique_test_dir("public recovery term-resistant leader");
+    remove_dir_all(&test_dir);
+    fs::create_dir_all(&test_dir).expect("test directory should be created");
+    let _test_dir_cleanup = TestDirectoryCleanup::new(&test_dir);
+    let leader_pid_path = test_dir.join("leader.pid");
+    let ready_path = test_dir.join("leader.ready");
+    let script_path = test_dir.join("term-resistant-leader.sh");
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nset -eu\ntrap '' TERM\nprintf '%s\\n' \"$$\" > \"$1\"\n: > \"$2\"\nwhile :; do sleep 1; done\n",
+    )
+    .expect("test recovery script should be written");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+        .expect("test recovery script should be executable");
+
+    let policy = UpstreamStallPolicy {
+        enabled: true,
+        first_chunk_timeout: Duration::from_millis(50),
+        idle_timeout: Duration::from_millis(50),
+        recovery_command: vec![
+            String::from("/bin/sh"),
+            script_path.display().to_string(),
+            leader_pid_path.display().to_string(),
+            ready_path.display().to_string(),
+        ],
+        recovery_timeout: Duration::from_millis(1),
+        recovery_cooldown: Duration::from_millis(1),
+        recovery_budget_window: Duration::from_secs(60),
+        recovery_max_per_window: 2,
+    };
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    let recovery = tokio::spawn({
+        let coordinator = Arc::clone(&coordinator);
+        async move { run_upstream_stall_recovery(&policy, &coordinator).await }
+    });
+    let leader = read_pid_file_after_ready(&leader_pid_path, &ready_path).await;
+    let metadata = recovery.await.expect("public recovery task should join");
+
+    // The legacy early public return leaves the background cleanup running.
+    // Let that bounded cleanup finish before asserting so this RED test cannot leak its leader.
+    sleep(Duration::from_millis(1_250)).await;
+    assert_process_reaped(leader).await;
+    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_term_sent"],
+        "true"
+    );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_kill_sent"],
+        "true"
+    );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_cleanup_status"],
+        "terminated_after_kill"
+    );
+    remove_dir_all(&test_dir);
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn upstream_stall_recovery_command_wiring_times_out_and_cleans_process_group() {
@@ -6244,6 +6305,33 @@ impl RecoveryProcessFixture {
     }
 }
 
+#[cfg(target_os = "linux")]
+async fn assert_recovery_process_group_cleanup(
+    metadata: &BTreeMap<String, String>,
+    leader: LinuxProcessIdentity,
+    descendant: LinuxProcessIdentity,
+) {
+    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_cleanup_scope"],
+        "process_group"
+    );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_term_sent"],
+        "true"
+    );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_kill_sent"],
+        "true"
+    );
+    assert_eq!(
+        metadata["upstream_stall_recovery_timeout_cleanup_status"],
+        "terminated_after_kill"
+    );
+    assert_process_reaped(leader).await;
+    assert_process_not_running(descendant).await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn recovery_child_timeout_cleanup_can_be_exercised_after_fixture_readiness() {
@@ -6284,14 +6372,11 @@ async fn upstream_stall_recovery_timeout_kills_descendant_process_group() {
         &[child_pid_path.as_path(), ready_path.as_path()],
     );
     let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
+    let leader = LinuxProcessIdentity::capture(fixture.process_group_id)
+        .expect("fixture leader identity should be readable");
     let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
-    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
-    assert_eq!(
-        metadata["upstream_stall_recovery_timeout_cleanup_scope"],
-        "process_group"
-    );
-    assert_process_not_running(child_pid).await;
+    assert_recovery_process_group_cleanup(&metadata, leader, child_pid).await;
     remove_dir_all(&test_dir);
 }
 
@@ -6318,22 +6403,18 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_descendant_process
         &[child_pid_path.as_path(), ready_path.as_path()],
     );
     let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
+    let leader = LinuxProcessIdentity::capture(fixture.process_group_id)
+        .expect("fixture leader identity should be readable");
     let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
-    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
-    assert_eq!(
-        metadata["upstream_stall_recovery_timeout_cleanup_scope"],
-        "process_group"
+    assert_recovery_process_group_cleanup(&metadata, leader, child_pid).await;
+    assert!(
+        matches!(
+            metadata["upstream_stall_recovery_timeout_term_child_wait_status"].as_str(),
+            "child_still_running_after_term" | "child_exited_unreaped_after_term"
+        ),
+        "TERM observation must retain a documented direct-leader state"
     );
-    assert_eq!(
-        metadata["upstream_stall_recovery_timeout_term_child_wait_status"],
-        "child_exited_unreaped_after_term"
-    );
-    assert_eq!(
-        metadata["upstream_stall_recovery_timeout_cleanup_status"],
-        "terminated_after_kill"
-    );
-    assert_process_not_running(child_pid).await;
     remove_dir_all(&test_dir);
 }
 
@@ -6360,21 +6441,14 @@ async fn upstream_stall_recovery_timeout_kills_term_resistant_group_leader_befor
         &[child_pid_path.as_path(), ready_path.as_path()],
     );
     let child_pid = read_pid_file_after_ready(&child_pid_path, &ready_path).await;
+    assert_eq!(child_pid.pid, fixture.process_group_id);
     let metadata = fixture.wait_with_timeout(Duration::from_millis(1)).await;
 
-    if metadata
-        .get("upstream_stall_recovery_status")
-        .map(String::as_str)
-        != Some("timeout_killed")
-    {
-        kill_process_if_running(child_pid);
-    }
-    assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
+    assert_recovery_process_group_cleanup(&metadata, child_pid, child_pid).await;
     assert_eq!(
-        metadata["upstream_stall_recovery_timeout_kill_sent"],
-        "true"
+        metadata["upstream_stall_recovery_timeout_term_child_wait_status"],
+        "child_still_running_after_term"
     );
-    assert_process_not_running(child_pid).await;
     remove_dir_all(&test_dir);
 }
 
