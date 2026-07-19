@@ -194,12 +194,15 @@ registration="${registration_dir}/text-cgroup.v1"
 deploy/gb10/cutover-guardian.sh "${registration}"
 ```
 
-The helper validates the complete registration contract before any guardian
-`systemctl` call. It treats a `not-found` standalone unit as a fresh install;
-otherwise it disables the standalone guardian before enabling the integrated
-guardian, so recovery has only one owner. If the proxy fails to become active,
-stop it and restore the previously enabled standalone guardian before
-continuing; never leave both recovery actors active.
+The helper validates the complete registration contract, the referenced live
+cgroup, and `cgroup.events` (`populated 1`) before any guardian `systemctl` call.
+Every unit operation has a deadline. It treats a `not-found` standalone unit as
+a fresh install; otherwise it disables the standalone guardian before enabling
+the integrated guardian, so recovery has only one owner. Any failure or signal
+after mutation begins automatically restores both units' prior enablement and
+activity states. Treat an `automatic rollback was incomplete` diagnostic as a
+hard stop requiring manual recovery; never continue while neither or both
+recovery actors may be active.
 
 The current gb10 AEON profile needs enough KV cache for the advertised 256000
 context window. If a cold restart fails with a vLLM error like `26.69 GiB KV

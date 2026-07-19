@@ -4,10 +4,50 @@ set -euo pipefail
 readonly legacy_unit="gb10-memory-guardian.service"
 readonly integrated_unit="llm-guard-proxy.service"
 readonly registration_max_bytes=1024
+readonly cgroup_root="${LLM_GUARD_CGROUP_ROOT:-/sys/fs/cgroup}"
+readonly systemctl_timeout="${LLM_GUARD_SYSTEMCTL_TIMEOUT:-15s}"
 
 die() {
     printf 'guardian cutover: %s\n' "$1" >&2
     exit 1
+}
+
+systemctl_bounded() {
+    timeout --foreground --kill-after=1s "${systemctl_timeout}" systemctl "$@"
+}
+
+validate_unit_state() {
+    local state_name="$1"
+    local state="$2"
+    shift 2
+    local allowed
+    for allowed in "$@"; do
+        [[ "${state}" != "${allowed}" ]] || return 0
+    done
+    die "${state_name} has unexpected state ${state}"
+}
+
+restore_unit_state() {
+    local unit="$1"
+    local unit_file_state="$2"
+    local active_state="$3"
+    local failed=0
+
+    case "${unit_file_state}" in
+        enabled | enabled-runtime)
+            systemctl_bounded --user enable "${unit}" || failed=1
+            ;;
+        disabled)
+            systemctl_bounded --user disable "${unit}" || failed=1
+            ;;
+        static | indirect | generated | transient) ;;
+    esac
+    if [[ "${active_state}" == "active" ]]; then
+        systemctl_bounded --user start "${unit}" || failed=1
+    else
+        systemctl_bounded --user stop "${unit}" || failed=1
+    fi
+    return "${failed}"
 }
 
 if (( $# > 1 )); then
@@ -73,14 +113,86 @@ expected_group="/user.slice/user-${uid}.slice/user@${uid}.service/app.slice/${sc
 [[ "${control_group}" == "${expected_group}" ]] \
     || die "control_group must match the current user and scope"
 
-# All registration validation is complete before the first guardian systemctl
-# call. A missing legacy unit is the expected fresh-install state.
+[[ "${cgroup_root}" == /* ]] || die "cgroup root must be absolute"
+cgroup_path="${cgroup_root}${control_group}"
+[[ -d "${cgroup_path}" && ! -L "${cgroup_path}" ]] \
+    || die "registered cgroup does not exist"
+cgroup_events="${cgroup_path}/cgroup.events"
+[[ -f "${cgroup_events}" && ! -L "${cgroup_events}" ]] \
+    || die "registered cgroup.events is unavailable"
+populated=""
+while read -r event_key event_value event_extra; do
+    if [[ "${event_key}" == "populated" ]]; then
+        [[ -z "${populated}" && -z "${event_extra:-}" && "${event_value}" =~ ^[01]$ ]] \
+            || die "registered cgroup.events has malformed populated state"
+        populated="${event_value}"
+    fi
+done <"${cgroup_events}"
+[[ "${populated}" == "1" ]] || die "registered cgroup is not populated"
+
+# All registration and live-target validation is complete before the first guardian
+# systemctl call. A missing legacy unit is the expected fresh-install state.
 legacy_load_state="$(
-    systemctl --user show --property=LoadState --value "${legacy_unit}"
+    systemctl_bounded --user show --property=LoadState --value "${legacy_unit}"
 )"
+legacy_unit_file_state="disabled"
+legacy_active_state="inactive"
 if [[ "${legacy_load_state}" != "not-found" ]]; then
     [[ -n "${legacy_load_state}" ]] || die "legacy guardian load state is empty"
-    systemctl --user disable --now "${legacy_unit}"
+    legacy_unit_file_state="$(
+        systemctl_bounded --user show --property=UnitFileState --value "${legacy_unit}"
+    )"
+    legacy_active_state="$(
+        systemctl_bounded --user show --property=ActiveState --value "${legacy_unit}"
+    )"
+    validate_unit_state "legacy guardian unit file" "${legacy_unit_file_state}" \
+        enabled enabled-runtime disabled static indirect generated transient
+    validate_unit_state "legacy guardian activity" "${legacy_active_state}" \
+        active inactive failed
 fi
-systemctl --user enable --now "${integrated_unit}"
-systemctl --user is-active "${integrated_unit}"
+integrated_unit_file_state="$(
+    systemctl_bounded --user show --property=UnitFileState --value "${integrated_unit}"
+)"
+integrated_active_state="$(
+    systemctl_bounded --user show --property=ActiveState --value "${integrated_unit}"
+)"
+validate_unit_state "integrated guardian unit file" "${integrated_unit_file_state}" \
+    enabled enabled-runtime disabled static indirect generated transient
+validate_unit_state "integrated guardian activity" "${integrated_active_state}" \
+    active inactive failed
+
+cutover_started=false
+cutover_complete=false
+rollback_cutover() {
+    local status=$?
+    trap - EXIT INT TERM
+    if [[ "${cutover_started}" == "true" && "${cutover_complete}" != "true" ]]; then
+        set +e
+        printf 'guardian cutover: restoring prior guardian unit states\n' >&2
+        local rollback_failed=0
+        restore_unit_state \
+            "${integrated_unit}" "${integrated_unit_file_state}" "${integrated_active_state}" \
+            || rollback_failed=1
+        if [[ "${legacy_load_state}" != "not-found" ]]; then
+            restore_unit_state \
+                "${legacy_unit}" "${legacy_unit_file_state}" "${legacy_active_state}" \
+                || rollback_failed=1
+        fi
+        if (( rollback_failed != 0 )); then
+            printf 'guardian cutover: automatic rollback was incomplete\n' >&2
+        fi
+    fi
+    exit "${status}"
+}
+trap rollback_cutover EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+cutover_started=true
+if [[ "${legacy_load_state}" != "not-found" ]]; then
+    systemctl_bounded --user disable --now "${legacy_unit}"
+fi
+systemctl_bounded --user enable --now "${integrated_unit}"
+systemctl_bounded --user is-active "${integrated_unit}"
+cutover_complete=true
+trap - EXIT INT TERM

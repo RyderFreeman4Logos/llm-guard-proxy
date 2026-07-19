@@ -19,6 +19,9 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
         registration: str,
         legacy_load_state: str = "not-found",
         metadata_violation: str | None = None,
+        target_state: str = "populated",
+        integrated_enable_failure: bool = False,
+        integrated_active_hang: bool = False,
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -37,6 +40,21 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
             elif metadata_violation == "symlink":
                 registration_path.symlink_to(registration_source)
 
+            cgroup_root = root / "cgroup"
+            control_group = next(
+                (
+                    line.removeprefix("control_group=")
+                    for line in registration.splitlines()
+                    if line.startswith("control_group=")
+                ),
+                "",
+            )
+            if target_state != "missing" and control_group:
+                target = cgroup_root / control_group.removeprefix("/")
+                target.mkdir(parents=True)
+                populated = "1" if target_state == "populated" else "0"
+                (target / "cgroup.events").write_text(f"populated {populated}\n")
+
             systemctl_log = root / "systemctl.log"
             fake_bin = root / "bin"
             fake_bin.mkdir()
@@ -46,8 +64,21 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                 "set -euo pipefail\n"
                 'printf \'%s\\n\' "$*" >>"${SYSTEMCTL_LOG}"\n'
                 'case "$*" in\n'
-                '  *"show"*"gb10-memory-guardian.service"*) '
+                '  *"show --property=LoadState"*"gb10-memory-guardian.service"*) '
                 'printf \'%s\\n\' "${LEGACY_LOAD_STATE}" ;;\n'
+                '  *"show --property=UnitFileState"*"gb10-memory-guardian.service"*) '
+                'printf \'%s\\n\' "${LEGACY_UNIT_FILE_STATE}" ;;\n'
+                '  *"show --property=ActiveState"*"gb10-memory-guardian.service"*) '
+                'printf \'%s\\n\' "${LEGACY_ACTIVE_STATE}" ;;\n'
+                '  *"show --property=UnitFileState"*"llm-guard-proxy.service"*) '
+                'printf \'%s\\n\' "${INTEGRATED_UNIT_FILE_STATE}" ;;\n'
+                '  *"show --property=ActiveState"*"llm-guard-proxy.service"*) '
+                'printf \'%s\\n\' "${INTEGRATED_ACTIVE_STATE}" ;;\n'
+                '  *"enable --now llm-guard-proxy.service"*) '
+                '[[ "${INTEGRATED_ENABLE_FAILURE}" != 1 ]] ;;\n'
+                '  *"is-active llm-guard-proxy.service"*) '
+                'if [[ "${INTEGRATED_ACTIVE_HANG}" == 1 ]]; then sleep 5; fi; '
+                'printf \'active\\n\' ;;\n'
                 "esac\n"
             )
             fake_systemctl.chmod(0o755)
@@ -56,13 +87,31 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
             env["PATH"] = f"{fake_bin}:{env['PATH']}"
             env["SYSTEMCTL_LOG"] = str(systemctl_log)
             env["LEGACY_LOAD_STATE"] = legacy_load_state
-            completed = subprocess.run(
-                [str(CUTOVER), str(registration_path)],
-                check=False,
-                capture_output=True,
-                text=True,
-                env=env,
-            )
+            env["LEGACY_UNIT_FILE_STATE"] = "enabled"
+            env["LEGACY_ACTIVE_STATE"] = "active"
+            env["INTEGRATED_UNIT_FILE_STATE"] = "disabled"
+            env["INTEGRATED_ACTIVE_STATE"] = "inactive"
+            env["INTEGRATED_ENABLE_FAILURE"] = "1" if integrated_enable_failure else "0"
+            env["INTEGRATED_ACTIVE_HANG"] = "1" if integrated_active_hang else "0"
+            env["LLM_GUARD_CGROUP_ROOT"] = str(cgroup_root)
+            env["LLM_GUARD_SYSTEMCTL_TIMEOUT"] = "0.1s"
+            command = [str(CUTOVER), str(registration_path)]
+            try:
+                completed = subprocess.run(
+                    command,
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=env,
+                    timeout=1,
+                )
+            except subprocess.TimeoutExpired as error:
+                completed = subprocess.CompletedProcess(
+                    command,
+                    124,
+                    stdout=error.stdout.decode() if error.stdout else "",
+                    stderr="cutover exceeded the test's outer deadline",
+                )
             calls = systemctl_log.read_text().splitlines() if systemctl_log.exists() else []
             return completed, calls
 
@@ -133,6 +182,72 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
             if "enable --now llm-guard-proxy.service" in call
         )
         self.assertLess(disable_index, enable_index)
+
+    def test_stale_or_empty_cgroup_fails_before_any_systemctl_call(self) -> None:
+        valid_registration = self.registration("a" * 64, "a" * 64)
+        for target_state in ("missing", "empty"):
+            with self.subTest(target_state=target_state):
+                completed, calls = self.run_cutover(
+                    valid_registration, target_state=target_state
+                )
+
+                self.assertNotEqual(completed.returncode, 0)
+                self.assertEqual(calls, [])
+
+    def test_integrated_enable_failure_restores_prior_legacy_state(self) -> None:
+        completed, calls = self.run_cutover(
+            self.registration("a" * 64, "a" * 64),
+            legacy_load_state="loaded",
+            integrated_enable_failure=True,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        failed_enable_index = next(
+            index
+            for index, call in enumerate(calls)
+            if "enable --now llm-guard-proxy.service" in call
+        )
+        rollback_enable_index = next(
+            (
+                index
+                for index, call in enumerate(calls)
+                if index > failed_enable_index
+                and call.endswith("enable gb10-memory-guardian.service")
+            ),
+            -1,
+        )
+        rollback_start_index = next(
+            (
+                index
+                for index, call in enumerate(calls)
+                if index > rollback_enable_index
+                and call.endswith("start gb10-memory-guardian.service")
+            ),
+            -1,
+        )
+        self.assertGreater(rollback_enable_index, failed_enable_index)
+        self.assertLess(rollback_enable_index, rollback_start_index)
+
+    def test_active_check_timeout_restores_prior_legacy_state(self) -> None:
+        completed, calls = self.run_cutover(
+            self.registration("a" * 64, "a" * 64),
+            legacy_load_state="loaded",
+            integrated_active_hang=True,
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        active_check_index = next(
+            index
+            for index, call in enumerate(calls)
+            if call.endswith("is-active llm-guard-proxy.service")
+        )
+        self.assertTrue(
+            any(
+                index > active_check_index
+                and call.endswith("start gb10-memory-guardian.service")
+                for index, call in enumerate(calls)
+            )
+        )
 
 
 if __name__ == "__main__":
