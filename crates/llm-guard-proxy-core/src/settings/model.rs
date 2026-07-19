@@ -2175,7 +2175,7 @@ impl UpstreamEndpointConfig {
                     version.len() == 40
                         && version
                             .bytes()
-                            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase()),
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
                     "profile.upstream.model_revision",
                     "must be a 40-character lowercase hexadecimal DeepInfra model version",
                 )?;

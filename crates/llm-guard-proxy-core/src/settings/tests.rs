@@ -504,6 +504,56 @@ api_key_env = "LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY"
 }
 
 #[test]
+fn deepinfra_model_revision_requires_lowercase_hexadecimal_sha() {
+    let valid_revision = "5fa94080caafeaa45a15d11f969d7978e087a3db";
+    let valid = parse_config_text(&format!(
+        r#"
+[[profile]]
+model = "qwen3-reranker-8b"
+
+[[profile.endpoints]]
+base_url = "https://api.deepinfra.com"
+priority = "primary"
+protocol = "deepinfra_qwen3_rerank"
+model = "Qwen/Qwen3-Reranker-8B"
+model_revision = "{valid_revision}"
+api_key_env = "LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY"
+"#
+    ))
+    .expect("valid lowercase hexadecimal revision should parse");
+    valid
+        .validate()
+        .expect("valid lowercase hexadecimal revision should validate");
+
+    for invalid_revision in [
+        "gggggggggggggggggggggggggggggggggggggggg",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "éééééééééééééééééééé",
+    ] {
+        let config = parse_config_text(&format!(
+            r#"
+[[profile]]
+model = "qwen3-reranker-8b"
+
+[[profile.endpoints]]
+base_url = "https://api.deepinfra.com"
+priority = "primary"
+protocol = "deepinfra_qwen3_rerank"
+model = "Qwen/Qwen3-Reranker-8B"
+model_revision = "{invalid_revision}"
+api_key_env = "LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY"
+"#
+        ))
+        .expect("invalid revision should parse before validation");
+        let error = config
+            .validate()
+            .expect_err("non-lowercase-hexadecimal revision must fail validation");
+        assert_eq!(error.field(), "profile.upstream.model_revision");
+    }
+}
+
+#[test]
 fn rejects_invalid_heterogeneous_reranker_endpoint_fields() {
     let unknown_protocol = parse_config_text(
         r#"
