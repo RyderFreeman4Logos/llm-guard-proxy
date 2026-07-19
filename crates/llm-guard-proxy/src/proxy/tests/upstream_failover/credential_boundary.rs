@@ -206,6 +206,118 @@ async fn signed_rerank_skips_transforming_endpoint_and_preserves_openai_headers(
 }
 
 #[tokio::test]
+async fn incompatible_failover_endpoint_does_not_consume_probe_deadline() {
+    let mut primary = FakeUpstream::spawn_with_rerank_status(StatusCode::SERVICE_UNAVAILABLE).await;
+    let mut incompatible = FakeUpstream::spawn().await;
+    let extra_config = openai_to_deepinfra_reranker_failover_profile_config(
+        &primary.base_url,
+        &incompatible.base_url,
+    );
+    let proxy = spawn_failover_proxy(&primary.base_url, &extra_config).await;
+    let started_at = Instant::now();
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/rerank", proxy.base_url))
+        .json(&serde_json::json!({
+            "model": "same-model",
+            "query": "opaque extension",
+            "documents": ["document"],
+            "instruction": "cannot be represented by DeepInfra",
+        }))
+        .send()
+        .await
+        .expect(
+            "terminal OpenAI response should return without waiting for an ineligible endpoint",
+        );
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        started_at.elapsed() < Duration::from_millis(250),
+        "protocol-incompatible failover must not burn the 400ms probe deadline"
+    );
+    assert_eq!(primary.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(primary.recv_next().await.path_and_query, "/v1/rerank");
+    assert!(
+        incompatible
+            .recv_within(Duration::from_millis(30))
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn credentialless_failover_endpoint_does_not_consume_probe_deadline() {
+    const MISSING_KEY_ENV: &str = "LLM_GUARD_PROXY_T4_MISSING_DEEPINFRA_KEY_01KXXEM1";
+    assert!(std::env::var_os(MISSING_KEY_ENV).is_none());
+    let mut primary = FakeUpstream::spawn_with_rerank_status(StatusCode::SERVICE_UNAVAILABLE).await;
+    let mut credentialless = FakeUpstream::spawn().await;
+    let extra_config = openai_to_deepinfra_config_with_key_env(
+        &primary.base_url,
+        &credentialless.base_url,
+        MISSING_KEY_ENV,
+    );
+    let proxy = spawn_failover_proxy(&primary.base_url, &extra_config).await;
+    let started_at = Instant::now();
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/rerank", proxy.base_url))
+        .json(&serde_json::json!({
+            "model": "same-model",
+            "query": "credential boundary",
+            "documents": ["document"],
+        }))
+        .send()
+        .await
+        .expect("terminal OpenAI response should return without waiting for credentials");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(
+        started_at.elapsed() < Duration::from_millis(250),
+        "credentialless failover must not burn the 400ms probe deadline"
+    );
+    assert_eq!(primary.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(primary.recv_next().await.path_and_query, "/v1/rerank");
+    assert!(
+        credentialless
+            .recv_within(Duration::from_millis(30))
+            .await
+            .is_none()
+    );
+}
+
+fn openai_to_deepinfra_config_with_key_env(
+    primary_base_url: &str,
+    deepinfra_base_url: &str,
+    api_key_env: &str,
+) -> String {
+    format!(
+        r#"
+[[profile]]
+model = "same-model"
+request_timeout_ms = 400
+health_probe_interval = "200ms"
+health_probe_timeout = "20ms"
+health_probe_max_wait = "400ms"
+
+[[profile.upstream]]
+base_url = "{primary_base_url}"
+priority = "primary"
+protocol = "openai"
+
+[[profile.upstream]]
+base_url = "{deepinfra_base_url}"
+priority = "failover"
+protocol = "deepinfra_qwen3_rerank"
+model = "Qwen/Qwen3-Reranker-8B"
+model_revision = "5fa94080caafeaa45a15d11f969d7978e087a3db"
+api_key_env = "{api_key_env}"
+"#
+    )
+}
+
+#[tokio::test]
 async fn openai_caller_auth_errors_do_not_fail_over_or_cool_down_shared_endpoint() {
     for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
         let mut primary = FakeUpstream::spawn_with_rerank_status(status).await;

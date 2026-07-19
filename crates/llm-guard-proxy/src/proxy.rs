@@ -4976,9 +4976,14 @@ async fn continue_endpoint_failover(
     } = progress;
     let mut attempted_base_urls = vec![runtime.retry.initial_endpoint.base_url.clone()];
     let mut completed_attempt_records = Vec::new();
+    let eligible_endpoint_count = UpstreamHealthRegistry::eligible_endpoint_count(
+        runtime.retry.profile,
+        runtime.retry.canonical_reranker,
+        Some(runtime.retry.original_downstream_headers),
+    );
     while is_retryable_endpoint_result(&result, terminal_attempt.protocol) {
         mark_retryable_endpoint_failure(runtime.retry.registry, &terminal_attempt, &result);
-        if attempted_base_urls.len() >= runtime.retry.profile.endpoints.len() {
+        if attempted_base_urls.len() >= eligible_endpoint_count {
             break;
         }
         let selected = match runtime

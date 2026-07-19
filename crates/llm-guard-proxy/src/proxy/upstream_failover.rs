@@ -131,6 +131,12 @@ impl UpstreamHealthRegistry {
         if let Some(preferred_base_urls) = constraints.preferred_base_urls {
             order_preferred_endpoints(&mut candidates, preferred_base_urls);
         }
+        candidates.retain(|endpoint| {
+            !constraints
+                .excluded_base_urls
+                .iter()
+                .any(|base_url| base_url == &endpoint.base_url)
+        });
         if candidates.is_empty() {
             return Err(EndpointSelectionError::Unavailable {
                 profile: profile.name.clone(),
@@ -141,13 +147,6 @@ impl UpstreamHealthRegistry {
         loop {
             let mut eligible = Vec::with_capacity(candidates.len());
             for endpoint in &candidates {
-                if constraints
-                    .excluded_base_urls
-                    .iter()
-                    .any(|base_url| base_url == &endpoint.base_url)
-                {
-                    continue;
-                }
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     break;
@@ -275,6 +274,14 @@ impl UpstreamHealthRegistry {
             UpstreamPriority::Failover => 1_u8,
         });
         endpoints
+    }
+
+    pub(super) fn eligible_endpoint_count(
+        profile: &UpstreamProfileConfig,
+        request: Option<&CanonicalRerankerRequest>,
+        request_headers: Option<&HeaderMap>,
+    ) -> usize {
+        Self::selection_order(profile, request, request_headers).len()
     }
 
     fn ordered_eligible_endpoints(
