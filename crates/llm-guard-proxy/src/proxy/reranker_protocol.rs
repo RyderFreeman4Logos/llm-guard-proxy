@@ -21,6 +21,8 @@ use super::{
 const MAX_PAIR_COUNT: usize = 1_024;
 const MAX_REQUEST_ID_BYTES: usize = 256;
 const MAX_DEEPINFRA_RENDERED_BODY_BYTES: usize = 1_048_576;
+const DEEPINFRA_CONVERTIBLE_RERANK_FIELDS: [&str; 5] =
+    ["model", "query", "documents", "top_n", "return_documents"];
 
 /// Preserved public request data used to render each selected replica.
 #[derive(Clone, Debug)]
@@ -104,8 +106,8 @@ pub(super) fn response_contract(
     request: &CanonicalRerankerRequest,
 ) -> Result<ResponseContract, ProxyError> {
     match request {
-        CanonicalRerankerRequest::OpenAiRerank { body, .. } => {
-            let input = parse_openai_rerank(body)?;
+        CanonicalRerankerRequest::OpenAiRerank { forward_uri, body } => {
+            let input = parse_deepinfra_convertible_rerank(forward_uri, body)?;
             Ok(ResponseContract::OpenAiRerank {
                 documents: input.documents,
                 top_n: input.top_n,
@@ -113,8 +115,8 @@ pub(super) fn response_contract(
                 model: input.model,
             })
         }
-        CanonicalRerankerRequest::Score { body, .. } => {
-            let input = parse_openai_rerank(body)?;
+        CanonicalRerankerRequest::Score { forward_uri, body } => {
+            let input = parse_deepinfra_convertible_rerank(forward_uri, body)?;
             Ok(ResponseContract::Score {
                 document_count: input.documents.len(),
                 top_n: input.top_n,
@@ -318,9 +320,9 @@ fn render_deepinfra_with_authorization(
 ) -> Result<RenderedEndpointRequest, ProxyError> {
     ensure_deepinfra_transformation_is_unsigned(downstream_headers)?;
     let (body, uri) = match request {
-        CanonicalRerankerRequest::OpenAiRerank { body, .. }
-        | CanonicalRerankerRequest::Score { body, .. } => {
-            let input = parse_openai_rerank(body)?;
+        CanonicalRerankerRequest::OpenAiRerank { forward_uri, body }
+        | CanonicalRerankerRequest::Score { forward_uri, body } => {
+            let input = parse_deepinfra_convertible_rerank(forward_uri, body)?;
             ensure_generated_body_fits(&input)?;
             let queries = vec![input.query; input.documents.len()];
             let body = serde_json::to_vec(&json!({
@@ -465,12 +467,32 @@ struct OpenAiRerankInput {
     return_documents: bool,
 }
 
+fn parse_deepinfra_convertible_rerank(
+    forward_uri: &Uri,
+    body: &Bytes,
+) -> Result<OpenAiRerankInput, ProxyError> {
+    if forward_uri.query().is_some_and(|query| !query.is_empty()) {
+        return Err(invalid_request_error(
+            "rerank query parameters cannot be preserved by DeepInfra",
+        ));
+    }
+    parse_openai_rerank(body)
+}
+
 fn parse_openai_rerank(body: &Bytes) -> Result<OpenAiRerankInput, ProxyError> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|error| invalid_request_error(&format!("invalid rerank JSON: {error}")))?;
     let object = value
         .as_object()
         .ok_or_else(|| invalid_request_error("rerank body must be a JSON object"))?;
+    if object
+        .keys()
+        .any(|key| !DEEPINFRA_CONVERTIBLE_RERANK_FIELDS.contains(&key.as_str()))
+    {
+        return Err(invalid_request_error(
+            "rerank body contains fields that cannot be preserved by DeepInfra",
+        ));
+    }
     let model = match object.get("model") {
         None => None,
         Some(Value::String(model)) if !model.trim().is_empty() => Some(model.clone()),
@@ -812,6 +834,44 @@ mod tests {
         assert_eq!(response["data"][0]["relevance_score"], 0.9);
         assert!(response.get("request_id").is_none());
         assert!(response.get("input_tokens").is_none());
+    }
+
+    #[test]
+    fn deepinfra_compatibility_rejects_unknown_keys_and_nonempty_query() {
+        let deepinfra = UpstreamEndpointConfig {
+            base_url: String::from("https://api.deepinfra.com"),
+            protocol: UpstreamEndpointProtocol::DeepInfraQwen3Rerank,
+            model: Some(String::from("Qwen/Qwen3-Reranker-8B")),
+            model_revision: Some(String::from(DEEPINFRA_QWEN3_RERANK_VERSION)),
+            ..UpstreamEndpointConfig::default()
+        };
+        let openai = UpstreamEndpointConfig::default();
+        let requests = [
+            CanonicalRerankerRequest::OpenAiRerank {
+                forward_uri: Uri::from_static("/v1/rerank"),
+                body: Bytes::from_static(
+                    br#"{"query":"q","documents":["d"],"instruction":"custom"}"#,
+                ),
+            },
+            CanonicalRerankerRequest::Score {
+                forward_uri: Uri::from_static("/v1/rerank?semantic=preserve"),
+                body: Bytes::from_static(br#"{"query":"q","documents":["d"]}"#),
+            },
+        ];
+
+        for request in &requests {
+            assert!(!is_compatible_with_endpoint(&deepinfra, Some(request)));
+            assert!(is_compatible_with_endpoint(&openai, Some(request)));
+            assert!(
+                render_deepinfra_with_authorization(
+                    &deepinfra,
+                    request,
+                    &HeaderMap::new(),
+                    HeaderValue::from_static("Bearer provider-secret"),
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

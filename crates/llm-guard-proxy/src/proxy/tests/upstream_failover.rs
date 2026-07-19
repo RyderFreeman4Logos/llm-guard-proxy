@@ -212,6 +212,58 @@ async fn malformed_deepinfra_2xx_retries_using_the_actual_backup_protocol() {
 }
 
 #[tokio::test]
+async fn nonlossless_rerank_requests_skip_deepinfra_and_remain_opaque_for_openai() {
+    for (path_suffix, request_body) in [
+        (
+            "",
+            json!({
+                "model": "same-model",
+                "query": "future extension",
+                "documents": ["document"],
+                "instruction": "preserve this caller instruction",
+            }),
+        ),
+        (
+            "?semantic=preserve",
+            json!({
+                "model": "same-model",
+                "query": "query parameter",
+                "documents": ["document"],
+            }),
+        ),
+    ] {
+        let mut deepinfra = FakeUpstream::spawn().await;
+        let mut openai = FakeUpstream::spawn().await;
+        let extra_config =
+            heterogeneous_reranker_failover_profile_config(&deepinfra.base_url, &openai.base_url);
+        let proxy = spawn_failover_proxy(&openai.base_url, &extra_config).await;
+
+        let response = proxy
+            .client
+            .post(format!("{}/v1/rerank{path_suffix}", proxy.base_url))
+            .json(&request_body)
+            .send()
+            .await
+            .expect("nonlossless request should remain eligible for OpenAI");
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.expect("response body should drain");
+
+        assert!(
+            deepinfra
+                .recv_within(Duration::from_millis(30))
+                .await
+                .is_none()
+        );
+        assert_eq!(openai.recv_next().await.path_and_query, "/v1/models");
+        let forwarded = openai.recv_next().await;
+        assert_eq!(forwarded.path_and_query, format!("/v1/rerank{path_suffix}"));
+        let forwarded_body: serde_json::Value =
+            serde_json::from_slice(&forwarded.body).expect("forwarded body should be JSON");
+        assert_eq!(forwarded_body, request_body);
+    }
+}
+
+#[tokio::test]
 async fn terminal_retryable_status_cools_down_a_singleton_endpoint() {
     let mut primary = FakeUpstream::spawn_with_rerank_status(StatusCode::SERVICE_UNAVAILABLE).await;
     let extra_config = failover_profile_config(&primary.base_url, None, "80ms", "20ms", "80ms");
