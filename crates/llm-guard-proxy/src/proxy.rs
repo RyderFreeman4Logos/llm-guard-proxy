@@ -4131,73 +4131,78 @@ fn prepare_generic_attempt_request(
     (override_headers, metadata)
 }
 
-async fn merged_models_groups(
+fn merged_models_profiles(
     context: &GenericForwardContext<'_>,
-) -> Result<Option<Vec<ModelsUpstreamGroup>>, ProxyError> {
+) -> Option<Vec<UpstreamProfileConfig>> {
     if !is_control_plane_models_request(&context.method, &context.uri) {
-        return Ok(None);
+        return None;
     }
-    let mut groups = Vec::<ModelsUpstreamGroup>::new();
-    for profile in listener_models_upstream_profiles(context.config, &context.state.listener) {
-        let request_deadline = Instant::now() + Duration::from_millis(profile.request_timeout_ms);
-        let (base_url, terminal_endpoint, endpoint_retry_order) = if profile.name
-            == context.upstream_profile.name
-        {
-            (
-                context.terminal_endpoint.base_url.clone(),
-                context.terminal_endpoint.clone(),
-                context.endpoint_retry_order.clone(),
+    let profiles = listener_models_upstream_profiles(context.config, &context.state.listener);
+    (profiles.len() > 1).then_some(profiles)
+}
+
+async fn begin_models_upstream_group(
+    context: &GenericForwardContext<'_>,
+    profile: UpstreamProfileConfig,
+) -> Result<ModelsUpstreamGroup, ProxyError> {
+    let is_current_profile = profile.name == context.upstream_profile.name;
+    let request_deadline = if is_current_profile {
+        context
+            .upstream_deadline
+            .unwrap_or_else(|| Instant::now() + Duration::from_millis(profile.request_timeout_ms))
+    } else {
+        Instant::now() + Duration::from_millis(profile.request_timeout_ms)
+    };
+    let (base_url, terminal_endpoint, endpoint_retry_order) = if is_current_profile {
+        (
+            context.terminal_endpoint.base_url.clone(),
+            context.terminal_endpoint.clone(),
+            context.endpoint_retry_order.clone(),
+        )
+    } else {
+        let selected = context
+            .state
+            .upstream_health
+            .select_endpoint(
+                &context.state.client,
+                &profile,
+                &context.state.shutdown,
+                None,
+                None,
+                Some(request_deadline),
             )
-        } else {
-            let selected = context
-                    .state
-                    .upstream_health
-                    .select_endpoint(
-                        &context.state.client,
-                        &profile,
-                        &context.state.shutdown,
-                        None,
-                        None,
-                        Some(request_deadline),
-                    )
-                    .await
-                    .map_err(|error| match error {
-                        EndpointSelectionError::Shutdown => ProxyError::server_shutdown(),
-                        EndpointSelectionError::Incompatible { profile } => {
-                            ProxyError::ContextBudgetExceeded {
-                                message: format!(
-                                    "no OpenAI-compatible model discovery endpoint for profile {profile}"
-                                ),
-                                param: "path",
-                                code: "unsupported_models_endpoint",
-                                request_metadata: None,
-                            }
-                        }
-                        EndpointSelectionError::Unavailable { profile, waited_ms } => {
-                            ProxyError::upstream_unavailable(profile, waited_ms)
-                        }
-                    })?;
-            (
-                selected.base_url,
-                selected.endpoint,
-                selected.selection_order,
-            )
-        };
-        if let Some(group) = groups.iter_mut().find(|group| group.base_url == base_url) {
-            group.request_timeout_ms = group.request_timeout_ms.max(profile.request_timeout_ms);
-            continue;
-        }
-        groups.push(ModelsUpstreamGroup {
-            base_url,
-            request_timeout_ms: profile.request_timeout_ms,
-            metadata: profile.metadata.clone(),
-            profile,
-            terminal_endpoint,
-            endpoint_retry_order,
-            request_deadline,
-        });
-    }
-    Ok((groups.len() > 1).then_some(groups))
+            .await
+            .map_err(|error| match error {
+                EndpointSelectionError::Shutdown => ProxyError::server_shutdown(),
+                EndpointSelectionError::Incompatible { profile } => {
+                    ProxyError::ContextBudgetExceeded {
+                        message: format!(
+                            "no OpenAI-compatible model discovery endpoint for profile {profile}"
+                        ),
+                        param: "path",
+                        code: "unsupported_models_endpoint",
+                        request_metadata: None,
+                    }
+                }
+                EndpointSelectionError::Unavailable { profile, waited_ms } => {
+                    ProxyError::upstream_unavailable(profile, waited_ms)
+                }
+            })?;
+        (
+            selected.base_url,
+            selected.endpoint,
+            selected.selection_order,
+        )
+    };
+    Ok(ModelsUpstreamGroup {
+        base_url,
+        request_timeout_ms: profile.request_timeout_ms,
+        metadata: profile.metadata.clone(),
+        profile,
+        terminal_endpoint,
+        endpoint_retry_order,
+        request_deadline,
+    })
 }
 
 fn copy_endpoint_selection_metadata(
@@ -4219,8 +4224,8 @@ fn copy_endpoint_selection_metadata(
 async fn forward_generic_openai_request(
     context: GenericForwardContext<'_>,
 ) -> Result<Response<Body>, ProxyError> {
-    if let Some(groups) = merged_models_groups(&context).await? {
-        return forward_merged_models_response(context, groups).await;
+    if let Some(profiles) = merged_models_profiles(&context) {
+        return forward_merged_models_response(context, profiles).await;
     }
 
     let attempt_id = AttemptId::for_request(context.request_id, 1);
@@ -4441,20 +4446,32 @@ struct CompletedModelsFetch {
 
 async fn forward_merged_models_response(
     context: GenericForwardContext<'_>,
-    groups: Vec<ModelsUpstreamGroup>,
+    profiles: Vec<UpstreamProfileConfig>,
 ) -> Result<Response<Body>, ProxyError> {
+    let profile_count = profiles.len();
     let mut response_status = None;
     let mut response_headers = None;
     let mut response_mode = None;
-    let mut filtered_bodies = Vec::with_capacity(groups.len());
-    let mut attempt_records = Vec::with_capacity(groups.len());
+    let mut filtered_bodies = Vec::with_capacity(profile_count);
+    let mut attempt_records = Vec::with_capacity(profile_count);
+    let mut selected_groups = Vec::<ModelsUpstreamGroup>::with_capacity(profile_count);
     let mut next_attempt_number = 1;
-    for group in &groups {
+    for profile in profiles {
+        let group = match begin_models_upstream_group(&context, profile).await {
+            Ok(group) => group,
+            Err(error) => return Err(error.with_completed_attempt_records(attempt_records)),
+        };
+        if selected_groups
+            .iter()
+            .any(|selected| selected.base_url == group.base_url)
+        {
+            continue;
+        }
         let fetch = match fetch_models_upstream_group(
             &context,
-            group,
+            &group,
             next_attempt_number,
-            u32::try_from(groups.len()).unwrap_or(u32::MAX),
+            u32::try_from(profile_count).unwrap_or(u32::MAX),
         )
         .await
         {
@@ -4470,9 +4487,10 @@ async fn forward_merged_models_response(
         filtered_bodies.push(fetch.body);
         attempt_records.extend(fetch.completed_attempt_records);
         attempt_records.push(fetch.attempt_record);
+        selected_groups.push(group);
     }
 
-    let metadata_config = groups
+    let metadata_config = selected_groups
         .first()
         .map_or(&context.upstream_profile.metadata, |group| &group.metadata);
     let merged_body = model_metadata::merge_models_bodies(filtered_bodies);
@@ -4499,7 +4517,9 @@ async fn forward_merged_models_response(
         started_at_unix_ms: context.started_at_unix_ms,
         attempt_id: AttemptId::for_request(context.request_id, 1),
         attempt_number: 1,
-        attempt_max_attempts: u32::try_from(groups.len()).unwrap_or(u32::MAX).max(1),
+        attempt_max_attempts: u32::try_from(selected_groups.len())
+            .unwrap_or(u32::MAX)
+            .max(1),
         attempt_started_at_unix_ms: context.started_at_unix_ms,
         upstream_mode,
         model_id: context.model_id,
@@ -5054,10 +5074,13 @@ async fn continue_endpoint_failover(
             terminal_attempt.started_at_unix_ms,
             terminal_attempt.request_metadata.clone(),
         ));
+        let endpoint_attempts_remaining =
+            eligible_endpoint_count.saturating_sub(attempted_base_urls.len());
         attempted_base_urls.push(selected.base_url.clone());
         let (next_result, next_attempt) = send_selected_failover_endpoint(
             &runtime,
             terminal_attempt.attempt_number.saturating_add(1),
+            endpoint_attempts_remaining,
             context_attempt_metadata(&terminal_attempt),
             selected,
         )
@@ -5090,6 +5113,7 @@ fn context_attempt_metadata(attempt: &PhysicalEndpointAttempt) -> BTreeMap<Strin
 async fn send_selected_failover_endpoint(
     runtime: &EndpointFailoverRuntime<'_>,
     attempt_number: u32,
+    endpoint_attempts_remaining: usize,
     request_metadata: BTreeMap<String, String>,
     selected: upstream_failover::SelectedUpstreamEndpoint,
 ) -> (
@@ -5128,11 +5152,7 @@ async fn send_selected_failover_endpoint(
             match upstream_timeout_within_deadline(
                 runtime.upstream_timeout,
                 runtime.retry.request_deadline,
-                runtime
-                    .retry
-                    .endpoint_retry_order
-                    .len()
-                    .saturating_sub(attempt_number.saturating_sub(1) as usize),
+                endpoint_attempts_remaining,
             ) {
                 Ok(timeout) => {
                     send_upstream_request_until_shutdown(

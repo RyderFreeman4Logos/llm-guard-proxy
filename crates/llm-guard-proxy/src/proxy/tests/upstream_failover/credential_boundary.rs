@@ -301,6 +301,106 @@ allowed_upstreams = ["first", "second"]
 }
 
 #[tokio::test]
+async fn aggregate_models_preserves_tail_budget_after_prior_group_and_slow_middle_endpoint() {
+    let mut first = FakeUpstream::spawn().await;
+    let (second_primary_base_url, primary_probe_seen) = spawn_probe_then_stop_upstream().await;
+    let mut slow_middle = FakeUpstream::spawn_with_models_body_and_delay(
+        r#"{"object":"list","data":[{"id":"slow-middle","object":"model"}]}"#,
+        Duration::from_millis(300),
+    )
+    .await;
+    let mut healthy_tail = FakeUpstream::spawn_with_models_body(
+        r#"{"object":"list","data":[{"id":"healthy-tail","object":"model"}]}"#,
+    )
+    .await;
+    let extra_config = format!(
+        r#"
+[[upstreams]]
+name = "first"
+base_url = "{first_base_url}"
+match_models = ["first-model"]
+
+[[upstreams]]
+name = "second"
+base_url = "{second_primary_base_url}"
+match_models = ["second-model"]
+request_timeout_ms = 400
+health_probe_interval_ms = 200
+health_probe_timeout_ms = 20
+health_probe_max_wait_ms = 400
+
+[[upstreams.endpoints]]
+base_url = "{second_primary_base_url}"
+priority = "primary"
+
+[[upstreams.endpoints]]
+base_url = "{slow_middle_base_url}"
+priority = "failover"
+
+[[upstreams.endpoints]]
+base_url = "{healthy_tail_base_url}"
+priority = "failover"
+
+[[listeners]]
+name = "tail-budget-models"
+bind_host = "127.0.0.1"
+port = 18019
+allowed_upstreams = ["first", "second"]
+"#,
+        first_base_url = first.base_url,
+        slow_middle_base_url = slow_middle.base_url,
+        healthy_tail_base_url = healthy_tail.base_url,
+    );
+    let proxy = spawn_observed_failover_proxy(&first.base_url, &extra_config).await;
+    let listener = listener_config(&proxy, "tail-budget-models");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models&budget=tail"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("aggregate model response should drain");
+    primary_probe_seen
+        .await
+        .expect("second profile primary should pass readiness before disconnecting");
+    assert_eq!(
+        first.recv_next().await.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models&budget=tail"
+    );
+    assert_eq!(slow_middle.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(
+        slow_middle.recv_next().await.path_and_query,
+        "/v1/models?test=distinct-multi-upstream-models&budget=tail"
+    );
+    let mut tail_paths = Vec::new();
+    for _ in 0..3 {
+        let Some(request) = healthy_tail.recv_within(Duration::from_millis(500)).await else {
+            break;
+        };
+        tail_paths.push(request.path_and_query);
+        if tail_paths
+            .iter()
+            .any(|path| path == "/v1/models?test=distinct-multi-upstream-models&budget=tail")
+        {
+            break;
+        }
+    }
+    assert!(
+        tail_paths.iter().any(|path| path == "/v1/models"),
+        "the final healthy endpoint must retain budget for its readiness probe; observed {tail_paths:?}"
+    );
+    assert!(
+        tail_paths
+            .iter()
+            .any(|path| path == "/v1/models?test=distinct-multi-upstream-models&budget=tail"),
+        "the final healthy endpoint must retain budget for the models request; observed {tail_paths:?}"
+    );
+}
+
+#[tokio::test]
 async fn model_discovery_round_robin_advances_once_per_request() {
     let mut first = FakeUpstream::spawn().await;
     let mut second = FakeUpstream::spawn().await;
