@@ -39,11 +39,17 @@ The operational source of truth is:
 
 `deploy/gb10/config.toml` is the reviewed installation snapshot derived from
 that file. Before each deployment, compare all active values against the source
-of truth. For this change, the only intended semantic difference is
-`default_injection_schema = "vllm_native"` in the global thinking policy, the
-AEON profile, and every retry rung. Do not replace current listener routing,
-per-upstream concurrency, timeouts, evidence settings, or loop-embedding policy
-with example defaults.
+of truth. This cutover intentionally changes both the thinking schema and host
+recovery policy relative to the previously installed snapshot:
+
+- `default_injection_schema = "vllm_native"` in the global thinking policy,
+  the AEON profile, and every retry rung.
+- The integrated guardian is enabled for `aeon-text` with a 5 GiB threshold,
+  direct `cgroup-kill`, a three-second poll, and `text-cgroup.v1` registration.
+
+The guardian values must match the operational source of truth exactly. Do not
+replace current listener routing, per-upstream concurrency, timeouts, evidence
+settings, or loop-embedding policy with example defaults.
 
 Deployment ordering is binary first, configuration second: install and verify
 the reviewed binary before copying the matching config snapshot. The live
@@ -60,6 +66,30 @@ RUSTUP_TOOLCHAIN=1.96.0 just smoke-gb10
 
 The smoke test must report `result=ok` and `/v1/models` context metadata before
 the service changes are applied.
+
+## Integrated guardian prerequisites
+
+The active AEON text unit is the registration producer. Its `ExecStartPost`
+must run the reviewed GB10 helper after every Docker generation; the helper
+atomically publishes the exact rootless Docker scope to
+`$XDG_RUNTIME_DIR/gb10-memory-guardian/text-cgroup.v1`. The producer script and
+text unit are governed by the `gb10-services` source repository, not by this
+installation snapshot.
+
+Before arming the integrated guardian, verify the installed producer contract:
+
+```bash
+test -x /home/obj/.local/bin/llm_guard_proxy_publish_cgroup_registration.sh
+grep -Fq \
+  'ExecStartPost=/home/obj/.local/bin/llm_guard_proxy_publish_cgroup_registration.sh' \
+  /home/obj/.config/systemd/user/vllm-aeon-27b-dflash-n12.service
+```
+
+Do not disable the legacy `gb10-memory-guardian.service` until the text unit
+has restarted and the new registration has passed the checks below. Do not run
+the standalone and integrated guardians concurrently: after registration is
+valid, stop and disable the standalone unit immediately before starting the
+proxy with `[guardian] enabled = true`.
 
 ## Install wrapper binary
 
@@ -159,8 +189,22 @@ systemctl --user restart vllm-aeon-27b-dflash-n12.service
 
 curl --fail --silent --show-error http://gb10:18010/v1/models >/dev/null
 
-systemctl --user enable --now llm-guard-proxy.service
+deploy/gb10/cutover-guardian.sh
 ```
+
+The unit and helper share the fixed `%t/gb10-memory-guardian` runtime directory;
+the helper intentionally accepts no registration-path override. It validates the
+complete registration contract, the referenced live cgroup, `cgroup.events`
+(`populated 1`), and `cgroup.kill` before any guardian `systemctl` call. Every
+unit operation has a deadline. After starting the integrated service, cutover
+also verifies its `MainPID` holds the registered `cgroup.events` descriptor and
+a writable `cgroup.kill` descriptor. It treats a `not-found` standalone unit as
+a fresh install; otherwise it disables the standalone guardian before enabling
+the integrated guardian, so recovery has only one owner. Any failure or signal
+after mutation begins automatically restores both units' prior enablement and
+activity states. Treat an `automatic rollback was incomplete` diagnostic as a
+hard stop requiring manual recovery; never continue while neither or both
+recovery actors may be active.
 
 The current gb10 AEON profile needs enough KV cache for the advertised 256000
 context window. If a cold restart fails with a vLLM error like `26.69 GiB KV
@@ -264,6 +308,17 @@ curl --fail --silent --show-error http://gb10:18009/v1/models >/dev/null
 Restoring the backed-up vLLM unit returns direct AEON vLLM service to
 `100.105.4.92:18009`. The wrapper config and unit can remain on disk while the
 wrapper service is disabled and stopped.
+
+If the pre-cutover deployment used `gb10-memory-guardian.service`, restore its
+known-good unit and config, verify its registration target, and only then run:
+
+```bash
+systemctl --user enable --now gb10-memory-guardian.service
+```
+
+The rollback order is the reverse ownership transfer: stop the integrated
+guardian with the proxy first, restore and verify the legacy target second, and
+start the standalone guardian last. Never operate both guardians concurrently.
 
 The deployment also makes `/home/obj/.local` non-group-writable (`0755`) so the
 wrapper accepts the configured SQLite path under `/home/obj/.local/state`. Leave

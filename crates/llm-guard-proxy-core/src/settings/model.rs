@@ -782,6 +782,7 @@ impl AppConfig {
             match_models: Vec::new(),
             base_url: self.upstream.base_url.clone(),
             endpoints: Vec::new(),
+            endpoint_selection: EndpointSelectionMode::PriorityFailover,
             health_probe_interval_ms: 2_000,
             health_probe_timeout_ms: 1_000,
             health_probe_max_wait_ms: 120_000,
@@ -1041,6 +1042,9 @@ impl AppConfig {
             .zip(requested.upstream_profiles.iter())
         {
             active.request_timeout_ms = requested.request_timeout_ms;
+            active.endpoint_selection = requested.endpoint_selection;
+            active.base_url.clone_from(&requested.base_url);
+            active.endpoints.clone_from(&requested.endpoints);
             active.health_probe_interval_ms = requested.health_probe_interval_ms;
             active.health_probe_timeout_ms = requested.health_probe_timeout_ms;
             active.health_probe_max_wait_ms = requested.health_probe_max_wait_ms;
@@ -1259,18 +1263,14 @@ impl From<&ListenerConfig> for ListenerTopology {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct UpstreamProfileTopology {
     name: String,
-    base_url: String,
     match_models: Vec<String>,
-    endpoints: Vec<UpstreamEndpointConfig>,
 }
 
 impl From<&UpstreamProfileConfig> for UpstreamProfileTopology {
     fn from(profile: &UpstreamProfileConfig) -> Self {
         Self {
             name: profile.name.clone(),
-            base_url: profile.base_url.clone(),
             match_models: profile.match_models.clone(),
-            endpoints: profile.endpoints.clone(),
         }
     }
 }
@@ -1840,6 +1840,48 @@ impl UpstreamPriority {
     }
 }
 
+/// Wire protocol rendered after an endpoint has been selected.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UpstreamEndpointProtocol {
+    /// Standard OpenAI-compatible endpoint forwarding.
+    #[default]
+    OpenAi,
+    /// `DeepInfra`'s native Qwen3 reranker inference API.
+    DeepInfraQwen3Rerank,
+}
+
+impl UpstreamEndpointProtocol {
+    /// Returns the stable, configuration-compatible protocol label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::DeepInfraQwen3Rerank => "deepinfra_qwen3_rerank",
+        }
+    }
+}
+
+/// Selection order for the currently eligible endpoints in one upstream profile.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EndpointSelectionMode {
+    /// Always choose the healthy primary before any healthy failover endpoint.
+    #[default]
+    PriorityFailover,
+    /// Rotate requests across eligible endpoints in their configured priority order.
+    RoundRobin,
+}
+
+impl EndpointSelectionMode {
+    /// Returns the stable, configuration-compatible selection-mode label.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PriorityFailover => "priority_failover",
+            Self::RoundRobin => "round_robin",
+        }
+    }
+}
+
 /// One OpenAI-compatible endpoint serving the model aliases in a profile.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct UpstreamEndpointConfig {
@@ -1847,6 +1889,14 @@ pub struct UpstreamEndpointConfig {
     pub base_url: String,
     /// Endpoint selection priority.
     pub priority: UpstreamPriority,
+    /// Endpoint-specific request and response protocol.
+    pub protocol: UpstreamEndpointProtocol,
+    /// Required remote model name for non-OpenAI endpoint protocols.
+    pub model: Option<String>,
+    /// Required immutable remote model version for non-OpenAI endpoint protocols.
+    pub model_revision: Option<String>,
+    /// Runtime environment variable containing the non-OpenAI endpoint credential.
+    pub api_key_env: Option<String>,
 }
 
 /// Named upstream profile with model routing and per-upstream policy.
@@ -1860,6 +1910,8 @@ pub struct UpstreamProfileConfig {
     pub base_url: String,
     /// Ordered same-model endpoints. Empty preserves the legacy single `base_url` behavior.
     pub endpoints: Vec<UpstreamEndpointConfig>,
+    /// Selection order for configured endpoint replicas.
+    pub endpoint_selection: EndpointSelectionMode,
     /// Milliseconds between `/v1/models` health probes while waiting for readiness.
     pub health_probe_interval_ms: u64,
     /// Timeout in milliseconds for one `/v1/models` health probe.
@@ -1972,6 +2024,7 @@ impl UpstreamProfileConfig {
         )?;
         for endpoint in &self.endpoints {
             validate_upstream_base_url(&endpoint.base_url)?;
+            endpoint.validate()?;
         }
         for (index, endpoint) in self.endpoints.iter().enumerate() {
             require(
@@ -2067,6 +2120,7 @@ impl Default for UpstreamProfileConfig {
             match_models: Vec::new(),
             base_url: upstream.base_url,
             endpoints: Vec::new(),
+            endpoint_selection: EndpointSelectionMode::PriorityFailover,
             health_probe_interval_ms: 2_000,
             health_probe_timeout_ms: 1_000,
             health_probe_max_wait_ms: 120_000,
@@ -2081,6 +2135,64 @@ impl Default for UpstreamProfileConfig {
             param_override: ParamOverrideConfig::default(),
         }
     }
+}
+
+impl UpstreamEndpointConfig {
+    fn validate(&self) -> Result<(), ValidationError> {
+        match self.protocol {
+            UpstreamEndpointProtocol::OpenAi => require(
+                self.model.is_none() && self.model_revision.is_none() && self.api_key_env.is_none(),
+                "profile.upstream.protocol",
+                "openai endpoints must not set model, model_revision, or api_key_env",
+            ),
+            UpstreamEndpointProtocol::DeepInfraQwen3Rerank => {
+                let model = self.model.as_deref().unwrap_or_default();
+                require(
+                    !model.is_empty() && model == model.trim(),
+                    "profile.upstream.model",
+                    "must be a non-empty trimmed model identifier for deepinfra_qwen3_rerank",
+                )?;
+                require(
+                    model.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+                    "profile.upstream.model",
+                    "must be at most 256 bytes",
+                )?;
+                require(
+                    model.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
+                    }),
+                    "profile.upstream.model",
+                    "must contain only ASCII letters, digits, '/', '-', '_', or '.'",
+                )?;
+                let version = self.model_revision.as_deref().unwrap_or_default();
+                require(
+                    !version.is_empty() && version == version.trim(),
+                    "profile.upstream.model_revision",
+                    "must be a non-empty trimmed immutable version for deepinfra_qwen3_rerank",
+                )?;
+                require(
+                    version.len() == 40
+                        && version
+                            .bytes()
+                            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')),
+                    "profile.upstream.model_revision",
+                    "must be a 40-character lowercase hexadecimal DeepInfra model version",
+                )?;
+                let environment_name = self.api_key_env.as_deref().unwrap_or_default();
+                require(
+                    is_environment_variable_identifier(environment_name),
+                    "profile.upstream.api_key_env",
+                    "must be a valid environment variable identifier for deepinfra_qwen3_rerank",
+                )
+            }
+        }
+    }
+}
+
+fn is_environment_variable_identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(byte) if byte.is_ascii_alphabetic() || byte == b'_')
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 /// Effective upstream profile selected for one request.

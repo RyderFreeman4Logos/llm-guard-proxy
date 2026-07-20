@@ -77,16 +77,17 @@ pub use risk_combiner::{CombinedRisk, DetectorKind, DetectorSignal, RiskCombiner
 pub use settings::ParamOverrideConfig;
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigHandle, ConfigHandleError, ConfigParseError,
-    DefaultInjectionSchema, DownstreamDropPolicy, EvidenceConfig, EvidencePairedComparisonConfig,
-    EvidenceShadowConfig, GuardianConfig, GuardianKillAction, HeartbeatConfig, HeartbeatMode,
-    HotRestartConfig, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
-    LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig, RELOADABLE_FIELDS,
-    RESTART_REQUIRED_FIELDS, ReloadOutcome, RestartRequiredChange, RetentionConfig, RetryConfig,
-    RetryLadderConfig, SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt,
-    ShieldingConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
-    UpstreamEndpointConfig, UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason,
-    UpstreamStallConfig, ValidationError, apply_reloadable, redact_upstream_base_url,
-    validate_upstream_base_url,
+    DefaultInjectionSchema, DownstreamDropPolicy, EndpointSelectionMode, EvidenceConfig,
+    EvidencePairedComparisonConfig, EvidenceShadowConfig, GuardianConfig, GuardianKillAction,
+    HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig, LocalRecoveryConfig,
+    LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy,
+    ObservabilityConfig, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ReloadOutcome,
+    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
+    SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
+    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, ValidationError, apply_reloadable,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 pub use settings::{BudgetConfig, UnknownKeyPolicy, VirtualKeyConfig};

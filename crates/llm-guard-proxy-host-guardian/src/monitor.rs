@@ -8,6 +8,7 @@ use crate::{
 use llm_guard_proxy_core::{
     ConfigHandle, ConfigHandleError, GuardianConfig, GuardianKillAction, ValidationError,
 };
+use nix::fcntl::OFlag;
 use nix::unistd::Uid;
 use std::{
     fs::{File, OpenOptions},
@@ -75,7 +76,7 @@ fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
 /// Returns whether Tier 1 must shed the registered cgroup.
 #[must_use]
 pub const fn should_shed(mem_available_bytes: u64, thresholds: Thresholds) -> bool {
-    mem_available_bytes < thresholds.threshold_bytes()
+    mem_available_bytes <= thresholds.threshold_bytes()
 }
 
 /// Returns whether the reserve may be reallocated and the latch cleared.
@@ -223,8 +224,10 @@ pub fn parse_registration(input: &[u8], uid: u32) -> Result<Registration, Regist
 /// Owns pre-opened descriptors used by the allocation-free Tier-1 action.
 #[derive(Debug)]
 pub struct CgroupTarget {
+    directory: File,
     kill: File,
     events: File,
+    registration: Registration,
 }
 
 /// Compact cgroup state failures for the allocation-free emergency loop.
@@ -282,20 +285,22 @@ impl CgroupTarget {
         let registration = parse_registration(&bytes[..length], expected_uid)
             .map_err(|error| GuardianError::InvalidRegistration(error.to_string()))?;
         let cgroup_path = cgroup_root.join(registration.control_group.trim_start_matches('/'));
-        let kill = OpenOptions::new()
-            .write(true)
-            .custom_flags(0)
-            .open(cgroup_path.join("cgroup.kill"))
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+            .open(cgroup_path)
             .map_err(|source| GuardianError::Io {
-                operation: "open cgroup.kill",
+                operation: "open cgroup directory",
                 source,
             })?;
-        let events =
-            File::open(cgroup_path.join("cgroup.events")).map_err(|source| GuardianError::Io {
-                operation: "open cgroup.events",
-                source,
-            })?;
-        let target = Self { kill, events };
+        let kill = open_cgroup_control(&directory, "cgroup.kill", true, "open cgroup.kill")?;
+        let events = open_cgroup_control(&directory, "cgroup.events", false, "open cgroup.events")?;
+        let target = Self {
+            directory,
+            kill,
+            events,
+            registration,
+        };
         if !target.is_populated().map_err(|_error| {
             GuardianError::InvalidRegistration(String::from(
                 "registered cgroup could not be verified as populated",
@@ -316,6 +321,17 @@ impl CgroupTarget {
         Ok(!self.is_populated()?)
     }
 
+    fn has_same_target_generation(&self, other: &Self) -> bool {
+        if self.registration != other.registration {
+            return false;
+        }
+        let (Ok(active), Ok(candidate)) = (self.directory.metadata(), other.directory.metadata())
+        else {
+            return false;
+        };
+        active.dev() == candidate.dev() && active.ino() == candidate.ino()
+    }
+
     fn is_populated(&self) -> Result<bool, CgroupStateError> {
         let mut bytes = [0_u8; EVENTS_BUFFER_BYTES];
         let length = self
@@ -333,6 +349,25 @@ impl CgroupTarget {
             None => Err(CgroupStateError::Invalid),
         }
     }
+}
+
+fn open_cgroup_control(
+    directory: &File,
+    name: &'static str,
+    write: bool,
+    operation: &'static str,
+) -> Result<File, GuardianError> {
+    // The retained directory descriptor pins one cgroup object even when its
+    // registered path is concurrently replaced by a new generation.
+    let descriptor_path = PathBuf::from("/proc/self/fd")
+        .join(directory.as_raw_fd().to_string())
+        .join(name);
+    OpenOptions::new()
+        .read(!write)
+        .write(write)
+        .custom_flags(OFlag::O_NOFOLLOW.bits())
+        .open(descriptor_path)
+        .map_err(|source| GuardianError::Io { operation, source })
 }
 
 fn validate_registration_metadata(file: &File, expected_uid: u32) -> Result<(), GuardianError> {
@@ -594,9 +629,10 @@ impl MemoryGuardian {
                     self.latched = false;
                     return GuardianIteration::Rearmed;
                 }
-                Some(Err(_error)) => return self.attempt_emergency(false),
+                Some(Err(_error)) => {}
             }
         }
+        let _changed = self.reconcile_active_target();
         self.attempt_emergency(false)
     }
 
@@ -644,9 +680,38 @@ impl MemoryGuardian {
         if requested != self.active_policy {
             return self.try_apply_policy(requested);
         }
-        if self.active_policy.enabled && self.target.is_none() {
+        self.reconcile_active_target()
+    }
+
+    /// Reopens only the target selected by the installed policy.
+    ///
+    /// Latched retries use this path so a registration or cgroup generation
+    /// can appear under pressure without applying a pending hot-reload.
+    fn reconcile_active_target(&mut self) -> bool {
+        let target_needs_reconciliation = self.active_policy.enabled
+            && (self.target.is_none()
+                || self.active_policy.kill_action == GuardianKillAction::CgroupKill);
+        if target_needs_reconciliation {
             match open_recovery_target(&self.active_policy, &self.runtime_dir) {
                 Ok(target) => {
+                    let same_target_generation = matches!(
+                        (&self.target, &target),
+                        (
+                            Some(RecoveryTarget::Cgroup(active)),
+                            RecoveryTarget::Cgroup(candidate)
+                        ) if active.has_same_target_generation(candidate)
+                    );
+                    if same_target_generation {
+                        let repopulated = self
+                            .controller
+                            .as_ref()
+                            .is_some_and(EmergencyController::target_is_verified);
+                        self.last_rejected_policy = None;
+                        if repopulated && let Some(controller) = self.controller.as_mut() {
+                            controller.reset_for_target_generation();
+                        }
+                        return repopulated;
+                    }
                     self.target = Some(target);
                     self.last_rejected_policy = None;
                     if let Some(controller) = self.controller.as_mut() {
@@ -854,6 +919,8 @@ mod tests {
         ConfigHandle::new(guardian_config(registration_file, cgroup_root))
     }
 
+    mod target_reconciliation;
+
     #[test]
     fn parses_mem_available() {
         assert_eq!(
@@ -919,10 +986,11 @@ mod tests {
     }
 
     #[test]
-    fn sheds_only_below_threshold() {
+    fn sheds_at_or_below_threshold() {
         let thresholds = Thresholds::new(1, 64).expect("thresholds");
         assert!(should_shed(thresholds.threshold_bytes() - 1, thresholds));
-        assert!(!should_shed(thresholds.threshold_bytes(), thresholds));
+        assert!(should_shed(thresholds.threshold_bytes(), thresholds));
+        assert!(!should_shed(thresholds.threshold_bytes() + 1, thresholds));
     }
 
     #[test]
@@ -1099,44 +1167,6 @@ mod tests {
     }
 
     #[test]
-    fn opens_and_kills_a_recreated_cgroup_after_the_original_becomes_empty() {
-        let (root, registration) = target_tree();
-        let uid = Uid::effective().as_raw();
-        let original_id = "a".repeat(64);
-        let original_events = root.join(format!(
-            "user.slice/user-{uid}.slice/user@{uid}.service/app.slice/docker-{original_id}.scope/cgroup.events"
-        ));
-        fs::write(original_events, b"populated 0\n").expect("mark original empty");
-
-        let replacement_id = "b".repeat(64);
-        let replacement_scope = format!("docker-{replacement_id}.scope");
-        let replacement = root.join(format!(
-            "user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{replacement_scope}"
-        ));
-        fs::create_dir_all(&replacement).expect("create replacement cgroup");
-        fs::write(replacement.join("cgroup.kill"), b"").expect("create replacement kill");
-        fs::write(replacement.join("cgroup.events"), b"populated 1\n")
-            .expect("create replacement events");
-        fs::write(
-            &registration,
-            format!(
-                "version=1\ncontainer_id={replacement_id}\nscope={replacement_scope}\ncontrol_group=/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/{replacement_scope}\n"
-            ),
-        )
-        .expect("publish replacement registration");
-
-        let target =
-            CgroupTarget::from_registration(&registration, &root, uid).expect("open replacement");
-        let mut reserve = EmergencyReserve::with_page_size(4096, 4096).expect("reserve");
-        kill_direct(&mut reserve, &target).expect("kill replacement");
-        assert_eq!(
-            fs::read(replacement.join("cgroup.kill")).expect("read replacement kill"),
-            b"1"
-        );
-        fs::remove_dir_all(root).expect("remove root");
-    }
-
-    #[test]
     fn disabled_policy_observes_pressure_without_latching_or_arming() {
         let root = temporary_tree();
         let meminfo = root.join("meminfo");
@@ -1155,43 +1185,6 @@ mod tests {
         assert!(!guardian.latched);
         assert!(guardian.controller.is_none());
         assert!(guardian.target.is_none());
-        fs::remove_dir_all(root).expect("remove root");
-    }
-
-    #[test]
-    fn startup_waits_until_initial_registration_is_available() {
-        let root = temporary_tree();
-        let runtime = root.join("runtime");
-        fs::create_dir_all(&runtime).expect("create runtime");
-        let handle = guardian_handle("target.v1", &root);
-
-        let mut guardian = super::MemoryGuardian::open(handle, &runtime)
-            .expect("missing registration must not abort startup");
-        guardian.reconcile_healthy_target();
-        assert!(guardian.target.is_none());
-
-        let id = "a".repeat(64);
-        let scope = format!("docker-{id}.scope");
-        let cgroup = root.join(format!(
-            "user.slice/user-{}.slice/user@{}.service/app.slice/{scope}",
-            Uid::effective().as_raw(),
-            Uid::effective().as_raw()
-        ));
-        fs::create_dir_all(&cgroup).expect("create cgroup");
-        fs::write(cgroup.join("cgroup.kill"), b"").expect("create kill");
-        fs::write(cgroup.join("cgroup.events"), b"populated 1\n").expect("create events");
-        let registration = format!(
-            "version=1\ncontainer_id={id}\nscope={scope}\ncontrol_group=/user.slice/user-{}.slice/user@{}.service/app.slice/{scope}\n",
-            Uid::effective().as_raw(),
-            Uid::effective().as_raw()
-        );
-        let registration_path = runtime.join("target.v1");
-        fs::write(&registration_path, registration).expect("publish registration");
-        fs::set_permissions(&registration_path, fs::Permissions::from_mode(0o600))
-            .expect("secure registration");
-
-        guardian.reconcile_healthy_target();
-        assert!(guardian.target.is_some());
         fs::remove_dir_all(root).expect("remove root");
     }
 
