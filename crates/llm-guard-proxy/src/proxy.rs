@@ -2926,27 +2926,34 @@ async fn forward_openai_request(
             .endpoint_retry_order
             .clone_from(&selected.selection_order);
         prepared_request.upstream_deadline = Some(upstream_deadline);
-        if selected.endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
-            let canonical = prepared_request
-                .canonical_reranker
-                .as_ref()
-                .ok_or_else(|| ProxyError::ContextBudgetExceeded {
-                    message: String::from(
-                        "selected DeepInfra endpoint only supports normalized reranker requests",
-                    ),
-                    param: "path",
-                    code: "unsupported_reranker_endpoint_request",
-                    request_metadata: None,
-                    attempts: Vec::new(),
-                })?;
-            let rendered =
+        let rendered = match prepared_request.canonical_reranker.as_ref() {
+            Some(canonical) => {
                 reranker_protocol::render(&selected.endpoint, canonical, &downstream_headers)
-                    .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
-            prepared_request.forward_uri = rendered.uri;
-            prepared_request.upstream_url = rendered.url;
-            prepared_request.shielded_chat_plan.upstream_body = rendered.body;
-            prepared_request.upstream_headers = Some(rendered.headers);
+            }
+            None if selected.endpoint.protocol == UpstreamEndpointProtocol::OpenAi => {
+                reranker_protocol::render_openai_endpoint(
+                    &selected.endpoint,
+                    prepared_request.forward_uri.clone(),
+                    &prepared_request.shielded_chat_plan.upstream_body,
+                    &downstream_headers,
+                    prepared_request.transformed_request_headers,
+                )
+            }
+            None => Err(ProxyError::ContextBudgetExceeded {
+                message: String::from(
+                    "selected DeepInfra endpoint only supports normalized reranker requests",
+                ),
+                param: "path",
+                code: "unsupported_reranker_endpoint_request",
+                request_metadata: None,
+                attempts: Vec::new(),
+            }),
         }
+        .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+        prepared_request.forward_uri = rendered.uri;
+        prepared_request.upstream_url = rendered.url;
+        prepared_request.shielded_chat_plan.upstream_body = rendered.body;
+        prepared_request.upstream_headers = Some(rendered.headers);
         request_metadata.insert(
             String::from("upstream_endpoint_priority"),
             match selected.priority {
@@ -4888,13 +4895,19 @@ async fn fetch_models_upstream_group(
     let (downstream_headers, attempt_request_metadata) =
         models_attempt_request(context, group, attempt_number);
 
-    let upstream_url = build_upstream_url(&group.base_url, &context.uri)?;
+    let rendered = reranker_protocol::render_openai_endpoint(
+        &group.terminal_endpoint,
+        context.uri.clone(),
+        &context.upstream_body,
+        &downstream_headers,
+        false,
+    )?;
     let sent_upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
         client: &context.state.client,
         method: context.reqwest_method.clone(),
-        upstream_url,
-        downstream_headers: &downstream_headers,
-        upstream_body: context.upstream_body.clone(),
+        upstream_url: rendered.url,
+        downstream_headers: &rendered.headers,
+        upstream_body: rendered.body,
         upstream_timeout: Duration::from_millis(group.request_timeout_ms),
         attempt_id: attempt_id.clone(),
         attempt_number,
@@ -4904,7 +4917,7 @@ async fn fetch_models_upstream_group(
         attempt_request_metadata: &attempt_request_metadata,
         shutdown: context.state.shutdown.subscribe(),
         failover_retry: models_failover_retry_context(context, group, &downstream_headers),
-        terminal_endpoint_protocol: UpstreamEndpointProtocol::OpenAi,
+        terminal_endpoint_protocol: group.terminal_endpoint.protocol,
         canonical_reranker: None,
         decode_heterogeneous_reranker: false,
         model_id: None,
@@ -5124,20 +5137,16 @@ impl EndpointResponse {
 
 fn render_retry_openai_request(
     retry: &UpstreamFailoverRetryContext<'_>,
-    base_url: &str,
+    endpoint: &UpstreamEndpointConfig,
     body: &Bytes,
 ) -> Result<RenderedEndpointRequest, ProxyError> {
-    let headers = if retry.transformed_request_headers {
-        sanitize_transformed_request_headers(retry.original_downstream_headers)
-    } else {
-        retry.original_downstream_headers.clone()
-    };
-    Ok(RenderedEndpointRequest {
-        url: build_upstream_url(base_url, &retry.local_forward_uri)?,
-        uri: retry.local_forward_uri.clone(),
-        body: body.clone(),
-        headers,
-    })
+    reranker_protocol::render_openai_endpoint(
+        endpoint,
+        retry.local_forward_uri.clone(),
+        body,
+        retry.original_downstream_headers,
+        retry.transformed_request_headers,
+    )
 }
 
 async fn send_first_upstream_attempt(
@@ -5420,7 +5429,7 @@ async fn send_selected_failover_endpoint(
             canonical,
             runtime.retry.original_downstream_headers,
         ),
-        None => render_retry_openai_request(runtime.retry, &selected.base_url, runtime.retry_body),
+        None => render_retry_openai_request(runtime.retry, &selected.endpoint, runtime.retry_body),
     };
     let attempt_id = AttemptId::for_request(runtime.request_id, attempt_number);
     let started_at_unix_ms = unix_time_millis();

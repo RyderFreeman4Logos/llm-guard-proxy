@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::{
     ProxyError, buffered_adapter::sanitize_transformed_request_headers, deepinfra_rerank_adapter,
-    score_adapter,
+    forwarded_request_headers, score_adapter,
 };
 
 const MAX_PAIR_COUNT: usize = 1_024;
@@ -171,8 +171,10 @@ pub(super) fn is_compatible_with_endpoint(
 /// never be sent as a health probe.
 pub(super) fn has_runtime_credential(endpoint: &UpstreamEndpointConfig) -> bool {
     match endpoint.protocol {
-        UpstreamEndpointProtocol::OpenAi => true,
-        UpstreamEndpointProtocol::DeepInfraQwen3Rerank => authorization_header(endpoint).is_ok(),
+        UpstreamEndpointProtocol::OpenAi => optional_authorization_header(endpoint).is_ok(),
+        UpstreamEndpointProtocol::DeepInfraQwen3Rerank => {
+            required_authorization_header(endpoint).is_ok()
+        }
     }
 }
 
@@ -283,12 +285,96 @@ fn render_openai(
         }
         CanonicalRerankerRequest::UnsupportedScore => return Err(unsupported_request_error()),
     };
+    let headers = request_headers_for_openai(request, downstream_headers);
+    render_openai_endpoint(endpoint, uri, &body, &headers, false)
+}
+
+/// Render one generic OpenAI-compatible endpoint, applying only endpoint-configured
+/// credential isolation and model alias translation.
+pub(super) fn render_openai_endpoint(
+    endpoint: &UpstreamEndpointConfig,
+    uri: Uri,
+    body: &Bytes,
+    downstream_headers: &HeaderMap,
+    transformed_request_headers: bool,
+) -> Result<RenderedEndpointRequest, ProxyError> {
+    let authorization = optional_authorization_header(endpoint)?;
+    let headers = if let Some(authorization) = authorization {
+        isolated_third_party_headers(downstream_headers, authorization)
+    } else if transformed_request_headers {
+        sanitize_transformed_request_headers(downstream_headers)
+    } else {
+        downstream_headers.clone()
+    };
+    let body = rewrite_openai_model(endpoint, body, downstream_headers)?;
     Ok(RenderedEndpointRequest {
         url: super::build_upstream_url(&endpoint.base_url, &uri)?,
         uri,
         body,
-        headers: request_headers_for_openai(request, downstream_headers),
+        headers,
     })
+}
+
+fn rewrite_openai_model(
+    endpoint: &UpstreamEndpointConfig,
+    body: &Bytes,
+    downstream_headers: &HeaderMap,
+) -> Result<Bytes, ProxyError> {
+    let Some(model) = endpoint.model.as_deref() else {
+        return Ok(body.clone());
+    };
+    if body.is_empty() {
+        return Ok(body.clone());
+    }
+    if endpoint.api_key_env.is_none() && has_integrity_headers(downstream_headers) {
+        return Err(ProxyError::ContextBudgetExceeded {
+            message: String::from(
+                "signed or integrity-protected requests cannot use an endpoint model override",
+            ),
+            param: "headers",
+            code: "signed_request_transformation_unsupported",
+            request_metadata: None,
+            attempts: Vec::new(),
+        });
+    }
+    let mut value: Value = serde_json::from_slice(body).map_err(|error| {
+        invalid_request_error(&format!(
+            "OpenAI endpoint model override requires JSON: {error}"
+        ))
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        invalid_request_error("OpenAI endpoint model override requires a JSON object")
+    })?;
+    object.insert(String::from("model"), Value::String(model.to_owned()));
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| {
+            invalid_request_error(&format!("serialize OpenAI request failed: {error}"))
+        })
+}
+
+fn isolated_third_party_headers(
+    downstream_headers: &HeaderMap,
+    authorization: HeaderValue,
+) -> HeaderMap {
+    let mut headers =
+        sanitize_transformed_request_headers(&forwarded_request_headers(downstream_headers));
+    for name in [
+        "authorization",
+        "x-api-key",
+        "x-virtual-key",
+        "cookie",
+        "proxy-authorization",
+        "signature",
+        "signature-input",
+        "forwarded",
+        "x-forwarded-for",
+        "x-real-ip",
+    ] {
+        headers.remove(name);
+    }
+    headers.insert(AUTHORIZATION, authorization);
+    headers
 }
 
 fn request_headers_for_openai(
@@ -310,7 +396,7 @@ fn render_deepinfra(
     request: &CanonicalRerankerRequest,
     downstream_headers: &HeaderMap,
 ) -> Result<RenderedEndpointRequest, ProxyError> {
-    let authorization = authorization_header(endpoint)?;
+    let authorization = required_authorization_header(endpoint)?;
     render_deepinfra_with_authorization(endpoint, request, downstream_headers, authorization)
 }
 
@@ -454,16 +540,25 @@ fn ensure_generated_body_fits(input: &OpenAiRerankInput) -> Result<(), ProxyErro
     Ok(())
 }
 
-fn authorization_header(endpoint: &UpstreamEndpointConfig) -> Result<HeaderValue, ProxyError> {
-    let variable = endpoint
-        .api_key_env
-        .as_deref()
-        .ok_or_else(unsupported_request_error)?;
+pub(super) fn optional_authorization_header(
+    endpoint: &UpstreamEndpointConfig,
+) -> Result<Option<HeaderValue>, ProxyError> {
+    let Some(variable) = endpoint.api_key_env.as_deref() else {
+        return Ok(None);
+    };
     let token = std::env::var(variable).map_err(|_error| credential_error())?;
     if token.trim().is_empty() {
         return Err(credential_error());
     }
-    HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_error| credential_error())
+    HeaderValue::from_str(&format!("Bearer {token}"))
+        .map(Some)
+        .map_err(|_error| credential_error())
+}
+
+fn required_authorization_header(
+    endpoint: &UpstreamEndpointConfig,
+) -> Result<HeaderValue, ProxyError> {
+    optional_authorization_header(endpoint)?.ok_or_else(unsupported_request_error)
 }
 
 struct OpenAiRerankInput {
@@ -802,7 +897,7 @@ fn unsupported_request_error() -> ProxyError {
 
 fn credential_error() -> ProxyError {
     ProxyError::ContextBudgetExceeded {
-        message: String::from("selected DeepInfra endpoint has no usable runtime credential"),
+        message: String::from("selected upstream endpoint has no usable runtime credential"),
         param: "api_key_env",
         code: "upstream_endpoint_credential_unavailable",
         request_metadata: None,

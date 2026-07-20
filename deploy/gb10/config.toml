@@ -187,6 +187,21 @@ match_models = ["qwen3-embedding-8b", "Qwen/Qwen3-Embedding-8B"]
 request_timeout_ms = 1800000
 max_in_flight_requests = 8
 max_queued_generation_requests = 64
+endpoint_selection = "priority_failover"
+
+[[upstreams.endpoints]]
+base_url = "http://100.105.4.92:18012/v1"
+priority = "primary"
+protocol = "openai"
+
+# This failover uses the generic OpenAI-compatible contract. Any provider exposing
+# /v1/embeddings can replace this base_url without a provider-specific adapter.
+[[upstreams.endpoints]]
+base_url = "https://api.deepinfra.com"
+priority = "failover"
+protocol = "openai"
+api_key_env = "LLM_GUARD_PROXY_EMBEDDING_FAILOVER_API_KEY"
+model = "Qwen/Qwen3-Embedding-8B"
 
 [upstreams.metadata]
 discovery_enabled = true
@@ -211,6 +226,21 @@ match_models = ["qwen3-reranker-8b", "Qwen/Qwen3-Reranker-8B"]
 request_timeout_ms = 1800000
 max_in_flight_requests = 8
 max_queued_generation_requests = 64
+endpoint_selection = "priority_failover"
+
+[[upstreams.endpoints]]
+base_url = "http://100.105.4.92:18013/v1"
+priority = "primary"
+protocol = "openai"
+
+# Enabled option B: this provider's reranker uses a native inference contract.
+[[upstreams.endpoints]]
+base_url = "https://api.deepinfra.com"
+priority = "failover"
+protocol = "deepinfra_qwen3_rerank"
+model = "Qwen/Qwen3-Reranker-8B"
+model_revision = "5fa94080caafeaa45a15d11f969d7978e087a3db"
+api_key_env = "LLM_GUARD_PROXY_DEEPINFRA_API_KEY"
 
 [upstreams.metadata]
 discovery_enabled = true
@@ -229,9 +259,10 @@ enabled = false
 enabled = false
 
 # BEGIN PARSEABLE EXAMPLE: heterogeneous-reranker-replicas
-# A local OpenAI-compatible reranker remains the preferred endpoint. The optional
-# DeepInfra replica is selected only for losslessly representable rerank/score calls;
-# generic OpenAI APIs and opaque or future score bodies never reach this endpoint.
+# A local OpenAI-compatible reranker remains the preferred endpoint. Option A is
+# any provider implementing standard /v1/rerank: use protocol="openai" with optional
+# api_key_env and model. Option B below is for DeepInfra's non-standard native API;
+# opaque or future score bodies never reach that native endpoint.
 #| [[upstreams]]
 #| name = "example-heterogeneous-reranker"                             # Stable profile name for routing and observability
 #| base_url = "http://127.0.0.1:18013/v1"                              # Legacy fallback; first endpoint is authoritative when replicas are configured
@@ -245,6 +276,8 @@ enabled = false
 #| base_url = "http://100.105.4.92:18013/v1"                           # OpenAI-compatible local replica
 #| priority = "primary"                                                # Preferred while healthy
 #| protocol = "openai"                                                 # Preserves arbitrary OpenAI request shapes
+#| # Option A failover would also use protocol="openai", plus an independent
+#| # api_key_env and optional provider model name, against a standard /v1/rerank.
 #| [[upstreams.endpoints]]
 #| base_url = "https://api.deepinfra.com"                              # DeepInfra API origin, without caller credentials
 #| priority = "failover"                                               # Used only after a compatible retry/failover decision
