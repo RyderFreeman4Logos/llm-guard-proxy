@@ -126,9 +126,15 @@ data: [DONE]
 #[test]
 fn stuck_watchdog_counts_non_stream_and_sse_output_tokens_in_trailing_window() {
     let tracker = StuckWatchdogTokenTracker::default();
-    tracker.record_response("default", br#"{"usage":{"completion_tokens":3}}"#, b"");
     tracker.record_response(
         "default",
+        Duration::from_secs(1),
+        br#"{"usage":{"completion_tokens":3}}"#,
+        b"",
+    );
+    tracker.record_response(
+        "default",
+        Duration::from_secs(1),
         b"",
         br#"data: {"usage":{"completion_tokens":2}}
 
@@ -145,7 +151,11 @@ fn stuck_watchdog_detects_only_active_requests_without_enough_output() {
     let tracker = Arc::new(StuckWatchdogTokenTracker::default());
     assert!(!tracker.has_active_requests("default"));
 
-    let request = tracker.begin_request("default");
+    let request = tracker.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
     assert!(tracker.has_active_requests("default"));
     assert!(tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 1));
 
@@ -205,6 +215,136 @@ async fn restart_queue_waits_for_readiness_result_and_times_out_without_it() {
     assert_eq!(
         wait_for_restart_queue(&coordinator, Duration::from_millis(5)).await,
         RestartQueueWaitResult::TimedOut
+    );
+}
+
+#[test]
+fn watchdog_records_streaming_and_non_chat_progress_when_emitted() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let chat = tracker.begin_request("chat", WatchdogProgressUnit::Chat, Duration::from_secs(1));
+    let embedding = tracker.begin_request(
+        "embedding",
+        WatchdogProgressUnit::Embedding,
+        Duration::from_secs(1),
+    );
+    let reranker = tracker.begin_request(
+        "reranker",
+        WatchdogProgressUnit::Reranker,
+        Duration::from_secs(1),
+    );
+
+    chat.record_emitted_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"healthy stream\"}}]}\n\n",
+    );
+    embedding.record_emitted_chunk(br#"{"data":[{"embedding":[0.1,0.2]}]}"#);
+    reranker.record_emitted_chunk(br#"{"results":[{"index":0,"relevance_score":0.9}]}"#);
+
+    assert!(!tracker.has_too_few_output_tokens("chat", Duration::from_secs(1), 1));
+    assert!(!tracker.has_too_few_output_tokens("embedding", Duration::from_secs(1), 1));
+    assert!(!tracker.has_too_few_output_tokens("reranker", Duration::from_secs(1), 1));
+}
+
+#[test]
+fn watchdog_token_samples_are_capped_and_maintained_without_active_requests() {
+    let tracker = StuckWatchdogTokenTracker::default();
+    for _ in 0..=STUCK_WATCHDOG_TOKEN_SAMPLE_CAP {
+        tracker.record_progress("default", Duration::from_secs(1), 1);
+    }
+    assert_eq!(
+        tracker.sample_count("default"),
+        STUCK_WATCHDOG_TOKEN_SAMPLE_CAP,
+        "insertion must cap remotely supplied output samples"
+    );
+
+    tracker.prune_profile("default", Duration::ZERO);
+    assert_eq!(
+        tracker.sample_count("default"),
+        0,
+        "maintenance must prune samples even after every request has completed"
+    );
+}
+
+#[test]
+fn watchdog_prunes_before_every_remote_sample_insertion() {
+    let tracker = StuckWatchdogTokenTracker::default();
+
+    tracker.record_progress("default", Duration::ZERO, 1);
+    tracker.record_progress("default", Duration::ZERO, 1);
+
+    assert_eq!(
+        tracker.sample_count("default"),
+        1,
+        "each sample insertion must prune old peer-controlled samples"
+    );
+}
+
+#[tokio::test]
+async fn restart_queue_uses_episode_deadline_not_a_fresh_wait_per_request() {
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery.recovery_started = Some(Instant::now());
+        recovery.recovery_deadline = Some(Instant::now());
+    }
+
+    assert_eq!(
+        timeout(
+            Duration::from_millis(20),
+            wait_for_restart_queue(&coordinator, Duration::from_secs(1)),
+        )
+        .await
+        .expect("an expired episode deadline must not start a fresh per-request wait"),
+        RestartQueueWaitResult::TimedOut,
+        "an already-running recovery has one deadline shared by every queued request"
+    );
+}
+
+#[tokio::test]
+async fn restart_queue_waiters_consume_queue_capacity_not_in_flight_capacity() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_queued_generation_requests = 1\n",
+    )
+    .await;
+    let mut profile = AppConfig::default().default_upstream_profile();
+    profile.restart_queue.enabled = true;
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    coordinator.state.lock().await.running = true;
+
+    let permit = proxy
+        .state
+        .acquire_restart_queue_permit(&profile, &coordinator)
+        .await
+        .expect("restart queue admission should succeed")
+        .expect("active recovery should acquire a queue permit");
+    let counts = proxy.state.generation_requests.snapshot_counts();
+    assert_eq!(counts.active, 0);
+    assert_eq!(counts.queued, 1);
+
+    drop(permit);
+    assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 0);
+}
+
+#[test]
+fn watchdog_schedule_keeps_profile_intervals_independent() {
+    let now = Instant::now();
+    let mut schedule = WatchdogSchedule::default();
+    let profiles = vec![
+        (String::from("fast"), Duration::from_secs(30)),
+        (String::from("slow"), Duration::from_secs(600)),
+    ];
+    assert_eq!(
+        schedule.due_profiles(now, &profiles),
+        vec![String::from("fast"), String::from("slow")]
+    );
+    assert_eq!(
+        schedule.due_profiles(now + Duration::from_secs(30), &profiles),
+        vec![String::from("fast")],
+        "a fast profile must not make a 600-second profile due every 30 seconds"
     );
 }
 
@@ -316,6 +456,27 @@ async fn metrics_expose_retained_gauges_without_secrets() {
     assert_metric_type(&body, "llm_guard_proxy_generation_queued", "gauge");
     assert_metric_type(&body, "llm_guard_proxy_generation_profile_active", "gauge");
     assert_metric_type(&body, "llm_guard_proxy_generation_profile_queued", "gauge");
+    assert_metric_type(&body, "llm_guard_proxy_restart_queue_depth", "gauge");
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_stuck_watchdog_detections_total",
+        "counter",
+    );
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_stuck_watchdog_restarts_total",
+        "counter",
+    );
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_stuck_watchdog_recovery_successes_total",
+        "counter",
+    );
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_stuck_watchdog_recovery_timeouts_total",
+        "counter",
+    );
     assert_metric_type(&body, "llm_guard_proxy_current_retained_requests", "gauge");
     assert_metric_type(
         &body,

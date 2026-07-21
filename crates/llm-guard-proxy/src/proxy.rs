@@ -119,6 +119,9 @@ const FINAL_DIRECT_RELAY_TERMINATED_ABORT_REASON: &str = "final_direct_relay_ter
 const MAX_PERSISTENCE_TASKS: usize = 64;
 const PERSISTENCE_BACKLOG_DROP_LOG_INTERVAL_MS: u64 = 10_000;
 const PERSISTENCE_BACKLOG_DROP_LOG_NEVER_EMITTED: u64 = u64::MAX;
+/// Per-profile hard cap for watchdog output samples. Upstream chunk cadence is
+/// peer-controlled, so this is deliberately independent of request activity.
+const STUCK_WATCHDOG_TOKEN_SAMPLE_CAP: usize = 4_096;
 #[cfg(feature = "guard")]
 const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
 
@@ -143,7 +146,6 @@ pub(crate) struct ProxyState {
     upstream_health: Arc<UpstreamHealthRegistry>,
     local_recovery: Arc<LocalRecoveryCoordinatorSet>,
     stuck_watchdog_tokens: Arc<StuckWatchdogTokenTracker>,
-    stuck_watchdog_started: Arc<AtomicBool>,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
@@ -275,7 +277,6 @@ impl ProxyState {
             upstream_health: Arc::new(UpstreamHealthRegistry::default()),
             local_recovery: Arc::new(LocalRecoveryCoordinatorSet::default()),
             stuck_watchdog_tokens: Arc::new(StuckWatchdogTokenTracker::default()),
-            stuck_watchdog_started: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "upstream-hot-restart")]
             hot_restart_recovery: Arc::new(HotRestartCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
@@ -320,19 +321,6 @@ impl ProxyState {
         self.persistence_tasks
             .flush(current_shutdown_drain_timeout(&self.config))
             .await;
-    }
-
-    fn start_stuck_watchdog(&self) {
-        if self.stuck_watchdog_started.swap(true, Ordering::SeqCst) {
-            return;
-        }
-        tokio::spawn(run_stuck_engine_watchdog(
-            self.config.clone(),
-            self.client.clone(),
-            Arc::clone(&self.local_recovery),
-            Arc::clone(&self.stuck_watchdog_tokens),
-            Arc::clone(&self.shutdown),
-        ));
     }
 
     #[cfg(test)]
@@ -591,6 +579,37 @@ impl ProxyState {
         )
     }
 
+    async fn acquire_restart_queue_permit(
+        &self,
+        profile: &UpstreamProfileConfig,
+        coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+    ) -> Result<Option<RestartQueuePermit>, ProxyError> {
+        if !coordinator.state.lock().await.running {
+            return Ok(None);
+        }
+        let config = self
+            .config
+            .snapshot()
+            .map_err(|error| ProxyError::config_snapshot(error.to_string()))?;
+        let max_queued = profile.effective_max_queued_generation_requests(&config.server);
+        let Some(queued) = self
+            .generation_limiter_for_profile(profile)
+            .try_enqueue(max_queued)
+        else {
+            return Err(ProxyError::upstream_unavailable(
+                profile.name.clone(),
+                config.server.generation_queue_timeout_ms,
+            ));
+        };
+        coordinator
+            .restart_queue_depth
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(Some(RestartQueuePermit {
+            _queued: queued,
+            coordinator: Arc::clone(coordinator),
+        }))
+    }
+
     fn try_acquire_control_plane_permit(
         &self,
         max_control_plane_in_flight_requests: usize,
@@ -692,7 +711,6 @@ pub(crate) async fn serve_until_shutdown(
         state.client.clone(),
         Arc::clone(&state.shutdown),
     );
-    state.start_stuck_watchdog();
     let config = state.config.clone();
     let shutdown_gate = Arc::clone(&state.shutdown);
     let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
@@ -1219,6 +1237,20 @@ impl Drop for QueuedAdmissionPermit {
     }
 }
 
+#[derive(Debug)]
+struct RestartQueuePermit {
+    _queued: QueuedAdmissionPermit,
+    coordinator: Arc<UpstreamStallRecoveryCoordinator>,
+}
+
+impl Drop for RestartQueuePermit {
+    fn drop(&mut self) {
+        self.coordinator
+            .restart_queue_depth
+            .fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 enum AdmissionFailure {
     #[error("failed to read proxy config snapshot: {0}")]
@@ -1598,6 +1630,7 @@ async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
                         state.malformed_response_counter.load(Ordering::Relaxed);
                     let persistence_dropped = state.persistence_tasks.dropped_total();
                     let upstream_failures = state.upstream_failure_counters.snapshot();
+                    let watchdog = state.local_recovery.watchdog_metrics_snapshot();
                     text_response(
                         StatusCode::OK,
                         render_metrics(
@@ -1606,6 +1639,7 @@ async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
                             malformed_responses,
                             persistence_dropped,
                             upstream_failures,
+                            watchdog,
                         ),
                     )
                 }
@@ -1996,9 +2030,11 @@ fn render_metrics(
     malformed_responses: u64,
     persistence_dropped: u64,
     upstream_failures: UpstreamFailureSnapshot,
+    watchdog: WatchdogMetricsSnapshot,
 ) -> String {
     let mut output = String::new();
     push_admission_metrics(&mut output, admission);
+    push_watchdog_metrics(&mut output, watchdog);
     push_request_metrics(&mut output, snapshot);
     push_request_terminal_metrics(&mut output, snapshot);
     push_attempt_metrics(&mut output, snapshot);
@@ -2064,6 +2100,50 @@ fn push_admission_metrics(output: &mut String, admission: &AdmissionMetricsSnaps
             &[("profile", &profile.profile)],
             usize_to_u64(profile.counts.queued),
         );
+    }
+}
+
+fn push_watchdog_metrics(output: &mut String, watchdog: WatchdogMetricsSnapshot) {
+    for (name, help, metric_type, value) in [
+        (
+            "llm_guard_proxy_stuck_watchdog_detections_total",
+            "Stuck-engine watchdog detections.",
+            "counter",
+            watchdog.detections,
+        ),
+        (
+            "llm_guard_proxy_stuck_watchdog_restarts_total",
+            "Stuck-engine watchdog recovery restarts.",
+            "counter",
+            watchdog.restarts,
+        ),
+        (
+            "llm_guard_proxy_stuck_watchdog_recovery_successes_total",
+            "Successful stuck-engine watchdog recoveries.",
+            "counter",
+            watchdog.recovery_successes,
+        ),
+        (
+            "llm_guard_proxy_stuck_watchdog_recovery_timeouts_total",
+            "Timed-out stuck-engine watchdog recoveries.",
+            "counter",
+            watchdog.recovery_timeouts,
+        ),
+        (
+            "llm_guard_proxy_restart_queue_depth",
+            "Requests currently waiting for a recovery restart.",
+            "gauge",
+            watchdog.restart_queue_depth,
+        ),
+        (
+            "llm_guard_proxy_stuck_watchdog_restart_queue_depth",
+            "Requests currently waiting for a watchdog restart.",
+            "gauge",
+            watchdog.restart_queue_depth,
+        ),
+    ] {
+        push_metric_header(output, name, help, metric_type);
+        push_metric_line(output, name, &[], value);
     }
 }
 
@@ -2898,20 +2978,21 @@ async fn forward_openai_request(
     )
     .await
     .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
-    wait_for_profile_restart_queue(
-        state,
-        &prepared_request.upstream_profile,
-        &mut request_metadata,
-    )
-    .await?;
     let stuck_watchdog_request = prepared_request
         .upstream_profile
         .stuck_watchdog
         .enabled
         .then(|| {
-            state
-                .stuck_watchdog_tokens
-                .begin_request(&prepared_request.upstream_profile.name)
+            state.stuck_watchdog_tokens.begin_request(
+                &prepared_request.upstream_profile.name,
+                watchdog_progress_unit(&prepared_request.forward_uri),
+                Duration::from_secs(
+                    prepared_request
+                        .upstream_profile
+                        .stuck_watchdog
+                        .detection_window_secs,
+                ),
+            )
         });
     let endpoint_retry_body = prepared_request.shielded_chat_plan.upstream_body.clone();
     let mut _initial_recovery_trial_lease = None;
@@ -3146,6 +3227,7 @@ struct BodyAdmissionContext<'request> {
     started_at_unix_ms: u64,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn read_body_and_admit_generation(
     state: &ProxyState,
     body: Body,
@@ -3203,17 +3285,56 @@ async fn read_body_and_admit_generation(
     }
 
     let model_id_for_admission = extract_model_id(request.method, request.uri, &body);
-    select_allowed_upstream_profile(&config, &state.listener, model_id_for_admission.as_deref())
-        .map_err(|error| {
-            ProxyError::listener_denied(error)
-                .with_request_metadata(body_read_request_metadata.clone())
-        })?;
+    let selected_profile = select_allowed_upstream_profile(
+        &config,
+        &state.listener,
+        model_id_for_admission.as_deref(),
+    )
+    .map_err(|error| {
+        ProxyError::listener_denied(error).with_request_metadata(body_read_request_metadata.clone())
+    })?;
     if admission_permit_kind == AdmissionPermitKind::Generation {
+        if !selected_profile.profile.restart_queue.enabled {
+            return Ok(OpenAiBodyAdmission {
+                config,
+                body,
+                in_flight_permit,
+                admission_metadata: request.admission_metadata,
+            });
+        }
+
+        // A request must not consume generation capacity while it is only waiting for
+        // the restart/readiness episode. Release the provisional permit, queue under
+        // the restart-specific bound, then select configuration and reacquire.
+        drop(in_flight_permit);
+        wait_for_profile_restart_queue(
+            state,
+            &selected_profile.profile,
+            &mut body_read_request_metadata,
+        )
+        .await?;
+        let record_context = AdmissionRecordContext {
+            store: state.store.clone(),
+            persistence_tasks: Arc::clone(&state.persistence_tasks),
+            request_id: request.request_id.clone(),
+            started_at_unix_ms: request.started_at_unix_ms,
+            request_metadata: body_read_request_metadata.clone(),
+        };
+        let admission = state
+            .acquire_generation_permit(record_context)
+            .await
+            .map_err(|error| {
+                let mut metadata = body_read_request_metadata;
+                metadata.extend(error.request_metadata());
+                ProxyError::admission(error).with_request_metadata(metadata)
+            })?;
+        let mut admission_metadata = request.admission_metadata;
+        admission_metadata.extend(acquired_admission_metadata(admission.queue_wait));
         return Ok(OpenAiBodyAdmission {
-            config,
+            config: admission.config,
             body,
-            in_flight_permit,
-            admission_metadata: request.admission_metadata,
+            in_flight_permit: admission.permit,
+            admission_metadata,
         });
     }
     let record_context = AdmissionRecordContext {
@@ -6179,11 +6300,18 @@ impl LocalRecoveryPolicy {
 struct UpstreamStallRecoveryCoordinator {
     state: AsyncMutex<UpstreamStallRecoveryState>,
     notify: Notify,
+    restart_queue_depth: AtomicU64,
+    watchdog_detections: AtomicU64,
+    watchdog_restarts: AtomicU64,
+    watchdog_recovery_successes: AtomicU64,
+    watchdog_recovery_timeouts: AtomicU64,
 }
 
 #[derive(Debug, Default)]
 struct UpstreamStallRecoveryState {
     running: bool,
+    recovery_started: Option<Instant>,
+    recovery_deadline: Option<Instant>,
     last_finished: Option<Instant>,
     window_started: Option<Instant>,
     runs_in_window: u32,
@@ -6201,10 +6329,27 @@ struct StuckWatchdogTokenWindow {
     active_requests: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WatchdogProgressUnit {
+    Chat,
+    Embedding,
+    Reranker,
+}
+
+fn watchdog_progress_unit(uri: &Uri) -> WatchdogProgressUnit {
+    match uri.path() {
+        path if path.contains("embeddings") => WatchdogProgressUnit::Embedding,
+        path if path.contains("rerank") || path.contains("score") => WatchdogProgressUnit::Reranker,
+        _ => WatchdogProgressUnit::Chat,
+    }
+}
+
 #[derive(Debug)]
 struct StuckWatchdogRequestInner {
     tracker: Arc<StuckWatchdogTokenTracker>,
     profile: String,
+    progress_unit: WatchdogProgressUnit,
+    detection_window: Duration,
 }
 
 #[derive(Clone, Debug)]
@@ -6213,7 +6358,12 @@ struct StuckWatchdogRequest {
 }
 
 impl StuckWatchdogTokenTracker {
-    fn begin_request(self: &Arc<Self>, profile: &str) -> StuckWatchdogRequest {
+    fn begin_request(
+        self: &Arc<Self>,
+        profile: &str,
+        progress_unit: WatchdogProgressUnit,
+        detection_window: Duration,
+    ) -> StuckWatchdogRequest {
         let mut windows = match self.windows.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -6224,23 +6374,69 @@ impl StuckWatchdogTokenTracker {
             inner: Arc::new(StuckWatchdogRequestInner {
                 tracker: Arc::clone(self),
                 profile: profile.to_owned(),
+                progress_unit,
+                detection_window,
             }),
         }
     }
 
-    fn record_response(&self, profile: &str, response_body: &[u8], sse_body: &[u8]) {
+    fn record_response(
+        &self,
+        profile: &str,
+        detection_window: Duration,
+        response_body: &[u8],
+        sse_body: &[u8],
+    ) {
         let Some(output_tokens) = parse_token_usage(response_body, sse_body).output_tokens else {
             return;
         };
+        self.prune_profile(profile, detection_window);
         let mut windows = match self.windows.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        record_watchdog_progress(
+            windows.entry(profile.to_owned()).or_default(),
+            Instant::now(),
+            output_tokens,
+        );
+    }
+
+    fn record_progress(&self, profile: &str, detection_window: Duration, progress: u64) {
+        if progress == 0 {
+            return;
+        }
+        self.prune_profile(profile, detection_window);
+        let mut windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        record_watchdog_progress(
+            windows.entry(profile.to_owned()).or_default(),
+            Instant::now(),
+            progress,
+        );
+    }
+
+    #[cfg(test)]
+    fn sample_count(&self, profile: &str) -> usize {
+        let windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         windows
-            .entry(profile.to_owned())
-            .or_default()
-            .samples
-            .push_back((Instant::now(), output_tokens));
+            .get(profile)
+            .map_or(0, |window| window.samples.len())
+    }
+
+    fn prune_profile(&self, profile: &str, detection_window: Duration) {
+        let mut windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(window) = windows.get_mut(profile) {
+            prune_watchdog_progress(window, detection_window, Instant::now());
+        }
     }
 
     fn has_too_few_output_tokens(
@@ -6272,9 +6468,29 @@ impl StuckWatchdogTokenTracker {
 
 impl StuckWatchdogRequest {
     fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
-        self.inner
-            .tracker
-            .record_response(&self.inner.profile, response_body, sse_body);
+        self.inner.tracker.record_response(
+            &self.inner.profile,
+            self.inner.detection_window,
+            response_body,
+            sse_body,
+        );
+    }
+
+    fn record_emitted_chunk(&self, chunk: &[u8]) {
+        let progress = match self.inner.progress_unit {
+            // A nonempty SSE chunk is observable streamed output before terminal usage.
+            WatchdogProgressUnit::Chat => u64::from(!chunk.is_empty()),
+            // Embedding and reranker endpoints generally omit completion_tokens; a
+            // result-bearing chunk is their endpoint-appropriate progress unit.
+            WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
+                u64::from(!chunk.is_empty())
+            }
+        };
+        self.inner.tracker.record_progress(
+            &self.inner.profile,
+            self.inner.detection_window,
+            progress,
+        );
     }
 }
 
@@ -6295,7 +6511,29 @@ fn window_has_too_few_output_tokens(
     detection_window: Duration,
     minimum_output_tokens: u64,
 ) -> bool {
-    if let Some(threshold) = Instant::now().checked_sub(detection_window) {
+    prune_watchdog_progress(window, detection_window, Instant::now());
+    window
+        .samples
+        .iter()
+        .fold(0_u64, |total, (_, output_tokens)| {
+            total.saturating_add(*output_tokens)
+        })
+        < minimum_output_tokens
+}
+
+fn record_watchdog_progress(window: &mut StuckWatchdogTokenWindow, now: Instant, progress: u64) {
+    window.samples.push_back((now, progress));
+    while window.samples.len() > STUCK_WATCHDOG_TOKEN_SAMPLE_CAP {
+        let _ = window.samples.pop_front();
+    }
+}
+
+fn prune_watchdog_progress(
+    window: &mut StuckWatchdogTokenWindow,
+    detection_window: Duration,
+    now: Instant,
+) {
+    if let Some(threshold) = now.checked_sub(detection_window) {
         while window
             .samples
             .front()
@@ -6304,12 +6542,26 @@ fn window_has_too_few_output_tokens(
             let _ = window.samples.pop_front();
         }
     }
-    window
-        .samples
-        .iter()
-        .map(|(_, output_tokens)| *output_tokens)
-        .sum::<u64>()
-        < minimum_output_tokens
+}
+
+#[derive(Debug, Default)]
+struct WatchdogSchedule {
+    next_due: HashMap<String, Instant>,
+}
+
+impl WatchdogSchedule {
+    fn due_profiles(&mut self, now: Instant, profiles: &[(String, Duration)]) -> Vec<String> {
+        profiles
+            .iter()
+            .filter_map(|(name, interval)| {
+                let due = self.next_due.get(name).is_none_or(|next| *next <= now);
+                due.then(|| {
+                    self.next_due.insert(name.clone(), now + *interval);
+                    name.clone()
+                })
+            })
+            .collect()
+    }
 }
 
 async fn run_stuck_engine_watchdog(
@@ -6319,6 +6571,7 @@ async fn run_stuck_engine_watchdog(
     tokens: Arc<StuckWatchdogTokenTracker>,
     shutdown: Arc<ShutdownGate>,
 ) {
+    let mut schedule = WatchdogSchedule::default();
     loop {
         let Ok(snapshot) = config.snapshot() else {
             let mut shutdown_gate = shutdown.subscribe();
@@ -6329,13 +6582,35 @@ async fn run_stuck_engine_watchdog(
             continue;
         };
         let profiles = watchdog_upstream_profiles(&snapshot);
-        let mut next_check_secs = 60;
+        let scheduled_profiles = profiles
+            .iter()
+            .filter(|profile| profile.stuck_watchdog.enabled)
+            .map(|profile| {
+                (
+                    profile.name.clone(),
+                    Duration::from_secs(profile.stuck_watchdog.check_interval_secs),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Bound retention every watchdog tick, including idle profiles. Retention
+        // must not depend on an active request that might never finish.
+        for profile in &profiles {
+            if profile.stuck_watchdog.enabled {
+                tokens.prune_profile(
+                    &profile.name,
+                    Duration::from_secs(profile.stuck_watchdog.detection_window_secs),
+                );
+            }
+        }
+        let due_profiles = schedule.due_profiles(Instant::now(), &scheduled_profiles);
         for profile in profiles {
-            let watchdog = &profile.stuck_watchdog;
-            if !watchdog.enabled {
+            if !due_profiles
+                .iter()
+                .any(|due_profile| due_profile == &profile.name)
+            {
                 continue;
             }
-            next_check_secs = next_check_secs.min(watchdog.check_interval_secs);
+            let watchdog = &profile.stuck_watchdog;
             let detection_window = Duration::from_secs(watchdog.detection_window_secs);
             if !tokens.has_active_requests(&profile.name)
                 || !tokens.has_too_few_output_tokens(
@@ -6356,6 +6631,12 @@ async fn run_stuck_engine_watchdog(
                 profile.name, watchdog.detection_window_secs, watchdog.min_output_tokens_in_window,
             );
             let coordinator = local_recovery.coordinator_for(&profile.name);
+            coordinator
+                .watchdog_detections
+                .fetch_add(1, Ordering::Relaxed);
+            coordinator
+                .watchdog_restarts
+                .fetch_add(1, Ordering::Relaxed);
             let recovery = run_local_recovery_for_profile(
                 &policy,
                 &coordinator,
@@ -6364,6 +6645,19 @@ async fn run_stuck_engine_watchdog(
                 LocalRecoveryCause::UpstreamStall,
             )
             .await;
+            match recovery.get("local_recovery_status").map(String::as_str) {
+                Some("succeeded") => {
+                    coordinator
+                        .watchdog_recovery_successes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                Some("completion_timeout" | "join_timeout" | "readiness_timeout") => {
+                    coordinator
+                        .watchdog_recovery_timeouts
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                _ => {}
+            }
             eprintln!(
                 "llm_guard_proxy_stuck_watchdog profile={} event=recovery_finished status={}",
                 profile.name,
@@ -6374,7 +6668,9 @@ async fn run_stuck_engine_watchdog(
         }
         let mut shutdown_gate = shutdown.subscribe();
         tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(next_check_secs)) => {}
+            // The loop wakes cheaply, while `schedule` enforces each profile's own
+            // cadence instead of collapsing all intervals to a global minimum.
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
             () = shutdown_gate.cancelled() => return,
         }
     }
@@ -6417,6 +6713,7 @@ async fn wait_for_restart_queue(
         let _ = notified.as_mut().enable();
 
         let state = coordinator.state.lock().await;
+        let recovery_deadline = state.recovery_deadline.unwrap_or(deadline);
         if !state.running {
             if !waited_for_recovery {
                 return RestartQueueWaitResult::NotRecovering;
@@ -6434,7 +6731,9 @@ async fn wait_for_restart_queue(
         waited_for_recovery = true;
         drop(state);
 
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining = deadline
+            .min(recovery_deadline)
+            .saturating_duration_since(Instant::now());
         if remaining.is_zero() || timeout(remaining, notified).await.is_err() {
             return RestartQueueWaitResult::TimedOut;
         }
@@ -6453,6 +6752,12 @@ async fn wait_for_profile_restart_queue(
 
     let queue_deadline = restart_queue_wait_deadline(queue);
     let coordinator = state.local_recovery.coordinator_for(&profile.name);
+    // Restart waiters are deliberately accounted in the bounded queue, never in
+    // generation in-flight capacity. The caller has released its routing permit
+    // before reaching this wait.
+    let _restart_queue_permit = state
+        .acquire_restart_queue_permit(profile, &coordinator)
+        .await?;
     match wait_for_restart_queue(&coordinator, queue_deadline).await {
         RestartQueueWaitResult::NotRecovering => Ok(()),
         RestartQueueWaitResult::Ready => {
@@ -6496,6 +6801,15 @@ fn restart_queue_wait_deadline(queue: &RestartQueueConfig) -> Duration {
     Duration::from_secs(queue.queue_deadline_secs.min(queue.restart_timeout_secs))
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct WatchdogMetricsSnapshot {
+    detections: u64,
+    restarts: u64,
+    recovery_successes: u64,
+    recovery_timeouts: u64,
+    restart_queue_depth: u64,
+}
+
 #[derive(Debug, Default)]
 struct LocalRecoveryCoordinatorSet {
     coordinators: Mutex<HashMap<String, Arc<UpstreamStallRecoveryCoordinator>>>,
@@ -6511,6 +6825,38 @@ impl LocalRecoveryCoordinatorSet {
             .entry(profile.to_owned())
             .or_insert_with(|| Arc::new(UpstreamStallRecoveryCoordinator::default()))
             .clone()
+    }
+
+    fn watchdog_metrics_snapshot(&self) -> WatchdogMetricsSnapshot {
+        let coordinators = match self.coordinators.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        coordinators.values().fold(
+            WatchdogMetricsSnapshot::default(),
+            |mut metrics, coordinator| {
+                metrics.detections = metrics
+                    .detections
+                    .saturating_add(coordinator.watchdog_detections.load(Ordering::Relaxed));
+                metrics.restarts = metrics
+                    .restarts
+                    .saturating_add(coordinator.watchdog_restarts.load(Ordering::Relaxed));
+                metrics.recovery_successes = metrics.recovery_successes.saturating_add(
+                    coordinator
+                        .watchdog_recovery_successes
+                        .load(Ordering::Relaxed),
+                );
+                metrics.recovery_timeouts = metrics.recovery_timeouts.saturating_add(
+                    coordinator
+                        .watchdog_recovery_timeouts
+                        .load(Ordering::Relaxed),
+                );
+                metrics.restart_queue_depth = metrics
+                    .restart_queue_depth
+                    .saturating_add(coordinator.restart_queue_depth.load(Ordering::Relaxed));
+                metrics
+            },
+        )
     }
 }
 
@@ -8902,6 +9248,13 @@ async fn run_local_recovery_for_profile(
     }
 
     state.running = true;
+    state.recovery_started = Some(now);
+    state.recovery_deadline = Some(
+        now + policy
+            .restart_timeout
+            .saturating_add(policy.readiness_deadline)
+            .saturating_add(Duration::from_secs(1)),
+    );
     state.runs_in_window = state.runs_in_window.saturating_add(1);
     drop(state);
 
@@ -8943,11 +9296,16 @@ async fn wait_for_local_recovery_result(
     coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
     joined_inflight: bool,
 ) -> BTreeMap<String, String> {
-    let deadline = Instant::now()
-        + policy
-            .restart_timeout
-            .saturating_add(policy.readiness_deadline)
-            .saturating_add(Duration::from_secs(1));
+    let mut state = coordinator.state.lock().await;
+    let recovery_started = *state.recovery_started.get_or_insert_with(Instant::now);
+    let deadline = *state.recovery_deadline.get_or_insert_with(|| {
+        recovery_started
+            + policy
+                .restart_timeout
+                .saturating_add(policy.readiness_deadline)
+                .saturating_add(Duration::from_secs(1))
+    });
+    drop(state);
     loop {
         let notified = coordinator.notify.notified();
         tokio::pin!(notified);
@@ -11065,6 +11423,13 @@ struct ForwardedBodyObserver {
 }
 
 impl ForwardedBodyObserver {
+    fn record_chunk(&self, chunk: &[u8]) {
+        if let Some(stuck_watchdog_request) = &self.stuck_watchdog_request {
+            // This is invoked from the body poll that yields the chunk downstream.
+            stuck_watchdog_request.record_emitted_chunk(chunk);
+        }
+    }
+
     fn record(self, body_bytes: u64, completion: &BodyCompletion, response_body: &Bytes) {
         let finished_at_unix_ms = unix_time_millis();
         let mut attempts = self.completed_attempt_records;
@@ -11533,6 +11898,9 @@ impl Stream for ObservedUpstreamBody {
             Poll::Ready(Some(Ok(bytes))) => {
                 let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 this.bytes_seen = this.bytes_seen.saturating_add(chunk_len);
+                if let Some(observer) = &this.observer {
+                    observer.record_chunk(&bytes);
+                }
                 if this.body_buffer.len() < TOKEN_USAGE_BODY_CAP {
                     let remaining = TOKEN_USAGE_BODY_CAP - this.body_buffer.len();
                     let take = remaining.min(bytes.len());
