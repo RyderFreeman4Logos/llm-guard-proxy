@@ -4,6 +4,7 @@ use super::*;
 enum PrimaryChatScript {
     AlwaysUnavailable,
     LoopThenUnavailable,
+    LoopThenSuccess,
 }
 
 #[derive(Clone)]
@@ -179,6 +180,58 @@ async fn shielded_physical_attempts_preserve_later_retry_failover_chain() {
     assert_endpoint_attribution(&metadata, 2, "failover", true);
 }
 
+#[tokio::test]
+async fn shielded_retry_stays_on_the_successful_failover_endpoint() {
+    let mut primary = spawn_scripted_primary(PrimaryChatScript::AlwaysUnavailable).await;
+    let fallback = spawn_scripted_primary(PrimaryChatScript::LoopThenSuccess).await;
+    let config = shielded_failover_config(&primary.base_url, &fallback.base_url, None, 3);
+    let proxy = spawn_observed_failover_proxy(&primary.base_url, &config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .json(&json!({
+            "model": "same-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "keep the terminal failover endpoint"}],
+        }))
+        .send()
+        .await
+        .expect("shielded retry should complete through the fallback endpoint");
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .bytes()
+        .await
+        .expect("shielded fallback retry stream should drain");
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    let metadata = read_attempt_request_metadata_rows(&proxy.sqlite_path);
+    assert_attempt_numbers(&attempts, &[1, 2, 3]);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(
+        attempts[0].retry_reason.as_deref(),
+        Some("endpoint_http_503")
+    );
+    assert_eq!(attempts[1].status, "retried");
+    assert_eq!(attempts[1].retry_reason.as_deref(), Some("loop_detected"));
+    assert_eq!(attempts[2].status, "succeeded");
+    assert_endpoint_attribution(&metadata, 0, "primary", false);
+    assert_endpoint_attribution(&metadata, 1, "failover", true);
+    assert_endpoint_attribution(&metadata, 2, "failover", false);
+    assert_eq!(primary.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(
+        primary.recv_next().await.path_and_query,
+        "/v1/chat/completions"
+    );
+    assert!(
+        primary
+            .recv_within(Duration::from_millis(100))
+            .await
+            .is_none(),
+        "the unhealthy primary must not receive a second logical shielded retry"
+    );
+}
+
 fn request_model(request: &ObservedRequest) -> String {
     let value: serde_json::Value =
         serde_json::from_slice(&request.body).expect("forwarded chat body should be JSON");
@@ -261,10 +314,27 @@ async fn scripted_primary_handler(
         return json_response("models", r#"{"object":"list","data":[]}"#.to_owned());
     }
     let attempt = state.chat_attempts.fetch_add(1, Ordering::SeqCst);
-    if matches!(state.script, PrimaryChatScript::LoopThenUnavailable) && attempt == 0 {
+    if matches!(
+        state.script,
+        PrimaryChatScript::LoopThenUnavailable | PrimaryChatScript::LoopThenSuccess
+    ) && attempt == 0
+    {
         return repeated_reasoning_line_sse_response(200);
     }
+    if matches!(state.script, PrimaryChatScript::LoopThenSuccess) {
+        return completed_chat_sse_response();
+    }
     upstream_status_json_response(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn completed_chat_sse_response() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .body(Body::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"fallback success\"}}]}\n\ndata: [DONE]\n\n",
+        ))
+        .expect("scripted successful SSE response should build")
 }
 
 fn shielded_failover_config(

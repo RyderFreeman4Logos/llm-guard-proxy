@@ -5093,6 +5093,7 @@ struct SentUpstreamResponse {
     attempt_request_metadata: BTreeMap<String, String>,
     completed_attempt_records: Vec<AttemptRecord>,
     did_failover: bool,
+    terminal_endpoint: Option<UpstreamEndpointConfig>,
     terminal_endpoint_protocol: UpstreamEndpointProtocol,
 }
 
@@ -5280,7 +5281,11 @@ fn finalize_sent_upstream_response(
     request_id: &RequestId,
     request_metadata: &BTreeMap<String, String>,
 ) -> Result<SentUpstreamResponse, ProxyError> {
-    let disposition = endpoint_disposition(&result, terminal_attempt.protocol);
+    let disposition = endpoint_disposition(
+        &result,
+        terminal_attempt.protocol,
+        terminal_attempt.endpoint.as_ref(),
+    );
     terminal_attempt.request_metadata.insert(
         String::from("endpoint_disposition"),
         String::from(disposition),
@@ -5294,6 +5299,7 @@ fn finalize_sent_upstream_response(
             attempt_request_metadata: terminal_attempt.request_metadata,
             did_failover: !completed_attempt_records.is_empty(),
             completed_attempt_records,
+            terminal_endpoint: terminal_attempt.endpoint.clone(),
             terminal_endpoint_protocol: terminal_attempt.protocol,
         }),
         Err(error) => {
@@ -5353,7 +5359,11 @@ async fn continue_endpoint_failover(
         Some(runtime.retry.original_downstream_headers),
     );
     let mut terminal_recovery_trial_lease = None;
-    while is_retryable_endpoint_result(&result, terminal_attempt.protocol) {
+    while is_retryable_endpoint_result(
+        &result,
+        terminal_attempt.protocol,
+        terminal_attempt.endpoint.as_ref(),
+    ) {
         mark_retryable_endpoint_failure(runtime.retry.registry, &terminal_attempt, &result);
         if attempted_base_urls.len() >= eligible_endpoint_count {
             break;
@@ -5384,7 +5394,11 @@ async fn continue_endpoint_failover(
         };
         completed_attempt_records.push(retried_endpoint_attempt_record(
             &result,
-            terminal_attempt.protocol,
+            endpoint_disposition(
+                &result,
+                terminal_attempt.protocol,
+                terminal_attempt.endpoint.as_ref(),
+            ),
             terminal_attempt.attempt_id.clone(),
             terminal_attempt.attempt_number,
             runtime.request_id.clone(),
@@ -5624,7 +5638,7 @@ fn annotate_physical_endpoint_attempt(
 
 fn retried_endpoint_attempt_record(
     result: &Result<EndpointResponse, ProxyError>,
-    protocol: UpstreamEndpointProtocol,
+    disposition: &'static str,
     attempt_id: AttemptId,
     attempt_number: u32,
     request_id: RequestId,
@@ -5634,7 +5648,7 @@ fn retried_endpoint_attempt_record(
     let finished_at_unix_ms = unix_time_millis();
     request_metadata.insert(
         String::from("endpoint_disposition"),
-        String::from(endpoint_disposition(result, protocol)),
+        String::from(disposition),
     );
     match result {
         Ok(response) => {
@@ -5715,6 +5729,7 @@ fn retry_reason_for_endpoint_result(result: &Result<EndpointResponse, ProxyError
 fn is_retryable_endpoint_result(
     result: &Result<EndpointResponse, ProxyError>,
     protocol: UpstreamEndpointProtocol,
+    endpoint: Option<&UpstreamEndpointConfig>,
 ) -> bool {
     match result {
         Err(ProxyError::UpstreamTransport { failure, .. }) => {
@@ -5727,6 +5742,7 @@ fn is_retryable_endpoint_result(
         Ok(response) => match response.status() {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+                    || endpoint_has_configured_credential(endpoint)
             }
             StatusCode::REQUEST_TIMEOUT
             | StatusCode::TOO_MANY_REQUESTS
@@ -5740,6 +5756,10 @@ fn is_retryable_endpoint_result(
     }
 }
 
+fn endpoint_has_configured_credential(endpoint: Option<&UpstreamEndpointConfig>) -> bool {
+    endpoint.is_some_and(|endpoint| endpoint.api_key_env.is_some())
+}
+
 fn is_caller_scoped_rate_limit(result: &Result<EndpointResponse, ProxyError>) -> bool {
     matches!(result, Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS)
 }
@@ -5750,6 +5770,7 @@ fn mark_retryable_endpoint_failure(
     result: &Result<EndpointResponse, ProxyError>,
 ) {
     if (attempt.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+        || endpoint_has_configured_credential(attempt.endpoint.as_ref())
         || !is_caller_scoped_rate_limit(result))
         && let Some(endpoint) = attempt.endpoint.as_ref()
     {
@@ -5766,7 +5787,7 @@ fn finish_passive_recovery_trial(
         return;
     };
     if !upstream_failover::is_passive_cloud_endpoint(endpoint)
-        || is_retryable_endpoint_result(result, attempt.protocol)
+        || is_retryable_endpoint_result(result, attempt.protocol, Some(endpoint))
     {
         return;
     }
@@ -5778,8 +5799,9 @@ fn finish_passive_recovery_trial(
 fn endpoint_disposition(
     result: &Result<EndpointResponse, ProxyError>,
     protocol: UpstreamEndpointProtocol,
+    endpoint: Option<&UpstreamEndpointConfig>,
 ) -> &'static str {
-    if is_retryable_endpoint_result(result, protocol) {
+    if is_retryable_endpoint_result(result, protocol, endpoint) {
         return "retryable_failure";
     }
     match result {
@@ -7051,6 +7073,9 @@ struct ShieldedStartedAttempt {
     info: ShieldedAttemptInfo,
     response: reqwest::Response,
     completed_endpoint_attempt_records: Vec<AttemptRecord>,
+    terminal_endpoint: UpstreamEndpointConfig,
+    terminal_endpoint_protocol: UpstreamEndpointProtocol,
+    endpoint_retry_order: Vec<String>,
     ignores_request_deadline: bool,
 }
 
@@ -7655,7 +7680,7 @@ async fn aggregate_shielded_attempt(
 
 #[allow(clippy::too_many_lines)]
 async fn run_shielded_attempts(
-    runtime: ShieldedRetryRuntime,
+    mut runtime: ShieldedRetryRuntime,
     initial_attempt: Option<ShieldedStartedAttempt>,
     mut attempt_records: Vec<AttemptRecord>,
     allow_terminal_forward: bool,
@@ -7709,6 +7734,7 @@ async fn run_shielded_attempts(
                 }
             }
         };
+        update_shielded_retry_endpoint(&mut runtime, &started);
         attempt_records.append(&mut started.completed_endpoint_attempt_records);
 
         update_shielded_attempt_progress(
@@ -9167,6 +9193,7 @@ async fn start_shielded_attempt(
         Ok(sent) => sent,
         Err(error) => return Err(shielded_start_transport_failure(start_failure(error))),
     };
+    let (terminal_endpoint, endpoint_retry_order) = shielded_retry_endpoint(runtime, &sent);
     let EndpointResponse::Upstream(response) = sent.response else {
         return Err(shielded_start_transport_failure(start_failure(
             ProxyError::upstream_body(String::from(
@@ -9193,6 +9220,9 @@ async fn start_shielded_attempt(
         },
         response,
         completed_endpoint_attempt_records: sent.completed_attempt_records,
+        terminal_endpoint,
+        terminal_endpoint_protocol: sent.terminal_endpoint_protocol,
+        endpoint_retry_order,
         ignores_request_deadline,
     })
 }
@@ -9208,6 +9238,42 @@ fn render_shielded_endpoint_body(
         &runtime.original_downstream_headers,
         runtime.transformed_request_headers,
     )
+}
+
+fn shielded_retry_endpoint(
+    runtime: &ShieldedRetryRuntime,
+    sent: &SentUpstreamResponse,
+) -> (UpstreamEndpointConfig, Vec<String>) {
+    let terminal_endpoint = sent
+        .terminal_endpoint
+        .clone()
+        .unwrap_or_else(|| runtime.terminal_endpoint.clone());
+    let endpoint_retry_order =
+        shielded_endpoint_retry_order(&terminal_endpoint, &runtime.endpoint_retry_order);
+    (terminal_endpoint, endpoint_retry_order)
+}
+
+fn shielded_endpoint_retry_order(
+    terminal_endpoint: &UpstreamEndpointConfig,
+    endpoint_retry_order: &[String],
+) -> Vec<String> {
+    let mut retry_order = endpoint_retry_order.to_vec();
+    retry_order.retain(|base_url| base_url != &terminal_endpoint.base_url);
+    retry_order.insert(0, terminal_endpoint.base_url.clone());
+    retry_order
+}
+
+fn update_shielded_retry_endpoint(
+    runtime: &mut ShieldedRetryRuntime,
+    started: &ShieldedStartedAttempt,
+) {
+    runtime
+        .terminal_endpoint
+        .clone_from(&started.terminal_endpoint);
+    runtime.terminal_endpoint_protocol = started.terminal_endpoint_protocol;
+    runtime
+        .endpoint_retry_order
+        .clone_from(&started.endpoint_retry_order);
 }
 
 fn shielded_attempt_upstream_timeout(

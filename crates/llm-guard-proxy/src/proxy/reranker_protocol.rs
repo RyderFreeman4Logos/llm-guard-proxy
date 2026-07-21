@@ -22,14 +22,13 @@ const MAX_PAIR_COUNT: usize = 1_024;
 const MAX_REQUEST_ID_BYTES: usize = 256;
 const MAX_DEEPINFRA_RENDERED_BODY_BYTES: usize = 1_048_576;
 /// Only these request headers may cross into an endpoint with a configured credential.
-const ISOLATED_THIRD_PARTY_SAFE_HEADERS: [&str; 37] = [
+const ISOLATED_THIRD_PARTY_SAFE_HEADERS: [&str; 34] = [
     "accept",
     "accept-charset",
     "accept-encoding",
     "accept-language",
     "access-control-request-headers",
     "access-control-request-method",
-    "baggage",
     "cache-control",
     "content-encoding",
     "content-language",
@@ -49,9 +48,7 @@ const ISOLATED_THIRD_PARTY_SAFE_HEADERS: [&str; 37] = [
     "origin",
     "pragma",
     "range",
-    "referer",
     "traceparent",
-    "tracestate",
     "user-agent",
     "via",
     "x-amzn-trace-id",

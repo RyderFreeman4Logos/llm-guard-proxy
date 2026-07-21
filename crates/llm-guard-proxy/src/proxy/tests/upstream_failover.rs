@@ -167,6 +167,12 @@ async fn openai_third_party_failover_rewrites_model_and_isolates_credentials() {
         .header("proxy-authorization", "Basic inbound-proxy-auth")
         .header("signature", "sig=:inbound-signature:")
         .header("signature-input", "sig=(\"authorization\")")
+        .header("baggage", "api_key=inbound-baggage-secret")
+        .header(
+            "referer",
+            "https://caller.example/?token=inbound-referer-secret",
+        )
+        .header("tracestate", "vendor=api_key=inbound-tracestate-secret")
         .header("x-request-id", "safe-generic-request-id")
         .json(&json!({"model": "same-model", "input": "fail over"}))
         .send()
@@ -205,10 +211,13 @@ async fn openai_third_party_failover_rewrites_model_and_isolates_credentials() {
         "proxy-authorization",
         "signature",
         "signature-input",
+        "baggage",
+        "referer",
+        "tracestate",
     ] {
         assert!(
             !request.headers.contains_key(name),
-            "third-party origin received inbound credential header {name}"
+            "third-party origin received inbound credential or opaque metadata header {name}"
         );
     }
     assert_eq!(
@@ -803,6 +812,60 @@ async fn terminal_cloud_retryable_statuses_enter_passive_cooldown() {
 }
 
 #[tokio::test]
+async fn configured_openai_auth_and_rate_limit_failures_fail_over_and_enter_cooldown() {
+    for status in [
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::TOO_MANY_REQUESTS,
+    ] {
+        let mut primary = FakeUpstream::spawn_with_rerank_status(status).await;
+        let mut fallback = FakeUpstream::spawn().await;
+        let extra_config = credentialed_openai_primary_failover_profile_config(
+            &primary.base_url,
+            &fallback.base_url,
+        );
+        let proxy = spawn_failover_proxy(&primary.base_url, &extra_config).await;
+
+        let first = proxy
+            .client
+            .post(format!("{}/v1/rerank", proxy.base_url))
+            .json(&json!({"model": "same-model", "query": "configured credential failure", "documents": ["d"]}))
+            .send()
+            .await
+            .expect("configured OpenAI failure should fail over");
+        assert_eq!(first.status(), StatusCode::OK);
+        first
+            .bytes()
+            .await
+            .expect("first response body should drain");
+        assert_eq!(primary.recv_next().await.path_and_query, "/v1/rerank");
+        assert_eq!(fallback.recv_next().await.path_and_query, "/v1/models");
+        assert_eq!(fallback.recv_next().await.path_and_query, "/v1/rerank");
+
+        let second = proxy
+            .client
+            .post(format!("{}/v1/rerank", proxy.base_url))
+            .json(&json!({"model": "same-model", "query": "configured credential cooldown", "documents": ["d"]}))
+            .send()
+            .await
+            .expect("healthy fallback should serve during configured credential cooldown");
+        assert_eq!(second.status(), StatusCode::OK);
+        second
+            .bytes()
+            .await
+            .expect("second response body should drain");
+        assert_eq!(fallback.recv_next().await.path_and_query, "/v1/rerank");
+        assert!(
+            primary
+                .recv_within(Duration::from_millis(30))
+                .await
+                .is_none(),
+            "configured OpenAI {status} must cool down the failed primary"
+        );
+    }
+}
+
+#[tokio::test]
 async fn nonretryable_local_client_error_fails_closed_without_backup_attempt() {
     let mut primary = FakeUpstream::spawn_with_rerank_status(StatusCode::BAD_REQUEST).await;
     let mut backup = FakeUpstream::spawn().await;
@@ -1192,6 +1255,28 @@ protocol = "openai"
     if let Some(model) = model {
         writeln!(config, "model = \"{model}\"").expect("write test config");
     }
+    config
+}
+
+fn credentialed_openai_primary_failover_profile_config(
+    primary_base_url: &str,
+    fallback_base_url: &str,
+) -> String {
+    let mut config = openai_single_endpoint_profile_config(
+        primary_base_url,
+        Some(THIRD_PARTY_TEST_KEY_ENV),
+        None,
+    );
+    write!(
+        config,
+        r#"
+[[profile.upstream]]
+base_url = "{fallback_base_url}"
+priority = "failover"
+protocol = "openai"
+"#
+    )
+    .expect("write test config");
     config
 }
 
