@@ -12,6 +12,117 @@ mod response_and_recovery;
 const THIRD_PARTY_TEST_KEY_ENV: &str = "PATH";
 
 #[tokio::test]
+async fn shielded_streaming_chat_isolates_configured_endpoint_credentials() {
+    let mut upstream = FakeUpstream::spawn().await;
+    let extra_config = format!(
+        r"
+{}
+
+[shielding]
+enabled = true
+
+[retry]
+enabled = true
+max_attempts = 2
+shielded_streaming_enabled = true
+",
+        openai_single_endpoint_profile_config(
+            &upstream.base_url,
+            Some(THIRD_PARTY_TEST_KEY_ENV),
+            None,
+        )
+    );
+    let proxy = spawn_failover_proxy(&upstream.base_url, &extra_config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(AUTHORIZATION, "Bearer inbound-authorization")
+        .header("x-api-key", "inbound-api-key")
+        .header("x-session-token", "inbound-session-token")
+        .header("openai-organization", "inbound-organization")
+        .header("openai-project", "inbound-project")
+        .header("cookie", "inbound-cookie=value")
+        .json(&json!({
+            "model": "same-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "isolate configured credentials"}],
+        }))
+        .send()
+        .await
+        .expect("shielded streaming chat should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .bytes()
+        .await
+        .expect("shielded stream should drain");
+    let request = upstream.recv_next().await;
+    let expected_authorization = format!(
+        "Bearer {}",
+        std::env::var(THIRD_PARTY_TEST_KEY_ENV).expect("test credential env should exist")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_authorization.as_str())
+    );
+    for name in [
+        "x-api-key",
+        "x-session-token",
+        "openai-organization",
+        "openai-project",
+        "cookie",
+    ] {
+        assert!(
+            !request.headers.contains_key(name),
+            "configured endpoint received inbound credential or session header {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn shielded_chat_retries_a_503_on_the_configured_failover_endpoint() {
+    let primary_base_url = spawn_shielded_503_upstream().await;
+    let mut fallback = FakeUpstream::spawn().await;
+    let extra_config =
+        shielded_openai_failover_profile_config(&primary_base_url, &fallback.base_url);
+    let proxy = spawn_failover_proxy(&primary_base_url, &extra_config).await;
+
+    let response = timeout(
+        Duration::from_secs(5),
+        proxy
+            .client
+            .post(format!(
+                "{}/v1/chat/completions?test=shielded-endpoint-failover",
+                proxy.base_url
+            ))
+            .json(&json!({
+                "model": "same-model",
+                "stream": true,
+                "messages": [{"role": "user", "content": "retry on the fallback endpoint"}],
+            }))
+            .send(),
+    )
+    .await
+    .expect("shielded endpoint failover should not wait on the failed primary")
+    .expect("shielded chat should retry after the primary 503");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .bytes()
+        .await
+        .expect("shielded fallback stream should drain");
+    assert_eq!(fallback.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(
+        fallback.recv_next().await.path_and_query,
+        "/v1/chat/completions?test=shielded-endpoint-failover"
+    );
+}
+
+#[tokio::test]
 async fn openai_third_party_failover_rewrites_model_and_isolates_credentials() {
     let primary_base_url = closed_upstream_base_url().await;
     let mut third_party = FakeUpstream::spawn().await;
@@ -918,6 +1029,71 @@ async fn closed_upstream_base_url() -> String {
         .expect("closed upstream address should be available");
     drop(listener);
     format!("http://{addr}/v1")
+}
+
+async fn spawn_shielded_503_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("shielded primary should bind");
+    let addr = listener
+        .local_addr()
+        .expect("shielded primary address should be available");
+    let app = axum::Router::new().fallback(|request: Request<Body>| async move {
+        if request.uri().path() == "/v1/models" {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"object":"list","data":[]}"#))
+                .expect("models response should build");
+        }
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::empty())
+            .expect("503 response should build")
+    });
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            eprintln!("shielded 503 upstream server failed: {error}");
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+fn shielded_openai_failover_profile_config(
+    primary_base_url: &str,
+    fallback_base_url: &str,
+) -> String {
+    format!(
+        r#"
+[[profile]]
+model = "same-model"
+request_timeout_ms = 1_000
+health_probe_interval = "200ms"
+health_probe_timeout = "20ms"
+health_probe_max_wait = "400ms"
+
+[[profile.upstream]]
+base_url = "{primary_base_url}"
+priority = "primary"
+protocol = "openai"
+
+[[profile.upstream]]
+base_url = "{fallback_base_url}"
+priority = "failover"
+protocol = "openai"
+
+[shielding]
+enabled = true
+
+[upstream.hot_restart]
+enabled = false
+
+[retry]
+enabled = true
+max_attempts = 2
+shielded_streaming_enabled = true
+"#
+    )
 }
 
 fn failover_profile_config(

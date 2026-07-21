@@ -966,6 +966,7 @@ fn gb10_deploy_uncomment_ready_examples_parse() {
         "upstream-local-recovery",
         "upstream-profile",
         "heterogeneous-reranker-replicas",
+        "generic-openai-reranker-failover",
     ] {
         assert_deploy_example_parses(name);
     }

@@ -2996,16 +2996,24 @@ async fn forward_openai_request(
         let local_recovery = state
             .local_recovery
             .coordinator_for(&prepared_request.upstream_profile.name);
-        return forward_shielded_chat_with_retries(
+        return Box::pin(forward_shielded_chat_with_retries(
             ShieldedRetryRuntime {
                 client: state.client.clone(),
                 method: prepared_request.reqwest_method,
                 upstream_url: prepared_request.upstream_url,
                 downstream_method: method,
                 downstream_uri: uri,
-                downstream_headers,
+                upstream_headers: prepared_request
+                    .upstream_headers
+                    .unwrap_or_else(|| downstream_headers.clone()),
+                original_downstream_headers: downstream_headers,
                 upstream_body: prepared_request.shielded_chat_plan.upstream_body,
                 downstream_body: prepared_request.shielded_chat_plan.downstream_body,
+                forward_uri: prepared_request.forward_uri,
+                transformed_request_headers: prepared_request.transformed_request_headers,
+                terminal_endpoint: prepared_request.terminal_endpoint,
+                terminal_endpoint_protocol: prepared_request.terminal_endpoint_protocol,
+                endpoint_retry_order: prepared_request.endpoint_retry_order,
                 chat_kind: prepared_request.shielded_chat_plan.kind,
                 upstream_timeout,
                 config: state.config.clone(),
@@ -3032,6 +3040,7 @@ async fn forward_openai_request(
                 request_deadline,
                 upstream_stall_policy,
                 upstream_stall_recovery: state.upstream_stall_recovery.clone(),
+                upstream_health: state.upstream_health.clone(),
                 local_recovery_policy,
                 local_recovery,
                 local_recovery_attempts: Arc::new(AtomicU64::new(0)),
@@ -3048,7 +3057,7 @@ async fn forward_openai_request(
                 shielded_heartbeat_ticks: state.shielded_heartbeat_ticks.clone(),
             },
             in_flight_permit,
-        )
+        ))
         .await;
     }
     forward_generic_openai_request(GenericForwardContext {
@@ -6894,9 +6903,15 @@ struct ShieldedRetryRuntime {
     upstream_url: Url,
     downstream_method: Method,
     downstream_uri: Uri,
-    downstream_headers: HeaderMap,
+    upstream_headers: HeaderMap,
+    original_downstream_headers: HeaderMap,
     upstream_body: Bytes,
     downstream_body: Bytes,
+    forward_uri: Uri,
+    transformed_request_headers: bool,
+    terminal_endpoint: UpstreamEndpointConfig,
+    terminal_endpoint_protocol: UpstreamEndpointProtocol,
+    endpoint_retry_order: Vec<String>,
     chat_kind: ShieldedChatKind,
     upstream_timeout: Duration,
     config: ConfigHandle,
@@ -6923,6 +6938,7 @@ struct ShieldedRetryRuntime {
     request_deadline: ShieldedRequestDeadline,
     upstream_stall_policy: UpstreamStallPolicy,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
+    upstream_health: Arc<UpstreamHealthRegistry>,
     local_recovery_policy: LocalRecoveryPolicy,
     local_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     local_recovery_attempts: Arc<AtomicU64>,
@@ -7034,6 +7050,7 @@ fn shadow_evidence_inner(
 struct ShieldedStartedAttempt {
     info: ShieldedAttemptInfo,
     response: reqwest::Response,
+    completed_endpoint_attempt_records: Vec<AttemptRecord>,
     ignores_request_deadline: bool,
 }
 
@@ -7539,7 +7556,7 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
                 std::mem::take(&mut attempt_records),
             ));
         }
-        let started = match start_shielded_attempt(
+        let mut started = match start_shielded_attempt(
             runtime,
             attempt_number,
             retry_cause,
@@ -7565,6 +7582,7 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
                 }
             }
         };
+        attempt_records.append(&mut started.completed_endpoint_attempt_records);
 
         match shielded_started_attempt_step(runtime, started, &mut attempt_records, true).await {
             ShieldedAttemptStep::Aggregatable(started) => {
@@ -9094,8 +9112,8 @@ async fn start_shielded_attempt(
         &attempt_plan,
         cot_salvage,
     );
-    let raw_request_body = raw_payload_text(&upstream_body);
-    let evidence_upstream_body = upstream_body.clone();
+    let (raw_request_body, evidence_upstream_body) =
+        (raw_payload_text(&upstream_body), upstream_body.clone());
     let request_metadata = shielded_attempt_request_metadata(
         runtime,
         attempt_number,
@@ -9115,52 +9133,116 @@ async fn start_shielded_attempt(
                 runtime.upstream_timeout.min(remaining)
             })
     };
-    match send_upstream_request_until_shutdown(
-        &runtime.client,
-        runtime.method.clone(),
-        runtime.upstream_url.clone(),
-        &runtime.downstream_headers,
+    let start_failure = |error| ShieldedStartFailureInput {
+        runtime,
+        attempt_id: attempt_id.clone(),
+        attempt_number,
+        attempt_started_at_unix_ms,
+        request_metadata: request_metadata.clone(),
+        raw_request_body: raw_request_body.clone(),
+        evidence_upstream_body: evidence_upstream_body.clone(),
+        error,
+    };
+    let sent = match send_shielded_upstream_attempt(
+        runtime,
+        (
+            attempt_id.clone(),
+            attempt_number,
+            attempt_started_at_unix_ms,
+        ),
+        &request_metadata,
         upstream_body,
         upstream_timeout,
-        runtime.shutdown.subscribe(),
+        ignores_request_deadline,
     )
     .await
     {
-        Ok(response) => {
-            let upstream_status = response.status();
-            let upstream_headers = response.headers().clone();
-            let upstream_mode = upstream_mode_from_headers(&upstream_headers);
-            Ok(ShieldedStartedAttempt {
-                info: ShieldedAttemptInfo {
-                    attempt_id,
-                    request_id: runtime.request_id.clone(),
-                    attempt_number,
-                    attempt_max_attempts: runtime.retry_policy.max_attempts,
-                    started_at_unix_ms: attempt_started_at_unix_ms,
-                    upstream_status,
-                    upstream_headers,
-                    upstream_mode,
-                    request_metadata,
-                    raw_request_body,
-                    upstream_body: evidence_upstream_body,
-                },
-                response,
-                ignores_request_deadline,
-            })
-        }
-        Err(error) => Err(shielded_start_transport_failure(
-            ShieldedStartFailureInput {
-                runtime,
-                attempt_id,
-                attempt_number,
-                attempt_started_at_unix_ms,
-                request_metadata,
-                raw_request_body,
-                evidence_upstream_body,
-                error,
+        Ok(sent) => sent,
+        Err(error) => return Err(shielded_start_transport_failure(start_failure(error))),
+    };
+    let EndpointResponse::Upstream(response) = sent.response else {
+        return Err(shielded_start_transport_failure(start_failure(
+            ProxyError::upstream_body(String::from(
+                "shielded chat request unexpectedly produced a rewritten endpoint response",
+            )),
+        )));
+    };
+    let upstream_status = response.status();
+    let upstream_headers = response.headers().clone();
+    let upstream_mode = upstream_mode_from_headers(&upstream_headers);
+    Ok(ShieldedStartedAttempt {
+        info: ShieldedAttemptInfo {
+            attempt_id: sent.attempt_id,
+            request_id: runtime.request_id.clone(),
+            attempt_number: sent.attempt_number,
+            attempt_max_attempts: runtime.retry_policy.max_attempts,
+            started_at_unix_ms: sent.attempt_started_at_unix_ms,
+            upstream_status,
+            upstream_headers,
+            upstream_mode,
+            request_metadata: sent.attempt_request_metadata,
+            raw_request_body,
+            upstream_body: evidence_upstream_body,
+        },
+        response,
+        completed_endpoint_attempt_records: sent.completed_attempt_records,
+        ignores_request_deadline,
+    })
+}
+
+async fn send_shielded_upstream_attempt(
+    runtime: &ShieldedRetryRuntime,
+    attempt: (AttemptId, u32, u64),
+    request_metadata: &BTreeMap<String, String>,
+    upstream_body: Bytes,
+    upstream_timeout: Duration,
+    ignores_request_deadline: bool,
+) -> Result<SentUpstreamResponse, ProxyError> {
+    let (attempt_id, attempt_number, attempt_started_at_unix_ms) = attempt;
+    let request_deadline = (!ignores_request_deadline)
+        .then(|| {
+            runtime
+                .request_deadline
+                .remaining()
+                .map(|remaining| Instant::now() + remaining)
+        })
+        .flatten();
+    send_first_upstream_attempt(UpstreamAttemptContext {
+        client: &runtime.client,
+        method: runtime.method.clone(),
+        upstream_url: runtime.upstream_url.clone(),
+        downstream_headers: &runtime.upstream_headers,
+        upstream_body: upstream_body.clone(),
+        retry_body: upstream_body,
+        upstream_timeout,
+        attempt_id,
+        attempt_number,
+        request_id: &runtime.request_id,
+        attempt_started_at_unix_ms,
+        request_metadata,
+        attempt_request_metadata: request_metadata,
+        shutdown: runtime.shutdown.subscribe(),
+        failover_retry: runtime.upstream_profile.has_endpoint_failover().then_some(
+            UpstreamFailoverRetryContext {
+                registry: runtime.upstream_health.as_ref(),
+                profile: &runtime.upstream_profile,
+                local_forward_uri: runtime.forward_uri.clone(),
+                original_downstream_headers: &runtime.original_downstream_headers,
+                canonical_reranker: None,
+                transformed_request_headers: runtime.transformed_request_headers,
+                initial_endpoint: &runtime.terminal_endpoint,
+                request_deadline,
+                endpoint_retry_order: &runtime.endpoint_retry_order,
+                shutdown: runtime.shutdown.as_ref(),
             },
-        )),
-    }
+        ),
+        terminal_endpoint_protocol: runtime.terminal_endpoint_protocol,
+        canonical_reranker: None,
+        decode_heterogeneous_reranker: false,
+        model_id: None,
+        request_deadline,
+    })
+    .await
 }
 
 struct ShieldedStartFailureInput<'runtime> {
@@ -9399,7 +9481,7 @@ fn shielded_attempt_request_metadata(
     let mut metadata = attempt_request_metadata(
         &runtime.downstream_method,
         &runtime.downstream_uri,
-        &runtime.downstream_headers,
+        &runtime.original_downstream_headers,
     );
     add_listener_metadata(&mut metadata, &runtime.listener);
     add_upstream_profile_metadata(
@@ -12799,7 +12881,7 @@ fn schedule_shadow_attempt(
         client: runtime.client.clone(),
         method: runtime.method.clone(),
         upstream_url: runtime.upstream_url.clone(),
-        downstream_headers: runtime.downstream_headers.clone(),
+        downstream_headers: runtime.upstream_headers.clone(),
         upstream_body: plan.upstream_body,
         upstream_timeout: runtime.upstream_timeout,
         evidence_store: runtime.evidence_store.clone(),

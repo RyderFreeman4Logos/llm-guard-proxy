@@ -276,8 +276,8 @@ enabled = false
 #| base_url = "http://100.105.4.92:18013/v1"                           # OpenAI-compatible local replica
 #| priority = "primary"                                                # Preferred while healthy
 #| protocol = "openai"                                                 # Preserves arbitrary OpenAI request shapes
-#| # Option A failover would also use protocol="openai", plus an independent
-#| # api_key_env and optional provider model name, against a standard /v1/rerank.
+# A complete standard OpenAI failover with its own credential and provider model
+# follows. The DeepInfra example remains below for its native-only protocol.
 #| [[upstreams.endpoints]]
 #| base_url = "https://api.deepinfra.com"                              # DeepInfra API origin, without caller credentials
 #| priority = "failover"                                               # Used only after a compatible retry/failover decision
@@ -286,6 +286,27 @@ enabled = false
 #| model_revision = "5fa94080caafeaa45a15d11f969d7978e087a3db"        # Required immutable DeepInfra version; rendered as the exact version query
 #| api_key_env = "LLM_GUARD_PROXY_DEEPINFRA_API_KEY"                   # Runtime credential environment variable; never put the secret here
 # END PARSEABLE EXAMPLE: heterogeneous-reranker-replicas
+
+# BEGIN PARSEABLE EXAMPLE: generic-openai-reranker-failover
+# A standard OpenAI-compatible provider can be a failover without using the
+# DeepInfra-native protocol. The credential name is resolved only at runtime.
+#| [[upstreams]]
+#| name = "example-generic-openai-reranker"
+#| base_url = "http://127.0.0.1:18013/v1"
+#| match_models = ["example-reranker"]
+#| request_timeout_ms = 600000
+#| endpoint_selection = "priority_failover"
+#| [[upstreams.endpoints]]
+#| base_url = "http://127.0.0.1:18013/v1"
+#| priority = "primary"
+#| protocol = "openai"
+#| [[upstreams.endpoints]]
+#| base_url = "https://provider.example.com/v1"
+#| priority = "failover"
+#| protocol = "openai"
+#| api_key_env = "LLM_GUARD_PROXY_GENERIC_OPENAI_API_KEY"
+#| model = "provider/reranker-v1"
+# END PARSEABLE EXAMPLE: generic-openai-reranker-failover
 
 # BEGIN PARSEABLE EXAMPLE: upstream-profile
 #| [[upstreams]]

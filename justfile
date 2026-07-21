@@ -52,6 +52,10 @@ clippy-feature-matrix:
 test:
     {{_io_prefix}} env RUST_TEST_THREADS={{local_test_threads}} cargo test --workspace --all-features
 
+# Focused workspace test runner for TDD and local reproduction.
+test-filter filter:
+    {{_io_prefix}} env RUST_TEST_THREADS={{local_test_threads}} cargo test --workspace --all-features {{filter}}
+
 smoke-gb10:
     scripts/smoke-gb10.sh
 
