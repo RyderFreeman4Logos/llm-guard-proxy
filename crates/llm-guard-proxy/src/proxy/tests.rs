@@ -147,7 +147,7 @@ data: [DONE]
 }
 
 #[test]
-fn stuck_watchdog_detects_only_active_requests_without_enough_output() {
+fn stuck_watchdog_waits_for_a_complete_detection_window_before_declaring_a_new_request_stuck() {
     let tracker = Arc::new(StuckWatchdogTokenTracker::default());
     assert!(!tracker.has_active_requests("default"));
 
@@ -157,7 +157,10 @@ fn stuck_watchdog_detects_only_active_requests_without_enough_output() {
         Duration::from_secs(1),
     );
     assert!(tracker.has_active_requests("default"));
-    assert!(tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 1));
+    assert!(
+        !tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 1),
+        "a request that just began has not yet had a full detection window to produce output"
+    );
 
     request.record_response(br#"{"usage":{"completion_tokens":1}}"#, b"");
     assert!(!tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 1));
@@ -245,6 +248,26 @@ fn watchdog_records_streaming_and_non_chat_progress_when_emitted() {
 }
 
 #[test]
+fn watchdog_ignores_sse_heartbeats_and_control_frames_but_records_content() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let chat = tracker.begin_request("chat", WatchdogProgressUnit::Chat, Duration::from_secs(1));
+
+    chat.record_emitted_chunk(b": llm-guard-proxy heartbeat\n\n");
+    chat.record_emitted_chunk(b"event: ping\ndata: {}\n\n");
+    chat.record_emitted_chunk(b"data: [DONE]\n\n");
+    assert_eq!(
+        tracker.sample_count("chat"),
+        0,
+        "transport heartbeats and terminal control frames are not model output"
+    );
+
+    chat.record_emitted_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"healthy stream\"}}]}\n\n",
+    );
+    assert_eq!(tracker.sample_count("chat"), 1);
+}
+
+#[test]
 fn watchdog_token_samples_are_capped_and_maintained_without_active_requests() {
     let tracker = StuckWatchdogTokenTracker::default();
     for _ in 0..=STUCK_WATCHDOG_TOKEN_SAMPLE_CAP {
@@ -327,6 +350,79 @@ async fn restart_queue_waiters_consume_queue_capacity_not_in_flight_capacity() {
 
     drop(permit);
     assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 0);
+}
+
+#[tokio::test]
+async fn real_default_profile_requests_wait_in_the_restart_queue_until_recovery_finishes() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_full_options_and_extra(ProxyFixtureSpawnOptions {
+        upstream_base_url: &fake.base_url,
+        observability_enabled: true,
+        max_in_flight_requests: 1,
+        server_config: "",
+        metadata_config: "",
+        observability_config: "",
+        evidence_config: "",
+        extra_config: r"
+[upstream.restart_queue]
+enabled = true
+queue_deadline_secs = 1
+restart_timeout_secs = 1
+",
+    })
+    .await;
+    let coordinator = proxy.state.local_recovery.coordinator_for("default");
+    {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery.recovery_started = Some(Instant::now());
+        recovery.recovery_deadline = Some(Instant::now() + Duration::from_secs(1));
+    }
+
+    let request = {
+        let client = proxy.client.clone();
+        let base_url = proxy.base_url.clone();
+        tokio::spawn(async move {
+            client
+                .post(format!("{base_url}/v1/chat/completions?test=restart-queue"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"queue me"}]}"#)
+                .send()
+                .await
+                .expect("queued proxy request should complete")
+        })
+    };
+
+    sleep(Duration::from_millis(40)).await;
+    assert!(
+        !request.is_finished(),
+        "the actual default-profile request must wait during the recovery episode"
+    );
+    assert!(
+        fake.recv_within(Duration::from_millis(40)).await.is_none(),
+        "a queued request must not reach the upstream before recovery is ready"
+    );
+
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+
+    let response = request.await.expect("queued request task should join");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response
+        .text()
+        .await
+        .expect("response body should be readable");
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=restart-queue"
+    );
 }
 
 #[test]
@@ -2041,28 +2137,29 @@ async fn hermes_like_context_extraction_reads_enriched_model_length() {
     let _observed = fake.recv().await;
 }
 
-#[tokio::test]
-async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
-    let mut fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
-    let body = Bytes::from_static(
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"thinking":{"budget_tokens":1},"stream":false}"#,
-    );
+async fn spawn_shielded_watchdog_proxy(upstream_base_url: &str) -> ProxyFixture {
+    ProxyFixture::spawn_with_full_options_and_extra(ProxyFixtureSpawnOptions {
+        upstream_base_url,
+        observability_enabled: true,
+        max_in_flight_requests: 8,
+        metadata_config: "",
+        server_config: "",
+        observability_config: "",
+        evidence_config: "",
+        extra_config: r"
+[upstream.stuck_watchdog]
+enabled = true
+detection_window_secs = 60
+min_output_tokens_in_window = 1
+check_interval_secs = 1
+",
+    })
+    .await
+}
 
-    let response = proxy
-        .client
-        .post(format!(
-            "{}/v1/chat/completions?test=request-id-collision",
-            proxy.base_url
-        ))
-        .header(CONTENT_TYPE, "application/json")
-        .body(body.clone())
-        .send()
-        .await
-        .expect("proxy request should complete");
-
+fn assert_shielded_response_headers(response: &reqwest::Response) -> String {
     assert_eq!(response.status(), StatusCode::OK);
-    let response_request_id = response
+    let request_id = response
         .headers()
         .get("x-request-id")
         .expect("terminal response should include x-request-id")
@@ -2070,7 +2167,7 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
         .expect("x-request-id should be valid header text")
         .to_owned();
     assert_ne!(
-        response_request_id, "upstream-request-id-collision",
+        request_id, "upstream-request-id-collision",
         "proxy terminal response must overwrite the upstream request ID"
     );
     assert_eq!(
@@ -2087,6 +2184,38 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
             .expect("shielded fake upstream SSE should be used"),
         "chat-completions-sse"
     );
+    request_id
+}
+
+fn assert_shielded_watchdog_progress(proxy: &ProxyFixture) {
+    assert!(
+        proxy.state.stuck_watchdog_tokens.sample_count("default") > 0,
+        "shielded upstream SSE content must reach the watchdog before aggregation completes"
+    );
+}
+
+#[tokio::test]
+async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = spawn_shielded_watchdog_proxy(&fake.base_url).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"thinking":{"budget_tokens":1},"stream":false}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=request-id-collision",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    let response_request_id = assert_shielded_response_headers(&response);
+    assert_shielded_watchdog_progress(&proxy);
     let response_body = response.text().await.expect("response body should be text");
     assert!(
         !response_body.starts_with(": llm-guard-proxy heartbeat"),

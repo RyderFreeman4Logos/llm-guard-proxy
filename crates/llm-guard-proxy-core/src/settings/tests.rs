@@ -3458,6 +3458,67 @@ interval_secs = 4
 }
 
 #[test]
+fn named_upstream_watchdog_and_restart_queue_parse_and_hot_reload() {
+    let current = AppConfig::parse(
+        r#"
+[[upstreams]]
+name = "named"
+base_url = "http://127.0.0.1:19000/v1"
+
+[upstreams.stuck_watchdog]
+enabled = false
+detection_window_secs = 90
+min_output_tokens_in_window = 2
+check_interval_secs = 5
+
+[upstreams.restart_queue]
+enabled = false
+queue_deadline_secs = 45
+restart_timeout_secs = 30
+"#,
+    )
+    .expect("named current config should parse");
+    let requested = AppConfig::parse(
+        r#"
+[[upstreams]]
+name = "named"
+base_url = "http://127.0.0.1:19000/v1"
+
+[upstreams.stuck_watchdog]
+enabled = true
+detection_window_secs = 120
+min_output_tokens_in_window = 3
+check_interval_secs = 7
+
+[upstreams.restart_queue]
+enabled = true
+queue_deadline_secs = 60
+restart_timeout_secs = 40
+"#,
+    )
+    .expect("named requested config should parse");
+    let handle = ConfigHandle::new(current);
+
+    let outcome = handle
+        .apply_reloadable(&requested)
+        .expect("named reloadable transition should succeed");
+    let snapshot = handle.snapshot().expect("snapshot should succeed");
+    let named = snapshot
+        .upstream_profiles
+        .first()
+        .expect("named profile should remain configured");
+
+    assert!(outcome.applied);
+    assert!(named.stuck_watchdog.enabled);
+    assert_eq!(named.stuck_watchdog.detection_window_secs, 120);
+    assert_eq!(named.stuck_watchdog.min_output_tokens_in_window, 3);
+    assert_eq!(named.stuck_watchdog.check_interval_secs, 7);
+    assert!(named.restart_queue.enabled);
+    assert_eq!(named.restart_queue.queue_deadline_secs, 60);
+    assert_eq!(named.restart_queue.restart_timeout_secs, 40);
+}
+
+#[test]
 fn parses_and_validates_guardian_policy_from_the_shared_config() {
     let config = AppConfig::parse(
         r#"

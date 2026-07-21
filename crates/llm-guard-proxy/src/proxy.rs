@@ -63,6 +63,7 @@ use serde_json::json;
 use thiserror::Error;
 #[cfg(feature = "upstream-hot-restart")]
 use tokio::task::JoinHandle;
+use tokio::task::JoinSet;
 use tokio::{
     net::TcpListener,
     process::Command,
@@ -488,6 +489,51 @@ impl ProxyState {
 
         drop(body_routing_permit);
 
+        self.wait_for_profile_generation_capacity(
+            queue_permit,
+            model_id.map(str::to_owned),
+            config.server.generation_queue_timeout_ms,
+            record_context,
+        )
+        .await
+    }
+
+    async fn reacquire_generation_permit_for_model(
+        &self,
+        model_id: Option<&str>,
+        record_context: AdmissionRecordContext,
+    ) -> Result<GenerationAdmission, AdmissionFailure> {
+        let config = self
+            .config
+            .snapshot()
+            .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+        if self.shutdown.is_shutting_down() {
+            return Err(AdmissionFailure::ShuttingDown { queued: None });
+        }
+        let selected_profile = select_allowed_upstream_profile(&config, &self.listener, model_id)
+            .map_err(AdmissionFailure::ListenerUpstreamDenied)?;
+        let limiter = self.generation_limiter_for_profile(&selected_profile.profile);
+        let max_in_flight_requests = selected_profile
+            .profile
+            .effective_max_in_flight_requests(&config.server);
+        if let Some(permit) = limiter.try_acquire(max_in_flight_requests) {
+            return Ok(GenerationAdmission::acquired(
+                config,
+                permit,
+                Duration::ZERO,
+            ));
+        }
+
+        let max_queued_generation_requests = selected_profile
+            .profile
+            .effective_max_queued_generation_requests(&config.server);
+        let Some(queue_permit) = limiter.try_enqueue(max_queued_generation_requests) else {
+            return Err(AdmissionFailure::GenerationQueueFull {
+                max_queued_generation_requests,
+                status: config.server.generation_queue_full_status,
+                retry_after_secs: config.server.generation_queue_retry_after_secs,
+            });
+        };
         self.wait_for_profile_generation_capacity(
             queue_permit,
             model_id.map(str::to_owned),
@@ -3227,7 +3273,6 @@ struct BodyAdmissionContext<'request> {
     started_at_unix_ms: u64,
 }
 
-#[allow(clippy::too_many_lines)]
 async fn read_body_and_admit_generation(
     state: &ProxyState,
     body: Body,
@@ -3236,6 +3281,39 @@ async fn read_body_and_admit_generation(
     max_request_body_bytes: usize,
     request: BodyAdmissionContext<'_>,
 ) -> Result<OpenAiBodyAdmission, ProxyError> {
+    let (body, body_read_request_metadata) =
+        read_body_for_generation_admission(state, body, max_request_body_bytes, &request).await?;
+    let config = state.config.snapshot().map_err(|error| {
+        ProxyError::config_snapshot(error.to_string())
+            .with_request_metadata(body_read_request_metadata.clone())
+    })?;
+    if is_control_plane_models_request(request.method, request.uri) {
+        return Ok(OpenAiBodyAdmission {
+            config,
+            body,
+            in_flight_permit,
+            admission_metadata: request.admission_metadata,
+        });
+    }
+
+    admit_generation_after_body(
+        state,
+        body,
+        config,
+        in_flight_permit,
+        admission_permit_kind,
+        body_read_request_metadata,
+        request,
+    )
+    .await
+}
+
+async fn read_body_for_generation_admission(
+    state: &ProxyState,
+    body: Body,
+    max_request_body_bytes: usize,
+    request: &BodyAdmissionContext<'_>,
+) -> Result<(Bytes, BTreeMap<String, String>), ProxyError> {
     let mut pre_body_request_metadata = pre_upstream_request_metadata(
         request.method,
         request.uri,
@@ -3260,30 +3338,18 @@ async fn read_body_and_admit_generation(
         request.shielding_enabled_hint,
     );
     add_listener_metadata(&mut body_read_request_metadata, &state.listener);
-    let config = state.config.snapshot().map_err(|error| {
-        ProxyError::config_snapshot(error.to_string())
-            .with_request_metadata(body_read_request_metadata.clone())
-    })?;
-    if is_control_plane_models_request(request.method, request.uri) {
-        return Ok(OpenAiBodyAdmission {
-            config,
-            body,
-            in_flight_permit,
-            admission_metadata: request.admission_metadata,
-        });
-    }
+    Ok((body, body_read_request_metadata))
+}
 
-    if admission_permit_kind != AdmissionPermitKind::BodyRouting
-        && !config.has_upstream_profile_generation_limits()
-    {
-        return Ok(OpenAiBodyAdmission {
-            config,
-            body,
-            in_flight_permit,
-            admission_metadata: request.admission_metadata,
-        });
-    }
-
+async fn admit_generation_after_body(
+    state: &ProxyState,
+    body: Bytes,
+    config: AppConfig,
+    in_flight_permit: InFlightPermit,
+    admission_permit_kind: AdmissionPermitKind,
+    body_read_request_metadata: BTreeMap<String, String>,
+    request: BodyAdmissionContext<'_>,
+) -> Result<OpenAiBodyAdmission, ProxyError> {
     let model_id_for_admission = extract_model_id(request.method, request.uri, &body);
     let selected_profile = select_allowed_upstream_profile(
         &config,
@@ -3293,57 +3359,29 @@ async fn read_body_and_admit_generation(
     .map_err(|error| {
         ProxyError::listener_denied(error).with_request_metadata(body_read_request_metadata.clone())
     })?;
-    if admission_permit_kind == AdmissionPermitKind::Generation {
-        if !selected_profile.profile.restart_queue.enabled {
-            return Ok(OpenAiBodyAdmission {
-                config,
-                body,
-                in_flight_permit,
-                admission_metadata: request.admission_metadata,
-            });
-        }
-
-        // A request must not consume generation capacity while it is only waiting for
-        // the restart/readiness episode. Release the provisional permit, queue under
-        // the restart-specific bound, then select configuration and reacquire.
-        drop(in_flight_permit);
-        wait_for_profile_restart_queue(
+    if selected_profile.profile.restart_queue.enabled {
+        return wait_for_restart_queue_and_readmit(
             state,
-            &selected_profile.profile,
-            &mut body_read_request_metadata,
-        )
-        .await?;
-        let record_context = AdmissionRecordContext {
-            store: state.store.clone(),
-            persistence_tasks: Arc::clone(&state.persistence_tasks),
-            request_id: request.request_id.clone(),
-            started_at_unix_ms: request.started_at_unix_ms,
-            request_metadata: body_read_request_metadata.clone(),
-        };
-        let admission = state
-            .acquire_generation_permit(record_context)
-            .await
-            .map_err(|error| {
-                let mut metadata = body_read_request_metadata;
-                metadata.extend(error.request_metadata());
-                ProxyError::admission(error).with_request_metadata(metadata)
-            })?;
-        let mut admission_metadata = request.admission_metadata;
-        admission_metadata.extend(acquired_admission_metadata(admission.queue_wait));
-        return Ok(OpenAiBodyAdmission {
-            config: admission.config,
             body,
-            in_flight_permit: admission.permit,
-            admission_metadata,
+            in_flight_permit,
+            model_id_for_admission,
+            selected_profile.profile,
+            body_read_request_metadata,
+            request,
+        )
+        .await;
+    }
+    if admission_permit_kind == AdmissionPermitKind::Generation {
+        return Ok(OpenAiBodyAdmission {
+            config,
+            body,
+            in_flight_permit,
+            admission_metadata: request.admission_metadata,
         });
     }
-    let record_context = AdmissionRecordContext {
-        store: state.store.clone(),
-        persistence_tasks: Arc::clone(&state.persistence_tasks),
-        request_id: request.request_id.clone(),
-        started_at_unix_ms: request.started_at_unix_ms,
-        request_metadata: body_read_request_metadata.clone(),
-    };
+
+    let record_context =
+        body_admission_record_context(state, &request, &body_read_request_metadata);
     let admission = state
         .acquire_generation_permit_for_model(
             model_id_for_admission.as_deref(),
@@ -3351,11 +3389,7 @@ async fn read_body_and_admit_generation(
             record_context,
         )
         .await
-        .map_err(|error| {
-            let mut metadata = body_read_request_metadata;
-            metadata.extend(error.request_metadata());
-            ProxyError::admission(error).with_request_metadata(metadata)
-        })?;
+        .map_err(|error| admission_proxy_error(error, body_read_request_metadata))?;
     let mut admission_metadata = request.admission_metadata;
     admission_metadata.extend(acquired_admission_metadata(admission.queue_wait));
     Ok(OpenAiBodyAdmission {
@@ -3364,6 +3398,57 @@ async fn read_body_and_admit_generation(
         in_flight_permit: admission.permit,
         admission_metadata,
     })
+}
+
+async fn wait_for_restart_queue_and_readmit(
+    state: &ProxyState,
+    body: Bytes,
+    in_flight_permit: InFlightPermit,
+    model_id: Option<String>,
+    profile: UpstreamProfileConfig,
+    mut body_read_request_metadata: BTreeMap<String, String>,
+    request: BodyAdmissionContext<'_>,
+) -> Result<OpenAiBodyAdmission, ProxyError> {
+    // Both provisional admission paths use capacity only to route/read the body.
+    // A restart waiter must release that capacity before entering the dedicated queue.
+    drop(in_flight_permit);
+    wait_for_profile_restart_queue(state, &profile, &mut body_read_request_metadata).await?;
+    let record_context =
+        body_admission_record_context(state, &request, &body_read_request_metadata);
+    let admission = state
+        .reacquire_generation_permit_for_model(model_id.as_deref(), record_context)
+        .await
+        .map_err(|error| admission_proxy_error(error, body_read_request_metadata))?;
+    let mut admission_metadata = request.admission_metadata;
+    admission_metadata.extend(acquired_admission_metadata(admission.queue_wait));
+    Ok(OpenAiBodyAdmission {
+        config: admission.config,
+        body,
+        in_flight_permit: admission.permit,
+        admission_metadata,
+    })
+}
+
+fn body_admission_record_context(
+    state: &ProxyState,
+    request: &BodyAdmissionContext<'_>,
+    request_metadata: &BTreeMap<String, String>,
+) -> AdmissionRecordContext {
+    AdmissionRecordContext {
+        store: state.store.clone(),
+        persistence_tasks: Arc::clone(&state.persistence_tasks),
+        request_id: request.request_id.clone(),
+        started_at_unix_ms: request.started_at_unix_ms,
+        request_metadata: request_metadata.clone(),
+    }
+}
+
+fn admission_proxy_error(
+    error: AdmissionFailure,
+    mut request_metadata: BTreeMap<String, String>,
+) -> ProxyError {
+    request_metadata.extend(error.request_metadata());
+    ProxyError::admission(error).with_request_metadata(request_metadata)
 }
 
 async fn read_body_with_adapter_limit(
@@ -6327,6 +6412,7 @@ struct StuckWatchdogTokenTracker {
 struct StuckWatchdogTokenWindow {
     samples: VecDeque<(Instant, u64)>,
     active_requests: usize,
+    active_since: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6350,6 +6436,7 @@ struct StuckWatchdogRequestInner {
     profile: String,
     progress_unit: WatchdogProgressUnit,
     detection_window: Duration,
+    sse_buffer: Mutex<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -6369,6 +6456,9 @@ impl StuckWatchdogTokenTracker {
             Err(poisoned) => poisoned.into_inner(),
         };
         let window = windows.entry(profile.to_owned()).or_default();
+        if window.active_requests == 0 {
+            window.active_since = Some(Instant::now());
+        }
         window.active_requests = window.active_requests.saturating_add(1);
         StuckWatchdogRequest {
             inner: Arc::new(StuckWatchdogRequestInner {
@@ -6376,6 +6466,7 @@ impl StuckWatchdogTokenTracker {
                 profile: profile.to_owned(),
                 progress_unit,
                 detection_window,
+                sse_buffer: Mutex::new(Vec::new()),
             }),
         }
     }
@@ -6452,7 +6543,12 @@ impl StuckWatchdogTokenTracker {
         let Some(window) = windows.get_mut(profile) else {
             return true;
         };
-        window_has_too_few_output_tokens(window, detection_window, minimum_output_tokens)
+        window_has_too_few_output_tokens(
+            window,
+            detection_window,
+            minimum_output_tokens,
+            Instant::now(),
+        )
     }
 
     fn has_active_requests(&self, profile: &str) -> bool {
@@ -6478,8 +6574,7 @@ impl StuckWatchdogRequest {
 
     fn record_emitted_chunk(&self, chunk: &[u8]) {
         let progress = match self.inner.progress_unit {
-            // A nonempty SSE chunk is observable streamed output before terminal usage.
-            WatchdogProgressUnit::Chat => u64::from(!chunk.is_empty()),
+            WatchdogProgressUnit::Chat => self.record_sse_content_progress(chunk),
             // Embedding and reranker endpoints generally omit completion_tokens; a
             // result-bearing chunk is their endpoint-appropriate progress unit.
             WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
@@ -6492,6 +6587,27 @@ impl StuckWatchdogRequest {
             progress,
         );
     }
+
+    fn record_sse_content_progress(&self, chunk: &[u8]) -> u64 {
+        const MAX_PENDING_SSE_BYTES: usize = 64 * 1024;
+        let mut pending = self
+            .inner
+            .sse_buffer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.extend(chunk.iter().copied().filter(|byte| *byte != b'\r'));
+        if pending.len() > MAX_PENDING_SSE_BYTES {
+            pending.clear();
+            return 0;
+        }
+
+        let mut progress = 0_u64;
+        while let Some(frame_end) = pending.windows(2).position(|window| window == b"\n\n") {
+            let frame = pending.drain(..frame_end + 2).collect::<Vec<_>>();
+            progress = progress.saturating_add(sse_content_progress(&frame));
+        }
+        progress
+    }
 }
 
 impl Drop for StuckWatchdogRequestInner {
@@ -6502,6 +6618,9 @@ impl Drop for StuckWatchdogRequestInner {
         };
         if let Some(window) = windows.get_mut(&self.profile) {
             window.active_requests = window.active_requests.saturating_sub(1);
+            if window.active_requests == 0 {
+                window.active_since = None;
+            }
         }
     }
 }
@@ -6510,8 +6629,16 @@ fn window_has_too_few_output_tokens(
     window: &mut StuckWatchdogTokenWindow,
     detection_window: Duration,
     minimum_output_tokens: u64,
+    now: Instant,
 ) -> bool {
-    prune_watchdog_progress(window, detection_window, Instant::now());
+    if window.active_requests > 0
+        && window
+            .active_since
+            .is_none_or(|started| now.saturating_duration_since(started) < detection_window)
+    {
+        return false;
+    }
+    prune_watchdog_progress(window, detection_window, now);
     window
         .samples
         .iter()
@@ -6519,6 +6646,50 @@ fn window_has_too_few_output_tokens(
             total.saturating_add(*output_tokens)
         })
         < minimum_output_tokens
+}
+
+fn sse_content_progress(frame: &[u8]) -> u64 {
+    frame
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| line.strip_prefix(b"data:"))
+        .map(trim_ascii)
+        .filter(|data| !data.is_empty() && *data != b"[DONE]")
+        .filter_map(|data| serde_json::from_slice::<serde_json::Value>(data).ok())
+        .filter(sse_event_has_model_content)
+        .count()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len().saturating_sub(1)];
+    }
+    bytes
+}
+
+fn sse_event_has_model_content(event: &serde_json::Value) -> bool {
+    event
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                let Some(delta) = choice.get("delta").and_then(serde_json::Value::as_object) else {
+                    return false;
+                };
+                ["content", "reasoning_content", "reasoning"]
+                    .iter()
+                    .any(|field| {
+                        delta
+                            .get(*field)
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|value| !value.is_empty())
+                    })
+            })
+        })
 }
 
 fn record_watchdog_progress(window: &mut StuckWatchdogTokenWindow, now: Instant, progress: u64) {
@@ -6572,7 +6743,14 @@ async fn run_stuck_engine_watchdog(
     shutdown: Arc<ShutdownGate>,
 ) {
     let mut schedule = WatchdogSchedule::default();
+    let mut recovery_tasks = JoinSet::<(String, BTreeMap<String, String>)>::new();
+    let mut recovering_profiles = HashSet::new();
     loop {
+        collect_finished_watchdog_recoveries(
+            &mut recovery_tasks,
+            &mut recovering_profiles,
+            &local_recovery,
+        );
         let Ok(snapshot) = config.snapshot() else {
             let mut shutdown_gate = shutdown.subscribe();
             tokio::select! {
@@ -6611,6 +6789,9 @@ async fn run_stuck_engine_watchdog(
                 continue;
             }
             let watchdog = &profile.stuck_watchdog;
+            if recovering_profiles.contains(&profile.name) {
+                continue;
+            }
             let detection_window = Duration::from_secs(watchdog.detection_window_secs);
             if !tokens.has_active_requests(&profile.name)
                 || !tokens.has_too_few_output_tokens(
@@ -6637,43 +6818,97 @@ async fn run_stuck_engine_watchdog(
             coordinator
                 .watchdog_restarts
                 .fetch_add(1, Ordering::Relaxed);
-            let recovery = run_local_recovery_for_profile(
-                &policy,
-                &coordinator,
+            let profile_name = profile.name.clone();
+            recovering_profiles.insert(profile_name.clone());
+            recovery_tasks.spawn(run_watchdog_recovery(
+                profile_name,
+                policy,
+                coordinator,
                 client.clone(),
                 profile.base_url.clone(),
-                LocalRecoveryCause::UpstreamStall,
-            )
-            .await;
-            match recovery.get("local_recovery_status").map(String::as_str) {
-                Some("succeeded") => {
-                    coordinator
-                        .watchdog_recovery_successes
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                Some("completion_timeout" | "join_timeout" | "readiness_timeout") => {
-                    coordinator
-                        .watchdog_recovery_timeouts
-                        .fetch_add(1, Ordering::Relaxed);
-                }
-                _ => {}
-            }
-            eprintln!(
-                "llm_guard_proxy_stuck_watchdog profile={} event=recovery_finished status={}",
-                profile.name,
-                recovery
-                    .get("local_recovery_status")
-                    .map_or("missing", String::as_str),
-            );
+                Arc::clone(&shutdown),
+            ));
         }
         let mut shutdown_gate = shutdown.subscribe();
         tokio::select! {
             // The loop wakes cheaply, while `schedule` enforces each profile's own
             // cadence instead of collapsing all intervals to a global minimum.
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
-            () = shutdown_gate.cancelled() => return,
+            () = shutdown_gate.cancelled() => {
+                recovery_tasks.abort_all();
+                while recovery_tasks.join_next().await.is_some() {}
+                return;
+            },
         }
     }
+}
+
+fn collect_finished_watchdog_recoveries(
+    recovery_tasks: &mut JoinSet<(String, BTreeMap<String, String>)>,
+    recovering_profiles: &mut HashSet<String>,
+    local_recovery: &LocalRecoveryCoordinatorSet,
+) {
+    while let Some(result) = recovery_tasks.try_join_next() {
+        if let Ok((profile, recovery)) = result {
+            recovering_profiles.remove(&profile);
+            record_watchdog_recovery_result(
+                &local_recovery.coordinator_for(&profile),
+                &profile,
+                &recovery,
+            );
+        }
+    }
+}
+
+async fn run_watchdog_recovery(
+    profile_name: String,
+    policy: LocalRecoveryPolicy,
+    coordinator: Arc<UpstreamStallRecoveryCoordinator>,
+    client: Client,
+    base_url: String,
+    shutdown: Arc<ShutdownGate>,
+) -> (String, BTreeMap<String, String>) {
+    let mut shutdown_gate = shutdown.subscribe();
+    let recovery = tokio::select! {
+        recovery = run_local_recovery_for_profile(
+            &policy,
+            &coordinator,
+            client,
+            base_url,
+            LocalRecoveryCause::UpstreamStall,
+        ) => recovery,
+        () = shutdown_gate.cancelled() => BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("shutdown_cancelled"),
+        )]),
+    };
+    (profile_name, recovery)
+}
+
+fn record_watchdog_recovery_result(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    profile: &str,
+    recovery: &BTreeMap<String, String>,
+) {
+    match recovery.get("local_recovery_status").map(String::as_str) {
+        Some("succeeded") => {
+            coordinator
+                .watchdog_recovery_successes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Some("completion_timeout" | "join_timeout" | "readiness_timeout") => {
+            coordinator
+                .watchdog_recovery_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    eprintln!(
+        "llm_guard_proxy_stuck_watchdog profile={profile} event=recovery_finished status={}",
+        recovery
+            .get("local_recovery_status")
+            .map_or("missing", String::as_str),
+    );
 }
 
 pub(crate) fn spawn_stuck_engine_watchdog(state: &ProxyState) -> tokio::task::JoinHandle<()> {
@@ -8332,8 +8567,16 @@ async fn aggregate_shielded_attempt(
 ) -> Result<ShieldedAggregatedAttempt, ShieldedAttemptFailure> {
     let request_id = runtime.request_id.as_str().to_owned();
     let request_model_id = runtime.model_id.clone();
+    let stuck_watchdog_request = runtime.stuck_watchdog_request.clone();
+    let upstream_stream = started.response.bytes_stream().inspect(move |chunk| {
+        if let (Some(request), Ok(chunk)) = (&stuck_watchdog_request, chunk) {
+            // Shielded calls aggregate upstream SSE internally, so this is the
+            // only place their sustained model output reaches the watchdog.
+            request.record_emitted_chunk(chunk);
+        }
+    });
     let aggregate = shielded_chat::aggregate_stream(
-        started.response.bytes_stream(),
+        upstream_stream,
         started.info.started_at_unix_ms,
         &request_id,
         request_model_id.as_deref(),
