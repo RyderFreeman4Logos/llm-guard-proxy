@@ -566,6 +566,118 @@ async fn persistence_tasks_contain_spawn_blocking_panics() {
     assert_eq!(tasks.panics.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
+    let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+
+    tasks.spawn_blocking(move || {
+        first_started_tx
+            .send(())
+            .expect("first persistence task receiver should remain open");
+        release_rx
+            .recv()
+            .expect("first persistence task should be released");
+    });
+    first_started_rx
+        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
+        .expect("first persistence task should start");
+
+    tasks.spawn_blocking(move || {
+        second_started_tx
+            .send(())
+            .expect("dropped persistence task must not execute");
+    });
+
+    assert!(
+        second_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_err(),
+        "persistence work must be dropped rather than queued after the backlog is full"
+    );
+    release_tx
+        .send(())
+        .expect("first persistence task should still be waiting");
+    timeout(STREAM_COMPLETION_TIMEOUT, tasks.flush())
+        .await
+        .expect("retained persistence task should drain");
+}
+
+#[tokio::test]
+async fn error_shutdown_signals_persistence_tracked_shadow_work_before_flushing() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let persistence_tasks = Arc::clone(&proxy.state.persistence_tasks);
+    let task_state = proxy.state.clone();
+    let (started_tx, started_rx) = oneshot::channel();
+
+    let shadow_task = tokio::spawn(async move {
+        let _task_guard = persistence_tasks.track();
+        let mut shutdown = task_state.shutdown.subscribe();
+        started_tx
+            .send(())
+            .expect("shadow task startup receiver should remain open");
+        shutdown.cancelled().await;
+    });
+    timeout(STREAM_COMPLETION_TIMEOUT, started_rx)
+        .await
+        .expect("shadow task should start before error shutdown")
+        .expect("shadow task must not stop before error shutdown");
+
+    proxy.state.begin_shutdown();
+    timeout(STREAM_COMPLETION_TIMEOUT, proxy.state.flush_persistence())
+        .await
+        .expect("error shutdown should let persistence-tracked shadow work drain");
+    timeout(STREAM_COMPLETION_TIMEOUT, shadow_task)
+        .await
+        .expect("shadow task should observe the error shutdown signal")
+        .expect("shadow task should not panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistence_flush_does_not_miss_a_zero_transition_after_observing_work() {
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let notification_registered = Arc::new(AtomicBool::new(false));
+    let tasks = Arc::new(PersistenceTasks {
+        flush_wait_hook: Some(PersistenceFlushWaitHook {
+            arrived: arrived_tx,
+            release: Arc::clone(&release),
+            notification_registered: Arc::clone(&notification_registered),
+        }),
+        ..PersistenceTasks::default()
+    });
+    let guard = tasks.track();
+    let flush_tasks = Arc::clone(&tasks);
+    let mut flush = tokio::spawn(async move {
+        flush_tasks.flush().await;
+    });
+
+    if arrived_rx.recv_timeout(STREAM_COMPLETION_TIMEOUT).is_err() {
+        flush.abort();
+        drop(guard);
+        panic!("flush must register for completion before observing in-flight work");
+    }
+    if !notification_registered.load(Ordering::SeqCst) {
+        release.wait();
+        flush.abort();
+        drop(guard);
+        panic!("flush must register for completion before observing in-flight work");
+    }
+    drop(guard);
+    release.wait();
+
+    match timeout(STREAM_COMPLETION_TIMEOUT, &mut flush).await {
+        Ok(result) => result.expect("flush task should not panic"),
+        Err(_elapsed) => {
+            flush.abort();
+            panic!("flush must complete after the last persistence task finishes");
+        }
+    }
+}
+
 #[test]
 fn request_cleanup_log_line_is_bounded_and_payload_free() {
     let mut request_metadata = BTreeMap::new();

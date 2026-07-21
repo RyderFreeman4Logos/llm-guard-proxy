@@ -367,6 +367,7 @@ async fn serve_bound_listeners(
         }
     };
     if result.is_err() {
+        state.begin_shutdown();
         servers.abort_all();
         while servers.join_next().await.is_some() {}
     }

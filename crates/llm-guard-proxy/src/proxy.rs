@@ -66,7 +66,7 @@ use tokio::task::JoinHandle;
 use tokio::{
     net::TcpListener,
     process::Command,
-    sync::{Mutex as AsyncMutex, Notify, futures::OwnedNotified, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, Semaphore, futures::OwnedNotified, oneshot},
     time::{Instant, Interval, MissedTickBehavior, Sleep, timeout},
 };
 
@@ -116,6 +116,7 @@ const PROXY_SHUTTING_DOWN_ERROR_TYPE: &str = "proxy_shutting_down";
 const REQUEST_DEADLINE_ABORT_REASON: &str = "request_deadline_exhausted";
 const REQUEST_DEADLINE_ERROR_TYPE: &str = "llm_guard_request_deadline_exhausted";
 const FINAL_DIRECT_RELAY_TERMINATED_ABORT_REASON: &str = "final_direct_relay_terminated";
+const MAX_PERSISTENCE_TASKS: usize = 64;
 #[cfg(feature = "guard")]
 const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
 
@@ -298,6 +299,10 @@ impl ProxyState {
         let mut state = self.clone();
         state.listener = listener;
         state
+    }
+
+    pub(crate) fn begin_shutdown(&self) {
+        self.shutdown.begin_shutdown();
     }
 
     pub(crate) async fn flush_persistence(&self) {
@@ -697,14 +702,41 @@ fn current_shutdown_drain_timeout(config: &ConfigHandle) -> Duration {
     Duration::from_millis(timeout_ms)
 }
 
-#[derive(Debug, Default)]
+#[cfg(test)]
+#[derive(Debug)]
+struct PersistenceFlushWaitHook {
+    arrived: std::sync::mpsc::Sender<()>,
+    release: Arc<std::sync::Barrier>,
+    notification_registered: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
 struct PersistenceTasks {
+    capacity: Arc<Semaphore>,
     in_flight: AtomicUsize,
     idle: Notify,
     #[cfg(test)]
     panics: AtomicUsize,
     #[cfg(test)]
     synchronous_for_tests: bool,
+    #[cfg(test)]
+    flush_wait_hook: Option<PersistenceFlushWaitHook>,
+}
+
+impl Default for PersistenceTasks {
+    fn default() -> Self {
+        Self {
+            capacity: Arc::new(Semaphore::new(MAX_PERSISTENCE_TASKS)),
+            in_flight: AtomicUsize::new(0),
+            idle: Notify::new(),
+            #[cfg(test)]
+            panics: AtomicUsize::new(0),
+            #[cfg(test)]
+            synchronous_for_tests: false,
+            #[cfg(test)]
+            flush_wait_hook: None,
+        }
+    }
 }
 
 impl PersistenceTasks {
@@ -712,6 +744,14 @@ impl PersistenceTasks {
     fn synchronous_for_tests() -> Self {
         Self {
             synchronous_for_tests: true,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_capacity_for_tests(capacity: usize) -> Self {
+        Self {
+            capacity: Arc::new(Semaphore::new(capacity)),
             ..Self::default()
         }
     }
@@ -724,9 +764,14 @@ impl PersistenceTasks {
     }
 
     fn spawn_blocking(self: &Arc<Self>, work: impl FnOnce() + Send + 'static) {
+        let Ok(capacity_permit) = Arc::clone(&self.capacity).try_acquire_owned() else {
+            eprintln!("persistence backlog full, dropping record");
+            return;
+        };
         let guard = self.track();
         #[cfg(test)]
         if self.synchronous_for_tests {
+            let _capacity_permit = capacity_permit;
             let _guard = guard;
             self.run(work);
             return;
@@ -735,6 +780,7 @@ impl PersistenceTasks {
         #[cfg(test)]
         let tasks = Arc::clone(self);
         tokio::task::spawn_blocking(move || {
+            let _capacity_permit = capacity_permit;
             let _guard = guard;
             #[cfg(test)]
             {
@@ -762,11 +808,20 @@ impl PersistenceTasks {
 
     async fn flush(&self) {
         loop {
-            let notified = self.idle.notified();
+            let mut notified = Box::pin(self.idle.notified());
+            let _already_notified = notified.as_mut().enable();
+            #[cfg(test)]
+            if let Some(hook) = &self.flush_wait_hook {
+                hook.notification_registered.store(true, Ordering::SeqCst);
+                hook.arrived
+                    .send(())
+                    .expect("flush test hook receiver should remain open");
+                hook.release.wait();
+            }
             if self.in_flight.load(Ordering::SeqCst) == 0 {
                 return;
             }
-            notified.await;
+            notified.as_mut().await;
         }
     }
 }
