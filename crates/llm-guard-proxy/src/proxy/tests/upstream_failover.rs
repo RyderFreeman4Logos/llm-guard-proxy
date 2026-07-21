@@ -27,9 +27,18 @@ async fn openai_third_party_failover_rewrites_model_and_isolates_credentials() {
         .client
         .post(format!("{}/v1/embeddings", proxy.base_url))
         .header(AUTHORIZATION, "Bearer inbound-authorization")
+        .header("api-key", "inbound-api-key")
         .header("x-api-key", "inbound-api-key")
+        .header("x-api-token", "inbound-api-token")
+        .header("x-auth-token", "inbound-auth-token")
+        .header("x-access-token", "inbound-access-token")
+        .header("x-session-token", "inbound-session-token")
+        .header("x-csrf-token", "inbound-csrf-token")
+        .header("x-goog-api-key", "inbound-google-api-key")
+        .header("x-amz-security-token", "inbound-aws-session-token")
         .header("x-virtual-key", "inbound-virtual-key")
         .header("cookie", "inbound-cookie=value")
+        .header("set-cookie", "inbound-set-cookie=value")
         .header("proxy-authorization", "Basic inbound-proxy-auth")
         .header("signature", "sig=:inbound-signature:")
         .header("signature-input", "sig=(\"authorization\")")
@@ -54,9 +63,18 @@ async fn openai_third_party_failover_rewrites_model_and_isolates_credentials() {
         Some(expected_authorization.as_str())
     );
     for name in [
+        "api-key",
         "x-api-key",
+        "x-api-token",
+        "x-auth-token",
+        "x-access-token",
+        "x-session-token",
+        "x-csrf-token",
+        "x-goog-api-key",
+        "x-amz-security-token",
         "x-virtual-key",
         "cookie",
+        "set-cookie",
         "proxy-authorization",
         "signature",
         "signature-input",

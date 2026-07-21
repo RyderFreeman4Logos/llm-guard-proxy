@@ -21,6 +21,28 @@ use super::{
 const MAX_PAIR_COUNT: usize = 1_024;
 const MAX_REQUEST_ID_BYTES: usize = 256;
 const MAX_DEEPINFRA_RENDERED_BODY_BYTES: usize = 1_048_576;
+/// Inbound credentials, sessions, and requester identity must not cross into a configured origin.
+const ISOLATED_THIRD_PARTY_HEADERS_TO_STRIP: [&str; 19] = [
+    "api-key",
+    "authorization",
+    "cookie",
+    "forwarded",
+    "proxy-authorization",
+    "set-cookie",
+    "signature",
+    "signature-input",
+    "x-access-token",
+    "x-amz-security-token",
+    "x-api-key",
+    "x-api-token",
+    "x-auth-token",
+    "x-csrf-token",
+    "x-forwarded-for",
+    "x-goog-api-key",
+    "x-real-ip",
+    "x-session-token",
+    "x-virtual-key",
+];
 const DEEPINFRA_CONVERTIBLE_RERANK_FIELDS: [&str; 5] =
     ["model", "query", "documents", "top_n", "return_documents"];
 
@@ -359,18 +381,7 @@ fn isolated_third_party_headers(
 ) -> HeaderMap {
     let mut headers =
         sanitize_transformed_request_headers(&forwarded_request_headers(downstream_headers));
-    for name in [
-        "authorization",
-        "x-api-key",
-        "x-virtual-key",
-        "cookie",
-        "proxy-authorization",
-        "signature",
-        "signature-input",
-        "forwarded",
-        "x-forwarded-for",
-        "x-real-ip",
-    ] {
+    for name in ISOLATED_THIRD_PARTY_HEADERS_TO_STRIP {
         headers.remove(name);
     }
     headers.insert(AUTHORIZATION, authorization);

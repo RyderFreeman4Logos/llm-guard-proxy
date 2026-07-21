@@ -1891,11 +1891,11 @@ pub struct UpstreamEndpointConfig {
     pub priority: UpstreamPriority,
     /// Endpoint-specific request and response protocol.
     pub protocol: UpstreamEndpointProtocol,
-    /// Required remote model name for non-OpenAI endpoint protocols.
+    /// Optional remote model name override for OpenAI-compatible and non-OpenAI endpoint protocols.
     pub model: Option<String>,
     /// Required immutable remote model version for non-OpenAI endpoint protocols.
     pub model_revision: Option<String>,
-    /// Runtime environment variable containing the non-OpenAI endpoint credential.
+    /// Optional runtime environment variable containing the endpoint credential.
     pub api_key_env: Option<String>,
 }
 
