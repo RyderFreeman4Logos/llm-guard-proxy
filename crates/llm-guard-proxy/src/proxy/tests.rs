@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -24,6 +25,7 @@ use axum::http::header::{AUTHORIZATION, CONNECTION, LOCATION};
 use futures_util::{Stream, StreamExt, stream};
 use rusqlite::{Connection, params};
 use tokio::{
+    io::AsyncReadExt,
     net::TcpListener,
     sync::{mpsc, oneshot},
     time::{sleep, timeout},
@@ -610,21 +612,119 @@ async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
         .expect("retained persistence task should drain");
 }
 
+async fn terminate_and_reap_test_child(
+    child: &mut tokio::process::Child,
+    process_group_id: u32,
+) -> (String, std::io::Result<std::process::ExitStatus>) {
+    #[cfg(unix)]
+    let termination = kill(
+        Pid::from_raw(-process_group_id.cast_signed()),
+        Signal::SIGKILL,
+    )
+    .map_or_else(|error| error.to_string(), |()| String::from("SIGKILL sent"));
+    #[cfg(not(unix))]
+    let termination = child
+        .start_kill()
+        .map_or_else(|error| error.to_string(), |()| String::from("SIGKILL sent"));
+    let reaped = child.wait().await;
+    (termination, reaped)
+}
+
+async fn drain_test_child_output(
+    stdout_reader: tokio::task::JoinHandle<Vec<u8>>,
+    stderr_reader: tokio::task::JoinHandle<Vec<u8>>,
+) -> (Vec<u8>, Vec<u8>) {
+    let stdout = stdout_reader
+        .await
+        .expect("backlog-drop child stdout reader should not panic");
+    let stderr = stderr_reader
+        .await
+        .expect("backlog-drop child stderr reader should not panic");
+    (stdout, stderr)
+}
+
+async fn run_bounded_test_child(test_name: &str, child_env: &str) -> std::process::Output {
+    let mut command = tokio::process::Command::new(
+        std::env::current_exe().expect("test binary path should be available"),
+    );
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env(child_env, "1")
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .expect("backlog-drop child test should start");
+    let process_group_id = child.id().expect("backlog-drop child process group id");
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .expect("backlog-drop child stdout should be captured");
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .expect("backlog-drop child stderr should be captured");
+    let stdout_reader = tokio::spawn(async move {
+        let mut output = Vec::new();
+        child_stdout
+            .read_to_end(&mut output)
+            .await
+            .expect("backlog-drop child stdout should drain");
+        output
+    });
+    let stderr_reader = tokio::spawn(async move {
+        let mut output = Vec::new();
+        child_stderr
+            .read_to_end(&mut output)
+            .await
+            .expect("backlog-drop child stderr should drain");
+        output
+    });
+    let status = match timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let (termination, reaped) =
+                terminate_and_reap_test_child(&mut child, process_group_id).await;
+            let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
+            panic!(
+                "backlog-drop child test wait failed: {error}; termination={termination}; reaped={reaped:?}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr),
+            );
+        }
+        Err(_) => {
+            let (termination, reaped) =
+                terminate_and_reap_test_child(&mut child, process_group_id).await;
+            let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
+            panic!(
+                "backlog-drop child test timed out after 30 seconds; termination={termination}; reaped={reaped:?}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr),
+            );
+        }
+    };
+    let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
     const CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_CHILD";
+    const HANG_CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_HANG_CHILD";
     const TEST_NAME: &str =
         "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
     const OVERFLOW_BURST: usize = 128;
 
     if std::env::var_os(CHILD_ENV).is_none() {
-        let output = std::process::Command::new(
-            std::env::current_exe().expect("test binary path should be available"),
-        )
-        .args(["--exact", TEST_NAME, "--nocapture"])
-        .env(CHILD_ENV, "1")
-        .output()
-        .expect("backlog-drop child test should run");
+        let output = run_bounded_test_child(TEST_NAME, CHILD_ENV).await;
         assert!(
             output.status.success(),
             "backlog-drop child test failed: {}",
@@ -649,6 +749,10 @@ async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
             "the first aggregated backlog-drop log must report its dropped delta: {stderr}"
         );
         return;
+    }
+
+    if std::env::var_os(HANG_CHILD_ENV).is_some() {
+        sleep(Duration::from_secs(60)).await;
     }
 
     let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
@@ -681,6 +785,51 @@ async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
     timeout(STREAM_COMPLETION_TIMEOUT, tasks.flush())
         .await
         .expect("retained persistence task should drain");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
+    const HANG_CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_HANG_CHILD";
+    const TEST_NAME: &str =
+        "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
+
+    let mut command = tokio::process::Command::new(
+        std::env::current_exe().expect("test binary path should be available"),
+    );
+    command
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .env(HANG_CHILD_ENV, "1")
+        .kill_on_drop(true)
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .expect("hung backlog-drop parent test should start");
+    let process_group_id = child.id().expect("hung backlog-drop parent child pid");
+
+    let status = match timeout(Duration::from_secs(35), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let (termination, reaped) =
+                terminate_and_reap_test_child(&mut child, process_group_id).await;
+            panic!(
+                "hung backlog-drop parent wait failed: {error}; termination={termination}; reaped={reaped:?}"
+            );
+        }
+        Err(_) => {
+            let (termination, reaped) =
+                terminate_and_reap_test_child(&mut child, process_group_id).await;
+            panic!(
+                "backlog-drop parent must fail after terminating its hung child; termination={termination}; reaped={reaped:?}"
+            );
+        }
+    };
+    assert!(
+        !status.success(),
+        "backlog-drop parent should fail after its child timeout"
+    );
 }
 
 #[tokio::test]
