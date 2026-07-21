@@ -18,7 +18,7 @@ mod workflow_runtime;
 use std::{ffi::OsString, fs, future::pending, path::PathBuf, process::ExitCode, time::Duration};
 
 use config_reload::ConfigManager;
-use llm_guard_proxy_core::redact_upstream_base_url;
+use llm_guard_proxy_core::{AppConfig, ConfigHandle, redact_upstream_base_url};
 #[cfg(feature = "memory-guardian")]
 use llm_guard_proxy_host_guardian::{MemoryGuardian, default_runtime_dir};
 #[cfg(feature = "host-telemetry")]
@@ -30,9 +30,20 @@ use llm_guard_proxy_state::{
 };
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(std::env::args_os()).await {
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("failed to construct Tokio runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = runtime.block_on(run(std::env::args_os()));
+    shutdown_runtime(runtime, outcome.runtime_shutdown_timeout);
+    match outcome.result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -41,33 +52,99 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
+struct RunOutcome {
+    result: Result<(), String>,
+    runtime_shutdown_timeout: Duration,
+}
+
+impl RunOutcome {
+    fn with_default_timeout(result: Result<(), String>) -> Self {
+        Self {
+            result,
+            runtime_shutdown_timeout: default_runtime_shutdown_timeout(),
+        }
+    }
+}
+
+async fn run(args: impl IntoIterator<Item = OsString>) -> RunOutcome {
     let args = args.into_iter().collect::<Vec<_>>();
     if args.get(1).and_then(|arg| arg.to_str()) == Some("evidence") {
-        return run_evidence_command(parse_evidence_command(&args[2..])?);
+        return RunOutcome::with_default_timeout(
+            parse_evidence_command(&args[2..]).and_then(run_evidence_command),
+        );
     }
     #[cfg(feature = "host-telemetry")]
     if args.get(1).and_then(|arg| arg.to_str()) == Some("telemetry") {
-        return run_telemetry_command(parse_telemetry_command(&args[2..])?).await;
+        let result = match parse_telemetry_command(&args[2..]) {
+            Ok(command) => run_telemetry_command(command).await,
+            Err(error) => Err(error),
+        };
+        return RunOutcome::with_default_timeout(result);
     }
     #[cfg(feature = "memory-guardian")]
     if args.get(1).and_then(|arg| arg.to_str()) == Some("guardian") {
-        return run_guardian_command(parse_guardian_command(&args[2..])?).await;
+        let result = match parse_guardian_command(&args[2..]) {
+            Ok(command) => run_guardian_command(command).await,
+            Err(error) => Err(error),
+        };
+        return RunOutcome::with_default_timeout(result);
     }
-    let options = parse_proxy_options(args)?;
+    let options = match parse_proxy_options(args) {
+        Ok(options) => options,
+        Err(error) => return RunOutcome::with_default_timeout(Err(error)),
+    };
     run_server(options).await
 }
 
-async fn run_server(options: ProxyOptions) -> Result<(), String> {
-    let manager = match options.config_path {
+fn default_runtime_shutdown_timeout() -> Duration {
+    Duration::from_millis(AppConfig::default().server.shutdown_drain_timeout_ms)
+}
+
+fn current_runtime_shutdown_timeout(config: &ConfigHandle) -> Duration {
+    let timeout_ms = config.snapshot().map_or_else(
+        |_error| AppConfig::default().server.shutdown_drain_timeout_ms,
+        |snapshot| snapshot.server.shutdown_drain_timeout_ms,
+    );
+    Duration::from_millis(timeout_ms)
+}
+
+fn shutdown_runtime(runtime: tokio::runtime::Runtime, shutdown_timeout: Duration) {
+    runtime.shutdown_timeout(shutdown_timeout);
+}
+
+async fn run_server(options: ProxyOptions) -> RunOutcome {
+    let manager = match options.config_path.clone() {
         Some(path) => ConfigManager::from_explicit_path(path),
         None => ConfigManager::from_default_path(),
     }
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string());
+    let manager = match manager {
+        Ok(manager) => manager,
+        Err(error) => return RunOutcome::with_default_timeout(Err(error)),
+    };
     let config = manager
         .handle()
         .snapshot()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string());
+    let config = match config {
+        Ok(config) => config,
+        Err(error) => return RunOutcome::with_default_timeout(Err(error)),
+    };
+    let runtime_config = manager.handle();
+    let result = run_server_with_config(options, manager, config).await;
+    RunOutcome {
+        result,
+        runtime_shutdown_timeout: current_runtime_shutdown_timeout(&runtime_config),
+    }
+}
+
+async fn run_server_with_config(
+    options: ProxyOptions,
+    manager: ConfigManager,
+    config: AppConfig,
+) -> Result<(), String> {
+    #[cfg(not(feature = "memory-guardian"))]
+    let _ = &options;
     let store = ObservabilityStore::open(manager.handle()).map_err(|error| error.to_string())?;
     let evidence_store = EvidenceStore::open(manager.handle());
     #[cfg(feature = "memory-guardian")]
@@ -162,6 +239,7 @@ async fn serve_with_guardian(
     state: proxy::ProxyState,
     guardian: MemoryGuardian,
 ) -> Result<(), String> {
+    let cleanup_state = state.clone();
     let mut server = tokio::spawn(serve_bound_listeners(bound_listeners, state));
     let mut guardian = tokio::spawn(async move {
         let mut guardian = guardian;
@@ -178,18 +256,42 @@ async fn serve_with_guardian(
                 Err(error) => Err(format!("server task failed: {error}")),
             },
             Ok(Err(error)) => {
-                server.abort();
+                abort_server_after_guardian_failure(
+                    &mut server,
+                    || cleanup_state.begin_shutdown(),
+                    cleanup_state.flush_persistence(),
+                )
+                .await;
                 Err(format!("memory guardian failed: {error}"))
             }
             Err(error) => {
-                server.abort();
+                abort_server_after_guardian_failure(
+                    &mut server,
+                    || cleanup_state.begin_shutdown(),
+                    cleanup_state.flush_persistence(),
+                )
+                .await;
                 Err(format!("memory guardian task failed: {error}"))
             }
         },
     };
-    server.abort();
     guardian.abort();
     result
+}
+
+#[cfg(feature = "memory-guardian")]
+async fn abort_server_after_guardian_failure(
+    server: &mut tokio::task::JoinHandle<Result<(), String>>,
+    begin_shutdown: impl FnOnce(),
+    flush_persistence: impl std::future::Future<Output = ()>,
+) {
+    // Signal shared ShutdownGate so serve_bound_listeners can stop each
+    // nested listener and drain its JoinSet. Do not abort the outer task:
+    // aborting would drop the JoinSet without joining children and race
+    // flush_persistence against response-observer cleanup.
+    begin_shutdown();
+    let _ignored = server.await;
+    flush_persistence.await;
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -345,26 +447,44 @@ async fn serve_bound_listeners(
     let mut servers = JoinSet::new();
     for (listener_config, listener, _local_addr) in bound_listeners {
         let listener_state = state.for_listener(listener_config);
+        // Clone so the shutdown future can observe begin_shutdown() from guardian
+        // failure (or other external paths) without aborting this outer JoinSet owner.
+        let shutdown_state = listener_state.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         servers.spawn(async move {
             proxy::serve_until_shutdown(listener, listener_state, async move {
-                if !*shutdown_rx.borrow() {
-                    let _ignored = shutdown_rx.changed().await;
+                tokio::select! {
+                    () = async {
+                        if !*shutdown_rx.borrow() {
+                            let _ignored = shutdown_rx.changed().await;
+                        }
+                    } => {}
+                    () = shutdown_state.wait_for_shutdown() => {}
                 }
             })
             .await
         });
     }
 
-    while let Some(result) = servers.join_next().await {
+    let result = loop {
+        let Some(result) = servers.join_next().await else {
+            break Ok(());
+        };
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(format!("server failed: {error}")),
-            Err(error) => return Err(format!("server task failed: {error}")),
+            Ok(Err(error)) => break Err(format!("server failed: {error}")),
+            Err(error) => break Err(format!("server task failed: {error}")),
         }
+    };
+    if result.is_err() {
+        // Signal siblings via ShutdownGate so serve_until_shutdown can run its
+        // bounded graceful drain (and schedule observer persistence) before flush.
+        // Do not abort_all(): that cancels the drain path mid-flight.
+        state.begin_shutdown();
+        while servers.join_next().await.is_some() {}
     }
-
-    Ok(())
+    state.flush_persistence().await;
+    result
 }
 
 fn render_listening(
@@ -752,9 +872,119 @@ fn parse_artifact_kind(value: &str) -> Result<EvidenceRawArtifactKind, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, path::Path};
+    use std::{ffi::OsString, path::Path, sync::mpsc, thread, time::Duration};
+
+    #[cfg(feature = "memory-guardian")]
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    #[cfg(feature = "memory-guardian")]
+    use tokio::{sync::watch, task::JoinSet};
 
     use llm_guard_proxy_core::{AppConfig, HeartbeatMode};
+
+    #[cfg(feature = "memory-guardian")]
+    struct PersistenceOnDrop {
+        graceful_shutdown: Arc<AtomicBool>,
+        enqueue: Option<tokio::sync::oneshot::Sender<bool>>,
+    }
+
+    #[cfg(feature = "memory-guardian")]
+    impl Drop for PersistenceOnDrop {
+        fn drop(&mut self) {
+            if let Some(enqueue) = self.enqueue.take() {
+                let _ignored = enqueue.send(self.graceful_shutdown.load(Ordering::SeqCst));
+            }
+        }
+    }
+
+    #[cfg(feature = "memory-guardian")]
+    #[tokio::test]
+    async fn guardian_failure_cleanup_drains_nested_listener_before_flush() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (listener_started_tx, listener_started_rx) = tokio::sync::oneshot::channel();
+        let (release_listener_tx, release_listener_rx) = tokio::sync::oneshot::channel();
+        let (persistence_enqueue_tx, persistence_enqueue_rx) = tokio::sync::oneshot::channel();
+        let graceful_shutdown = Arc::new(AtomicBool::new(false));
+        let listener_shutdown = Arc::clone(&graceful_shutdown);
+        let mut server = tokio::spawn(async move {
+            let mut listeners = JoinSet::new();
+            listeners.spawn(async move {
+                let _persistence_on_drop = PersistenceOnDrop {
+                    graceful_shutdown: listener_shutdown,
+                    enqueue: Some(persistence_enqueue_tx),
+                };
+                listener_started_tx
+                    .send(())
+                    .expect("test should wait for the nested listener to start");
+                let mut shutdown_rx = shutdown_rx;
+                shutdown_rx
+                    .changed()
+                    .await
+                    .expect("guardian shutdown sender should stay alive");
+                release_listener_rx
+                    .await
+                    .expect("guardian shutdown should release the nested listener");
+                graceful_shutdown.store(true, Ordering::SeqCst);
+            });
+            while listeners.join_next().await.is_some() {}
+            Ok::<(), String>(())
+        });
+        listener_started_rx
+            .await
+            .expect("nested listener should start before guardian cleanup");
+
+        let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+        let release_listener = tokio::spawn(async move {
+            shutdown_started_rx
+                .await
+                .expect("guardian cleanup should begin shutdown");
+            release_listener_tx
+                .send(())
+                .expect("nested listener should still be alive for graceful shutdown");
+        });
+        let begin_events = Arc::clone(&events);
+        let flush_events = Arc::clone(&events);
+        super::abort_server_after_guardian_failure(
+            &mut server,
+            move || {
+                shutdown_tx
+                    .send(true)
+                    .expect("guardian shutdown sender should stay alive");
+                shutdown_started_tx
+                    .send(())
+                    .expect("release task should wait for guardian shutdown");
+                begin_events
+                    .lock()
+                    .expect("event log should remain available")
+                    .push("shutdown");
+            },
+            async move {
+                assert!(
+                    persistence_enqueue_rx
+                        .await
+                        .expect("nested listener should schedule persistence on drop"),
+                    "persistence must be scheduled only after nested listener shutdown completes"
+                );
+                flush_events
+                    .lock()
+                    .expect("event log should remain available")
+                    .push("flush");
+            },
+        )
+        .await;
+        release_listener
+            .await
+            .expect("release task should complete without panic");
+
+        assert_eq!(
+            *events.lock().expect("event log should remain available"),
+            ["shutdown", "flush"]
+        );
+    }
+
     use llm_guard_proxy_state::RequestId;
 
     use super::{
@@ -912,5 +1142,58 @@ mod tests {
         assert!(!rendered.contains("x-api-key"));
         assert!(!rendered.contains("safe=ok"));
         assert!(!rendered.contains("token=sk-test"));
+    }
+
+    #[test]
+    fn runtime_shutdown_timeout_returns_with_a_started_blocking_task() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (runtime_ready_tx, runtime_ready_rx) = mpsc::channel();
+        let (begin_shutdown_tx, begin_shutdown_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (shutdown_finished_tx, shutdown_finished_rx) = mpsc::channel();
+
+        let runtime_thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(async move {
+                tokio::task::spawn_blocking(move || {
+                    started_tx
+                        .send(())
+                        .expect("test should wait for the blocking task to start");
+                    let _release = release_rx.recv();
+                });
+            });
+            runtime_ready_tx
+                .send(())
+                .expect("test should wait until the runtime is ready to shut down");
+            begin_shutdown_rx
+                .recv()
+                .expect("test should trigger runtime shutdown");
+            super::shutdown_runtime(runtime, Duration::from_millis(25));
+            shutdown_finished_tx
+                .send(())
+                .expect("test should wait for bounded runtime shutdown");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocking task should start before runtime shutdown");
+        runtime_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("runtime should be ready to shut down after spawning work");
+        begin_shutdown_tx
+            .send(())
+            .expect("runtime thread should still wait for the shutdown signal");
+        shutdown_finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("runtime shutdown must not wait for the stalled blocking task");
+        release_tx
+            .send(())
+            .expect("stalled blocking task should still be waiting after runtime shutdown");
+        runtime_thread
+            .join()
+            .expect("runtime shutdown thread should not panic");
     }
 }

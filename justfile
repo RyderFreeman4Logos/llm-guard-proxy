@@ -2,12 +2,14 @@
 # Keep this file small; issue #1 only needs local quality gates and hook wiring.
 
 set shell := ["bash", "-c"]
+# IO scheduling: run cargo at idle priority to avoid starving interactive processes
+_io_prefix := "ionice -c 3 nice -n 19"
+# Cap libtest concurrency independently of Cargo build jobs (global cargo config).
+local_test_threads := env("LLM_GUARD_LOCAL_TEST_THREADS", "2")
 set tempdir := "."
 set dotenv-load := true
 
 _repo_root := `git rev-parse --show-superproject-working-tree 2>/dev/null | grep . || git rev-parse --show-toplevel`
-local_jobs := env_var_or_default("LLM_GUARD_LOCAL_JOBS", "2")
-local_test_threads := env_var_or_default("LLM_GUARD_LOCAL_TEST_THREADS", "2")
 
 default: pre-commit
 
@@ -28,10 +30,10 @@ check-generated-artifacts:
     fi
 
 fmt:
-    cargo fmt --all
+    {{_io_prefix}} cargo fmt --all
 
 fmt-check:
-    cargo fmt --all -- --check
+    {{_io_prefix}} cargo fmt --all -- --check
 
 contracts:
     python3 -m unittest discover -s tests -p 'test_*.py' -v
@@ -39,16 +41,16 @@ contracts:
 clippy: clippy-all-features clippy-feature-matrix
 
 clippy-all-features:
-    cargo clippy --workspace --all-targets --all-features --jobs {{local_jobs}} -- -D warnings
+    {{_io_prefix}} cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 clippy-feature-matrix:
-    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --jobs {{local_jobs}} -- -D warnings
-    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features guard --jobs {{local_jobs}} -- -D warnings
-    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features param-override --jobs {{local_jobs}} -- -D warnings
-    cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features upstream-hot-restart --jobs {{local_jobs}} -- -D warnings
+    {{_io_prefix}} cargo clippy -p llm-guard-proxy --all-targets --no-default-features -- -D warnings
+    {{_io_prefix}} cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features guard -- -D warnings
+    {{_io_prefix}} cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features param-override -- -D warnings
+    {{_io_prefix}} cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features upstream-hot-restart -- -D warnings
 
 test:
-    RUST_TEST_THREADS={{local_test_threads}} cargo test --workspace --all-features --jobs {{local_jobs}}
+    {{_io_prefix}} env RUST_TEST_THREADS={{local_test_threads}} cargo test --workspace --all-features
 
 smoke-gb10:
     scripts/smoke-gb10.sh

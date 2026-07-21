@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    process::Stdio,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -24,6 +25,7 @@ use axum::http::header::{AUTHORIZATION, CONNECTION, LOCATION};
 use futures_util::{Stream, StreamExt, stream};
 use rusqlite::{Connection, params};
 use tokio::{
+    io::AsyncReadExt,
     net::TcpListener,
     sync::{mpsc, oneshot},
     time::{sleep, timeout},
@@ -552,6 +554,366 @@ fn admin_token_matcher_accepts_only_exact_values() {
     assert!(!admin_token_matches("admin-token-extra", "admin-token"));
     assert!(!admin_token_matches("admin-toke", "admin-token"));
     assert!(!admin_token_matches("", "admin-token"));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn persistence_tasks_contain_spawn_blocking_panics() {
+    let tasks = Arc::new(PersistenceTasks::default());
+
+    tasks.spawn_blocking(|| panic!("simulated persistence store teardown failure"));
+
+    timeout(
+        STREAM_COMPLETION_TIMEOUT,
+        tasks.flush(STREAM_COMPLETION_TIMEOUT),
+    )
+    .await
+    .expect("panic-safe persistence task should finish");
+    assert_eq!(tasks.panics.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
+    let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+
+    tasks.spawn_blocking(move || {
+        first_started_tx
+            .send(())
+            .expect("first persistence task receiver should remain open");
+        release_rx
+            .recv()
+            .expect("first persistence task should be released");
+    });
+    first_started_rx
+        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
+        .expect("first persistence task should start");
+
+    tasks.spawn_blocking(move || {
+        second_started_tx
+            .send(())
+            .expect("dropped persistence task must not execute");
+    });
+
+    assert!(
+        second_started_rx
+            .recv_timeout(Duration::from_millis(250))
+            .is_err(),
+        "overflow persistence work must not execute while the backlog is saturated"
+    );
+    assert_eq!(
+        tasks.dropped_total(),
+        1,
+        "backlog saturation must increment the dropped_total metric counter"
+    );
+    release_tx
+        .send(())
+        .expect("first persistence task should still be waiting");
+    timeout(
+        STREAM_COMPLETION_TIMEOUT,
+        tasks.flush(STREAM_COMPLETION_TIMEOUT),
+    )
+    .await
+    .expect("retained persistence task should drain");
+}
+
+async fn terminate_and_reap_test_child(
+    child: &mut tokio::process::Child,
+    process_group_id: u32,
+) -> (String, std::io::Result<std::process::ExitStatus>) {
+    #[cfg(unix)]
+    let termination = kill(
+        Pid::from_raw(-process_group_id.cast_signed()),
+        Signal::SIGKILL,
+    )
+    .map_or_else(|error| error.to_string(), |()| String::from("SIGKILL sent"));
+    #[cfg(not(unix))]
+    let termination = child
+        .start_kill()
+        .map_or_else(|error| error.to_string(), |()| String::from("SIGKILL sent"));
+    let reaped = child.wait().await;
+    (termination, reaped)
+}
+
+async fn drain_test_child_output(
+    stdout_reader: tokio::task::JoinHandle<Vec<u8>>,
+    stderr_reader: tokio::task::JoinHandle<Vec<u8>>,
+) -> (Vec<u8>, Vec<u8>) {
+    let stdout = stdout_reader
+        .await
+        .expect("backlog-drop child stdout reader should not panic");
+    let stderr = stderr_reader
+        .await
+        .expect("backlog-drop child stderr reader should not panic");
+    (stdout, stderr)
+}
+
+async fn run_bounded_test_child(test_name: &str, child_env: &str) -> std::process::Output {
+    let mut command = tokio::process::Command::new(
+        std::env::current_exe().expect("test binary path should be available"),
+    );
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env(child_env, "1")
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .expect("backlog-drop child test should start");
+    let process_group_id = child.id().expect("backlog-drop child process group id");
+    let mut child_stdout = child
+        .stdout
+        .take()
+        .expect("backlog-drop child stdout should be captured");
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .expect("backlog-drop child stderr should be captured");
+    let stdout_reader = tokio::spawn(async move {
+        let mut output = Vec::new();
+        child_stdout
+            .read_to_end(&mut output)
+            .await
+            .expect("backlog-drop child stdout should drain");
+        output
+    });
+    let stderr_reader = tokio::spawn(async move {
+        let mut output = Vec::new();
+        child_stderr
+            .read_to_end(&mut output)
+            .await
+            .expect("backlog-drop child stderr should drain");
+        output
+    });
+    let status = match timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let (termination, reaped) =
+                terminate_and_reap_test_child(&mut child, process_group_id).await;
+            let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
+            panic!(
+                "backlog-drop child test wait failed: {error}; termination={termination}; reaped={reaped:?}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr),
+            );
+        }
+        Err(_) => {
+            let (termination, reaped) =
+                terminate_and_reap_test_child(&mut child, process_group_id).await;
+            let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
+            panic!(
+                "backlog-drop child test timed out after 30 seconds; termination={termination}; reaped={reaped:?}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr),
+            );
+        }
+    };
+    let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
+    std::process::Output {
+        status,
+        stdout,
+        stderr,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
+    const CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_CHILD";
+    const HANG_CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_HANG_CHILD";
+    const TEST_NAME: &str =
+        "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
+    const OVERFLOW_BURST: usize = 128;
+
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = run_bounded_test_child(TEST_NAME, CHILD_ENV).await;
+        assert!(
+            output.status.success(),
+            "backlog-drop child test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "backlog-drop child test must run exactly one test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let log_emissions = stderr
+            .matches("persistence backlog full, dropping record")
+            .count();
+        assert!(
+            log_emissions <= 1,
+            "a saturated overflow burst must emit at most one backlog-drop log, emitted {log_emissions}"
+        );
+        assert!(
+            stderr.contains("dropped_since_last_log=1"),
+            "the first aggregated backlog-drop log must report its dropped delta: {stderr}"
+        );
+        return;
+    }
+
+    if std::env::var_os(HANG_CHILD_ENV).is_some() {
+        sleep(Duration::from_secs(60)).await;
+    }
+
+    let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    tasks.spawn_blocking(move || {
+        first_started_tx
+            .send(())
+            .expect("first persistence task receiver should remain open");
+        release_rx
+            .recv()
+            .expect("first persistence task should be released");
+    });
+    first_started_rx
+        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
+        .expect("first persistence task should start");
+
+    for _ in 0..OVERFLOW_BURST {
+        tasks.spawn_blocking(|| {});
+    }
+    assert_eq!(
+        tasks.dropped_total(),
+        OVERFLOW_BURST as u64,
+        "every saturated overflow must remain visible in the dropped counter"
+    );
+
+    release_tx
+        .send(())
+        .expect("first persistence task should still be waiting");
+    timeout(
+        STREAM_COMPLETION_TIMEOUT,
+        tasks.flush(STREAM_COMPLETION_TIMEOUT),
+    )
+    .await
+    .expect("retained persistence task should drain");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
+    const HANG_CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_HANG_CHILD";
+    const TEST_NAME: &str =
+        "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
+
+    let mut command = tokio::process::Command::new(
+        std::env::current_exe().expect("test binary path should be available"),
+    );
+    command
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .env(HANG_CHILD_ENV, "1")
+        .kill_on_drop(true)
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let mut child = command
+        .spawn()
+        .expect("hung backlog-drop parent test should start");
+    let process_group_id = child.id().expect("hung backlog-drop parent child pid");
+
+    // The nested child has a 30-second deadline; leave startup scheduling headroom
+    // when the full suite is running concurrently.
+    let status = match timeout(Duration::from_secs(60), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(error)) => {
+            let (termination, reaped) =
+                terminate_and_reap_test_child(&mut child, process_group_id).await;
+            panic!(
+                "hung backlog-drop parent wait failed: {error}; termination={termination}; reaped={reaped:?}"
+            );
+        }
+        Err(_) => {
+            let (termination, reaped) =
+                terminate_and_reap_test_child(&mut child, process_group_id).await;
+            panic!(
+                "backlog-drop parent must fail after terminating its hung child; termination={termination}; reaped={reaped:?}"
+            );
+        }
+    };
+    assert!(
+        !status.success(),
+        "backlog-drop parent should fail after its child timeout"
+    );
+}
+
+#[tokio::test]
+async fn error_shutdown_signals_persistence_tracked_shadow_work_before_flushing() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let persistence_tasks = Arc::clone(&proxy.state.persistence_tasks);
+    let task_state = proxy.state.clone();
+    let (started_tx, started_rx) = oneshot::channel();
+
+    let shadow_task = tokio::spawn(async move {
+        let _task_guard = persistence_tasks.track();
+        let mut shutdown = task_state.shutdown.subscribe();
+        started_tx
+            .send(())
+            .expect("shadow task startup receiver should remain open");
+        shutdown.cancelled().await;
+    });
+    timeout(STREAM_COMPLETION_TIMEOUT, started_rx)
+        .await
+        .expect("shadow task should start before error shutdown")
+        .expect("shadow task must not stop before error shutdown");
+
+    proxy.state.begin_shutdown();
+    timeout(STREAM_COMPLETION_TIMEOUT, proxy.state.flush_persistence())
+        .await
+        .expect("error shutdown should let persistence-tracked shadow work drain");
+    timeout(STREAM_COMPLETION_TIMEOUT, shadow_task)
+        .await
+        .expect("shadow task should observe the error shutdown signal")
+        .expect("shadow task should not panic");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistence_flush_does_not_miss_a_zero_transition_after_observing_work() {
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let notification_registered = Arc::new(AtomicBool::new(false));
+    let tasks = Arc::new(PersistenceTasks {
+        flush_wait_hook: Some(PersistenceFlushWaitHook {
+            arrived: arrived_tx,
+            release: Arc::clone(&release),
+            notification_registered: Arc::clone(&notification_registered),
+        }),
+        ..PersistenceTasks::default()
+    });
+    let guard = tasks.track();
+    let flush_tasks = Arc::clone(&tasks);
+    let mut flush = tokio::spawn(async move {
+        flush_tasks.flush(STREAM_COMPLETION_TIMEOUT).await;
+    });
+
+    if arrived_rx.recv_timeout(STREAM_COMPLETION_TIMEOUT).is_err() {
+        flush.abort();
+        drop(guard);
+        panic!("flush must register for completion before observing in-flight work");
+    }
+    if !notification_registered.load(Ordering::SeqCst) {
+        release.wait();
+        flush.abort();
+        drop(guard);
+        panic!("flush must register for completion before observing in-flight work");
+    }
+    drop(guard);
+    release.wait();
+
+    match timeout(STREAM_COMPLETION_TIMEOUT, &mut flush).await {
+        Ok(result) => result.expect("flush task should not panic"),
+        Err(_elapsed) => {
+            flush.abort();
+            panic!("flush must complete after the last persistence task finishes");
+        }
+    }
 }
 
 #[test]
@@ -6066,7 +6428,9 @@ async fn upstream_stall_recovery_public_path_returns_term_resistant_leader_clean
             leader_pid_path.display().to_string(),
             ready_path.display().to_string(),
         ],
-        recovery_timeout: Duration::from_millis(1),
+        // The public waiter must observe a real leader before the timeout path
+        // tears it down; cleanup behavior is independent of a one-millisecond race.
+        recovery_timeout: Duration::from_secs(1),
         recovery_cooldown: Duration::from_millis(1),
         recovery_budget_window: Duration::from_secs(60),
         recovery_max_per_window: 2,
@@ -16469,6 +16833,7 @@ async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
         .expect("invalid upstream URL should carry request metadata");
 
     record_failed_request(
+        &proxy.state.persistence_tasks,
         &proxy.store,
         FailedRequestRecord {
             request_id,

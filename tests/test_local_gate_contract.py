@@ -24,8 +24,12 @@ class LocalGateContractTests(unittest.TestCase):
         review_check = REVIEW_CHECK.read_text()
 
         self.assertIn("pre-push:", justfile)
-        self.assertIn("LLM_GUARD_LOCAL_JOBS", justfile)
-        self.assertIn("LLM_GUARD_LOCAL_TEST_THREADS", justfile)
+        self.assertIn('_io_prefix := "ionice -c 3 nice -n 19"', justfile)
+        self.assertIn('local_test_threads := env("LLM_GUARD_LOCAL_TEST_THREADS", "2")', justfile)
+        self.assertIn(
+            "{{_io_prefix}} env RUST_TEST_THREADS={{local_test_threads}} cargo test --workspace --all-features",
+            justfile,
+        )
         self.assertIn("review-check:", lefthook)
         self.assertIn("run: scripts/hooks/review-check.sh", lefthook)
         self.assertIn("run: just pre-push", lefthook)
