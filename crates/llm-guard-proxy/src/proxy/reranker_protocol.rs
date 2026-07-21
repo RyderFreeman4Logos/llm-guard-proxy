@@ -22,7 +22,7 @@ const MAX_PAIR_COUNT: usize = 1_024;
 const MAX_REQUEST_ID_BYTES: usize = 256;
 const MAX_DEEPINFRA_RENDERED_BODY_BYTES: usize = 1_048_576;
 /// Inbound credentials, sessions, and requester identity must not cross into a configured origin.
-const ISOLATED_THIRD_PARTY_HEADERS_TO_STRIP: [&str; 21] = [
+const ISOLATED_THIRD_PARTY_HEADERS_TO_STRIP: [&str; 22] = [
     "api-key",
     "authorization",
     "cookie",
@@ -33,6 +33,7 @@ const ISOLATED_THIRD_PARTY_HEADERS_TO_STRIP: [&str; 21] = [
     "set-cookie",
     "signature",
     "signature-input",
+    "x-access-key",
     "x-access-token",
     "x-amz-security-token",
     "x-api-key",

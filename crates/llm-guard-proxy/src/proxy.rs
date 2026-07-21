@@ -7125,6 +7125,7 @@ struct ShieldedAttemptFailure {
     response_metadata: BTreeMap<String, String>,
     raw_payloads: RawPayloads,
     upstream_body: Bytes,
+    completed_endpoint_attempt_records: Vec<AttemptRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -7338,9 +7339,10 @@ enum ShieldedStartFailureStep {
 
 async fn shielded_start_failure_step(
     runtime: &ShieldedRetryRuntime,
-    failure: ShieldedAttemptFailure,
+    mut failure: ShieldedAttemptFailure,
     attempt_records: &mut Vec<AttemptRecord>,
 ) -> ShieldedStartFailureStep {
+    attempt_records.append(&mut failure.completed_endpoint_attempt_records);
     let next_retry_cause = failure.retry_cause;
     let can_retry = should_retry_after_shielded_failure(runtime, &failure);
     let (failure, can_retry) = {
@@ -7667,7 +7669,7 @@ async fn run_shielded_attempts(
     let mut cot_salvage = None;
     let mut cot_salvage_attempted = false;
     loop {
-        let started = if let Some(started) = current_attempt.take() {
+        let mut started = if let Some(started) = current_attempt.take() {
             started
         } else {
             let ignores_request_deadline = consume_local_recovery_deadline_replay_permit(&runtime);
@@ -7707,6 +7709,7 @@ async fn run_shielded_attempts(
                 }
             }
         };
+        attempt_records.append(&mut started.completed_endpoint_attempt_records);
 
         update_shielded_attempt_progress(
             attempt_progress.as_ref(),
@@ -9207,12 +9210,19 @@ async fn send_shielded_upstream_attempt(
                 .map(|remaining| Instant::now() + remaining)
         })
         .flatten();
+    let rendered = reranker_protocol::render_openai_endpoint(
+        &runtime.terminal_endpoint,
+        runtime.forward_uri.clone(),
+        &upstream_body,
+        &runtime.original_downstream_headers,
+        runtime.transformed_request_headers,
+    )?;
     send_first_upstream_attempt(UpstreamAttemptContext {
         client: &runtime.client,
         method: runtime.method.clone(),
-        upstream_url: runtime.upstream_url.clone(),
-        downstream_headers: &runtime.upstream_headers,
-        upstream_body: upstream_body.clone(),
+        upstream_url: rendered.url,
+        downstream_headers: &rendered.headers,
+        upstream_body: rendered.body,
         retry_body: upstream_body,
         upstream_timeout,
         attempt_id,
@@ -9256,10 +9266,26 @@ struct ShieldedStartFailureInput<'runtime> {
     error: ProxyError,
 }
 
+fn shielded_start_error_type(error: &ProxyError, request_deadline_exhausted: bool) -> &'static str {
+    if request_deadline_exhausted {
+        REQUEST_DEADLINE_ERROR_TYPE
+    } else if matches!(
+        error,
+        ProxyError::UpstreamTransport {
+            failure: ReqwestFailureKind::Connect,
+            ..
+        }
+    ) {
+        "upstream_connect_error"
+    } else {
+        error.error_type()
+    }
+}
+
 fn shielded_start_transport_failure(
     input: ShieldedStartFailureInput<'_>,
 ) -> ShieldedAttemptFailure {
-    let finished_at_unix_ms = unix_time_millis();
+    let mut finished_at_unix_ms = unix_time_millis();
     let request_deadline_exhausted = input.runtime.request_deadline.is_exhausted()
         && matches!(
             &input.error,
@@ -9269,7 +9295,7 @@ fn shielded_start_transport_failure(
             }
         );
     let retry_cause =
-        if matches!(input.error, ProxyError::Shutdown { .. }) || request_deadline_exhausted {
+        if matches!(&input.error, ProxyError::Shutdown { .. }) || request_deadline_exhausted {
             None
         } else {
             transport_retry_cause(&input.error)
@@ -9279,21 +9305,40 @@ fn shielded_start_transport_failure(
     } else {
         input.error.abort_reason().map(str::to_owned)
     };
-    let error_type = if request_deadline_exhausted {
-        REQUEST_DEADLINE_ERROR_TYPE
-    } else {
-        input.error.error_type()
-    };
+    let error_type = shielded_start_error_type(&input.error, request_deadline_exhausted);
     let error_message = if request_deadline_exhausted {
         String::from("shielded request deadline exhausted before upstream response headers")
     } else {
         input.error.to_string()
     };
-    let mut response_metadata = failed_response_metadata(
-        input.attempt_started_at_unix_ms,
-        finished_at_unix_ms,
-        error_type,
-    );
+    let mut completed_endpoint_attempt_records = input.error.attempt_records();
+    let terminal_endpoint_attempt = completed_endpoint_attempt_records.pop();
+    let mut attempt_id = input.attempt_id;
+    let mut request_id = input.runtime.request_id.clone();
+    let mut attempt_number = input.attempt_number;
+    let mut started_at_unix_ms = input.attempt_started_at_unix_ms;
+    let mut upstream_mode = UpstreamMode::NotApplicable;
+    let mut http_status = None;
+    let mut request_metadata = input.request_metadata;
+    let mut response_metadata =
+        failed_response_metadata(started_at_unix_ms, finished_at_unix_ms, error_type);
+    let mut raw_payloads = RawPayloads::default();
+    if let Some(terminal) = terminal_endpoint_attempt {
+        attempt_id = terminal.attempt_id;
+        request_id = terminal.request_id;
+        attempt_number = terminal.attempt_number;
+        started_at_unix_ms = terminal.started_at_unix_ms;
+        finished_at_unix_ms = terminal.finished_at_unix_ms.unwrap_or(finished_at_unix_ms);
+        upstream_mode = terminal.upstream_mode;
+        http_status = terminal.http_status;
+        request_metadata = terminal.request_metadata;
+        response_metadata.extend(terminal.response_metadata);
+        raw_payloads = terminal.raw_payloads;
+    }
+    if raw_payloads.input.is_none() {
+        raw_payloads.input = input.raw_request_body;
+    }
+    response_metadata.insert(String::from("error_type"), error_type.to_owned());
     response_metadata.insert(
         String::from("upstream_response_received"),
         String::from("false"),
@@ -9309,13 +9354,13 @@ fn shielded_start_transport_failure(
         );
     }
     ShieldedAttemptFailure {
-        attempt_id: input.attempt_id,
-        request_id: input.runtime.request_id.clone(),
-        attempt_number: input.attempt_number,
-        started_at_unix_ms: input.attempt_started_at_unix_ms,
+        attempt_id,
+        request_id,
+        attempt_number,
+        started_at_unix_ms,
         finished_at_unix_ms,
-        upstream_mode: UpstreamMode::NotApplicable,
-        http_status: None,
+        upstream_mode,
+        http_status,
         #[cfg(feature = "upstream-hot-restart")]
         transport_failure: match &input.error {
             ProxyError::UpstreamTransport { failure, .. } => Some(*failure),
@@ -9325,13 +9370,11 @@ fn shielded_start_transport_failure(
         error_message,
         retry_cause,
         abort_reason,
-        request_metadata: input.request_metadata,
+        request_metadata,
         response_metadata,
-        raw_payloads: RawPayloads {
-            input: input.raw_request_body,
-            ..RawPayloads::default()
-        },
+        raw_payloads,
         upstream_body: input.evidence_upstream_body,
+        completed_endpoint_attempt_records,
     }
 }
 
@@ -9725,6 +9768,7 @@ fn aggregation_failure(
         response_metadata,
         raw_payloads,
         upstream_body: info.upstream_body.clone(),
+        completed_endpoint_attempt_records: Vec::new(),
     }
 }
 
@@ -9764,6 +9808,7 @@ fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAtte
             ..RawPayloads::default()
         },
         upstream_body: info.upstream_body.clone(),
+        completed_endpoint_attempt_records: Vec::new(),
     }
 }
 
@@ -9807,6 +9852,7 @@ fn request_deadline_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> Shie
             ..RawPayloads::default()
         },
         upstream_body: info.upstream_body.clone(),
+        completed_endpoint_attempt_records: Vec::new(),
     }
 }
 
@@ -9910,6 +9956,7 @@ fn status_failure(
             ..RawPayloads::default()
         },
         upstream_body: info.upstream_body.clone(),
+        completed_endpoint_attempt_records: Vec::new(),
     }
 }
 
@@ -9949,6 +9996,7 @@ fn status_failure_without_retry(
             ..RawPayloads::default()
         },
         upstream_body: info.upstream_body.clone(),
+        completed_endpoint_attempt_records: Vec::new(),
     }
 }
 

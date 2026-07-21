@@ -8,6 +8,7 @@ use tokio::{
 mod credential_boundary;
 mod models_attempt_preservation;
 mod response_and_recovery;
+mod shielded_attempt_continuity;
 
 const THIRD_PARTY_TEST_KEY_ENV: &str = "PATH";
 
@@ -39,10 +40,12 @@ shielded_streaming_enabled = true
         .post(format!("{}/v1/chat/completions", proxy.base_url))
         .header(AUTHORIZATION, "Bearer inbound-authorization")
         .header("x-api-key", "inbound-api-key")
+        .header("x-access-key", "inbound-access-key")
         .header("x-session-token", "inbound-session-token")
         .header("openai-organization", "inbound-organization")
         .header("openai-project", "inbound-project")
         .header("cookie", "inbound-cookie=value")
+        .header("x-request-id", "safe-shielded-request-id")
         .json(&json!({
             "model": "same-model",
             "stream": true,
@@ -71,6 +74,7 @@ shielded_streaming_enabled = true
     );
     for name in [
         "x-api-key",
+        "x-access-key",
         "x-session-token",
         "openai-organization",
         "openai-project",
@@ -81,6 +85,13 @@ shielded_streaming_enabled = true
             "configured endpoint received inbound credential or session header {name}"
         );
     }
+    assert_eq!(
+        request
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("safe-shielded-request-id")
+    );
 }
 
 #[tokio::test]
@@ -142,6 +153,7 @@ async fn openai_third_party_failover_rewrites_model_and_isolates_credentials() {
         .header("x-api-key", "inbound-api-key")
         .header("x-api-token", "inbound-api-token")
         .header("x-auth-token", "inbound-auth-token")
+        .header("x-access-key", "inbound-access-key")
         .header("x-access-token", "inbound-access-token")
         .header("x-session-token", "inbound-session-token")
         .header("x-csrf-token", "inbound-csrf-token")
@@ -153,6 +165,7 @@ async fn openai_third_party_failover_rewrites_model_and_isolates_credentials() {
         .header("proxy-authorization", "Basic inbound-proxy-auth")
         .header("signature", "sig=:inbound-signature:")
         .header("signature-input", "sig=(\"authorization\")")
+        .header("x-request-id", "safe-generic-request-id")
         .json(&json!({"model": "same-model", "input": "fail over"}))
         .send()
         .await
@@ -178,6 +191,7 @@ async fn openai_third_party_failover_rewrites_model_and_isolates_credentials() {
         "x-api-key",
         "x-api-token",
         "x-auth-token",
+        "x-access-key",
         "x-access-token",
         "x-session-token",
         "x-csrf-token",
@@ -195,6 +209,13 @@ async fn openai_third_party_failover_rewrites_model_and_isolates_credentials() {
             "third-party origin received inbound credential header {name}"
         );
     }
+    assert_eq!(
+        request
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("safe-generic-request-id")
+    );
     let body: serde_json::Value =
         serde_json::from_slice(&request.body).expect("forwarded body should be JSON");
     assert_eq!(body["model"], "vendor/embedding-model.v1");

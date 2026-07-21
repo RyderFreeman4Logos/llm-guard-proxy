@@ -1,8 +1,9 @@
 use super::*;
 
-const MODEL_DISCOVERY_SENSITIVE_HEADERS: [&str; 12] = [
+const MODEL_DISCOVERY_SENSITIVE_HEADERS: [&str; 13] = [
     "authorization",
     "x-api-key",
+    "x-access-key",
     "x-virtual-key",
     "cookie",
     "proxy-authorization",
@@ -33,6 +34,7 @@ async fn aggregate_models_uses_openai_failover_without_forwarding_caller_credent
     let sensitive_headers = [
         ("authorization", "Bearer aggregate-authorization-unique"),
         ("x-api-key", "aggregate-api-key-unique"),
+        ("x-access-key", "aggregate-access-key-unique"),
         ("x-virtual-key", "aggregate-virtual-key-unique"),
         ("cookie", "aggregate-cookie-unique"),
         ("proxy-authorization", "aggregate-proxy-auth-unique"),
