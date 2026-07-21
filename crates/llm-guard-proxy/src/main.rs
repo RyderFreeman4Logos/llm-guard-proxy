@@ -162,6 +162,7 @@ async fn serve_with_guardian(
     state: proxy::ProxyState,
     guardian: MemoryGuardian,
 ) -> Result<(), String> {
+    let cleanup_state = state.clone();
     let mut server = tokio::spawn(serve_bound_listeners(bound_listeners, state));
     let mut guardian = tokio::spawn(async move {
         let mut guardian = guardian;
@@ -178,18 +179,39 @@ async fn serve_with_guardian(
                 Err(error) => Err(format!("server task failed: {error}")),
             },
             Ok(Err(error)) => {
-                server.abort();
+                abort_server_after_guardian_failure(
+                    &mut server,
+                    || cleanup_state.begin_shutdown(),
+                    cleanup_state.flush_persistence(),
+                )
+                .await;
                 Err(format!("memory guardian failed: {error}"))
             }
             Err(error) => {
-                server.abort();
+                abort_server_after_guardian_failure(
+                    &mut server,
+                    || cleanup_state.begin_shutdown(),
+                    cleanup_state.flush_persistence(),
+                )
+                .await;
                 Err(format!("memory guardian task failed: {error}"))
             }
         },
     };
-    server.abort();
     guardian.abort();
     result
+}
+
+#[cfg(feature = "memory-guardian")]
+async fn abort_server_after_guardian_failure(
+    server: &mut tokio::task::JoinHandle<Result<(), String>>,
+    begin_shutdown: impl FnOnce(),
+    flush_persistence: impl std::future::Future<Output = ()>,
+) {
+    begin_shutdown();
+    server.abort();
+    let _ignored = server.await;
+    flush_persistence.await;
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -762,7 +784,69 @@ fn parse_artifact_kind(value: &str) -> Result<EvidenceRawArtifactKind, String> {
 mod tests {
     use std::{ffi::OsString, path::Path};
 
+    #[cfg(feature = "memory-guardian")]
+    use std::sync::{Arc, Mutex};
+
     use llm_guard_proxy_core::{AppConfig, HeartbeatMode};
+
+    #[cfg(feature = "memory-guardian")]
+    struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
+
+    #[cfg(feature = "memory-guardian")]
+    impl Drop for DropNotifier {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ignored = sender.send(());
+            }
+        }
+    }
+
+    #[cfg(feature = "memory-guardian")]
+    #[tokio::test]
+    async fn guardian_failure_cleanup_starts_shutdown_and_awaits_server_before_flush() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (server_started_tx, server_started_rx) = tokio::sync::oneshot::channel();
+        let (server_dropped_tx, server_dropped_rx) = tokio::sync::oneshot::channel();
+        let mut server = tokio::spawn(async move {
+            let _server_lifetime = DropNotifier(Some(server_dropped_tx));
+            server_started_tx
+                .send(())
+                .expect("test should wait for the server task to start");
+            std::future::pending::<()>().await;
+            Ok::<(), String>(())
+        });
+        server_started_rx
+            .await
+            .expect("server task should start before cleanup");
+
+        let begin_events = Arc::clone(&events);
+        let flush_events = Arc::clone(&events);
+        super::abort_server_after_guardian_failure(
+            &mut server,
+            move || {
+                begin_events
+                    .lock()
+                    .expect("event log should remain available")
+                    .push("shutdown");
+            },
+            async move {
+                server_dropped_rx
+                    .await
+                    .expect("server task must terminate before persistence flush starts");
+                flush_events
+                    .lock()
+                    .expect("event log should remain available")
+                    .push("flush");
+            },
+        )
+        .await;
+
+        assert_eq!(
+            *events.lock().expect("event log should remain available"),
+            ["shutdown", "flush"]
+        );
+    }
+
     use llm_guard_proxy_state::RequestId;
 
     use super::{
