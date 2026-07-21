@@ -305,6 +305,11 @@ impl ProxyState {
         self.shutdown.begin_shutdown();
     }
 
+    pub(crate) async fn wait_for_shutdown(&self) {
+        let mut shutdown = self.shutdown.subscribe();
+        shutdown.cancelled().await;
+    }
+
     pub(crate) async fn flush_persistence(&self) {
         self.persistence_tasks.flush().await;
     }

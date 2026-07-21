@@ -208,8 +208,11 @@ async fn abort_server_after_guardian_failure(
     begin_shutdown: impl FnOnce(),
     flush_persistence: impl std::future::Future<Output = ()>,
 ) {
+    // Signal shared ShutdownGate so serve_bound_listeners can stop each
+    // nested listener and drain its JoinSet. Do not abort the outer task:
+    // aborting would drop the JoinSet without joining children and race
+    // flush_persistence against response-observer cleanup.
     begin_shutdown();
-    server.abort();
     let _ignored = server.await;
     flush_persistence.await;
 }
@@ -367,11 +370,19 @@ async fn serve_bound_listeners(
     let mut servers = JoinSet::new();
     for (listener_config, listener, _local_addr) in bound_listeners {
         let listener_state = state.for_listener(listener_config);
+        // Clone so the shutdown future can observe begin_shutdown() from guardian
+        // failure (or other external paths) without aborting this outer JoinSet owner.
+        let shutdown_state = listener_state.clone();
         let mut shutdown_rx = shutdown_rx.clone();
         servers.spawn(async move {
             proxy::serve_until_shutdown(listener, listener_state, async move {
-                if !*shutdown_rx.borrow() {
-                    let _ignored = shutdown_rx.changed().await;
+                tokio::select! {
+                    () = async {
+                        if !*shutdown_rx.borrow() {
+                            let _ignored = shutdown_rx.changed().await;
+                        }
+                    } => {}
+                    () = shutdown_state.wait_for_shutdown() => {}
                 }
             })
             .await
@@ -785,54 +796,99 @@ mod tests {
     use std::{ffi::OsString, path::Path};
 
     #[cfg(feature = "memory-guardian")]
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    #[cfg(feature = "memory-guardian")]
+    use tokio::{sync::watch, task::JoinSet};
 
     use llm_guard_proxy_core::{AppConfig, HeartbeatMode};
 
     #[cfg(feature = "memory-guardian")]
-    struct DropNotifier(Option<tokio::sync::oneshot::Sender<()>>);
+    struct PersistenceOnDrop {
+        graceful_shutdown: Arc<AtomicBool>,
+        enqueue: Option<tokio::sync::oneshot::Sender<bool>>,
+    }
 
     #[cfg(feature = "memory-guardian")]
-    impl Drop for DropNotifier {
+    impl Drop for PersistenceOnDrop {
         fn drop(&mut self) {
-            if let Some(sender) = self.0.take() {
-                let _ignored = sender.send(());
+            if let Some(enqueue) = self.enqueue.take() {
+                let _ignored = enqueue.send(self.graceful_shutdown.load(Ordering::SeqCst));
             }
         }
     }
 
     #[cfg(feature = "memory-guardian")]
     #[tokio::test]
-    async fn guardian_failure_cleanup_starts_shutdown_and_awaits_server_before_flush() {
+    async fn guardian_failure_cleanup_drains_nested_listener_before_flush() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let (server_started_tx, server_started_rx) = tokio::sync::oneshot::channel();
-        let (server_dropped_tx, server_dropped_rx) = tokio::sync::oneshot::channel();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (listener_started_tx, listener_started_rx) = tokio::sync::oneshot::channel();
+        let (release_listener_tx, release_listener_rx) = tokio::sync::oneshot::channel();
+        let (persistence_enqueue_tx, persistence_enqueue_rx) = tokio::sync::oneshot::channel();
+        let graceful_shutdown = Arc::new(AtomicBool::new(false));
+        let listener_shutdown = Arc::clone(&graceful_shutdown);
         let mut server = tokio::spawn(async move {
-            let _server_lifetime = DropNotifier(Some(server_dropped_tx));
-            server_started_tx
-                .send(())
-                .expect("test should wait for the server task to start");
-            std::future::pending::<()>().await;
+            let mut listeners = JoinSet::new();
+            listeners.spawn(async move {
+                let _persistence_on_drop = PersistenceOnDrop {
+                    graceful_shutdown: listener_shutdown,
+                    enqueue: Some(persistence_enqueue_tx),
+                };
+                listener_started_tx
+                    .send(())
+                    .expect("test should wait for the nested listener to start");
+                let mut shutdown_rx = shutdown_rx;
+                shutdown_rx
+                    .changed()
+                    .await
+                    .expect("guardian shutdown sender should stay alive");
+                release_listener_rx
+                    .await
+                    .expect("guardian shutdown should release the nested listener");
+                graceful_shutdown.store(true, Ordering::SeqCst);
+            });
+            while listeners.join_next().await.is_some() {}
             Ok::<(), String>(())
         });
-        server_started_rx
+        listener_started_rx
             .await
-            .expect("server task should start before cleanup");
+            .expect("nested listener should start before guardian cleanup");
 
+        let (shutdown_started_tx, shutdown_started_rx) = tokio::sync::oneshot::channel();
+        let release_listener = tokio::spawn(async move {
+            shutdown_started_rx
+                .await
+                .expect("guardian cleanup should begin shutdown");
+            release_listener_tx
+                .send(())
+                .expect("nested listener should still be alive for graceful shutdown");
+        });
         let begin_events = Arc::clone(&events);
         let flush_events = Arc::clone(&events);
         super::abort_server_after_guardian_failure(
             &mut server,
             move || {
+                shutdown_tx
+                    .send(true)
+                    .expect("guardian shutdown sender should stay alive");
+                shutdown_started_tx
+                    .send(())
+                    .expect("release task should wait for guardian shutdown");
                 begin_events
                     .lock()
                     .expect("event log should remain available")
                     .push("shutdown");
             },
             async move {
-                server_dropped_rx
-                    .await
-                    .expect("server task must terminate before persistence flush starts");
+                assert!(
+                    persistence_enqueue_rx
+                        .await
+                        .expect("nested listener should schedule persistence on drop"),
+                    "persistence must be scheduled only after nested listener shutdown completes"
+                );
                 flush_events
                     .lock()
                     .expect("event log should remain available")
@@ -840,6 +896,9 @@ mod tests {
             },
         )
         .await;
+        release_listener
+            .await
+            .expect("release task should complete without panic");
 
         assert_eq!(
             *events.lock().expect("event log should remain available"),
