@@ -400,8 +400,10 @@ async fn serve_bound_listeners(
         }
     };
     if result.is_err() {
+        // Signal siblings via ShutdownGate so serve_until_shutdown can run its
+        // bounded graceful drain (and schedule observer persistence) before flush.
+        // Do not abort_all(): that cancels the drain path mid-flight.
         state.begin_shutdown();
-        servers.abort_all();
         while servers.join_next().await.is_some() {}
     }
     state.flush_persistence().await;
