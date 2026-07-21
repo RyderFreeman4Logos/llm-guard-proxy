@@ -558,7 +558,7 @@ fn endpoint_identity(endpoint: &UpstreamEndpointConfig) -> String {
     )
 }
 
-fn is_passive_cloud_endpoint(endpoint: &UpstreamEndpointConfig) -> bool {
+pub(super) fn is_passive_cloud_endpoint(endpoint: &UpstreamEndpointConfig) -> bool {
     endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
         || endpoint.api_key_env.is_some()
 }

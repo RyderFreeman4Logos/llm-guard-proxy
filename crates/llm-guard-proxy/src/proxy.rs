@@ -5742,14 +5742,14 @@ fn finish_passive_recovery_trial(
     attempt: &PhysicalEndpointAttempt,
     result: &Result<EndpointResponse, ProxyError>,
 ) {
-    if attempt.protocol != UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+    let Some(endpoint) = attempt.endpoint.as_ref() else {
+        return;
+    };
+    if !upstream_failover::is_passive_cloud_endpoint(endpoint)
         || is_retryable_endpoint_result(result, attempt.protocol)
     {
         return;
     }
-    let Some(endpoint) = attempt.endpoint.as_ref() else {
-        return;
-    };
     if result.is_ok() {
         registry.mark_healthy(endpoint);
     }

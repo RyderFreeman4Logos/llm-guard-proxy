@@ -150,6 +150,106 @@ async fn deepinfra_cooldown_recovery_admits_exactly_one_concurrent_trial() {
 }
 
 #[tokio::test]
+async fn generic_openai_passive_recovery_restores_full_concurrent_admission() {
+    let mut openai = FakeUpstream::spawn_with_options(
+        None,
+        StatusCode::OK,
+        "models",
+        None,
+        Some(Duration::from_millis(150)),
+        None,
+        None,
+    )
+    .await;
+    let extra_config = openai_single_endpoint_profile_config(
+        &openai.base_url,
+        Some(THIRD_PARTY_TEST_KEY_ENV),
+        None,
+    );
+    let proxy = spawn_failover_proxy(&openai.base_url, &extra_config).await;
+    let url = format!(
+        "{}/v1/chat/completions?test=transient-503-then-success",
+        proxy.base_url
+    );
+
+    let initial = proxy
+        .client
+        .post(&url)
+        .json(&json!({
+            "model": "same-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "prime passive cooldown"}],
+        }))
+        .send()
+        .await
+        .expect("initial OpenAI request should complete");
+    assert_eq!(initial.status(), StatusCode::SERVICE_UNAVAILABLE);
+    initial.bytes().await.expect("initial body should drain");
+    assert_eq!(
+        openai.recv_next().await.path_and_query,
+        "/v1/chat/completions?test=transient-503-then-success"
+    );
+
+    sleep(Duration::from_millis(225)).await;
+    let recovery = proxy
+        .client
+        .post(&url)
+        .json(&json!({
+            "model": "same-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "recover passive endpoint"}],
+        }))
+        .send()
+        .await
+        .expect("passive OpenAI recovery trial should complete");
+    assert_eq!(recovery.status(), StatusCode::OK);
+    recovery.bytes().await.expect("recovery body should drain");
+    assert_eq!(
+        openai.recv_next().await.path_and_query,
+        "/v1/chat/completions?test=transient-503-then-success"
+    );
+
+    let request_count = 8;
+    let barrier = Arc::new(Barrier::new(request_count + 1));
+    let mut requests = Vec::with_capacity(request_count);
+    for index in 0..request_count {
+        let client = proxy.client.clone();
+        let url = url.clone();
+        let barrier = Arc::clone(&barrier);
+        requests.push(tokio::spawn(async move {
+            barrier.wait().await;
+            client
+                .post(url)
+                .json(&json!({
+                    "model": "same-model",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": format!("post-recovery request {index}")}],
+                }))
+                .send()
+                .await
+                .expect("post-recovery request should complete")
+        }));
+    }
+    barrier.wait().await;
+    for request in requests {
+        let response = request
+            .await
+            .expect("post-recovery request task should join");
+        assert_eq!(response.status(), StatusCode::OK);
+        response
+            .bytes()
+            .await
+            .expect("post-recovery body should drain");
+    }
+    for _ in 0..request_count {
+        assert_eq!(
+            openai.recv_next().await.path_and_query,
+            "/v1/chat/completions?test=transient-503-then-success"
+        );
+    }
+}
+
+#[tokio::test]
 async fn deepinfra_recovery_lease_remains_held_until_retry_classification() {
     let mut openai = FakeUpstream::spawn().await;
     let mut deepinfra = FakeUpstream::spawn_with_deepinfra_response(
