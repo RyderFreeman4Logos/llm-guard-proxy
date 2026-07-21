@@ -1891,11 +1891,11 @@ pub struct UpstreamEndpointConfig {
     pub priority: UpstreamPriority,
     /// Endpoint-specific request and response protocol.
     pub protocol: UpstreamEndpointProtocol,
-    /// Required remote model name for non-OpenAI endpoint protocols.
+    /// Optional remote model name override for OpenAI-compatible and non-OpenAI endpoint protocols.
     pub model: Option<String>,
     /// Required immutable remote model version for non-OpenAI endpoint protocols.
     pub model_revision: Option<String>,
-    /// Runtime environment variable containing the non-OpenAI endpoint credential.
+    /// Optional runtime environment variable containing the endpoint credential.
     pub api_key_env: Option<String>,
 }
 
@@ -2140,30 +2140,23 @@ impl Default for UpstreamProfileConfig {
 impl UpstreamEndpointConfig {
     fn validate(&self) -> Result<(), ValidationError> {
         match self.protocol {
-            UpstreamEndpointProtocol::OpenAi => require(
-                self.model.is_none() && self.model_revision.is_none() && self.api_key_env.is_none(),
-                "profile.upstream.protocol",
-                "openai endpoints must not set model, model_revision, or api_key_env",
-            ),
+            UpstreamEndpointProtocol::OpenAi => {
+                require(
+                    self.model_revision.is_none(),
+                    "profile.upstream.model_revision",
+                    "must not be set for openai endpoints",
+                )?;
+                if let Some(model) = self.model.as_deref() {
+                    validate_endpoint_model(model)?;
+                }
+                if let Some(environment_name) = self.api_key_env.as_deref() {
+                    validate_endpoint_api_key_env(environment_name)?;
+                }
+                Ok(())
+            }
             UpstreamEndpointProtocol::DeepInfraQwen3Rerank => {
                 let model = self.model.as_deref().unwrap_or_default();
-                require(
-                    !model.is_empty() && model == model.trim(),
-                    "profile.upstream.model",
-                    "must be a non-empty trimmed model identifier for deepinfra_qwen3_rerank",
-                )?;
-                require(
-                    model.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
-                    "profile.upstream.model",
-                    "must be at most 256 bytes",
-                )?;
-                require(
-                    model.bytes().all(|byte| {
-                        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
-                    }),
-                    "profile.upstream.model",
-                    "must contain only ASCII letters, digits, '/', '-', '_', or '.'",
-                )?;
+                validate_endpoint_model(model)?;
                 let version = self.model_revision.as_deref().unwrap_or_default();
                 require(
                     !version.is_empty() && version == version.trim(),
@@ -2178,15 +2171,38 @@ impl UpstreamEndpointConfig {
                     "profile.upstream.model_revision",
                     "must be a 40-character lowercase hexadecimal DeepInfra model version",
                 )?;
-                let environment_name = self.api_key_env.as_deref().unwrap_or_default();
-                require(
-                    is_environment_variable_identifier(environment_name),
-                    "profile.upstream.api_key_env",
-                    "must be a valid environment variable identifier for deepinfra_qwen3_rerank",
-                )
+                validate_endpoint_api_key_env(self.api_key_env.as_deref().unwrap_or_default())
             }
         }
     }
+}
+
+fn validate_endpoint_model(model: &str) -> Result<(), ValidationError> {
+    require(
+        !model.is_empty() && model == model.trim(),
+        "profile.upstream.model",
+        "must be a non-empty trimmed endpoint model identifier",
+    )?;
+    require(
+        model.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+        "profile.upstream.model",
+        "must be at most 256 bytes",
+    )?;
+    require(
+        model
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')),
+        "profile.upstream.model",
+        "must contain only ASCII letters, digits, '/', '-', '_', or '.'",
+    )
+}
+
+fn validate_endpoint_api_key_env(environment_name: &str) -> Result<(), ValidationError> {
+    require(
+        is_environment_variable_identifier(environment_name),
+        "profile.upstream.api_key_env",
+        "must be a valid endpoint environment variable identifier",
+    )
 }
 
 fn is_environment_variable_identifier(value: &str) -> bool {

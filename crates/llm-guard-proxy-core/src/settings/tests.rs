@@ -504,6 +504,72 @@ api_key_env = "LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY"
 }
 
 #[test]
+fn openai_endpoints_accept_optional_credentials_and_model_override() {
+    let config = parse_config_text(
+        r#"
+[[profile]]
+model = "public-embedding-alias"
+
+[[profile.endpoints]]
+base_url = "http://127.0.0.1:18012/v1"
+priority = "primary"
+protocol = "openai"
+
+[[profile.endpoints]]
+base_url = "https://inference.example.test/v1"
+priority = "failover"
+protocol = "openai"
+api_key_env = "LLM_GUARD_PROXY_TEST_THIRD_PARTY_KEY"
+model = "vendor/embedding-model.v1"
+"#,
+    )
+    .expect("generic OpenAI-compatible endpoint fields should parse");
+
+    config
+        .validate()
+        .expect("generic OpenAI-compatible endpoint fields should validate");
+    let endpoint = &config.upstream_profiles[0].endpoints[1];
+    assert_eq!(
+        endpoint.api_key_env.as_deref(),
+        Some("LLM_GUARD_PROXY_TEST_THIRD_PARTY_KEY")
+    );
+    assert_eq!(endpoint.model.as_deref(), Some("vendor/embedding-model.v1"));
+}
+
+#[test]
+fn openai_endpoints_reject_model_revision_and_invalid_optional_fields() {
+    for (field, endpoint_fields) in [
+        (
+            "profile.upstream.model_revision",
+            "model_revision = \"0123456789abcdef0123456789abcdef01234567\"",
+        ),
+        ("profile.upstream.model", "model = \" invalid-model\""),
+        (
+            "profile.upstream.api_key_env",
+            "api_key_env = \"invalid-environment-name\"",
+        ),
+    ] {
+        let config = parse_config_text(&format!(
+            r#"
+[[profile]]
+model = "public-embedding-alias"
+
+[[profile.endpoints]]
+base_url = "https://inference.example.test/v1"
+priority = "primary"
+protocol = "openai"
+{endpoint_fields}
+"#
+        ))
+        .expect("recognized OpenAI endpoint fields should parse before validation");
+        let error = config
+            .validate()
+            .expect_err("invalid OpenAI endpoint fields should fail validation");
+        assert_eq!(error.field(), field);
+    }
+}
+
+#[test]
 fn deepinfra_model_revision_requires_lowercase_hexadecimal_sha() {
     let valid_revision = "5fa94080caafeaa45a15d11f969d7978e087a3db";
     let valid = parse_config_text(&format!(
@@ -630,18 +696,6 @@ protocol = "deepinfra_qwen3_rerank"
 model = "Qwen/Qwen3-Reranker-8B"
 model_revision = "2026.07.18"
 api_key_env = "LLM_GUARD_PROXY_TEST_DEEPINFRA_KEY"
-"#,
-        ),
-        (
-            "profile.upstream.protocol",
-            r#"
-[[profile]]
-model = "qwen3-reranker-8b"
-
-[[profile.endpoints]]
-base_url = "http://127.0.0.1:18013/v1"
-priority = "primary"
-model = "Qwen/Qwen3-Reranker-8B"
 "#,
         ),
     ] {
@@ -846,6 +900,7 @@ fn gb10_deploy_config_preserves_authoritative_topology_with_native_thinking() {
             ("qwen3-reranker-8b", Some(8), Some(64)),
         ]
     );
+    assert_gb10_failover_topology(&config);
     assert_eq!(
         config.upstream_profiles[0]
             .thinking
@@ -860,6 +915,49 @@ fn gb10_deploy_config_preserves_authoritative_topology_with_native_thinking() {
         .all(|entry| entry.default_injection_schema == Some(DefaultInjectionSchema::VllmNative)));
 }
 
+#[cfg(feature = "param-override")]
+fn assert_gb10_failover_topology(config: &AppConfig) {
+    let chat = &config.upstream_profiles[0];
+    assert_eq!(chat.base_url, "http://100.105.4.92:18010/v1");
+    assert!(
+        chat.endpoints.is_empty(),
+        "aeon-chat must remain single-endpoint"
+    );
+
+    let embedding = &config.upstream_profiles[1];
+    assert_eq!(embedding.endpoints.len(), 2);
+    assert_eq!(embedding.endpoints[0].priority, UpstreamPriority::Primary);
+    assert_eq!(
+        embedding.endpoints[0].protocol,
+        UpstreamEndpointProtocol::OpenAi
+    );
+    assert_eq!(embedding.endpoints[1].priority, UpstreamPriority::Failover);
+    assert_eq!(
+        embedding.endpoints[1].protocol,
+        UpstreamEndpointProtocol::OpenAi
+    );
+    assert_eq!(
+        embedding.endpoints[1].api_key_env.as_deref(),
+        Some("LLM_GUARD_PROXY_EMBEDDING_FAILOVER_API_KEY")
+    );
+    assert_eq!(
+        embedding.endpoints[1].model.as_deref(),
+        Some("Qwen/Qwen3-Embedding-8B")
+    );
+
+    let reranker = &config.upstream_profiles[2];
+    assert_eq!(reranker.endpoints.len(), 2);
+    assert_eq!(
+        reranker.endpoints[0].protocol,
+        UpstreamEndpointProtocol::OpenAi
+    );
+    assert_eq!(
+        reranker.endpoints[1].protocol,
+        UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+    );
+    assert_eq!(reranker.endpoints[1].priority, UpstreamPriority::Failover);
+}
+
 #[test]
 #[cfg(feature = "param-override")]
 fn gb10_deploy_uncomment_ready_examples_parse() {
@@ -868,6 +966,7 @@ fn gb10_deploy_uncomment_ready_examples_parse() {
         "upstream-local-recovery",
         "upstream-profile",
         "heterogeneous-reranker-replicas",
+        "generic-openai-reranker-failover",
     ] {
         assert_deploy_example_parses(name);
     }

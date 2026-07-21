@@ -274,10 +274,10 @@ impl UpstreamHealthRegistry {
         probe_timeout: Duration,
         shutdown: &ShutdownGate,
     ) -> Result<bool, EndpointSelectionError> {
-        if endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
-            if !super::reranker_protocol::has_runtime_credential(endpoint) {
-                return Ok(false);
-            }
+        if !super::reranker_protocol::has_runtime_credential(endpoint) {
+            return Ok(false);
+        }
+        if is_passive_cloud_endpoint(endpoint) {
             let health = self.endpoint_health(endpoint);
             // Cloud health is passive: a cooldown blocks selection, expiry grants one real
             // request as the recovery trial, and no paid inference health probe is issued.
@@ -302,7 +302,7 @@ impl UpstreamHealthRegistry {
             return Ok(healthy);
         }
 
-        let healthy = probe_models(client, &endpoint.base_url, probe_timeout, shutdown).await?;
+        let healthy = probe_models(client, endpoint, probe_timeout, shutdown).await?;
         let mut snapshot = health_snapshot_mut(&health);
         snapshot.checked_at = Some(Instant::now());
         snapshot.healthy = healthy;
@@ -334,7 +334,7 @@ impl UpstreamHealthRegistry {
         endpoint: &UpstreamEndpointConfig,
         probe_interval: Duration,
     ) -> RecoveryTrialReservation {
-        if endpoint.protocol != UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
+        if !is_passive_cloud_endpoint(endpoint) {
             return RecoveryTrialReservation::Available;
         }
         let health = self.endpoint_health(endpoint);
@@ -558,6 +558,11 @@ fn endpoint_identity(endpoint: &UpstreamEndpointConfig) -> String {
     )
 }
 
+pub(super) fn is_passive_cloud_endpoint(endpoint: &UpstreamEndpointConfig) -> bool {
+    endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+        || endpoint.api_key_env.is_some()
+}
+
 fn order_preferred_endpoints(
     endpoints: &mut [UpstreamEndpointConfig],
     preferred_base_urls: &[String],
@@ -572,18 +577,21 @@ fn order_preferred_endpoints(
 
 async fn probe_models(
     client: &Client,
-    base_url: &str,
+    endpoint: &UpstreamEndpointConfig,
     probe_timeout: Duration,
     shutdown: &ShutdownGate,
 ) -> Result<bool, EndpointSelectionError> {
     let uri = Uri::from_static("/v1/models");
-    let Ok(url) = build_upstream_url(base_url, &uri) else {
+    let Ok(url) = build_upstream_url(&endpoint.base_url, &uri) else {
         return Ok(false);
     };
-    let request = client
+    let mut request = client
         .get(url)
-        .header(HEALTH_PROBE_HEADER, "same-model-health")
-        .send();
+        .header(HEALTH_PROBE_HEADER, "same-model-health");
+    if let Ok(Some(authorization)) = reranker_protocol::optional_authorization_header(endpoint) {
+        request = request.header(reqwest::header::AUTHORIZATION, authorization);
+    }
+    let request = request.send();
     let mut shutdown_subscription = shutdown.subscribe();
     tokio::select! {
         result = timeout(probe_timeout, request) => {

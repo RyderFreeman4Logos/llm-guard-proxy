@@ -2880,6 +2880,7 @@ async fn forward_openai_request(
     )
     .await
     .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    let endpoint_retry_body = prepared_request.shielded_chat_plan.upstream_body.clone();
     let mut _initial_recovery_trial_lease = None;
     if prepared_request.upstream_profile.has_endpoint_failover() {
         let upstream_deadline = Instant::now()
@@ -2926,27 +2927,34 @@ async fn forward_openai_request(
             .endpoint_retry_order
             .clone_from(&selected.selection_order);
         prepared_request.upstream_deadline = Some(upstream_deadline);
-        if selected.endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
-            let canonical = prepared_request
-                .canonical_reranker
-                .as_ref()
-                .ok_or_else(|| ProxyError::ContextBudgetExceeded {
-                    message: String::from(
-                        "selected DeepInfra endpoint only supports normalized reranker requests",
-                    ),
-                    param: "path",
-                    code: "unsupported_reranker_endpoint_request",
-                    request_metadata: None,
-                    attempts: Vec::new(),
-                })?;
-            let rendered =
+        let rendered = match prepared_request.canonical_reranker.as_ref() {
+            Some(canonical) => {
                 reranker_protocol::render(&selected.endpoint, canonical, &downstream_headers)
-                    .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
-            prepared_request.forward_uri = rendered.uri;
-            prepared_request.upstream_url = rendered.url;
-            prepared_request.shielded_chat_plan.upstream_body = rendered.body;
-            prepared_request.upstream_headers = Some(rendered.headers);
+            }
+            None if selected.endpoint.protocol == UpstreamEndpointProtocol::OpenAi => {
+                reranker_protocol::render_openai_endpoint(
+                    &selected.endpoint,
+                    prepared_request.forward_uri.clone(),
+                    &endpoint_retry_body,
+                    &downstream_headers,
+                    prepared_request.transformed_request_headers,
+                )
+            }
+            None => Err(ProxyError::ContextBudgetExceeded {
+                message: String::from(
+                    "selected DeepInfra endpoint only supports normalized reranker requests",
+                ),
+                param: "path",
+                code: "unsupported_reranker_endpoint_request",
+                request_metadata: None,
+                attempts: Vec::new(),
+            }),
         }
+        .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+        prepared_request.forward_uri = rendered.uri;
+        prepared_request.upstream_url = rendered.url;
+        prepared_request.shielded_chat_plan.upstream_body = rendered.body;
+        prepared_request.upstream_headers = Some(rendered.headers);
         request_metadata.insert(
             String::from("upstream_endpoint_priority"),
             match selected.priority {
@@ -2988,16 +2996,24 @@ async fn forward_openai_request(
         let local_recovery = state
             .local_recovery
             .coordinator_for(&prepared_request.upstream_profile.name);
-        return forward_shielded_chat_with_retries(
+        return Box::pin(forward_shielded_chat_with_retries(
             ShieldedRetryRuntime {
                 client: state.client.clone(),
                 method: prepared_request.reqwest_method,
                 upstream_url: prepared_request.upstream_url,
                 downstream_method: method,
                 downstream_uri: uri,
-                downstream_headers,
+                upstream_headers: prepared_request
+                    .upstream_headers
+                    .unwrap_or_else(|| downstream_headers.clone()),
+                original_downstream_headers: downstream_headers,
                 upstream_body: prepared_request.shielded_chat_plan.upstream_body,
                 downstream_body: prepared_request.shielded_chat_plan.downstream_body,
+                forward_uri: prepared_request.forward_uri,
+                transformed_request_headers: prepared_request.transformed_request_headers,
+                terminal_endpoint: prepared_request.terminal_endpoint,
+                terminal_endpoint_protocol: prepared_request.terminal_endpoint_protocol,
+                endpoint_retry_order: prepared_request.endpoint_retry_order,
                 chat_kind: prepared_request.shielded_chat_plan.kind,
                 upstream_timeout,
                 config: state.config.clone(),
@@ -3024,6 +3040,7 @@ async fn forward_openai_request(
                 request_deadline,
                 upstream_stall_policy,
                 upstream_stall_recovery: state.upstream_stall_recovery.clone(),
+                upstream_health: state.upstream_health.clone(),
                 local_recovery_policy,
                 local_recovery,
                 local_recovery_attempts: Arc::new(AtomicU64::new(0)),
@@ -3040,7 +3057,7 @@ async fn forward_openai_request(
                 shielded_heartbeat_ticks: state.shielded_heartbeat_ticks.clone(),
             },
             in_flight_permit,
-        )
+        ))
         .await;
     }
     forward_generic_openai_request(GenericForwardContext {
@@ -3053,6 +3070,7 @@ async fn forward_openai_request(
         upstream_uri: prepared_request.forward_uri,
         upstream_url: prepared_request.upstream_url,
         upstream_body: prepared_request.shielded_chat_plan.upstream_body,
+        endpoint_retry_body,
         upstream_timeout,
         upstream_profile: prepared_request.upstream_profile,
         route_reason: prepared_request.route_reason,
@@ -4362,6 +4380,7 @@ struct GenericForwardContext<'request> {
     upstream_uri: Uri,
     upstream_url: Url,
     upstream_body: Bytes,
+    endpoint_retry_body: Bytes,
     upstream_timeout: Duration,
     upstream_profile: UpstreamProfileConfig,
     route_reason: UpstreamRouteReason,
@@ -4431,14 +4450,16 @@ async fn begin_models_upstream_group(
     } else {
         Instant::now() + Duration::from_millis(profile.request_timeout_ms)
     };
-    let (base_url, terminal_endpoint, endpoint_retry_order) = if is_current_profile {
-        (
-            context.terminal_endpoint.base_url.clone(),
-            context.terminal_endpoint.clone(),
-            context.endpoint_retry_order.clone(),
-        )
-    } else {
-        let selected = context
+    let (base_url, terminal_endpoint, endpoint_retry_order, recovery_trial_lease) =
+        if is_current_profile {
+            (
+                context.terminal_endpoint.base_url.clone(),
+                context.terminal_endpoint.clone(),
+                context.endpoint_retry_order.clone(),
+                None,
+            )
+        } else {
+            let selected = context
             .state
             .upstream_health
             .select_endpoint(
@@ -4467,12 +4488,13 @@ async fn begin_models_upstream_group(
                     ProxyError::upstream_unavailable(profile, waited_ms)
                 }
             })?;
-        (
-            selected.base_url,
-            selected.endpoint,
-            selected.selection_order,
-        )
-    };
+            (
+                selected.base_url,
+                selected.endpoint,
+                selected.selection_order,
+                selected.recovery_trial_lease,
+            )
+        };
     Ok(ModelsUpstreamGroup {
         base_url,
         request_timeout_ms: profile.request_timeout_ms,
@@ -4480,6 +4502,7 @@ async fn begin_models_upstream_group(
         profile,
         terminal_endpoint,
         endpoint_retry_order,
+        _recovery_trial_lease: recovery_trial_lease,
         request_deadline,
     })
 }
@@ -4535,6 +4558,7 @@ async fn forward_generic_openai_request(
         upstream_url: context.upstream_url.clone(),
         downstream_headers,
         upstream_body: context.upstream_body.clone(),
+        retry_body: context.endpoint_retry_body.clone(),
         upstream_timeout: context.upstream_timeout,
         attempt_id: attempt_id.clone(),
         attempt_number: 1,
@@ -4704,7 +4728,6 @@ fn forward_rewritten_endpoint_response(
     )
 }
 
-#[derive(Clone)]
 struct ModelsUpstreamGroup {
     profile: UpstreamProfileConfig,
     base_url: String,
@@ -4712,6 +4735,8 @@ struct ModelsUpstreamGroup {
     metadata: MetadataConfig,
     terminal_endpoint: UpstreamEndpointConfig,
     endpoint_retry_order: Vec<String>,
+    // Kept alive while this group is fetched and its endpoint response is classified.
+    _recovery_trial_lease: Option<upstream_failover::RecoveryTrialLease>,
     request_deadline: Instant,
 }
 
@@ -4743,7 +4768,7 @@ async fn forward_merged_models_response(
         };
         if selected_groups
             .iter()
-            .any(|selected| selected.base_url == group.base_url)
+            .any(|selected| same_models_endpoint_identity(selected, &group))
         {
             continue;
         }
@@ -4825,6 +4850,12 @@ async fn forward_merged_models_response(
     ))
 }
 
+fn same_models_endpoint_identity(left: &ModelsUpstreamGroup, right: &ModelsUpstreamGroup) -> bool {
+    left.base_url == right.base_url
+        && left.terminal_endpoint.protocol == right.terminal_endpoint.protocol
+        && left.terminal_endpoint.api_key_env == right.terminal_endpoint.api_key_env
+}
+
 fn models_success_response_headers() -> HeaderMap {
     let mut headers = HeaderMap::new();
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -4888,13 +4919,20 @@ async fn fetch_models_upstream_group(
     let (downstream_headers, attempt_request_metadata) =
         models_attempt_request(context, group, attempt_number);
 
-    let upstream_url = build_upstream_url(&group.base_url, &context.uri)?;
+    let rendered = reranker_protocol::render_openai_endpoint(
+        &group.terminal_endpoint,
+        context.uri.clone(),
+        &context.upstream_body,
+        &downstream_headers,
+        false,
+    )?;
     let sent_upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
         client: &context.state.client,
         method: context.reqwest_method.clone(),
-        upstream_url,
-        downstream_headers: &downstream_headers,
-        upstream_body: context.upstream_body.clone(),
+        upstream_url: rendered.url,
+        downstream_headers: &rendered.headers,
+        upstream_body: rendered.body,
+        retry_body: context.upstream_body.clone(),
         upstream_timeout: Duration::from_millis(group.request_timeout_ms),
         attempt_id: attempt_id.clone(),
         attempt_number,
@@ -4904,7 +4942,7 @@ async fn fetch_models_upstream_group(
         attempt_request_metadata: &attempt_request_metadata,
         shutdown: context.state.shutdown.subscribe(),
         failover_retry: models_failover_retry_context(context, group, &downstream_headers),
-        terminal_endpoint_protocol: UpstreamEndpointProtocol::OpenAi,
+        terminal_endpoint_protocol: group.terminal_endpoint.protocol,
         canonical_reranker: None,
         decode_heterogeneous_reranker: false,
         model_id: None,
@@ -5030,6 +5068,7 @@ struct UpstreamAttemptContext<'request> {
     upstream_url: Url,
     downstream_headers: &'request HeaderMap,
     upstream_body: Bytes,
+    retry_body: Bytes,
     upstream_timeout: Duration,
     attempt_id: AttemptId,
     attempt_number: u32,
@@ -5054,6 +5093,7 @@ struct SentUpstreamResponse {
     attempt_request_metadata: BTreeMap<String, String>,
     completed_attempt_records: Vec<AttemptRecord>,
     did_failover: bool,
+    terminal_endpoint: Option<UpstreamEndpointConfig>,
     terminal_endpoint_protocol: UpstreamEndpointProtocol,
 }
 
@@ -5124,20 +5164,16 @@ impl EndpointResponse {
 
 fn render_retry_openai_request(
     retry: &UpstreamFailoverRetryContext<'_>,
-    base_url: &str,
+    endpoint: &UpstreamEndpointConfig,
     body: &Bytes,
 ) -> Result<RenderedEndpointRequest, ProxyError> {
-    let headers = if retry.transformed_request_headers {
-        sanitize_transformed_request_headers(retry.original_downstream_headers)
-    } else {
-        retry.original_downstream_headers.clone()
-    };
-    Ok(RenderedEndpointRequest {
-        url: build_upstream_url(base_url, &retry.local_forward_uri)?,
-        uri: retry.local_forward_uri.clone(),
-        body: body.clone(),
-        headers,
-    })
+    reranker_protocol::render_openai_endpoint(
+        endpoint,
+        retry.local_forward_uri.clone(),
+        body,
+        retry.original_downstream_headers,
+        retry.transformed_request_headers,
+    )
 }
 
 async fn send_first_upstream_attempt(
@@ -5209,7 +5245,7 @@ async fn send_first_upstream_attempt(
                     client: context.client,
                     retry,
                     retry_method: context.method.clone(),
-                    retry_body: &context.upstream_body,
+                    retry_body: &context.retry_body,
                     upstream_timeout: context.upstream_timeout,
                     request_id: context.request_id,
                     decode_heterogeneous_reranker: context.decode_heterogeneous_reranker,
@@ -5245,7 +5281,11 @@ fn finalize_sent_upstream_response(
     request_id: &RequestId,
     request_metadata: &BTreeMap<String, String>,
 ) -> Result<SentUpstreamResponse, ProxyError> {
-    let disposition = endpoint_disposition(&result, terminal_attempt.protocol);
+    let disposition = endpoint_disposition(
+        &result,
+        terminal_attempt.protocol,
+        terminal_attempt.endpoint.as_ref(),
+    );
     terminal_attempt.request_metadata.insert(
         String::from("endpoint_disposition"),
         String::from(disposition),
@@ -5259,6 +5299,7 @@ fn finalize_sent_upstream_response(
             attempt_request_metadata: terminal_attempt.request_metadata,
             did_failover: !completed_attempt_records.is_empty(),
             completed_attempt_records,
+            terminal_endpoint: terminal_attempt.endpoint.clone(),
             terminal_endpoint_protocol: terminal_attempt.protocol,
         }),
         Err(error) => {
@@ -5318,7 +5359,11 @@ async fn continue_endpoint_failover(
         Some(runtime.retry.original_downstream_headers),
     );
     let mut terminal_recovery_trial_lease = None;
-    while is_retryable_endpoint_result(&result, terminal_attempt.protocol) {
+    while is_retryable_endpoint_result(
+        &result,
+        terminal_attempt.protocol,
+        terminal_attempt.endpoint.as_ref(),
+    ) {
         mark_retryable_endpoint_failure(runtime.retry.registry, &terminal_attempt, &result);
         if attempted_base_urls.len() >= eligible_endpoint_count {
             break;
@@ -5349,7 +5394,11 @@ async fn continue_endpoint_failover(
         };
         completed_attempt_records.push(retried_endpoint_attempt_record(
             &result,
-            terminal_attempt.protocol,
+            endpoint_disposition(
+                &result,
+                terminal_attempt.protocol,
+                terminal_attempt.endpoint.as_ref(),
+            ),
             terminal_attempt.attempt_id.clone(),
             terminal_attempt.attempt_number,
             runtime.request_id.clone(),
@@ -5420,7 +5469,7 @@ async fn send_selected_failover_endpoint(
             canonical,
             runtime.retry.original_downstream_headers,
         ),
-        None => render_retry_openai_request(runtime.retry, &selected.base_url, runtime.retry_body),
+        None => render_retry_openai_request(runtime.retry, &selected.endpoint, runtime.retry_body),
     };
     let attempt_id = AttemptId::for_request(runtime.request_id, attempt_number);
     let started_at_unix_ms = unix_time_millis();
@@ -5589,7 +5638,7 @@ fn annotate_physical_endpoint_attempt(
 
 fn retried_endpoint_attempt_record(
     result: &Result<EndpointResponse, ProxyError>,
-    protocol: UpstreamEndpointProtocol,
+    disposition: &'static str,
     attempt_id: AttemptId,
     attempt_number: u32,
     request_id: RequestId,
@@ -5599,7 +5648,7 @@ fn retried_endpoint_attempt_record(
     let finished_at_unix_ms = unix_time_millis();
     request_metadata.insert(
         String::from("endpoint_disposition"),
-        String::from(endpoint_disposition(result, protocol)),
+        String::from(disposition),
     );
     match result {
         Ok(response) => {
@@ -5680,6 +5729,7 @@ fn retry_reason_for_endpoint_result(result: &Result<EndpointResponse, ProxyError
 fn is_retryable_endpoint_result(
     result: &Result<EndpointResponse, ProxyError>,
     protocol: UpstreamEndpointProtocol,
+    endpoint: Option<&UpstreamEndpointConfig>,
 ) -> bool {
     match result {
         Err(ProxyError::UpstreamTransport { failure, .. }) => {
@@ -5692,6 +5742,7 @@ fn is_retryable_endpoint_result(
         Ok(response) => match response.status() {
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => {
                 protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+                    || endpoint_has_configured_credential(endpoint)
             }
             StatusCode::REQUEST_TIMEOUT
             | StatusCode::TOO_MANY_REQUESTS
@@ -5705,6 +5756,10 @@ fn is_retryable_endpoint_result(
     }
 }
 
+fn endpoint_has_configured_credential(endpoint: Option<&UpstreamEndpointConfig>) -> bool {
+    endpoint.is_some_and(|endpoint| endpoint.api_key_env.is_some())
+}
+
 fn is_caller_scoped_rate_limit(result: &Result<EndpointResponse, ProxyError>) -> bool {
     matches!(result, Ok(response) if response.status() == StatusCode::TOO_MANY_REQUESTS)
 }
@@ -5715,6 +5770,7 @@ fn mark_retryable_endpoint_failure(
     result: &Result<EndpointResponse, ProxyError>,
 ) {
     if (attempt.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+        || endpoint_has_configured_credential(attempt.endpoint.as_ref())
         || !is_caller_scoped_rate_limit(result))
         && let Some(endpoint) = attempt.endpoint.as_ref()
     {
@@ -5727,14 +5783,14 @@ fn finish_passive_recovery_trial(
     attempt: &PhysicalEndpointAttempt,
     result: &Result<EndpointResponse, ProxyError>,
 ) {
-    if attempt.protocol != UpstreamEndpointProtocol::DeepInfraQwen3Rerank
-        || is_retryable_endpoint_result(result, attempt.protocol)
-    {
-        return;
-    }
     let Some(endpoint) = attempt.endpoint.as_ref() else {
         return;
     };
+    if !upstream_failover::is_passive_cloud_endpoint(endpoint)
+        || is_retryable_endpoint_result(result, attempt.protocol, Some(endpoint))
+    {
+        return;
+    }
     if result.is_ok() {
         registry.mark_healthy(endpoint);
     }
@@ -5743,8 +5799,9 @@ fn finish_passive_recovery_trial(
 fn endpoint_disposition(
     result: &Result<EndpointResponse, ProxyError>,
     protocol: UpstreamEndpointProtocol,
+    endpoint: Option<&UpstreamEndpointConfig>,
 ) -> &'static str {
-    if is_retryable_endpoint_result(result, protocol) {
+    if is_retryable_endpoint_result(result, protocol, endpoint) {
         return "retryable_failure";
     }
     match result {
@@ -6868,9 +6925,15 @@ struct ShieldedRetryRuntime {
     upstream_url: Url,
     downstream_method: Method,
     downstream_uri: Uri,
-    downstream_headers: HeaderMap,
+    upstream_headers: HeaderMap,
+    original_downstream_headers: HeaderMap,
     upstream_body: Bytes,
     downstream_body: Bytes,
+    forward_uri: Uri,
+    transformed_request_headers: bool,
+    terminal_endpoint: UpstreamEndpointConfig,
+    terminal_endpoint_protocol: UpstreamEndpointProtocol,
+    endpoint_retry_order: Vec<String>,
     chat_kind: ShieldedChatKind,
     upstream_timeout: Duration,
     config: ConfigHandle,
@@ -6897,6 +6960,7 @@ struct ShieldedRetryRuntime {
     request_deadline: ShieldedRequestDeadline,
     upstream_stall_policy: UpstreamStallPolicy,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
+    upstream_health: Arc<UpstreamHealthRegistry>,
     local_recovery_policy: LocalRecoveryPolicy,
     local_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     local_recovery_attempts: Arc<AtomicU64>,
@@ -7008,6 +7072,10 @@ fn shadow_evidence_inner(
 struct ShieldedStartedAttempt {
     info: ShieldedAttemptInfo,
     response: reqwest::Response,
+    completed_endpoint_attempt_records: Vec<AttemptRecord>,
+    terminal_endpoint: UpstreamEndpointConfig,
+    terminal_endpoint_protocol: UpstreamEndpointProtocol,
+    endpoint_retry_order: Vec<String>,
     ignores_request_deadline: bool,
 }
 
@@ -7082,6 +7150,7 @@ struct ShieldedAttemptFailure {
     response_metadata: BTreeMap<String, String>,
     raw_payloads: RawPayloads,
     upstream_body: Bytes,
+    completed_endpoint_attempt_records: Vec<AttemptRecord>,
 }
 
 #[derive(Clone, Debug)]
@@ -7295,9 +7364,10 @@ enum ShieldedStartFailureStep {
 
 async fn shielded_start_failure_step(
     runtime: &ShieldedRetryRuntime,
-    failure: ShieldedAttemptFailure,
+    mut failure: ShieldedAttemptFailure,
     attempt_records: &mut Vec<AttemptRecord>,
 ) -> ShieldedStartFailureStep {
+    attempt_records.append(&mut failure.completed_endpoint_attempt_records);
     let next_retry_cause = failure.retry_cause;
     let can_retry = should_retry_after_shielded_failure(runtime, &failure);
     let (failure, can_retry) = {
@@ -7513,7 +7583,7 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
                 std::mem::take(&mut attempt_records),
             ));
         }
-        let started = match start_shielded_attempt(
+        let mut started = match start_shielded_attempt(
             runtime,
             attempt_number,
             retry_cause,
@@ -7539,6 +7609,7 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
                 }
             }
         };
+        attempt_records.append(&mut started.completed_endpoint_attempt_records);
 
         match shielded_started_attempt_step(runtime, started, &mut attempt_records, true).await {
             ShieldedAttemptStep::Aggregatable(started) => {
@@ -7609,7 +7680,7 @@ async fn aggregate_shielded_attempt(
 
 #[allow(clippy::too_many_lines)]
 async fn run_shielded_attempts(
-    runtime: ShieldedRetryRuntime,
+    mut runtime: ShieldedRetryRuntime,
     initial_attempt: Option<ShieldedStartedAttempt>,
     mut attempt_records: Vec<AttemptRecord>,
     allow_terminal_forward: bool,
@@ -7623,7 +7694,7 @@ async fn run_shielded_attempts(
     let mut cot_salvage = None;
     let mut cot_salvage_attempted = false;
     loop {
-        let started = if let Some(started) = current_attempt.take() {
+        let mut started = if let Some(started) = current_attempt.take() {
             started
         } else {
             let ignores_request_deadline = consume_local_recovery_deadline_replay_permit(&runtime);
@@ -7663,6 +7734,8 @@ async fn run_shielded_attempts(
                 }
             }
         };
+        update_shielded_retry_endpoint(&mut runtime, &started);
+        attempt_records.append(&mut started.completed_endpoint_attempt_records);
 
         update_shielded_attempt_progress(
             attempt_progress.as_ref(),
@@ -9068,8 +9141,6 @@ async fn start_shielded_attempt(
         &attempt_plan,
         cot_salvage,
     );
-    let raw_request_body = raw_payload_text(&upstream_body);
-    let evidence_upstream_body = upstream_body.clone();
     let request_metadata = shielded_attempt_request_metadata(
         runtime,
         attempt_number,
@@ -9079,7 +9150,137 @@ async fn start_shielded_attempt(
         cot_salvage,
         &attempt_thinking_metadata,
     );
-    let upstream_timeout = if ignores_request_deadline {
+    let rendered = render_shielded_endpoint_body(runtime, &upstream_body).map_err(|error| {
+        shielded_start_transport_failure(ShieldedStartFailureInput {
+            runtime,
+            attempt_id: attempt_id.clone(),
+            attempt_number,
+            attempt_started_at_unix_ms,
+            request_metadata: request_metadata.clone(),
+            raw_request_body: None,
+            evidence_upstream_body: upstream_body.clone(),
+            error,
+        })
+    })?;
+    let raw_request_body = raw_payload_text(&rendered.body);
+    let evidence_upstream_body = rendered.body.clone();
+    let upstream_timeout = shielded_attempt_upstream_timeout(runtime, ignores_request_deadline);
+    let start_failure = |error| ShieldedStartFailureInput {
+        runtime,
+        attempt_id: attempt_id.clone(),
+        attempt_number,
+        attempt_started_at_unix_ms,
+        request_metadata: request_metadata.clone(),
+        raw_request_body: raw_request_body.clone(),
+        evidence_upstream_body: evidence_upstream_body.clone(),
+        error,
+    };
+    let sent = match send_shielded_upstream_attempt(
+        runtime,
+        (
+            attempt_id.clone(),
+            attempt_number,
+            attempt_started_at_unix_ms,
+        ),
+        &request_metadata,
+        rendered,
+        upstream_body,
+        upstream_timeout,
+        ignores_request_deadline,
+    )
+    .await
+    {
+        Ok(sent) => sent,
+        Err(error) => return Err(shielded_start_transport_failure(start_failure(error))),
+    };
+    let (terminal_endpoint, endpoint_retry_order) = shielded_retry_endpoint(runtime, &sent);
+    let EndpointResponse::Upstream(response) = sent.response else {
+        return Err(shielded_start_transport_failure(start_failure(
+            ProxyError::upstream_body(String::from(
+                "shielded chat request unexpectedly produced a rewritten endpoint response",
+            )),
+        )));
+    };
+    let upstream_status = response.status();
+    let upstream_headers = response.headers().clone();
+    let upstream_mode = upstream_mode_from_headers(&upstream_headers);
+    Ok(ShieldedStartedAttempt {
+        info: ShieldedAttemptInfo {
+            attempt_id: sent.attempt_id,
+            request_id: runtime.request_id.clone(),
+            attempt_number: sent.attempt_number,
+            attempt_max_attempts: runtime.retry_policy.max_attempts,
+            started_at_unix_ms: sent.attempt_started_at_unix_ms,
+            upstream_status,
+            upstream_headers,
+            upstream_mode,
+            request_metadata: sent.attempt_request_metadata,
+            raw_request_body,
+            upstream_body: evidence_upstream_body,
+        },
+        response,
+        completed_endpoint_attempt_records: sent.completed_attempt_records,
+        terminal_endpoint,
+        terminal_endpoint_protocol: sent.terminal_endpoint_protocol,
+        endpoint_retry_order,
+        ignores_request_deadline,
+    })
+}
+
+fn render_shielded_endpoint_body(
+    runtime: &ShieldedRetryRuntime,
+    body: &Bytes,
+) -> Result<reranker_protocol::RenderedEndpointRequest, ProxyError> {
+    reranker_protocol::render_openai_endpoint(
+        &runtime.terminal_endpoint,
+        runtime.forward_uri.clone(),
+        body,
+        &runtime.original_downstream_headers,
+        runtime.transformed_request_headers,
+    )
+}
+
+fn shielded_retry_endpoint(
+    runtime: &ShieldedRetryRuntime,
+    sent: &SentUpstreamResponse,
+) -> (UpstreamEndpointConfig, Vec<String>) {
+    let terminal_endpoint = sent
+        .terminal_endpoint
+        .clone()
+        .unwrap_or_else(|| runtime.terminal_endpoint.clone());
+    let endpoint_retry_order =
+        shielded_endpoint_retry_order(&terminal_endpoint, &runtime.endpoint_retry_order);
+    (terminal_endpoint, endpoint_retry_order)
+}
+
+fn shielded_endpoint_retry_order(
+    terminal_endpoint: &UpstreamEndpointConfig,
+    endpoint_retry_order: &[String],
+) -> Vec<String> {
+    let mut retry_order = endpoint_retry_order.to_vec();
+    retry_order.retain(|base_url| base_url != &terminal_endpoint.base_url);
+    retry_order.insert(0, terminal_endpoint.base_url.clone());
+    retry_order
+}
+
+fn update_shielded_retry_endpoint(
+    runtime: &mut ShieldedRetryRuntime,
+    started: &ShieldedStartedAttempt,
+) {
+    runtime
+        .terminal_endpoint
+        .clone_from(&started.terminal_endpoint);
+    runtime.terminal_endpoint_protocol = started.terminal_endpoint_protocol;
+    runtime
+        .endpoint_retry_order
+        .clone_from(&started.endpoint_retry_order);
+}
+
+fn shielded_attempt_upstream_timeout(
+    runtime: &ShieldedRetryRuntime,
+    ignores_request_deadline: bool,
+) -> Duration {
+    if ignores_request_deadline {
         runtime.upstream_timeout
     } else {
         runtime
@@ -9088,53 +9289,63 @@ async fn start_shielded_attempt(
             .map_or(Duration::ZERO, |remaining| {
                 runtime.upstream_timeout.min(remaining)
             })
-    };
-    match send_upstream_request_until_shutdown(
-        &runtime.client,
-        runtime.method.clone(),
-        runtime.upstream_url.clone(),
-        &runtime.downstream_headers,
-        upstream_body,
-        upstream_timeout,
-        runtime.shutdown.subscribe(),
-    )
-    .await
-    {
-        Ok(response) => {
-            let upstream_status = response.status();
-            let upstream_headers = response.headers().clone();
-            let upstream_mode = upstream_mode_from_headers(&upstream_headers);
-            Ok(ShieldedStartedAttempt {
-                info: ShieldedAttemptInfo {
-                    attempt_id,
-                    request_id: runtime.request_id.clone(),
-                    attempt_number,
-                    attempt_max_attempts: runtime.retry_policy.max_attempts,
-                    started_at_unix_ms: attempt_started_at_unix_ms,
-                    upstream_status,
-                    upstream_headers,
-                    upstream_mode,
-                    request_metadata,
-                    raw_request_body,
-                    upstream_body: evidence_upstream_body,
-                },
-                response,
-                ignores_request_deadline,
-            })
-        }
-        Err(error) => Err(shielded_start_transport_failure(
-            ShieldedStartFailureInput {
-                runtime,
-                attempt_id,
-                attempt_number,
-                attempt_started_at_unix_ms,
-                request_metadata,
-                raw_request_body,
-                evidence_upstream_body,
-                error,
-            },
-        )),
     }
+}
+
+async fn send_shielded_upstream_attempt(
+    runtime: &ShieldedRetryRuntime,
+    attempt: (AttemptId, u32, u64),
+    request_metadata: &BTreeMap<String, String>,
+    rendered: reranker_protocol::RenderedEndpointRequest,
+    retry_body: Bytes,
+    upstream_timeout: Duration,
+    ignores_request_deadline: bool,
+) -> Result<SentUpstreamResponse, ProxyError> {
+    let (attempt_id, attempt_number, attempt_started_at_unix_ms) = attempt;
+    let request_deadline = (!ignores_request_deadline)
+        .then(|| {
+            runtime
+                .request_deadline
+                .remaining()
+                .map(|remaining| Instant::now() + remaining)
+        })
+        .flatten();
+    send_first_upstream_attempt(UpstreamAttemptContext {
+        client: &runtime.client,
+        method: runtime.method.clone(),
+        upstream_url: rendered.url,
+        downstream_headers: &rendered.headers,
+        upstream_body: rendered.body,
+        retry_body,
+        upstream_timeout,
+        attempt_id,
+        attempt_number,
+        request_id: &runtime.request_id,
+        attempt_started_at_unix_ms,
+        request_metadata,
+        attempt_request_metadata: request_metadata,
+        shutdown: runtime.shutdown.subscribe(),
+        failover_retry: runtime.upstream_profile.has_endpoint_failover().then_some(
+            UpstreamFailoverRetryContext {
+                registry: runtime.upstream_health.as_ref(),
+                profile: &runtime.upstream_profile,
+                local_forward_uri: runtime.forward_uri.clone(),
+                original_downstream_headers: &runtime.original_downstream_headers,
+                canonical_reranker: None,
+                transformed_request_headers: runtime.transformed_request_headers,
+                initial_endpoint: &runtime.terminal_endpoint,
+                request_deadline,
+                endpoint_retry_order: &runtime.endpoint_retry_order,
+                shutdown: runtime.shutdown.as_ref(),
+            },
+        ),
+        terminal_endpoint_protocol: runtime.terminal_endpoint_protocol,
+        canonical_reranker: None,
+        decode_heterogeneous_reranker: false,
+        model_id: None,
+        request_deadline,
+    })
+    .await
 }
 
 struct ShieldedStartFailureInput<'runtime> {
@@ -9148,10 +9359,26 @@ struct ShieldedStartFailureInput<'runtime> {
     error: ProxyError,
 }
 
+fn shielded_start_error_type(error: &ProxyError, request_deadline_exhausted: bool) -> &'static str {
+    if request_deadline_exhausted {
+        REQUEST_DEADLINE_ERROR_TYPE
+    } else if matches!(
+        error,
+        ProxyError::UpstreamTransport {
+            failure: ReqwestFailureKind::Connect,
+            ..
+        }
+    ) {
+        "upstream_connect_error"
+    } else {
+        error.error_type()
+    }
+}
+
 fn shielded_start_transport_failure(
     input: ShieldedStartFailureInput<'_>,
 ) -> ShieldedAttemptFailure {
-    let finished_at_unix_ms = unix_time_millis();
+    let mut finished_at_unix_ms = unix_time_millis();
     let request_deadline_exhausted = input.runtime.request_deadline.is_exhausted()
         && matches!(
             &input.error,
@@ -9161,7 +9388,7 @@ fn shielded_start_transport_failure(
             }
         );
     let retry_cause =
-        if matches!(input.error, ProxyError::Shutdown { .. }) || request_deadline_exhausted {
+        if matches!(&input.error, ProxyError::Shutdown { .. }) || request_deadline_exhausted {
             None
         } else {
             transport_retry_cause(&input.error)
@@ -9171,21 +9398,40 @@ fn shielded_start_transport_failure(
     } else {
         input.error.abort_reason().map(str::to_owned)
     };
-    let error_type = if request_deadline_exhausted {
-        REQUEST_DEADLINE_ERROR_TYPE
-    } else {
-        input.error.error_type()
-    };
+    let error_type = shielded_start_error_type(&input.error, request_deadline_exhausted);
     let error_message = if request_deadline_exhausted {
         String::from("shielded request deadline exhausted before upstream response headers")
     } else {
         input.error.to_string()
     };
-    let mut response_metadata = failed_response_metadata(
-        input.attempt_started_at_unix_ms,
-        finished_at_unix_ms,
-        error_type,
-    );
+    let mut completed_endpoint_attempt_records = input.error.attempt_records();
+    let terminal_endpoint_attempt = completed_endpoint_attempt_records.pop();
+    let mut attempt_id = input.attempt_id;
+    let mut request_id = input.runtime.request_id.clone();
+    let mut attempt_number = input.attempt_number;
+    let mut started_at_unix_ms = input.attempt_started_at_unix_ms;
+    let mut upstream_mode = UpstreamMode::NotApplicable;
+    let mut http_status = None;
+    let mut request_metadata = input.request_metadata;
+    let mut response_metadata =
+        failed_response_metadata(started_at_unix_ms, finished_at_unix_ms, error_type);
+    let mut raw_payloads = RawPayloads::default();
+    if let Some(terminal) = terminal_endpoint_attempt {
+        attempt_id = terminal.attempt_id;
+        request_id = terminal.request_id;
+        attempt_number = terminal.attempt_number;
+        started_at_unix_ms = terminal.started_at_unix_ms;
+        finished_at_unix_ms = terminal.finished_at_unix_ms.unwrap_or(finished_at_unix_ms);
+        upstream_mode = terminal.upstream_mode;
+        http_status = terminal.http_status;
+        request_metadata = terminal.request_metadata;
+        response_metadata.extend(terminal.response_metadata);
+        raw_payloads = terminal.raw_payloads;
+    }
+    if raw_payloads.input.is_none() {
+        raw_payloads.input = input.raw_request_body;
+    }
+    response_metadata.insert(String::from("error_type"), error_type.to_owned());
     response_metadata.insert(
         String::from("upstream_response_received"),
         String::from("false"),
@@ -9201,13 +9447,13 @@ fn shielded_start_transport_failure(
         );
     }
     ShieldedAttemptFailure {
-        attempt_id: input.attempt_id,
-        request_id: input.runtime.request_id.clone(),
-        attempt_number: input.attempt_number,
-        started_at_unix_ms: input.attempt_started_at_unix_ms,
+        attempt_id,
+        request_id,
+        attempt_number,
+        started_at_unix_ms,
         finished_at_unix_ms,
-        upstream_mode: UpstreamMode::NotApplicable,
-        http_status: None,
+        upstream_mode,
+        http_status,
         #[cfg(feature = "upstream-hot-restart")]
         transport_failure: match &input.error {
             ProxyError::UpstreamTransport { failure, .. } => Some(*failure),
@@ -9217,13 +9463,11 @@ fn shielded_start_transport_failure(
         error_message,
         retry_cause,
         abort_reason,
-        request_metadata: input.request_metadata,
+        request_metadata,
         response_metadata,
-        raw_payloads: RawPayloads {
-            input: input.raw_request_body,
-            ..RawPayloads::default()
-        },
+        raw_payloads,
         upstream_body: input.evidence_upstream_body,
+        completed_endpoint_attempt_records,
     }
 }
 
@@ -9373,7 +9617,7 @@ fn shielded_attempt_request_metadata(
     let mut metadata = attempt_request_metadata(
         &runtime.downstream_method,
         &runtime.downstream_uri,
-        &runtime.downstream_headers,
+        &runtime.original_downstream_headers,
     );
     add_listener_metadata(&mut metadata, &runtime.listener);
     add_upstream_profile_metadata(
@@ -9617,6 +9861,7 @@ fn aggregation_failure(
         response_metadata,
         raw_payloads,
         upstream_body: info.upstream_body.clone(),
+        completed_endpoint_attempt_records: Vec::new(),
     }
 }
 
@@ -9656,6 +9901,7 @@ fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAtte
             ..RawPayloads::default()
         },
         upstream_body: info.upstream_body.clone(),
+        completed_endpoint_attempt_records: Vec::new(),
     }
 }
 
@@ -9699,6 +9945,7 @@ fn request_deadline_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> Shie
             ..RawPayloads::default()
         },
         upstream_body: info.upstream_body.clone(),
+        completed_endpoint_attempt_records: Vec::new(),
     }
 }
 
@@ -9802,6 +10049,7 @@ fn status_failure(
             ..RawPayloads::default()
         },
         upstream_body: info.upstream_body.clone(),
+        completed_endpoint_attempt_records: Vec::new(),
     }
 }
 
@@ -9841,6 +10089,7 @@ fn status_failure_without_retry(
             ..RawPayloads::default()
         },
         upstream_body: info.upstream_body.clone(),
+        completed_endpoint_attempt_records: Vec::new(),
     }
 }
 
@@ -12773,7 +13022,7 @@ fn schedule_shadow_attempt(
         client: runtime.client.clone(),
         method: runtime.method.clone(),
         upstream_url: runtime.upstream_url.clone(),
-        downstream_headers: runtime.downstream_headers.clone(),
+        downstream_headers: runtime.upstream_headers.clone(),
         upstream_body: plan.upstream_body,
         upstream_timeout: runtime.upstream_timeout,
         evidence_store: runtime.evidence_store.clone(),
@@ -12864,6 +13113,7 @@ fn shadow_comparison_attempt_plan(
         &runtime.upstream_profile,
         &mut prepared.thinking_metadata,
     );
+    upstream_body = render_shadow_endpoint_body(runtime, &upstream_body)?;
     let mut request_metadata = source.request_metadata.clone();
     request_metadata.extend(prepared.thinking_metadata);
     request_metadata.insert(
@@ -12906,6 +13156,7 @@ fn paired_shadow_comparison_attempt_plan(
         &runtime.upstream_profile,
         &mut prepared.thinking_metadata,
     );
+    let upstream_body = render_shadow_endpoint_body(runtime, &upstream_body)?;
     let mut request_metadata = source.request_metadata.clone();
     request_metadata.extend(prepared.thinking_metadata);
     request_metadata.insert(
@@ -12941,6 +13192,18 @@ fn paired_shadow_comparison_attempt_plan(
 struct PreparedShadowBody {
     upstream_body: Bytes,
     thinking_metadata: BTreeMap<String, String>,
+}
+
+fn render_shadow_endpoint_body(runtime: &ShieldedRetryRuntime, body: &Bytes) -> Option<Bytes> {
+    reranker_protocol::render_openai_endpoint(
+        &runtime.terminal_endpoint,
+        runtime.forward_uri.clone(),
+        body,
+        &runtime.original_downstream_headers,
+        runtime.transformed_request_headers,
+    )
+    .ok()
+    .map(|rendered| rendered.body)
 }
 
 fn prepared_shadow_body(

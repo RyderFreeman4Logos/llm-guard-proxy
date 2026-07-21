@@ -15,12 +15,64 @@ use serde_json::{Value, json};
 
 use super::{
     ProxyError, buffered_adapter::sanitize_transformed_request_headers, deepinfra_rerank_adapter,
-    score_adapter,
+    forwarded_request_headers, score_adapter,
 };
 
 const MAX_PAIR_COUNT: usize = 1_024;
 const MAX_REQUEST_ID_BYTES: usize = 256;
 const MAX_DEEPINFRA_RENDERED_BODY_BYTES: usize = 1_048_576;
+/// Only these request headers may cross into an endpoint with a configured credential.
+const ISOLATED_THIRD_PARTY_SAFE_HEADERS: [&str; 34] = [
+    "accept",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "access-control-request-headers",
+    "access-control-request-method",
+    "cache-control",
+    "content-encoding",
+    "content-language",
+    "content-length",
+    "content-location",
+    "content-type",
+    "date",
+    "expect",
+    "host",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "max-forwards",
+    "openai-beta",
+    "origin",
+    "pragma",
+    "range",
+    "traceparent",
+    "user-agent",
+    "via",
+    "x-amzn-trace-id",
+    "x-b3-spanid",
+    "x-b3-traceid",
+    "x-client-request-id",
+    "x-correlation-id",
+    "x-request-id",
+];
+/// Pattern-match credential-bearing header names so configured origins cannot receive aliases
+/// outside a finite denylist.
+const CREDENTIAL_LIKE_HEADER_NAME_PARTS: [&str; 11] = [
+    "key",
+    "token",
+    "secret",
+    "auth",
+    "credential",
+    "password",
+    "passwd",
+    "cookie",
+    "api-key",
+    "access-key",
+    "bearer",
+];
 const DEEPINFRA_CONVERTIBLE_RERANK_FIELDS: [&str; 5] =
     ["model", "query", "documents", "top_n", "return_documents"];
 
@@ -171,8 +223,10 @@ pub(super) fn is_compatible_with_endpoint(
 /// never be sent as a health probe.
 pub(super) fn has_runtime_credential(endpoint: &UpstreamEndpointConfig) -> bool {
     match endpoint.protocol {
-        UpstreamEndpointProtocol::OpenAi => true,
-        UpstreamEndpointProtocol::DeepInfraQwen3Rerank => authorization_header(endpoint).is_ok(),
+        UpstreamEndpointProtocol::OpenAi => optional_authorization_header(endpoint).is_ok(),
+        UpstreamEndpointProtocol::DeepInfraQwen3Rerank => {
+            required_authorization_header(endpoint).is_ok()
+        }
     }
 }
 
@@ -283,12 +337,103 @@ fn render_openai(
         }
         CanonicalRerankerRequest::UnsupportedScore => return Err(unsupported_request_error()),
     };
+    let headers = request_headers_for_openai(request, downstream_headers);
+    render_openai_endpoint(endpoint, uri, &body, &headers, false)
+}
+
+/// Render one generic OpenAI-compatible endpoint, applying only endpoint-configured
+/// credential isolation and model alias translation.
+pub(super) fn render_openai_endpoint(
+    endpoint: &UpstreamEndpointConfig,
+    uri: Uri,
+    body: &Bytes,
+    downstream_headers: &HeaderMap,
+    transformed_request_headers: bool,
+) -> Result<RenderedEndpointRequest, ProxyError> {
+    let authorization = optional_authorization_header(endpoint)?;
+    let rendered_body = rewrite_openai_model(endpoint, body, downstream_headers)?;
+    let body_was_rewritten = transformed_request_headers || rendered_body.as_ref() != body.as_ref();
+    let headers = if let Some(authorization) = authorization {
+        isolated_third_party_headers(downstream_headers, authorization)
+    } else {
+        downstream_headers.clone()
+    };
+    let headers = if body_was_rewritten {
+        sanitize_transformed_request_headers(&headers)
+    } else {
+        headers
+    };
     Ok(RenderedEndpointRequest {
         url: super::build_upstream_url(&endpoint.base_url, &uri)?,
         uri,
-        body,
-        headers: request_headers_for_openai(request, downstream_headers),
+        body: rendered_body,
+        headers,
     })
+}
+
+fn rewrite_openai_model(
+    endpoint: &UpstreamEndpointConfig,
+    body: &Bytes,
+    downstream_headers: &HeaderMap,
+) -> Result<Bytes, ProxyError> {
+    let Some(model) = endpoint.model.as_deref() else {
+        return Ok(body.clone());
+    };
+    if body.is_empty() {
+        return Ok(body.clone());
+    }
+    if endpoint.api_key_env.is_none() && has_integrity_headers(downstream_headers) {
+        return Err(ProxyError::ContextBudgetExceeded {
+            message: String::from(
+                "signed or integrity-protected requests cannot use an endpoint model override",
+            ),
+            param: "headers",
+            code: "signed_request_transformation_unsupported",
+            request_metadata: None,
+            attempts: Vec::new(),
+        });
+    }
+    let mut value: Value = serde_json::from_slice(body).map_err(|error| {
+        invalid_request_error(&format!(
+            "OpenAI endpoint model override requires JSON: {error}"
+        ))
+    })?;
+    let object = value.as_object_mut().ok_or_else(|| {
+        invalid_request_error("OpenAI endpoint model override requires a JSON object")
+    })?;
+    object.insert(String::from("model"), Value::String(model.to_owned()));
+    serde_json::to_vec(&value)
+        .map(Bytes::from)
+        .map_err(|error| {
+            invalid_request_error(&format!("serialize OpenAI request failed: {error}"))
+        })
+}
+
+fn isolated_third_party_headers(
+    downstream_headers: &HeaderMap,
+    authorization: HeaderValue,
+) -> HeaderMap {
+    let forwarded = forwarded_request_headers(downstream_headers);
+    let mut headers = HeaderMap::new();
+    for (name, value) in &forwarded {
+        if is_safe_isolated_third_party_header(name.as_str()) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    headers.insert(AUTHORIZATION, authorization);
+    headers
+}
+
+fn is_safe_isolated_third_party_header(name: &str) -> bool {
+    !header_name_contains_credential_pattern(name)
+        && ISOLATED_THIRD_PARTY_SAFE_HEADERS.contains(&name)
+}
+
+fn header_name_contains_credential_pattern(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    CREDENTIAL_LIKE_HEADER_NAME_PARTS
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
 }
 
 fn request_headers_for_openai(
@@ -310,7 +455,7 @@ fn render_deepinfra(
     request: &CanonicalRerankerRequest,
     downstream_headers: &HeaderMap,
 ) -> Result<RenderedEndpointRequest, ProxyError> {
-    let authorization = authorization_header(endpoint)?;
+    let authorization = required_authorization_header(endpoint)?;
     render_deepinfra_with_authorization(endpoint, request, downstream_headers, authorization)
 }
 
@@ -454,16 +599,25 @@ fn ensure_generated_body_fits(input: &OpenAiRerankInput) -> Result<(), ProxyErro
     Ok(())
 }
 
-fn authorization_header(endpoint: &UpstreamEndpointConfig) -> Result<HeaderValue, ProxyError> {
-    let variable = endpoint
-        .api_key_env
-        .as_deref()
-        .ok_or_else(unsupported_request_error)?;
+pub(super) fn optional_authorization_header(
+    endpoint: &UpstreamEndpointConfig,
+) -> Result<Option<HeaderValue>, ProxyError> {
+    let Some(variable) = endpoint.api_key_env.as_deref() else {
+        return Ok(None);
+    };
     let token = std::env::var(variable).map_err(|_error| credential_error())?;
     if token.trim().is_empty() {
         return Err(credential_error());
     }
-    HeaderValue::from_str(&format!("Bearer {token}")).map_err(|_error| credential_error())
+    HeaderValue::from_str(&format!("Bearer {token}"))
+        .map(Some)
+        .map_err(|_error| credential_error())
+}
+
+fn required_authorization_header(
+    endpoint: &UpstreamEndpointConfig,
+) -> Result<HeaderValue, ProxyError> {
+    optional_authorization_header(endpoint)?.ok_or_else(unsupported_request_error)
 }
 
 struct OpenAiRerankInput {
@@ -802,7 +956,7 @@ fn unsupported_request_error() -> ProxyError {
 
 fn credential_error() -> ProxyError {
     ProxyError::ContextBudgetExceeded {
-        message: String::from("selected DeepInfra endpoint has no usable runtime credential"),
+        message: String::from("selected upstream endpoint has no usable runtime credential"),
         param: "api_key_env",
         code: "upstream_endpoint_credential_unavailable",
         request_metadata: None,
@@ -1213,5 +1367,86 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn openai_model_override_sanitizes_payload_bound_headers() {
+        let endpoint = test_openai_endpoint(Some("vendor-a"), None);
+        let body = Bytes::from_static(br#"{"model":"same-model","input":"rewrite"}"#);
+        let mut headers = HeaderMap::new();
+        headers.insert("content-md5", HeaderValue::from_static("stale-md5"));
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+
+        let rendered = render_openai_endpoint(
+            &endpoint,
+            Uri::from_static("/v1/embeddings"),
+            &body,
+            &headers,
+            false,
+        )
+        .expect("model override should render");
+
+        assert_ne!(rendered.body, body);
+        assert!(!rendered.headers.contains_key("content-md5"));
+        assert!(!rendered.headers.contains_key("content-encoding"));
+    }
+
+    #[test]
+    fn credential_only_openai_endpoint_preserves_representation_headers() {
+        let endpoint = test_openai_endpoint(None, Some("PATH"));
+        let body = Bytes::from_static(b"\x1f\x8b\x08\0gzip-body");
+        let mut headers = HeaderMap::new();
+        headers.insert("content-encoding", HeaderValue::from_static("gzip"));
+
+        let rendered = render_openai_endpoint(
+            &endpoint,
+            Uri::from_static("/v1/embeddings"),
+            &body,
+            &headers,
+            false,
+        )
+        .expect("credential-only endpoint should render opaque compressed bytes");
+
+        assert_eq!(rendered.body, body);
+        assert_eq!(
+            rendered.headers.get("content-encoding"),
+            Some(&HeaderValue::from_static("gzip"))
+        );
+    }
+
+    #[test]
+    fn credentialed_openai_endpoint_strips_tenant_selectors() {
+        let endpoint = test_openai_endpoint(None, Some("PATH"));
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "openai-organization",
+            HeaderValue::from_static("client-org"),
+        );
+        headers.insert("openai-project", HeaderValue::from_static("client-project"));
+
+        let rendered = render_openai_endpoint(
+            &endpoint,
+            Uri::from_static("/v1/embeddings"),
+            &Bytes::from_static(br#"{"model":"same-model","input":"tenant"}"#),
+            &headers,
+            false,
+        )
+        .expect("credentialed endpoint should render");
+
+        assert!(!rendered.headers.contains_key("openai-organization"));
+        assert!(!rendered.headers.contains_key("openai-project"));
+    }
+
+    fn test_openai_endpoint(
+        model: Option<&str>,
+        api_key_env: Option<&str>,
+    ) -> UpstreamEndpointConfig {
+        UpstreamEndpointConfig {
+            base_url: String::from("https://openai.example"),
+            protocol: UpstreamEndpointProtocol::OpenAi,
+            model: model.map(String::from),
+            api_key_env: api_key_env.map(String::from),
+            ..UpstreamEndpointConfig::default()
+        }
     }
 }

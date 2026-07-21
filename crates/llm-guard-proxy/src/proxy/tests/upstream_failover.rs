@@ -1,4 +1,5 @@
 use super::*;
+use std::fmt::Write as _;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     sync::oneshot,
@@ -7,6 +8,436 @@ use tokio::{
 mod credential_boundary;
 mod models_attempt_preservation;
 mod response_and_recovery;
+mod shielded_attempt_continuity;
+
+const THIRD_PARTY_TEST_KEY_ENV: &str = "PATH";
+
+#[tokio::test]
+async fn shielded_streaming_chat_isolates_configured_endpoint_credentials() {
+    let mut upstream = FakeUpstream::spawn().await;
+    let extra_config = format!(
+        r"
+{}
+
+[shielding]
+enabled = true
+
+[retry]
+enabled = true
+max_attempts = 2
+shielded_streaming_enabled = true
+",
+        openai_single_endpoint_profile_config(
+            &upstream.base_url,
+            Some(THIRD_PARTY_TEST_KEY_ENV),
+            None,
+        )
+    );
+    let proxy = spawn_failover_proxy(&upstream.base_url, &extra_config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(AUTHORIZATION, "Bearer inbound-authorization")
+        .header("x-api-key", "inbound-api-key")
+        .header("x-access-key", "inbound-access-key")
+        .header("x-auth-key", "inbound-pattern-matched-auth-key")
+        .header("x-session-token", "inbound-session-token")
+        .header("openai-organization", "inbound-organization")
+        .header("openai-project", "inbound-project")
+        .header("cookie", "inbound-cookie=value")
+        .header("x-request-id", "safe-shielded-request-id")
+        .json(&json!({
+            "model": "same-model",
+            "stream": true,
+            "messages": [{"role": "user", "content": "isolate configured credentials"}],
+        }))
+        .send()
+        .await
+        .expect("shielded streaming chat should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .bytes()
+        .await
+        .expect("shielded stream should drain");
+    let request = upstream.recv_next().await;
+    let expected_authorization = format!(
+        "Bearer {}",
+        std::env::var(THIRD_PARTY_TEST_KEY_ENV).expect("test credential env should exist")
+    );
+    assert_eq!(
+        request
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_authorization.as_str())
+    );
+    for name in [
+        "x-api-key",
+        "x-access-key",
+        "x-auth-key",
+        "x-session-token",
+        "openai-organization",
+        "openai-project",
+        "cookie",
+    ] {
+        assert!(
+            !request.headers.contains_key(name),
+            "configured endpoint received inbound credential or session header {name}"
+        );
+    }
+    assert_eq!(
+        request
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("safe-shielded-request-id")
+    );
+}
+
+#[tokio::test]
+async fn shielded_chat_retries_a_503_on_the_configured_failover_endpoint() {
+    let primary_base_url = spawn_shielded_503_upstream().await;
+    let mut fallback = FakeUpstream::spawn().await;
+    let extra_config =
+        shielded_openai_failover_profile_config(&primary_base_url, &fallback.base_url);
+    let proxy = spawn_failover_proxy(&primary_base_url, &extra_config).await;
+
+    let response = timeout(
+        Duration::from_secs(5),
+        proxy
+            .client
+            .post(format!(
+                "{}/v1/chat/completions?test=shielded-endpoint-failover",
+                proxy.base_url
+            ))
+            .json(&json!({
+                "model": "same-model",
+                "stream": true,
+                "messages": [{"role": "user", "content": "retry on the fallback endpoint"}],
+            }))
+            .send(),
+    )
+    .await
+    .expect("shielded endpoint failover should not wait on the failed primary")
+    .expect("shielded chat should retry after the primary 503");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .bytes()
+        .await
+        .expect("shielded fallback stream should drain");
+    assert_eq!(fallback.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(
+        fallback.recv_next().await.path_and_query,
+        "/v1/chat/completions?test=shielded-endpoint-failover"
+    );
+}
+
+#[tokio::test]
+async fn openai_third_party_failover_rewrites_model_and_isolates_credentials() {
+    let primary_base_url = closed_upstream_base_url().await;
+    let mut third_party = FakeUpstream::spawn().await;
+    let extra_config = openai_third_party_profile_config(
+        &primary_base_url,
+        &third_party.base_url,
+        Some(THIRD_PARTY_TEST_KEY_ENV),
+        Some("vendor/embedding-model.v1"),
+    );
+    let proxy = spawn_failover_proxy(&primary_base_url, &extra_config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/embeddings", proxy.base_url))
+        .header(AUTHORIZATION, "Bearer inbound-authorization")
+        .header("api-key", "inbound-api-key")
+        .header("x-api-key", "inbound-api-key")
+        .header("x-api-token", "inbound-api-token")
+        .header("x-auth-token", "inbound-auth-token")
+        .header("x-access-key", "inbound-access-key")
+        .header("x-access-token", "inbound-access-token")
+        .header("x-session-token", "inbound-session-token")
+        .header("x-csrf-token", "inbound-csrf-token")
+        .header("x-goog-api-key", "inbound-google-api-key")
+        .header("x-amz-security-token", "inbound-aws-session-token")
+        .header("x-virtual-key", "inbound-virtual-key")
+        .header("cookie", "inbound-cookie=value")
+        .header("set-cookie", "inbound-set-cookie=value")
+        .header("proxy-authorization", "Basic inbound-proxy-auth")
+        .header("signature", "sig=:inbound-signature:")
+        .header("signature-input", "sig=(\"authorization\")")
+        .header("baggage", "api_key=inbound-baggage-secret")
+        .header(
+            "referer",
+            "https://caller.example/?token=inbound-referer-secret",
+        )
+        .header("tracestate", "vendor=api_key=inbound-tracestate-secret")
+        .header("x-request-id", "safe-generic-request-id")
+        .json(&json!({"model": "same-model", "input": "fail over"}))
+        .send()
+        .await
+        .expect("generic OpenAI-compatible failover should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response body should drain");
+    let expected_authorization = format!(
+        "Bearer {}",
+        std::env::var(THIRD_PARTY_TEST_KEY_ENV).expect("test credential env should exist")
+    );
+    let request = third_party.recv_next().await;
+    assert_eq!(request.method, Method::POST);
+    assert_eq!(
+        request
+            .headers
+            .get(AUTHORIZATION)
+            .and_then(|value| value.to_str().ok()),
+        Some(expected_authorization.as_str())
+    );
+    for name in [
+        "api-key",
+        "x-api-key",
+        "x-api-token",
+        "x-auth-token",
+        "x-access-key",
+        "x-access-token",
+        "x-session-token",
+        "x-csrf-token",
+        "x-goog-api-key",
+        "x-amz-security-token",
+        "x-virtual-key",
+        "cookie",
+        "set-cookie",
+        "proxy-authorization",
+        "signature",
+        "signature-input",
+        "baggage",
+        "referer",
+        "tracestate",
+    ] {
+        assert!(
+            !request.headers.contains_key(name),
+            "third-party origin received inbound credential or opaque metadata header {name}"
+        );
+    }
+    assert_eq!(
+        request
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("safe-generic-request-id")
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&request.body).expect("forwarded body should be JSON");
+    assert_eq!(body["model"], "vendor/embedding-model.v1");
+    assert!(
+        third_party
+            .recv_within(Duration::from_millis(100))
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn openai_model_only_override_preserves_inbound_authorization() {
+    let mut upstream = FakeUpstream::spawn().await;
+    let extra_config = openai_single_endpoint_profile_config(
+        &upstream.base_url,
+        None,
+        Some("vendor/reranker-model.v2"),
+    );
+    let proxy = spawn_failover_proxy(&upstream.base_url, &extra_config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/rerank", proxy.base_url))
+        .bearer_auth("inbound-caller-token")
+        .json(&json!({
+            "model": "same-model",
+            "query": "model override",
+            "documents": ["document"],
+        }))
+        .send()
+        .await
+        .expect("model-only OpenAI endpoint request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response body should drain");
+
+    assert_eq!(upstream.recv_next().await.path_and_query, "/v1/models");
+    let forwarded = upstream.recv_next().await;
+    assert_eq!(
+        forwarded.headers[AUTHORIZATION],
+        "Bearer inbound-caller-token"
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&forwarded.body).expect("forwarded body should be JSON");
+    assert_eq!(body["model"], "vendor/reranker-model.v2");
+}
+
+#[tokio::test]
+async fn primary_model_override_does_not_leak_to_unconfigured_openai_failover() {
+    let (primary_base_url, primary_probe_seen) = spawn_probe_then_stop_upstream().await;
+    let mut failover = FakeUpstream::spawn().await;
+    let extra_config = format!(
+        r#"
+[[profile]]
+model = "same-model"
+request_timeout_ms = 400
+health_probe_interval = "200ms"
+health_probe_timeout = "20ms"
+health_probe_max_wait = "400ms"
+
+[[profile.upstream]]
+base_url = "{primary_base_url}"
+priority = "primary"
+protocol = "openai"
+model = "vendor-a"
+
+[[profile.upstream]]
+base_url = "{}"
+priority = "failover"
+protocol = "openai"
+"#,
+        failover.base_url
+    );
+    let proxy = spawn_failover_proxy(&failover.base_url, &extra_config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/embeddings", proxy.base_url))
+        .json(&json!({
+            "model": "same-model",
+            "input": "preserve the caller model on failover",
+        }))
+        .send()
+        .await
+        .expect("failed primary transport should fail over");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response body should drain");
+    primary_probe_seen
+        .await
+        .expect("primary should receive its readiness probe before stopping");
+    assert_eq!(failover.recv_next().await.path_and_query, "/v1/models");
+    let forwarded = failover.recv_next().await;
+    assert_eq!(forwarded.path_and_query, "/v1/embeddings");
+    let body: serde_json::Value =
+        serde_json::from_slice(&forwarded.body).expect("failover request should be JSON");
+    assert_eq!(body["model"], "same-model");
+}
+
+#[tokio::test]
+async fn openai_api_key_only_replaces_inbound_credentials_without_rewriting_body() {
+    let mut upstream = FakeUpstream::spawn().await;
+    let extra_config = openai_single_endpoint_profile_config(
+        &upstream.base_url,
+        Some(THIRD_PARTY_TEST_KEY_ENV),
+        None,
+    );
+    let proxy = spawn_failover_proxy(&upstream.base_url, &extra_config).await;
+    let body = json!({"model": "same-model", "input": "key only"});
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/embeddings", proxy.base_url))
+        .header(AUTHORIZATION, "Bearer inbound-caller-token")
+        .header("x-api-key", "inbound-api-key")
+        .header("cookie", "inbound-cookie=value")
+        .json(&body)
+        .send()
+        .await
+        .expect("credential-only OpenAI endpoint request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response body should drain");
+
+    let expected_authorization = format!(
+        "Bearer {}",
+        std::env::var(THIRD_PARTY_TEST_KEY_ENV).expect("test credential env should exist")
+    );
+    let request = upstream.recv_next().await;
+    assert_eq!(request.method, Method::POST);
+    assert_eq!(
+        request.headers[AUTHORIZATION],
+        expected_authorization.as_str()
+    );
+    assert!(!request.headers.contains_key("x-api-key"));
+    assert!(!request.headers.contains_key("cookie"));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&request.body)
+            .expect("forwarded body should be JSON"),
+        body
+    );
+    assert!(
+        upstream
+            .recv_within(Duration::from_millis(100))
+            .await
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn healthy_local_embedding_primary_does_not_contact_third_party() {
+    let mut primary = FakeUpstream::spawn().await;
+    let mut third_party = FakeUpstream::spawn().await;
+    let extra_config = openai_third_party_profile_config(
+        &primary.base_url,
+        &third_party.base_url,
+        Some(THIRD_PARTY_TEST_KEY_ENV),
+        Some("vendor/embedding-model.v1"),
+    );
+    let proxy = spawn_failover_proxy(&primary.base_url, &extra_config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/embeddings", proxy.base_url))
+        .json(&json!({"model": "same-model", "input": "stay local"}))
+        .send()
+        .await
+        .expect("healthy primary request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response body should drain");
+
+    assert_eq!(primary.recv_next().await.path_and_query, "/v1/models");
+    assert_eq!(primary.recv_next().await.path_and_query, "/v1/embeddings");
+    assert!(
+        third_party
+            .recv_within(Duration::from_millis(100))
+            .await
+            .is_none(),
+        "passive third-party endpoint must not be probed while primary is healthy"
+    );
+}
+
+#[tokio::test]
+async fn openai_endpoint_without_optional_fields_preserves_request() {
+    let mut upstream = FakeUpstream::spawn().await;
+    let extra_config = openai_single_endpoint_profile_config(&upstream.base_url, None, None);
+    let proxy = spawn_failover_proxy(&upstream.base_url, &extra_config).await;
+    let body = json!({"model": "same-model", "input": "unchanged"});
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/embeddings", proxy.base_url))
+        .bearer_auth("inbound-caller-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("legacy OpenAI endpoint request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response body should drain");
+
+    assert_eq!(upstream.recv_next().await.path_and_query, "/v1/models");
+    let forwarded = upstream.recv_next().await;
+    assert_eq!(
+        forwarded.headers[AUTHORIZATION],
+        "Bearer inbound-caller-token"
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&forwarded.body)
+            .expect("forwarded body should be JSON"),
+        body
+    );
+}
 
 #[tokio::test]
 async fn same_model_request_fails_over_when_primary_is_down() {
@@ -381,6 +812,60 @@ async fn terminal_cloud_retryable_statuses_enter_passive_cooldown() {
 }
 
 #[tokio::test]
+async fn configured_openai_auth_and_rate_limit_failures_fail_over_and_enter_cooldown() {
+    for status in [
+        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
+        StatusCode::TOO_MANY_REQUESTS,
+    ] {
+        let mut primary = FakeUpstream::spawn_with_rerank_status(status).await;
+        let mut fallback = FakeUpstream::spawn().await;
+        let extra_config = credentialed_openai_primary_failover_profile_config(
+            &primary.base_url,
+            &fallback.base_url,
+        );
+        let proxy = spawn_failover_proxy(&primary.base_url, &extra_config).await;
+
+        let first = proxy
+            .client
+            .post(format!("{}/v1/rerank", proxy.base_url))
+            .json(&json!({"model": "same-model", "query": "configured credential failure", "documents": ["d"]}))
+            .send()
+            .await
+            .expect("configured OpenAI failure should fail over");
+        assert_eq!(first.status(), StatusCode::OK);
+        first
+            .bytes()
+            .await
+            .expect("first response body should drain");
+        assert_eq!(primary.recv_next().await.path_and_query, "/v1/rerank");
+        assert_eq!(fallback.recv_next().await.path_and_query, "/v1/models");
+        assert_eq!(fallback.recv_next().await.path_and_query, "/v1/rerank");
+
+        let second = proxy
+            .client
+            .post(format!("{}/v1/rerank", proxy.base_url))
+            .json(&json!({"model": "same-model", "query": "configured credential cooldown", "documents": ["d"]}))
+            .send()
+            .await
+            .expect("healthy fallback should serve during configured credential cooldown");
+        assert_eq!(second.status(), StatusCode::OK);
+        second
+            .bytes()
+            .await
+            .expect("second response body should drain");
+        assert_eq!(fallback.recv_next().await.path_and_query, "/v1/rerank");
+        assert!(
+            primary
+                .recv_within(Duration::from_millis(30))
+                .await
+                .is_none(),
+            "configured OpenAI {status} must cool down the failed primary"
+        );
+    }
+}
+
+#[tokio::test]
 async fn nonretryable_local_client_error_fails_closed_without_backup_attempt() {
     let mut primary = FakeUpstream::spawn_with_rerank_status(StatusCode::BAD_REQUEST).await;
     let mut backup = FakeUpstream::spawn().await;
@@ -483,10 +968,18 @@ async fn deepinfra_adapted_score_path_survives_connect_retry_failover() {
     primary_probe_seen
         .await
         .expect("primary should receive the initial readiness probe");
-    assert_eq!(backup.recv_next().await.path_and_query, "/v1/models");
-    assert_eq!(
-        backup.recv_next().await.path_and_query,
-        "/v1/score?test=deepinfra-rerank-retry-failover"
+    let mut observed_score = false;
+    for _ in 0..3 {
+        if backup.recv_next().await.path_and_query
+            == "/v1/score?test=deepinfra-rerank-retry-failover"
+        {
+            observed_score = true;
+            break;
+        }
+    }
+    assert!(
+        observed_score,
+        "backup should receive the retried score request"
     );
 }
 
@@ -624,6 +1117,71 @@ async fn closed_upstream_base_url() -> String {
     format!("http://{addr}/v1")
 }
 
+async fn spawn_shielded_503_upstream() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("shielded primary should bind");
+    let addr = listener
+        .local_addr()
+        .expect("shielded primary address should be available");
+    let app = axum::Router::new().fallback(|request: Request<Body>| async move {
+        if request.uri().path() == "/v1/models" {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"object":"list","data":[]}"#))
+                .expect("models response should build");
+        }
+        Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::empty())
+            .expect("503 response should build")
+    });
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            eprintln!("shielded 503 upstream server failed: {error}");
+        }
+    });
+    format!("http://{addr}/v1")
+}
+
+fn shielded_openai_failover_profile_config(
+    primary_base_url: &str,
+    fallback_base_url: &str,
+) -> String {
+    format!(
+        r#"
+[[profile]]
+model = "same-model"
+request_timeout_ms = 1_000
+health_probe_interval = "200ms"
+health_probe_timeout = "20ms"
+health_probe_max_wait = "400ms"
+
+[[profile.upstream]]
+base_url = "{primary_base_url}"
+priority = "primary"
+protocol = "openai"
+
+[[profile.upstream]]
+base_url = "{fallback_base_url}"
+priority = "failover"
+protocol = "openai"
+
+[shielding]
+enabled = true
+
+[upstream.hot_restart]
+enabled = false
+
+[retry]
+enabled = true
+max_attempts = 2
+shielded_streaming_enabled = true
+"#
+    )
+}
+
 fn failover_profile_config(
     primary_base_url: &str,
     backup_base_url: Option<&str>,
@@ -672,6 +1230,83 @@ priority = "primary"
 {backup}
 "#
     )
+}
+
+fn openai_third_party_profile_config(
+    primary_base_url: &str,
+    failover_base_url: &str,
+    api_key_env: Option<&str>,
+    model: Option<&str>,
+) -> String {
+    let mut config = openai_single_endpoint_profile_config(primary_base_url, None, None);
+    write!(
+        config,
+        r#"
+[[profile.upstream]]
+base_url = "{failover_base_url}"
+priority = "failover"
+protocol = "openai"
+"#
+    )
+    .expect("write test config");
+    if let Some(api_key_env) = api_key_env {
+        writeln!(config, "api_key_env = \"{api_key_env}\"").expect("write test config");
+    }
+    if let Some(model) = model {
+        writeln!(config, "model = \"{model}\"").expect("write test config");
+    }
+    config
+}
+
+fn credentialed_openai_primary_failover_profile_config(
+    primary_base_url: &str,
+    fallback_base_url: &str,
+) -> String {
+    let mut config = openai_single_endpoint_profile_config(
+        primary_base_url,
+        Some(THIRD_PARTY_TEST_KEY_ENV),
+        None,
+    );
+    write!(
+        config,
+        r#"
+[[profile.upstream]]
+base_url = "{fallback_base_url}"
+priority = "failover"
+protocol = "openai"
+"#
+    )
+    .expect("write test config");
+    config
+}
+
+fn openai_single_endpoint_profile_config(
+    base_url: &str,
+    api_key_env: Option<&str>,
+    model: Option<&str>,
+) -> String {
+    let mut config = format!(
+        r#"
+[[profile]]
+model = "same-model"
+request_timeout_ms = 400
+health_probe_interval = "200ms"
+health_probe_timeout = "20ms"
+health_probe_max_wait = "400ms"
+
+[[profile.upstream]]
+base_url = "{base_url}"
+priority = "primary"
+protocol = "openai"
+"#
+    );
+    if let Some(api_key_env) = api_key_env {
+        writeln!(config, "api_key_env = \"{api_key_env}\"").expect("write test config");
+    }
+    if let Some(model) = model {
+        writeln!(config, "model = \"{model}\"").expect("write test config");
+    }
+    config
 }
 
 fn heterogeneous_reranker_failover_profile_config(
