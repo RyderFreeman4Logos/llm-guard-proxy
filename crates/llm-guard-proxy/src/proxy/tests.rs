@@ -562,9 +562,12 @@ async fn persistence_tasks_contain_spawn_blocking_panics() {
 
     tasks.spawn_blocking(|| panic!("simulated persistence store teardown failure"));
 
-    timeout(STREAM_COMPLETION_TIMEOUT, tasks.flush())
-        .await
-        .expect("panic-safe persistence task should finish");
+    timeout(
+        STREAM_COMPLETION_TIMEOUT,
+        tasks.flush(STREAM_COMPLETION_TIMEOUT),
+    )
+    .await
+    .expect("panic-safe persistence task should finish");
     assert_eq!(tasks.panics.load(Ordering::SeqCst), 1);
 }
 
@@ -607,9 +610,12 @@ async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
     release_tx
         .send(())
         .expect("first persistence task should still be waiting");
-    timeout(STREAM_COMPLETION_TIMEOUT, tasks.flush())
-        .await
-        .expect("retained persistence task should drain");
+    timeout(
+        STREAM_COMPLETION_TIMEOUT,
+        tasks.flush(STREAM_COMPLETION_TIMEOUT),
+    )
+    .await
+    .expect("retained persistence task should drain");
 }
 
 async fn terminate_and_reap_test_child(
@@ -782,9 +788,12 @@ async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
     release_tx
         .send(())
         .expect("first persistence task should still be waiting");
-    timeout(STREAM_COMPLETION_TIMEOUT, tasks.flush())
-        .await
-        .expect("retained persistence task should drain");
+    timeout(
+        STREAM_COMPLETION_TIMEOUT,
+        tasks.flush(STREAM_COMPLETION_TIMEOUT),
+    )
+    .await
+    .expect("retained persistence task should drain");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -881,7 +890,7 @@ async fn persistence_flush_does_not_miss_a_zero_transition_after_observing_work(
     let guard = tasks.track();
     let flush_tasks = Arc::clone(&tasks);
     let mut flush = tokio::spawn(async move {
-        flush_tasks.flush().await;
+        flush_tasks.flush(STREAM_COMPLETION_TIMEOUT).await;
     });
 
     if arrived_rx.recv_timeout(STREAM_COMPLETION_TIMEOUT).is_err() {

@@ -313,7 +313,9 @@ impl ProxyState {
     }
 
     pub(crate) async fn flush_persistence(&self) {
-        self.persistence_tasks.flush().await;
+        self.persistence_tasks
+            .flush(current_shutdown_drain_timeout(&self.config))
+            .await;
     }
 
     #[cfg(test)]
@@ -849,7 +851,9 @@ impl PersistenceTasks {
 
         #[cfg(test)]
         let tasks = Arc::clone(self);
-        tokio::task::spawn_blocking(move || {
+        // The handle is intentionally detached: after its bounded shutdown wait expires,
+        // persistence must not retain a waiter on a stalled blocking SQLite operation.
+        let _detached_task = tokio::task::spawn_blocking(move || {
             let _capacity_permit = capacity_permit;
             let _guard = guard;
             #[cfg(test)]
@@ -880,22 +884,31 @@ impl PersistenceTasks {
         }
     }
 
-    async fn flush(&self) {
-        loop {
-            let mut notified = Box::pin(self.idle.notified());
-            let _already_notified = notified.as_mut().enable();
-            #[cfg(test)]
-            if let Some(hook) = &self.flush_wait_hook {
-                hook.notification_registered.store(true, Ordering::SeqCst);
-                hook.arrived
-                    .send(())
-                    .expect("flush test hook receiver should remain open");
-                hook.release.wait();
+    async fn flush(&self, flush_timeout: Duration) {
+        let flush = async {
+            loop {
+                let mut notified = Box::pin(self.idle.notified());
+                let _already_notified = notified.as_mut().enable();
+                #[cfg(test)]
+                if let Some(hook) = &self.flush_wait_hook {
+                    hook.notification_registered.store(true, Ordering::SeqCst);
+                    hook.arrived
+                        .send(())
+                        .expect("flush test hook receiver should remain open");
+                    hook.release.wait();
+                }
+                if self.in_flight.load(Ordering::SeqCst) == 0 {
+                    return;
+                }
+                notified.as_mut().await;
             }
-            if self.in_flight.load(Ordering::SeqCst) == 0 {
-                return;
-            }
-            notified.as_mut().await;
+        };
+        if timeout(flush_timeout, flush).await.is_err() {
+            let in_flight = self.in_flight.load(Ordering::SeqCst);
+            eprintln!(
+                "llm_guard_proxy_persistence_flush_timeout timeout_ms={} in_flight={in_flight}",
+                flush_timeout.as_millis()
+            );
         }
     }
 }
@@ -14248,6 +14261,9 @@ impl OpenAiPathError {
     }
 }
 
+#[cfg(test)]
+#[path = "proxy/persistence_flush_tests.rs"]
+mod persistence_flush_tests;
 #[cfg(test)]
 mod tests;
 

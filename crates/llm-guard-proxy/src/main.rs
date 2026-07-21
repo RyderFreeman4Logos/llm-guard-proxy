@@ -18,7 +18,7 @@ mod workflow_runtime;
 use std::{ffi::OsString, fs, future::pending, path::PathBuf, process::ExitCode, time::Duration};
 
 use config_reload::ConfigManager;
-use llm_guard_proxy_core::redact_upstream_base_url;
+use llm_guard_proxy_core::{AppConfig, ConfigHandle, redact_upstream_base_url};
 #[cfg(feature = "memory-guardian")]
 use llm_guard_proxy_host_guardian::{MemoryGuardian, default_runtime_dir};
 #[cfg(feature = "host-telemetry")]
@@ -30,9 +30,20 @@ use llm_guard_proxy_state::{
 };
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(std::env::args_os()).await {
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("failed to construct Tokio runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let outcome = runtime.block_on(run(std::env::args_os()));
+    shutdown_runtime(runtime, outcome.runtime_shutdown_timeout);
+    match outcome.result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
@@ -41,33 +52,99 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn run(args: impl IntoIterator<Item = OsString>) -> Result<(), String> {
+struct RunOutcome {
+    result: Result<(), String>,
+    runtime_shutdown_timeout: Duration,
+}
+
+impl RunOutcome {
+    fn with_default_timeout(result: Result<(), String>) -> Self {
+        Self {
+            result,
+            runtime_shutdown_timeout: default_runtime_shutdown_timeout(),
+        }
+    }
+}
+
+async fn run(args: impl IntoIterator<Item = OsString>) -> RunOutcome {
     let args = args.into_iter().collect::<Vec<_>>();
     if args.get(1).and_then(|arg| arg.to_str()) == Some("evidence") {
-        return run_evidence_command(parse_evidence_command(&args[2..])?);
+        return RunOutcome::with_default_timeout(
+            parse_evidence_command(&args[2..]).and_then(run_evidence_command),
+        );
     }
     #[cfg(feature = "host-telemetry")]
     if args.get(1).and_then(|arg| arg.to_str()) == Some("telemetry") {
-        return run_telemetry_command(parse_telemetry_command(&args[2..])?).await;
+        let result = match parse_telemetry_command(&args[2..]) {
+            Ok(command) => run_telemetry_command(command).await,
+            Err(error) => Err(error),
+        };
+        return RunOutcome::with_default_timeout(result);
     }
     #[cfg(feature = "memory-guardian")]
     if args.get(1).and_then(|arg| arg.to_str()) == Some("guardian") {
-        return run_guardian_command(parse_guardian_command(&args[2..])?).await;
+        let result = match parse_guardian_command(&args[2..]) {
+            Ok(command) => run_guardian_command(command).await,
+            Err(error) => Err(error),
+        };
+        return RunOutcome::with_default_timeout(result);
     }
-    let options = parse_proxy_options(args)?;
+    let options = match parse_proxy_options(args) {
+        Ok(options) => options,
+        Err(error) => return RunOutcome::with_default_timeout(Err(error)),
+    };
     run_server(options).await
 }
 
-async fn run_server(options: ProxyOptions) -> Result<(), String> {
-    let manager = match options.config_path {
+fn default_runtime_shutdown_timeout() -> Duration {
+    Duration::from_millis(AppConfig::default().server.shutdown_drain_timeout_ms)
+}
+
+fn current_runtime_shutdown_timeout(config: &ConfigHandle) -> Duration {
+    let timeout_ms = config.snapshot().map_or_else(
+        |_error| AppConfig::default().server.shutdown_drain_timeout_ms,
+        |snapshot| snapshot.server.shutdown_drain_timeout_ms,
+    );
+    Duration::from_millis(timeout_ms)
+}
+
+fn shutdown_runtime(runtime: tokio::runtime::Runtime, shutdown_timeout: Duration) {
+    runtime.shutdown_timeout(shutdown_timeout);
+}
+
+async fn run_server(options: ProxyOptions) -> RunOutcome {
+    let manager = match options.config_path.clone() {
         Some(path) => ConfigManager::from_explicit_path(path),
         None => ConfigManager::from_default_path(),
     }
-    .map_err(|error| error.to_string())?;
+    .map_err(|error| error.to_string());
+    let manager = match manager {
+        Ok(manager) => manager,
+        Err(error) => return RunOutcome::with_default_timeout(Err(error)),
+    };
     let config = manager
         .handle()
         .snapshot()
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string());
+    let config = match config {
+        Ok(config) => config,
+        Err(error) => return RunOutcome::with_default_timeout(Err(error)),
+    };
+    let runtime_config = manager.handle();
+    let result = run_server_with_config(options, manager, config).await;
+    RunOutcome {
+        result,
+        runtime_shutdown_timeout: current_runtime_shutdown_timeout(&runtime_config),
+    }
+}
+
+async fn run_server_with_config(
+    options: ProxyOptions,
+    manager: ConfigManager,
+    config: AppConfig,
+) -> Result<(), String> {
+    #[cfg(not(feature = "memory-guardian"))]
+    let _ = &options;
     let store = ObservabilityStore::open(manager.handle()).map_err(|error| error.to_string())?;
     let evidence_store = EvidenceStore::open(manager.handle());
     #[cfg(feature = "memory-guardian")]
@@ -795,7 +872,7 @@ fn parse_artifact_kind(value: &str) -> Result<EvidenceRawArtifactKind, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{ffi::OsString, path::Path};
+    use std::{ffi::OsString, path::Path, sync::mpsc, thread, time::Duration};
 
     #[cfg(feature = "memory-guardian")]
     use std::sync::{
@@ -1065,5 +1142,58 @@ mod tests {
         assert!(!rendered.contains("x-api-key"));
         assert!(!rendered.contains("safe=ok"));
         assert!(!rendered.contains("token=sk-test"));
+    }
+
+    #[test]
+    fn runtime_shutdown_timeout_returns_with_a_started_blocking_task() {
+        let (started_tx, started_rx) = mpsc::channel();
+        let (runtime_ready_tx, runtime_ready_rx) = mpsc::channel();
+        let (begin_shutdown_tx, begin_shutdown_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (shutdown_finished_tx, shutdown_finished_rx) = mpsc::channel();
+
+        let runtime_thread = thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build");
+            runtime.block_on(async move {
+                tokio::task::spawn_blocking(move || {
+                    started_tx
+                        .send(())
+                        .expect("test should wait for the blocking task to start");
+                    let _release = release_rx.recv();
+                });
+            });
+            runtime_ready_tx
+                .send(())
+                .expect("test should wait until the runtime is ready to shut down");
+            begin_shutdown_rx
+                .recv()
+                .expect("test should trigger runtime shutdown");
+            super::shutdown_runtime(runtime, Duration::from_millis(25));
+            shutdown_finished_tx
+                .send(())
+                .expect("test should wait for bounded runtime shutdown");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocking task should start before runtime shutdown");
+        runtime_ready_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("runtime should be ready to shut down after spawning work");
+        begin_shutdown_tx
+            .send(())
+            .expect("runtime thread should still wait for the shutdown signal");
+        shutdown_finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("runtime shutdown must not wait for the stalled blocking task");
+        release_tx
+            .send(())
+            .expect("stalled blocking task should still be waiting after runtime shutdown");
+        runtime_thread
+            .join()
+            .expect("runtime shutdown thread should not panic");
     }
 }
