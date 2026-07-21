@@ -33,6 +33,9 @@ use tokio::{
 
 use super::*;
 
+#[path = "tests/shielded_endpoint_rendering.rs"]
+mod shielded_endpoint_rendering;
+
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;
 const TEST_MAX_RECORDS: u64 = 100;

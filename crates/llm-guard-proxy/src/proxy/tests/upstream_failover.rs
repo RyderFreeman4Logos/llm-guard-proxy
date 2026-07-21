@@ -41,6 +41,7 @@ shielded_streaming_enabled = true
         .header(AUTHORIZATION, "Bearer inbound-authorization")
         .header("x-api-key", "inbound-api-key")
         .header("x-access-key", "inbound-access-key")
+        .header("x-auth-key", "inbound-pattern-matched-auth-key")
         .header("x-session-token", "inbound-session-token")
         .header("openai-organization", "inbound-organization")
         .header("openai-project", "inbound-project")
@@ -75,6 +76,7 @@ shielded_streaming_enabled = true
     for name in [
         "x-api-key",
         "x-access-key",
+        "x-auth-key",
         "x-session-token",
         "openai-organization",
         "openai-project",

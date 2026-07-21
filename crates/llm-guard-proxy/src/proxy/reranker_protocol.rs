@@ -21,30 +21,60 @@ use super::{
 const MAX_PAIR_COUNT: usize = 1_024;
 const MAX_REQUEST_ID_BYTES: usize = 256;
 const MAX_DEEPINFRA_RENDERED_BODY_BYTES: usize = 1_048_576;
-/// Inbound credentials, sessions, and requester identity must not cross into a configured origin.
-const ISOLATED_THIRD_PARTY_HEADERS_TO_STRIP: [&str; 22] = [
-    "api-key",
-    "authorization",
+/// Only these request headers may cross into an endpoint with a configured credential.
+const ISOLATED_THIRD_PARTY_SAFE_HEADERS: [&str; 37] = [
+    "accept",
+    "accept-charset",
+    "accept-encoding",
+    "accept-language",
+    "access-control-request-headers",
+    "access-control-request-method",
+    "baggage",
+    "cache-control",
+    "content-encoding",
+    "content-language",
+    "content-length",
+    "content-location",
+    "content-type",
+    "date",
+    "expect",
+    "host",
+    "if-match",
+    "if-modified-since",
+    "if-none-match",
+    "if-range",
+    "if-unmodified-since",
+    "max-forwards",
+    "openai-beta",
+    "origin",
+    "pragma",
+    "range",
+    "referer",
+    "traceparent",
+    "tracestate",
+    "user-agent",
+    "via",
+    "x-amzn-trace-id",
+    "x-b3-spanid",
+    "x-b3-traceid",
+    "x-client-request-id",
+    "x-correlation-id",
+    "x-request-id",
+];
+/// Pattern-match credential-bearing header names so configured origins cannot receive aliases
+/// outside a finite denylist.
+const CREDENTIAL_LIKE_HEADER_NAME_PARTS: [&str; 11] = [
+    "key",
+    "token",
+    "secret",
+    "auth",
+    "credential",
+    "password",
+    "passwd",
     "cookie",
-    "forwarded",
-    "openai-organization",
-    "openai-project",
-    "proxy-authorization",
-    "set-cookie",
-    "signature",
-    "signature-input",
-    "x-access-key",
-    "x-access-token",
-    "x-amz-security-token",
-    "x-api-key",
-    "x-api-token",
-    "x-auth-token",
-    "x-csrf-token",
-    "x-forwarded-for",
-    "x-goog-api-key",
-    "x-real-ip",
-    "x-session-token",
-    "x-virtual-key",
+    "api-key",
+    "access-key",
+    "bearer",
 ];
 const DEEPINFRA_CONVERTIBLE_RERANK_FIELDS: [&str; 5] =
     ["model", "query", "documents", "top_n", "return_documents"];
@@ -386,12 +416,27 @@ fn isolated_third_party_headers(
     downstream_headers: &HeaderMap,
     authorization: HeaderValue,
 ) -> HeaderMap {
-    let mut headers = forwarded_request_headers(downstream_headers);
-    for name in ISOLATED_THIRD_PARTY_HEADERS_TO_STRIP {
-        headers.remove(name);
+    let forwarded = forwarded_request_headers(downstream_headers);
+    let mut headers = HeaderMap::new();
+    for (name, value) in &forwarded {
+        if is_safe_isolated_third_party_header(name.as_str()) {
+            headers.append(name.clone(), value.clone());
+        }
     }
     headers.insert(AUTHORIZATION, authorization);
     headers
+}
+
+fn is_safe_isolated_third_party_header(name: &str) -> bool {
+    !header_name_contains_credential_pattern(name)
+        && ISOLATED_THIRD_PARTY_SAFE_HEADERS.contains(&name)
+}
+
+fn header_name_contains_credential_pattern(name: &str) -> bool {
+    let normalized = name.to_ascii_lowercase();
+    CREDENTIAL_LIKE_HEADER_NAME_PARTS
+        .iter()
+        .any(|pattern| normalized.contains(pattern))
 }
 
 fn request_headers_for_openai(

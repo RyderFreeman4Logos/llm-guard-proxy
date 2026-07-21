@@ -9115,8 +9115,6 @@ async fn start_shielded_attempt(
         &attempt_plan,
         cot_salvage,
     );
-    let (raw_request_body, evidence_upstream_body) =
-        (raw_payload_text(&upstream_body), upstream_body.clone());
     let request_metadata = shielded_attempt_request_metadata(
         runtime,
         attempt_number,
@@ -9126,16 +9124,21 @@ async fn start_shielded_attempt(
         cot_salvage,
         &attempt_thinking_metadata,
     );
-    let upstream_timeout = if ignores_request_deadline {
-        runtime.upstream_timeout
-    } else {
-        runtime
-            .request_deadline
-            .remaining()
-            .map_or(Duration::ZERO, |remaining| {
-                runtime.upstream_timeout.min(remaining)
-            })
-    };
+    let rendered = render_shielded_endpoint_body(runtime, &upstream_body).map_err(|error| {
+        shielded_start_transport_failure(ShieldedStartFailureInput {
+            runtime,
+            attempt_id: attempt_id.clone(),
+            attempt_number,
+            attempt_started_at_unix_ms,
+            request_metadata: request_metadata.clone(),
+            raw_request_body: None,
+            evidence_upstream_body: upstream_body.clone(),
+            error,
+        })
+    })?;
+    let raw_request_body = raw_payload_text(&rendered.body);
+    let evidence_upstream_body = rendered.body.clone();
+    let upstream_timeout = shielded_attempt_upstream_timeout(runtime, ignores_request_deadline);
     let start_failure = |error| ShieldedStartFailureInput {
         runtime,
         attempt_id: attempt_id.clone(),
@@ -9154,6 +9157,7 @@ async fn start_shielded_attempt(
             attempt_started_at_unix_ms,
         ),
         &request_metadata,
+        rendered,
         upstream_body,
         upstream_timeout,
         ignores_request_deadline,
@@ -9193,11 +9197,41 @@ async fn start_shielded_attempt(
     })
 }
 
+fn render_shielded_endpoint_body(
+    runtime: &ShieldedRetryRuntime,
+    body: &Bytes,
+) -> Result<reranker_protocol::RenderedEndpointRequest, ProxyError> {
+    reranker_protocol::render_openai_endpoint(
+        &runtime.terminal_endpoint,
+        runtime.forward_uri.clone(),
+        body,
+        &runtime.original_downstream_headers,
+        runtime.transformed_request_headers,
+    )
+}
+
+fn shielded_attempt_upstream_timeout(
+    runtime: &ShieldedRetryRuntime,
+    ignores_request_deadline: bool,
+) -> Duration {
+    if ignores_request_deadline {
+        runtime.upstream_timeout
+    } else {
+        runtime
+            .request_deadline
+            .remaining()
+            .map_or(Duration::ZERO, |remaining| {
+                runtime.upstream_timeout.min(remaining)
+            })
+    }
+}
+
 async fn send_shielded_upstream_attempt(
     runtime: &ShieldedRetryRuntime,
     attempt: (AttemptId, u32, u64),
     request_metadata: &BTreeMap<String, String>,
-    upstream_body: Bytes,
+    rendered: reranker_protocol::RenderedEndpointRequest,
+    retry_body: Bytes,
     upstream_timeout: Duration,
     ignores_request_deadline: bool,
 ) -> Result<SentUpstreamResponse, ProxyError> {
@@ -9210,20 +9244,13 @@ async fn send_shielded_upstream_attempt(
                 .map(|remaining| Instant::now() + remaining)
         })
         .flatten();
-    let rendered = reranker_protocol::render_openai_endpoint(
-        &runtime.terminal_endpoint,
-        runtime.forward_uri.clone(),
-        &upstream_body,
-        &runtime.original_downstream_headers,
-        runtime.transformed_request_headers,
-    )?;
     send_first_upstream_attempt(UpstreamAttemptContext {
         client: &runtime.client,
         method: runtime.method.clone(),
         upstream_url: rendered.url,
         downstream_headers: &rendered.headers,
         upstream_body: rendered.body,
-        retry_body: upstream_body,
+        retry_body,
         upstream_timeout,
         attempt_id,
         attempt_number,
@@ -13020,6 +13047,7 @@ fn shadow_comparison_attempt_plan(
         &runtime.upstream_profile,
         &mut prepared.thinking_metadata,
     );
+    upstream_body = render_shadow_endpoint_body(runtime, &upstream_body)?;
     let mut request_metadata = source.request_metadata.clone();
     request_metadata.extend(prepared.thinking_metadata);
     request_metadata.insert(
@@ -13062,6 +13090,7 @@ fn paired_shadow_comparison_attempt_plan(
         &runtime.upstream_profile,
         &mut prepared.thinking_metadata,
     );
+    let upstream_body = render_shadow_endpoint_body(runtime, &upstream_body)?;
     let mut request_metadata = source.request_metadata.clone();
     request_metadata.extend(prepared.thinking_metadata);
     request_metadata.insert(
@@ -13097,6 +13126,18 @@ fn paired_shadow_comparison_attempt_plan(
 struct PreparedShadowBody {
     upstream_body: Bytes,
     thinking_metadata: BTreeMap<String, String>,
+}
+
+fn render_shadow_endpoint_body(runtime: &ShieldedRetryRuntime, body: &Bytes) -> Option<Bytes> {
+    reranker_protocol::render_openai_endpoint(
+        &runtime.terminal_endpoint,
+        runtime.forward_uri.clone(),
+        body,
+        &runtime.original_downstream_headers,
+        runtime.transformed_request_headers,
+    )
+    .ok()
+    .map(|rendered| rendered.body)
 }
 
 fn prepared_shadow_body(
