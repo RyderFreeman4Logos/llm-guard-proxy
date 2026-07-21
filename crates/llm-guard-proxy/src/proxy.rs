@@ -4441,14 +4441,16 @@ async fn begin_models_upstream_group(
     } else {
         Instant::now() + Duration::from_millis(profile.request_timeout_ms)
     };
-    let (base_url, terminal_endpoint, endpoint_retry_order) = if is_current_profile {
-        (
-            context.terminal_endpoint.base_url.clone(),
-            context.terminal_endpoint.clone(),
-            context.endpoint_retry_order.clone(),
-        )
-    } else {
-        let selected = context
+    let (base_url, terminal_endpoint, endpoint_retry_order, recovery_trial_lease) =
+        if is_current_profile {
+            (
+                context.terminal_endpoint.base_url.clone(),
+                context.terminal_endpoint.clone(),
+                context.endpoint_retry_order.clone(),
+                None,
+            )
+        } else {
+            let selected = context
             .state
             .upstream_health
             .select_endpoint(
@@ -4477,12 +4479,13 @@ async fn begin_models_upstream_group(
                     ProxyError::upstream_unavailable(profile, waited_ms)
                 }
             })?;
-        (
-            selected.base_url,
-            selected.endpoint,
-            selected.selection_order,
-        )
-    };
+            (
+                selected.base_url,
+                selected.endpoint,
+                selected.selection_order,
+                selected.recovery_trial_lease,
+            )
+        };
     Ok(ModelsUpstreamGroup {
         base_url,
         request_timeout_ms: profile.request_timeout_ms,
@@ -4490,6 +4493,7 @@ async fn begin_models_upstream_group(
         profile,
         terminal_endpoint,
         endpoint_retry_order,
+        _recovery_trial_lease: recovery_trial_lease,
         request_deadline,
     })
 }
@@ -4715,7 +4719,6 @@ fn forward_rewritten_endpoint_response(
     )
 }
 
-#[derive(Clone)]
 struct ModelsUpstreamGroup {
     profile: UpstreamProfileConfig,
     base_url: String,
@@ -4723,6 +4726,8 @@ struct ModelsUpstreamGroup {
     metadata: MetadataConfig,
     terminal_endpoint: UpstreamEndpointConfig,
     endpoint_retry_order: Vec<String>,
+    // Kept alive while this group is fetched and its endpoint response is classified.
+    _recovery_trial_lease: Option<upstream_failover::RecoveryTrialLease>,
     request_deadline: Instant,
 }
 
@@ -4754,7 +4759,7 @@ async fn forward_merged_models_response(
         };
         if selected_groups
             .iter()
-            .any(|selected| selected.base_url == group.base_url)
+            .any(|selected| same_models_endpoint_identity(selected, &group))
         {
             continue;
         }
@@ -4834,6 +4839,12 @@ async fn forward_merged_models_response(
         &upstream_headers,
         Body::from_stream(response_body),
     ))
+}
+
+fn same_models_endpoint_identity(left: &ModelsUpstreamGroup, right: &ModelsUpstreamGroup) -> bool {
+    left.base_url == right.base_url
+        && left.terminal_endpoint.protocol == right.terminal_endpoint.protocol
+        && left.terminal_endpoint.api_key_env == right.terminal_endpoint.api_key_env
 }
 
 fn models_success_response_headers() -> HeaderMap {
