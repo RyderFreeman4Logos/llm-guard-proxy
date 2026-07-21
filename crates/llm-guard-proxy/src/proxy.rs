@@ -2880,6 +2880,7 @@ async fn forward_openai_request(
     )
     .await
     .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    let endpoint_retry_body = prepared_request.shielded_chat_plan.upstream_body.clone();
     let mut _initial_recovery_trial_lease = None;
     if prepared_request.upstream_profile.has_endpoint_failover() {
         let upstream_deadline = Instant::now()
@@ -2934,7 +2935,7 @@ async fn forward_openai_request(
                 reranker_protocol::render_openai_endpoint(
                     &selected.endpoint,
                     prepared_request.forward_uri.clone(),
-                    &prepared_request.shielded_chat_plan.upstream_body,
+                    &endpoint_retry_body,
                     &downstream_headers,
                     prepared_request.transformed_request_headers,
                 )
@@ -3060,6 +3061,7 @@ async fn forward_openai_request(
         upstream_uri: prepared_request.forward_uri,
         upstream_url: prepared_request.upstream_url,
         upstream_body: prepared_request.shielded_chat_plan.upstream_body,
+        endpoint_retry_body,
         upstream_timeout,
         upstream_profile: prepared_request.upstream_profile,
         route_reason: prepared_request.route_reason,
@@ -4369,6 +4371,7 @@ struct GenericForwardContext<'request> {
     upstream_uri: Uri,
     upstream_url: Url,
     upstream_body: Bytes,
+    endpoint_retry_body: Bytes,
     upstream_timeout: Duration,
     upstream_profile: UpstreamProfileConfig,
     route_reason: UpstreamRouteReason,
@@ -4542,6 +4545,7 @@ async fn forward_generic_openai_request(
         upstream_url: context.upstream_url.clone(),
         downstream_headers,
         upstream_body: context.upstream_body.clone(),
+        retry_body: context.endpoint_retry_body.clone(),
         upstream_timeout: context.upstream_timeout,
         attempt_id: attempt_id.clone(),
         attempt_number: 1,
@@ -4908,6 +4912,7 @@ async fn fetch_models_upstream_group(
         upstream_url: rendered.url,
         downstream_headers: &rendered.headers,
         upstream_body: rendered.body,
+        retry_body: context.upstream_body.clone(),
         upstream_timeout: Duration::from_millis(group.request_timeout_ms),
         attempt_id: attempt_id.clone(),
         attempt_number,
@@ -5043,6 +5048,7 @@ struct UpstreamAttemptContext<'request> {
     upstream_url: Url,
     downstream_headers: &'request HeaderMap,
     upstream_body: Bytes,
+    retry_body: Bytes,
     upstream_timeout: Duration,
     attempt_id: AttemptId,
     attempt_number: u32,
@@ -5218,7 +5224,7 @@ async fn send_first_upstream_attempt(
                     client: context.client,
                     retry,
                     retry_method: context.method.clone(),
-                    retry_body: &context.upstream_body,
+                    retry_body: &context.retry_body,
                     upstream_timeout: context.upstream_timeout,
                     request_id: context.request_id,
                     decode_heterogeneous_reranker: context.decode_heterogeneous_reranker,

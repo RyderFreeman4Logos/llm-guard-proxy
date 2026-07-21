@@ -132,6 +132,58 @@ async fn openai_model_only_override_preserves_inbound_authorization() {
 }
 
 #[tokio::test]
+async fn primary_model_override_does_not_leak_to_unconfigured_openai_failover() {
+    let (primary_base_url, primary_probe_seen) = spawn_probe_then_stop_upstream().await;
+    let mut failover = FakeUpstream::spawn().await;
+    let extra_config = format!(
+        r#"
+[[profile]]
+model = "same-model"
+request_timeout_ms = 400
+health_probe_interval = "200ms"
+health_probe_timeout = "20ms"
+health_probe_max_wait = "400ms"
+
+[[profile.upstream]]
+base_url = "{primary_base_url}"
+priority = "primary"
+protocol = "openai"
+model = "vendor-a"
+
+[[profile.upstream]]
+base_url = "{}"
+priority = "failover"
+protocol = "openai"
+"#,
+        failover.base_url
+    );
+    let proxy = spawn_failover_proxy(&failover.base_url, &extra_config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/embeddings", proxy.base_url))
+        .json(&json!({
+            "model": "same-model",
+            "input": "preserve the caller model on failover",
+        }))
+        .send()
+        .await
+        .expect("failed primary transport should fail over");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response body should drain");
+    primary_probe_seen
+        .await
+        .expect("primary should receive its readiness probe before stopping");
+    assert_eq!(failover.recv_next().await.path_and_query, "/v1/models");
+    let forwarded = failover.recv_next().await;
+    assert_eq!(forwarded.path_and_query, "/v1/embeddings");
+    let body: serde_json::Value =
+        serde_json::from_slice(&forwarded.body).expect("failover request should be JSON");
+    assert_eq!(body["model"], "same-model");
+}
+
+#[tokio::test]
 async fn openai_api_key_only_replaces_inbound_credentials_without_rewriting_body() {
     let mut upstream = FakeUpstream::spawn().await;
     let extra_config = openai_single_endpoint_profile_config(
