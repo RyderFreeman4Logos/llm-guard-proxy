@@ -125,6 +125,19 @@ recovery_max_per_window = 2              # Max recovery attempts per window
 #| max_per_window = 2                                                 # Max recoveries per budget window
 # END PARSEABLE EXAMPLE: upstream-local-recovery
 
+# BEGIN PARSEABLE EXAMPLE: upstream-stuck-watchdog-and-restart-queue
+#| [upstream.stuck_watchdog]
+#| enabled = true                                                     # Detect active output-starved requests
+#| check_interval_secs = 30                                           # Polling interval
+#| detection_window_secs = 180                                       # Trailing output-token window
+#| min_output_tokens_in_window = 1                                   # Restart when active requests make less output
+#|
+#| [upstream.restart_queue]
+#| enabled = true                                                     # Wait for an in-progress local recovery
+#| queue_deadline_secs = 300                                         # Return 503 if recovery exceeds this wait
+#| restart_timeout_secs = 300                                       # Cap one restart/readiness episode
+# END PARSEABLE EXAMPLE: upstream-stuck-watchdog-and-restart-queue
+
 # ── Upstream metadata discovery ──────────────────────────────────────────────
 # Automatically discovers model metadata from /v1/models.
 

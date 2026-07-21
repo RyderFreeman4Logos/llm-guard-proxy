@@ -124,6 +124,91 @@ data: [DONE]
 }
 
 #[test]
+fn stuck_watchdog_counts_non_stream_and_sse_output_tokens_in_trailing_window() {
+    let tracker = StuckWatchdogTokenTracker::default();
+    tracker.record_response("default", br#"{"usage":{"completion_tokens":3}}"#, b"");
+    tracker.record_response(
+        "default",
+        b"",
+        br#"data: {"usage":{"completion_tokens":2}}
+
+data: [DONE]
+"#,
+    );
+
+    assert!(!tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 5));
+    assert!(tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 6));
+}
+
+#[test]
+fn stuck_watchdog_detects_only_active_requests_without_enough_output() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    assert!(!tracker.has_active_requests("default"));
+
+    let request = tracker.begin_request("default");
+    assert!(tracker.has_active_requests("default"));
+    assert!(tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 1));
+
+    request.record_response(br#"{"usage":{"completion_tokens":1}}"#, b"");
+    assert!(!tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 1));
+
+    drop(request);
+    assert!(!tracker.has_active_requests("default"));
+}
+
+#[test]
+fn restart_queue_wait_deadline_caps_recovery_episode_timeout() {
+    let queue = RestartQueueConfig {
+        enabled: true,
+        queue_deadline_secs: 60,
+        restart_timeout_secs: 30,
+    };
+
+    assert_eq!(restart_queue_wait_deadline(&queue), Duration::from_secs(30));
+}
+
+#[tokio::test]
+async fn restart_queue_waits_for_readiness_result_and_times_out_without_it() {
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    assert_eq!(
+        wait_for_restart_queue(&coordinator, Duration::from_millis(5)).await,
+        RestartQueueWaitResult::NotRecovering
+    );
+
+    coordinator.state.lock().await.running = true;
+    let waiting = {
+        let coordinator = Arc::clone(&coordinator);
+        tokio::spawn(async move {
+            wait_for_restart_queue(&coordinator, Duration::from_millis(200)).await
+        })
+    };
+
+    sleep(Duration::from_millis(20)).await;
+    assert!(
+        !waiting.is_finished(),
+        "request must remain queued during recovery"
+    );
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+    assert_eq!(
+        waiting.await.expect("queued request task should join"),
+        RestartQueueWaitResult::Ready
+    );
+
+    coordinator.state.lock().await.running = true;
+    assert_eq!(
+        wait_for_restart_queue(&coordinator, Duration::from_millis(5)).await,
+        RestartQueueWaitResult::TimedOut
+    );
+}
+
+#[test]
 fn parse_token_usage_reads_embedding_prompt_tokens() {
     let usage = parse_token_usage(
         br#"{"data":[],"usage":{"prompt_tokens":17,"total_tokens":17}}"#,

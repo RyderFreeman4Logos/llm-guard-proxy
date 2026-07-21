@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     convert::Infallible,
     fmt,
     future::{Future, IntoFuture},
@@ -43,10 +43,10 @@ use llm_guard_proxy_core::{
 use llm_guard_proxy_core::{
     AppConfig, ConfigHandle, DefaultInjectionSchema, DownstreamDropPolicy, Health, HeartbeatMode,
     LICENSE, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
-    MetadataConfig, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
-    ShadowComparisonAttempt, ThinkingConfig, ThinkingMode, UpstreamEndpointConfig,
-    UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason,
-    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    MetadataConfig, RestartQueueConfig, RetryConfig, RetryLadderConfig, SERVICE_NAME,
+    SelectedUpstreamProfile, ShadowComparisonAttempt, ThinkingConfig, ThinkingMode,
+    UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 use llm_guard_proxy_state::{
     AttemptId, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
@@ -142,6 +142,8 @@ pub(crate) struct ProxyState {
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     upstream_health: Arc<UpstreamHealthRegistry>,
     local_recovery: Arc<LocalRecoveryCoordinatorSet>,
+    stuck_watchdog_tokens: Arc<StuckWatchdogTokenTracker>,
+    stuck_watchdog_started: Arc<AtomicBool>,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
@@ -272,6 +274,8 @@ impl ProxyState {
             upstream_stall_recovery: Arc::new(UpstreamStallRecoveryCoordinator::default()),
             upstream_health: Arc::new(UpstreamHealthRegistry::default()),
             local_recovery: Arc::new(LocalRecoveryCoordinatorSet::default()),
+            stuck_watchdog_tokens: Arc::new(StuckWatchdogTokenTracker::default()),
+            stuck_watchdog_started: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "upstream-hot-restart")]
             hot_restart_recovery: Arc::new(HotRestartCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
@@ -316,6 +320,19 @@ impl ProxyState {
         self.persistence_tasks
             .flush(current_shutdown_drain_timeout(&self.config))
             .await;
+    }
+
+    fn start_stuck_watchdog(&self) {
+        if self.stuck_watchdog_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        tokio::spawn(run_stuck_engine_watchdog(
+            self.config.clone(),
+            self.client.clone(),
+            Arc::clone(&self.local_recovery),
+            Arc::clone(&self.stuck_watchdog_tokens),
+            Arc::clone(&self.shutdown),
+        ));
     }
 
     #[cfg(test)]
@@ -675,6 +692,7 @@ pub(crate) async fn serve_until_shutdown(
         state.client.clone(),
         Arc::clone(&state.shutdown),
     );
+    state.start_stuck_watchdog();
     let config = state.config.clone();
     let shutdown_gate = Arc::clone(&state.shutdown);
     let (shutdown_started_tx, shutdown_started_rx) = oneshot::channel();
@@ -2880,6 +2898,21 @@ async fn forward_openai_request(
     )
     .await
     .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    wait_for_profile_restart_queue(
+        state,
+        &prepared_request.upstream_profile,
+        &mut request_metadata,
+    )
+    .await?;
+    let stuck_watchdog_request = prepared_request
+        .upstream_profile
+        .stuck_watchdog
+        .enabled
+        .then(|| {
+            state
+                .stuck_watchdog_tokens
+                .begin_request(&prepared_request.upstream_profile.name)
+        });
     let endpoint_retry_body = prepared_request.shielded_chat_plan.upstream_body.clone();
     let mut _initial_recovery_trial_lease = None;
     if prepared_request.upstream_profile.has_endpoint_failover() {
@@ -3023,6 +3056,7 @@ async fn forward_openai_request(
                 request_id: request_id.clone(),
                 started_at_unix_ms,
                 model_id: prepared_request.model_id,
+                stuck_watchdog_request,
                 request_metadata,
                 listener: state.listener.clone(),
                 upstream_profile: prepared_request.upstream_profile,
@@ -3080,6 +3114,7 @@ async fn forward_openai_request(
         request_id,
         started_at_unix_ms,
         model_id: prepared_request.model_id,
+        stuck_watchdog_request,
         request_metadata,
         in_flight_permit,
         response_adapter: prepared_request.response_adapter,
@@ -4390,6 +4425,7 @@ struct GenericForwardContext<'request> {
     request_id: &'request RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
+    stuck_watchdog_request: Option<StuckWatchdogRequest>,
     request_metadata: BTreeMap<String, String>,
     in_flight_permit: InFlightPermit,
     response_adapter: Option<BufferedResponseAdapter>,
@@ -4693,6 +4729,7 @@ fn generic_forwarded_response(
         attempt_request_metadata: sent_upstream_response.attempt_request_metadata,
         completed_attempt_records: sent_upstream_response.completed_attempt_records,
         shutdown: Arc::clone(&context.state.shutdown),
+        stuck_watchdog_request: context.stuck_watchdog_request.clone(),
     };
     GenericForwardedResponse {
         response_parts,
@@ -4836,6 +4873,7 @@ async fn forward_merged_models_response(
         attempt_request_metadata: BTreeMap::new(),
         completed_attempt_records: Vec::new(),
         shutdown: Arc::clone(&context.state.shutdown),
+        stuck_watchdog_request: None,
     };
     let shutdown = response_parts.shutdown_subscription();
     let mut observer = response_parts.into_observer();
@@ -6153,6 +6191,312 @@ struct UpstreamStallRecoveryState {
 }
 
 #[derive(Debug, Default)]
+struct StuckWatchdogTokenTracker {
+    windows: Mutex<HashMap<String, StuckWatchdogTokenWindow>>,
+}
+
+#[derive(Debug, Default)]
+struct StuckWatchdogTokenWindow {
+    samples: VecDeque<(Instant, u64)>,
+    active_requests: usize,
+}
+
+#[derive(Debug)]
+struct StuckWatchdogRequestInner {
+    tracker: Arc<StuckWatchdogTokenTracker>,
+    profile: String,
+}
+
+#[derive(Clone, Debug)]
+struct StuckWatchdogRequest {
+    inner: Arc<StuckWatchdogRequestInner>,
+}
+
+impl StuckWatchdogTokenTracker {
+    fn begin_request(self: &Arc<Self>, profile: &str) -> StuckWatchdogRequest {
+        let mut windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let window = windows.entry(profile.to_owned()).or_default();
+        window.active_requests = window.active_requests.saturating_add(1);
+        StuckWatchdogRequest {
+            inner: Arc::new(StuckWatchdogRequestInner {
+                tracker: Arc::clone(self),
+                profile: profile.to_owned(),
+            }),
+        }
+    }
+
+    fn record_response(&self, profile: &str, response_body: &[u8], sse_body: &[u8]) {
+        let Some(output_tokens) = parse_token_usage(response_body, sse_body).output_tokens else {
+            return;
+        };
+        let mut windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        windows
+            .entry(profile.to_owned())
+            .or_default()
+            .samples
+            .push_back((Instant::now(), output_tokens));
+    }
+
+    fn has_too_few_output_tokens(
+        &self,
+        profile: &str,
+        detection_window: Duration,
+        minimum_output_tokens: u64,
+    ) -> bool {
+        let mut windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(window) = windows.get_mut(profile) else {
+            return true;
+        };
+        window_has_too_few_output_tokens(window, detection_window, minimum_output_tokens)
+    }
+
+    fn has_active_requests(&self, profile: &str) -> bool {
+        let windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        windows
+            .get(profile)
+            .is_some_and(|window| window.active_requests > 0)
+    }
+}
+
+impl StuckWatchdogRequest {
+    fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
+        self.inner
+            .tracker
+            .record_response(&self.inner.profile, response_body, sse_body);
+    }
+}
+
+impl Drop for StuckWatchdogRequestInner {
+    fn drop(&mut self) {
+        let mut windows = match self.tracker.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(window) = windows.get_mut(&self.profile) {
+            window.active_requests = window.active_requests.saturating_sub(1);
+        }
+    }
+}
+
+fn window_has_too_few_output_tokens(
+    window: &mut StuckWatchdogTokenWindow,
+    detection_window: Duration,
+    minimum_output_tokens: u64,
+) -> bool {
+    if let Some(threshold) = Instant::now().checked_sub(detection_window) {
+        while window
+            .samples
+            .front()
+            .is_some_and(|(recorded_at, _)| *recorded_at < threshold)
+        {
+            let _ = window.samples.pop_front();
+        }
+    }
+    window
+        .samples
+        .iter()
+        .map(|(_, output_tokens)| *output_tokens)
+        .sum::<u64>()
+        < minimum_output_tokens
+}
+
+async fn run_stuck_engine_watchdog(
+    config: ConfigHandle,
+    client: Client,
+    local_recovery: Arc<LocalRecoveryCoordinatorSet>,
+    tokens: Arc<StuckWatchdogTokenTracker>,
+    shutdown: Arc<ShutdownGate>,
+) {
+    loop {
+        let Ok(snapshot) = config.snapshot() else {
+            let mut shutdown_gate = shutdown.subscribe();
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(60)) => {}
+                () = shutdown_gate.cancelled() => return,
+            }
+            continue;
+        };
+        let profiles = watchdog_upstream_profiles(&snapshot);
+        let mut next_check_secs = 60;
+        for profile in profiles {
+            let watchdog = &profile.stuck_watchdog;
+            if !watchdog.enabled {
+                continue;
+            }
+            next_check_secs = next_check_secs.min(watchdog.check_interval_secs);
+            let detection_window = Duration::from_secs(watchdog.detection_window_secs);
+            if !tokens.has_active_requests(&profile.name)
+                || !tokens.has_too_few_output_tokens(
+                    &profile.name,
+                    detection_window,
+                    watchdog.min_output_tokens_in_window,
+                )
+            {
+                continue;
+            }
+
+            let policy = LocalRecoveryPolicy::from_config(&profile.local_recovery);
+            if !policy.is_configured() {
+                continue;
+            }
+            eprintln!(
+                "llm_guard_proxy_stuck_watchdog profile={} event=detected detection_window_secs={} min_output_tokens={}",
+                profile.name, watchdog.detection_window_secs, watchdog.min_output_tokens_in_window,
+            );
+            let coordinator = local_recovery.coordinator_for(&profile.name);
+            let recovery = run_local_recovery_for_profile(
+                &policy,
+                &coordinator,
+                client.clone(),
+                profile.base_url.clone(),
+                LocalRecoveryCause::UpstreamStall,
+            )
+            .await;
+            eprintln!(
+                "llm_guard_proxy_stuck_watchdog profile={} event=recovery_finished status={}",
+                profile.name,
+                recovery
+                    .get("local_recovery_status")
+                    .map_or("missing", String::as_str),
+            );
+        }
+        let mut shutdown_gate = shutdown.subscribe();
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(next_check_secs)) => {}
+            () = shutdown_gate.cancelled() => return,
+        }
+    }
+}
+
+pub(crate) fn spawn_stuck_engine_watchdog(state: &ProxyState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_stuck_engine_watchdog(
+        state.config.clone(),
+        state.client.clone(),
+        Arc::clone(&state.local_recovery),
+        Arc::clone(&state.stuck_watchdog_tokens),
+        Arc::clone(&state.shutdown),
+    ))
+}
+
+fn watchdog_upstream_profiles(config: &AppConfig) -> Vec<UpstreamProfileConfig> {
+    let mut profiles = Vec::with_capacity(config.upstream_profiles.len().saturating_add(1));
+    profiles.push(config.default_upstream_profile());
+    profiles.extend(config.upstream_profiles.iter().cloned());
+    profiles
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestartQueueWaitResult {
+    NotRecovering,
+    Ready,
+    Failed,
+    TimedOut,
+}
+
+async fn wait_for_restart_queue(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    queue_deadline: Duration,
+) -> RestartQueueWaitResult {
+    let deadline = Instant::now() + queue_deadline;
+    let mut waited_for_recovery = false;
+    loop {
+        let notified = coordinator.notify.notified();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+
+        let state = coordinator.state.lock().await;
+        if !state.running {
+            if !waited_for_recovery {
+                return RestartQueueWaitResult::NotRecovering;
+            }
+            return if state
+                .last_result
+                .as_ref()
+                .is_some_and(local_recovery_completed_ready)
+            {
+                RestartQueueWaitResult::Ready
+            } else {
+                RestartQueueWaitResult::Failed
+            };
+        }
+        waited_for_recovery = true;
+        drop(state);
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || timeout(remaining, notified).await.is_err() {
+            return RestartQueueWaitResult::TimedOut;
+        }
+    }
+}
+
+async fn wait_for_profile_restart_queue(
+    state: &ProxyState,
+    profile: &UpstreamProfileConfig,
+    request_metadata: &mut BTreeMap<String, String>,
+) -> Result<(), ProxyError> {
+    let queue = &profile.restart_queue;
+    if !queue.enabled {
+        return Ok(());
+    }
+
+    let queue_deadline = restart_queue_wait_deadline(queue);
+    let coordinator = state.local_recovery.coordinator_for(&profile.name);
+    match wait_for_restart_queue(&coordinator, queue_deadline).await {
+        RestartQueueWaitResult::NotRecovering => Ok(()),
+        RestartQueueWaitResult::Ready => {
+            request_metadata.insert(
+                String::from("restart_queue_outcome"),
+                String::from("released_after_recovery"),
+            );
+            eprintln!(
+                "llm_guard_proxy_restart_queue profile={} event=released_after_recovery",
+                profile.name
+            );
+            Ok(())
+        }
+        result @ (RestartQueueWaitResult::Failed | RestartQueueWaitResult::TimedOut) => {
+            let outcome = match result {
+                RestartQueueWaitResult::Failed => "recovery_failed",
+                RestartQueueWaitResult::TimedOut => "timeout",
+                RestartQueueWaitResult::NotRecovering | RestartQueueWaitResult::Ready => {
+                    unreachable!("only failed or timed-out restart queues reach this branch")
+                }
+            };
+            request_metadata.insert(String::from("restart_queue_outcome"), String::from(outcome));
+            request_metadata.insert(
+                String::from("restart_queue_deadline_secs"),
+                queue.queue_deadline_secs.to_string(),
+            );
+            eprintln!(
+                "llm_guard_proxy_restart_queue profile={} event={outcome}",
+                profile.name
+            );
+            Err(ProxyError::upstream_unavailable(
+                profile.name.clone(),
+                u64::try_from(queue_deadline.as_millis()).unwrap_or(u64::MAX),
+            )
+            .with_request_metadata(request_metadata.clone()))
+        }
+    }
+}
+
+fn restart_queue_wait_deadline(queue: &RestartQueueConfig) -> Duration {
+    Duration::from_secs(queue.queue_deadline_secs.min(queue.restart_timeout_secs))
+}
+
+#[derive(Debug, Default)]
 struct LocalRecoveryCoordinatorSet {
     coordinators: Mutex<HashMap<String, Arc<UpstreamStallRecoveryCoordinator>>>,
 }
@@ -6709,6 +7053,7 @@ struct ForwardedResponseParts {
     attempt_request_metadata: BTreeMap<String, String>,
     completed_attempt_records: Vec<AttemptRecord>,
     shutdown: Arc<ShutdownGate>,
+    stuck_watchdog_request: Option<StuckWatchdogRequest>,
 }
 
 impl ForwardedResponseParts {
@@ -6769,6 +7114,7 @@ impl ForwardedResponseParts {
             extra_response_metadata,
             raw_payloads,
             completed_attempt_records: self.completed_attempt_records,
+            stuck_watchdog_request: self.stuck_watchdog_request,
             final_attempt: Some(final_attempt),
             retry_observation: None,
             attempt_progress: None,
@@ -6943,6 +7289,7 @@ struct ShieldedRetryRuntime {
     request_id: RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
+    stuck_watchdog_request: Option<StuckWatchdogRequest>,
     request_metadata: BTreeMap<String, String>,
     listener: ListenerConfig,
     upstream_profile: UpstreamProfileConfig,
@@ -8488,8 +8835,23 @@ async fn run_local_recovery(
     runtime: &ShieldedRetryRuntime,
     cause: LocalRecoveryCause,
 ) -> BTreeMap<String, String> {
-    let policy = &runtime.local_recovery_policy;
-    let coordinator = &runtime.local_recovery;
+    run_local_recovery_for_profile(
+        &runtime.local_recovery_policy,
+        &runtime.local_recovery,
+        runtime.client.clone(),
+        runtime.upstream_profile.base_url.clone(),
+        cause,
+    )
+    .await
+}
+
+async fn run_local_recovery_for_profile(
+    policy: &LocalRecoveryPolicy,
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+    client: Client,
+    base_url: String,
+    cause: LocalRecoveryCause,
+) -> BTreeMap<String, String> {
     let mut state = coordinator.state.lock().await;
     if state.running {
         drop(state);
@@ -8545,8 +8907,6 @@ async fn run_local_recovery(
 
     let task_policy = policy.clone();
     let task_coordinator = Arc::clone(coordinator);
-    let client = runtime.client.clone();
-    let base_url = runtime.upstream_profile.base_url.clone();
     tokio::spawn(async move {
         let mut metadata = BTreeMap::from([(
             String::from("local_recovery_trigger_cause"),
@@ -10602,6 +10962,7 @@ fn shielded_retry_observer(
         extra_response_metadata: input.extra_response_metadata,
         raw_payloads: input.raw_payloads,
         completed_attempt_records: input.completed_attempt_records,
+        stuck_watchdog_request: runtime.stuck_watchdog_request.clone(),
         final_attempt: input.final_attempt,
         retry_observation: Some(RetryObservation {
             policy: runtime.retry_policy.clone(),
@@ -10697,6 +11058,7 @@ struct ForwardedBodyObserver {
     extra_response_metadata: BTreeMap<String, String>,
     raw_payloads: RawPayloads,
     completed_attempt_records: Vec<AttemptRecord>,
+    stuck_watchdog_request: Option<StuckWatchdogRequest>,
     final_attempt: Option<FinalAttemptContext>,
     retry_observation: Option<RetryObservation>,
     attempt_progress: Option<ShieldedAttemptProgressHandle>,
@@ -10720,6 +11082,13 @@ impl ForwardedBodyObserver {
         let upstream_mode = final_attempt
             .as_ref()
             .map_or(self.upstream_mode, |attempt| attempt.upstream_mode);
+        if let Some(stuck_watchdog_request) = &self.stuck_watchdog_request {
+            let sse_body = final_attempt
+                .as_ref()
+                .map(|attempt| attempt.sse_body.as_ref())
+                .unwrap_or_default();
+            stuck_watchdog_request.record_response(response_body, sse_body);
+        }
         if let Some(final_attempt) = &mut final_attempt
             && final_attempt.response_body.is_empty()
         {

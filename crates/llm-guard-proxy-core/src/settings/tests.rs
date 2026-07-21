@@ -290,12 +290,7 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.upstream_stall.recovery_cooldown_ms, 300_000);
     assert_eq!(config.upstream_stall.recovery_budget_window_ms, 900_000);
     assert_eq!(config.upstream_stall.recovery_max_per_window, 2);
-    assert!(!config.upstream.local_recovery.enabled);
-    assert!(config.upstream.local_recovery.restart_command.is_empty());
-    assert_eq!(
-        config.upstream.local_recovery.readiness_endpoint,
-        "/v1/chat/completions"
-    );
+    assert_default_recovery_watchdog_and_restart_queue_configs(&config);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
     assert!(config.cloudflare.enabled);
     assert!(config.upstream_profiles.is_empty());
@@ -305,6 +300,25 @@ fn defaults_match_issue_contract() {
         assert!(config.workflows.is_empty());
     }
     assert_eq!(config.default_upstream_profile().name, "default");
+}
+
+fn assert_default_recovery_watchdog_and_restart_queue_configs(config: &AppConfig) {
+    assert!(!config.upstream.local_recovery.enabled);
+    assert!(config.upstream.local_recovery.restart_command.is_empty());
+    assert_eq!(
+        config.upstream.local_recovery.readiness_endpoint,
+        "/v1/chat/completions"
+    );
+    assert!(!config.upstream.stuck_watchdog.enabled);
+    assert_eq!(config.upstream.stuck_watchdog.detection_window_secs, 1_800);
+    assert_eq!(
+        config.upstream.stuck_watchdog.min_output_tokens_in_window,
+        1
+    );
+    assert_eq!(config.upstream.stuck_watchdog.check_interval_secs, 60);
+    assert!(!config.upstream.restart_queue.enabled);
+    assert_eq!(config.upstream.restart_queue.queue_deadline_secs, 1_800);
+    assert_eq!(config.upstream.restart_queue.restart_timeout_secs, 1_800);
 }
 
 #[test]

@@ -792,6 +792,8 @@ impl AppConfig {
             metadata: self.upstream.metadata.clone(),
             hot_restart: self.upstream.hot_restart.clone(),
             local_recovery: self.upstream.local_recovery.clone(),
+            stuck_watchdog: self.upstream.stuck_watchdog.clone(),
+            restart_queue: self.upstream.restart_queue.clone(),
             thinking: self.thinking.clone(),
             #[cfg(feature = "param-override")]
             param_override: ParamOverrideConfig::default(),
@@ -940,6 +942,8 @@ impl AppConfig {
         self.upstream.metadata = requested.upstream.metadata.clone();
         self.upstream.hot_restart = requested.upstream.hot_restart.clone();
         self.upstream.local_recovery = requested.upstream.local_recovery.clone();
+        self.upstream.stuck_watchdog = requested.upstream.stuck_watchdog.clone();
+        self.upstream.restart_queue = requested.upstream.restart_queue.clone();
         if self.upstream_profiles_topology_matches(requested) {
             self.apply_reloadable_upstream_profile_fields(requested);
         }
@@ -1053,6 +1057,8 @@ impl AppConfig {
             active.metadata = requested.metadata.clone();
             active.hot_restart = requested.hot_restart.clone();
             active.local_recovery = requested.local_recovery.clone();
+            active.stuck_watchdog = requested.stuck_watchdog.clone();
+            active.restart_queue = requested.restart_queue.clone();
             active.thinking = requested.thinking.clone();
             apply_reloadable_param_override(active, requested);
         }
@@ -1508,6 +1514,10 @@ pub struct UpstreamConfig {
     pub hot_restart: HotRestartConfig,
     /// Opt-in local restart and chat readiness recovery policy.
     pub local_recovery: LocalRecoveryConfig,
+    /// Opt-in proactive no-output watchdog policy.
+    pub stuck_watchdog: StuckWatchdogConfig,
+    /// Opt-in admission queue policy while local recovery is running.
+    pub restart_queue: RestartQueueConfig,
 }
 
 impl UpstreamConfig {
@@ -1527,7 +1537,11 @@ impl UpstreamConfig {
             chat_template_kwargs: "upstream.hot_restart.probe_chat_template_kwargs",
         })?;
         self.local_recovery
-            .validate(LocalRecoveryValidationFields::upstream())
+            .validate(LocalRecoveryValidationFields::upstream())?;
+        self.stuck_watchdog
+            .validate(StuckWatchdogValidationFields::upstream())?;
+        self.restart_queue
+            .validate(RestartQueueValidationFields::upstream())
     }
 
     /// Returns a display-safe upstream base URL.
@@ -1548,6 +1562,8 @@ impl Default for UpstreamConfig {
             metadata: MetadataConfig::default(),
             hot_restart: HotRestartConfig::default(),
             local_recovery: LocalRecoveryConfig::default(),
+            stuck_watchdog: StuckWatchdogConfig::default(),
+            restart_queue: RestartQueueConfig::default(),
         }
     }
 }
@@ -1741,6 +1757,130 @@ impl Default for LocalRecoveryConfig {
     }
 }
 
+/// Proactive no-output watchdog policy for one upstream service.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StuckWatchdogConfig {
+    /// Enables proactive restart when the upstream emits too little output.
+    pub enabled: bool,
+    /// Trailing interval whose output token count is evaluated.
+    pub detection_window_secs: u64,
+    /// Minimum output tokens required in the detection window.
+    pub min_output_tokens_in_window: u64,
+    /// Watchdog evaluation cadence.
+    pub check_interval_secs: u64,
+}
+
+impl StuckWatchdogConfig {
+    fn validate(&self, fields: StuckWatchdogValidationFields) -> Result<(), ValidationError> {
+        require(
+            self.detection_window_secs > 0,
+            fields.detection_window_secs,
+            "must be greater than zero",
+        )?;
+        require(
+            self.check_interval_secs > 0,
+            fields.check_interval_secs,
+            "must be greater than zero",
+        )?;
+        require(
+            self.check_interval_secs <= self.detection_window_secs,
+            fields.check_interval_secs,
+            "must be less than or equal to detection_window_secs",
+        )
+    }
+}
+
+impl Default for StuckWatchdogConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            detection_window_secs: 1_800,
+            min_output_tokens_in_window: 1,
+            check_interval_secs: 60,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct StuckWatchdogValidationFields {
+    detection_window_secs: &'static str,
+    check_interval_secs: &'static str,
+}
+
+impl StuckWatchdogValidationFields {
+    const fn upstream() -> Self {
+        Self {
+            detection_window_secs: "upstream.stuck_watchdog.detection_window_secs",
+            check_interval_secs: "upstream.stuck_watchdog.check_interval_secs",
+        }
+    }
+
+    const fn upstream_profile() -> Self {
+        Self {
+            detection_window_secs: "upstreams.stuck_watchdog.detection_window_secs",
+            check_interval_secs: "upstreams.stuck_watchdog.check_interval_secs",
+        }
+    }
+}
+
+/// Admission queue policy for downstream requests while local recovery is running.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RestartQueueConfig {
+    /// Enables transparent queuing while the upstream local recovery is active.
+    pub enabled: bool,
+    /// Maximum seconds one queued request may wait for readiness.
+    pub queue_deadline_secs: u64,
+    /// Maximum seconds to wait for a restart episode to become ready.
+    pub restart_timeout_secs: u64,
+}
+
+impl RestartQueueConfig {
+    fn validate(&self, fields: RestartQueueValidationFields) -> Result<(), ValidationError> {
+        require(
+            self.queue_deadline_secs > 0,
+            fields.queue_deadline_secs,
+            "must be greater than zero",
+        )?;
+        require(
+            self.restart_timeout_secs > 0,
+            fields.restart_timeout_secs,
+            "must be greater than zero",
+        )
+    }
+}
+
+impl Default for RestartQueueConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            queue_deadline_secs: 1_800,
+            restart_timeout_secs: 1_800,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RestartQueueValidationFields {
+    queue_deadline_secs: &'static str,
+    restart_timeout_secs: &'static str,
+}
+
+impl RestartQueueValidationFields {
+    const fn upstream() -> Self {
+        Self {
+            queue_deadline_secs: "upstream.restart_queue.queue_deadline_secs",
+            restart_timeout_secs: "upstream.restart_queue.restart_timeout_secs",
+        }
+    }
+
+    const fn upstream_profile() -> Self {
+        Self {
+            queue_deadline_secs: "upstreams.restart_queue.queue_deadline_secs",
+            restart_timeout_secs: "upstreams.restart_queue.restart_timeout_secs",
+        }
+    }
+}
+
 /// Readiness probe settings used while an upstream appears to be restarting.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HotRestartConfig {
@@ -1930,6 +2070,10 @@ pub struct UpstreamProfileConfig {
     pub hot_restart: HotRestartConfig,
     /// Opt-in local restart and chat readiness recovery policy.
     pub local_recovery: LocalRecoveryConfig,
+    /// Opt-in proactive no-output watchdog policy.
+    pub stuck_watchdog: StuckWatchdogConfig,
+    /// Opt-in admission queue policy while local recovery is running.
+    pub restart_queue: RestartQueueConfig,
     /// Thinking budget policy for this profile.
     pub thinking: ThinkingConfig,
     /// Inference parameter override policy for this profile.
@@ -2003,6 +2147,10 @@ impl UpstreamProfileConfig {
         })?;
         self.local_recovery
             .validate(LocalRecoveryValidationFields::upstream_profile())?;
+        self.stuck_watchdog
+            .validate(StuckWatchdogValidationFields::upstream_profile())?;
+        self.restart_queue
+            .validate(RestartQueueValidationFields::upstream_profile())?;
         self.thinking.validate("upstreams.thinking.max_tokens")?;
         #[cfg(feature = "param-override")]
         self.param_override.validate("upstreams.param_override")?;
@@ -2130,6 +2278,8 @@ impl Default for UpstreamProfileConfig {
             metadata: upstream.metadata,
             hot_restart: upstream.hot_restart,
             local_recovery: upstream.local_recovery,
+            stuck_watchdog: upstream.stuck_watchdog,
+            restart_queue: upstream.restart_queue,
             thinking: ThinkingConfig::default(),
             #[cfg(feature = "param-override")]
             param_override: ParamOverrideConfig::default(),

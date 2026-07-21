@@ -443,6 +443,7 @@ async fn serve_bound_listeners(
         shutdown_signal().await;
         let _ignored = shutdown_tx.send(true);
     });
+    let stuck_engine_watchdog = proxy::spawn_stuck_engine_watchdog(&state);
 
     let mut servers = JoinSet::new();
     for (listener_config, listener, _local_addr) in bound_listeners {
@@ -483,6 +484,8 @@ async fn serve_bound_listeners(
         state.begin_shutdown();
         while servers.join_next().await.is_some() {}
     }
+    state.begin_shutdown();
+    let _watchdog_result = stuck_engine_watchdog.await;
     state.flush_persistence().await;
     result
 }
