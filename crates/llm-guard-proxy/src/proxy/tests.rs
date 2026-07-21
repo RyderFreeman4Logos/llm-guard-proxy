@@ -595,7 +595,12 @@ async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
         second_started_rx
             .recv_timeout(Duration::from_millis(250))
             .is_err(),
-        "persistence work must be dropped rather than queued after the backlog is full"
+        "overflow persistence work must not execute while the backlog is saturated"
+    );
+    assert_eq!(
+        tasks.dropped_total(),
+        1,
+        "backlog saturation must increment the dropped_total metric counter"
     );
     release_tx
         .send(())

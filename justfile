@@ -4,6 +4,8 @@
 set shell := ["bash", "-c"]
 # IO scheduling: run cargo at idle priority to avoid starving interactive processes
 _io_prefix := "ionice -c 3 nice -n 19"
+# Cap libtest concurrency independently of Cargo build jobs (global cargo config).
+local_test_threads := env("LLM_GUARD_LOCAL_TEST_THREADS", "2")
 set tempdir := "."
 set dotenv-load := true
 
@@ -48,7 +50,7 @@ clippy-feature-matrix:
     {{_io_prefix}} cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features upstream-hot-restart -- -D warnings
 
 test:
-    {{_io_prefix}} cargo test --workspace --all-features
+    {{_io_prefix}} env RUST_TEST_THREADS={{local_test_threads}} cargo test --workspace --all-features
 
 smoke-gb10:
     scripts/smoke-gb10.sh

@@ -720,6 +720,7 @@ struct PersistenceTasks {
     capacity: Arc<Semaphore>,
     in_flight: AtomicUsize,
     idle: Notify,
+    dropped: AtomicU64,
     #[cfg(test)]
     panics: AtomicUsize,
     #[cfg(test)]
@@ -734,6 +735,7 @@ impl Default for PersistenceTasks {
             capacity: Arc::new(Semaphore::new(MAX_PERSISTENCE_TASKS)),
             in_flight: AtomicUsize::new(0),
             idle: Notify::new(),
+            dropped: AtomicU64::new(0),
             #[cfg(test)]
             panics: AtomicUsize::new(0),
             #[cfg(test)]
@@ -770,7 +772,16 @@ impl PersistenceTasks {
 
     fn spawn_blocking(self: &Arc<Self>, work: impl FnOnce() + Send + 'static) {
         let Ok(capacity_permit) = Arc::clone(&self.capacity).try_acquire_owned() else {
-            eprintln!("persistence backlog full, dropping record");
+            // Availability-first bound: refuse unbounded Tokio/blocking growth when SQLite
+            // lags. Count every drop so operators can alert; full-record durability under
+            // backlog saturation remains a best-effort path, not a silent void.
+            let dropped_total = self
+                .dropped
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            eprintln!(
+                "persistence backlog full, dropping record dropped_total={dropped_total} capacity={MAX_PERSISTENCE_TASKS}"
+            );
             return;
         };
         let guard = self.track();
@@ -794,6 +805,10 @@ impl PersistenceTasks {
             #[cfg(not(test))]
             Self::run(work);
         });
+    }
+
+    fn dropped_total(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1496,6 +1511,7 @@ async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
                     let admission = state.admission_metrics_snapshot();
                     let malformed_responses =
                         state.malformed_response_counter.load(Ordering::Relaxed);
+                    let persistence_dropped = state.persistence_tasks.dropped_total();
                     let upstream_failures = state.upstream_failure_counters.snapshot();
                     text_response(
                         StatusCode::OK,
@@ -1503,6 +1519,7 @@ async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
                             &snapshot,
                             &admission,
                             malformed_responses,
+                            persistence_dropped,
                             upstream_failures,
                         ),
                     )
@@ -1892,6 +1909,7 @@ fn render_metrics(
     snapshot: &ObservabilityMetricsSnapshot,
     admission: &AdmissionMetricsSnapshot,
     malformed_responses: u64,
+    persistence_dropped: u64,
     upstream_failures: UpstreamFailureSnapshot,
 ) -> String {
     let mut output = String::new();
@@ -1901,6 +1919,7 @@ fn render_metrics(
     push_attempt_metrics(&mut output, snapshot);
     push_retry_and_error_metrics(&mut output, snapshot);
     push_malformed_response_metrics(&mut output, malformed_responses);
+    push_persistence_drop_metrics(&mut output, persistence_dropped);
     push_upstream_failure_metrics(&mut output, upstream_failures);
     push_latency_metrics(&mut output, snapshot);
     push_heartbeat_metrics(&mut output, snapshot);
@@ -2083,6 +2102,21 @@ fn push_malformed_response_metrics(output: &mut String, malformed_responses: u64
         "llm_guard_proxy_malformed_response_total",
         &[("kind", "missing_choices")],
         malformed_responses,
+    );
+}
+
+fn push_persistence_drop_metrics(output: &mut String, persistence_dropped: u64) {
+    push_metric_header(
+        output,
+        "llm_guard_proxy_persistence_dropped_total",
+        "Observability/evidence persistence closures dropped because the bounded backlog was full.",
+        "counter",
+    );
+    push_metric_line(
+        output,
+        "llm_guard_proxy_persistence_dropped_total",
+        &[],
+        persistence_dropped,
     );
 }
 
