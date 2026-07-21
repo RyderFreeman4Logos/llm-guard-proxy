@@ -9,7 +9,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -147,6 +147,7 @@ pub(crate) struct ProxyState {
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
     live_registry: Arc<LiveRequestRegistry>,
+    persistence_tasks: Arc<PersistenceTasks>,
     #[cfg(test)]
     shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
@@ -276,6 +277,16 @@ impl ProxyState {
             malformed_response_counter: Arc::new(AtomicU64::new(0)),
             upstream_failure_counters: Arc::new(UpstreamFailureCounters::default()),
             live_registry: Arc::new(LiveRequestRegistry::new()),
+            persistence_tasks: {
+                #[cfg(test)]
+                {
+                    Arc::new(PersistenceTasks::synchronous_for_tests())
+                }
+                #[cfg(not(test))]
+                {
+                    Arc::new(PersistenceTasks::default())
+                }
+            },
             #[cfg(test)]
             shielded_heartbeat_ticks: Arc::new(AtomicU64::new(0)),
         }
@@ -287,6 +298,10 @@ impl ProxyState {
         let mut state = self.clone();
         state.listener = listener;
         state
+    }
+
+    pub(crate) async fn flush_persistence(&self) {
+        self.persistence_tasks.flush().await;
     }
 
     #[cfg(test)]
@@ -683,6 +698,92 @@ fn current_shutdown_drain_timeout(config: &ConfigHandle) -> Duration {
 }
 
 #[derive(Debug, Default)]
+struct PersistenceTasks {
+    in_flight: AtomicUsize,
+    idle: Notify,
+    #[cfg(test)]
+    panics: AtomicUsize,
+    #[cfg(test)]
+    synchronous_for_tests: bool,
+}
+
+impl PersistenceTasks {
+    #[cfg(test)]
+    fn synchronous_for_tests() -> Self {
+        Self {
+            synchronous_for_tests: true,
+            ..Self::default()
+        }
+    }
+
+    fn track(self: &Arc<Self>) -> PersistenceTaskGuard {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        PersistenceTaskGuard {
+            tasks: Arc::clone(self),
+        }
+    }
+
+    fn spawn_blocking(self: &Arc<Self>, work: impl FnOnce() + Send + 'static) {
+        let guard = self.track();
+        #[cfg(test)]
+        if self.synchronous_for_tests {
+            let _guard = guard;
+            self.run(work);
+            return;
+        }
+
+        #[cfg(test)]
+        let tasks = Arc::clone(self);
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            #[cfg(test)]
+            {
+                tasks.run(work);
+            }
+            #[cfg(not(test))]
+            Self::run(work);
+        });
+    }
+
+    #[cfg(test)]
+    fn run(&self, work: impl FnOnce()) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+            eprintln!("persistence task panicked");
+            self.panics.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(not(test))]
+    fn run(work: impl FnOnce()) {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
+            eprintln!("persistence task panicked");
+        }
+    }
+
+    async fn flush(&self) {
+        loop {
+            let notified = self.idle.notified();
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+struct PersistenceTaskGuard {
+    tasks: Arc<PersistenceTasks>,
+}
+
+impl Drop for PersistenceTaskGuard {
+    fn drop(&mut self) {
+        if self.tasks.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.tasks.idle.notify_waiters();
+        }
+    }
+}
+
+#[derive(Debug, Default)]
 struct InFlightLimiter {
     counts: Mutex<AdmissionCounts>,
     notify: Notify,
@@ -820,6 +921,7 @@ impl GenerationAdmission {
 #[derive(Clone, Debug)]
 struct AdmissionRecordContext {
     store: ObservabilityStore,
+    persistence_tasks: Arc<PersistenceTasks>,
     request_id: RequestId,
     started_at_unix_ms: u64,
     request_metadata: BTreeMap<String, String>,
@@ -2182,6 +2284,7 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
         );
         add_listener_metadata(&mut request_metadata, &state.listener);
         record_failed_request(
+            &state.persistence_tasks,
             &state.store,
             FailedRequestRecord {
                 request_id: request_id.clone(),
@@ -2251,6 +2354,7 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
                 BTreeMap::from([(String::from("proxy_error"), error_type.to_owned())])
             });
             record_failed_request(
+                &state.persistence_tasks,
                 &state.store,
                 FailedRequestRecord {
                     request_id: request_id.clone(),
@@ -2329,6 +2433,7 @@ async fn admit_request(
             let response =
                 proxy_error_response(StatusCode::INTERNAL_SERVER_ERROR, error_type, &error_reason);
             record_failed_request(
+                &state.persistence_tasks,
                 &state.store,
                 FailedRequestRecord {
                     request_id: request_id.clone(),
@@ -2456,6 +2561,7 @@ fn reject_admission(
         error.retry_after(),
     );
     record_failed_request(
+        &state.persistence_tasks,
         &state.store,
         FailedRequestRecord {
             request_id: request_id.clone(),
@@ -2489,6 +2595,7 @@ fn admission_record_context(
     add_listener_metadata(&mut request_metadata, &state.listener);
     AdmissionRecordContext {
         store: state.store.clone(),
+        persistence_tasks: Arc::clone(&state.persistence_tasks),
         request_id: request_id.clone(),
         started_at_unix_ms,
         request_metadata,
@@ -2735,6 +2842,7 @@ async fn forward_openai_request(
                 config: state.config.clone(),
                 store: state.store.clone(),
                 evidence_store: state.evidence_store.clone(),
+                persistence_tasks: Arc::clone(&state.persistence_tasks),
                 request_id: request_id.clone(),
                 started_at_unix_ms,
                 model_id: prepared_request.model_id,
@@ -2896,6 +3004,7 @@ async fn read_body_and_admit_generation(
     }
     let record_context = AdmissionRecordContext {
         store: state.store.clone(),
+        persistence_tasks: Arc::clone(&state.persistence_tasks),
         request_id: request.request_id.clone(),
         started_at_unix_ms: request.started_at_unix_ms,
         request_metadata: body_read_request_metadata.clone(),
@@ -3697,7 +3806,10 @@ fn record_workflow_alias_success(
         ),
         raw_payloads: RawPayloads::default(),
     };
-    record_observability_many(&state.store, &request_record, &[]);
+    let store = state.store.clone();
+    state
+        .persistence_tasks
+        .spawn_blocking(move || record_observability_many(&store, &request_record, &[]));
 }
 
 #[cfg(feature = "guard")]
@@ -4378,6 +4490,7 @@ fn generic_forwarded_response(
         config: context.state.config.clone(),
         store: context.state.store.clone(),
         evidence_store: context.state.evidence_store.clone(),
+        persistence_tasks: Arc::clone(&context.state.persistence_tasks),
         request_id: context.request_id.clone(),
         started_at_unix_ms: context.started_at_unix_ms,
         attempt_id: sent_upstream_response.attempt_id,
@@ -4519,6 +4632,7 @@ async fn forward_merged_models_response(
         config: context.state.config.clone(),
         store: context.state.store.clone(),
         evidence_store: context.state.evidence_store.clone(),
+        persistence_tasks: Arc::clone(&context.state.persistence_tasks),
         request_id: context.request_id.clone(),
         started_at_unix_ms: context.started_at_unix_ms,
         attempt_id: AttemptId::for_request(context.request_id, 1),
@@ -6361,6 +6475,7 @@ struct ForwardedResponseParts {
     config: ConfigHandle,
     store: ObservabilityStore,
     evidence_store: EvidenceStore,
+    persistence_tasks: Arc<PersistenceTasks>,
     request_id: RequestId,
     started_at_unix_ms: u64,
     attempt_id: AttemptId,
@@ -6422,6 +6537,7 @@ impl ForwardedResponseParts {
             downstream_mode,
             store: self.store,
             evidence_store: self.evidence_store,
+            persistence_tasks: self.persistence_tasks,
             shadow_evidence: ShadowEvidenceState::default(),
             paired_shadow_runtime: None,
             request_id: self.request_id,
@@ -6599,6 +6715,7 @@ struct ShieldedRetryRuntime {
     config: ConfigHandle,
     store: ObservabilityStore,
     evidence_store: EvidenceStore,
+    persistence_tasks: Arc<PersistenceTasks>,
     request_id: RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
@@ -10060,6 +10177,7 @@ fn shielded_retry_observer(
         config: runtime.config.clone(),
         store: runtime.store.clone(),
         evidence_store: runtime.evidence_store.clone(),
+        persistence_tasks: Arc::clone(&runtime.persistence_tasks),
         shadow_evidence: runtime.shadow_evidence.clone(),
         paired_shadow_runtime: Some(runtime.clone()),
         request_id: runtime.request_id.clone(),
@@ -10154,6 +10272,7 @@ struct ForwardedBodyObserver {
     config: ConfigHandle,
     store: ObservabilityStore,
     evidence_store: EvidenceStore,
+    persistence_tasks: Arc<PersistenceTasks>,
     shadow_evidence: ShadowEvidenceState,
     paired_shadow_runtime: Option<ShieldedRetryRuntime>,
     request_id: RequestId,
@@ -10185,7 +10304,7 @@ impl ForwardedBodyObserver {
         ) && let Some(progress) = &self.attempt_progress
         {
             let progress = shielded_attempt_progress(progress);
-            attempts = progress.completed_attempt_records.clone();
+            attempts.clone_from(&progress.completed_attempt_records);
             final_attempt.clone_from(&progress.current_attempt);
         }
         let upstream_mode = final_attempt
@@ -10239,25 +10358,32 @@ impl ForwardedBodyObserver {
             response_metadata,
             raw_payloads: self.raw_payloads,
         };
-        record_observability_many(&self.store, &request_record, &attempts);
-        let evidence_written = record_evidence_many(
-            EvidenceRecordContext {
-                config: &self.config,
-                store: &self.evidence_store,
-                shadow_evidence: &self.shadow_evidence,
-            },
-            &request_record,
-            &attempts,
-        );
-        log_request_cleanup(
-            &request_record,
-            completion.terminal_reason(),
-            unix_time_millis().saturating_sub(finished_at_unix_ms),
-            evidence_written,
-        );
-        if evidence_written && let Some(runtime) = paired_shadow_runtime.as_ref() {
-            maybe_schedule_paired_comparison_after_primary(runtime, &request_record, &attempts);
-        }
+        let store = self.store.clone();
+        let evidence_store = self.evidence_store.clone();
+        let config = self.config.clone();
+        let shadow_evidence = self.shadow_evidence.clone();
+        let terminal_reason: &'static str = completion.terminal_reason();
+        self.persistence_tasks.spawn_blocking(move || {
+            record_observability_many(&store, &request_record, &attempts);
+            let evidence_written = record_evidence_many(
+                EvidenceRecordContext {
+                    config: &config,
+                    store: &evidence_store,
+                    shadow_evidence: &shadow_evidence,
+                },
+                &request_record,
+                &attempts,
+            );
+            log_request_cleanup(
+                &request_record,
+                terminal_reason,
+                unix_time_millis().saturating_sub(finished_at_unix_ms),
+                evidence_written,
+            );
+            if evidence_written && let Some(runtime) = paired_shadow_runtime.as_ref() {
+                maybe_schedule_paired_comparison_after_primary(runtime, &request_record, &attempts);
+            }
+        });
     }
 }
 
@@ -12037,53 +12163,63 @@ fn record_queued_admission_cancel(record: QueuedAdmissionCancelRecord) {
         response_metadata,
         raw_payloads: RawPayloads::default(),
     };
-    record_observability_many(&context.store, &request_record, &[]);
-    log_request_cleanup(
-        &request_record,
-        failed_request_terminal_reason(
-            request_record.status,
-            request_record.abort_reason.as_deref(),
-        ),
-        unix_time_millis().saturating_sub(finished_at_unix_ms),
-        false,
-    );
+    let persistence_tasks = Arc::clone(&context.persistence_tasks);
+    persistence_tasks.spawn_blocking(move || {
+        record_observability_many(&context.store, &request_record, &[]);
+        log_request_cleanup(
+            &request_record,
+            failed_request_terminal_reason(
+                request_record.status,
+                request_record.abort_reason.as_deref(),
+            ),
+            unix_time_millis().saturating_sub(finished_at_unix_ms),
+            false,
+        );
+    });
 }
 
-fn record_failed_request(store: &ObservabilityStore, failure: FailedRequestRecord) {
-    let mut response_metadata = failed_response_metadata(
-        failure.started_at_unix_ms,
-        failure.finished_at_unix_ms,
-        failure.error_type,
-    );
-    if let Some(attempt) = failure.attempts.last() {
-        copy_loop_response_metadata(&attempt.response_metadata, &mut response_metadata);
-    }
-    let request_record = RequestRecord {
-        request_id: failure.request_id,
-        started_at_unix_ms: failure.started_at_unix_ms,
-        finished_at_unix_ms: Some(failure.finished_at_unix_ms),
-        downstream_mode: DownstreamMode::NonStreamJson,
-        upstream_mode: UpstreamMode::NotApplicable,
-        model_id: None,
-        input_fingerprint: None,
-        status: failure.status,
-        http_status: Some(failure.http_status),
-        error_reason: Some(format!("{}: {}", failure.error_type, failure.error_reason)),
-        abort_reason: failure.abort_reason.map(str::to_owned),
-        request_metadata: failure.request_metadata,
-        response_metadata,
-        raw_payloads: RawPayloads::default(),
-    };
-    record_observability_many(store, &request_record, &failure.attempts);
-    log_request_cleanup(
-        &request_record,
-        failed_request_terminal_reason(
-            request_record.status,
-            request_record.abort_reason.as_deref(),
-        ),
-        unix_time_millis().saturating_sub(failure.finished_at_unix_ms),
-        false,
-    );
+fn record_failed_request(
+    persistence_tasks: &Arc<PersistenceTasks>,
+    store: &ObservabilityStore,
+    failure: FailedRequestRecord,
+) {
+    let store = store.clone();
+    persistence_tasks.spawn_blocking(move || {
+        let mut response_metadata = failed_response_metadata(
+            failure.started_at_unix_ms,
+            failure.finished_at_unix_ms,
+            failure.error_type,
+        );
+        if let Some(attempt) = failure.attempts.last() {
+            copy_loop_response_metadata(&attempt.response_metadata, &mut response_metadata);
+        }
+        let request_record = RequestRecord {
+            request_id: failure.request_id,
+            started_at_unix_ms: failure.started_at_unix_ms,
+            finished_at_unix_ms: Some(failure.finished_at_unix_ms),
+            downstream_mode: DownstreamMode::NonStreamJson,
+            upstream_mode: UpstreamMode::NotApplicable,
+            model_id: None,
+            input_fingerprint: None,
+            status: failure.status,
+            http_status: Some(failure.http_status),
+            error_reason: Some(format!("{}: {}", failure.error_type, failure.error_reason)),
+            abort_reason: failure.abort_reason.map(str::to_owned),
+            request_metadata: failure.request_metadata,
+            response_metadata,
+            raw_payloads: RawPayloads::default(),
+        };
+        record_observability_many(&store, &request_record, &failure.attempts);
+        log_request_cleanup(
+            &request_record,
+            failed_request_terminal_reason(
+                request_record.status,
+                request_record.abort_reason.as_deref(),
+            ),
+            unix_time_millis().saturating_sub(failure.finished_at_unix_ms),
+            false,
+        );
+    });
 }
 
 fn failed_request_terminal_reason(
@@ -12480,6 +12616,7 @@ fn schedule_shadow_attempt(
         upstream_body: plan.upstream_body,
         upstream_timeout: runtime.upstream_timeout,
         evidence_store: runtime.evidence_store.clone(),
+        persistence_tasks: Arc::clone(&runtime.persistence_tasks),
         shadow_evidence: runtime.shadow_evidence.clone(),
         shutdown: Arc::clone(&runtime.shutdown),
         request_id: runtime.request_id.clone(),
@@ -12494,12 +12631,17 @@ fn schedule_shadow_attempt(
         comparison_attempt: plan.comparison_attempt,
         _permit: permit,
     };
+    let task_guard = runtime.persistence_tasks.track();
     tokio::spawn(async move {
+        let _task_guard = task_guard;
         let record = run_shadow_continuation(task).await;
         record.shadow_evidence.push_record(record.attempt.clone());
-        match record.evidence_store.record_shadow_attempt(&record.attempt) {
-            Ok(EvidenceStoreWrite::Written | EvidenceStoreWrite::Disabled) | Err(_) => {}
-        }
+        let persistence_tasks = Arc::clone(&record.persistence_tasks);
+        persistence_tasks.spawn_blocking(move || {
+            match record.evidence_store.record_shadow_attempt(&record.attempt) {
+                Ok(EvidenceStoreWrite::Written | EvidenceStoreWrite::Disabled) | Err(_) => {}
+            }
+        });
     });
 }
 
@@ -12704,6 +12846,7 @@ struct ShadowContinuationTask {
     upstream_body: Bytes,
     upstream_timeout: Duration,
     evidence_store: EvidenceStore,
+    persistence_tasks: Arc<PersistenceTasks>,
     shadow_evidence: ShadowEvidenceState,
     shutdown: Arc<ShutdownGate>,
     request_id: RequestId,
@@ -12721,12 +12864,14 @@ struct ShadowContinuationTask {
 
 struct ShadowContinuationRecord {
     evidence_store: EvidenceStore,
+    persistence_tasks: Arc<PersistenceTasks>,
     shadow_evidence: ShadowEvidenceState,
     attempt: EvidenceAttemptRecord,
 }
 
 async fn run_shadow_continuation(task: ShadowContinuationTask) -> ShadowContinuationRecord {
     let evidence_store = task.evidence_store.clone();
+    let persistence_tasks = Arc::clone(&task.persistence_tasks);
     let shadow_evidence = task.shadow_evidence.clone();
     let started_at_unix_ms = unix_time_millis();
     let timeout_ms = task.shadow_attempt_timeout_ms;
@@ -12775,6 +12920,7 @@ async fn run_shadow_continuation(task: ShadowContinuationTask) -> ShadowContinua
     };
     ShadowContinuationRecord {
         evidence_store,
+        persistence_tasks,
         shadow_evidence,
         attempt,
     }

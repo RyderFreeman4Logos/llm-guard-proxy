@@ -554,6 +554,18 @@ fn admin_token_matcher_accepts_only_exact_values() {
     assert!(!admin_token_matches("", "admin-token"));
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn persistence_tasks_contain_spawn_blocking_panics() {
+    let tasks = Arc::new(PersistenceTasks::default());
+
+    tasks.spawn_blocking(|| panic!("simulated persistence store teardown failure"));
+
+    timeout(STREAM_COMPLETION_TIMEOUT, tasks.flush())
+        .await
+        .expect("panic-safe persistence task should finish");
+    assert_eq!(tasks.panics.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn request_cleanup_log_line_is_bounded_and_payload_free() {
     let mut request_metadata = BTreeMap::new();
@@ -16469,6 +16481,7 @@ async fn invalid_upstream_url_failure_writes_metadata_without_secret() {
         .expect("invalid upstream URL should carry request metadata");
 
     record_failed_request(
+        &proxy.state.persistence_tasks,
         &proxy.store,
         FailedRequestRecord {
             request_id,

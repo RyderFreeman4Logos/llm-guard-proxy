@@ -356,15 +356,22 @@ async fn serve_bound_listeners(
         });
     }
 
-    while let Some(result) = servers.join_next().await {
+    let result = loop {
+        let Some(result) = servers.join_next().await else {
+            break Ok(());
+        };
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(error)) => return Err(format!("server failed: {error}")),
-            Err(error) => return Err(format!("server task failed: {error}")),
+            Ok(Err(error)) => break Err(format!("server failed: {error}")),
+            Err(error) => break Err(format!("server task failed: {error}")),
         }
+    };
+    if result.is_err() {
+        servers.abort_all();
+        while servers.join_next().await.is_some() {}
     }
-
-    Ok(())
+    state.flush_persistence().await;
+    result
 }
 
 fn render_listening(
