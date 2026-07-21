@@ -809,7 +809,9 @@ async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
         .expect("hung backlog-drop parent test should start");
     let process_group_id = child.id().expect("hung backlog-drop parent child pid");
 
-    let status = match timeout(Duration::from_secs(35), child.wait()).await {
+    // The nested child has a 30-second deadline; leave startup scheduling headroom
+    // when the full suite is running concurrently.
+    let status = match timeout(Duration::from_secs(60), child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             let (termination, reaped) =
