@@ -610,6 +610,79 @@ async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
         .expect("retained persistence task should drain");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
+    const CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_CHILD";
+    const TEST_NAME: &str =
+        "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
+    const OVERFLOW_BURST: usize = 128;
+
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("test binary path should be available"),
+        )
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .env(CHILD_ENV, "1")
+        .output()
+        .expect("backlog-drop child test should run");
+        assert!(
+            output.status.success(),
+            "backlog-drop child test failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
+            "backlog-drop child test must run exactly one test: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let log_emissions = stderr
+            .matches("persistence backlog full, dropping record")
+            .count();
+        assert!(
+            log_emissions <= 1,
+            "a saturated overflow burst must emit at most one backlog-drop log, emitted {log_emissions}"
+        );
+        assert!(
+            stderr.contains("dropped_since_last_log=1"),
+            "the first aggregated backlog-drop log must report its dropped delta: {stderr}"
+        );
+        return;
+    }
+
+    let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    tasks.spawn_blocking(move || {
+        first_started_tx
+            .send(())
+            .expect("first persistence task receiver should remain open");
+        release_rx
+            .recv()
+            .expect("first persistence task should be released");
+    });
+    first_started_rx
+        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
+        .expect("first persistence task should start");
+
+    for _ in 0..OVERFLOW_BURST {
+        tasks.spawn_blocking(|| {});
+    }
+    assert_eq!(
+        tasks.dropped_total(),
+        OVERFLOW_BURST as u64,
+        "every saturated overflow must remain visible in the dropped counter"
+    );
+
+    release_tx
+        .send(())
+        .expect("first persistence task should still be waiting");
+    timeout(STREAM_COMPLETION_TIMEOUT, tasks.flush())
+        .await
+        .expect("retained persistence task should drain");
+}
+
 #[tokio::test]
 async fn error_shutdown_signals_persistence_tracked_shadow_work_before_flushing() {
     let fake = FakeUpstream::spawn().await;
@@ -6195,7 +6268,9 @@ async fn upstream_stall_recovery_public_path_returns_term_resistant_leader_clean
             leader_pid_path.display().to_string(),
             ready_path.display().to_string(),
         ],
-        recovery_timeout: Duration::from_millis(1),
+        // The public waiter must observe a real leader before the timeout path
+        // tears it down; cleanup behavior is independent of a one-millisecond race.
+        recovery_timeout: Duration::from_secs(1),
         recovery_cooldown: Duration::from_millis(1),
         recovery_budget_window: Duration::from_secs(60),
         recovery_max_per_window: 2,

@@ -117,6 +117,8 @@ const REQUEST_DEADLINE_ABORT_REASON: &str = "request_deadline_exhausted";
 const REQUEST_DEADLINE_ERROR_TYPE: &str = "llm_guard_request_deadline_exhausted";
 const FINAL_DIRECT_RELAY_TERMINATED_ABORT_REASON: &str = "final_direct_relay_terminated";
 const MAX_PERSISTENCE_TASKS: usize = 64;
+const PERSISTENCE_BACKLOG_DROP_LOG_INTERVAL_MS: u64 = 10_000;
+const PERSISTENCE_BACKLOG_DROP_LOG_NEVER_EMITTED: u64 = u64::MAX;
 #[cfg(feature = "guard")]
 const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
 
@@ -716,11 +718,60 @@ struct PersistenceFlushWaitHook {
 }
 
 #[derive(Debug)]
+struct PersistenceBacklogDropLog {
+    started_at: Instant,
+    last_emitted_at_ms: AtomicU64,
+    last_emitted_total: AtomicU64,
+}
+
+impl Default for PersistenceBacklogDropLog {
+    fn default() -> Self {
+        Self {
+            started_at: Instant::now(),
+            last_emitted_at_ms: AtomicU64::new(PERSISTENCE_BACKLOG_DROP_LOG_NEVER_EMITTED),
+            last_emitted_total: AtomicU64::new(0),
+        }
+    }
+}
+
+impl PersistenceBacklogDropLog {
+    fn take_report(&self, dropped_total: u64) -> Option<u64> {
+        let elapsed_ms = u64::try_from(self.started_at.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let interval_ms = PERSISTENCE_BACKLOG_DROP_LOG_INTERVAL_MS;
+
+        loop {
+            let last_emitted_at_ms = self.last_emitted_at_ms.load(Ordering::Relaxed);
+            if last_emitted_at_ms != PERSISTENCE_BACKLOG_DROP_LOG_NEVER_EMITTED
+                && elapsed_ms.saturating_sub(last_emitted_at_ms) < interval_ms
+            {
+                return None;
+            }
+            if self
+                .last_emitted_at_ms
+                .compare_exchange_weak(
+                    last_emitted_at_ms,
+                    elapsed_ms,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                let previous_total = self
+                    .last_emitted_total
+                    .swap(dropped_total, Ordering::Relaxed);
+                return Some(dropped_total.saturating_sub(previous_total));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 struct PersistenceTasks {
     capacity: Arc<Semaphore>,
     in_flight: AtomicUsize,
     idle: Notify,
     dropped: AtomicU64,
+    backlog_drop_log: PersistenceBacklogDropLog,
     #[cfg(test)]
     panics: AtomicUsize,
     #[cfg(test)]
@@ -736,6 +787,7 @@ impl Default for PersistenceTasks {
             in_flight: AtomicUsize::new(0),
             idle: Notify::new(),
             dropped: AtomicU64::new(0),
+            backlog_drop_log: PersistenceBacklogDropLog::default(),
             #[cfg(test)]
             panics: AtomicUsize::new(0),
             #[cfg(test)]
@@ -779,9 +831,11 @@ impl PersistenceTasks {
                 .dropped
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1);
-            eprintln!(
-                "persistence backlog full, dropping record dropped_total={dropped_total} capacity={MAX_PERSISTENCE_TASKS}"
-            );
+            if let Some(dropped_since_last_log) = self.backlog_drop_log.take_report(dropped_total) {
+                eprintln!(
+                    "persistence backlog full, dropping record dropped_total={dropped_total} dropped_since_last_log={dropped_since_last_log} capacity={MAX_PERSISTENCE_TASKS}"
+                );
+            }
             return;
         };
         let guard = self.track();
