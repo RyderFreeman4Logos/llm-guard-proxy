@@ -3417,7 +3417,10 @@ async fn wait_for_restart_queue_and_readmit(
     // Both provisional admission paths use capacity only to route/read the body.
     // A restart waiter must release that capacity before entering the dedicated queue.
     drop(in_flight_permit);
-    wait_for_profile_restart_queue(state, &profile, &mut body_read_request_metadata).await?;
+    let restart_queue_outcome =
+        wait_for_profile_restart_queue(state, &profile, &mut body_read_request_metadata).await?;
+    let restart_queue_metadata = restart_queue_outcome.request_metadata();
+    body_read_request_metadata.extend(restart_queue_metadata.clone());
     let record_context =
         body_admission_record_context(state, &request, &body_read_request_metadata);
     let admission = state
@@ -3425,6 +3428,7 @@ async fn wait_for_restart_queue_and_readmit(
         .await
         .map_err(|error| admission_proxy_error(error, body_read_request_metadata))?;
     let mut admission_metadata = request.admission_metadata;
+    admission_metadata.extend(restart_queue_metadata);
     admission_metadata.extend(acquired_admission_metadata(admission.queue_wait));
     Ok(OpenAiBodyAdmission {
         config: admission.config,
@@ -5850,6 +5854,9 @@ async fn finalize_endpoint_response(
             "heterogeneous reranker response rewrite failed: {error}"
         ))
     })?;
+    if let Some(lease) = attempt.stuck_watchdog_attempt.as_ref() {
+        let _ = lease.record_emitted_chunk(&body);
+    }
     Ok(EndpointResponse::Rewritten(RewrittenEndpointResponse {
         body,
         upstream_body_bytes,
@@ -7085,6 +7092,36 @@ enum RestartQueueWaitResult {
     TimedOut,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestartQueueOutcome {
+    NotRecovering,
+    ReleasedAfterRecovery,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RestartQueueWaitOutcome {
+    outcome: RestartQueueOutcome,
+    elapsed: Duration,
+}
+
+impl RestartQueueWaitOutcome {
+    fn request_metadata(self) -> BTreeMap<String, String> {
+        match self.outcome {
+            RestartQueueOutcome::NotRecovering => BTreeMap::new(),
+            RestartQueueOutcome::ReleasedAfterRecovery => BTreeMap::from([
+                (
+                    String::from("restart_queue_outcome"),
+                    String::from("released_after_recovery"),
+                ),
+                (
+                    String::from("restart_queue_wait_ms"),
+                    duration_millis_u64(self.elapsed).to_string(),
+                ),
+            ]),
+        }
+    }
+}
+
 async fn wait_for_restart_queue(
     coordinator: &UpstreamStallRecoveryCoordinator,
     queue_deadline: Duration,
@@ -7128,10 +7165,14 @@ async fn wait_for_profile_restart_queue(
     state: &ProxyState,
     profile: &UpstreamProfileConfig,
     request_metadata: &mut BTreeMap<String, String>,
-) -> Result<(), ProxyError> {
+) -> Result<RestartQueueWaitOutcome, ProxyError> {
+    let wait_started = Instant::now();
     let queue = &profile.restart_queue;
     if !queue.enabled {
-        return Ok(());
+        return Ok(RestartQueueWaitOutcome {
+            outcome: RestartQueueOutcome::NotRecovering,
+            elapsed: wait_started.elapsed(),
+        });
     }
 
     let queue_deadline = restart_queue_wait_deadline(queue);
@@ -7145,20 +7186,25 @@ async fn wait_for_profile_restart_queue(
     else {
         // This request atomically observed no recovery while registering, so it
         // must not wait for a later episode without a queue admission permit.
-        return Ok(());
+        return Ok(RestartQueueWaitOutcome {
+            outcome: RestartQueueOutcome::NotRecovering,
+            elapsed: wait_started.elapsed(),
+        });
     };
     match wait_for_restart_queue(&coordinator, queue_deadline).await {
-        RestartQueueWaitResult::NotRecovering => Ok(()),
+        RestartQueueWaitResult::NotRecovering => Ok(RestartQueueWaitOutcome {
+            outcome: RestartQueueOutcome::NotRecovering,
+            elapsed: wait_started.elapsed(),
+        }),
         RestartQueueWaitResult::Ready => {
-            request_metadata.insert(
-                String::from("restart_queue_outcome"),
-                String::from("released_after_recovery"),
-            );
             eprintln!(
                 "llm_guard_proxy_restart_queue profile={} event=released_after_recovery",
                 profile.name
             );
-            Ok(())
+            Ok(RestartQueueWaitOutcome {
+                outcome: RestartQueueOutcome::ReleasedAfterRecovery,
+                elapsed: wait_started.elapsed(),
+            })
         }
         result @ (RestartQueueWaitResult::Failed | RestartQueueWaitResult::TimedOut) => {
             let outcome = match result {

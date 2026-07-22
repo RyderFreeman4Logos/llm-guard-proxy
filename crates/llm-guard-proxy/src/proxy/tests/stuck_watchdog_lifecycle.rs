@@ -47,6 +47,45 @@ fn watchdog_recognizes_every_supported_chat_delta_progress_field() {
 }
 
 #[test]
+fn watchdog_maps_completions_and_records_text_progress() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let completions_uri: Uri = "/v1/completions".parse().expect("URI should parse");
+    let progress_unit = watchdog_progress_unit(&completions_uri);
+    let request = tracker.watch_request("completions", progress_unit, WATCHDOG_WINDOW);
+
+    assert_eq!(progress_unit, WatchdogProgressUnit::Completion);
+    assert!(
+        request.record_emitted_chunk(
+            b"data: {\"choices\":[{\"text\":\"healthy completion text\"}]}\n\n",
+        )
+    );
+    assert_eq!(
+        tracker.sample_count("completions"),
+        1,
+        "a completion text chunk must count as model progress"
+    );
+}
+
+#[test]
+fn watchdog_non_chat_sse_after_comment_records_later_result_event() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let request = tracker.watch_request(
+        "reranker-heartbeat",
+        WatchdogProgressUnit::Reranker,
+        WATCHDOG_WINDOW,
+    );
+
+    assert!(request.record_emitted_chunk(
+        b": ping\n\ndata: {\"results\":[{\"index\":0,\"relevance_score\":0.9}]}\n\n",
+    ));
+    assert_eq!(
+        tracker.sample_count("reranker-heartbeat"),
+        1,
+        "an SSE heartbeat must not prevent a later result event from counting as progress"
+    );
+}
+
+#[test]
 fn watchdog_request_snapshot_does_not_prune_shared_samples_after_reload() {
     let tracker = Arc::new(StuckWatchdogTokenTracker::default());
     let profile = "current-window";
@@ -210,6 +249,55 @@ async fn watchdog_lifecycle_does_not_restart_for_tool_call_only_sse() {
     assert!(
         !restarted,
         "tool-call-only model output is healthy and must not trigger recovery"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_lifecycle_records_progress_while_rewriting_a_heterogeneous_reranker_body() {
+    let upstream = SlowHeterogeneousRerankerUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("heterogeneous-reranker-progress");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let config = format!(
+        "{}\n\n[[profile]]\nmodel = \"same-model\"\nrequest_timeout_ms = 3000\n\n[[profile.upstream]]\nbase_url = \"{}\"\npriority = \"primary\"\nprotocol = \"deepinfra_qwen3_rerank\"\nmodel = \"Qwen/Qwen3-Reranker-8B\"\nmodel_revision = \"5fa94080caafeaa45a15d11f969d7978e087a3db\"\napi_key_env = \"PATH\"\n",
+        recovery_watchdog_config(&marker, 1, 1, 1),
+        upstream.base_url,
+    );
+    let proxy = spawn_watchdog_proxy(&upstream.base_url, &config).await;
+    let peer = proxy.state.stuck_watchdog_tokens.begin_request(
+        "same-model",
+        WatchdogProgressUnit::Reranker,
+        WATCHDOG_WINDOW,
+    );
+    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+    let client = proxy.client.clone();
+    let base_url = proxy.base_url.clone();
+    let request = tokio::spawn(async move {
+        client
+            .post(format!("{base_url}/v1/rerank"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(r#"{"model":"same-model","query":"rank this","documents":["document"]}"#)
+            .send()
+            .await
+            .expect("heterogeneous reranker request should complete")
+    });
+
+    sleep(Duration::from_millis(1_300)).await;
+    let restarted = marker.exists();
+    let response = request
+        .await
+        .expect("heterogeneous reranker request task should join");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _response_body = response
+        .text()
+        .await
+        .expect("rewritten reranker response body should drain");
+    drop(peer);
+    stop_watchdog(&proxy, watchdog).await;
+
+    assert!(
+        !restarted,
+        "a valid result read during heterogeneous reranker rewriting must count as watchdog progress"
     );
 }
 
@@ -382,6 +470,76 @@ async fn watchdog_lifecycle_never_waits_after_recovery_starts_without_a_queue_pe
         "a request that observed no recovery while registering must not wait for a later episode without a queue permit"
     );
     assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 0);
+}
+
+#[tokio::test]
+async fn restart_queue_recovery_success_metadata_persists_on_the_completed_request() {
+    let fake = FakeUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("restart-queue-success-metadata");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let proxy =
+        spawn_watchdog_proxy(&fake.base_url, &recovery_watchdog_config(&marker, 1, 1, 1)).await;
+    let coordinator = proxy.state.local_recovery.coordinator_for("default");
+    {
+        let mut recovery = coordinator.state.lock().await;
+        let now = Instant::now();
+        recovery.running = true;
+        recovery.recovery_started = Some(now);
+        recovery.recovery_deadline = Some(now + Duration::from_secs(2));
+    }
+
+    let client = proxy.client.clone();
+    let base_url = proxy.base_url.clone();
+    let request = tokio::spawn(async move {
+        client
+            .post(format!(
+                "{base_url}/v1/chat/completions?test=restart-queue-success-metadata"
+            ))
+            .header(CONTENT_TYPE, "application/json")
+            .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"queue me"}]}"#)
+            .send()
+            .await
+            .expect("queued proxy request should complete")
+    });
+    sleep(Duration::from_millis(40)).await;
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+
+    let response = request.await.expect("queued request task should join");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response
+        .text()
+        .await
+        .expect("response body should be readable");
+    proxy.state.flush_persistence().await;
+
+    let request_metadata_json: String = Connection::open(&proxy.sqlite_path)
+        .expect("sqlite should open")
+        .query_row(
+            "SELECT request_metadata_json FROM requests ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("completed request row should exist");
+    let request_metadata: serde_json::Value =
+        serde_json::from_str(&request_metadata_json).expect("request metadata should be json");
+    assert_eq!(
+        request_metadata["restart_queue_outcome"],
+        "released_after_recovery"
+    );
+    assert!(
+        request_metadata["restart_queue_wait_ms"]
+            .as_str()
+            .is_some_and(|elapsed| elapsed.parse::<u64>().is_ok_and(|elapsed| elapsed > 0)),
+        "successful restart-queue metadata must include elapsed wait time"
+    );
 }
 
 #[tokio::test]
@@ -642,6 +800,38 @@ async fn wait_for_watchdog_restart_metric(proxy: &ProxyFixture, wait: Duration) 
     .is_ok()
 }
 
+struct SlowHeterogeneousRerankerUpstream {
+    base_url: String,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl SlowHeterogeneousRerankerUpstream {
+    async fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("slow heterogeneous reranker upstream should bind");
+        let address = listener
+            .local_addr()
+            .expect("slow heterogeneous reranker upstream address should resolve");
+        let app = Router::new().fallback(slow_heterogeneous_reranker_handler);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("slow heterogeneous reranker upstream should serve");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            server,
+        }
+    }
+}
+
+impl Drop for SlowHeterogeneousRerankerUpstream {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
 struct BackpressureUpstream {
     base_url: String,
     chunks_pulled: Arc<AtomicU64>,
@@ -709,6 +899,31 @@ impl Drop for PendingSseUpstream {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+
+async fn slow_heterogeneous_reranker_handler() -> Response<Body> {
+    let body = Body::from_stream(stream::unfold(0_u8, |step| async move {
+        match step {
+            0 => Some((Ok::<Bytes, Infallible>(Bytes::from_static(b"{")), 1)),
+            1 => {
+                sleep(Duration::from_millis(600)).await;
+                Some((
+                    Ok::<Bytes, Infallible>(Bytes::from_static(
+                        br#""scores":[0.9],"input_tokens":1}"#,
+                    )),
+                    2,
+                ))
+            }
+            _ => None,
+        }
+    }));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/vnd.vllm.score+json"),
+    );
+    response
 }
 
 async fn backpressure_stream_handler(

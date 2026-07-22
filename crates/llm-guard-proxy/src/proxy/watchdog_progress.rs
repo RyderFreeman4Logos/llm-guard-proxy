@@ -6,12 +6,14 @@ const MAX_PENDING_PROGRESS_BYTES: usize = 64 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WatchdogProgressUnit {
     Chat,
+    Completion,
     Embedding,
     Reranker,
 }
 
 pub(super) fn watchdog_progress_unit(uri: &Uri) -> WatchdogProgressUnit {
     match uri.path() {
+        "/v1/completions" => WatchdogProgressUnit::Completion,
         "/v1/embeddings" => WatchdogProgressUnit::Embedding,
         "/v1/rerank" | "/v1/score" => WatchdogProgressUnit::Reranker,
         _ => WatchdogProgressUnit::Chat,
@@ -31,6 +33,9 @@ pub(super) fn emitted_progress(
 
     match progress_unit {
         WatchdogProgressUnit::Chat => complete_sse_progress(pending, sse_event_has_model_content),
+        WatchdogProgressUnit::Completion => {
+            complete_sse_progress(pending, sse_event_has_completion_text)
+        }
         WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
             complete_result_progress(progress_unit, pending)
         }
@@ -50,7 +55,7 @@ where
 }
 
 fn complete_result_progress(progress_unit: WatchdogProgressUnit, pending: &mut Vec<u8>) -> u64 {
-    if pending.starts_with(b"data:") {
+    if has_sse_framing(pending) {
         return complete_sse_progress(pending, |event| {
             result_event_has_progress(progress_unit, event)
         });
@@ -61,6 +66,14 @@ fn complete_result_progress(progress_unit: WatchdogProgressUnit, pending: &mut V
     };
     pending.clear();
     u64::from(result_event_has_progress(progress_unit, &event))
+}
+
+fn has_sse_framing(pending: &[u8]) -> bool {
+    pending.split(|byte| *byte == b'\n').any(|line| {
+        [b"data:".as_slice(), b"event:", b"id:", b"retry:", b":"]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+    })
 }
 
 fn sse_progress<F>(frame: &[u8], event_has_progress: &F) -> u64
@@ -101,7 +114,7 @@ fn result_event_has_progress(progress_unit: WatchdogProgressUnit, event: &Value)
                 .and_then(Value::as_array)
                 .is_some_and(|results| results.iter().any(reranker_result_has_content))
         }),
-        WatchdogProgressUnit::Chat => false,
+        WatchdogProgressUnit::Chat | WatchdogProgressUnit::Completion => false,
     }
 }
 
@@ -123,6 +136,20 @@ fn non_empty_json_value(value: &Value) -> bool {
         Value::String(value) => !value.is_empty(),
         _ => false,
     }
+}
+
+fn sse_event_has_completion_text(event: &Value) -> bool {
+    event
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| {
+            choices.iter().any(|choice| {
+                choice
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            })
+        })
 }
 
 fn sse_event_has_model_content(event: &Value) -> bool {
