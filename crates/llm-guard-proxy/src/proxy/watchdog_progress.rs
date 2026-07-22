@@ -31,37 +31,135 @@ pub(super) fn watchdog_progress_unit(uri: &Uri) -> Option<WatchdogProgressUnit> 
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WatchdogProgressState {
+    Progress(u64),
+    Incomplete,
+    UnobservableOversize,
+}
+
+#[derive(Debug)]
+pub(super) struct WatchdogProgressParser {
+    pending: Vec<u8>,
+    state: WatchdogProgressState,
+}
+
+impl Default for WatchdogProgressParser {
+    fn default() -> Self {
+        Self {
+            pending: Vec::new(),
+            state: WatchdogProgressState::Incomplete,
+        }
+    }
+}
+
 pub(super) fn emitted_progress(
     progress_unit: WatchdogProgressUnit,
-    pending: &mut Vec<u8>,
+    parser: &mut WatchdogProgressParser,
     chunk: &[u8],
-) -> u64 {
-    // Append first, then parse complete protocol units. The incomplete residual is
-    // the only buffer that may grow; its size is capped after draining complete frames.
-    pending.extend(chunk.iter().copied().filter(|byte| *byte != b'\r'));
+) -> WatchdogProgressState {
+    if parser.state == WatchdogProgressState::UnobservableOversize {
+        return parser.state;
+    }
+
+    let pending_cap = residual_cap(progress_unit, &parser.pending, chunk);
+    let retained_chunk_len = chunk.iter().filter(|byte| **byte != b'\r').count();
+    if retained_chunk_len > pending_cap.saturating_sub(parser.pending.len()) {
+        if parser.pending.is_empty()
+            && let Some(progress) = complete_progress_without_buffering(progress_unit, chunk)
+        {
+            parser.state = progress_state(progress);
+            return parser.state;
+        }
+        parser.state = WatchdogProgressState::UnobservableOversize;
+        return parser.state;
+    }
+
+    parser
+        .pending
+        .extend(chunk.iter().copied().filter(|byte| *byte != b'\r'));
     let progress = match progress_unit {
-        WatchdogProgressUnit::Chat => complete_sse_progress(pending, sse_event_has_model_content),
+        WatchdogProgressUnit::Chat => {
+            complete_sse_progress(&mut parser.pending, sse_event_has_model_content)
+        }
         WatchdogProgressUnit::Completion => {
-            complete_sse_progress(pending, sse_event_has_completion_text)
+            complete_sse_progress(&mut parser.pending, sse_event_has_completion_text)
         }
         WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
-            complete_result_progress(progress_unit, pending)
+            complete_result_progress(progress_unit, &mut parser.pending)
         }
     };
-    let residual_cap = match progress_unit {
+    let pending_cap = residual_cap(progress_unit, &parser.pending, &[]);
+    if parser.pending.len() > pending_cap {
+        parser.pending.truncate(pending_cap);
+        parser.state = WatchdogProgressState::UnobservableOversize;
+    } else {
+        parser.state = progress_state(progress);
+    }
+    parser.state
+}
+
+const fn progress_state(progress: u64) -> WatchdogProgressState {
+    if progress == 0 {
+        WatchdogProgressState::Incomplete
+    } else {
+        WatchdogProgressState::Progress(progress)
+    }
+}
+
+fn residual_cap(progress_unit: WatchdogProgressUnit, pending: &[u8], chunk: &[u8]) -> usize {
+    match progress_unit {
         WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker
-            if !has_sse_framing(pending) =>
+            if !has_sse_framing(pending) && !has_sse_framing(chunk) =>
         {
             MAX_PENDING_RESULT_DOCUMENT_BYTES
         }
         _ => MAX_PENDING_SSE_RESIDUAL_BYTES,
-    };
-    if pending.len() > residual_cap {
-        // Incomplete residual only: discarding an oversized residual avoids unbounded
-        // growth without dropping already-recognized complete progress frames.
-        pending.clear();
     }
-    progress
+}
+
+fn complete_progress_without_buffering(
+    progress_unit: WatchdogProgressUnit,
+    chunk: &[u8],
+) -> Option<u64> {
+    match progress_unit {
+        WatchdogProgressUnit::Chat => {
+            complete_sse_progress_without_buffering(chunk, sse_event_has_model_content)
+        }
+        WatchdogProgressUnit::Completion => {
+            complete_sse_progress_without_buffering(chunk, sse_event_has_completion_text)
+        }
+        WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker
+            if has_sse_framing(chunk) =>
+        {
+            complete_sse_progress_without_buffering(chunk, |event| {
+                result_event_has_progress(progress_unit, event)
+            })
+        }
+        WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
+            serde_json::from_slice::<Value>(chunk)
+                .ok()
+                .map(|event| u64::from(result_event_has_progress(progress_unit, &event)))
+        }
+    }
+}
+
+fn complete_sse_progress_without_buffering<F>(chunk: &[u8], event_has_progress: F) -> Option<u64>
+where
+    F: Fn(&Value) -> bool,
+{
+    if chunk.contains(&b'\r') {
+        return None;
+    }
+    let mut remaining = chunk;
+    let mut progress = 0_u64;
+    while let Some(frame_end) = remaining.windows(2).position(|window| window == b"\n\n") {
+        let frame_end = frame_end.saturating_add(2);
+        progress =
+            progress.saturating_add(sse_progress(&remaining[..frame_end], &event_has_progress));
+        remaining = &remaining[frame_end..];
+    }
+    remaining.is_empty().then_some(progress)
 }
 
 fn complete_sse_progress<F>(pending: &mut Vec<u8>, event_has_progress: F) -> u64

@@ -394,6 +394,93 @@ async fn watchdog_lifecycle_does_not_restart_for_large_complete_chat_progress() 
 }
 
 #[tokio::test]
+async fn watchdog_lifecycle_suspends_split_oversized_progress_for_every_protocol() {
+    for (name, unit, residual_cap) in [
+        ("chat", WatchdogProgressUnit::Chat, 64 * 1024),
+        ("completion", WatchdogProgressUnit::Completion, 64 * 1024),
+        (
+            "embedding",
+            WatchdogProgressUnit::Embedding,
+            8 * 1024 * 1024,
+        ),
+        ("reranker", WatchdogProgressUnit::Reranker, 8 * 1024 * 1024),
+    ] {
+        let fake = FakeUpstream::spawn().await;
+        let test_root = create_watchdog_test_root(&format!("split-oversized-{name}"));
+        let _cleanup = TestDirectoryCleanup::new(&test_root);
+        let marker = test_root.join("restart.marker");
+        let proxy =
+            spawn_watchdog_proxy(&fake.base_url, &touch_recovery_watchdog_config(&marker, 1)).await;
+        let request =
+            proxy
+                .state
+                .stuck_watchdog_tokens
+                .begin_request("default", unit, WATCHDOG_WINDOW);
+        let frame = split_oversized_progress_frame(unit, residual_cap);
+        assert!(
+            frame.len() > residual_cap,
+            "{name} fixture must split an incomplete valid progress unit over its residual cap"
+        );
+        request.record_emitted_chunk(&frame[..residual_cap]);
+        request.record_emitted_chunk(&frame[residual_cap..]);
+        let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+
+        sleep(Duration::from_millis(1_600)).await;
+        let restarted = marker.exists();
+
+        drop(request);
+        stop_watchdog(&proxy, watchdog).await;
+        assert!(
+            !restarted,
+            "a valid but oversized fragmented {name} progress unit must suspend watchdog observation instead of restarting the upstream"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn watchdog_lifecycle_ignores_disabled_restart_queue_timeout() {
+    let fake = FakeUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("disabled-queue-timeout");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let script = test_root.join("slow-restart.sh");
+    let marker = test_root.join("restart.marker");
+    fs::write(
+        &script,
+        "#!/bin/sh\nset -eu\nsleep 2\n/usr/bin/touch \"$1\"\n",
+    )
+    .expect("slow restart script should be written");
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700))
+        .expect("slow restart script should be executable");
+    let proxy = spawn_watchdog_proxy(
+        &fake.base_url,
+        &disabled_queue_slow_recovery_watchdog_config(&script, &marker),
+    )
+    .await;
+    let request = proxy.state.stuck_watchdog_tokens.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        WATCHDOG_WINDOW,
+    );
+    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+
+    let restart_completed = wait_for_path(&marker, Duration::from_secs(6)).await;
+    let recovery_succeeded =
+        wait_for_watchdog_recovery_success(&proxy, Duration::from_secs(2)).await;
+
+    drop(request);
+    stop_watchdog(&proxy, watchdog).await;
+    assert!(
+        restart_completed,
+        "disabled restart_queue timeout must not cancel a slower valid watchdog restart"
+    );
+    assert!(
+        recovery_succeeded,
+        "watchdog recovery that outlives a disabled queue timeout must publish success"
+    );
+}
+
+#[tokio::test]
 async fn watchdog_lifecycle_records_progress_while_rewriting_a_heterogeneous_reranker_body() {
     let upstream = SlowHeterogeneousRerankerUpstream::spawn().await;
     let test_root = create_watchdog_test_root("heterogeneous-reranker-progress");
@@ -1274,7 +1361,7 @@ async fn watchdog_recovery_preclosed_shutdown_does_not_spawn_restart_command() {
         recovery_tasks.spawn(run_watchdog_recovery(
             String::from("preclosed"),
             policy.clone(),
-            Duration::from_secs(1),
+            Some(Duration::from_secs(1)),
             Arc::clone(&coordinator),
             client.clone(),
             fake.base_url.clone(),
@@ -1359,6 +1446,26 @@ fn chat_delta_sse(delta: &serde_json::Value) -> Bytes {
             "finish_reason": null
         }]
     }))
+}
+
+fn split_oversized_progress_frame(unit: WatchdogProgressUnit, residual_cap: usize) -> Vec<u8> {
+    let payload = "x".repeat(residual_cap);
+    match unit {
+        WatchdogProgressUnit::Chat => {
+            format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{payload}\"}}}}]}}\n\n")
+                .into_bytes()
+        }
+        WatchdogProgressUnit::Completion => {
+            format!("data: {{\"choices\":[{{\"text\":\"{payload}\"}}]}}\n\n").into_bytes()
+        }
+        WatchdogProgressUnit::Embedding => {
+            format!("{{\"data\":[{{\"embedding\":[0.1],\"text\":\"{payload}\"}}]}}").into_bytes()
+        }
+        WatchdogProgressUnit::Reranker => format!(
+            "{{\"results\":[{{\"index\":0,\"relevance_score\":0.9,\"document\":\"{payload}\"}}]}}"
+        )
+        .into_bytes(),
+    }
 }
 
 fn create_watchdog_test_root(name: &str) -> PathBuf {
@@ -1457,6 +1564,40 @@ restart_timeout_secs = 1
     )
 }
 
+#[cfg(target_os = "linux")]
+fn disabled_queue_slow_recovery_watchdog_config(script: &Path, marker: &Path) -> String {
+    format!(
+        r#"
+[retry]
+enabled = false
+
+[upstream.stuck_watchdog]
+enabled = true
+detection_window_secs = 1
+min_output_progress_units_in_window = 1
+check_interval_secs = 1
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["{script}", "{marker}"]
+restart_timeout_ms = 3000
+readiness_request_timeout_ms = 200
+readiness_deadline_ms = 1000
+readiness_interval_ms = 25
+cooldown_ms = 5000
+budget_window_ms = 10000
+max_per_window = 10
+
+[upstream.restart_queue]
+enabled = false
+queue_deadline_secs = 1
+restart_timeout_secs = 1
+"#,
+        script = script.display(),
+        marker = marker.display(),
+    )
+}
+
 async fn stop_watchdog(proxy: &ProxyFixture, watchdog: tokio::task::JoinHandle<()>) {
     proxy.state.begin_shutdown();
     timeout(WATCHDOG_TASK_TIMEOUT, watchdog)
@@ -1507,6 +1648,22 @@ async fn wait_for_watchdog_restart_metric(proxy: &ProxyFixture, wait: Duration) 
     let coordinator = proxy.state.local_recovery.coordinator_for("default");
     timeout(wait, async {
         while coordinator.watchdog_restarts.load(Ordering::Relaxed) == 0 {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_watchdog_recovery_success(proxy: &ProxyFixture, wait: Duration) -> bool {
+    let coordinator = proxy.state.local_recovery.coordinator_for("default");
+    timeout(wait, async {
+        while coordinator
+            .watchdog_recovery_successes
+            .load(Ordering::Relaxed)
+            == 0
+        {
             sleep(Duration::from_millis(25)).await;
         }
     })

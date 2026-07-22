@@ -87,7 +87,10 @@ mod watchdog_progress;
 use upstream_failover::{
     EndpointSelectionConstraints, EndpointSelectionError, UpstreamHealthRegistry,
 };
-use watchdog_progress::{WatchdogProgressUnit, emitted_progress, watchdog_progress_unit};
+use watchdog_progress::{
+    WatchdogProgressParser, WatchdogProgressState, WatchdogProgressUnit, emitted_progress,
+    watchdog_progress_unit,
+};
 
 use buffered_adapter::{
     BufferedResponseAdapter, adapt_openai_request_if_needed,
@@ -6614,6 +6617,7 @@ struct StuckWatchdogAttempt {
     started_at: Instant,
     completed: Option<Instant>,
     observation_suspended: bool,
+    unobservable_progress: bool,
 }
 
 #[derive(Debug)]
@@ -6622,7 +6626,8 @@ struct StuckWatchdogRequestInner {
     profile: String,
     progress_unit: WatchdogProgressUnit,
     detection_window: Duration,
-    progress_buffer: Mutex<Vec<u8>>,
+    #[cfg(test)]
+    fallback_progress_parser: Mutex<WatchdogProgressParser>,
     upstream_progress_recorded: AtomicBool,
 }
 
@@ -6638,6 +6643,7 @@ struct StuckWatchdogRequest {
 struct StuckWatchdogAttemptLease {
     request: StuckWatchdogRequest,
     attempt_id: u64,
+    progress_parser: Arc<Mutex<WatchdogProgressParser>>,
     ended: bool,
 }
 
@@ -6647,6 +6653,7 @@ struct StuckWatchdogAttemptLease {
 struct StuckWatchdogAttemptProgress {
     request: StuckWatchdogRequest,
     attempt_id: u64,
+    progress_parser: Arc<Mutex<WatchdogProgressParser>>,
 }
 
 impl StuckWatchdogTokenTracker {
@@ -6675,7 +6682,8 @@ impl StuckWatchdogTokenTracker {
                 profile: profile.to_owned(),
                 progress_unit,
                 detection_window,
-                progress_buffer: Mutex::new(Vec::new()),
+                #[cfg(test)]
+                fallback_progress_parser: Mutex::new(WatchdogProgressParser::default()),
                 upstream_progress_recorded: AtomicBool::new(false),
             }),
         }
@@ -6818,11 +6826,13 @@ impl StuckWatchdogRequest {
                     started_at: Instant::now(),
                     completed: None,
                     observation_suspended: false,
+                    unobservable_progress: false,
                 },
             );
         StuckWatchdogAttemptLease {
             request: self.clone(),
             attempt_id,
+            progress_parser: Arc::new(Mutex::new(WatchdogProgressParser::default())),
             ended: false,
         }
     }
@@ -6843,31 +6853,47 @@ impl StuckWatchdogRequest {
         );
     }
 
-    fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
-        let progress = {
-            let mut pending = self
-                .inner
-                .progress_buffer
+    fn record_emitted_progress(
+        &self,
+        parser: &Mutex<WatchdogProgressParser>,
+        chunk: &[u8],
+    ) -> WatchdogProgressState {
+        let state = {
+            let mut parser = parser
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            emitted_progress(self.inner.progress_unit, &mut pending, chunk)
+            emitted_progress(self.inner.progress_unit, &mut parser, chunk)
         };
-        self.inner.tracker.record_progress(
-            &self.inner.profile,
-            self.inner.detection_window,
-            progress,
-        );
-        progress > 0
+        if let WatchdogProgressState::Progress(progress) = state {
+            self.inner.tracker.record_progress(
+                &self.inner.profile,
+                self.inner.detection_window,
+                progress,
+            );
+        }
+        state
     }
 
-    fn record_upstream_emitted_chunk(&self, chunk: &[u8]) -> bool {
-        if self.record_emitted_chunk(chunk) {
+    fn record_upstream_emitted_progress(
+        &self,
+        parser: &Mutex<WatchdogProgressParser>,
+        chunk: &[u8],
+    ) -> WatchdogProgressState {
+        let state = self.record_emitted_progress(parser, chunk);
+        if matches!(state, WatchdogProgressState::Progress(_)) {
             self.inner
                 .upstream_progress_recorded
                 .store(true, Ordering::Relaxed);
-            return true;
         }
-        false
+        state
+    }
+
+    #[cfg(test)]
+    fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
+        matches!(
+            self.record_emitted_progress(&self.inner.fallback_progress_parser, chunk),
+            WatchdogProgressState::Progress(_)
+        )
     }
 
     fn set_attempt_observation_suspended(&self, attempt_id: u64, suspended: bool) {
@@ -6883,12 +6909,27 @@ impl StuckWatchdogRequest {
         };
         if suspended {
             attempt.observation_suspended = true;
-        } else if attempt.observation_suspended {
+        } else if attempt.observation_suspended && !attempt.unobservable_progress {
             attempt.observation_suspended = false;
             // Restart maturity once downstream capacity makes upstream observation
             // possible again; samples from the hidden interval cannot prove liveness.
             attempt.started_at = Instant::now();
         }
+    }
+
+    fn set_attempt_unobservable_progress(&self, attempt_id: u64) {
+        let mut windows = match self.inner.tracker.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(attempt) = windows
+            .get_mut(&self.inner.profile)
+            .and_then(|window| window.attempts.get_mut(&attempt_id))
+        else {
+            return;
+        };
+        attempt.observation_suspended = true;
+        attempt.unobservable_progress = true;
     }
 }
 
@@ -6897,6 +6938,7 @@ impl StuckWatchdogAttemptLease {
         StuckWatchdogAttemptProgress {
             request: self.request.clone(),
             attempt_id: self.attempt_id,
+            progress_parser: Arc::clone(&self.progress_parser),
         }
     }
 
@@ -6905,12 +6947,19 @@ impl StuckWatchdogAttemptLease {
     }
 
     fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
-        self.request.record_upstream_emitted_chunk(chunk)
+        let state = self
+            .request
+            .record_upstream_emitted_progress(&self.progress_parser, chunk);
+        if matches!(state, WatchdogProgressState::UnobservableOversize) {
+            self.request
+                .set_attempt_unobservable_progress(self.attempt_id);
+        }
+        matches!(state, WatchdogProgressState::Progress(_))
     }
 
     #[cfg(test)]
     fn record_upstream_emitted_chunk(&self, chunk: &[u8]) {
-        self.request.record_upstream_emitted_chunk(chunk);
+        let _ = self.record_emitted_chunk(chunk);
     }
 
     fn end(mut self) {
@@ -6940,7 +6989,14 @@ impl StuckWatchdogAttemptLease {
 
 impl StuckWatchdogAttemptProgress {
     fn record_upstream_emitted_chunk(&self, chunk: &[u8]) -> bool {
-        self.request.record_upstream_emitted_chunk(chunk)
+        let state = self
+            .request
+            .record_upstream_emitted_progress(&self.progress_parser, chunk);
+        if matches!(state, WatchdogProgressState::UnobservableOversize) {
+            self.request
+                .set_attempt_unobservable_progress(self.attempt_id);
+        }
+        matches!(state, WatchdogProgressState::Progress(_))
     }
 
     fn suspend_observation(&self) {
@@ -7153,10 +7209,14 @@ async fn run_stuck_engine_watchdog(
                 .fetch_add(1, Ordering::Relaxed);
             let profile_name = profile.name.clone();
             recovering_profiles.insert(profile_name.clone());
+            let episode_timeout = profile
+                .restart_queue
+                .enabled
+                .then(|| Duration::from_secs(profile.restart_queue.restart_timeout_secs));
             let task = recovery_tasks.spawn(run_watchdog_recovery(
                 profile_name.clone(),
                 policy,
-                Duration::from_secs(profile.restart_queue.restart_timeout_secs),
+                episode_timeout,
                 coordinator,
                 client.clone(),
                 profile.primary_base_url().to_owned(),
@@ -7288,7 +7348,7 @@ async fn record_watchdog_recovery_task_failure(
 async fn run_watchdog_recovery(
     profile_name: String,
     policy: LocalRecoveryPolicy,
-    episode_timeout: Duration,
+    episode_timeout: Option<Duration>,
     coordinator: Arc<UpstreamStallRecoveryCoordinator>,
     client: Client,
     base_url: String,
@@ -7313,7 +7373,7 @@ async fn run_watchdog_recovery(
             client,
             base_url,
             watchdog_recovery_cause(),
-            Some(episode_timeout),
+            episode_timeout,
         )
         .await
     });
