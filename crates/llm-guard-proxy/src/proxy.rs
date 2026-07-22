@@ -650,10 +650,16 @@ impl ProxyState {
         // bytes are reserved against the server-global budget for the full
         // waiter lifetime so aggregate memory cannot exceed
         // max_restart_queue_body_bytes independently of profile count.
-        let recovery = coordinator.state.lock().await;
+        let mut recovery = coordinator.state.lock().await;
         if !recovery.running {
             return Ok(None);
         }
+        let Some(observed_recovery_episode_id) = recovery.ensure_active_recovery_episode() else {
+            return Err(ProxyError::upstream_unavailable(
+                profile.name.clone(),
+                config.server.generation_queue_timeout_ms,
+            ));
+        };
         let Some(body_reservation) = self
             .restart_queue_body_budget
             .try_reserve(max_queued_body_bytes, body_bytes)
@@ -677,7 +683,7 @@ impl ProxyState {
             _queued: queued,
             _body: body_reservation,
             coordinator: Arc::clone(coordinator),
-            observed_running_recovery: true,
+            observed_recovery_episode_id,
         }))
     }
 
@@ -1373,7 +1379,7 @@ struct RestartQueuePermit {
     /// episode is running. That observation must survive into the waiter so a
     /// completion that races between registration and the first re-lock still
     /// consumes the episode result instead of re-inferring "no recovery".
-    observed_running_recovery: bool,
+    observed_recovery_episode_id: u64,
 }
 
 impl Drop for RestartQueuePermit {
@@ -2261,6 +2267,12 @@ fn push_watchdog_metrics(output: &mut String, watchdog: WatchdogMetricsSnapshot)
             "Timed-out stuck-engine watchdog recoveries.",
             "counter",
             watchdog.recovery_timeouts,
+        ),
+        (
+            "llm_guard_proxy_stuck_watchdog_recovery_task_failures_total",
+            "Failed stuck-engine watchdog recovery tasks.",
+            "counter",
+            watchdog.recovery_task_failures,
         ),
         (
             "llm_guard_proxy_restart_queue_depth",
@@ -6523,6 +6535,7 @@ struct UpstreamStallRecoveryCoordinator {
     watchdog_restarts: AtomicU64,
     watchdog_recovery_successes: AtomicU64,
     watchdog_recovery_timeouts: AtomicU64,
+    watchdog_recovery_task_failures: AtomicU64,
 }
 
 #[derive(Debug, Default)]
@@ -6534,6 +6547,52 @@ struct UpstreamStallRecoveryState {
     window_started: Option<Instant>,
     runs_in_window: u32,
     last_result: Option<BTreeMap<String, String>>,
+    next_recovery_episode_id: u64,
+    active_recovery_episode_id: Option<u64>,
+    completed_recovery_episodes: VecDeque<CompletedRecoveryEpisode>,
+}
+
+const COMPLETED_RECOVERY_EPISODE_CAPACITY: usize = 8;
+
+#[derive(Debug)]
+struct CompletedRecoveryEpisode {
+    id: u64,
+    result: BTreeMap<String, String>,
+}
+
+impl UpstreamStallRecoveryState {
+    /// Allocates an episode identity while recovery is running. A queue permit
+    /// retains this identity so it cannot consume a later recovery's result.
+    fn ensure_active_recovery_episode(&mut self) -> Option<u64> {
+        if let Some(id) = self.active_recovery_episode_id {
+            return Some(id);
+        }
+        let id = self.next_recovery_episode_id.checked_add(1)?;
+        self.next_recovery_episode_id = id;
+        self.active_recovery_episode_id = Some(id);
+        Some(id)
+    }
+
+    fn completed_recovery_result(&self, episode_id: u64) -> Option<&BTreeMap<String, String>> {
+        self.completed_recovery_episodes
+            .iter()
+            .find(|episode| episode.id == episode_id)
+            .map(|episode| &episode.result)
+    }
+
+    fn finish_recovery(&mut self, result: BTreeMap<String, String>) {
+        let episode_id = self.active_recovery_episode_id.take();
+        self.running = false;
+        self.last_finished = Some(Instant::now());
+        self.last_result = Some(result.clone());
+        if let Some(id) = episode_id {
+            self.completed_recovery_episodes
+                .push_back(CompletedRecoveryEpisode { id, result });
+            while self.completed_recovery_episodes.len() > COMPLETED_RECOVERY_EPISODE_CAPACITY {
+                let _removed = self.completed_recovery_episodes.pop_front();
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -6939,6 +6998,12 @@ fn checked_instant_add(now: Instant, duration: Duration) -> Instant {
 
 impl WatchdogSchedule {
     fn due_profiles(&mut self, now: Instant, profiles: &[(String, Duration)]) -> Vec<String> {
+        let enabled_profiles = profiles
+            .iter()
+            .map(|(name, _interval)| name.as_str())
+            .collect::<HashSet<_>>();
+        self.next_due
+            .retain(|name, _entry| enabled_profiles.contains(name.as_str()));
         profiles
             .iter()
             .filter_map(|(name, interval)| {
@@ -6970,41 +7035,35 @@ async fn run_stuck_engine_watchdog(
     let mut schedule = WatchdogSchedule::default();
     let mut recovery_tasks = JoinSet::<(String, BTreeMap<String, String>)>::new();
     let mut recovering_profiles = HashSet::new();
+    let mut recovery_task_profiles = HashMap::new();
     loop {
         collect_finished_watchdog_recoveries(
             &mut recovery_tasks,
             &mut recovering_profiles,
+            &mut recovery_task_profiles,
             &local_recovery,
-        );
+        )
+        .await;
         let Ok(snapshot) = config.snapshot() else {
             let mut shutdown_gate = shutdown.subscribe();
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(60)) => {}
-                () = shutdown_gate.cancelled() => return,
+                () = shutdown_gate.cancelled() => {
+                    drain_watchdog_recoveries(
+                        &mut recovery_tasks,
+                        &mut recovering_profiles,
+                        &mut recovery_task_profiles,
+                        &local_recovery,
+                    )
+                    .await;
+                    return;
+                }
             }
             continue;
         };
         let profiles = watchdog_upstream_profiles(&snapshot);
-        let scheduled_profiles = profiles
-            .iter()
-            .filter(|profile| profile.stuck_watchdog.enabled)
-            .map(|profile| {
-                (
-                    profile.name.clone(),
-                    Duration::from_secs(profile.stuck_watchdog.check_interval_secs),
-                )
-            })
-            .collect::<Vec<_>>();
-        // Bound retention every watchdog tick, including idle profiles. Retention
-        // must not depend on an active request that might never finish.
-        for profile in &profiles {
-            if profile.stuck_watchdog.enabled {
-                tokens.prune_profile(
-                    &profile.name,
-                    Duration::from_secs(profile.stuck_watchdog.detection_window_secs),
-                );
-            }
-        }
+        let scheduled_profiles = scheduled_watchdog_profiles(&profiles);
+        prune_enabled_watchdog_tokens(&tokens, &profiles);
         let due_profiles = schedule.due_profiles(Instant::now(), &scheduled_profiles);
         for profile in profiles {
             if !due_profiles
@@ -7042,8 +7101,8 @@ async fn run_stuck_engine_watchdog(
                 .fetch_add(1, Ordering::Relaxed);
             let profile_name = profile.name.clone();
             recovering_profiles.insert(profile_name.clone());
-            recovery_tasks.spawn(run_watchdog_recovery(
-                profile_name,
+            let task = recovery_tasks.spawn(run_watchdog_recovery(
+                profile_name.clone(),
                 policy,
                 Duration::from_secs(profile.restart_queue.restart_timeout_secs),
                 coordinator,
@@ -7051,6 +7110,7 @@ async fn run_stuck_engine_watchdog(
                 profile.primary_base_url().to_owned(),
                 Arc::clone(&shutdown),
             ));
+            recovery_task_profiles.insert(task.id(), profile_name);
         }
         let mut shutdown_gate = shutdown.subscribe();
         tokio::select! {
@@ -7058,29 +7118,119 @@ async fn run_stuck_engine_watchdog(
             // cadence instead of collapsing all intervals to a global minimum.
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
             () = shutdown_gate.cancelled() => {
-                recovery_tasks.abort_all();
-                while recovery_tasks.join_next().await.is_some() {}
+                drain_watchdog_recoveries(
+                    &mut recovery_tasks,
+                    &mut recovering_profiles,
+                    &mut recovery_task_profiles,
+                    &local_recovery,
+                )
+                .await;
                 return;
             },
         }
     }
 }
 
-fn collect_finished_watchdog_recoveries(
-    recovery_tasks: &mut JoinSet<(String, BTreeMap<String, String>)>,
-    recovering_profiles: &mut HashSet<String>,
-    local_recovery: &LocalRecoveryCoordinatorSet,
+fn scheduled_watchdog_profiles(profiles: &[UpstreamProfileConfig]) -> Vec<(String, Duration)> {
+    profiles
+        .iter()
+        .filter(|profile| profile.stuck_watchdog.enabled)
+        .map(|profile| {
+            (
+                profile.name.clone(),
+                Duration::from_secs(profile.stuck_watchdog.check_interval_secs),
+            )
+        })
+        .collect()
+}
+
+/// Bound retention every watchdog tick, including idle profiles. Retention
+/// must not depend on an active request that might never finish.
+fn prune_enabled_watchdog_tokens(
+    tokens: &StuckWatchdogTokenTracker,
+    profiles: &[UpstreamProfileConfig],
 ) {
-    while let Some(result) = recovery_tasks.try_join_next() {
-        if let Ok((profile, recovery)) = result {
-            recovering_profiles.remove(&profile);
-            record_watchdog_recovery_result(
-                &local_recovery.coordinator_for(&profile),
-                &profile,
-                &recovery,
+    for profile in profiles {
+        if profile.stuck_watchdog.enabled {
+            tokens.prune_profile(
+                &profile.name,
+                Duration::from_secs(profile.stuck_watchdog.detection_window_secs),
             );
         }
     }
+}
+
+async fn drain_watchdog_recoveries(
+    recovery_tasks: &mut JoinSet<(String, BTreeMap<String, String>)>,
+    recovering_profiles: &mut HashSet<String>,
+    recovery_task_profiles: &mut HashMap<tokio::task::Id, String>,
+    local_recovery: &LocalRecoveryCoordinatorSet,
+) {
+    while let Some(result) = recovery_tasks.join_next_with_id().await {
+        match result {
+            Ok((task_id, (profile, recovery))) => {
+                recovery_task_profiles.remove(&task_id);
+                recovering_profiles.remove(&profile);
+                record_watchdog_recovery_result(
+                    &local_recovery.coordinator_for(&profile),
+                    &profile,
+                    &recovery,
+                );
+            }
+            Err(error) => {
+                if let Some(profile) = recovery_task_profiles.remove(&error.id()) {
+                    recovering_profiles.remove(&profile);
+                    record_watchdog_recovery_task_failure(local_recovery, &profile).await;
+                }
+            }
+        }
+    }
+}
+
+async fn collect_finished_watchdog_recoveries(
+    recovery_tasks: &mut JoinSet<(String, BTreeMap<String, String>)>,
+    recovering_profiles: &mut HashSet<String>,
+    recovery_task_profiles: &mut HashMap<tokio::task::Id, String>,
+    local_recovery: &LocalRecoveryCoordinatorSet,
+) {
+    while let Some(result) = recovery_tasks.try_join_next_with_id() {
+        match result {
+            Ok((task_id, (profile, recovery))) => {
+                recovery_task_profiles.remove(&task_id);
+                recovering_profiles.remove(&profile);
+                record_watchdog_recovery_result(
+                    &local_recovery.coordinator_for(&profile),
+                    &profile,
+                    &recovery,
+                );
+            }
+            Err(error) => {
+                if let Some(profile) = recovery_task_profiles.remove(&error.id()) {
+                    recovering_profiles.remove(&profile);
+                    record_watchdog_recovery_task_failure(local_recovery, &profile).await;
+                }
+            }
+        }
+    }
+}
+
+async fn record_watchdog_recovery_task_failure(
+    local_recovery: &LocalRecoveryCoordinatorSet,
+    profile: &str,
+) {
+    let coordinator = local_recovery.coordinator_for(profile);
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("task_failed"),
+        )]),
+    )
+    .await;
+    coordinator
+        .watchdog_recovery_task_failures
+        .fetch_add(1, Ordering::Relaxed);
+    eprintln!("llm_guard_proxy_stuck_watchdog profile={profile} event=recovery_task_failed");
 }
 
 async fn run_watchdog_recovery(
@@ -7093,20 +7243,46 @@ async fn run_watchdog_recovery(
     shutdown: Arc<ShutdownGate>,
 ) -> (String, BTreeMap<String, String>) {
     let mut shutdown_gate = shutdown.subscribe();
-    let mut recovery = tokio::select! {
-        recovery = run_local_recovery_for_profile(
-            &policy,
-            &coordinator,
+    let recovery_policy = policy.clone();
+    let recovery_coordinator = Arc::clone(&coordinator);
+    let mut local_recovery = tokio::spawn(async move {
+        run_local_recovery_for_profile(
+            &recovery_policy,
+            &recovery_coordinator,
             client,
             base_url,
             watchdog_recovery_cause(),
             Some(episode_timeout),
-        ) => recovery,
-        () = shutdown_gate.cancelled() => BTreeMap::from([(
-            String::from("local_recovery_status"),
-            String::from("shutdown_cancelled"),
-        )]),
+        )
+        .await
+    });
+    let (mut recovery, terminal_state_required) = tokio::select! {
+        result = &mut local_recovery => match result {
+            Ok(recovery) => (recovery, false),
+            Err(error) => (
+                BTreeMap::from([(
+                    String::from("local_recovery_status"),
+                    if error.is_cancelled() {
+                        String::from("cancelled")
+                    } else {
+                        String::from("task_failed")
+                    },
+                )]),
+                true,
+            ),
+        },
+        () = shutdown_gate.cancelled() => {
+            local_recovery.abort();
+            let _ = local_recovery.await;
+            (BTreeMap::from([(
+                String::from("local_recovery_status"),
+                String::from("shutdown_cancelled"),
+            )]), true)
+        },
     };
+    if terminal_state_required {
+        finish_upstream_stall_recovery(&coordinator, recovery.clone()).await;
+    }
     // The waiter deadline intentionally bounds the caller. The recovery task may
     // have just spawned a restart when that deadline fires, so give its terminal
     // metadata a short chance to publish before recording watchdog metrics.
@@ -7195,7 +7371,6 @@ fn watchdog_upstream_profiles(config: &AppConfig) -> Vec<UpstreamProfileConfig> 
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RestartQueueWaitResult {
-    NotRecovering,
     Ready,
     Failed,
     TimedOut,
@@ -7231,36 +7406,29 @@ impl RestartQueueWaitOutcome {
     }
 }
 
-async fn wait_for_restart_queue(
+async fn wait_for_restart_queue_episode(
     coordinator: &UpstreamStallRecoveryCoordinator,
     queue_deadline: Duration,
-    mut observed_running_recovery: bool,
+    episode_id: u64,
 ) -> RestartQueueWaitResult {
     let deadline = checked_instant_add(Instant::now(), queue_deadline);
     loop {
         let notified = coordinator.notify.notified();
         tokio::pin!(notified);
         let _ = notified.as_mut().enable();
-
         let state = coordinator.state.lock().await;
-        let recovery_deadline = state.recovery_deadline.unwrap_or(deadline);
-        if !state.running {
-            if !observed_running_recovery {
-                return RestartQueueWaitResult::NotRecovering;
-            }
-            return if state
-                .last_result
-                .as_ref()
-                .is_some_and(local_recovery_completed_ready)
-            {
+        if let Some(result) = state.completed_recovery_result(episode_id) {
+            return if local_recovery_completed_ready(result) {
                 RestartQueueWaitResult::Ready
             } else {
                 RestartQueueWaitResult::Failed
             };
         }
-        observed_running_recovery = true;
+        if !state.running || state.active_recovery_episode_id != Some(episode_id) {
+            return RestartQueueWaitResult::Failed;
+        }
+        let recovery_deadline = state.recovery_deadline.unwrap_or(deadline);
         drop(state);
-
         let remaining = deadline
             .min(recovery_deadline)
             .saturating_duration_since(Instant::now());
@@ -7319,17 +7487,8 @@ async fn wait_for_restart_queue_with_held_permit(
     let queue = &profile.restart_queue;
     let queue_deadline = restart_queue_wait_deadline(queue);
     let coordinator = state.local_recovery.coordinator_for(&profile.name);
-    let observed_running_recovery = restart_queue_permit.observed_running_recovery;
-    match wait_for_restart_queue(&coordinator, queue_deadline, observed_running_recovery).await {
-        RestartQueueWaitResult::NotRecovering => {
-            // Holding a permit means recovery was observed at registration. The
-            // waiter therefore must never re-infer an empty NotRecovering path.
-            drop(restart_queue_permit);
-            Ok(RestartQueueWaitOutcome {
-                outcome: RestartQueueOutcome::NotRecovering,
-                elapsed: wait_started.elapsed(),
-            })
-        }
+    let episode_id = restart_queue_permit.observed_recovery_episode_id;
+    match wait_for_restart_queue_episode(&coordinator, queue_deadline, episode_id).await {
         RestartQueueWaitResult::Ready => {
             eprintln!(
                 "llm_guard_proxy_restart_queue profile={} event=released_after_recovery",
@@ -7345,7 +7504,7 @@ async fn wait_for_restart_queue_with_held_permit(
             let outcome = match result {
                 RestartQueueWaitResult::Failed => "recovery_failed",
                 RestartQueueWaitResult::TimedOut => "timeout",
-                RestartQueueWaitResult::NotRecovering | RestartQueueWaitResult::Ready => {
+                RestartQueueWaitResult::Ready => {
                     unreachable!("only failed or timed-out restart queues reach this branch")
                 }
             };
@@ -7378,6 +7537,7 @@ struct WatchdogMetricsSnapshot {
     restarts: u64,
     recovery_successes: u64,
     recovery_timeouts: u64,
+    recovery_task_failures: u64,
     restart_queue_depth: u64,
 }
 
@@ -7420,6 +7580,11 @@ impl LocalRecoveryCoordinatorSet {
                 metrics.recovery_timeouts = metrics.recovery_timeouts.saturating_add(
                     coordinator
                         .watchdog_recovery_timeouts
+                        .load(Ordering::Relaxed),
+                );
+                metrics.recovery_task_failures = metrics.recovery_task_failures.saturating_add(
+                    coordinator
+                        .watchdog_recovery_task_failures
                         .load(Ordering::Relaxed),
                 );
                 metrics.restart_queue_depth = metrics
@@ -9854,83 +10019,72 @@ async fn run_local_recovery_for_profile(
     state.runs_in_window = state.runs_in_window.saturating_add(1);
     drop(state);
 
-    spawn_local_recovery_task(
-        policy.clone(),
-        Arc::clone(coordinator),
-        client,
-        base_url,
-        cause,
-        episode_timeout,
-    );
-
-    wait_for_local_recovery_result(policy, coordinator, false).await
+    let metadata =
+        run_local_recovery_task(policy.clone(), client, base_url, cause, episode_timeout).await;
+    finish_upstream_stall_recovery(coordinator, metadata.clone()).await;
+    metadata
 }
 
-fn spawn_local_recovery_task(
+async fn run_local_recovery_task(
     policy: LocalRecoveryPolicy,
-    coordinator: Arc<UpstreamStallRecoveryCoordinator>,
     client: Client,
     base_url: String,
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
-) {
-    tokio::spawn(async move {
-        let trigger_cause = cause.as_str().to_owned();
-        let recovery_trigger_cause = trigger_cause.clone();
-        let restart_ran = Arc::new(AtomicBool::new(false));
-        let recovery_restart_ran = Arc::clone(&restart_ran);
-        let recovery = async {
-            let mut metadata = BTreeMap::from([(
-                String::from("local_recovery_trigger_cause"),
-                recovery_trigger_cause,
-            )]);
-            metadata
-                .extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
-            if metadata
-                .get("local_recovery_restart_status")
-                .is_some_and(|status| status == "succeeded")
+) -> BTreeMap<String, String> {
+    let trigger_cause = cause.as_str().to_owned();
+    let recovery_trigger_cause = trigger_cause.clone();
+    let restart_ran = Arc::new(AtomicBool::new(false));
+    let recovery_restart_ran = Arc::clone(&restart_ran);
+    let recovery = async {
+        let mut metadata = BTreeMap::from([(
+            String::from("local_recovery_trigger_cause"),
+            recovery_trigger_cause,
+        )]);
+        metadata.extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
+        if metadata
+            .get("local_recovery_restart_status")
+            .is_some_and(|status| status == "succeeded")
+        {
+            metadata.extend(run_local_recovery_readiness(client, base_url, &policy).await);
+        }
+        if !metadata.contains_key("local_recovery_status") {
+            let status = match metadata
+                .get("local_recovery_readiness_status")
+                .map(String::as_str)
             {
-                metadata.extend(run_local_recovery_readiness(client, base_url, &policy).await);
-            }
-            if !metadata.contains_key("local_recovery_status") {
-                let status = match metadata
-                    .get("local_recovery_readiness_status")
-                    .map(String::as_str)
-                {
-                    Some("ready") => "succeeded",
-                    Some("timeout") => "readiness_timeout",
-                    Some("error") => "readiness_error",
-                    Some(_) => "readiness_not_ready",
-                    None => "restart_failed",
-                };
-                metadata.insert(String::from("local_recovery_status"), status.to_owned());
-            }
-            metadata
-        };
-        let metadata = match episode_timeout {
-            Some(timeout_duration) => match timeout(timeout_duration, recovery).await {
-                Ok(metadata) => metadata,
-                Err(_elapsed) => {
-                    let mut metadata = BTreeMap::from([
-                        (String::from("local_recovery_trigger_cause"), trigger_cause),
-                        (
-                            String::from("local_recovery_status"),
-                            String::from("episode_timeout"),
-                        ),
-                    ]);
-                    if restart_ran.load(Ordering::Relaxed) {
-                        metadata.insert(
-                            String::from("local_recovery_restart_ran"),
-                            String::from("true"),
-                        );
-                    }
-                    metadata
+                Some("ready") => "succeeded",
+                Some("timeout") => "readiness_timeout",
+                Some("error") => "readiness_error",
+                Some(_) => "readiness_not_ready",
+                None => "restart_failed",
+            };
+            metadata.insert(String::from("local_recovery_status"), status.to_owned());
+        }
+        metadata
+    };
+    match episode_timeout {
+        Some(timeout_duration) => match timeout(timeout_duration, recovery).await {
+            Ok(metadata) => metadata,
+            Err(_elapsed) => {
+                let mut metadata = BTreeMap::from([
+                    (String::from("local_recovery_trigger_cause"), trigger_cause),
+                    (
+                        String::from("local_recovery_status"),
+                        String::from("episode_timeout"),
+                    ),
+                ]);
+                if restart_ran.load(Ordering::Relaxed) {
+                    metadata.insert(
+                        String::from("local_recovery_restart_ran"),
+                        String::from("true"),
+                    );
                 }
-            },
-            None => recovery.await,
-        };
-        finish_upstream_stall_recovery(&coordinator, metadata).await;
-    });
+                metadata
+            }
+        },
+        None => recovery.await,
+    }
 }
 
 async fn wait_for_local_recovery_result(
@@ -10393,9 +10547,7 @@ async fn finish_upstream_stall_recovery(
     metadata: BTreeMap<String, String>,
 ) {
     let mut state = coordinator.state.lock().await;
-    state.running = false;
-    state.last_finished = Some(Instant::now());
-    state.last_result = Some(metadata);
+    state.finish_recovery(metadata);
     drop(state);
     coordinator.notify.notify_waiters();
 }

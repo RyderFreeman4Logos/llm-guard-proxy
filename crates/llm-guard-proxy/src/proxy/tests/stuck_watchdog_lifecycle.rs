@@ -46,6 +46,61 @@ fn watchdog_recognizes_every_supported_chat_delta_progress_field() {
     }
 }
 
+#[tokio::test]
+async fn watchdog_panicked_recovery_releases_profile_for_a_later_schedule() {
+    let local_recovery = LocalRecoveryCoordinatorSet::default();
+    let mut recovery_tasks = tokio::task::JoinSet::new();
+    let profile = String::from("panic-profile");
+    let mut recovering_profiles = std::collections::HashSet::from([profile.clone()]);
+    let mut recovery_task_profiles = std::collections::HashMap::new();
+    {
+        let coordinator = local_recovery.coordinator_for(&profile);
+        let mut state = coordinator.state.lock().await;
+        state.running = true;
+    }
+    let task = recovery_tasks.spawn(async {
+        panic!("injected watchdog recovery panic");
+    });
+    recovery_task_profiles.insert(task.id(), profile.clone());
+
+    tokio::task::yield_now().await;
+    collect_finished_watchdog_recoveries(
+        &mut recovery_tasks,
+        &mut recovering_profiles,
+        &mut recovery_task_profiles,
+        &local_recovery,
+    )
+    .await;
+
+    assert!(
+        recovering_profiles.insert(profile.clone()),
+        "a panic must remove the profile from recovery bookkeeping so it can be scheduled again"
+    );
+    let coordinator = local_recovery.coordinator_for(&profile);
+    let state = coordinator.state.lock().await;
+    assert!(
+        !state.running,
+        "a panicked task must publish a terminal coordinator state"
+    );
+    assert_eq!(
+        state
+            .last_result
+            .as_ref()
+            .and_then(|metadata| metadata.get("local_recovery_status"))
+            .map(String::as_str),
+        Some("task_failed")
+    );
+    drop(state);
+    assert_eq!(
+        local_recovery
+            .coordinator_for(&profile)
+            .watchdog_recovery_task_failures
+            .load(Ordering::Relaxed),
+        1,
+        "panic cleanup must increment the bounded watchdog task-failure metric"
+    );
+}
+
 #[test]
 fn watchdog_maps_completions_and_records_text_progress() {
     let tracker = Arc::new(StuckWatchdogTokenTracker::default());
@@ -1018,6 +1073,67 @@ async fn restart_queue_completion_race_successful_recovery_retains_metadata() {
 }
 
 #[tokio::test]
+async fn restart_queue_waiter_uses_the_episode_observed_at_permit_acquisition() {
+    let fake = FakeUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("restart-queue-episode-binding");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let proxy =
+        spawn_watchdog_proxy(&fake.base_url, &recovery_watchdog_config(&marker, 1, 1, 1)).await;
+    let profile = proxy
+        .state
+        .config
+        .snapshot()
+        .expect("watchdog config should snapshot")
+        .default_upstream_profile();
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    {
+        let mut recovery = coordinator.state.lock().await;
+        let now = Instant::now();
+        recovery.running = true;
+        recovery.recovery_started = Some(now);
+        recovery.recovery_deadline = Some(now + Duration::from_secs(2));
+    }
+    let permit = proxy
+        .state
+        .acquire_restart_queue_permit(&profile, &coordinator, 0)
+        .await
+        .expect("restart queue admission should succeed")
+        .expect("recovery A must yield a queue permit");
+
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+    {
+        let mut recovery = coordinator.state.lock().await;
+        let now = Instant::now();
+        recovery.running = true;
+        recovery.recovery_started = Some(now);
+        recovery.recovery_deadline = Some(now + Duration::from_secs(2));
+    }
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("spawn_failed"),
+        )]),
+    )
+    .await;
+
+    let mut metadata = BTreeMap::new();
+    let outcome =
+        wait_for_restart_queue_with_held_permit(&proxy.state, &profile, &mut metadata, permit)
+            .await
+            .expect("the waiter must consume recovery A's success, not recovery B's failure");
+    assert_eq!(outcome.outcome, RestartQueueOutcome::ReleasedAfterRecovery);
+}
+
+#[tokio::test]
 async fn watchdog_lifecycle_applies_reloaded_interval_without_old_interval_delay() {
     let fake = FakeUpstream::spawn().await;
     let test_root = create_watchdog_test_root("interval-reload");
@@ -1058,6 +1174,57 @@ async fn watchdog_lifecycle_applies_reloaded_interval_without_old_interval_delay
         restarted,
         "the reloaded one-second interval must replace the previously scheduled three-second due time"
     );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn watchdog_shutdown_reaps_owned_recovery_and_publishes_terminal_state() {
+    let fake = FakeUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("shutdown-owned-recovery");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let script_path = test_root.join("slow-restart.sh");
+    let pid_path = test_root.join("restart.pid");
+    let ready_path = test_root.join("restart.ready");
+    fs::write(
+        &script_path,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$$\" > \"$1\"\n: > \"$2\"\nexec sleep 30\n",
+    )
+    .expect("fake restart script should be written");
+    fs::set_permissions(&script_path, fs::Permissions::from_mode(0o700))
+        .expect("fake restart script should be executable");
+    let config = slow_recovery_watchdog_config(&script_path, &pid_path, &ready_path);
+    let proxy = spawn_watchdog_proxy(&fake.base_url, &config).await;
+    let request = proxy.state.stuck_watchdog_tokens.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        WATCHDOG_WINDOW,
+    );
+    sleep(Duration::from_millis(1_100)).await;
+    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+    let process = read_pid_file_after_ready(&pid_path, &ready_path).await;
+
+    stop_watchdog(&proxy, watchdog).await;
+
+    assert!(
+        wait_for_process_stop(process, Duration::from_millis(500)).await,
+        "watchdog shutdown must reap its in-flight restart command before joining"
+    );
+    let coordinator = proxy.state.local_recovery.coordinator_for("default");
+    let state = coordinator.state.lock().await;
+    assert!(
+        !state.running,
+        "watchdog shutdown must publish a terminal recovery coordinator state"
+    );
+    assert_eq!(
+        state
+            .last_result
+            .as_ref()
+            .and_then(|metadata| metadata.get("local_recovery_status"))
+            .map(String::as_str),
+        Some("shutdown_cancelled")
+    );
+    drop(state);
+    drop(request);
 }
 
 #[cfg(target_os = "linux")]

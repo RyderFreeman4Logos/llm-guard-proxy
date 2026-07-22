@@ -319,16 +319,19 @@ fn restart_queue_wait_deadline_caps_recovery_episode_timeout() {
 #[tokio::test]
 async fn restart_queue_waits_for_readiness_result_and_times_out_without_it() {
     let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
-    assert_eq!(
-        wait_for_restart_queue(&coordinator, Duration::from_millis(5), false).await,
-        RestartQueueWaitResult::NotRecovering
-    );
 
-    coordinator.state.lock().await.running = true;
+    let episode_id = {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
     let waiting = {
         let coordinator = Arc::clone(&coordinator);
         tokio::spawn(async move {
-            wait_for_restart_queue(&coordinator, Duration::from_millis(200), true).await
+            wait_for_restart_queue_episode(&coordinator, Duration::from_millis(200), episode_id)
+                .await
         })
     };
 
@@ -350,9 +353,15 @@ async fn restart_queue_waits_for_readiness_result_and_times_out_without_it() {
         RestartQueueWaitResult::Ready
     );
 
-    coordinator.state.lock().await.running = true;
+    let episode_id = {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
     assert_eq!(
-        wait_for_restart_queue(&coordinator, Duration::from_millis(5), true).await,
+        wait_for_restart_queue_episode(&coordinator, Duration::from_millis(5), episode_id).await,
         RestartQueueWaitResult::TimedOut
     );
 }
@@ -369,7 +378,12 @@ async fn restart_queue_consumes_failed_episode_completed_between_permit_and_wait
 
     // A permit is only issued while recovery is running. Completing the episode
     // before the waiter re-locks must still consume that episode's result.
-    let observed_running_recovery = true;
+    let observed_recovery_episode_id = {
+        let mut recovery = coordinator.state.lock().await;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
     finish_upstream_stall_recovery(
         &coordinator,
         BTreeMap::from([(
@@ -380,10 +394,10 @@ async fn restart_queue_consumes_failed_episode_completed_between_permit_and_wait
     .await;
 
     assert_eq!(
-        wait_for_restart_queue(
+        wait_for_restart_queue_episode(
             &coordinator,
             Duration::from_millis(50),
-            observed_running_recovery
+            observed_recovery_episode_id
         )
         .await,
         RestartQueueWaitResult::Failed,
@@ -401,7 +415,12 @@ async fn restart_queue_consumes_successful_episode_completed_between_permit_and_
         recovery.recovery_deadline = Some(Instant::now() + Duration::from_secs(2));
     }
 
-    let observed_running_recovery = true;
+    let observed_recovery_episode_id = {
+        let mut recovery = coordinator.state.lock().await;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
     finish_upstream_stall_recovery(
         &coordinator,
         BTreeMap::from([(
@@ -412,10 +431,10 @@ async fn restart_queue_consumes_successful_episode_completed_between_permit_and_
     .await;
 
     assert_eq!(
-        wait_for_restart_queue(
+        wait_for_restart_queue_episode(
             &coordinator,
             Duration::from_millis(50),
-            observed_running_recovery
+            observed_recovery_episode_id
         )
         .await,
         RestartQueueWaitResult::Ready
@@ -888,17 +907,20 @@ fn completed_watchdog_attempts_are_removed_and_stay_bounded_after_disable() {
 #[tokio::test]
 async fn restart_queue_uses_episode_deadline_not_a_fresh_wait_per_request() {
     let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
-    {
+    let episode_id = {
         let mut recovery = coordinator.state.lock().await;
         recovery.running = true;
         recovery.recovery_started = Some(Instant::now());
         recovery.recovery_deadline = Some(Instant::now());
-    }
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
 
     assert_eq!(
         timeout(
             Duration::from_millis(20),
-            wait_for_restart_queue(&coordinator, Duration::from_secs(1), true),
+            wait_for_restart_queue_episode(&coordinator, Duration::from_secs(1), episode_id),
         )
         .await
         .expect("an expired episode deadline must not start a fresh per-request wait"),
@@ -1029,6 +1051,34 @@ fn watchdog_schedule_keeps_profile_intervals_independent() {
 }
 
 #[test]
+fn watchdog_schedule_reenables_a_disabled_profile_without_waiting_for_its_old_due_time() {
+    let now = Instant::now();
+    let profile = String::from("reloadable");
+    let long_interval = Duration::from_secs(86_400);
+    let mut schedule = WatchdogSchedule::default();
+
+    assert_eq!(
+        schedule.due_profiles(now, &[(profile.clone(), long_interval)]),
+        vec![profile.clone()],
+        "the initially enabled profile must be scheduled"
+    );
+    assert!(
+        schedule
+            .due_profiles(now + Duration::from_secs(1), &[])
+            .is_empty(),
+        "disabled profiles must not be evaluated"
+    );
+    assert_eq!(
+        schedule.due_profiles(
+            now + Duration::from_secs(2),
+            &[(profile.clone(), long_interval)]
+        ),
+        vec![profile],
+        "re-enabling the same interval must schedule an immediate evaluation instead of retaining a stale future due time"
+    );
+}
+
+#[test]
 fn parse_token_usage_reads_embedding_prompt_tokens() {
     let usage = parse_token_usage(
         br#"{"data":[],"usage":{"prompt_tokens":17,"total_tokens":17}}"#,
@@ -1155,6 +1205,11 @@ async fn metrics_expose_retained_gauges_without_secrets() {
     assert_metric_type(
         &body,
         "llm_guard_proxy_stuck_watchdog_recovery_timeouts_total",
+        "counter",
+    );
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_stuck_watchdog_recovery_task_failures_total",
         "counter",
     );
     assert_metric_type(&body, "llm_guard_proxy_current_retained_requests", "gauge");
