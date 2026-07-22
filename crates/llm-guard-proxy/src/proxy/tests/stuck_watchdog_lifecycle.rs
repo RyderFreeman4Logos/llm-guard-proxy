@@ -475,10 +475,8 @@ enabled = false
         "upstream must progress into the independent relay while the client does not read; pulled={pulled_while_unread}"
     );
 
-    // Resume before the detection window ages out retained progress samples. The
-    // lossless relay pauses upstream under full buffers instead of discarding, so
-    // an indefinitely paused client may legitimately look stuck; this test only
-    // checks short-pause behavior and ordered delivery.
+    // This smaller exercise checks short-pause behavior and ordered delivery;
+    // the numbered regression below holds the client beyond the detection window.
     let mut body_stream = response.bytes_stream();
     let mut delivered = Vec::new();
     for _ in 0..(OBSERVED_UPSTREAM_RELAY_CAPACITY.saturating_mul(2)) {
@@ -520,7 +518,8 @@ async fn independent_relay_preserves_every_numbered_sse_frame_under_backpressure
     let total_frames = OBSERVED_UPSTREAM_RELAY_CAPACITY
         .saturating_mul(2)
         .saturating_add(8);
-    let upstream = NumberedFrameUpstream::spawn(total_frames).await;
+    let frame_payload_bytes = 64 * 1024;
+    let upstream = NumberedFrameUpstream::spawn(total_frames, frame_payload_bytes).await;
     let test_root = create_watchdog_test_root("numbered-backpressure");
     let _cleanup = TestDirectoryCleanup::new(&test_root);
     let marker = test_root.join("restart.marker");
@@ -532,46 +531,51 @@ enabled = false
         touch_recovery_watchdog_config(&marker, 1)
     );
     let proxy = spawn_watchdog_proxy(&upstream.base_url, &config).await;
+    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
 
-    let response = proxy
-        .client
-        .post(format!("{}/v1/chat/completions", proxy.base_url))
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
         .header(CONTENT_TYPE, "application/json")
-        .body(
+        .body(Body::from(
             r#"{"model":"test-chat","messages":[{"role":"user","content":"stream"}],"stream":true}"#,
-        )
-        .send()
-        .await
-        .expect("streaming request should receive upstream headers");
+        ))
+        .expect("streaming request should build");
+    let response = proxy_handler(State(proxy.state.clone()), request).await;
     assert_eq!(response.status(), StatusCode::OK);
 
-    // Pause the client until the independent relay has observed enough healthy
-    // frames to prove progress is not coupled to client body polls. The finite
-    // upstream still finishes every numbered frame + [DONE] into the ordered
-    // buffer / flow-controlled chain without discarding middle frames.
+    // Pause long enough for the relay to fill both its downstream channel and
+    // retained ordered buffer, then age past the watchdog's detection window.
+    // The proxy cannot observe upstream production while that flow-control wait
+    // is active, so it must suspend this attempt instead of restarting the shared
+    // profile as though the engine had stopped producing output.
     timeout(Duration::from_secs(5), async {
         while upstream.chunks_pulled.load(Ordering::Relaxed)
-            <= OBSERVED_UPSTREAM_RELAY_CAPACITY as u64
+            < OBSERVED_UPSTREAM_RELAY_CAPACITY.saturating_mul(2) as u64
         {
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect(
-        "finite numbered upstream must progress past relay capacity while the client is paused",
-    );
-    // Give the producer a moment to either finish or settle under flow control.
-    sleep(Duration::from_millis(100)).await;
+    .expect("finite numbered upstream must fill the relay while the client is paused");
+    sleep(Duration::from_millis(2_200)).await;
+    let restarted_while_suspended = marker.exists();
 
     // Resume: every frame and the terminal [DONE] must still be delivered in order.
-    let body = timeout(Duration::from_secs(5), response.bytes())
-        .await
-        .expect("paused client must resume without hanging")
-        .expect("downstream body must drain after resume");
+    let body = timeout(
+        Duration::from_secs(5),
+        to_bytes(response.into_body(), 8 * 1024 * 1024),
+    )
+    .await
+    .expect("paused client must resume without hanging")
+    .expect("downstream body must drain after resume");
     let delivered = String::from_utf8_lossy(&body);
     let mut search_from = 0;
+    let frame_payload = "x".repeat(frame_payload_bytes);
     for index in 0..total_frames {
-        let frame = chat_delta_sse(&serde_json::json!({"content": format!("frame-{index}")}));
+        let frame = chat_delta_sse(&serde_json::json!({
+            "content": format!("frame-{index}:{frame_payload}")
+        }));
         let frame = String::from_utf8_lossy(&frame);
         let found = delivered[search_from..]
             .find(frame.as_ref())
@@ -584,9 +588,22 @@ enabled = false
         delivered[search_from..].contains("data: [DONE]"),
         "terminal [DONE] must survive backpressure after every numbered frame"
     );
+    let attempt_released = !proxy
+        .state
+        .stuck_watchdog_tokens
+        .has_active_requests("default");
+    stop_watchdog(&proxy, watchdog).await;
+    assert!(
+        !restarted_while_suspended,
+        "downstream backpressure past the detection window must not restart a healthy shared upstream"
+    );
     assert!(
         !marker.exists(),
-        "finite healthy production under client pause must not trigger recovery"
+        "resuming a flow-controlled healthy stream must not trigger recovery"
+    );
+    assert!(
+        attempt_released,
+        "draining the resumed stream must release its suspended watchdog attempt"
     );
 }
 
@@ -1227,6 +1244,61 @@ async fn watchdog_shutdown_reaps_owned_recovery_and_publishes_terminal_state() {
     drop(request);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watchdog_recovery_preclosed_shutdown_does_not_spawn_restart_command() {
+    let fake = FakeUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("preclosed-recovery");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let shutdown = Arc::new(ShutdownGate::new());
+    shutdown.begin_shutdown();
+    let policy = LocalRecoveryPolicy {
+        enabled: true,
+        restart_command: vec![String::from("/usr/bin/touch"), marker.display().to_string()],
+        restart_timeout: Duration::from_secs(1),
+        readiness_endpoint: String::from("/v1/chat/completions"),
+        readiness_body: serde_json::json!({}),
+        readiness_request_timeout: Duration::from_millis(100),
+        readiness_deadline: Duration::from_millis(100),
+        readiness_interval: Duration::from_millis(10),
+        max_attempts_per_request: 1,
+        cooldown: Duration::ZERO,
+        budget_window: Duration::from_secs(1),
+        max_per_window: 1,
+    };
+
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    let client = build_http_client().expect("watchdog recovery client should build");
+    let mut recovery_tasks = tokio::task::JoinSet::new();
+    for _ in 0..64 {
+        recovery_tasks.spawn(run_watchdog_recovery(
+            String::from("preclosed"),
+            policy.clone(),
+            Duration::from_secs(1),
+            Arc::clone(&coordinator),
+            client.clone(),
+            fake.base_url.clone(),
+            Arc::clone(&shutdown),
+        ));
+    }
+
+    while let Some(recovery) = recovery_tasks.join_next().await {
+        let (profile, recovery) = recovery.expect("watchdog recovery task must not panic");
+        assert_eq!(profile, "preclosed");
+        assert_eq!(
+            recovery.get("local_recovery_status").map(String::as_str),
+            Some("shutdown_cancelled"),
+            "a preclosed shutdown gate must cancel recovery before any restart work starts"
+        );
+    }
+    sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        !marker.exists(),
+        "a preclosed shutdown gate must prevent the marker restart command from spawning"
+    );
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn watchdog_lifecycle_restart_timeout_bounds_and_cancels_the_real_episode() {
@@ -1518,7 +1590,7 @@ struct NumberedFrameUpstream {
 }
 
 impl NumberedFrameUpstream {
-    async fn spawn(total_frames: usize) -> Self {
+    async fn spawn(total_frames: usize, frame_payload_bytes: usize) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("numbered-frame upstream should bind");
@@ -1528,7 +1600,11 @@ impl NumberedFrameUpstream {
         let chunks_pulled = Arc::new(AtomicU64::new(0));
         let app = Router::new()
             .route("/v1/chat/completions", post(numbered_frame_stream_handler))
-            .with_state((Arc::clone(&chunks_pulled), total_frames));
+            .with_state((
+                Arc::clone(&chunks_pulled),
+                total_frames,
+                "x".repeat(frame_payload_bytes),
+            ));
         let server = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -1632,11 +1708,11 @@ async fn backpressure_stream_handler(
 }
 
 async fn numbered_frame_stream_handler(
-    State((chunks_pulled, total_frames)): State<(Arc<AtomicU64>, usize)>,
+    State((chunks_pulled, total_frames, frame_payload)): State<(Arc<AtomicU64>, usize, String)>,
 ) -> Response<Body> {
     let body = Body::from_stream(stream::unfold(
-        (0_usize, chunks_pulled, total_frames),
-        |(index, chunks_pulled, total_frames)| async move {
+        (0_usize, chunks_pulled, total_frames, frame_payload),
+        |(index, chunks_pulled, total_frames, frame_payload)| async move {
             if index > total_frames {
                 return None;
             }
@@ -1645,15 +1721,15 @@ async fn numbered_frame_stream_handler(
             if index == total_frames {
                 return Some((
                     Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n")),
-                    (index + 1, chunks_pulled, total_frames),
+                    (index + 1, chunks_pulled, total_frames, frame_payload),
                 ));
             }
             let frame = chat_delta_sse(&serde_json::json!({
-                "content": format!("frame-{index}")
+                "content": format!("frame-{index}:{frame_payload}")
             }));
             Some((
                 Ok::<Bytes, Infallible>(frame),
-                (index + 1, chunks_pulled, total_frames),
+                (index + 1, chunks_pulled, total_frames, frame_payload),
             ))
         },
     ));

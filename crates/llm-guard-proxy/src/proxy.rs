@@ -6613,6 +6613,7 @@ struct StuckWatchdogTokenWindow {
 struct StuckWatchdogAttempt {
     started_at: Instant,
     completed: Option<Instant>,
+    observation_suspended: bool,
 }
 
 #[derive(Debug)]
@@ -6638,6 +6639,14 @@ struct StuckWatchdogAttemptLease {
     request: StuckWatchdogRequest,
     attempt_id: u64,
     ended: bool,
+}
+
+/// Cloneable progress handle for one physical upstream attempt. The lease remains
+/// the sole owner that keeps that attempt active in the watchdog tracker.
+#[derive(Clone, Debug)]
+struct StuckWatchdogAttemptProgress {
+    request: StuckWatchdogRequest,
+    attempt_id: u64,
 }
 
 impl StuckWatchdogTokenTracker {
@@ -6808,6 +6817,7 @@ impl StuckWatchdogRequest {
                 StuckWatchdogAttempt {
                     started_at: Instant::now(),
                     completed: None,
+                    observation_suspended: false,
                 },
             );
         StuckWatchdogAttemptLease {
@@ -6859,11 +6869,35 @@ impl StuckWatchdogRequest {
         }
         false
     }
+
+    fn set_attempt_observation_suspended(&self, attempt_id: u64, suspended: bool) {
+        let mut windows = match self.inner.tracker.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(attempt) = windows
+            .get_mut(&self.inner.profile)
+            .and_then(|window| window.attempts.get_mut(&attempt_id))
+        else {
+            return;
+        };
+        if suspended {
+            attempt.observation_suspended = true;
+        } else if attempt.observation_suspended {
+            attempt.observation_suspended = false;
+            // Restart maturity once downstream capacity makes upstream observation
+            // possible again; samples from the hidden interval cannot prove liveness.
+            attempt.started_at = Instant::now();
+        }
+    }
 }
 
 impl StuckWatchdogAttemptLease {
-    fn progress_request(&self) -> StuckWatchdogRequest {
-        self.request.clone()
+    fn progress_request(&self) -> StuckWatchdogAttemptProgress {
+        StuckWatchdogAttemptProgress {
+            request: self.request.clone(),
+            attempt_id: self.attempt_id,
+        }
     }
 
     fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
@@ -6904,6 +6938,22 @@ impl StuckWatchdogAttemptLease {
     }
 }
 
+impl StuckWatchdogAttemptProgress {
+    fn record_upstream_emitted_chunk(&self, chunk: &[u8]) -> bool {
+        self.request.record_upstream_emitted_chunk(chunk)
+    }
+
+    fn suspend_observation(&self) {
+        self.request
+            .set_attempt_observation_suspended(self.attempt_id, true);
+    }
+
+    fn resume_observation(&self) {
+        self.request
+            .set_attempt_observation_suspended(self.attempt_id, false);
+    }
+}
+
 impl Drop for StuckWatchdogAttemptLease {
     fn drop(&mut self) {
         self.finish();
@@ -6928,6 +6978,7 @@ fn window_has_too_few_output_progress_units(
     // independently matured stuck attempt, and a young-only window must not fire.
     let has_mature_active_attempt = window.attempts.values().any(|attempt| {
         attempt.completed.is_none()
+            && !attempt.observation_suspended
             && now.saturating_duration_since(attempt.started_at) >= detection_window
     });
     if !has_mature_active_attempt {
@@ -7036,7 +7087,10 @@ async fn run_stuck_engine_watchdog(
     let mut recovery_tasks = JoinSet::<(String, BTreeMap<String, String>)>::new();
     let mut recovering_profiles = HashSet::new();
     let mut recovery_task_profiles = HashMap::new();
-    loop {
+    'watchdog: loop {
+        if shutdown.is_shutting_down() {
+            break;
+        }
         collect_finished_watchdog_recoveries(
             &mut recovery_tasks,
             &mut recovering_profiles,
@@ -7049,14 +7103,7 @@ async fn run_stuck_engine_watchdog(
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_secs(60)) => {}
                 () = shutdown_gate.cancelled() => {
-                    drain_watchdog_recoveries(
-                        &mut recovery_tasks,
-                        &mut recovering_profiles,
-                        &mut recovery_task_profiles,
-                        &local_recovery,
-                    )
-                    .await;
-                    return;
+                    break 'watchdog;
                 }
             }
             continue;
@@ -7089,6 +7136,11 @@ async fn run_stuck_engine_watchdog(
             if !policy.is_configured() {
                 continue;
             }
+            // Re-check at the dispatch boundary: shutdown can begin after this
+            // iteration's entry check but before a due profile is spawned.
+            if shutdown.is_shutting_down() {
+                break 'watchdog;
+            }
             eprintln!(
                 "llm_guard_proxy_stuck_watchdog profile={} event=detected detection_window_secs={} min_output_progress_units={}",
                 profile.name,
@@ -7118,17 +7170,17 @@ async fn run_stuck_engine_watchdog(
             // cadence instead of collapsing all intervals to a global minimum.
             () = tokio::time::sleep(Duration::from_secs(1)) => {}
             () = shutdown_gate.cancelled() => {
-                drain_watchdog_recoveries(
-                    &mut recovery_tasks,
-                    &mut recovering_profiles,
-                    &mut recovery_task_profiles,
-                    &local_recovery,
-                )
-                .await;
-                return;
+                break 'watchdog;
             },
         }
     }
+    drain_watchdog_recoveries(
+        &mut recovery_tasks,
+        &mut recovering_profiles,
+        &mut recovery_task_profiles,
+        &local_recovery,
+    )
+    .await;
 }
 
 fn scheduled_watchdog_profiles(profiles: &[UpstreamProfileConfig]) -> Vec<(String, Duration)> {
@@ -7245,7 +7297,16 @@ async fn run_watchdog_recovery(
     let mut shutdown_gate = shutdown.subscribe();
     let recovery_policy = policy.clone();
     let recovery_coordinator = Arc::clone(&coordinator);
+    let recovery_shutdown = Arc::clone(&shutdown);
     let mut local_recovery = tokio::spawn(async move {
+        // This task can start on another runtime worker after shutdown closes.
+        // Check before entering recovery so no restart command can be spawned.
+        if recovery_shutdown.is_shutting_down() {
+            return BTreeMap::from([(
+                String::from("local_recovery_status"),
+                String::from("shutdown_cancelled"),
+            )]);
+        }
         run_local_recovery_for_profile(
             &recovery_policy,
             &recovery_coordinator,
@@ -12229,7 +12290,7 @@ struct ForwardedBodyObserver {
 }
 
 impl ForwardedBodyObserver {
-    fn stuck_watchdog_progress_request(&self) -> Option<StuckWatchdogRequest> {
+    fn stuck_watchdog_progress_request(&self) -> Option<StuckWatchdogAttemptProgress> {
         // Shielded aggregation records progress on its internal inspect path; the
         // independent relay is only for bodies whose progress would otherwise be
         // coupled to downstream poll_next.
@@ -12626,7 +12687,7 @@ const OBSERVED_UPSTREAM_RELAY_CAPACITY: usize = 16;
 /// pump so cancellation still reaches upstream.
 fn observe_upstream_body_independently(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-    progress: Option<StuckWatchdogRequest>,
+    progress: Option<StuckWatchdogAttemptProgress>,
 ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send {
     let (tx, rx) = mpsc::channel(OBSERVED_UPSTREAM_RELAY_CAPACITY);
     tokio::spawn(async move {
@@ -12655,6 +12716,9 @@ fn observe_upstream_body_independently(
                 }
                 // Upstream finished; wait for client capacity while delivering
                 // every retained ordered chunk exactly once.
+                if let Some(progress) = &progress {
+                    progress.suspend_observation();
+                }
                 let item = pending.pop_front().expect("non-empty pending queue");
                 if tx.send(item).await.is_err() {
                     return;
@@ -12662,6 +12726,9 @@ fn observe_upstream_body_independently(
                 continue;
             }
             if pending.len() < OBSERVED_UPSTREAM_RELAY_CAPACITY {
+                if let Some(progress) = &progress {
+                    progress.resume_observation();
+                }
                 tokio::select! {
                     biased;
                     () = tx.closed() => return,
@@ -12684,12 +12751,22 @@ fn observe_upstream_body_independently(
             // Downstream is not draining and the ordered buffer is full. Wait for
             // either client capacity or cancellation; never poll and discard more
             // upstream body while the still-open stream cannot retain it.
+            // Mark the attempt before `reserve()` can park: while flow control
+            // blocks this relay, the proxy has no observation path to upstream.
+            if let Some(progress) = &progress {
+                progress.suspend_observation();
+            }
             tokio::select! {
                 biased;
                 () = tx.closed() => return,
                 result = tx.reserve() => match result {
                     Ok(permit) => {
                         let item = pending.pop_front().expect("full pending queue is non-empty");
+                        // A downstream read released capacity. Resume observation
+                        // immediately so the next upstream poll has a fresh maturity window.
+                        if let Some(progress) = &progress {
+                            progress.resume_observation();
+                        }
                         permit.send(item);
                     }
                     Err(_) => return,
