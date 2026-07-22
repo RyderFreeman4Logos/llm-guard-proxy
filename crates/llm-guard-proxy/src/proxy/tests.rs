@@ -379,7 +379,7 @@ fn watchdog_token_samples_are_capped_and_maintained_without_active_requests() {
 }
 
 #[test]
-fn watchdog_prunes_before_every_remote_sample_insertion() {
+fn watchdog_does_not_prune_shared_samples_using_request_snapshots() {
     let tracker = StuckWatchdogTokenTracker::default();
 
     tracker.record_progress("default", Duration::ZERO, 1);
@@ -387,8 +387,14 @@ fn watchdog_prunes_before_every_remote_sample_insertion() {
 
     assert_eq!(
         tracker.sample_count("default"),
-        1,
-        "each sample insertion must prune old peer-controlled samples"
+        2,
+        "per-request snapshot windows must not prune shared samples"
+    );
+    tracker.prune_profile("default", Duration::ZERO);
+    assert_eq!(
+        tracker.sample_count("default"),
+        0,
+        "the current watchdog window owns shared-sample retention"
     );
 }
 

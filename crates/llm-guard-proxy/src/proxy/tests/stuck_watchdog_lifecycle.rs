@@ -46,6 +46,138 @@ fn watchdog_recognizes_every_supported_chat_delta_progress_field() {
     }
 }
 
+#[test]
+fn watchdog_request_snapshot_does_not_prune_shared_samples_after_reload() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let profile = "current-window";
+    let current_config_request = tracker.watch_request(
+        profile,
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1_800),
+    );
+    assert!(current_config_request.record_emitted_chunk(
+        br#"data: {"choices":[{"delta":{"content":"kept"}}]}
+
+    "#,
+    ));
+
+    let stale_config_request =
+        tracker.watch_request(profile, WatchdogProgressUnit::Chat, Duration::ZERO);
+    assert!(stale_config_request.record_emitted_chunk(
+        br#"data: {"choices":[{"delta":{"content":"new"}}]}
+
+    "#,
+    ));
+
+    assert_eq!(
+        tracker.sample_count(profile),
+        2,
+        "an old request's detection-window snapshot must not prune shared profile samples"
+    );
+    assert!(
+        !tracker.has_too_few_output_progress_units(profile, Duration::from_secs(1_800), 2),
+        "the current watchdog window must retain both currently valid samples"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_completed_attempt_lease_ends_before_failover_selection_wait() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let profile = "physical-attempt";
+    let request =
+        tracker.watch_request(profile, WatchdogProgressUnit::Chat, Duration::from_secs(1));
+    let mut completed_attempt = Some(request.begin_attempt());
+    assert!(tracker.has_active_requests(profile));
+
+    // The retryable status or transport failure completed this physical attempt.
+    end_stuck_watchdog_attempt(&mut completed_attempt);
+    assert!(completed_attempt.is_none());
+    assert!(!tracker.has_active_requests(profile));
+
+    // The successor selection can outlast a watchdog window without reviving this lease.
+    let selection_wait = Duration::from_millis(40);
+    tokio::time::sleep(selection_wait).await;
+    assert!(
+        !tracker.has_too_few_output_progress_units(profile, selection_wait, 1),
+        "a completed attempt must not trigger recovery while failover selects its successor"
+    );
+}
+
+#[test]
+fn watchdog_recovery_has_distinct_telemetry_cause() {
+    assert_eq!(
+        watchdog_recovery_cause().as_str(),
+        "stuck_watchdog",
+        "watchdog-triggered recovery must not be attributed to a request upstream stall"
+    );
+}
+
+#[test]
+fn watchdog_non_chat_requires_complete_result_bearing_json() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let cases = [
+        (
+            WatchdogProgressUnit::Embedding,
+            br#"{"data":[{"embedding":[0.1,0.2]}]}"#.as_slice(),
+        ),
+        (
+            WatchdogProgressUnit::Reranker,
+            br#"{"results":[{"index":0,"relevance_score":0.9}]}"#.as_slice(),
+        ),
+    ];
+
+    for (index, (unit, result)) in cases.into_iter().enumerate() {
+        let profile = format!("non-chat-invalid-{index}");
+        for invalid in [
+            b" ".as_slice(),
+            b"{".as_slice(),
+            b"}".as_slice(),
+            b"data: {\n\n".as_slice(),
+        ] {
+            let request = tracker.watch_request(&profile, unit, WATCHDOG_WINDOW);
+            assert!(
+                !request.record_emitted_chunk(invalid),
+                "whitespace, JSON punctuation, and incomplete JSON are not result progress"
+            );
+            assert_eq!(tracker.sample_count(&profile), 0);
+        }
+
+        let request = tracker.watch_request(&profile, unit, WATCHDOG_WINDOW);
+        assert!(
+            request.record_emitted_chunk(result),
+            "a complete response with the endpoint's result field is progress"
+        );
+        assert_eq!(tracker.sample_count(&profile), 1);
+    }
+}
+
+#[test]
+fn watchdog_chat_routing_and_tool_calls_fail_closed() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let request = tracker.watch_request(
+        "malformed-tool-call",
+        WatchdogProgressUnit::Chat,
+        WATCHDOG_WINDOW,
+    );
+
+    assert!(
+        !request.record_emitted_chunk(
+            br#"data: {"choices":[{"delta":{"tool_calls":[false]}}]}
+
+"#,
+        ),
+        "unrecognized tool-call primitives must not be progress"
+    );
+    assert_eq!(tracker.sample_count("malformed-tool-call"), 0);
+
+    let score_substring_path: Uri = "/v1/models/scorecard".parse().expect("URI should parse");
+    assert_eq!(
+        watchdog_progress_unit(&score_substring_path),
+        WatchdogProgressUnit::Chat,
+        "only registered endpoint paths may select non-chat progress parsing"
+    );
+}
+
 #[tokio::test]
 async fn watchdog_lifecycle_does_not_restart_for_tool_call_only_sse() {
     let fake = FakeUpstream::spawn().await;

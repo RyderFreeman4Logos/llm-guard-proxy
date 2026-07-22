@@ -82,10 +82,12 @@ mod reranker_protocol;
 mod score_adapter;
 mod shielded_chat;
 mod upstream_failover;
+mod watchdog_progress;
 
 use upstream_failover::{
     EndpointSelectionConstraints, EndpointSelectionError, UpstreamHealthRegistry,
 };
+use watchdog_progress::{WatchdogProgressUnit, emitted_progress, watchdog_progress_unit};
 
 use buffered_adapter::{
     BufferedResponseAdapter, adapt_openai_request_if_needed,
@@ -5637,6 +5639,7 @@ async fn continue_endpoint_failover(
         terminal_attempt.endpoint.as_ref(),
     ) {
         mark_retryable_endpoint_failure(runtime.retry.registry, &terminal_attempt, &result);
+        end_stuck_watchdog_attempt(&mut terminal_attempt.stuck_watchdog_attempt);
         if attempted_base_urls.len() >= eligible_endpoint_count {
             break;
         }
@@ -6455,28 +6458,13 @@ struct StuckWatchdogAttempt {
     completed: Option<Instant>,
 }
 
-#[derive(Clone, Copy, Debug)]
-enum WatchdogProgressUnit {
-    Chat,
-    Embedding,
-    Reranker,
-}
-
-fn watchdog_progress_unit(uri: &Uri) -> WatchdogProgressUnit {
-    match uri.path() {
-        path if path.contains("embeddings") => WatchdogProgressUnit::Embedding,
-        path if path.contains("rerank") || path.contains("score") => WatchdogProgressUnit::Reranker,
-        _ => WatchdogProgressUnit::Chat,
-    }
-}
-
 #[derive(Debug)]
 struct StuckWatchdogRequestInner {
     tracker: Arc<StuckWatchdogTokenTracker>,
     profile: String,
     progress_unit: WatchdogProgressUnit,
     detection_window: Duration,
-    sse_buffer: Mutex<Vec<u8>>,
+    progress_buffer: Mutex<Vec<u8>>,
     upstream_progress_recorded: AtomicBool,
 }
 
@@ -6521,7 +6509,7 @@ impl StuckWatchdogTokenTracker {
                 profile: profile.to_owned(),
                 progress_unit,
                 detection_window,
-                sse_buffer: Mutex::new(Vec::new()),
+                progress_buffer: Mutex::new(Vec::new()),
                 upstream_progress_recorded: AtomicBool::new(false),
             }),
         }
@@ -6565,7 +6553,9 @@ impl StuckWatchdogTokenTracker {
         };
         let now = Instant::now();
         let window = windows.entry(profile.to_owned()).or_default();
-        prune_watchdog_progress(window, detection_window, now);
+        // Samples are shared by all requests for a profile. A request can retain
+        // an old configuration snapshot, so only the watchdog's current-window
+        // read path is allowed to prune shared progress samples.
         prune_watchdog_attempts(window, detection_window, now);
         after_prune();
         record_watchdog_progress(window, now, progress);
@@ -6676,13 +6666,13 @@ impl StuckWatchdogRequest {
     }
 
     fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
-        let progress = match self.inner.progress_unit {
-            WatchdogProgressUnit::Chat => self.record_sse_content_progress(chunk),
-            // Embedding and reranker endpoints generally omit completion_tokens; a
-            // result-bearing chunk is their endpoint-appropriate progress unit.
-            WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
-                u64::from(!chunk.is_empty())
-            }
+        let progress = {
+            let mut pending = self
+                .inner
+                .progress_buffer
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            emitted_progress(self.inner.progress_unit, &mut pending, chunk)
         };
         self.inner.tracker.record_progress(
             &self.inner.profile,
@@ -6700,27 +6690,6 @@ impl StuckWatchdogRequest {
             return true;
         }
         false
-    }
-
-    fn record_sse_content_progress(&self, chunk: &[u8]) -> u64 {
-        const MAX_PENDING_SSE_BYTES: usize = 64 * 1024;
-        let mut pending = self
-            .inner
-            .sse_buffer
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.extend(chunk.iter().copied().filter(|byte| *byte != b'\r'));
-        if pending.len() > MAX_PENDING_SSE_BYTES {
-            pending.clear();
-            return 0;
-        }
-
-        let mut progress = 0_u64;
-        while let Some(frame_end) = pending.windows(2).position(|window| window == b"\n\n") {
-            let frame = pending.drain(..frame_end + 2).collect::<Vec<_>>();
-            progress = progress.saturating_add(sse_content_progress(&frame));
-        }
-        progress
     }
 }
 
@@ -6766,6 +6735,12 @@ impl Drop for StuckWatchdogAttemptLease {
     }
 }
 
+fn end_stuck_watchdog_attempt(lease: &mut Option<StuckWatchdogAttemptLease>) {
+    if let Some(lease) = lease.take() {
+        lease.end();
+    }
+}
+
 fn window_has_too_few_output_progress_units(
     window: &mut StuckWatchdogTokenWindow,
     detection_window: Duration,
@@ -6791,58 +6766,6 @@ fn window_has_too_few_output_progress_units(
             total.saturating_add(*output_tokens)
         })
         < minimum_output_tokens
-}
-
-fn sse_content_progress(frame: &[u8]) -> u64 {
-    frame
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(b"data:"))
-        .map(trim_ascii)
-        .filter(|data| !data.is_empty() && *data != b"[DONE]")
-        .filter_map(|data| serde_json::from_slice::<serde_json::Value>(data).ok())
-        .filter(sse_event_has_model_content)
-        .count()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
-fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
-    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
-        bytes = &bytes[1..];
-    }
-    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
-        bytes = &bytes[..bytes.len().saturating_sub(1)];
-    }
-    bytes
-}
-
-fn sse_event_has_model_content(event: &serde_json::Value) -> bool {
-    event
-        .get("choices")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|choices| {
-            choices.iter().any(|choice| {
-                let Some(delta) = choice.get("delta").and_then(serde_json::Value::as_object) else {
-                    return false;
-                };
-                ["content", "reasoning_content", "reasoning", "thinking"]
-                    .iter()
-                    .any(|field| {
-                        delta
-                            .get(*field)
-                            .and_then(serde_json::Value::as_str)
-                            .is_some_and(|value| !value.is_empty())
-                    })
-                    || ["tool_calls", "function_call"].iter().any(|field| {
-                        delta.get(*field).is_some_and(|value| match value {
-                            serde_json::Value::Array(values) => !values.is_empty(),
-                            serde_json::Value::Object(values) => !values.is_empty(),
-                            serde_json::Value::Null => false,
-                            _ => true,
-                        })
-                    })
-            })
-        })
 }
 
 fn record_watchdog_progress(window: &mut StuckWatchdogTokenWindow, now: Instant, progress: u64) {
@@ -6992,7 +6915,7 @@ async fn run_stuck_engine_watchdog(
                 continue;
             }
             eprintln!(
-                "llm_guard_proxy_stuck_watchdog profile={} event=detected detection_window_secs={} min_output_tokens={}",
+                "llm_guard_proxy_stuck_watchdog profile={} event=detected detection_window_secs={} min_output_progress_units={}",
                 profile.name,
                 watchdog.detection_window_secs,
                 watchdog.min_output_progress_units_in_window,
@@ -7060,7 +6983,7 @@ async fn run_watchdog_recovery(
             &coordinator,
             client,
             base_url,
-            LocalRecoveryCause::UpstreamStall,
+            watchdog_recovery_cause(),
             Some(episode_timeout),
         ) => recovery,
         () = shutdown_gate.cancelled() => BTreeMap::from([(
@@ -8596,7 +8519,7 @@ async fn shielded_start_failure_step(
 
 async fn shielded_started_attempt_step(
     runtime: &ShieldedRetryRuntime,
-    started: ShieldedStartedAttempt,
+    mut started: ShieldedStartedAttempt,
     attempt_records: &mut Vec<AttemptRecord>,
     allow_terminal_forward: bool,
 ) -> ShieldedAttemptStep {
@@ -8607,6 +8530,7 @@ async fn shielded_started_attempt_step(
 
     if !started.info.upstream_status.is_success() {
         if let Some(cause) = retry_cause_for_upstream_status(started.info.upstream_status) {
+            end_stuck_watchdog_attempt(&mut started.stuck_watchdog_attempt);
             return shielded_retryable_status_step(runtime, &started.info, cause, attempt_records)
                 .await;
         }
@@ -9428,6 +9352,7 @@ fn hot_restart_recovery_metadata(configured: bool) -> BTreeMap<String, String> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalRecoveryCause {
+    StuckWatchdog,
     UpstreamStall,
     TransientStatus,
     TransientTransport,
@@ -9437,12 +9362,17 @@ enum LocalRecoveryCause {
 impl LocalRecoveryCause {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::StuckWatchdog => "stuck_watchdog",
             Self::UpstreamStall => "upstream_stall",
             Self::TransientStatus => "transient_status",
             Self::TransientTransport => "transient_transport",
             Self::RequestDeadline => "request_deadline",
         }
     }
+}
+
+const fn watchdog_recovery_cause() -> LocalRecoveryCause {
+    LocalRecoveryCause::StuckWatchdog
 }
 
 struct LocalRecoveryGate {
