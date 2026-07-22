@@ -6855,6 +6855,93 @@ max_per_window = 1
 }
 
 #[tokio::test]
+async fn disabled_restart_queue_does_not_cap_local_recovery_episode_timeout() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+
+[upstream.stall]
+enabled = true
+first_chunk_timeout_ms = 50
+idle_timeout_ms = 50
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/bin/sleep", "2"]
+restart_timeout_ms = 3000
+readiness_body = {"model":"test-chat","messages":[{"role":"user","content":"disabled queue recovery ready"}],"max_tokens":1}
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 50
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+
+[upstream.restart_queue]
+enabled = false
+queue_deadline_secs = 1
+restart_timeout_secs = 1
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=stall-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"wait for recovery"}]}"#)
+        .send()
+        .await
+        .expect("request should finish after local recovery");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a disabled restart queue must not cancel a local recovery whose own timeout budget permits completion"
+    );
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let first = fake.recv_next().await;
+    let probe = fake.recv_next().await;
+    let replay = fake.recv_next().await;
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=stall-once-then-success"
+    );
+    assert_eq!(probe.path_and_query, "/v1/chat/completions");
+    assert!(body_contains_text(
+        &probe.body,
+        "disabled queue recovery ready"
+    ));
+    assert_eq!(replay.path_and_query, first.path_and_query);
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_status"],
+        "succeeded"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_permits_retry"],
+        "true"
+    );
+    assert_eq!(attempts[1].status, "succeeded");
+}
+
+#[tokio::test]
 async fn local_recovery_chat_readiness() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(

@@ -9769,15 +9769,17 @@ async fn run_local_recovery(
     runtime: &ShieldedRetryRuntime,
     cause: LocalRecoveryCause,
 ) -> BTreeMap<String, String> {
+    let restart_queue = &runtime.upstream_profile.restart_queue;
+    let episode_timeout = restart_queue
+        .enabled
+        .then(|| Duration::from_secs(restart_queue.restart_timeout_secs));
     run_local_recovery_for_profile(
         &runtime.local_recovery_policy,
         &runtime.local_recovery,
         runtime.client.clone(),
         runtime.upstream_profile.primary_base_url().to_owned(),
         cause,
-        Some(Duration::from_secs(
-            runtime.upstream_profile.restart_queue.restart_timeout_secs,
-        )),
+        episode_timeout,
     )
     .await
 }
