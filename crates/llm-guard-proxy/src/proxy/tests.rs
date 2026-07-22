@@ -35,6 +35,9 @@ use super::*;
 
 #[path = "tests/shielded_endpoint_rendering.rs"]
 mod shielded_endpoint_rendering;
+#[cfg(unix)]
+#[path = "tests/stuck_watchdog_lifecycle.rs"]
+mod stuck_watchdog_lifecycle;
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;
@@ -19157,6 +19160,9 @@ fn fake_streaming_chat_completion_response(
     state: &FakeUpstreamState,
     body: &Bytes,
 ) -> Option<Response<Body>> {
+    if path_and_query.contains("test=watchdog-tool-call-only") {
+        return Some(repeated_tool_fingerprint_sse_response());
+    }
     if let Some(response) =
         fake_compat_and_loop_once_chat_completion_response(path_and_query, state, body)
     {

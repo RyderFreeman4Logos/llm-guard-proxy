@@ -630,18 +630,20 @@ impl ProxyState {
         profile: &UpstreamProfileConfig,
         coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
     ) -> Result<Option<RestartQueuePermit>, ProxyError> {
-        if !coordinator.state.lock().await.running {
-            return Ok(None);
-        }
         let config = self
             .config
             .snapshot()
             .map_err(|error| ProxyError::config_snapshot(error.to_string()))?;
         let max_queued = profile.effective_max_queued_generation_requests(&config.server);
-        let Some(queued) = self
-            .generation_limiter_for_profile(profile)
-            .try_enqueue(max_queued)
-        else {
+        let limiter = self.generation_limiter_for_profile(profile);
+        // Recovery may start or finish while requests are admitted. Hold its
+        // coordinator state lock through queue registration so every request
+        // that observes a running episode owns a bounded queue permit.
+        let recovery = coordinator.state.lock().await;
+        if !recovery.running {
+            return Ok(None);
+        }
+        let Some(queued) = limiter.try_enqueue(max_queued) else {
             return Err(ProxyError::upstream_unavailable(
                 profile.name.clone(),
                 config.server.generation_queue_timeout_ms,
@@ -650,6 +652,7 @@ impl ProxyState {
         coordinator
             .restart_queue_depth
             .fetch_add(1, Ordering::Relaxed);
+        drop(recovery);
         Ok(Some(RestartQueuePermit {
             _queued: queued,
             coordinator: Arc::clone(coordinator),
@@ -4862,6 +4865,12 @@ async fn forward_generic_endpoint_response(
             rewritten,
         )),
         EndpointResponse::Upstream(upstream_response) => {
+            if let Some(watchdog_request) = response_parts.stuck_watchdog_request.as_ref() {
+                // The reqwest response exists only after the upstream has sent
+                // response headers. Record this before handing the body to any
+                // downstream-owned stream, which may be paused by backpressure.
+                watchdog_request.record_upstream_response_started();
+            }
             if let Some(adapter) = context
                 .response_adapter
                 .map(|adapter| adapter.with_terminal_protocol(terminal_endpoint_protocol))
@@ -6406,13 +6415,22 @@ struct UpstreamStallRecoveryState {
 #[derive(Debug, Default)]
 struct StuckWatchdogTokenTracker {
     windows: Mutex<HashMap<String, StuckWatchdogTokenWindow>>,
+    next_attempt_id: AtomicU64,
 }
 
 #[derive(Debug, Default)]
 struct StuckWatchdogTokenWindow {
     samples: VecDeque<(Instant, u64)>,
-    active_requests: usize,
-    active_since: Option<Instant>,
+    attempts: HashMap<u64, StuckWatchdogAttempt>,
+}
+
+/// Upstream liveness is scoped to a concrete attempt rather than a profile-wide
+/// aggregate, so an older completion cannot age a newer request into recovery.
+#[derive(Debug)]
+struct StuckWatchdogAttempt {
+    started_at: Instant,
+    response_started: Option<Instant>,
+    completed: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6434,6 +6452,7 @@ fn watchdog_progress_unit(uri: &Uri) -> WatchdogProgressUnit {
 struct StuckWatchdogRequestInner {
     tracker: Arc<StuckWatchdogTokenTracker>,
     profile: String,
+    attempt_id: u64,
     progress_unit: WatchdogProgressUnit,
     detection_window: Duration,
     sse_buffer: Mutex<Vec<u8>>,
@@ -6456,14 +6475,20 @@ impl StuckWatchdogTokenTracker {
             Err(poisoned) => poisoned.into_inner(),
         };
         let window = windows.entry(profile.to_owned()).or_default();
-        if window.active_requests == 0 {
-            window.active_since = Some(Instant::now());
-        }
-        window.active_requests = window.active_requests.saturating_add(1);
+        let attempt_id = self.next_attempt_id.fetch_add(1, Ordering::Relaxed);
+        window.attempts.insert(
+            attempt_id,
+            StuckWatchdogAttempt {
+                started_at: Instant::now(),
+                response_started: None,
+                completed: None,
+            },
+        );
         StuckWatchdogRequest {
             inner: Arc::new(StuckWatchdogRequestInner {
                 tracker: Arc::clone(self),
                 profile: profile.to_owned(),
+                attempt_id,
                 progress_unit,
                 detection_window,
                 sse_buffer: Mutex::new(Vec::new()),
@@ -6526,7 +6551,9 @@ impl StuckWatchdogTokenTracker {
             Err(poisoned) => poisoned.into_inner(),
         };
         if let Some(window) = windows.get_mut(profile) {
-            prune_watchdog_progress(window, detection_window, Instant::now());
+            let now = Instant::now();
+            prune_watchdog_progress(window, detection_window, now);
+            prune_watchdog_attempts(window, detection_window, now);
         }
     }
 
@@ -6556,13 +6583,32 @@ impl StuckWatchdogTokenTracker {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        windows
-            .get(profile)
-            .is_some_and(|window| window.active_requests > 0)
+        windows.get(profile).is_some_and(|window| {
+            window
+                .attempts
+                .values()
+                .any(|attempt| attempt.completed.is_none())
+        })
     }
 }
 
 impl StuckWatchdogRequest {
+    /// Response headers were received from the upstream before the body is
+    /// handed to the client.  This intentionally does not depend on downstream
+    /// consumption, which can be paused indefinitely by client backpressure.
+    fn record_upstream_response_started(&self) {
+        let mut windows = match self.inner.tracker.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(attempt) = windows
+            .get_mut(&self.inner.profile)
+            .and_then(|window| window.attempts.get_mut(&self.inner.attempt_id))
+        {
+            attempt.response_started.get_or_insert_with(Instant::now);
+        }
+    }
+
     fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
         self.inner.tracker.record_response(
             &self.inner.profile,
@@ -6616,11 +6662,11 @@ impl Drop for StuckWatchdogRequestInner {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(window) = windows.get_mut(&self.profile) {
-            window.active_requests = window.active_requests.saturating_sub(1);
-            if window.active_requests == 0 {
-                window.active_since = None;
-            }
+        if let Some(attempt) = windows
+            .get_mut(&self.profile)
+            .and_then(|window| window.attempts.get_mut(&self.attempt_id))
+        {
+            attempt.completed = Some(Instant::now());
         }
     }
 }
@@ -6631,10 +6677,16 @@ fn window_has_too_few_output_tokens(
     minimum_output_tokens: u64,
     now: Instant,
 ) -> bool {
-    if window.active_requests > 0
-        && window
-            .active_since
-            .is_none_or(|started| now.saturating_duration_since(started) < detection_window)
+    prune_watchdog_attempts(window, detection_window, now);
+    let mut active_attempts = window
+        .attempts
+        .values()
+        .filter(|attempt| attempt.completed.is_none());
+    if active_attempts
+        .clone()
+        .any(|attempt| attempt.response_started.is_some())
+        || active_attempts
+            .any(|attempt| now.saturating_duration_since(attempt.started_at) < detection_window)
     {
         return false;
     }
@@ -6680,13 +6732,21 @@ fn sse_event_has_model_content(event: &serde_json::Value) -> bool {
                 let Some(delta) = choice.get("delta").and_then(serde_json::Value::as_object) else {
                     return false;
                 };
-                ["content", "reasoning_content", "reasoning"]
+                ["content", "reasoning_content", "reasoning", "thinking"]
                     .iter()
                     .any(|field| {
                         delta
                             .get(*field)
                             .and_then(serde_json::Value::as_str)
                             .is_some_and(|value| !value.is_empty())
+                    })
+                    || ["tool_calls", "function_call"].iter().any(|field| {
+                        delta.get(*field).is_some_and(|value| match value {
+                            serde_json::Value::Array(values) => !values.is_empty(),
+                            serde_json::Value::Object(values) => !values.is_empty(),
+                            serde_json::Value::Null => false,
+                            _ => true,
+                        })
                     })
             })
         })
@@ -6715,9 +6775,30 @@ fn prune_watchdog_progress(
     }
 }
 
+fn prune_watchdog_attempts(
+    window: &mut StuckWatchdogTokenWindow,
+    detection_window: Duration,
+    now: Instant,
+) {
+    let Some(threshold) = now.checked_sub(detection_window) else {
+        return;
+    };
+    window.attempts.retain(|_, attempt| {
+        attempt
+            .completed
+            .is_none_or(|completed_at| completed_at >= threshold)
+    });
+}
+
 #[derive(Debug, Default)]
 struct WatchdogSchedule {
-    next_due: HashMap<String, Instant>,
+    next_due: HashMap<String, WatchdogScheduleEntry>,
+}
+
+#[derive(Debug)]
+struct WatchdogScheduleEntry {
+    next_due: Instant,
+    applied_interval: Duration,
 }
 
 impl WatchdogSchedule {
@@ -6725,9 +6806,17 @@ impl WatchdogSchedule {
         profiles
             .iter()
             .filter_map(|(name, interval)| {
-                let due = self.next_due.get(name).is_none_or(|next| *next <= now);
+                let due = self.next_due.get(name).is_none_or(|entry| {
+                    entry.next_due <= now || entry.applied_interval != *interval
+                });
                 due.then(|| {
-                    self.next_due.insert(name.clone(), now + *interval);
+                    self.next_due.insert(
+                        name.clone(),
+                        WatchdogScheduleEntry {
+                            next_due: now + *interval,
+                            applied_interval: *interval,
+                        },
+                    );
                     name.clone()
                 })
             })
@@ -6823,6 +6912,7 @@ async fn run_stuck_engine_watchdog(
             recovery_tasks.spawn(run_watchdog_recovery(
                 profile_name,
                 policy,
+                Duration::from_secs(profile.restart_queue.restart_timeout_secs),
                 coordinator,
                 client.clone(),
                 profile.base_url.clone(),
@@ -6863,6 +6953,7 @@ fn collect_finished_watchdog_recoveries(
 async fn run_watchdog_recovery(
     profile_name: String,
     policy: LocalRecoveryPolicy,
+    episode_timeout: Duration,
     coordinator: Arc<UpstreamStallRecoveryCoordinator>,
     client: Client,
     base_url: String,
@@ -6876,6 +6967,7 @@ async fn run_watchdog_recovery(
             client,
             base_url,
             LocalRecoveryCause::UpstreamStall,
+            Some(episode_timeout),
         ) => recovery,
         () = shutdown_gate.cancelled() => BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -6896,7 +6988,7 @@ fn record_watchdog_recovery_result(
                 .watchdog_recovery_successes
                 .fetch_add(1, Ordering::Relaxed);
         }
-        Some("completion_timeout" | "join_timeout" | "readiness_timeout") => {
+        Some("completion_timeout" | "episode_timeout" | "join_timeout" | "readiness_timeout") => {
             coordinator
                 .watchdog_recovery_timeouts
                 .fetch_add(1, Ordering::Relaxed);
@@ -6990,9 +7082,14 @@ async fn wait_for_profile_restart_queue(
     // Restart waiters are deliberately accounted in the bounded queue, never in
     // generation in-flight capacity. The caller has released its routing permit
     // before reaching this wait.
-    let _restart_queue_permit = state
+    let Some(_restart_queue_permit) = state
         .acquire_restart_queue_permit(profile, &coordinator)
-        .await?;
+        .await?
+    else {
+        // This request atomically observed no recovery while registering, so it
+        // must not wait for a later episode without a queue admission permit.
+        return Ok(());
+    };
     match wait_for_restart_queue(&coordinator, queue_deadline).await {
         RestartQueueWaitResult::NotRecovering => Ok(()),
         RestartQueueWaitResult::Ready => {
@@ -9430,6 +9527,9 @@ async fn run_local_recovery(
         runtime.client.clone(),
         runtime.upstream_profile.base_url.clone(),
         cause,
+        Some(Duration::from_secs(
+            runtime.upstream_profile.restart_queue.restart_timeout_secs,
+        )),
     )
     .await
 }
@@ -9440,6 +9540,7 @@ async fn run_local_recovery_for_profile(
     client: Client,
     base_url: String,
     cause: LocalRecoveryCause,
+    episode_timeout: Option<Duration>,
 ) -> BTreeMap<String, String> {
     let mut state = coordinator.state.lock().await;
     if state.running {
@@ -9492,46 +9593,81 @@ async fn run_local_recovery_for_profile(
 
     state.running = true;
     state.recovery_started = Some(now);
+    let recovery_timeout = policy
+        .restart_timeout
+        .saturating_add(policy.readiness_deadline)
+        .saturating_add(Duration::from_secs(1));
     state.recovery_deadline = Some(
-        now + policy
-            .restart_timeout
-            .saturating_add(policy.readiness_deadline)
-            .saturating_add(Duration::from_secs(1)),
+        now + episode_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
     );
     state.runs_in_window = state.runs_in_window.saturating_add(1);
     drop(state);
 
-    let task_policy = policy.clone();
-    let task_coordinator = Arc::clone(coordinator);
-    tokio::spawn(async move {
-        let mut metadata = BTreeMap::from([(
-            String::from("local_recovery_trigger_cause"),
-            cause.as_str().to_owned(),
-        )]);
-        metadata.extend(run_local_recovery_restart_command(&task_policy).await);
-        if metadata
-            .get("local_recovery_restart_status")
-            .is_some_and(|status| status == "succeeded")
-        {
-            metadata.extend(run_local_recovery_readiness(client, base_url, &task_policy).await);
-        }
-        if !metadata.contains_key("local_recovery_status") {
-            let status = match metadata
-                .get("local_recovery_readiness_status")
-                .map(String::as_str)
-            {
-                Some("ready") => "succeeded",
-                Some("timeout") => "readiness_timeout",
-                Some("error") => "readiness_error",
-                Some(_) => "readiness_not_ready",
-                None => "restart_failed",
-            };
-            metadata.insert(String::from("local_recovery_status"), status.to_owned());
-        }
-        finish_upstream_stall_recovery(&task_coordinator, metadata).await;
-    });
+    spawn_local_recovery_task(
+        policy.clone(),
+        Arc::clone(coordinator),
+        client,
+        base_url,
+        cause,
+        episode_timeout,
+    );
 
     wait_for_local_recovery_result(policy, coordinator, false).await
+}
+
+fn spawn_local_recovery_task(
+    policy: LocalRecoveryPolicy,
+    coordinator: Arc<UpstreamStallRecoveryCoordinator>,
+    client: Client,
+    base_url: String,
+    cause: LocalRecoveryCause,
+    episode_timeout: Option<Duration>,
+) {
+    tokio::spawn(async move {
+        let trigger_cause = cause.as_str().to_owned();
+        let recovery_trigger_cause = trigger_cause.clone();
+        let recovery = async {
+            let mut metadata = BTreeMap::from([(
+                String::from("local_recovery_trigger_cause"),
+                recovery_trigger_cause,
+            )]);
+            metadata.extend(run_local_recovery_restart_command(&policy).await);
+            if metadata
+                .get("local_recovery_restart_status")
+                .is_some_and(|status| status == "succeeded")
+            {
+                metadata.extend(run_local_recovery_readiness(client, base_url, &policy).await);
+            }
+            if !metadata.contains_key("local_recovery_status") {
+                let status = match metadata
+                    .get("local_recovery_readiness_status")
+                    .map(String::as_str)
+                {
+                    Some("ready") => "succeeded",
+                    Some("timeout") => "readiness_timeout",
+                    Some("error") => "readiness_error",
+                    Some(_) => "readiness_not_ready",
+                    None => "restart_failed",
+                };
+                metadata.insert(String::from("local_recovery_status"), status.to_owned());
+            }
+            metadata
+        };
+        let metadata = match episode_timeout {
+            Some(timeout_duration) => match timeout(timeout_duration, recovery).await {
+                Ok(metadata) => metadata,
+                Err(_elapsed) => BTreeMap::from([
+                    (String::from("local_recovery_trigger_cause"), trigger_cause),
+                    (
+                        String::from("local_recovery_status"),
+                        String::from("episode_timeout"),
+                    ),
+                ]),
+            },
+            None => recovery.await,
+        };
+        finish_upstream_stall_recovery(&coordinator, metadata).await;
+    });
 }
 
 async fn wait_for_local_recovery_result(
@@ -10082,6 +10218,14 @@ async fn wait_for_recovery_child_with_timeout(
     metadata
 }
 
+/// Shielded attempts buffer the upstream independently of downstream response
+/// consumption, so headers must count as progress before aggregation begins.
+fn record_shielded_attempt_response_start(runtime: &ShieldedRetryRuntime) {
+    if let Some(watchdog_request) = runtime.stuck_watchdog_request.as_ref() {
+        watchdog_request.record_upstream_response_started();
+    }
+}
+
 async fn start_shielded_attempt(
     runtime: &ShieldedRetryRuntime,
     attempt_number: u32,
@@ -10162,6 +10306,7 @@ async fn start_shielded_attempt(
             )),
         )));
     };
+    record_shielded_attempt_response_start(runtime);
     let upstream_status = response.status();
     let upstream_headers = response.headers().clone();
     let upstream_mode = upstream_mode_from_headers(&upstream_headers);
