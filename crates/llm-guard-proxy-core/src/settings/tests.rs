@@ -216,6 +216,7 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.server.generation_queue_retry_after_secs, None);
     assert_eq!(config.server.max_control_plane_in_flight_requests, 128);
     assert_eq!(config.server.max_request_body_bytes, 67_108_864);
+    assert_eq!(config.server.max_restart_queue_body_bytes, 268_435_456);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
     assert_eq!(config.upstream.request_timeout_ms, 120_000);
     assert!(config.upstream.metadata.discovery_enabled);
@@ -3197,6 +3198,19 @@ fn validates_request_body_limit_bounds() {
     assert_eq!(error.field(), "server.max_request_body_bytes");
 
     config = AppConfig::default();
+    config.server.max_restart_queue_body_bytes = 0;
+    let error = config
+        .validate()
+        .expect_err("zero restart-queue body budget should fail");
+    assert_eq!(error.field(), "server.max_restart_queue_body_bytes");
+
+    config.server.max_restart_queue_body_bytes = 4_294_967_297;
+    let error = config
+        .validate()
+        .expect_err("excessive restart-queue body budget should fail");
+    assert_eq!(error.field(), "server.max_restart_queue_body_bytes");
+
+    config = AppConfig::default();
     config.server.shutdown_drain_timeout_ms = 0;
     let error = config
         .validate()
@@ -3819,6 +3833,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"server.generation_queue_retry_after_secs"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_control_plane_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_request_body_bytes"));
+    assert!(RELOADABLE_FIELDS.contains(&"server.max_restart_queue_body_bytes"));
     assert!(RELOADABLE_FIELDS.contains(&"server.shutdown_drain_timeout_ms"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.mode"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.on_reasoning_loop"));

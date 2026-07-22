@@ -30,6 +30,10 @@ max_control_plane_in_flight_requests = 128
 # exhaustion from large payloads.
 max_request_body_bytes = 4194304
 
+# Aggregate body bytes retained across restart-queue waiters while recovery
+# runs. Independent of max_queued_generation_requests × max_request_body_bytes.
+max_restart_queue_body_bytes = 134217728
+
 # Maximum graceful shutdown drain wait after SIGTERM starts cancellation.
 # shutdown_drain_timeout_ms = 30000
 

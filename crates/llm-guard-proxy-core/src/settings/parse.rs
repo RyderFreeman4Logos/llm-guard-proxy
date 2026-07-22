@@ -1170,6 +1170,10 @@ fn assign_server(
             config.max_request_body_bytes =
                 parse_usize(value, line_number, "server.max_request_body_bytes")?;
         }
+        "max_restart_queue_body_bytes" => {
+            config.max_restart_queue_body_bytes =
+                parse_u64(value, line_number, "server.max_restart_queue_body_bytes")?;
+        }
         "shutdown_drain_timeout_ms" => {
             config.shutdown_drain_timeout_ms =
                 parse_u64(value, line_number, "server.shutdown_drain_timeout_ms")?;

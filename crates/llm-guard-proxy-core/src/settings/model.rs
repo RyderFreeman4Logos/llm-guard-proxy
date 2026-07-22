@@ -886,6 +886,7 @@ impl AppConfig {
         self.server.max_control_plane_in_flight_requests =
             requested.server.max_control_plane_in_flight_requests;
         self.server.max_request_body_bytes = requested.server.max_request_body_bytes;
+        self.server.max_restart_queue_body_bytes = requested.server.max_restart_queue_body_bytes;
         self.server.shutdown_drain_timeout_ms = requested.server.shutdown_drain_timeout_ms;
         self.shielding = requested.shielding.clone();
         self.observability.enabled = requested.observability.enabled;
@@ -1325,6 +1326,8 @@ pub struct ServerConfig {
     pub max_control_plane_in_flight_requests: usize,
     /// Maximum downstream request body bytes buffered before forwarding.
     pub max_request_body_bytes: usize,
+    /// Aggregate body bytes retained by restart-queue waiters across all requests.
+    pub max_restart_queue_body_bytes: u64,
     /// Maximum milliseconds to wait for graceful shutdown after accepting stops.
     pub shutdown_drain_timeout_ms: u64,
 }
@@ -1378,6 +1381,16 @@ impl ServerConfig {
             "must be less than or equal to 1073741824",
         )?;
         require(
+            self.max_restart_queue_body_bytes > 0,
+            "server.max_restart_queue_body_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.max_restart_queue_body_bytes <= 4_294_967_296,
+            "server.max_restart_queue_body_bytes",
+            "must be less than or equal to 4294967296",
+        )?;
+        require(
             self.shutdown_drain_timeout_ms > 0,
             "server.shutdown_drain_timeout_ms",
             "must be greater than zero",
@@ -1402,6 +1415,9 @@ impl Default for ServerConfig {
             generation_queue_retry_after_secs: None,
             max_control_plane_in_flight_requests: 128,
             max_request_body_bytes: 67_108_864,
+            // Independent of request-count × body-size products: restart waiters keep
+            // full request bodies, so the aggregate reservation must be bounded alone.
+            max_restart_queue_body_bytes: 268_435_456,
             shutdown_drain_timeout_ms: 30_000,
         }
     }

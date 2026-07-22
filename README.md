@@ -200,6 +200,8 @@ port = 18009
 max_in_flight_requests = 16
 max_control_plane_in_flight_requests = 128
 max_request_body_bytes = 67108864
+# Aggregate body bytes retained by restart-queue waiters (default 256 MiB).
+# max_restart_queue_body_bytes = 268435456
 
 [[listeners]]
 name = "embedding-legacy"
@@ -425,6 +427,7 @@ Reloadable fields:
 - `server.generation_queue_timeout_ms`
 - `server.max_control_plane_in_flight_requests`
 - `server.max_request_body_bytes`
+- `server.max_restart_queue_body_bytes`
 - `shielding.enabled`
 - `observability.enabled`
 - `observability.capture_raw_payloads`

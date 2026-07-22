@@ -590,6 +590,146 @@ fn watchdog_progress_units_count_one_multi_token_chat_delta() {
     attempt.end();
 }
 
+#[test]
+fn watchdog_records_complete_progress_frames_at_and_above_pending_buffer_cap() {
+    // 64 KiB is the incomplete-tail residual cap. Complete protocol frames must
+    // be drained first so a single large healthy emission still counts.
+    for payload_len in [65_536_usize, 65_537_usize] {
+        let cases = [
+            (
+                WatchdogProgressUnit::Chat,
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                    "c".repeat(payload_len)
+                )
+                .into_bytes(),
+            ),
+            (
+                WatchdogProgressUnit::Completion,
+                format!(
+                    "data: {{\"choices\":[{{\"text\":\"{}\"}}]}}\n\n",
+                    "t".repeat(payload_len)
+                )
+                .into_bytes(),
+            ),
+            (
+                WatchdogProgressUnit::Embedding,
+                format!(
+                    "{{\"data\":[{{\"embedding\":[0.1],\"text\":\"{}\"}}]}}",
+                    "e".repeat(payload_len)
+                )
+                .into_bytes(),
+            ),
+            (
+                WatchdogProgressUnit::Reranker,
+                format!(
+                    "{{\"results\":[{{\"index\":0,\"relevance_score\":0.9,\"document\":\"{}\"}}]}}",
+                    "r".repeat(payload_len)
+                )
+                .into_bytes(),
+            ),
+        ];
+
+        for (unit, frame) in cases {
+            assert!(
+                frame.len() >= payload_len,
+                "constructed progress frame must cover the requested boundary"
+            );
+            let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+            let profile = format!("{unit:?}-{payload_len}");
+            let request = tracker.watch_request(&profile, unit, Duration::from_secs(1));
+            let attempt = request.begin_attempt();
+            assert!(
+                attempt.record_emitted_chunk(&frame),
+                "complete {unit:?} frame of {} bytes must count as progress",
+                frame.len()
+            );
+            assert_eq!(
+                tracker.sample_count(&profile),
+                1,
+                "complete {unit:?} progress must survive the incomplete-tail cap"
+            );
+            attempt.end();
+        }
+    }
+}
+
+#[tokio::test]
+async fn restart_queue_rejects_when_aggregate_queued_body_budget_is_exhausted() {
+    // Concurrent large bodies with an explicit aggregate ceiling smaller than
+    // request-count × per-body size prove the independent body budget.
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        4,
+        "max_queued_generation_requests = 8\nmax_restart_queue_body_bytes = 100\n",
+    )
+    .await;
+    let mut profile = AppConfig::default().default_upstream_profile();
+    profile.restart_queue.enabled = true;
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    coordinator.state.lock().await.running = true;
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let state = proxy.state.clone();
+        let profile = profile.clone();
+        let coordinator = Arc::clone(&coordinator);
+        join_set.spawn(async move {
+            state
+                .acquire_restart_queue_permit(&profile, &coordinator, 40)
+                .await
+                .map_err(|error| error.status())
+        });
+    }
+
+    let mut admitted = Vec::new();
+    let mut rejected = 0_usize;
+    while let Some(result) = join_set.join_next().await {
+        match result.expect("concurrent restart-queue admission task must join") {
+            Ok(Some(permit)) => admitted.push(permit),
+            Ok(None) => panic!("active recovery must attempt queue admission"),
+            Err(status) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                rejected = rejected.saturating_add(1);
+            }
+        }
+    }
+
+    let reserved = proxy
+        .state
+        .generation_requests
+        .snapshot_counts()
+        .queued_body_bytes;
+    assert_eq!(reserved, admitted.len() as u64 * 40);
+    assert!(
+        reserved <= 100,
+        "aggregate queued body reservation must stay within the explicit ceiling"
+    );
+    assert_eq!(
+        admitted.len(),
+        2,
+        "equal concurrent bodies must saturate the independent aggregate ceiling exactly"
+    );
+    assert_eq!(
+        rejected, 2,
+        "over-budget concurrent admissions must fail closed before retaining body"
+    );
+    assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 2);
+
+    drop(admitted);
+    assert_eq!(
+        proxy
+            .state
+            .generation_requests
+            .snapshot_counts()
+            .queued_body_bytes,
+        0
+    );
+    assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 0);
+}
+
 #[tokio::test]
 async fn restart_queue_uses_episode_deadline_not_a_fresh_wait_per_request() {
     let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
@@ -629,7 +769,7 @@ async fn restart_queue_waiters_consume_queue_capacity_not_in_flight_capacity() {
 
     let permit = proxy
         .state
-        .acquire_restart_queue_permit(&profile, &coordinator)
+        .acquire_restart_queue_permit(&profile, &coordinator, 0)
         .await
         .expect("restart queue admission should succeed")
         .expect("active recovery should acquire a queue permit");

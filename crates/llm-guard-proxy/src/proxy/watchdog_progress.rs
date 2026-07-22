@@ -25,13 +25,10 @@ pub(super) fn emitted_progress(
     pending: &mut Vec<u8>,
     chunk: &[u8],
 ) -> u64 {
+    // Append first, then parse complete protocol units. The incomplete residual is
+    // the only buffer that may grow; its size is capped after draining complete frames.
     pending.extend(chunk.iter().copied().filter(|byte| *byte != b'\r'));
-    if pending.len() > MAX_PENDING_PROGRESS_BYTES {
-        pending.clear();
-        return 0;
-    }
-
-    match progress_unit {
+    let progress = match progress_unit {
         WatchdogProgressUnit::Chat => complete_sse_progress(pending, sse_event_has_model_content),
         WatchdogProgressUnit::Completion => {
             complete_sse_progress(pending, sse_event_has_completion_text)
@@ -39,7 +36,13 @@ pub(super) fn emitted_progress(
         WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
             complete_result_progress(progress_unit, pending)
         }
+    };
+    if pending.len() > MAX_PENDING_PROGRESS_BYTES {
+        // Incomplete tail only: discarding an oversized residual avoids unbounded growth
+        // without dropping already-recognized complete progress frames.
+        pending.clear();
     }
+    progress
 }
 
 fn complete_sse_progress<F>(pending: &mut Vec<u8>, event_has_progress: F) -> u64

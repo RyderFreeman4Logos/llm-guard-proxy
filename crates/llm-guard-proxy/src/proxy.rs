@@ -631,21 +631,27 @@ impl ProxyState {
         &self,
         profile: &UpstreamProfileConfig,
         coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+        body_bytes: u64,
     ) -> Result<Option<RestartQueuePermit>, ProxyError> {
         let config = self
             .config
             .snapshot()
             .map_err(|error| ProxyError::config_snapshot(error.to_string()))?;
         let max_queued = profile.effective_max_queued_generation_requests(&config.server);
+        let max_queued_body_bytes = config.server.max_restart_queue_body_bytes;
         let limiter = self.generation_limiter_for_profile(profile);
         // Recovery may start or finish while requests are admitted. Hold its
         // coordinator state lock through queue registration so every request
-        // that observes a running episode owns a bounded queue permit.
+        // that observes a running episode owns a bounded queue permit. Body
+        // bytes are reserved for the full waiter lifetime so aggregate memory
+        // cannot exceed max_restart_queue_body_bytes independently of count.
         let recovery = coordinator.state.lock().await;
         if !recovery.running {
             return Ok(None);
         }
-        let Some(queued) = limiter.try_enqueue(max_queued) else {
+        let Some(queued) =
+            limiter.try_enqueue_with_body(max_queued, max_queued_body_bytes, body_bytes)
+        else {
             return Err(ProxyError::upstream_unavailable(
                 profile.name.clone(),
                 config.server.generation_queue_timeout_ms,
@@ -1039,6 +1045,33 @@ impl InFlightLimiter {
         counts.queued = counts.queued.saturating_add(1);
         Some(QueuedAdmissionPermit {
             limiter: Arc::clone(self),
+            body_bytes: 0,
+        })
+    }
+
+    fn try_enqueue_with_body(
+        self: &Arc<Self>,
+        max_queued_requests: usize,
+        max_queued_body_bytes: u64,
+        body_bytes: u64,
+    ) -> Option<QueuedAdmissionPermit> {
+        let mut counts = admission_counts(&self.counts);
+        if counts.queued >= max_queued_requests {
+            return None;
+        }
+        if counts
+            .queued_body_bytes
+            .checked_add(body_bytes)
+            .is_none_or(|total| total > max_queued_body_bytes)
+        {
+            return None;
+        }
+
+        counts.queued = counts.queued.saturating_add(1);
+        counts.queued_body_bytes = counts.queued_body_bytes.saturating_add(body_bytes);
+        Some(QueuedAdmissionPermit {
+            limiter: Arc::clone(self),
+            body_bytes,
         })
     }
 
@@ -1055,9 +1088,10 @@ impl InFlightLimiter {
         self.notify.notify_waiters();
     }
 
-    fn leave_queue(&self) {
+    fn leave_queue(&self, body_bytes: u64) {
         let mut counts = admission_counts(&self.counts);
         counts.queued = counts.queued.saturating_sub(1);
+        counts.queued_body_bytes = counts.queued_body_bytes.saturating_sub(body_bytes);
         self.notify.notify_waiters();
     }
 
@@ -1117,6 +1151,7 @@ fn guard_outcome_after_workflow_task(
 struct AdmissionCounts {
     active: usize,
     queued: usize,
+    queued_body_bytes: u64,
 }
 
 #[derive(Debug)]
@@ -1281,11 +1316,12 @@ impl Drop for InFlightPermit {
 #[derive(Debug)]
 struct QueuedAdmissionPermit {
     limiter: Arc<InFlightLimiter>,
+    body_bytes: u64,
 }
 
 impl Drop for QueuedAdmissionPermit {
     fn drop(&mut self) {
-        self.limiter.leave_queue();
+        self.limiter.leave_queue(self.body_bytes);
     }
 }
 
@@ -3422,9 +3458,16 @@ async fn wait_for_restart_queue_and_readmit(
 ) -> Result<OpenAiBodyAdmission, ProxyError> {
     // Both provisional admission paths use capacity only to route/read the body.
     // A restart waiter must release that capacity before entering the dedicated queue.
+    // Body retention is admitted under max_restart_queue_body_bytes before waiting.
     drop(in_flight_permit);
-    let restart_queue_outcome =
-        wait_for_profile_restart_queue(state, &profile, &mut body_read_request_metadata).await?;
+    let body_bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
+    let restart_queue_outcome = wait_for_profile_restart_queue(
+        state,
+        &profile,
+        body_bytes,
+        &mut body_read_request_metadata,
+    )
+    .await?;
     let restart_queue_metadata = restart_queue_outcome.request_metadata();
     body_read_request_metadata.extend(restart_queue_metadata.clone());
     let record_context =
@@ -7170,6 +7213,7 @@ async fn wait_for_restart_queue(
 async fn wait_for_profile_restart_queue(
     state: &ProxyState,
     profile: &UpstreamProfileConfig,
+    body_bytes: u64,
     request_metadata: &mut BTreeMap<String, String>,
 ) -> Result<RestartQueueWaitOutcome, ProxyError> {
     let wait_started = Instant::now();
@@ -7184,9 +7228,9 @@ async fn wait_for_profile_restart_queue(
     let coordinator = state.local_recovery.coordinator_for(&profile.name);
     // Restart waiters are deliberately accounted in the bounded queue, never in
     // generation in-flight capacity. The caller has released its routing permit
-    // before reaching this wait.
+    // before reaching this wait. Body-byte budget is reserved with the permit.
     let Some(restart_queue_permit) = state
-        .acquire_restart_queue_permit(profile, &coordinator)
+        .acquire_restart_queue_permit(profile, &coordinator, body_bytes)
         .await?
     else {
         // This request atomically observed no recovery while registering, so it

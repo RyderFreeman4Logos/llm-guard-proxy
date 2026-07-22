@@ -253,6 +253,35 @@ async fn watchdog_lifecycle_does_not_restart_for_tool_call_only_sse() {
 }
 
 #[tokio::test]
+async fn watchdog_lifecycle_does_not_restart_for_large_complete_chat_progress() {
+    let fake = FakeUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("large-complete-chat-progress");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let config = touch_recovery_watchdog_config(&marker, 1);
+    let proxy = spawn_watchdog_proxy(&fake.base_url, &config).await;
+    let request = proxy.state.stuck_watchdog_tokens.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        WATCHDOG_WINDOW,
+    );
+    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+
+    sleep(Duration::from_millis(600)).await;
+    let content = "x".repeat(65_537);
+    request.record_emitted_chunk(&chat_delta_sse(&serde_json::json!({ "content": content })));
+    sleep(Duration::from_millis(650)).await;
+    let restarted = marker.exists();
+
+    drop(request);
+    stop_watchdog(&proxy, watchdog).await;
+    assert!(
+        !restarted,
+        "a complete SSE frame larger than the incomplete-tail residual cap is healthy progress"
+    );
+}
+
+#[tokio::test]
 async fn watchdog_lifecycle_records_progress_while_rewriting_a_heterogeneous_reranker_body() {
     let upstream = SlowHeterogeneousRerankerUpstream::spawn().await;
     let test_root = create_watchdog_test_root("heterogeneous-reranker-progress");
@@ -425,7 +454,7 @@ async fn watchdog_lifecycle_never_waits_after_recovery_starts_without_a_queue_pe
     let mut waiting = tokio::spawn(async move {
         let _started = waiter_started_tx.send(());
         let mut metadata = BTreeMap::new();
-        wait_for_profile_restart_queue(&waiting_state, &waiting_profile, &mut metadata).await
+        wait_for_profile_restart_queue(&waiting_state, &waiting_profile, 0, &mut metadata).await
     });
     waiter_started_rx
         .await
@@ -567,10 +596,10 @@ async fn restart_queue_completion_race_failed_recovery_returns_unavailable() {
 
     let permit = proxy
         .state
-        .acquire_restart_queue_permit(&profile, &coordinator)
+        .acquire_restart_queue_permit(&profile, &coordinator, 0)
         .await
-        .expect("restart queue admission should succeed")
-        .expect("active recovery should acquire a queue permit");
+        .expect("queue permit should acquire while recovery is running")
+        .expect("active recovery must yield a queue permit");
     assert_eq!(
         coordinator.restart_queue_depth.load(Ordering::Relaxed),
         1,
@@ -636,7 +665,7 @@ async fn restart_queue_completion_race_successful_recovery_retains_metadata() {
 
     let permit = proxy
         .state
-        .acquire_restart_queue_permit(&profile, &coordinator)
+        .acquire_restart_queue_permit(&profile, &coordinator, 0)
         .await
         .expect("restart queue admission should succeed")
         .expect("active recovery should acquire a queue permit");
