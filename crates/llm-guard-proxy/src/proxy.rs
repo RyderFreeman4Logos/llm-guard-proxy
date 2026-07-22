@@ -142,6 +142,9 @@ pub(crate) struct ProxyState {
     generation_requests: Arc<InFlightLimiter>,
     generation_body_routing_requests: Arc<InFlightLimiter>,
     generation_profile_requests: Arc<Mutex<HashMap<String, Arc<InFlightLimiter>>>>,
+    /// Server-wide retained restart-queue body budget. Profile generation limiters
+    /// only bound waiter count; body bytes share this single reservation pool.
+    restart_queue_body_budget: Arc<RestartQueueBodyBudget>,
     control_plane_requests: Arc<InFlightLimiter>,
     #[cfg(feature = "guard")]
     workflow_execution_requests: Arc<InFlightLimiter>,
@@ -273,6 +276,7 @@ impl ProxyState {
             generation_requests: Arc::new(InFlightLimiter::default()),
             generation_body_routing_requests: Arc::new(InFlightLimiter::default()),
             generation_profile_requests: Arc::new(Mutex::new(HashMap::new())),
+            restart_queue_body_budget: Arc::new(RestartQueueBodyBudget::default()),
             control_plane_requests: Arc::new(InFlightLimiter::default()),
             #[cfg(feature = "guard")]
             workflow_execution_requests: Arc::new(InFlightLimiter::default()),
@@ -643,15 +647,23 @@ impl ProxyState {
         // Recovery may start or finish while requests are admitted. Hold its
         // coordinator state lock through queue registration so every request
         // that observes a running episode owns a bounded queue permit. Body
-        // bytes are reserved for the full waiter lifetime so aggregate memory
-        // cannot exceed max_restart_queue_body_bytes independently of count.
+        // bytes are reserved against the server-global budget for the full
+        // waiter lifetime so aggregate memory cannot exceed
+        // max_restart_queue_body_bytes independently of profile count.
         let recovery = coordinator.state.lock().await;
         if !recovery.running {
             return Ok(None);
         }
-        let Some(queued) =
-            limiter.try_enqueue_with_body(max_queued, max_queued_body_bytes, body_bytes)
+        let Some(body_reservation) = self
+            .restart_queue_body_budget
+            .try_reserve(max_queued_body_bytes, body_bytes)
         else {
+            return Err(ProxyError::upstream_unavailable(
+                profile.name.clone(),
+                config.server.generation_queue_timeout_ms,
+            ));
+        };
+        let Some(queued) = limiter.try_enqueue(max_queued) else {
             return Err(ProxyError::upstream_unavailable(
                 profile.name.clone(),
                 config.server.generation_queue_timeout_ms,
@@ -663,6 +675,7 @@ impl ProxyState {
         drop(recovery);
         Ok(Some(RestartQueuePermit {
             _queued: queued,
+            _body: body_reservation,
             coordinator: Arc::clone(coordinator),
             observed_running_recovery: true,
         }))
@@ -1045,33 +1058,6 @@ impl InFlightLimiter {
         counts.queued = counts.queued.saturating_add(1);
         Some(QueuedAdmissionPermit {
             limiter: Arc::clone(self),
-            body_bytes: 0,
-        })
-    }
-
-    fn try_enqueue_with_body(
-        self: &Arc<Self>,
-        max_queued_requests: usize,
-        max_queued_body_bytes: u64,
-        body_bytes: u64,
-    ) -> Option<QueuedAdmissionPermit> {
-        let mut counts = admission_counts(&self.counts);
-        if counts.queued >= max_queued_requests {
-            return None;
-        }
-        if counts
-            .queued_body_bytes
-            .checked_add(body_bytes)
-            .is_none_or(|total| total > max_queued_body_bytes)
-        {
-            return None;
-        }
-
-        counts.queued = counts.queued.saturating_add(1);
-        counts.queued_body_bytes = counts.queued_body_bytes.saturating_add(body_bytes);
-        Some(QueuedAdmissionPermit {
-            limiter: Arc::clone(self),
-            body_bytes,
         })
     }
 
@@ -1088,10 +1074,9 @@ impl InFlightLimiter {
         self.notify.notify_waiters();
     }
 
-    fn leave_queue(&self, body_bytes: u64) {
+    fn leave_queue(&self) {
         let mut counts = admission_counts(&self.counts);
         counts.queued = counts.queued.saturating_sub(1);
-        counts.queued_body_bytes = counts.queued_body_bytes.saturating_sub(body_bytes);
         self.notify.notify_waiters();
     }
 
@@ -1151,7 +1136,62 @@ fn guard_outcome_after_workflow_task(
 struct AdmissionCounts {
     active: usize,
     queued: usize,
-    queued_body_bytes: u64,
+}
+
+/// Server-global retained restart-queue body reservation. Profile generation
+/// limiters own waiter cardinality only; every waiter holds one RAII reservation
+/// from this pool so aggregate body retention cannot multiply by profile count.
+#[derive(Debug, Default)]
+struct RestartQueueBodyBudget {
+    reserved: Mutex<u64>,
+}
+
+impl RestartQueueBodyBudget {
+    fn try_reserve(
+        self: &Arc<Self>,
+        max_queued_body_bytes: u64,
+        body_bytes: u64,
+    ) -> Option<RestartQueueBodyReservation> {
+        let mut reserved = match self.reserved.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if reserved
+            .checked_add(body_bytes)
+            .is_none_or(|total| total > max_queued_body_bytes)
+        {
+            return None;
+        }
+        *reserved = reserved.saturating_add(body_bytes);
+        Some(RestartQueueBodyReservation {
+            budget: Arc::clone(self),
+            body_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn reserved_bytes(&self) -> u64 {
+        match self.reserved.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RestartQueueBodyReservation {
+    budget: Arc<RestartQueueBodyBudget>,
+    body_bytes: u64,
+}
+
+impl Drop for RestartQueueBodyReservation {
+    fn drop(&mut self) {
+        let mut reserved = match self.budget.reserved.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *reserved = reserved.saturating_sub(self.body_bytes);
+    }
 }
 
 #[derive(Debug)]
@@ -1316,18 +1356,18 @@ impl Drop for InFlightPermit {
 #[derive(Debug)]
 struct QueuedAdmissionPermit {
     limiter: Arc<InFlightLimiter>,
-    body_bytes: u64,
 }
 
 impl Drop for QueuedAdmissionPermit {
     fn drop(&mut self) {
-        self.limiter.leave_queue(self.body_bytes);
+        self.limiter.leave_queue();
     }
 }
 
 #[derive(Debug)]
 struct RestartQueuePermit {
     _queued: QueuedAdmissionPermit,
+    _body: RestartQueueBodyReservation,
     coordinator: Arc<UpstreamStallRecoveryCoordinator>,
     /// Permit acquisition holds the coordinator lock and only succeeds while an
     /// episode is running. That observation must survive into the waiter so a
@@ -6676,6 +6716,17 @@ impl StuckWatchdogTokenTracker {
                 .any(|attempt| attempt.completed.is_none())
         })
     }
+
+    #[cfg(test)]
+    fn attempt_count(&self, profile: &str) -> usize {
+        let windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        windows
+            .get(profile)
+            .map_or(0, |window| window.attempts.len())
+    }
 }
 
 impl StuckWatchdogRequest {
@@ -6781,11 +6832,14 @@ impl StuckWatchdogAttemptLease {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if let Some(attempt) = windows
-            .get_mut(&self.request.inner.profile)
-            .and_then(|window| window.attempts.get_mut(&self.attempt_id))
-        {
-            attempt.completed = Some(Instant::now());
+        // Completed physical attempts are not needed for active-stall detection and
+        // would otherwise grow as request_rate × detection_window (or indefinitely
+        // after watchdog disable stops periodic prune). Delete by ID on lease end.
+        if let Some(window) = windows.get_mut(&self.request.inner.profile) {
+            window.attempts.remove(&self.attempt_id);
+            if window.attempts.is_empty() && window.samples.is_empty() {
+                windows.remove(&self.request.inner.profile);
+            }
         }
         self.ended = true;
     }
@@ -12425,18 +12479,32 @@ fn observe_upstream_body_independently(
         let mut pending: VecDeque<Result<Bytes, reqwest::Error>> = VecDeque::new();
         let mut upstream_open = true;
         loop {
-            if !pending.is_empty() {
+            if tx.is_closed() {
+                return;
+            }
+            // Always prefer draining retained items when the client is reading,
+            // but never block upstream observation on a full downstream half.
+            while !pending.is_empty() {
+                match tx.try_send(pending.pop_front().expect("non-empty pending queue")) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(item)) => {
+                        pending.push_front(item);
+                        break;
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                }
+            }
+            if !upstream_open {
+                if pending.is_empty() {
+                    return;
+                }
+                // Upstream finished; it is safe to wait for client capacity while
+                // delivering the retained ordered prefix.
                 let item = pending.pop_front().expect("non-empty pending queue");
                 if tx.send(item).await.is_err() {
                     return;
                 }
                 continue;
-            }
-            if !upstream_open {
-                return;
-            }
-            if tx.is_closed() {
-                return;
             }
             if pending.len() < OBSERVED_UPSTREAM_RELAY_CAPACITY {
                 tokio::select! {
@@ -12472,6 +12540,11 @@ fn observe_upstream_body_independently(
                         }
                     }
                     Some(Err(error)) => {
+                        // Prefer surfaceable transport failure over a retained
+                        // healthy chunk once the slow client finally drains.
+                        if pending.len() >= OBSERVED_UPSTREAM_RELAY_CAPACITY {
+                            let _ = pending.pop_back();
+                        }
                         pending.push_back(Err(error));
                     }
                     None => {

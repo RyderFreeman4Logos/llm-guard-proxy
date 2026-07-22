@@ -697,11 +697,7 @@ async fn restart_queue_rejects_when_aggregate_queued_body_budget_is_exhausted() 
         }
     }
 
-    let reserved = proxy
-        .state
-        .generation_requests
-        .snapshot_counts()
-        .queued_body_bytes;
+    let reserved = proxy.state.restart_queue_body_budget.reserved_bytes();
     assert_eq!(reserved, admitted.len() as u64 * 40);
     assert!(
         reserved <= 100,
@@ -719,15 +715,129 @@ async fn restart_queue_rejects_when_aggregate_queued_body_budget_is_exhausted() 
     assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 2);
 
     drop(admitted);
-    assert_eq!(
-        proxy
-            .state
-            .generation_requests
-            .snapshot_counts()
-            .queued_body_bytes,
-        0
-    );
+    assert_eq!(proxy.state.restart_queue_body_budget.reserved_bytes(), 0);
     assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 0);
+}
+
+#[tokio::test]
+async fn restart_queue_body_budget_is_global_across_named_profiles() {
+    // Named profiles with independent generation limiters must still share one
+    // server-level restart-queue body budget; per-profile count isolation must
+    // not multiply retained body bytes.
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        4,
+        "max_queued_generation_requests = 8\nmax_restart_queue_body_bytes = 100\n",
+    )
+    .await;
+
+    let mut alpha = AppConfig::default().default_upstream_profile();
+    alpha.name = String::from("alpha");
+    alpha.max_in_flight_requests = Some(4);
+    alpha.max_queued_generation_requests = Some(8);
+    alpha.restart_queue.enabled = true;
+    let mut beta = AppConfig::default().default_upstream_profile();
+    beta.name = String::from("beta");
+    beta.max_in_flight_requests = Some(4);
+    beta.max_queued_generation_requests = Some(8);
+    beta.restart_queue.enabled = true;
+
+    let alpha_coordinator = proxy.state.local_recovery.coordinator_for(&alpha.name);
+    let beta_coordinator = proxy.state.local_recovery.coordinator_for(&beta.name);
+    alpha_coordinator.state.lock().await.running = true;
+    beta_coordinator.state.lock().await.running = true;
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for (profile, coordinator) in [
+        (alpha.clone(), Arc::clone(&alpha_coordinator)),
+        (alpha.clone(), Arc::clone(&alpha_coordinator)),
+        (beta.clone(), Arc::clone(&beta_coordinator)),
+        (beta.clone(), Arc::clone(&beta_coordinator)),
+    ] {
+        let state = proxy.state.clone();
+        join_set.spawn(async move {
+            state
+                .acquire_restart_queue_permit(&profile, &coordinator, 40)
+                .await
+                .map_err(|error| error.status())
+        });
+    }
+
+    let mut admitted = Vec::new();
+    let mut rejected = 0_usize;
+    while let Some(result) = join_set.join_next().await {
+        match result.expect("cross-profile restart-queue admission task must join") {
+            Ok(Some(permit)) => admitted.push(permit),
+            Ok(None) => panic!("active recovery must attempt queue admission"),
+            Err(status) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                rejected = rejected.saturating_add(1);
+            }
+        }
+    }
+
+    let reserved = proxy.state.restart_queue_body_budget.reserved_bytes();
+    assert_eq!(reserved, admitted.len() as u64 * 40);
+    assert!(
+        reserved <= 100,
+        "cross-profile restart waiters must share one global body budget, reserved={reserved}"
+    );
+    assert_eq!(
+        admitted.len(),
+        2,
+        "two 40-byte bodies must fill the global 100-byte budget regardless of profile count"
+    );
+    assert_eq!(
+        rejected, 2,
+        "additional named-profile waiters must fail closed once the global body budget is exhausted"
+    );
+
+    drop(admitted);
+    assert_eq!(proxy.state.restart_queue_body_budget.reserved_bytes(), 0);
+}
+
+#[test]
+fn completed_watchdog_attempts_are_removed_and_stay_bounded_after_disable() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let profile = "high-throughput";
+    for _ in 0..12_000 {
+        let lease = tracker.begin_request(
+            profile,
+            WatchdogProgressUnit::Chat,
+            Duration::from_secs(3_600),
+        );
+        drop(lease);
+    }
+    assert_eq!(
+        tracker.attempt_count(profile),
+        0,
+        "completed physical attempts must be deleted on lease end instead of retained for the detection window"
+    );
+
+    // Hot-reload disable stops periodic prune; completed attempts must still not
+    // accumulate from completed request throughput.
+    for _ in 0..4_000 {
+        let lease = tracker.begin_request(
+            profile,
+            WatchdogProgressUnit::Chat,
+            Duration::from_secs(86_400),
+        );
+        drop(lease);
+    }
+    assert_eq!(
+        tracker.attempt_count(profile),
+        0,
+        "disabled/idle watchdog paths must not retain completed attempts indefinitely"
+    );
+
+    let active = tracker.begin_request(profile, WatchdogProgressUnit::Chat, Duration::from_secs(1));
+    assert_eq!(tracker.attempt_count(profile), 1);
+    assert!(tracker.has_active_requests(profile));
+    drop(active);
+    assert_eq!(tracker.attempt_count(profile), 0);
+    assert!(!tracker.has_active_requests(profile));
 }
 
 #[tokio::test]

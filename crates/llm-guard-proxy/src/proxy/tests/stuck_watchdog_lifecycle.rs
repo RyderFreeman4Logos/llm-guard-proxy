@@ -414,16 +414,57 @@ enabled = false
         .expect("streaming request should receive upstream headers");
     assert_eq!(response.status(), StatusCode::OK);
     wait_for_upstream_backpressure(&upstream.chunks_pulled).await;
+    let pulled_while_unread = upstream.chunks_pulled.load(Ordering::Relaxed);
+    assert!(
+        pulled_while_unread > OBSERVED_UPSTREAM_RELAY_CAPACITY as u64,
+        "upstream must keep producing past the independent relay capacity while the client does not read; pulled={pulled_while_unread}"
+    );
 
     let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
     sleep(Duration::from_millis(2_200)).await;
     let restarted = marker.exists();
+    let pulled_before_drain = upstream.chunks_pulled.load(Ordering::Relaxed);
 
-    drop(response);
+    // Resume consumption after saturation: retained prefix must stay ordered OpenAI
+    // SSE without silent reordering. The upstream fixture is intentionally unbounded,
+    // so only drain a finite retained window before cancelling the consumer.
+    let mut body_stream = response.bytes_stream();
+    let mut delivered = Vec::new();
+    for _ in 0..(OBSERVED_UPSTREAM_RELAY_CAPACITY.saturating_mul(2)) {
+        match timeout(Duration::from_millis(500), body_stream.next()).await {
+            Ok(Some(Ok(chunk))) => delivered.extend_from_slice(&chunk),
+            Ok(Some(Err(error))) => panic!("downstream body should stay readable: {error}"),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    drop(body_stream);
+    let delivered = String::from_utf8_lossy(&delivered);
+    let healthy_frame = chat_delta_sse(&serde_json::json!({"content": "healthy"}));
+    let frame = String::from_utf8_lossy(&healthy_frame);
+    let delivered_frames = delivered.matches(frame.as_ref()).count();
+    assert!(
+        delivered_frames > 0,
+        "open consumer must still receive at least the retained ordered SSE prefix"
+    );
+    assert!(
+        delivered.split("data: ").skip(1).all(|fragment| {
+            let trimmed = fragment.trim_start();
+            trimmed.is_empty()
+                || trimmed.starts_with("{\"choices\"")
+                || trimmed.starts_with("[DONE]")
+                || trimmed.contains("\"content\":\"healthy\"")
+        }),
+        "delivered bytes must remain ordered OpenAI SSE frames without silent reordering"
+    );
+
     stop_watchdog(&proxy, watchdog).await;
     assert!(
         !restarted,
         "healthy upstream production under downstream backpressure must not trigger shared recovery"
+    );
+    assert!(
+        pulled_before_drain >= pulled_while_unread,
+        "watchdog observation must not stall upstream production after the channel fills"
     );
 }
 
@@ -1331,11 +1372,15 @@ async fn pending_sse_handler() -> Response<Body> {
 }
 
 async fn wait_for_upstream_backpressure(chunks_pulled: &AtomicU64) {
-    // Independent relay keeps observing healthy upstream production even when the
-    // client stops reading, so chunk counts may keep rising. Wait only for enough
-    // production to prove the upstream half is being driven without client polls.
-    timeout(Duration::from_secs(3), async {
-        while chunks_pulled.load(Ordering::Relaxed) < 8 {
+    // Independent relay must keep observing healthy upstream production even after
+    // the downstream-facing channel (capacity 16) and any local socket buffering
+    // saturate. Waiting far past that capacity proves the pump does not block on
+    // client consumption before recording progress.
+    let minimum_chunks = (OBSERVED_UPSTREAM_RELAY_CAPACITY as u64)
+        .saturating_mul(4)
+        .saturating_add(8);
+    timeout(Duration::from_secs(5), async {
+        while chunks_pulled.load(Ordering::Relaxed) < minimum_chunks {
             sleep(Duration::from_millis(10)).await;
         }
     })
