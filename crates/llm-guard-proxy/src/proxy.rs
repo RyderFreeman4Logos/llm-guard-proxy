@@ -63,7 +63,7 @@ use serde_json::json;
 use thiserror::Error;
 #[cfg(feature = "upstream-hot-restart")]
 use tokio::task::JoinHandle;
-use tokio::task::JoinSet;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::{
     net::TcpListener,
     process::Command,
@@ -6559,6 +6559,7 @@ struct UpstreamStallRecoveryState {
     next_recovery_episode_id: u64,
     active_recovery_episode_id: Option<u64>,
     active_recovery_episode_permits: Option<Arc<AtomicUsize>>,
+    active_local_recovery_task: Option<AbortHandle>,
     completed_recovery_episodes: VecDeque<CompletedRecoveryEpisode>,
 }
 
@@ -6614,6 +6615,7 @@ impl UpstreamStallRecoveryState {
 
     fn finish_recovery(&mut self, result: BTreeMap<String, String>) {
         let episode_id = self.active_recovery_episode_id.take();
+        self.active_local_recovery_task = None;
         let permit_references = self
             .active_recovery_episode_permits
             .take()
@@ -6630,6 +6632,21 @@ impl UpstreamStallRecoveryState {
                 });
             self.prune_completed_recovery_episodes();
         }
+    }
+
+    /// Publishes a local-recovery result only if its episode still owns the
+    /// coordinator. A delayed task from an older episode must not clear or
+    /// overwrite a newer recovery.
+    fn finish_recovery_for_episode(
+        &mut self,
+        episode_id: u64,
+        result: BTreeMap<String, String>,
+    ) -> bool {
+        if self.active_recovery_episode_id != Some(episode_id) {
+            return false;
+        }
+        self.finish_recovery(result);
+        true
     }
 
     fn prune_completed_recovery_episodes(&mut self) {
@@ -6676,7 +6693,6 @@ struct StuckWatchdogRequestInner {
     detection_window: Duration,
     #[cfg(test)]
     fallback_progress_parser: Mutex<WatchdogProgressParser>,
-    upstream_progress_recorded: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -6692,6 +6708,8 @@ struct StuckWatchdogAttemptLease {
     request: StuckWatchdogRequest,
     attempt_id: u64,
     progress_parser: Arc<Mutex<WatchdogProgressParser>>,
+    upstream_progress_recorded: Arc<AtomicBool>,
+    upstream_terminalized: Arc<AtomicBool>,
     ended: bool,
 }
 
@@ -6702,6 +6720,8 @@ struct StuckWatchdogAttemptProgress {
     request: StuckWatchdogRequest,
     attempt_id: u64,
     progress_parser: Arc<Mutex<WatchdogProgressParser>>,
+    upstream_progress_recorded: Arc<AtomicBool>,
+    upstream_terminalized: Arc<AtomicBool>,
 }
 
 impl StuckWatchdogTokenTracker {
@@ -6732,7 +6752,6 @@ impl StuckWatchdogTokenTracker {
                 detection_window,
                 #[cfg(test)]
                 fallback_progress_parser: Mutex::new(WatchdogProgressParser::default()),
-                upstream_progress_recorded: AtomicBool::new(false),
             }),
         }
     }
@@ -6881,6 +6900,8 @@ impl StuckWatchdogRequest {
             request: self.clone(),
             attempt_id,
             progress_parser: Arc::new(Mutex::new(WatchdogProgressParser::default())),
+            upstream_progress_recorded: Arc::new(AtomicBool::new(false)),
+            upstream_terminalized: Arc::new(AtomicBool::new(false)),
             ended: false,
         }
     }
@@ -6901,13 +6922,6 @@ impl StuckWatchdogRequest {
     }
 
     fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
-        if self
-            .inner
-            .upstream_progress_recorded
-            .load(Ordering::Relaxed)
-        {
-            return;
-        }
         self.inner.tracker.record_response(
             &self.inner.profile,
             self.inner.detection_window,
@@ -6933,20 +6947,6 @@ impl StuckWatchdogRequest {
                 self.inner.detection_window,
                 progress,
             );
-        }
-        state
-    }
-
-    fn record_upstream_emitted_progress(
-        &self,
-        parser: &Mutex<WatchdogProgressParser>,
-        chunk: &[u8],
-    ) -> WatchdogProgressState {
-        let state = self.record_emitted_progress(parser, chunk);
-        if matches!(state, WatchdogProgressState::Progress(_)) {
-            self.inner
-                .upstream_progress_recorded
-                .store(true, Ordering::Relaxed);
         }
         state
     }
@@ -7002,17 +7002,28 @@ impl StuckWatchdogAttemptLease {
             request: self.request.clone(),
             attempt_id: self.attempt_id,
             progress_parser: Arc::clone(&self.progress_parser),
+            upstream_progress_recorded: Arc::clone(&self.upstream_progress_recorded),
+            upstream_terminalized: Arc::clone(&self.upstream_terminalized),
         }
     }
 
     fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
+        if self.upstream_progress_recorded.load(Ordering::Relaxed)
+            || self.upstream_terminalized.load(Ordering::Relaxed)
+        {
+            return;
+        }
         self.request.record_response(response_body, sse_body);
     }
 
     fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
         let state = self
             .request
-            .record_upstream_emitted_progress(&self.progress_parser, chunk);
+            .record_emitted_progress(&self.progress_parser, chunk);
+        if matches!(state, WatchdogProgressState::Progress(_)) {
+            self.upstream_progress_recorded
+                .store(true, Ordering::Relaxed);
+        }
         if matches!(state, WatchdogProgressState::UnobservableOversize) {
             self.request
                 .set_attempt_unobservable_progress(self.attempt_id);
@@ -7040,13 +7051,18 @@ impl StuckWatchdogAttemptLease {
 
 impl StuckWatchdogAttemptProgress {
     fn end_attempt(&self) {
+        self.upstream_terminalized.store(true, Ordering::Relaxed);
         self.request.finish_attempt(self.attempt_id);
     }
 
     fn record_upstream_emitted_chunk(&self, chunk: &[u8]) -> bool {
         let state = self
             .request
-            .record_upstream_emitted_progress(&self.progress_parser, chunk);
+            .record_emitted_progress(&self.progress_parser, chunk);
+        if matches!(state, WatchdogProgressState::Progress(_)) {
+            self.upstream_progress_recorded
+                .store(true, Ordering::Relaxed);
+        }
         if matches!(state, WatchdogProgressState::UnobservableOversize) {
             self.request
                 .set_attempt_unobservable_progress(self.attempt_id);
@@ -7073,7 +7089,7 @@ impl Drop for StuckWatchdogAttemptLease {
 
 fn end_stuck_watchdog_attempt(lease: &mut Option<StuckWatchdogAttemptLease>) {
     if let Some(lease) = lease.take() {
-        lease.end();
+        lease.progress_request().end_attempt();
     }
 }
 
@@ -7386,14 +7402,13 @@ async fn record_watchdog_recovery_task_failure(
     profile: &str,
 ) {
     let coordinator = local_recovery.coordinator_for(profile);
-    finish_upstream_stall_recovery(
-        &coordinator,
-        BTreeMap::from([(
-            String::from("local_recovery_status"),
-            String::from("task_failed"),
-        )]),
-    )
-    .await;
+    let metadata = BTreeMap::from([(
+        String::from("local_recovery_status"),
+        String::from("task_failed"),
+    )]);
+    if !abort_active_local_recovery(&coordinator, metadata.clone()).await {
+        finish_upstream_stall_recovery(&coordinator, metadata).await;
+    }
     coordinator
         .watchdog_recovery_task_failures
         .fetch_add(1, Ordering::Relaxed);
@@ -7450,10 +7465,13 @@ async fn run_watchdog_recovery(
         () = shutdown_gate.cancelled() => {
             local_recovery.abort();
             let _ = local_recovery.await;
-            (BTreeMap::from([(
+            let recovery = BTreeMap::from([(
                 String::from("local_recovery_status"),
                 String::from("shutdown_cancelled"),
-            )]), true)
+            )]);
+            let terminal_state_required =
+                !abort_active_local_recovery(&coordinator, recovery.clone()).await;
+            (recovery, terminal_state_required)
         },
     };
     if terminal_state_required {
@@ -10190,6 +10208,13 @@ async fn run_local_recovery_for_profile(
     }
 
     state.running = true;
+    let Some(recovery_episode_id) = state.ensure_active_recovery_episode() else {
+        state.running = false;
+        return BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("episode_id_exhausted"),
+        )]);
+    };
     state.recovery_started = Some(now);
     let recovery_timeout = policy
         .restart_timeout
@@ -10200,12 +10225,65 @@ async fn run_local_recovery_for_profile(
         episode_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
     ));
     state.runs_in_window = state.runs_in_window.saturating_add(1);
+    let recovery_task = tokio::spawn(run_local_recovery_task(
+        policy.clone(),
+        client,
+        base_url,
+        cause,
+        episode_timeout,
+    ));
+    state.active_local_recovery_task = Some(recovery_task.abort_handle());
     drop(state);
 
-    let metadata =
-        run_local_recovery_task(policy.clone(), client, base_url, cause, episode_timeout).await;
-    finish_upstream_stall_recovery(coordinator, metadata.clone()).await;
-    metadata
+    let recovery_coordinator = Arc::clone(coordinator);
+    let _terminalizer = tokio::spawn(async move {
+        let metadata = match recovery_task.await {
+            Ok(metadata) => metadata,
+            Err(error) => BTreeMap::from([(
+                String::from("local_recovery_status"),
+                if error.is_cancelled() {
+                    String::from("cancelled")
+                } else {
+                    String::from("task_failed")
+                },
+            )]),
+        };
+        let _published =
+            finish_local_recovery_episode(&recovery_coordinator, recovery_episode_id, metadata)
+                .await;
+    });
+
+    wait_for_local_recovery_result(policy, coordinator, false).await
+}
+
+async fn finish_local_recovery_episode(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    recovery_episode_id: u64,
+    metadata: BTreeMap<String, String>,
+) -> bool {
+    let mut state = coordinator.state.lock().await;
+    if !state.finish_recovery_for_episode(recovery_episode_id, metadata) {
+        return false;
+    }
+    drop(state);
+    coordinator.notify.notify_waiters();
+    true
+}
+
+async fn abort_active_local_recovery(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    metadata: BTreeMap<String, String>,
+) -> bool {
+    let Some((recovery_episode_id, recovery_task)) = ({
+        let state = coordinator.state.lock().await;
+        state
+            .active_recovery_episode_id
+            .zip(state.active_local_recovery_task.clone())
+    }) else {
+        return false;
+    };
+    recovery_task.abort();
+    finish_local_recovery_episode(coordinator, recovery_episode_id, metadata).await
 }
 
 async fn run_local_recovery_task(

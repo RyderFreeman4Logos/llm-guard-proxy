@@ -599,6 +599,76 @@ enabled = false
 }
 
 #[tokio::test]
+async fn non_stream_upstream_eof_progress_is_not_retimestamped_by_later_downstream_drain() {
+    let upstream = NonStreamThenPendingUpstream::spawn().await;
+    let config = r"
+[retry]
+enabled = false
+
+[shielding]
+enabled = false
+
+[upstream.stuck_watchdog]
+enabled = true
+detection_window_secs = 1
+min_output_progress_units_in_window = 1
+check_interval_secs = 1
+";
+    let proxy = spawn_watchdog_proxy(&upstream.base_url, config).await;
+
+    let completed_request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"complete"}]}"#,
+        ))
+        .expect("completed non-stream request should build");
+    let completed_response = proxy_handler(State(proxy.state.clone()), completed_request).await;
+    assert_eq!(completed_response.status(), StatusCode::OK);
+
+    timeout(Duration::from_secs(2), async {
+        while proxy
+            .state
+            .stuck_watchdog_tokens
+            .has_active_requests("default")
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("independent relay must terminalize the completed upstream before downstream drains");
+    sleep(Duration::from_millis(1_100)).await;
+
+    let stuck_request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"pending"}],"stream":true}"#,
+        ))
+        .expect("stuck request should build");
+    let _unread_stuck_response = proxy_handler(State(proxy.state.clone()), stuck_request).await;
+    sleep(Duration::from_millis(1_100)).await;
+
+    let _drained_completed_response = to_bytes(completed_response.into_body(), 1024 * 1024)
+        .await
+        .expect("completed downstream response should drain");
+    assert_eq!(
+        proxy.state.stuck_watchdog_tokens.sample_count("default"),
+        0,
+        "late downstream draining must not add a fresh generic progress sample after upstream EOF"
+    );
+    assert!(
+        proxy
+            .state
+            .stuck_watchdog_tokens
+            .has_too_few_output_progress_units("default", Duration::from_secs(1), 1,),
+        "draining an old completed non-stream response must not make the mature pending request look healthy"
+    );
+}
+
+#[tokio::test]
 async fn independent_relay_preserves_every_numbered_sse_frame_under_backpressure() {
     // Emit more frames than channel + pending capacity so the old discard branch
     // would permanently lose the middle of the response.
@@ -1388,6 +1458,151 @@ async fn watchdog_recovery_preclosed_shutdown_does_not_spawn_restart_command() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn request_recovery_survives_initiator_cancellation_and_releases_its_queue_waiter() {
+    let fake = FakeUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("request-recovery-cancellation");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let script_path = test_root.join("blocked-restart.sh");
+    let started_path = test_root.join("restart.started");
+    let release_path = test_root.join("restart.release");
+    write_blocked_restart_script(&script_path);
+    let proxy = spawn_watchdog_proxy(
+        &fake.base_url,
+        &touch_recovery_watchdog_config(&test_root.join("unused.marker"), 1),
+    )
+    .await;
+    let profile = proxy
+        .state
+        .config
+        .snapshot()
+        .expect("watchdog config should snapshot")
+        .default_upstream_profile();
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    let policy = blocked_local_recovery_policy(&script_path, &started_path, &release_path);
+    let initiating_policy = policy.clone();
+    let initiating_coordinator = Arc::clone(&coordinator);
+    let initiating_client = build_http_client().expect("recovery client should build");
+    let initiating_base_url = fake.base_url.clone();
+    let initiating_recovery = tokio::spawn(async move {
+        run_local_recovery_for_profile(
+            &initiating_policy,
+            &initiating_coordinator,
+            initiating_client,
+            initiating_base_url,
+            watchdog_recovery_cause(),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+    });
+
+    assert!(
+        wait_for_path(&started_path, Duration::from_secs(1)).await,
+        "the request-driven recovery must start its bounded restart command"
+    );
+    {
+        let state = coordinator.state.lock().await;
+        assert!(
+            state.running,
+            "the coordinator must report the request-owned recovery as running before cancellation"
+        );
+    }
+    let permit = proxy
+        .state
+        .acquire_restart_queue_permit(&profile, &coordinator, 0)
+        .await
+        .expect("active recovery should admit a restart-queue permit")
+        .expect("the running recovery must yield a queue permit");
+    let waiting_state = proxy.state.clone();
+    let waiting_profile = profile.clone();
+    let mut waiter = tokio::spawn(async move {
+        let mut metadata = BTreeMap::new();
+        wait_for_restart_queue_with_held_permit(
+            &waiting_state,
+            &waiting_profile,
+            &mut metadata,
+            permit,
+        )
+        .await
+    });
+
+    initiating_recovery.abort();
+    assert!(
+        initiating_recovery
+            .await
+            .expect_err("the initiating request task must be cancelled")
+            .is_cancelled(),
+        "the regression must cancel the initiating recovery waiter, not the test harness"
+    );
+    fs::write(&release_path, "").expect("blocked restart should be released after cancellation");
+    let outcome = timeout(Duration::from_secs(1), &mut waiter)
+        .await
+        .expect("the queue waiter must consume the terminal result after initiator cancellation")
+        .expect("restart-queue waiter task should join")
+        .expect("request-owned recovery should finish ready after release");
+    assert_eq!(outcome.outcome, RestartQueueOutcome::ReleasedAfterRecovery);
+    {
+        let state = coordinator.state.lock().await;
+        assert!(
+            !state.running,
+            "coordinator-owned terminalization must clear the cancelled request's episode"
+        );
+    }
+
+    let later = run_local_recovery_for_profile(
+        &policy,
+        &coordinator,
+        build_http_client().expect("later recovery client should build"),
+        fake.base_url.clone(),
+        watchdog_recovery_cause(),
+        Some(Duration::from_secs(2)),
+    )
+    .await;
+    assert_eq!(
+        later.get("local_recovery_status").map(String::as_str),
+        Some("succeeded"),
+        "a later request must be able to start a fresh recovery after cancellation"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn write_blocked_restart_script(script_path: &Path) {
+    fs::write(
+        script_path,
+        "#!/bin/sh\nset -eu\n: > \"$1\"\nwhile [ ! -e \"$2\" ]; do sleep 0.01; done\n",
+    )
+    .expect("blocked restart script should be written");
+    fs::set_permissions(script_path, fs::Permissions::from_mode(0o700))
+        .expect("blocked restart script should be executable");
+}
+
+#[cfg(target_os = "linux")]
+fn blocked_local_recovery_policy(
+    script_path: &Path,
+    started_path: &Path,
+    release_path: &Path,
+) -> LocalRecoveryPolicy {
+    LocalRecoveryPolicy {
+        enabled: true,
+        restart_command: vec![
+            script_path.display().to_string(),
+            started_path.display().to_string(),
+            release_path.display().to_string(),
+        ],
+        restart_timeout: Duration::from_secs(2),
+        readiness_endpoint: String::from("/v1/chat/completions"),
+        readiness_body: serde_json::json!({}),
+        readiness_request_timeout: Duration::from_millis(100),
+        readiness_deadline: Duration::from_secs(1),
+        readiness_interval: Duration::from_millis(10),
+        max_attempts_per_request: 2,
+        cooldown: Duration::ZERO,
+        budget_window: Duration::from_secs(10),
+        max_per_window: 2,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn watchdog_lifecycle_restart_timeout_bounds_and_cancels_the_real_episode() {
     let fake = FakeUpstream::spawn().await;
     let test_root = create_watchdog_test_root("episode-timeout");
@@ -1740,6 +1955,44 @@ impl Drop for BackpressureUpstream {
     }
 }
 
+struct NonStreamThenPendingUpstream {
+    base_url: String,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl NonStreamThenPendingUpstream {
+    async fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("non-stream then pending upstream should bind");
+        let address = listener
+            .local_addr()
+            .expect("non-stream then pending upstream address should resolve");
+        let requests = Arc::new(AtomicU64::new(0));
+        let app = Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(non_stream_then_pending_handler),
+            )
+            .with_state(requests);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("non-stream then pending upstream should serve");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            server,
+        }
+    }
+}
+
+impl Drop for NonStreamThenPendingUpstream {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
 struct NumberedFrameUpstream {
     base_url: String,
     chunks_pulled: Arc<AtomicU64>,
@@ -1862,6 +2115,28 @@ async fn backpressure_stream_handler(
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
     response
+}
+
+async fn non_stream_then_pending_handler(State(requests): State<Arc<AtomicU64>>) -> Response<Body> {
+    if requests.fetch_add(1, Ordering::Relaxed) == 0 {
+        let mut response = Response::new(Body::from(Bytes::from_static(
+            br#"{"id":"complete","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"completion_tokens":1}}"#,
+        )));
+        *response.status_mut() = StatusCode::OK;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        response
+    } else {
+        let mut response = Response::new(Body::from_stream(stream::pending::<
+            Result<Bytes, Infallible>,
+        >()));
+        *response.status_mut() = StatusCode::OK;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+    }
 }
 
 async fn numbered_frame_stream_handler(
