@@ -33,6 +33,50 @@ async fn independent_relay_ends_watchdog_lease_at_upstream_eof_while_downstream_
 }
 
 #[tokio::test]
+async fn independent_relay_records_one_non_sse_chat_or_completion_progress_at_upstream_eof() {
+    for (profile, progress_unit, response) in [
+        (
+            "non-sse-chat",
+            WatchdogProgressUnit::Chat,
+            br#"{"id":"chat","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#
+                .as_slice(),
+        ),
+        (
+            "non-sse-completion",
+            WatchdogProgressUnit::Completion,
+            br#"{"id":"completion","object":"text_completion","choices":[{"index":0,"text":"done","finish_reason":"stop"}]}"#
+                .as_slice(),
+        ),
+    ] {
+        let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+        let request = tracker.watch_request(profile, progress_unit, Duration::from_secs(1));
+        let lease = request.begin_attempt();
+        let _unread_downstream = observe_upstream_body_independently(
+            stream::iter([Ok::<Bytes, reqwest::Error>(Bytes::copy_from_slice(response))]),
+            Some(lease.progress_request()),
+        );
+
+        timeout(Duration::from_secs(1), async {
+            while tracker.sample_count(profile) < 1 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("non-SSE progress must be recorded at upstream EOF before downstream draining");
+        assert_eq!(
+            tracker.sample_count(profile),
+            1,
+            "a complete non-SSE {progress_unit:?} response must contribute exactly one upstream-time progress sample"
+        );
+        assert!(
+            !tracker.has_active_requests(profile),
+            "upstream EOF must terminalize the non-SSE attempt while downstream remains unread"
+        );
+        drop(lease);
+    }
+}
+
+#[tokio::test]
 async fn buffered_adapter_ends_watchdog_lease_before_constructing_unread_downstream_body() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn(&fake.base_url, true).await;

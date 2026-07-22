@@ -89,7 +89,7 @@ use upstream_failover::{
 };
 use watchdog_progress::{
     WatchdogProgressParser, WatchdogProgressState, WatchdogProgressUnit, emitted_progress,
-    watchdog_progress_unit,
+    non_sse_progress_at_eof, watchdog_progress_unit,
 };
 
 use buffered_adapter::{
@@ -6951,6 +6951,26 @@ impl StuckWatchdogRequest {
         state
     }
 
+    fn record_non_sse_progress_at_upstream_eof(
+        &self,
+        parser: &Mutex<WatchdogProgressParser>,
+    ) -> WatchdogProgressState {
+        let state = {
+            let mut parser = parser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            non_sse_progress_at_eof(self.inner.progress_unit, &mut parser)
+        };
+        if let WatchdogProgressState::Progress(progress) = state {
+            self.inner.tracker.record_progress(
+                &self.inner.profile,
+                self.inner.detection_window,
+                progress,
+            );
+        }
+        state
+    }
+
     #[cfg(test)]
     fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
         matches!(
@@ -7068,6 +7088,19 @@ impl StuckWatchdogAttemptProgress {
                 .set_attempt_unobservable_progress(self.attempt_id);
         }
         matches!(state, WatchdogProgressState::Progress(_))
+    }
+
+    fn record_non_sse_progress_at_upstream_eof(&self) {
+        if self.upstream_progress_recorded.load(Ordering::Relaxed) {
+            return;
+        }
+        let state = self
+            .request
+            .record_non_sse_progress_at_upstream_eof(&self.progress_parser);
+        if matches!(state, WatchdogProgressState::Progress(_)) {
+            self.upstream_progress_recorded
+                .store(true, Ordering::Relaxed);
+        }
     }
 
     fn suspend_observation(&self) {
@@ -12948,6 +12981,7 @@ fn observe_upstream_body_independently(
                         }
                         None => {
                             if let Some(progress) = &progress {
+                                progress.record_non_sse_progress_at_upstream_eof();
                                 progress.end_attempt();
                             }
                             upstream_open = false;

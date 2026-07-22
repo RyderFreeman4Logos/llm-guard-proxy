@@ -599,22 +599,34 @@ enabled = false
 }
 
 #[tokio::test]
-async fn non_stream_upstream_eof_progress_is_not_retimestamped_by_later_downstream_drain() {
-    let upstream = NonStreamThenPendingUpstream::spawn().await;
-    let config = r"
-[retry]
-enabled = false
-
+async fn non_stream_upstream_eof_progress_suppresses_restart_for_mature_stalled_overlap() {
+    let upstream = PendingThenNonStreamUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("non-stream-eof-progress");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let config = format!(
+        r"
 [shielding]
 enabled = false
+{}",
+        recovery_watchdog_config(&marker, 1, 2, 1)
+    );
+    let proxy = spawn_watchdog_proxy(&upstream.base_url, &config).await;
 
-[upstream.stuck_watchdog]
-enabled = true
-detection_window_secs = 1
-min_output_progress_units_in_window = 1
-check_interval_secs = 1
-";
-    let proxy = spawn_watchdog_proxy(&upstream.base_url, config).await;
+    let stalled_request = Request::builder()
+        .method(Method::POST)
+        .uri("/v1/chat/completions")
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"pending"}],"stream":true}"#,
+        ))
+        .expect("stalled streaming request should build");
+    let _unread_stalled_response = proxy_handler(State(proxy.state.clone()), stalled_request).await;
+
+    // Mature the stalled attempt before the healthy non-stream response reaches
+    // upstream EOF, so a fresh upstream-time sample is the only reason recovery
+    // can be suppressed.
+    sleep(Duration::from_millis(2_100)).await;
 
     let completed_request = Request::builder()
         .method(Method::POST)
@@ -625,46 +637,36 @@ check_interval_secs = 1
         ))
         .expect("completed non-stream request should build");
     let completed_response = proxy_handler(State(proxy.state.clone()), completed_request).await;
-    assert_eq!(completed_response.status(), StatusCode::OK);
 
-    timeout(Duration::from_secs(2), async {
-        while proxy
-            .state
-            .stuck_watchdog_tokens
-            .has_active_requests("default")
-        {
+    timeout(Duration::from_secs(1), async {
+        while proxy.state.stuck_watchdog_tokens.sample_count("default") < 1 {
             sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("independent relay must terminalize the completed upstream before downstream drains");
-    sleep(Duration::from_millis(1_100)).await;
-
-    let stuck_request = Request::builder()
-        .method(Method::POST)
-        .uri("/v1/chat/completions")
-        .header(CONTENT_TYPE, "application/json")
-        .body(Body::from(
-            r#"{"model":"test-chat","messages":[{"role":"user","content":"pending"}],"stream":true}"#,
-        ))
-        .expect("stuck request should build");
-    let _unread_stuck_response = proxy_handler(State(proxy.state.clone()), stuck_request).await;
-    sleep(Duration::from_millis(1_100)).await;
-
-    let _drained_completed_response = to_bytes(completed_response.into_body(), 1024 * 1024)
-        .await
-        .expect("completed downstream response should drain");
+    .expect(
+        "complete non-stream response must record upstream progress before downstream draining",
+    );
     assert_eq!(
         proxy.state.stuck_watchdog_tokens.sample_count("default"),
-        0,
-        "late downstream draining must not add a fresh generic progress sample after upstream EOF"
+        1,
+        "complete non-stream upstream EOF must record exactly one progress sample"
+    );
+    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+    sleep(Duration::from_millis(1_100)).await;
+    let restarted = marker.exists();
+    stop_watchdog(&proxy, watchdog).await;
+    let _drained_completed_response = to_bytes(completed_response.into_body(), 1024 * 1024)
+        .await
+        .expect("completed non-stream downstream response should drain");
+    assert_eq!(
+        proxy.state.stuck_watchdog_tokens.sample_count("default"),
+        1,
+        "downstream draining must not add a second progress sample after upstream EOF"
     );
     assert!(
-        proxy
-            .state
-            .stuck_watchdog_tokens
-            .has_too_few_output_progress_units("default", Duration::from_secs(1), 1,),
-        "draining an old completed non-stream response must not make the mature pending request look healthy"
+        !restarted,
+        "a fresh non-stream upstream EOF sample must suppress restart for a mature stalled overlap"
     );
 }
 
@@ -1955,12 +1957,12 @@ impl Drop for BackpressureUpstream {
     }
 }
 
-struct NonStreamThenPendingUpstream {
+struct PendingThenNonStreamUpstream {
     base_url: String,
     server: tokio::task::JoinHandle<()>,
 }
 
-impl NonStreamThenPendingUpstream {
+impl PendingThenNonStreamUpstream {
     async fn spawn() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -1972,7 +1974,7 @@ impl NonStreamThenPendingUpstream {
         let app = Router::new()
             .route(
                 "/v1/chat/completions",
-                post(non_stream_then_pending_handler),
+                post(pending_then_non_stream_handler),
             )
             .with_state(requests);
         let server = tokio::spawn(async move {
@@ -1987,7 +1989,7 @@ impl NonStreamThenPendingUpstream {
     }
 }
 
-impl Drop for NonStreamThenPendingUpstream {
+impl Drop for PendingThenNonStreamUpstream {
     fn drop(&mut self) {
         self.server.abort();
     }
@@ -2117,17 +2119,8 @@ async fn backpressure_stream_handler(
     response
 }
 
-async fn non_stream_then_pending_handler(State(requests): State<Arc<AtomicU64>>) -> Response<Body> {
+async fn pending_then_non_stream_handler(State(requests): State<Arc<AtomicU64>>) -> Response<Body> {
     if requests.fetch_add(1, Ordering::Relaxed) == 0 {
-        let mut response = Response::new(Body::from(Bytes::from_static(
-            br#"{"id":"complete","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"completion_tokens":1}}"#,
-        )));
-        *response.status_mut() = StatusCode::OK;
-        response
-            .headers_mut()
-            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        response
-    } else {
         let mut response = Response::new(Body::from_stream(stream::pending::<
             Result<Bytes, Infallible>,
         >()));
@@ -2135,6 +2128,15 @@ async fn non_stream_then_pending_handler(State(requests): State<Arc<AtomicU64>>)
         response
             .headers_mut()
             .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response
+    } else {
+        let mut response = Response::new(Body::from(Bytes::from_static(
+            br#"{"id":"complete","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"completion_tokens":1}}"#,
+        )));
+        *response.status_mut() = StatusCode::OK;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         response
     }
 }

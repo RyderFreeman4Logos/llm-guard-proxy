@@ -99,6 +99,34 @@ pub(super) fn emitted_progress(
     parser.state
 }
 
+/// Records a single progress unit for a complete non-SSE Chat or Completion
+/// response once the upstream has reached EOF. Unlike SSE, raw JSON has no frame
+/// boundary before EOF, so recognizing it while chunks arrive could record an
+/// incomplete document or couple liveness to downstream consumption.
+pub(super) fn non_sse_progress_at_eof(
+    progress_unit: WatchdogProgressUnit,
+    parser: &mut WatchdogProgressParser,
+) -> WatchdogProgressState {
+    if parser.state == WatchdogProgressState::UnobservableOversize
+        || !matches!(
+            progress_unit,
+            WatchdogProgressUnit::Chat | WatchdogProgressUnit::Completion
+        )
+        || has_sse_framing(&parser.pending)
+    {
+        return parser.state;
+    }
+
+    let progress = u64::from(
+        serde_json::from_slice::<Value>(&parser.pending)
+            .ok()
+            .is_some_and(|response| complete_chat_or_completion_response(&response)),
+    );
+    parser.pending.clear();
+    parser.state = progress_state(progress);
+    parser.state
+}
+
 const fn progress_state(progress: u64) -> WatchdogProgressState {
     if progress == 0 {
         WatchdogProgressState::Incomplete
@@ -186,6 +214,13 @@ fn complete_result_progress(progress_unit: WatchdogProgressUnit, pending: &mut V
     };
     pending.clear();
     u64::from(result_event_has_progress(progress_unit, &event))
+}
+
+fn complete_chat_or_completion_response(response: &Value) -> bool {
+    response
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| !choices.is_empty())
 }
 
 fn has_sse_framing(pending: &[u8]) -> bool {
