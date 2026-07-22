@@ -327,6 +327,7 @@ async fn watchdog_lifecycle_restart_timeout_bounds_and_cancels_the_real_episode(
         kill_process_if_running(process);
     }
     let timeout_recorded = wait_for_watchdog_timeout_metric(&proxy, Duration::from_secs(2)).await;
+    let restart_recorded = wait_for_watchdog_restart_metric(&proxy, Duration::from_secs(2)).await;
 
     drop(request);
     stop_watchdog(&proxy, watchdog).await;
@@ -337,6 +338,10 @@ async fn watchdog_lifecycle_restart_timeout_bounds_and_cancels_the_real_episode(
     assert!(
         timeout_recorded,
         "a bounded watchdog episode must finish and record a timeout result"
+    );
+    assert!(
+        restart_recorded,
+        "a restart command that began before episode timeout must increment the restart metric"
     );
 }
 
@@ -380,7 +385,7 @@ fn recovery_watchdog_config(
     marker: &Path,
     check_interval_secs: u64,
     detection_window_secs: u64,
-    min_output_tokens_in_window: u64,
+    min_output_progress_units_in_window: u64,
 ) -> String {
     format!(
         r#"
@@ -390,7 +395,7 @@ enabled = false
 [upstream.stuck_watchdog]
 enabled = true
 detection_window_secs = {detection_window_secs}
-min_output_tokens_in_window = {min_output_tokens_in_window}
+min_output_progress_units_in_window = {min_output_progress_units_in_window}
 check_interval_secs = {check_interval_secs}
 
 [upstream.local_recovery]
@@ -423,7 +428,7 @@ enabled = false
 [upstream.stuck_watchdog]
 enabled = true
 detection_window_secs = 1
-min_output_tokens_in_window = 1
+min_output_progress_units_in_window = 1
 check_interval_secs = 1
 
 [upstream.local_recovery]
@@ -486,6 +491,18 @@ async fn wait_for_watchdog_timeout_metric(proxy: &ProxyFixture, wait: Duration) 
             .load(Ordering::Relaxed)
             == 0
         {
+            sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+#[cfg(target_os = "linux")]
+async fn wait_for_watchdog_restart_metric(proxy: &ProxyFixture, wait: Duration) -> bool {
+    let coordinator = proxy.state.local_recovery.coordinator_for("default");
+    timeout(wait, async {
+        while coordinator.watchdog_restarts.load(Ordering::Relaxed) == 0 {
             sleep(Duration::from_millis(25)).await;
         }
     })

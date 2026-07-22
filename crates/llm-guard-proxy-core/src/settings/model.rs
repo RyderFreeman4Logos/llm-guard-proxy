@@ -1758,16 +1758,23 @@ impl Default for LocalRecoveryConfig {
 }
 
 const MAX_WATCHDOG_AND_RESTART_DURATION_SECS: u64 = 86_400;
+/// Retained watchdog progress samples are bounded so configuration cannot require
+/// progress that the in-memory evidence window is unable to represent.
+pub const MAX_STUCK_WATCHDOG_PROGRESS_UNITS_IN_WINDOW: u64 = 4_096;
 
 /// Proactive no-output watchdog policy for one upstream service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StuckWatchdogConfig {
     /// Enables proactive restart when the upstream emits too little output.
     pub enabled: bool,
-    /// Trailing interval whose output token count is evaluated.
+    /// Trailing interval whose output-progress units are evaluated.
     pub detection_window_secs: u64,
-    /// Minimum output tokens required in the detection window.
-    pub min_output_tokens_in_window: u64,
+    /// Minimum model-output progress units required in the detection window.
+    ///
+    /// A chat progress unit is one content-bearing SSE event; embedding and
+    /// reranker progress is one non-empty result-bearing chunk. This is not a
+    /// token count because upstream streams do not expose tokens reliably.
+    pub min_output_progress_units_in_window: u64,
     /// Watchdog evaluation cadence.
     pub check_interval_secs: u64,
 }
@@ -1798,6 +1805,11 @@ impl StuckWatchdogConfig {
             self.check_interval_secs <= self.detection_window_secs,
             fields.check_interval_secs,
             "must be less than or equal to detection_window_secs",
+        )?;
+        require(
+            self.min_output_progress_units_in_window <= MAX_STUCK_WATCHDOG_PROGRESS_UNITS_IN_WINDOW,
+            fields.min_output_progress_units_in_window,
+            "must be at most 4096 retained progress samples",
         )
     }
 }
@@ -1807,7 +1819,7 @@ impl Default for StuckWatchdogConfig {
         Self {
             enabled: false,
             detection_window_secs: 1_800,
-            min_output_tokens_in_window: 1,
+            min_output_progress_units_in_window: 1,
             check_interval_secs: 60,
         }
     }
@@ -1816,6 +1828,7 @@ impl Default for StuckWatchdogConfig {
 #[derive(Clone, Copy)]
 struct StuckWatchdogValidationFields {
     detection_window_secs: &'static str,
+    min_output_progress_units_in_window: &'static str,
     check_interval_secs: &'static str,
 }
 
@@ -1823,6 +1836,7 @@ impl StuckWatchdogValidationFields {
     const fn upstream() -> Self {
         Self {
             detection_window_secs: "upstream.stuck_watchdog.detection_window_secs",
+            min_output_progress_units_in_window: "upstream.stuck_watchdog.min_output_progress_units_in_window",
             check_interval_secs: "upstream.stuck_watchdog.check_interval_secs",
         }
     }
@@ -1830,6 +1844,7 @@ impl StuckWatchdogValidationFields {
     const fn upstream_profile() -> Self {
         Self {
             detection_window_secs: "upstreams.stuck_watchdog.detection_window_secs",
+            min_output_progress_units_in_window: "upstreams.stuck_watchdog.min_output_progress_units_in_window",
             check_interval_secs: "upstreams.stuck_watchdog.check_interval_secs",
         }
     }

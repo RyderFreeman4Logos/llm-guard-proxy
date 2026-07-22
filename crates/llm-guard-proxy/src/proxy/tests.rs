@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -127,7 +127,7 @@ data: [DONE]
 }
 
 #[test]
-fn stuck_watchdog_counts_non_stream_and_sse_output_tokens_in_trailing_window() {
+fn stuck_watchdog_counts_non_stream_and_sse_output_progress_units_in_trailing_window() {
     let tracker = StuckWatchdogTokenTracker::default();
     let tracker = Arc::new(tracker);
     let request = tracker.begin_request(
@@ -141,7 +141,7 @@ fn stuck_watchdog_counts_non_stream_and_sse_output_tokens_in_trailing_window() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let attempt = windows
         .get_mut("default")
-        .and_then(|window| window.attempts.get_mut(&request.inner.attempt_id))
+        .and_then(|window| window.attempts.get_mut(&request.attempt_id))
         .expect("active test request must be tracked");
     attempt.started_at = Instant::now()
         .checked_sub(Duration::from_secs(2))
@@ -163,8 +163,8 @@ data: [DONE]
 "#,
     );
 
-    assert!(!tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 5));
-    assert!(tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 6));
+    assert!(!tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 2));
+    assert!(tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 3));
 }
 
 #[test]
@@ -179,17 +179,17 @@ fn stuck_watchdog_waits_for_a_complete_detection_window_before_declaring_a_new_r
     );
     assert!(tracker.has_active_requests("default"));
     assert!(
-        !tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 1),
+        !tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1),
         "a request that just began has not yet had a full detection window to produce output"
     );
 
     request.record_response(br#"{"usage":{"completion_tokens":1}}"#, b"");
-    assert!(!tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 1));
+    assert!(!tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1));
 
     drop(request);
     assert!(!tracker.has_active_requests("default"));
     assert!(
-        !tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 2),
+        !tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 2),
         "a completed-only window must not be considered an active stuck request"
     );
 }
@@ -333,9 +333,9 @@ fn watchdog_records_streaming_and_non_chat_progress_when_emitted() {
     embedding.record_emitted_chunk(br#"{"data":[{"embedding":[0.1,0.2]}]}"#);
     reranker.record_emitted_chunk(br#"{"results":[{"index":0,"relevance_score":0.9}]}"#);
 
-    assert!(!tracker.has_too_few_output_tokens("chat", Duration::from_secs(1), 1));
-    assert!(!tracker.has_too_few_output_tokens("embedding", Duration::from_secs(1), 1));
-    assert!(!tracker.has_too_few_output_tokens("reranker", Duration::from_secs(1), 1));
+    assert!(!tracker.has_too_few_output_progress_units("chat", Duration::from_secs(1), 1));
+    assert!(!tracker.has_too_few_output_progress_units("embedding", Duration::from_secs(1), 1));
+    assert!(!tracker.has_too_few_output_progress_units("reranker", Duration::from_secs(1), 1));
 }
 
 #[test]
@@ -361,12 +361,12 @@ fn watchdog_ignores_sse_heartbeats_and_control_frames_but_records_content() {
 #[test]
 fn watchdog_token_samples_are_capped_and_maintained_without_active_requests() {
     let tracker = StuckWatchdogTokenTracker::default();
-    for _ in 0..=STUCK_WATCHDOG_TOKEN_SAMPLE_CAP {
+    for _ in 0..=STUCK_WATCHDOG_PROGRESS_SAMPLE_CAP {
         tracker.record_progress("default", Duration::from_secs(1), 1);
     }
     assert_eq!(
         tracker.sample_count("default"),
-        STUCK_WATCHDOG_TOKEN_SAMPLE_CAP,
+        STUCK_WATCHDOG_PROGRESS_SAMPLE_CAP,
         "insertion must cap remotely supplied output samples"
     );
 
@@ -390,6 +390,133 @@ fn watchdog_prunes_before_every_remote_sample_insertion() {
         1,
         "each sample insertion must prune old peer-controlled samples"
     );
+}
+
+#[test]
+fn watchdog_physical_attempt_lease_resets_age_and_ends_before_persistence() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let request = tracker.watch_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    let first_attempt = request.begin_attempt();
+    {
+        let mut windows = tracker
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = windows
+            .get_mut("default")
+            .and_then(|window| window.attempts.get_mut(&first_attempt.attempt_id))
+            .expect("first physical attempt must be active");
+        first.started_at = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test Instant supports a two-second adjustment");
+    }
+
+    first_attempt.end();
+    let retry_attempt = request.begin_attempt();
+    let persistence_runtime = request.clone();
+
+    assert!(
+        !tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1),
+        "a retry is a new physical attempt with a full output window"
+    );
+    retry_attempt.end();
+    assert!(
+        !tracker.has_active_requests("default"),
+        "ending the network attempt must not wait for persistence runtime clones"
+    );
+    drop(persistence_runtime);
+}
+
+#[test]
+fn watchdog_prune_and_insert_are_atomic_against_detection() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let request = tracker.watch_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    let attempt = request.begin_attempt();
+    {
+        let mut windows = tracker
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let window = windows
+            .get_mut("default")
+            .expect("attempt window must exist");
+        let active = window
+            .attempts
+            .get_mut(&attempt.attempt_id)
+            .expect("attempt must be active");
+        active.started_at = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test Instant supports a two-second adjustment");
+        window.samples.push_back((
+            Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("test Instant supports a two-second adjustment"),
+            1,
+        ));
+    }
+
+    let producer_tracker = Arc::clone(&tracker);
+    let entered_pruned_state = Arc::new(Barrier::new(2));
+    let release_producer = Arc::new(Barrier::new(2));
+    let producer_entered = Arc::clone(&entered_pruned_state);
+    let producer_release = Arc::clone(&release_producer);
+    let producer = std::thread::spawn(move || {
+        producer_tracker.record_progress_with_hook("default", Duration::from_secs(1), 1, || {
+            producer_entered.wait();
+            producer_release.wait();
+        });
+    });
+    entered_pruned_state.wait();
+
+    let detector_tracker = Arc::clone(&tracker);
+    let (detector_tx, detector_rx) = std::sync::mpsc::channel();
+    let detector = std::thread::spawn(move || {
+        let _ignored = detector_tx.send(detector_tracker.has_too_few_output_progress_units(
+            "default",
+            Duration::from_secs(1),
+            1,
+        ));
+    });
+    assert!(
+        detector_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "the detector must remain blocked while producer prunes and inserts under one lock"
+    );
+
+    release_producer.wait();
+    producer.join().expect("producer must join");
+    assert!(
+        !detector_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detector must observe the completed transition"),
+        "the detector must see the fresh progress sample, never a pruned empty window"
+    );
+    detector.join().expect("detector must join");
+    attempt.end();
+}
+
+#[test]
+fn watchdog_progress_units_count_one_multi_token_chat_delta() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let request = tracker.watch_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    let attempt = request.begin_attempt();
+    attempt.record_emitted_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"many distinct model tokens\"}}]}\n\n",
+    );
+
+    assert_eq!(tracker.sample_count("default"), 1);
+    attempt.end();
 }
 
 #[tokio::test]
@@ -2241,7 +2368,7 @@ async fn spawn_shielded_watchdog_proxy(upstream_base_url: &str) -> ProxyFixture 
 [upstream.stuck_watchdog]
 enabled = true
 detection_window_secs = 60
-min_output_tokens_in_window = 1
+min_output_progress_units_in_window = 1
 check_interval_secs = 1
 ",
     })
@@ -6249,7 +6376,8 @@ async fn local_recovery_restart_command() {
         budget_window: Duration::from_secs(60),
         max_per_window: 1,
     };
-    let success = run_local_recovery_restart_command(&success_policy).await;
+    let success_ran = AtomicBool::new(false);
+    let success = run_local_recovery_restart_command(&success_policy, &success_ran).await;
     assert_eq!(success["local_recovery_restart_status"], "succeeded");
 
     let timeout_policy = LocalRecoveryPolicy {
@@ -6257,7 +6385,8 @@ async fn local_recovery_restart_command() {
         restart_timeout: Duration::from_millis(50),
         ..success_policy
     };
-    let timeout = run_local_recovery_restart_command(&timeout_policy).await;
+    let timeout_ran = AtomicBool::new(false);
+    let timeout = run_local_recovery_restart_command(&timeout_policy, &timeout_ran).await;
     assert_eq!(timeout["local_recovery_restart_status"], "timeout_killed");
     assert_eq!(timeout["local_recovery_status"], "timeout_killed");
 }

@@ -130,8 +130,8 @@ recovery_max_per_window = 2              # Max recovery attempts per window
 #| [upstream.stuck_watchdog]
 #| enabled = true                                                     # Detect active output-starved requests
 #| check_interval_secs = 30                                           # Polling interval
-#| detection_window_secs = 180                                       # Trailing output-token window
-#| min_output_tokens_in_window = 1                                   # Restart when active requests make less output
+#| detection_window_secs = 180                                       # Trailing output-progress window
+#| min_output_progress_units_in_window = 1                           # Restart when active requests emit fewer model-progress units
 #|
 #| [upstream.restart_queue]
 #| enabled = true                                                     # Wait for an in-progress local recovery

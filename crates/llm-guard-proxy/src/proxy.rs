@@ -120,9 +120,9 @@ const FINAL_DIRECT_RELAY_TERMINATED_ABORT_REASON: &str = "final_direct_relay_ter
 const MAX_PERSISTENCE_TASKS: usize = 64;
 const PERSISTENCE_BACKLOG_DROP_LOG_INTERVAL_MS: u64 = 10_000;
 const PERSISTENCE_BACKLOG_DROP_LOG_NEVER_EMITTED: u64 = u64::MAX;
-/// Per-profile hard cap for watchdog output samples. Upstream chunk cadence is
+/// Per-profile hard cap for watchdog output-progress samples. Upstream chunk cadence is
 /// peer-controlled, so this is deliberately independent of request activity.
-const STUCK_WATCHDOG_TOKEN_SAMPLE_CAP: usize = 4_096;
+const STUCK_WATCHDOG_PROGRESS_SAMPLE_CAP: usize = 4_096;
 #[cfg(feature = "guard")]
 const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
 
@@ -3032,7 +3032,7 @@ async fn forward_openai_request(
         .stuck_watchdog
         .enabled
         .then(|| {
-            state.stuck_watchdog_tokens.begin_request(
+            state.stuck_watchdog_tokens.watch_request(
                 &prepared_request.upstream_profile.name,
                 watchdog_progress_unit(&prepared_request.forward_uri),
                 Duration::from_secs(
@@ -4836,6 +4836,7 @@ async fn forward_generic_openai_request(
         }),
         model_id: context.model_id.as_deref(),
         request_deadline: context.upstream_deadline,
+        stuck_watchdog_request: context.stuck_watchdog_request.as_ref(),
     })
     .await?;
     let GenericForwardedResponse {
@@ -4938,7 +4939,7 @@ fn generic_forwarded_response(
         attempt_request_metadata: sent_upstream_response.attempt_request_metadata,
         completed_attempt_records: sent_upstream_response.completed_attempt_records,
         shutdown: Arc::clone(&context.state.shutdown),
-        stuck_watchdog_request: context.stuck_watchdog_request.clone(),
+        stuck_watchdog_attempt: sent_upstream_response.stuck_watchdog_attempt,
     };
     GenericForwardedResponse {
         response_parts,
@@ -5082,7 +5083,7 @@ async fn forward_merged_models_response(
         attempt_request_metadata: BTreeMap::new(),
         completed_attempt_records: Vec::new(),
         shutdown: Arc::clone(&context.state.shutdown),
-        stuck_watchdog_request: None,
+        stuck_watchdog_attempt: None,
     };
     let shutdown = response_parts.shutdown_subscription();
     let mut observer = response_parts.into_observer();
@@ -5194,6 +5195,7 @@ async fn fetch_models_upstream_group(
         decode_heterogeneous_reranker: false,
         model_id: None,
         request_deadline: Some(group.request_deadline),
+        stuck_watchdog_request: None,
     })
     .await?;
     let SentUpstreamResponse {
@@ -5330,6 +5332,7 @@ struct UpstreamAttemptContext<'request> {
     decode_heterogeneous_reranker: bool,
     model_id: Option<&'request str>,
     request_deadline: Option<Instant>,
+    stuck_watchdog_request: Option<&'request StuckWatchdogRequest>,
 }
 
 struct SentUpstreamResponse {
@@ -5342,6 +5345,7 @@ struct SentUpstreamResponse {
     did_failover: bool,
     terminal_endpoint: Option<UpstreamEndpointConfig>,
     terminal_endpoint_protocol: UpstreamEndpointProtocol,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
 struct PhysicalEndpointAttempt {
@@ -5352,6 +5356,7 @@ struct PhysicalEndpointAttempt {
     endpoint: Option<UpstreamEndpointConfig>,
     protocol: UpstreamEndpointProtocol,
     observed_response: Option<ObservedEndpointResponse>,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
 struct EndpointFailoverOutcome {
@@ -5369,6 +5374,7 @@ struct EndpointFailoverRuntime<'request> {
     request_id: &'request RequestId,
     decode_heterogeneous_reranker: bool,
     model_id: Option<&'request str>,
+    stuck_watchdog_request: Option<&'request StuckWatchdogRequest>,
 }
 
 struct EndpointFailoverProgress {
@@ -5438,6 +5444,7 @@ async fn send_first_upstream_attempt(
         endpoint: terminal_endpoint,
         protocol: context.terminal_endpoint_protocol,
         observed_response: None,
+        stuck_watchdog_attempt: None,
     };
     annotate_physical_endpoint_attempt(
         &mut initial_attempt.request_metadata,
@@ -5458,6 +5465,9 @@ async fn send_first_upstream_attempt(
     );
     let result = match initial_timeout {
         Ok(timeout) => {
+            initial_attempt.stuck_watchdog_attempt = context
+                .stuck_watchdog_request
+                .map(StuckWatchdogRequest::begin_attempt);
             send_upstream_request_until_shutdown(
                 context.client,
                 context.method.clone(),
@@ -5497,6 +5507,7 @@ async fn send_first_upstream_attempt(
                     request_id: context.request_id,
                     decode_heterogeneous_reranker: context.decode_heterogeneous_reranker,
                     model_id: context.model_id,
+                    stuck_watchdog_request: context.stuck_watchdog_request,
                 },
                 EndpointFailoverProgress {
                     result,
@@ -5538,18 +5549,32 @@ fn finalize_sent_upstream_response(
         String::from(disposition),
     );
     match result {
-        Ok(response) => Ok(SentUpstreamResponse {
-            response,
-            attempt_id: terminal_attempt.attempt_id,
-            attempt_number: terminal_attempt.attempt_number,
-            attempt_started_at_unix_ms: terminal_attempt.started_at_unix_ms,
-            attempt_request_metadata: terminal_attempt.request_metadata,
-            did_failover: !completed_attempt_records.is_empty(),
-            completed_attempt_records,
-            terminal_endpoint: terminal_attempt.endpoint.clone(),
-            terminal_endpoint_protocol: terminal_attempt.protocol,
-        }),
+        Ok(response) => {
+            let stuck_watchdog_attempt = if matches!(&response, EndpointResponse::Upstream(_)) {
+                terminal_attempt.stuck_watchdog_attempt.take()
+            } else {
+                if let Some(lease) = terminal_attempt.stuck_watchdog_attempt.take() {
+                    lease.end();
+                }
+                None
+            };
+            Ok(SentUpstreamResponse {
+                response,
+                attempt_id: terminal_attempt.attempt_id,
+                attempt_number: terminal_attempt.attempt_number,
+                attempt_started_at_unix_ms: terminal_attempt.started_at_unix_ms,
+                attempt_request_metadata: terminal_attempt.request_metadata,
+                did_failover: !completed_attempt_records.is_empty(),
+                completed_attempt_records,
+                terminal_endpoint: terminal_attempt.endpoint.clone(),
+                terminal_endpoint_protocol: terminal_attempt.protocol,
+                stuck_watchdog_attempt,
+            })
+        }
         Err(error) => {
+            if let Some(lease) = terminal_attempt.stuck_watchdog_attempt.take() {
+                lease.end();
+            }
             let finished_at_unix_ms = unix_time_millis();
             let error_reason = error.to_string();
             let mut attempt_record = failed_attempt_record(FailedAttemptRecordInput {
@@ -5728,6 +5753,7 @@ async fn send_selected_failover_endpoint(
         endpoint: Some(selected.endpoint.clone()),
         protocol: selected.endpoint.protocol,
         observed_response: None,
+        stuck_watchdog_attempt: None,
     };
     let response = match rendered {
         Ok(rendered) => {
@@ -5745,6 +5771,9 @@ async fn send_selected_failover_endpoint(
                 endpoint_attempts_remaining,
             ) {
                 Ok(timeout) => {
+                    attempt.stuck_watchdog_attempt = runtime
+                        .stuck_watchdog_request
+                        .map(StuckWatchdogRequest::begin_attempt);
                     send_upstream_request_until_shutdown(
                         runtime.client,
                         runtime.retry_method.clone(),
@@ -6445,7 +6474,6 @@ fn watchdog_progress_unit(uri: &Uri) -> WatchdogProgressUnit {
 struct StuckWatchdogRequestInner {
     tracker: Arc<StuckWatchdogTokenTracker>,
     profile: String,
-    attempt_id: u64,
     progress_unit: WatchdogProgressUnit,
     detection_window: Duration,
     sse_buffer: Mutex<Vec<u8>>,
@@ -6457,31 +6485,40 @@ struct StuckWatchdogRequest {
     inner: Arc<StuckWatchdogRequestInner>,
 }
 
+/// Owns exactly one physical upstream send/stream lifetime. It deliberately
+/// cannot be cloned: request runtimes may be cloned for observers and
+/// persistence, but only the network attempt can keep watchdog activity alive.
+#[derive(Debug)]
+struct StuckWatchdogAttemptLease {
+    request: StuckWatchdogRequest,
+    attempt_id: u64,
+    ended: bool,
+}
+
 impl StuckWatchdogTokenTracker {
+    /// Starts a lease immediately. Kept for unit-level lifecycle tests; request
+    /// forwarding uses `watch_request` plus `begin_attempt` at the actual send.
+    #[cfg(test)]
     fn begin_request(
         self: &Arc<Self>,
         profile: &str,
         progress_unit: WatchdogProgressUnit,
         detection_window: Duration,
+    ) -> StuckWatchdogAttemptLease {
+        self.watch_request(profile, progress_unit, detection_window)
+            .begin_attempt()
+    }
+
+    fn watch_request(
+        self: &Arc<Self>,
+        profile: &str,
+        progress_unit: WatchdogProgressUnit,
+        detection_window: Duration,
     ) -> StuckWatchdogRequest {
-        let mut windows = match self.windows.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let window = windows.entry(profile.to_owned()).or_default();
-        let attempt_id = self.next_attempt_id.fetch_add(1, Ordering::Relaxed);
-        window.attempts.insert(
-            attempt_id,
-            StuckWatchdogAttempt {
-                started_at: Instant::now(),
-                completed: None,
-            },
-        );
         StuckWatchdogRequest {
             inner: Arc::new(StuckWatchdogRequestInner {
                 tracker: Arc::clone(self),
                 profile: profile.to_owned(),
-                attempt_id,
                 progress_unit,
                 detection_window,
                 sse_buffer: Mutex::new(Vec::new()),
@@ -6497,35 +6534,41 @@ impl StuckWatchdogTokenTracker {
         response_body: &[u8],
         sse_body: &[u8],
     ) {
-        let Some(output_tokens) = parse_token_usage(response_body, sse_body).output_tokens else {
+        let Some(_output_tokens) = parse_token_usage(response_body, sse_body).output_tokens else {
             return;
         };
-        self.prune_profile(profile, detection_window);
-        let mut windows = match self.windows.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        record_watchdog_progress(
-            windows.entry(profile.to_owned()).or_default(),
-            Instant::now(),
-            output_tokens,
-        );
+        // Non-streaming responses expose a completion token count but the
+        // watchdog contract is progress units, so one successful response is
+        // one unit rather than a provider-specific token estimate.
+        self.record_progress(profile, detection_window, 1);
     }
 
     fn record_progress(&self, profile: &str, detection_window: Duration, progress: u64) {
+        self.record_progress_with_hook(profile, detection_window, progress, || {});
+    }
+
+    fn record_progress_with_hook<F>(
+        &self,
+        profile: &str,
+        detection_window: Duration,
+        progress: u64,
+        after_prune: F,
+    ) where
+        F: FnOnce(),
+    {
         if progress == 0 {
             return;
         }
-        self.prune_profile(profile, detection_window);
         let mut windows = match self.windows.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        record_watchdog_progress(
-            windows.entry(profile.to_owned()).or_default(),
-            Instant::now(),
-            progress,
-        );
+        let now = Instant::now();
+        let window = windows.entry(profile.to_owned()).or_default();
+        prune_watchdog_progress(window, detection_window, now);
+        prune_watchdog_attempts(window, detection_window, now);
+        after_prune();
+        record_watchdog_progress(window, now, progress);
     }
 
     #[cfg(test)]
@@ -6551,7 +6594,7 @@ impl StuckWatchdogTokenTracker {
         }
     }
 
-    fn has_too_few_output_tokens(
+    fn has_too_few_output_progress_units(
         &self,
         profile: &str,
         detection_window: Duration,
@@ -6564,7 +6607,7 @@ impl StuckWatchdogTokenTracker {
         let Some(window) = windows.get_mut(profile) else {
             return false;
         };
-        window_has_too_few_output_tokens(
+        window_has_too_few_output_progress_units(
             window,
             detection_window,
             minimum_output_tokens,
@@ -6588,6 +6631,34 @@ impl StuckWatchdogTokenTracker {
 }
 
 impl StuckWatchdogRequest {
+    fn begin_attempt(&self) -> StuckWatchdogAttemptLease {
+        let mut windows = match self.inner.tracker.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let attempt_id = self
+            .inner
+            .tracker
+            .next_attempt_id
+            .fetch_add(1, Ordering::Relaxed);
+        windows
+            .entry(self.inner.profile.clone())
+            .or_default()
+            .attempts
+            .insert(
+                attempt_id,
+                StuckWatchdogAttempt {
+                    started_at: Instant::now(),
+                    completed: None,
+                },
+            );
+        StuckWatchdogAttemptLease {
+            request: self.clone(),
+            attempt_id,
+            ended: false,
+        }
+    }
+
     fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
         if self
             .inner
@@ -6621,12 +6692,14 @@ impl StuckWatchdogRequest {
         progress > 0
     }
 
-    fn record_upstream_emitted_chunk(&self, chunk: &[u8]) {
+    fn record_upstream_emitted_chunk(&self, chunk: &[u8]) -> bool {
         if self.record_emitted_chunk(chunk) {
             self.inner
                 .upstream_progress_recorded
                 .store(true, Ordering::Relaxed);
+            return true;
         }
+        false
     }
 
     fn record_sse_content_progress(&self, chunk: &[u8]) -> u64 {
@@ -6651,22 +6724,49 @@ impl StuckWatchdogRequest {
     }
 }
 
-impl Drop for StuckWatchdogRequestInner {
-    fn drop(&mut self) {
-        let mut windows = match self.tracker.windows.lock() {
+impl StuckWatchdogAttemptLease {
+    fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
+        self.request.record_response(response_body, sse_body);
+    }
+
+    fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
+        self.request.record_upstream_emitted_chunk(chunk)
+    }
+
+    #[cfg(test)]
+    fn record_upstream_emitted_chunk(&self, chunk: &[u8]) {
+        self.request.record_upstream_emitted_chunk(chunk);
+    }
+
+    fn end(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if self.ended {
+            return;
+        }
+        let mut windows = match self.request.inner.tracker.windows.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         if let Some(attempt) = windows
-            .get_mut(&self.profile)
+            .get_mut(&self.request.inner.profile)
             .and_then(|window| window.attempts.get_mut(&self.attempt_id))
         {
             attempt.completed = Some(Instant::now());
         }
+        self.ended = true;
     }
 }
 
-fn window_has_too_few_output_tokens(
+impl Drop for StuckWatchdogAttemptLease {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn window_has_too_few_output_progress_units(
     window: &mut StuckWatchdogTokenWindow,
     detection_window: Duration,
     minimum_output_tokens: u64,
@@ -6747,7 +6847,7 @@ fn sse_event_has_model_content(event: &serde_json::Value) -> bool {
 
 fn record_watchdog_progress(window: &mut StuckWatchdogTokenWindow, now: Instant, progress: u64) {
     window.samples.push_back((now, progress));
-    while window.samples.len() > STUCK_WATCHDOG_TOKEN_SAMPLE_CAP {
+    while window.samples.len() > STUCK_WATCHDOG_PROGRESS_SAMPLE_CAP {
         let _ = window.samples.pop_front();
     }
 }
@@ -6879,10 +6979,10 @@ async fn run_stuck_engine_watchdog(
                 continue;
             }
             let detection_window = Duration::from_secs(watchdog.detection_window_secs);
-            if !tokens.has_too_few_output_tokens(
+            if !tokens.has_too_few_output_progress_units(
                 &profile.name,
                 detection_window,
-                watchdog.min_output_tokens_in_window,
+                watchdog.min_output_progress_units_in_window,
             ) {
                 continue;
             }
@@ -6893,7 +6993,9 @@ async fn run_stuck_engine_watchdog(
             }
             eprintln!(
                 "llm_guard_proxy_stuck_watchdog profile={} event=detected detection_window_secs={} min_output_tokens={}",
-                profile.name, watchdog.detection_window_secs, watchdog.min_output_tokens_in_window,
+                profile.name,
+                watchdog.detection_window_secs,
+                watchdog.min_output_progress_units_in_window,
             );
             let coordinator = local_recovery.coordinator_for(&profile.name);
             coordinator
@@ -6952,7 +7054,7 @@ async fn run_watchdog_recovery(
     shutdown: Arc<ShutdownGate>,
 ) -> (String, BTreeMap<String, String>) {
     let mut shutdown_gate = shutdown.subscribe();
-    let recovery = tokio::select! {
+    let mut recovery = tokio::select! {
         recovery = run_local_recovery_for_profile(
             &policy,
             &coordinator,
@@ -6966,7 +7068,36 @@ async fn run_watchdog_recovery(
             String::from("shutdown_cancelled"),
         )]),
     };
+    // The waiter deadline intentionally bounds the caller. The recovery task may
+    // have just spawned a restart when that deadline fires, so give its terminal
+    // metadata a short chance to publish before recording watchdog metrics.
+    if recovery
+        .get("local_recovery_status")
+        .is_some_and(|status| status == "completion_timeout")
+        && let Some(completed) = wait_for_started_local_recovery_result(&coordinator).await
+    {
+        recovery = completed;
+    }
     (profile_name, recovery)
+}
+
+async fn wait_for_started_local_recovery_result(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+) -> Option<BTreeMap<String, String>> {
+    let notified = coordinator.notify.notified();
+    {
+        let state = coordinator.state.lock().await;
+        if !state.running {
+            return state.last_result.clone();
+        }
+    }
+    if timeout(Duration::from_millis(250), notified).await.is_err() {
+        return None;
+    }
+    let state = coordinator.state.lock().await;
+    (!state.running)
+        .then(|| state.last_result.clone())
+        .flatten()
 }
 
 fn record_watchdog_recovery_result(
@@ -7734,7 +7865,7 @@ struct ForwardedResponseParts {
     attempt_request_metadata: BTreeMap<String, String>,
     completed_attempt_records: Vec<AttemptRecord>,
     shutdown: Arc<ShutdownGate>,
-    stuck_watchdog_request: Option<StuckWatchdogRequest>,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
 impl ForwardedResponseParts {
@@ -7795,7 +7926,7 @@ impl ForwardedResponseParts {
             extra_response_metadata,
             raw_payloads,
             completed_attempt_records: self.completed_attempt_records,
-            stuck_watchdog_request: self.stuck_watchdog_request,
+            stuck_watchdog_attempt: self.stuck_watchdog_attempt,
             final_attempt: Some(final_attempt),
             retry_observation: None,
             attempt_progress: None,
@@ -8105,6 +8236,7 @@ struct ShieldedStartedAttempt {
     terminal_endpoint_protocol: UpstreamEndpointProtocol,
     endpoint_retry_order: Vec<String>,
     ignores_request_deadline: bool,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
 struct ShieldedAcceptedOutcome {
@@ -8267,6 +8399,7 @@ fn shielded_liveness_stream_response(
             completed_attempt_records: prior_attempt_records.clone(),
             final_attempt: None,
             attempt_progress: Some(attempt_progress.clone()),
+            stuck_watchdog_attempt: None,
         },
     );
     let aggregate_runtime = runtime.clone();
@@ -8667,12 +8800,12 @@ async fn aggregate_shielded_attempt(
 ) -> Result<ShieldedAggregatedAttempt, ShieldedAttemptFailure> {
     let request_id = runtime.request_id.as_str().to_owned();
     let request_model_id = runtime.model_id.clone();
-    let stuck_watchdog_request = runtime.stuck_watchdog_request.clone();
+    let stuck_watchdog_attempt = started.stuck_watchdog_attempt.as_ref();
     let upstream_stream = started.response.bytes_stream().inspect(move |chunk| {
-        if let (Some(request), Ok(chunk)) = (&stuck_watchdog_request, chunk) {
+        if let (Some(attempt), Ok(chunk)) = (stuck_watchdog_attempt, chunk) {
             // Shielded calls aggregate upstream SSE internally, so this is the
             // only place their sustained model output reaches the watchdog.
-            request.record_upstream_emitted_chunk(chunk);
+            attempt.record_emitted_chunk(chunk);
         }
     });
     let aggregate = shielded_chat::aggregate_stream(
@@ -9630,12 +9763,15 @@ fn spawn_local_recovery_task(
     tokio::spawn(async move {
         let trigger_cause = cause.as_str().to_owned();
         let recovery_trigger_cause = trigger_cause.clone();
+        let restart_ran = Arc::new(AtomicBool::new(false));
+        let recovery_restart_ran = Arc::clone(&restart_ran);
         let recovery = async {
             let mut metadata = BTreeMap::from([(
                 String::from("local_recovery_trigger_cause"),
                 recovery_trigger_cause,
             )]);
-            metadata.extend(run_local_recovery_restart_command(&policy).await);
+            metadata
+                .extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
             if metadata
                 .get("local_recovery_restart_status")
                 .is_some_and(|status| status == "succeeded")
@@ -9660,13 +9796,22 @@ fn spawn_local_recovery_task(
         let metadata = match episode_timeout {
             Some(timeout_duration) => match timeout(timeout_duration, recovery).await {
                 Ok(metadata) => metadata,
-                Err(_elapsed) => BTreeMap::from([
-                    (String::from("local_recovery_trigger_cause"), trigger_cause),
-                    (
-                        String::from("local_recovery_status"),
-                        String::from("episode_timeout"),
-                    ),
-                ]),
+                Err(_elapsed) => {
+                    let mut metadata = BTreeMap::from([
+                        (String::from("local_recovery_trigger_cause"), trigger_cause),
+                        (
+                            String::from("local_recovery_status"),
+                            String::from("episode_timeout"),
+                        ),
+                    ]);
+                    if restart_ran.load(Ordering::Relaxed) {
+                        metadata.insert(
+                            String::from("local_recovery_restart_ran"),
+                            String::from("true"),
+                        );
+                    }
+                    metadata
+                }
             },
             None => recovery.await,
         };
@@ -9747,6 +9892,7 @@ fn completed_local_recovery_metadata(
 
 async fn run_local_recovery_restart_command(
     policy: &LocalRecoveryPolicy,
+    restart_ran: &AtomicBool,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::new();
     let program = &policy.restart_command[0];
@@ -9777,6 +9923,7 @@ async fn run_local_recovery_restart_command(
             return metadata;
         }
     };
+    restart_ran.store(true, Ordering::Relaxed);
     metadata.insert(
         String::from("local_recovery_restart_ran"),
         String::from("true"),
@@ -10328,6 +10475,7 @@ async fn start_shielded_attempt(
         terminal_endpoint_protocol: sent.terminal_endpoint_protocol,
         endpoint_retry_order,
         ignores_request_deadline,
+        stuck_watchdog_attempt: sent.stuck_watchdog_attempt,
     })
 }
 
@@ -10448,6 +10596,7 @@ async fn send_shielded_upstream_attempt(
         decode_heterogeneous_reranker: false,
         model_id: None,
         request_deadline,
+        stuck_watchdog_request: runtime.stuck_watchdog_request.as_ref(),
     })
     .await
 }
@@ -11494,6 +11643,7 @@ fn shielded_retry_success_response(
             completed_attempt_records: outcome.prior_attempt_records,
             final_attempt: Some(outcome.final_attempt),
             attempt_progress: None,
+            stuck_watchdog_attempt: None,
         },
     );
     let response_body = ObservedBufferedBody::new(
@@ -11549,6 +11699,7 @@ fn shielded_retry_error_response(
             completed_attempt_records: failure.attempt_records,
             final_attempt: None,
             attempt_progress: None,
+            stuck_watchdog_attempt: None,
         },
     );
     let completion = if is_shutdown_failure {
@@ -11597,6 +11748,7 @@ async fn shielded_retry_terminal_forward_response(
             completed_attempt_records: terminal.prior_attempt_records,
             final_attempt: Some(final_attempt),
             attempt_progress: None,
+            stuck_watchdog_attempt: terminal.started.stuck_watchdog_attempt,
         },
     );
     let response_body = ObservedUpstreamBody::new(
@@ -11647,6 +11799,7 @@ async fn shielded_retry_direct_relay_response(
             completed_attempt_records: outcome.prior_attempt_records,
             final_attempt: Some(final_attempt),
             attempt_progress: None,
+            stuck_watchdog_attempt: outcome.started.stuck_watchdog_attempt,
         },
     );
     let response_body = ObservedUpstreamBody::new_with_deadline(
@@ -11681,6 +11834,7 @@ struct ShieldedRetryObserverInput {
     completed_attempt_records: Vec<AttemptRecord>,
     final_attempt: Option<FinalAttemptContext>,
     attempt_progress: Option<ShieldedAttemptProgressHandle>,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
 fn shielded_retry_observer(
@@ -11706,7 +11860,7 @@ fn shielded_retry_observer(
         extra_response_metadata: input.extra_response_metadata,
         raw_payloads: input.raw_payloads,
         completed_attempt_records: input.completed_attempt_records,
-        stuck_watchdog_request: runtime.stuck_watchdog_request.clone(),
+        stuck_watchdog_attempt: input.stuck_watchdog_attempt,
         final_attempt: input.final_attempt,
         retry_observation: Some(RetryObservation {
             policy: runtime.retry_policy.clone(),
@@ -11802,7 +11956,7 @@ struct ForwardedBodyObserver {
     extra_response_metadata: BTreeMap<String, String>,
     raw_payloads: RawPayloads,
     completed_attempt_records: Vec<AttemptRecord>,
-    stuck_watchdog_request: Option<StuckWatchdogRequest>,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
     final_attempt: Option<FinalAttemptContext>,
     retry_observation: Option<RetryObservation>,
     attempt_progress: Option<ShieldedAttemptProgressHandle>,
@@ -11811,14 +11965,14 @@ struct ForwardedBodyObserver {
 impl ForwardedBodyObserver {
     fn record_chunk(&self, chunk: &[u8]) {
         if self.attempt_progress.is_none()
-            && let Some(stuck_watchdog_request) = &self.stuck_watchdog_request
+            && let Some(stuck_watchdog_attempt) = &self.stuck_watchdog_attempt
         {
             // This is invoked from the body poll that yields the chunk downstream.
-            stuck_watchdog_request.record_emitted_chunk(chunk);
+            stuck_watchdog_attempt.record_emitted_chunk(chunk);
         }
     }
 
-    fn record(self, body_bytes: u64, completion: &BodyCompletion, response_body: &Bytes) {
+    fn record(mut self, body_bytes: u64, completion: &BodyCompletion, response_body: &Bytes) {
         let finished_at_unix_ms = unix_time_millis();
         let mut attempts = self.completed_attempt_records;
         let mut final_attempt = self.final_attempt;
@@ -11835,12 +11989,14 @@ impl ForwardedBodyObserver {
         let upstream_mode = final_attempt
             .as_ref()
             .map_or(self.upstream_mode, |attempt| attempt.upstream_mode);
-        if let Some(stuck_watchdog_request) = &self.stuck_watchdog_request {
+        if let Some(stuck_watchdog_attempt) = self.stuck_watchdog_attempt.take() {
             let sse_body = final_attempt
                 .as_ref()
                 .map(|attempt| attempt.sse_body.as_ref())
                 .unwrap_or_default();
-            stuck_watchdog_request.record_response(response_body, sse_body);
+            stuck_watchdog_attempt.record_response(response_body, sse_body);
+            // Do not retain an active lease in the persistence runtime below.
+            stuck_watchdog_attempt.end();
         }
         if let Some(final_attempt) = &mut final_attempt
             && final_attempt.response_body.is_empty()

@@ -312,7 +312,10 @@ fn assert_default_recovery_watchdog_and_restart_queue_configs(config: &AppConfig
     assert!(!config.upstream.stuck_watchdog.enabled);
     assert_eq!(config.upstream.stuck_watchdog.detection_window_secs, 1_800);
     assert_eq!(
-        config.upstream.stuck_watchdog.min_output_tokens_in_window,
+        config
+            .upstream
+            .stuck_watchdog
+            .min_output_progress_units_in_window,
         1
     );
     assert_eq!(config.upstream.stuck_watchdog.check_interval_secs, 60);
@@ -3468,7 +3471,7 @@ base_url = "http://127.0.0.1:19000/v1"
 [upstreams.stuck_watchdog]
 enabled = false
 detection_window_secs = 90
-min_output_tokens_in_window = 2
+min_output_progress_units_in_window = 2
 check_interval_secs = 5
 
 [upstreams.restart_queue]
@@ -3487,7 +3490,7 @@ base_url = "http://127.0.0.1:19000/v1"
 [upstreams.stuck_watchdog]
 enabled = true
 detection_window_secs = 120
-min_output_tokens_in_window = 3
+min_output_progress_units_in_window = 3
 check_interval_secs = 7
 
 [upstreams.restart_queue]
@@ -3511,11 +3514,54 @@ restart_timeout_secs = 40
     assert!(outcome.applied);
     assert!(named.stuck_watchdog.enabled);
     assert_eq!(named.stuck_watchdog.detection_window_secs, 120);
-    assert_eq!(named.stuck_watchdog.min_output_tokens_in_window, 3);
+    assert_eq!(named.stuck_watchdog.min_output_progress_units_in_window, 3);
     assert_eq!(named.stuck_watchdog.check_interval_secs, 7);
     assert!(named.restart_queue.enabled);
     assert_eq!(named.restart_queue.queue_deadline_secs, 60);
     assert_eq!(named.restart_queue.restart_timeout_secs, 40);
+}
+
+#[test]
+fn watchdog_progress_unit_threshold_is_hot_reloadable() {
+    let current = AppConfig::parse(
+        r"
+[upstream.stuck_watchdog]
+min_output_progress_units_in_window = 1
+",
+    )
+    .expect("current progress-unit watchdog config should parse");
+    let requested = AppConfig::parse(
+        r"
+[upstream.stuck_watchdog]
+min_output_progress_units_in_window = 2
+",
+    )
+    .expect("requested progress-unit watchdog config should parse");
+    let handle = ConfigHandle::new(current);
+
+    let outcome = handle
+        .apply_reloadable(&requested)
+        .expect("progress-unit threshold reload should succeed");
+
+    assert!(
+        outcome.applied,
+        "changing only the progress-unit threshold must apply without a restart"
+    );
+}
+
+#[test]
+fn rejects_watchdog_progress_unit_threshold_above_sample_retention() {
+    let error = parse_config_text(
+        "[upstream.stuck_watchdog]\nmin_output_progress_units_in_window = 4097\n",
+    )
+    .expect("progress-unit threshold syntax should parse before validation")
+    .validate()
+    .expect_err("a progress-unit threshold above retained samples must be rejected");
+
+    assert_eq!(
+        error.field(),
+        "upstream.stuck_watchdog.min_output_progress_units_in_window"
+    );
 }
 
 #[test]

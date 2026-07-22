@@ -1345,11 +1345,11 @@ fn assign_stuck_watchdog(
             config.detection_window_secs =
                 parse_u64(value, line_number, "stuck_watchdog.detection_window_secs")?;
         }
-        "min_output_tokens_in_window" => {
-            config.min_output_tokens_in_window = parse_u64(
+        "min_output_progress_units_in_window" => {
+            config.min_output_progress_units_in_window = parse_u64(
                 value,
                 line_number,
-                "stuck_watchdog.min_output_tokens_in_window",
+                "stuck_watchdog.min_output_progress_units_in_window",
             )?;
         }
         "check_interval_secs" => {
