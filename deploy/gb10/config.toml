@@ -126,6 +126,7 @@ recovery_max_per_window = 2              # Max recovery attempts per window
 # END PARSEABLE EXAMPLE: upstream-local-recovery
 
 # BEGIN PARSEABLE EXAMPLE: upstream-stuck-watchdog-and-restart-queue
+# Safe defaults: both sections are disabled. Defaults are a 1800-second detection/window/queue/restart limit and a 60-second watchdog check; all *_secs values are capped at 86400 seconds.
 #| [upstream.stuck_watchdog]
 #| enabled = true                                                     # Detect active output-starved requests
 #| check_interval_secs = 30                                           # Polling interval

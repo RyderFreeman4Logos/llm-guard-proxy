@@ -129,6 +129,24 @@ data: [DONE]
 #[test]
 fn stuck_watchdog_counts_non_stream_and_sse_output_tokens_in_trailing_window() {
     let tracker = StuckWatchdogTokenTracker::default();
+    let tracker = Arc::new(tracker);
+    let request = tracker.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    let mut windows = tracker
+        .windows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let attempt = windows
+        .get_mut("default")
+        .and_then(|window| window.attempts.get_mut(&request.inner.attempt_id))
+        .expect("active test request must be tracked");
+    attempt.started_at = Instant::now()
+        .checked_sub(Duration::from_secs(2))
+        .expect("test Instant supports a two-second adjustment");
+    drop(windows);
     tracker.record_response(
         "default",
         Duration::from_secs(1),
@@ -170,6 +188,76 @@ fn stuck_watchdog_waits_for_a_complete_detection_window_before_declaring_a_new_r
 
     drop(request);
     assert!(!tracker.has_active_requests("default"));
+    assert!(
+        !tracker.has_too_few_output_tokens("default", Duration::from_secs(1), 2),
+        "a completed-only window must not be considered an active stuck request"
+    );
+}
+
+#[test]
+fn shielded_watchdog_counts_a_stream_delta_and_terminal_usage_once() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let request = tracker.begin_request(
+        "shielded",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+
+    request.record_upstream_emitted_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+    );
+    request.record_response(
+        b"",
+        b"data: {\"usage\":{\"completion_tokens\":1}}\n\ndata: [DONE]\n\n",
+    );
+
+    assert_eq!(
+        tracker.sample_count("shielded"),
+        1,
+        "a shielded upstream delta must not be counted again from terminal usage"
+    );
+}
+
+#[test]
+fn watchdog_metrics_count_only_started_commands_and_timeout_kills() {
+    let coordinator = UpstreamStallRecoveryCoordinator::default();
+    let skipped = BTreeMap::from([(
+        String::from("local_recovery_status"),
+        String::from("skipped_cooldown"),
+    )]);
+    record_watchdog_recovery_result(&coordinator, "default", &skipped);
+    assert_eq!(coordinator.watchdog_restarts.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        coordinator
+            .watchdog_recovery_timeouts
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    let timeout_killed = BTreeMap::from([
+        (
+            String::from("local_recovery_restart_ran"),
+            String::from("true"),
+        ),
+        (
+            String::from("local_recovery_status"),
+            String::from("timeout_killed"),
+        ),
+    ]);
+    record_watchdog_recovery_result(&coordinator, "default", &timeout_killed);
+
+    assert_eq!(
+        coordinator.watchdog_restarts.load(Ordering::Relaxed),
+        1,
+        "only a recovery command that actually started is a watchdog restart"
+    );
+    assert_eq!(
+        coordinator
+            .watchdog_recovery_timeouts
+            .load(Ordering::Relaxed),
+        1,
+        "a killed restart command is a timed-out watchdog recovery"
+    );
 }
 
 #[test]

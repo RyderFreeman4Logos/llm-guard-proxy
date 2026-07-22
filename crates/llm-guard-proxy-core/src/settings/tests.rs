@@ -3519,6 +3519,36 @@ restart_timeout_secs = 40
 }
 
 #[test]
+fn rejects_unbounded_watchdog_and_restart_queue_durations() {
+    let cases = [
+        (
+            "[upstream.stuck_watchdog]\ndetection_window_secs = 18446744073709551615\n",
+            "upstream.stuck_watchdog.detection_window_secs",
+        ),
+        (
+            "[upstream.stuck_watchdog]\ncheck_interval_secs = 18446744073709551615\n",
+            "upstream.stuck_watchdog.check_interval_secs",
+        ),
+        (
+            "[upstream.restart_queue]\nqueue_deadline_secs = 18446744073709551615\n",
+            "upstream.restart_queue.queue_deadline_secs",
+        ),
+        (
+            "[upstream.restart_queue]\nrestart_timeout_secs = 18446744073709551615\n",
+            "upstream.restart_queue.restart_timeout_secs",
+        ),
+    ];
+
+    for (contents, field) in cases {
+        let error = parse_config_text(contents)
+            .expect("duration syntax should parse before validation")
+            .validate()
+            .expect_err("unbounded duration must be rejected before Instant arithmetic");
+        assert_eq!(error.field(), field);
+    }
+}
+
+#[test]
 fn parses_and_validates_guardian_policy_from_the_shared_config() {
     let config = AppConfig::parse(
         r#"

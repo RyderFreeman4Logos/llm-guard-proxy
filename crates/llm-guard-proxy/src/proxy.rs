@@ -4865,12 +4865,6 @@ async fn forward_generic_endpoint_response(
             rewritten,
         )),
         EndpointResponse::Upstream(upstream_response) => {
-            if let Some(watchdog_request) = response_parts.stuck_watchdog_request.as_ref() {
-                // The reqwest response exists only after the upstream has sent
-                // response headers. Record this before handing the body to any
-                // downstream-owned stream, which may be paused by backpressure.
-                watchdog_request.record_upstream_response_started();
-            }
             if let Some(adapter) = context
                 .response_adapter
                 .map(|adapter| adapter.with_terminal_protocol(terminal_endpoint_protocol))
@@ -6429,7 +6423,6 @@ struct StuckWatchdogTokenWindow {
 #[derive(Debug)]
 struct StuckWatchdogAttempt {
     started_at: Instant,
-    response_started: Option<Instant>,
     completed: Option<Instant>,
 }
 
@@ -6456,6 +6449,7 @@ struct StuckWatchdogRequestInner {
     progress_unit: WatchdogProgressUnit,
     detection_window: Duration,
     sse_buffer: Mutex<Vec<u8>>,
+    upstream_progress_recorded: AtomicBool,
 }
 
 #[derive(Clone, Debug)]
@@ -6480,7 +6474,6 @@ impl StuckWatchdogTokenTracker {
             attempt_id,
             StuckWatchdogAttempt {
                 started_at: Instant::now(),
-                response_started: None,
                 completed: None,
             },
         );
@@ -6492,6 +6485,7 @@ impl StuckWatchdogTokenTracker {
                 progress_unit,
                 detection_window,
                 sse_buffer: Mutex::new(Vec::new()),
+                upstream_progress_recorded: AtomicBool::new(false),
             }),
         }
     }
@@ -6568,7 +6562,7 @@ impl StuckWatchdogTokenTracker {
             Err(poisoned) => poisoned.into_inner(),
         };
         let Some(window) = windows.get_mut(profile) else {
-            return true;
+            return false;
         };
         window_has_too_few_output_tokens(
             window,
@@ -6578,6 +6572,7 @@ impl StuckWatchdogTokenTracker {
         )
     }
 
+    #[cfg(test)]
     fn has_active_requests(&self, profile: &str) -> bool {
         let windows = match self.windows.lock() {
             Ok(guard) => guard,
@@ -6593,23 +6588,14 @@ impl StuckWatchdogTokenTracker {
 }
 
 impl StuckWatchdogRequest {
-    /// Response headers were received from the upstream before the body is
-    /// handed to the client.  This intentionally does not depend on downstream
-    /// consumption, which can be paused indefinitely by client backpressure.
-    fn record_upstream_response_started(&self) {
-        let mut windows = match self.inner.tracker.windows.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(attempt) = windows
-            .get_mut(&self.inner.profile)
-            .and_then(|window| window.attempts.get_mut(&self.inner.attempt_id))
-        {
-            attempt.response_started.get_or_insert_with(Instant::now);
-        }
-    }
-
     fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
+        if self
+            .inner
+            .upstream_progress_recorded
+            .load(Ordering::Relaxed)
+        {
+            return;
+        }
         self.inner.tracker.record_response(
             &self.inner.profile,
             self.inner.detection_window,
@@ -6618,7 +6604,7 @@ impl StuckWatchdogRequest {
         );
     }
 
-    fn record_emitted_chunk(&self, chunk: &[u8]) {
+    fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
         let progress = match self.inner.progress_unit {
             WatchdogProgressUnit::Chat => self.record_sse_content_progress(chunk),
             // Embedding and reranker endpoints generally omit completion_tokens; a
@@ -6632,6 +6618,15 @@ impl StuckWatchdogRequest {
             self.inner.detection_window,
             progress,
         );
+        progress > 0
+    }
+
+    fn record_upstream_emitted_chunk(&self, chunk: &[u8]) {
+        if self.record_emitted_chunk(chunk) {
+            self.inner
+                .upstream_progress_recorded
+                .store(true, Ordering::Relaxed);
+        }
     }
 
     fn record_sse_content_progress(&self, chunk: &[u8]) -> u64 {
@@ -6682,9 +6677,7 @@ fn window_has_too_few_output_tokens(
         .attempts
         .values()
         .filter(|attempt| attempt.completed.is_none());
-    if active_attempts
-        .clone()
-        .any(|attempt| attempt.response_started.is_some())
+    if active_attempts.clone().next().is_none()
         || active_attempts
             .any(|attempt| now.saturating_duration_since(attempt.started_at) < detection_window)
     {
@@ -6801,6 +6794,10 @@ struct WatchdogScheduleEntry {
     applied_interval: Duration,
 }
 
+fn checked_instant_add(now: Instant, duration: Duration) -> Instant {
+    now.checked_add(duration).unwrap_or(now)
+}
+
 impl WatchdogSchedule {
     fn due_profiles(&mut self, now: Instant, profiles: &[(String, Duration)]) -> Vec<String> {
         profiles
@@ -6813,7 +6810,7 @@ impl WatchdogSchedule {
                     self.next_due.insert(
                         name.clone(),
                         WatchdogScheduleEntry {
-                            next_due: now + *interval,
+                            next_due: checked_instant_add(now, *interval),
                             applied_interval: *interval,
                         },
                     );
@@ -6882,13 +6879,11 @@ async fn run_stuck_engine_watchdog(
                 continue;
             }
             let detection_window = Duration::from_secs(watchdog.detection_window_secs);
-            if !tokens.has_active_requests(&profile.name)
-                || !tokens.has_too_few_output_tokens(
-                    &profile.name,
-                    detection_window,
-                    watchdog.min_output_tokens_in_window,
-                )
-            {
+            if !tokens.has_too_few_output_tokens(
+                &profile.name,
+                detection_window,
+                watchdog.min_output_tokens_in_window,
+            ) {
                 continue;
             }
 
@@ -6903,9 +6898,6 @@ async fn run_stuck_engine_watchdog(
             let coordinator = local_recovery.coordinator_for(&profile.name);
             coordinator
                 .watchdog_detections
-                .fetch_add(1, Ordering::Relaxed);
-            coordinator
-                .watchdog_restarts
                 .fetch_add(1, Ordering::Relaxed);
             let profile_name = profile.name.clone();
             recovering_profiles.insert(profile_name.clone());
@@ -6982,13 +6974,24 @@ fn record_watchdog_recovery_result(
     profile: &str,
     recovery: &BTreeMap<String, String>,
 ) {
+    if recovery
+        .get("local_recovery_restart_ran")
+        .is_some_and(|started| started == "true")
+    {
+        coordinator
+            .watchdog_restarts
+            .fetch_add(1, Ordering::Relaxed);
+    }
     match recovery.get("local_recovery_status").map(String::as_str) {
         Some("succeeded") => {
             coordinator
                 .watchdog_recovery_successes
                 .fetch_add(1, Ordering::Relaxed);
         }
-        Some("completion_timeout" | "episode_timeout" | "join_timeout" | "readiness_timeout") => {
+        Some(
+            "completion_timeout" | "episode_timeout" | "join_timeout" | "readiness_timeout"
+            | "timeout_killed",
+        ) => {
             coordinator
                 .watchdog_recovery_timeouts
                 .fetch_add(1, Ordering::Relaxed);
@@ -7032,7 +7035,7 @@ async fn wait_for_restart_queue(
     coordinator: &UpstreamStallRecoveryCoordinator,
     queue_deadline: Duration,
 ) -> RestartQueueWaitResult {
-    let deadline = Instant::now() + queue_deadline;
+    let deadline = checked_instant_add(Instant::now(), queue_deadline);
     let mut waited_for_recovery = false;
     loop {
         let notified = coordinator.notify.notified();
@@ -8669,7 +8672,7 @@ async fn aggregate_shielded_attempt(
         if let (Some(request), Ok(chunk)) = (&stuck_watchdog_request, chunk) {
             // Shielded calls aggregate upstream SSE internally, so this is the
             // only place their sustained model output reaches the watchdog.
-            request.record_emitted_chunk(chunk);
+            request.record_upstream_emitted_chunk(chunk);
         }
     });
     let aggregate = shielded_chat::aggregate_stream(
@@ -9597,9 +9600,10 @@ async fn run_local_recovery_for_profile(
         .restart_timeout
         .saturating_add(policy.readiness_deadline)
         .saturating_add(Duration::from_secs(1));
-    state.recovery_deadline = Some(
-        now + episode_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
-    );
+    state.recovery_deadline = Some(checked_instant_add(
+        now,
+        episode_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
+    ));
     state.runs_in_window = state.runs_in_window.saturating_add(1);
     drop(state);
 
@@ -9678,11 +9682,13 @@ async fn wait_for_local_recovery_result(
     let mut state = coordinator.state.lock().await;
     let recovery_started = *state.recovery_started.get_or_insert_with(Instant::now);
     let deadline = *state.recovery_deadline.get_or_insert_with(|| {
-        recovery_started
-            + policy
+        checked_instant_add(
+            recovery_started,
+            policy
                 .restart_timeout
                 .saturating_add(policy.readiness_deadline)
-                .saturating_add(Duration::from_secs(1))
+                .saturating_add(Duration::from_secs(1)),
+        )
     });
     drop(state);
     loop {
@@ -9742,10 +9748,7 @@ fn completed_local_recovery_metadata(
 async fn run_local_recovery_restart_command(
     policy: &LocalRecoveryPolicy,
 ) -> BTreeMap<String, String> {
-    let mut metadata = BTreeMap::from([(
-        String::from("local_recovery_restart_ran"),
-        String::from("true"),
-    )]);
+    let mut metadata = BTreeMap::new();
     let program = &policy.restart_command[0];
     let args = &policy.restart_command[1..];
     let mut command = Command::new(program);
@@ -9774,6 +9777,10 @@ async fn run_local_recovery_restart_command(
             return metadata;
         }
     };
+    metadata.insert(
+        String::from("local_recovery_restart_ran"),
+        String::from("true"),
+    );
     match timeout(policy.restart_timeout, child.wait()).await {
         Ok(Ok(status)) => {
             let restart_status = if status.success() {
@@ -10218,14 +10225,6 @@ async fn wait_for_recovery_child_with_timeout(
     metadata
 }
 
-/// Shielded attempts buffer the upstream independently of downstream response
-/// consumption, so headers must count as progress before aggregation begins.
-fn record_shielded_attempt_response_start(runtime: &ShieldedRetryRuntime) {
-    if let Some(watchdog_request) = runtime.stuck_watchdog_request.as_ref() {
-        watchdog_request.record_upstream_response_started();
-    }
-}
-
 async fn start_shielded_attempt(
     runtime: &ShieldedRetryRuntime,
     attempt_number: u32,
@@ -10306,7 +10305,6 @@ async fn start_shielded_attempt(
             )),
         )));
     };
-    record_shielded_attempt_response_start(runtime);
     let upstream_status = response.status();
     let upstream_headers = response.headers().clone();
     let upstream_mode = upstream_mode_from_headers(&upstream_headers);
@@ -11812,7 +11810,9 @@ struct ForwardedBodyObserver {
 
 impl ForwardedBodyObserver {
     fn record_chunk(&self, chunk: &[u8]) {
-        if let Some(stuck_watchdog_request) = &self.stuck_watchdog_request {
+        if self.attempt_progress.is_none()
+            && let Some(stuck_watchdog_request) = &self.stuck_watchdog_request
+        {
             // This is invoked from the body poll that yields the chunk downstream.
             stuck_watchdog_request.record_emitted_chunk(chunk);
         }

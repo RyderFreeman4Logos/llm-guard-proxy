@@ -1757,6 +1757,8 @@ impl Default for LocalRecoveryConfig {
     }
 }
 
+const MAX_WATCHDOG_AND_RESTART_DURATION_SECS: u64 = 86_400;
+
 /// Proactive no-output watchdog policy for one upstream service.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StuckWatchdogConfig {
@@ -1778,9 +1780,19 @@ impl StuckWatchdogConfig {
             "must be greater than zero",
         )?;
         require(
+            self.detection_window_secs <= MAX_WATCHDOG_AND_RESTART_DURATION_SECS,
+            fields.detection_window_secs,
+            "must be at most 86400 seconds",
+        )?;
+        require(
             self.check_interval_secs > 0,
             fields.check_interval_secs,
             "must be greater than zero",
+        )?;
+        require(
+            self.check_interval_secs <= MAX_WATCHDOG_AND_RESTART_DURATION_SECS,
+            fields.check_interval_secs,
+            "must be at most 86400 seconds",
         )?;
         require(
             self.check_interval_secs <= self.detection_window_secs,
@@ -1842,9 +1854,19 @@ impl RestartQueueConfig {
             "must be greater than zero",
         )?;
         require(
+            self.queue_deadline_secs <= MAX_WATCHDOG_AND_RESTART_DURATION_SECS,
+            fields.queue_deadline_secs,
+            "must be at most 86400 seconds",
+        )?;
+        require(
             self.restart_timeout_secs > 0,
             fields.restart_timeout_secs,
             "must be greater than zero",
+        )?;
+        require(
+            self.restart_timeout_secs <= MAX_WATCHDOG_AND_RESTART_DURATION_SECS,
+            fields.restart_timeout_secs,
+            "must be at most 86400 seconds",
         )
     }
 }

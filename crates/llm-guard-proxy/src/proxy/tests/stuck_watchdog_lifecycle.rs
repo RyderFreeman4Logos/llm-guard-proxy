@@ -82,7 +82,7 @@ async fn watchdog_lifecycle_does_not_restart_for_tool_call_only_sse() {
 }
 
 #[tokio::test]
-async fn watchdog_lifecycle_ignores_downstream_backpressure() {
+async fn watchdog_lifecycle_restarts_when_backpressure_stops_upstream_body_progress() {
     let upstream = BackpressureUpstream::spawn().await;
     let test_root = create_watchdog_test_root("downstream-backpressure");
     let _cleanup = TestDirectoryCleanup::new(&test_root);
@@ -110,8 +110,40 @@ async fn watchdog_lifecycle_ignores_downstream_backpressure() {
     drop(response);
     stop_watchdog(&proxy, watchdog).await;
     assert!(
-        !restarted,
-        "a downstream client that stops consuming must not make a healthy upstream look stuck"
+        restarted,
+        "an active response without recent upstream body progress must trigger watchdog recovery"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_lifecycle_restarts_after_headers_without_body_progress() {
+    let upstream = PendingSseUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("headers-without-body");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let config = touch_recovery_watchdog_config(&marker, 1);
+    let proxy = spawn_watchdog_proxy(&upstream.base_url, &config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"stream"}],"stream":true}"#,
+        )
+        .send()
+        .await
+        .expect("pending SSE request should receive upstream headers");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+    let restarted = wait_for_path(&marker, Duration::from_millis(3_500)).await;
+
+    drop(response);
+    stop_watchdog(&proxy, watchdog).await;
+    assert!(
+        restarted,
+        "headers without a later upstream SSE body delta must trigger watchdog recovery"
     );
 }
 
@@ -498,6 +530,38 @@ impl Drop for BackpressureUpstream {
     }
 }
 
+struct PendingSseUpstream {
+    base_url: String,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl PendingSseUpstream {
+    async fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("pending SSE upstream should bind");
+        let address = listener
+            .local_addr()
+            .expect("pending SSE upstream address should resolve");
+        let app = Router::new().route("/v1/chat/completions", post(pending_sse_handler));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("pending SSE upstream should serve");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            server,
+        }
+    }
+}
+
+impl Drop for PendingSseUpstream {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
 async fn backpressure_stream_handler(
     State(chunks_pulled): State<Arc<AtomicU64>>,
 ) -> Response<Body> {
@@ -514,6 +578,17 @@ async fn backpressure_stream_handler(
         },
     ));
     let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response
+}
+
+async fn pending_sse_handler() -> Response<Body> {
+    let mut response = Response::new(Body::from_stream(stream::pending::<
+        Result<Bytes, Infallible>,
+    >()));
     *response.status_mut() = StatusCode::OK;
     response
         .headers_mut()

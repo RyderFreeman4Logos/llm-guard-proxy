@@ -487,15 +487,28 @@ async fn serve_bound_listeners(
         while servers.join_next().await.is_some() {}
     }
     state.begin_shutdown();
-    join_stuck_engine_watchdog(stuck_engine_watchdog, WATCHDOG_SHUTDOWN_JOIN_TIMEOUT).await;
+    if let Err(error) =
+        join_stuck_engine_watchdog(stuck_engine_watchdog, WATCHDOG_SHUTDOWN_JOIN_TIMEOUT).await
+    {
+        eprintln!("stuck-engine watchdog task failed during shutdown: {error}");
+    }
     state.flush_persistence().await;
     result
 }
 
-async fn join_stuck_engine_watchdog(mut watchdog: tokio::task::JoinHandle<()>, max_wait: Duration) {
-    if tokio::time::timeout(max_wait, &mut watchdog).await.is_err() {
-        watchdog.abort();
-        let _watchdog_result = watchdog.await;
+async fn join_stuck_engine_watchdog(
+    mut watchdog: tokio::task::JoinHandle<()>,
+    max_wait: Duration,
+) -> Result<(), tokio::task::JoinError> {
+    match tokio::time::timeout(max_wait, &mut watchdog).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            watchdog.abort();
+            match watchdog.await {
+                Err(error) if error.is_cancelled() => Ok(()),
+                result => result,
+            }
+        }
     }
 }
 
@@ -1165,7 +1178,22 @@ mod tests {
         )
         .await;
 
-        assert!(joined.is_ok(), "shutdown must not await a stalled watchdog");
+        assert!(
+            joined
+                .expect("shutdown must not await a stalled watchdog")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_join_reports_task_failure() {
+        let watchdog = tokio::spawn(async { panic!("watchdog task failed") });
+
+        assert!(
+            super::join_stuck_engine_watchdog(watchdog, Duration::from_millis(100))
+                .await
+                .is_err()
+        );
     }
 
     #[test]
