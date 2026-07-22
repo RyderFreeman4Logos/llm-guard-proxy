@@ -275,7 +275,7 @@ fn restart_queue_wait_deadline_caps_recovery_episode_timeout() {
 async fn restart_queue_waits_for_readiness_result_and_times_out_without_it() {
     let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
     assert_eq!(
-        wait_for_restart_queue(&coordinator, Duration::from_millis(5)).await,
+        wait_for_restart_queue(&coordinator, Duration::from_millis(5), false).await,
         RestartQueueWaitResult::NotRecovering
     );
 
@@ -283,7 +283,7 @@ async fn restart_queue_waits_for_readiness_result_and_times_out_without_it() {
     let waiting = {
         let coordinator = Arc::clone(&coordinator);
         tokio::spawn(async move {
-            wait_for_restart_queue(&coordinator, Duration::from_millis(200)).await
+            wait_for_restart_queue(&coordinator, Duration::from_millis(200), true).await
         })
     };
 
@@ -307,8 +307,73 @@ async fn restart_queue_waits_for_readiness_result_and_times_out_without_it() {
 
     coordinator.state.lock().await.running = true;
     assert_eq!(
-        wait_for_restart_queue(&coordinator, Duration::from_millis(5)).await,
+        wait_for_restart_queue(&coordinator, Duration::from_millis(5), true).await,
         RestartQueueWaitResult::TimedOut
+    );
+}
+
+#[tokio::test]
+async fn restart_queue_consumes_failed_episode_completed_between_permit_and_wait() {
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery.recovery_started = Some(Instant::now());
+        recovery.recovery_deadline = Some(Instant::now() + Duration::from_secs(2));
+    }
+
+    // A permit is only issued while recovery is running. Completing the episode
+    // before the waiter re-locks must still consume that episode's result.
+    let observed_running_recovery = true;
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("spawn_failed"),
+        )]),
+    )
+    .await;
+
+    assert_eq!(
+        wait_for_restart_queue(
+            &coordinator,
+            Duration::from_millis(50),
+            observed_running_recovery
+        )
+        .await,
+        RestartQueueWaitResult::Failed,
+        "queue permit holders must not re-infer NotRecovering after the observed episode ends"
+    );
+}
+
+#[tokio::test]
+async fn restart_queue_consumes_successful_episode_completed_between_permit_and_wait() {
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery.recovery_started = Some(Instant::now());
+        recovery.recovery_deadline = Some(Instant::now() + Duration::from_secs(2));
+    }
+
+    let observed_running_recovery = true;
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+
+    assert_eq!(
+        wait_for_restart_queue(
+            &coordinator,
+            Duration::from_millis(50),
+            observed_running_recovery
+        )
+        .await,
+        RestartQueueWaitResult::Ready
     );
 }
 
@@ -538,7 +603,7 @@ async fn restart_queue_uses_episode_deadline_not_a_fresh_wait_per_request() {
     assert_eq!(
         timeout(
             Duration::from_millis(20),
-            wait_for_restart_queue(&coordinator, Duration::from_secs(1)),
+            wait_for_restart_queue(&coordinator, Duration::from_secs(1), true),
         )
         .await
         .expect("an expired episode deadline must not start a fresh per-request wait"),

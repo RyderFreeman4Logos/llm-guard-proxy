@@ -543,6 +543,141 @@ async fn restart_queue_recovery_success_metadata_persists_on_the_completed_reque
 }
 
 #[tokio::test]
+async fn restart_queue_completion_race_failed_recovery_returns_unavailable() {
+    let fake = FakeUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("restart-queue-completion-race-failed");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let proxy =
+        spawn_watchdog_proxy(&fake.base_url, &recovery_watchdog_config(&marker, 1, 1, 1)).await;
+    let profile = proxy
+        .state
+        .config
+        .snapshot()
+        .expect("watchdog config should snapshot")
+        .default_upstream_profile();
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    {
+        let mut recovery = coordinator.state.lock().await;
+        let now = Instant::now();
+        recovery.running = true;
+        recovery.recovery_started = Some(now);
+        recovery.recovery_deadline = Some(now + Duration::from_secs(2));
+    }
+
+    let permit = proxy
+        .state
+        .acquire_restart_queue_permit(&profile, &coordinator)
+        .await
+        .expect("restart queue admission should succeed")
+        .expect("active recovery should acquire a queue permit");
+    assert_eq!(
+        coordinator.restart_queue_depth.load(Ordering::Relaxed),
+        1,
+        "queue permit holders are counted in restart_queue_depth"
+    );
+    assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 1);
+
+    // Finish the observed episode after the permit is held and before the
+    // waiter's first state check, matching the production completion race.
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("spawn_failed"),
+        )]),
+    )
+    .await;
+
+    let mut metadata = BTreeMap::new();
+    let error =
+        wait_for_restart_queue_with_held_permit(&proxy.state, &profile, &mut metadata, permit)
+            .await
+            .expect_err("failed recovery must surface as unavailable");
+    assert_eq!(error.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        error
+            .request_metadata()
+            .and_then(|metadata| metadata.get("restart_queue_outcome"))
+            .map(String::as_str),
+        Some("recovery_failed")
+    );
+    assert_eq!(
+        coordinator.restart_queue_depth.load(Ordering::Relaxed),
+        0,
+        "failed completion must drop the queue permit"
+    );
+    assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 0);
+    assert_eq!(proxy.state.generation_requests.snapshot_counts().active, 0);
+}
+
+#[tokio::test]
+async fn restart_queue_completion_race_successful_recovery_retains_metadata() {
+    let fake = FakeUpstream::spawn().await;
+    let test_root = create_watchdog_test_root("restart-queue-completion-race-success");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let proxy =
+        spawn_watchdog_proxy(&fake.base_url, &recovery_watchdog_config(&marker, 1, 1, 1)).await;
+    let profile = proxy
+        .state
+        .config
+        .snapshot()
+        .expect("watchdog config should snapshot")
+        .default_upstream_profile();
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    {
+        let mut recovery = coordinator.state.lock().await;
+        let now = Instant::now();
+        recovery.running = true;
+        recovery.recovery_started = Some(now);
+        recovery.recovery_deadline = Some(now + Duration::from_secs(2));
+    }
+
+    let permit = proxy
+        .state
+        .acquire_restart_queue_permit(&profile, &coordinator)
+        .await
+        .expect("restart queue admission should succeed")
+        .expect("active recovery should acquire a queue permit");
+
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+
+    let mut metadata = BTreeMap::new();
+    let outcome =
+        wait_for_restart_queue_with_held_permit(&proxy.state, &profile, &mut metadata, permit)
+            .await
+            .expect("successful recovery must release the waiter");
+    assert_eq!(outcome.outcome, RestartQueueOutcome::ReleasedAfterRecovery);
+    let restart_metadata = outcome.request_metadata();
+    assert_eq!(
+        restart_metadata
+            .get("restart_queue_outcome")
+            .map(String::as_str),
+        Some("released_after_recovery")
+    );
+    assert!(
+        restart_metadata
+            .get("restart_queue_wait_ms")
+            .is_some_and(|elapsed| elapsed.parse::<u64>().is_ok()),
+        "successful restart-queue metadata must include elapsed wait time"
+    );
+    assert_eq!(
+        coordinator.restart_queue_depth.load(Ordering::Relaxed),
+        0,
+        "successful completion must drop the queue permit"
+    );
+    assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 0);
+}
+
+#[tokio::test]
 async fn watchdog_lifecycle_applies_reloaded_interval_without_old_interval_delay() {
     let fake = FakeUpstream::spawn().await;
     let test_root = create_watchdog_test_root("interval-reload");

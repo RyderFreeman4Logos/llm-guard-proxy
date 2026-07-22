@@ -658,6 +658,7 @@ impl ProxyState {
         Ok(Some(RestartQueuePermit {
             _queued: queued,
             coordinator: Arc::clone(coordinator),
+            observed_running_recovery: true,
         }))
     }
 
@@ -1292,6 +1293,11 @@ impl Drop for QueuedAdmissionPermit {
 struct RestartQueuePermit {
     _queued: QueuedAdmissionPermit,
     coordinator: Arc<UpstreamStallRecoveryCoordinator>,
+    /// Permit acquisition holds the coordinator lock and only succeeds while an
+    /// episode is running. That observation must survive into the waiter so a
+    /// completion that races between registration and the first re-lock still
+    /// consumes the episode result instead of re-inferring "no recovery".
+    observed_running_recovery: bool,
 }
 
 impl Drop for RestartQueuePermit {
@@ -7125,9 +7131,9 @@ impl RestartQueueWaitOutcome {
 async fn wait_for_restart_queue(
     coordinator: &UpstreamStallRecoveryCoordinator,
     queue_deadline: Duration,
+    mut observed_running_recovery: bool,
 ) -> RestartQueueWaitResult {
     let deadline = checked_instant_add(Instant::now(), queue_deadline);
-    let mut waited_for_recovery = false;
     loop {
         let notified = coordinator.notify.notified();
         tokio::pin!(notified);
@@ -7136,7 +7142,7 @@ async fn wait_for_restart_queue(
         let state = coordinator.state.lock().await;
         let recovery_deadline = state.recovery_deadline.unwrap_or(deadline);
         if !state.running {
-            if !waited_for_recovery {
+            if !observed_running_recovery {
                 return RestartQueueWaitResult::NotRecovering;
             }
             return if state
@@ -7149,7 +7155,7 @@ async fn wait_for_restart_queue(
                 RestartQueueWaitResult::Failed
             };
         }
-        waited_for_recovery = true;
+        observed_running_recovery = true;
         drop(state);
 
         let remaining = deadline
@@ -7175,12 +7181,11 @@ async fn wait_for_profile_restart_queue(
         });
     }
 
-    let queue_deadline = restart_queue_wait_deadline(queue);
     let coordinator = state.local_recovery.coordinator_for(&profile.name);
     // Restart waiters are deliberately accounted in the bounded queue, never in
     // generation in-flight capacity. The caller has released its routing permit
     // before reaching this wait.
-    let Some(_restart_queue_permit) = state
+    let Some(restart_queue_permit) = state
         .acquire_restart_queue_permit(profile, &coordinator)
         .await?
     else {
@@ -7191,16 +7196,42 @@ async fn wait_for_profile_restart_queue(
             elapsed: wait_started.elapsed(),
         });
     };
-    match wait_for_restart_queue(&coordinator, queue_deadline).await {
-        RestartQueueWaitResult::NotRecovering => Ok(RestartQueueWaitOutcome {
-            outcome: RestartQueueOutcome::NotRecovering,
-            elapsed: wait_started.elapsed(),
-        }),
+    wait_for_restart_queue_with_held_permit(state, profile, request_metadata, restart_queue_permit)
+        .await
+}
+
+/// Consume the recovery episode observed when the queue permit was acquired.
+///
+/// Callers that already hold a `RestartQueuePermit` must use this path so a
+/// completion that races between permit registration and the waiter's first
+/// state check still reads `last_result` instead of re-inferring `NotRecovering`.
+async fn wait_for_restart_queue_with_held_permit(
+    state: &ProxyState,
+    profile: &UpstreamProfileConfig,
+    request_metadata: &mut BTreeMap<String, String>,
+    restart_queue_permit: RestartQueuePermit,
+) -> Result<RestartQueueWaitOutcome, ProxyError> {
+    let wait_started = Instant::now();
+    let queue = &profile.restart_queue;
+    let queue_deadline = restart_queue_wait_deadline(queue);
+    let coordinator = state.local_recovery.coordinator_for(&profile.name);
+    let observed_running_recovery = restart_queue_permit.observed_running_recovery;
+    match wait_for_restart_queue(&coordinator, queue_deadline, observed_running_recovery).await {
+        RestartQueueWaitResult::NotRecovering => {
+            // Holding a permit means recovery was observed at registration. The
+            // waiter therefore must never re-infer an empty NotRecovering path.
+            drop(restart_queue_permit);
+            Ok(RestartQueueWaitOutcome {
+                outcome: RestartQueueOutcome::NotRecovering,
+                elapsed: wait_started.elapsed(),
+            })
+        }
         RestartQueueWaitResult::Ready => {
             eprintln!(
                 "llm_guard_proxy_restart_queue profile={} event=released_after_recovery",
                 profile.name
             );
+            drop(restart_queue_permit);
             Ok(RestartQueueWaitOutcome {
                 outcome: RestartQueueOutcome::ReleasedAfterRecovery,
                 elapsed: wait_started.elapsed(),
@@ -7223,6 +7254,7 @@ async fn wait_for_profile_restart_queue(
                 "llm_guard_proxy_restart_queue profile={} event={outcome}",
                 profile.name
             );
+            drop(restart_queue_permit);
             Err(ProxyError::upstream_unavailable(
                 profile.name.clone(),
                 u64::try_from(queue_deadline.as_millis()).unwrap_or(u64::MAX),
