@@ -310,6 +310,7 @@ pub(super) async fn rewrite_buffered_adapter_response_from_upstream(
             ));
         }
     };
+    response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
     let upstream_body_bytes = body.len();
     let (body, response_headers) = if upstream_status.is_success() {
         match adapter.rewrite(&body, model_id) {

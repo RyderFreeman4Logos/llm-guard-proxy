@@ -38,6 +38,8 @@ mod shielded_endpoint_rendering;
 #[cfg(unix)]
 #[path = "tests/stuck_watchdog_lifecycle.rs"]
 mod stuck_watchdog_lifecycle;
+#[path = "tests/stuck_watchdog_terminalization.rs"]
+mod stuck_watchdog_terminalization;
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;
@@ -439,6 +441,63 @@ async fn restart_queue_consumes_successful_episode_completed_between_permit_and_
         .await,
         RestartQueueWaitResult::Ready
     );
+}
+
+#[tokio::test]
+async fn restart_queue_permit_retains_success_after_completion_history_eviction() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let profile = AppConfig::default().default_upstream_profile();
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    {
+        let mut recovery = coordinator.state.lock().await;
+        let now = Instant::now();
+        recovery.running = true;
+        recovery.recovery_started = Some(now);
+        recovery.recovery_deadline = Some(now + Duration::from_secs(2));
+    }
+    let permit = proxy
+        .state
+        .acquire_restart_queue_permit(&profile, &coordinator, 0)
+        .await
+        .expect("active recovery should admit a restart-queue permit")
+        .expect("active recovery must produce a restart-queue permit");
+
+    finish_upstream_stall_recovery(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+    for _ in 0..COMPLETED_RECOVERY_EPISODE_CAPACITY {
+        {
+            let mut recovery = coordinator.state.lock().await;
+            let now = Instant::now();
+            recovery.running = true;
+            recovery.recovery_started = Some(now);
+            recovery.recovery_deadline = Some(now + Duration::from_secs(2));
+            recovery
+                .ensure_active_recovery_episode()
+                .expect("later recovery must allocate an episode");
+        }
+        finish_upstream_stall_recovery(
+            &coordinator,
+            BTreeMap::from([(
+                String::from("local_recovery_status"),
+                String::from("succeeded"),
+            )]),
+        )
+        .await;
+    }
+
+    let mut metadata = BTreeMap::new();
+    let outcome =
+        wait_for_restart_queue_with_held_permit(&proxy.state, &profile, &mut metadata, permit)
+            .await
+            .expect("a permit must retain its successful recovery result after history eviction");
+    assert_eq!(outcome.outcome, RestartQueueOutcome::ReleasedAfterRecovery);
 }
 
 #[test]

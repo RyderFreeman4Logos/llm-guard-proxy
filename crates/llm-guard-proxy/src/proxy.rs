@@ -657,7 +657,9 @@ impl ProxyState {
         if !recovery.running {
             return Ok(None);
         }
-        let Some(observed_recovery_episode_id) = recovery.ensure_active_recovery_episode() else {
+        let Some((observed_recovery_episode_id, recovery_episode_permit_reference)) =
+            recovery.acquire_active_recovery_episode_permit()
+        else {
             return Err(ProxyError::upstream_unavailable(
                 profile.name.clone(),
                 config.server.generation_queue_timeout_ms,
@@ -687,6 +689,7 @@ impl ProxyState {
             _body: body_reservation,
             coordinator: Arc::clone(coordinator),
             observed_recovery_episode_id,
+            _recovery_episode_permit_reference: recovery_episode_permit_reference,
         }))
     }
 
@@ -1383,6 +1386,9 @@ struct RestartQueuePermit {
     /// completion that races between registration and the first re-lock still
     /// consumes the episode result instead of re-inferring "no recovery".
     observed_recovery_episode_id: u64,
+    /// Keeps the completed recovery result resident until this waiter has
+    /// consumed it, even when later recoveries fill the normal history bound.
+    _recovery_episode_permit_reference: RecoveryEpisodePermitReference,
 }
 
 impl Drop for RestartQueuePermit {
@@ -6552,6 +6558,7 @@ struct UpstreamStallRecoveryState {
     last_result: Option<BTreeMap<String, String>>,
     next_recovery_episode_id: u64,
     active_recovery_episode_id: Option<u64>,
+    active_recovery_episode_permits: Option<Arc<AtomicUsize>>,
     completed_recovery_episodes: VecDeque<CompletedRecoveryEpisode>,
 }
 
@@ -6561,6 +6568,16 @@ const COMPLETED_RECOVERY_EPISODE_CAPACITY: usize = 8;
 struct CompletedRecoveryEpisode {
     id: u64,
     result: BTreeMap<String, String>,
+    permit_references: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct RecoveryEpisodePermitReference(Arc<AtomicUsize>);
+
+impl Drop for RecoveryEpisodePermitReference {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
 }
 
 impl UpstreamStallRecoveryState {
@@ -6568,12 +6585,24 @@ impl UpstreamStallRecoveryState {
     /// retains this identity so it cannot consume a later recovery's result.
     fn ensure_active_recovery_episode(&mut self) -> Option<u64> {
         if let Some(id) = self.active_recovery_episode_id {
+            self.active_recovery_episode_permits
+                .get_or_insert_with(|| Arc::new(AtomicUsize::new(0)));
             return Some(id);
         }
         let id = self.next_recovery_episode_id.checked_add(1)?;
         self.next_recovery_episode_id = id;
         self.active_recovery_episode_id = Some(id);
+        self.active_recovery_episode_permits = Some(Arc::new(AtomicUsize::new(0)));
         Some(id)
+    }
+
+    fn acquire_active_recovery_episode_permit(
+        &mut self,
+    ) -> Option<(u64, RecoveryEpisodePermitReference)> {
+        let id = self.ensure_active_recovery_episode()?;
+        let permit_references = Arc::clone(self.active_recovery_episode_permits.as_ref()?);
+        permit_references.fetch_add(1, Ordering::Relaxed);
+        Some((id, RecoveryEpisodePermitReference(permit_references)))
     }
 
     fn completed_recovery_result(&self, episode_id: u64) -> Option<&BTreeMap<String, String>> {
@@ -6585,15 +6614,34 @@ impl UpstreamStallRecoveryState {
 
     fn finish_recovery(&mut self, result: BTreeMap<String, String>) {
         let episode_id = self.active_recovery_episode_id.take();
+        let permit_references = self
+            .active_recovery_episode_permits
+            .take()
+            .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
         self.running = false;
         self.last_finished = Some(Instant::now());
         self.last_result = Some(result.clone());
         if let Some(id) = episode_id {
             self.completed_recovery_episodes
-                .push_back(CompletedRecoveryEpisode { id, result });
-            while self.completed_recovery_episodes.len() > COMPLETED_RECOVERY_EPISODE_CAPACITY {
-                let _removed = self.completed_recovery_episodes.pop_front();
-            }
+                .push_back(CompletedRecoveryEpisode {
+                    id,
+                    result,
+                    permit_references,
+                });
+            self.prune_completed_recovery_episodes();
+        }
+    }
+
+    fn prune_completed_recovery_episodes(&mut self) {
+        while self.completed_recovery_episodes.len() > COMPLETED_RECOVERY_EPISODE_CAPACITY {
+            let Some(index) = self
+                .completed_recovery_episodes
+                .iter()
+                .position(|episode| episode.permit_references.load(Ordering::Acquire) == 0)
+            else {
+                return;
+            };
+            let _removed = self.completed_recovery_episodes.remove(index);
         }
     }
 }
@@ -6837,6 +6885,21 @@ impl StuckWatchdogRequest {
         }
     }
 
+    fn finish_attempt(&self, attempt_id: u64) {
+        let mut windows = match self.inner.tracker.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // A physical attempt has reached an upstream terminal state. It cannot
+        // become stalled while a downstream observer still retains its body.
+        if let Some(window) = windows.get_mut(&self.inner.profile) {
+            window.attempts.remove(&attempt_id);
+            if window.attempts.is_empty() && window.samples.is_empty() {
+                windows.remove(&self.inner.profile);
+            }
+        }
+    }
+
     fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
         if self
             .inner
@@ -6970,24 +7033,16 @@ impl StuckWatchdogAttemptLease {
         if self.ended {
             return;
         }
-        let mut windows = match self.request.inner.tracker.windows.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // Completed physical attempts are not needed for active-stall detection and
-        // would otherwise grow as request_rate × detection_window (or indefinitely
-        // after watchdog disable stops periodic prune). Delete by ID on lease end.
-        if let Some(window) = windows.get_mut(&self.request.inner.profile) {
-            window.attempts.remove(&self.attempt_id);
-            if window.attempts.is_empty() && window.samples.is_empty() {
-                windows.remove(&self.request.inner.profile);
-            }
-        }
+        self.request.finish_attempt(self.attempt_id);
         self.ended = true;
     }
 }
 
 impl StuckWatchdogAttemptProgress {
+    fn end_attempt(&self) {
+        self.request.finish_attempt(self.attempt_id);
+    }
+
     fn record_upstream_emitted_chunk(&self, chunk: &[u8]) -> bool {
         let state = self
             .request
@@ -8260,6 +8315,12 @@ struct ForwardedResponseParts {
 }
 
 impl ForwardedResponseParts {
+    fn end_stuck_watchdog_attempt_at_upstream_terminal(&self) {
+        if let Some(stuck_watchdog_attempt) = &self.stuck_watchdog_attempt {
+            stuck_watchdog_attempt.progress_request().end_attempt();
+        }
+    }
+
     fn shutdown_subscription(&self) -> ShutdownSubscription {
         self.shutdown.subscribe()
     }
@@ -8416,6 +8477,7 @@ async fn forward_buffered_models_response(
         Ok(body) => body,
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
+    response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
     let body = filter_models_body_for_listener(config, listener, body);
     let body = model_metadata::enrich_models_body(config, metadata_config, body);
     let shutdown = response_parts.shutdown_subscription();
@@ -12793,15 +12855,23 @@ fn observe_upstream_body_independently(
                     biased;
                     () = tx.closed() => return,
                     item = stream.next() => match item {
-                        Some(item) => {
-                            if let Ok(bytes) = &item
-                                && let Some(progress) = &progress
-                            {
-                                progress.record_upstream_emitted_chunk(bytes);
+                        Some(Ok(bytes)) => {
+                            if let Some(progress) = &progress {
+                                progress.record_upstream_emitted_chunk(&bytes);
                             }
-                            pending.push_back(item);
+                            pending.push_back(Ok(bytes));
+                        }
+                        Some(Err(error)) => {
+                            if let Some(progress) = &progress {
+                                progress.end_attempt();
+                            }
+                            pending.push_back(Err(error));
+                            upstream_open = false;
                         }
                         None => {
+                            if let Some(progress) = &progress {
+                                progress.end_attempt();
+                            }
                             upstream_open = false;
                         }
                     },
