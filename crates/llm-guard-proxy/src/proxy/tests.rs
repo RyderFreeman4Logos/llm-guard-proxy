@@ -195,6 +195,51 @@ fn stuck_watchdog_waits_for_a_complete_detection_window_before_declaring_a_new_r
 }
 
 #[test]
+fn young_active_attempt_does_not_suppress_old_stuck_detection() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let old_request = tracker.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    {
+        let mut windows = tracker
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let attempt = windows
+            .get_mut("default")
+            .and_then(|window| window.attempts.get_mut(&old_request.attempt_id))
+            .expect("old attempt must be tracked");
+        attempt.started_at = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test Instant supports a two-second adjustment");
+    }
+
+    assert!(
+        tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1),
+        "an output-starved attempt past the detection window must trigger recovery"
+    );
+
+    let young_request = tracker.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    assert!(
+        tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1),
+        "a young concurrent attempt must not suppress an independently matured stuck attempt"
+    );
+
+    drop(old_request);
+    assert!(
+        !tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1),
+        "after the old attempt ends, a remaining young attempt alone must not trigger recovery"
+    );
+    drop(young_request);
+}
+
+#[test]
 fn shielded_watchdog_counts_a_stream_delta_and_terminal_usage_once() {
     let tracker = Arc::new(StuckWatchdogTokenTracker::default());
     let request = tracker.begin_request(

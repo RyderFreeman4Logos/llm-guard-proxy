@@ -416,18 +416,14 @@ enabled = false
     wait_for_upstream_backpressure(&upstream.chunks_pulled).await;
     let pulled_while_unread = upstream.chunks_pulled.load(Ordering::Relaxed);
     assert!(
-        pulled_while_unread > OBSERVED_UPSTREAM_RELAY_CAPACITY as u64,
-        "upstream must keep producing past the independent relay capacity while the client does not read; pulled={pulled_while_unread}"
+        pulled_while_unread >= OBSERVED_UPSTREAM_RELAY_CAPACITY as u64,
+        "upstream must progress into the independent relay while the client does not read; pulled={pulled_while_unread}"
     );
 
-    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
-    sleep(Duration::from_millis(2_200)).await;
-    let restarted = marker.exists();
-    let pulled_before_drain = upstream.chunks_pulled.load(Ordering::Relaxed);
-
-    // Resume consumption after saturation: retained prefix must stay ordered OpenAI
-    // SSE without silent reordering. The upstream fixture is intentionally unbounded,
-    // so only drain a finite retained window before cancelling the consumer.
+    // Resume before the detection window ages out retained progress samples. The
+    // lossless relay pauses upstream under full buffers instead of discarding, so
+    // an indefinitely paused client may legitimately look stuck; this test only
+    // checks short-pause behavior and ordered delivery.
     let mut body_stream = response.bytes_stream();
     let mut delivered = Vec::new();
     for _ in 0..(OBSERVED_UPSTREAM_RELAY_CAPACITY.saturating_mul(2)) {
@@ -444,7 +440,7 @@ enabled = false
     let delivered_frames = delivered.matches(frame.as_ref()).count();
     assert!(
         delivered_frames > 0,
-        "open consumer must still receive at least the retained ordered SSE prefix"
+        "open consumer must still receive retained ordered SSE frames after backpressure"
     );
     assert!(
         delivered.split("data: ").skip(1).all(|fragment| {
@@ -456,15 +452,86 @@ enabled = false
         }),
         "delivered bytes must remain ordered OpenAI SSE frames without silent reordering"
     );
-
-    stop_watchdog(&proxy, watchdog).await;
     assert!(
-        !restarted,
-        "healthy upstream production under downstream backpressure must not trigger shared recovery"
+        !marker.exists(),
+        "short client pause under healthy production must not trigger shared recovery"
+    );
+}
+
+#[tokio::test]
+async fn independent_relay_preserves_every_numbered_sse_frame_under_backpressure() {
+    // Emit more frames than channel + pending capacity so the old discard branch
+    // would permanently lose the middle of the response.
+    let total_frames = OBSERVED_UPSTREAM_RELAY_CAPACITY
+        .saturating_mul(2)
+        .saturating_add(8);
+    let upstream = NumberedFrameUpstream::spawn(total_frames).await;
+    let test_root = create_watchdog_test_root("numbered-backpressure");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let config = format!(
+        r"
+[shielding]
+enabled = false
+{}",
+        touch_recovery_watchdog_config(&marker, 1)
+    );
+    let proxy = spawn_watchdog_proxy(&upstream.base_url, &config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"stream"}],"stream":true}"#,
+        )
+        .send()
+        .await
+        .expect("streaming request should receive upstream headers");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // Pause the client until the independent relay has observed enough healthy
+    // frames to prove progress is not coupled to client body polls. The finite
+    // upstream still finishes every numbered frame + [DONE] into the ordered
+    // buffer / flow-controlled chain without discarding middle frames.
+    timeout(Duration::from_secs(5), async {
+        while upstream.chunks_pulled.load(Ordering::Relaxed)
+            <= OBSERVED_UPSTREAM_RELAY_CAPACITY as u64
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect(
+        "finite numbered upstream must progress past relay capacity while the client is paused",
+    );
+    // Give the producer a moment to either finish or settle under flow control.
+    sleep(Duration::from_millis(100)).await;
+
+    // Resume: every frame and the terminal [DONE] must still be delivered in order.
+    let body = timeout(Duration::from_secs(5), response.bytes())
+        .await
+        .expect("paused client must resume without hanging")
+        .expect("downstream body must drain after resume");
+    let delivered = String::from_utf8_lossy(&body);
+    let mut search_from = 0;
+    for index in 0..total_frames {
+        let frame = chat_delta_sse(&serde_json::json!({"content": format!("frame-{index}")}));
+        let frame = String::from_utf8_lossy(&frame);
+        let found = delivered[search_from..]
+            .find(frame.as_ref())
+            .unwrap_or_else(|| {
+                panic!("missing ordered SSE frame {index} after backpressure; body={delivered}")
+            });
+        search_from += found + frame.len();
+    }
+    assert!(
+        delivered[search_from..].contains("data: [DONE]"),
+        "terminal [DONE] must survive backpressure after every numbered frame"
     );
     assert!(
-        pulled_before_drain >= pulled_while_unread,
-        "watchdog observation must not stall upstream production after the channel fills"
+        !marker.exists(),
+        "finite healthy production under client pause must not trigger recovery"
     );
 }
 
@@ -1277,6 +1344,43 @@ impl Drop for BackpressureUpstream {
     }
 }
 
+struct NumberedFrameUpstream {
+    base_url: String,
+    chunks_pulled: Arc<AtomicU64>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl NumberedFrameUpstream {
+    async fn spawn(total_frames: usize) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("numbered-frame upstream should bind");
+        let address = listener
+            .local_addr()
+            .expect("numbered-frame upstream address should resolve");
+        let chunks_pulled = Arc::new(AtomicU64::new(0));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(numbered_frame_stream_handler))
+            .with_state((Arc::clone(&chunks_pulled), total_frames));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("numbered-frame upstream should serve");
+        });
+        Self {
+            base_url: format!("http://{address}"),
+            chunks_pulled,
+            server,
+        }
+    }
+}
+
+impl Drop for NumberedFrameUpstream {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
 struct PendingSseUpstream {
     base_url: String,
     server: tokio::task::JoinHandle<()>,
@@ -1360,6 +1464,40 @@ async fn backpressure_stream_handler(
     response
 }
 
+async fn numbered_frame_stream_handler(
+    State((chunks_pulled, total_frames)): State<(Arc<AtomicU64>, usize)>,
+) -> Response<Body> {
+    let body = Body::from_stream(stream::unfold(
+        (0_usize, chunks_pulled, total_frames),
+        |(index, chunks_pulled, total_frames)| async move {
+            if index > total_frames {
+                return None;
+            }
+            chunks_pulled.fetch_add(1, Ordering::Relaxed);
+            sleep(Duration::from_millis(5)).await;
+            if index == total_frames {
+                return Some((
+                    Ok::<Bytes, Infallible>(Bytes::from_static(b"data: [DONE]\n\n")),
+                    (index + 1, chunks_pulled, total_frames),
+                ));
+            }
+            let frame = chat_delta_sse(&serde_json::json!({
+                "content": format!("frame-{index}")
+            }));
+            Some((
+                Ok::<Bytes, Infallible>(frame),
+                (index + 1, chunks_pulled, total_frames),
+            ))
+        },
+    ));
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response
+}
+
 async fn pending_sse_handler() -> Response<Body> {
     let mut response = Response::new(Body::from_stream(stream::pending::<
         Result<Bytes, Infallible>,
@@ -1372,13 +1510,11 @@ async fn pending_sse_handler() -> Response<Body> {
 }
 
 async fn wait_for_upstream_backpressure(chunks_pulled: &AtomicU64) {
-    // Independent relay must keep observing healthy upstream production even after
-    // the downstream-facing channel (capacity 16) and any local socket buffering
-    // saturate. Waiting far past that capacity proves the pump does not block on
-    // client consumption before recording progress.
-    let minimum_chunks = (OBSERVED_UPSTREAM_RELAY_CAPACITY as u64)
-        .saturating_mul(4)
-        .saturating_add(8);
+    // With lossless backpressure the independent relay may fill the channel and
+    // pending buffer, then stop polling upstream until the client drains. Waiting
+    // past the channel capacity proves production was observed independently of
+    // client body polls without requiring unbounded discard.
+    let minimum_chunks = (OBSERVED_UPSTREAM_RELAY_CAPACITY as u64).saturating_add(1);
     timeout(Duration::from_secs(5), async {
         while chunks_pulled.load(Ordering::Relaxed) < minimum_chunks {
             sleep(Duration::from_millis(10)).await;

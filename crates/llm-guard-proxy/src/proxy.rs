@@ -6864,14 +6864,14 @@ fn window_has_too_few_output_progress_units(
     now: Instant,
 ) -> bool {
     prune_watchdog_attempts(window, detection_window, now);
-    let mut active_attempts = window
-        .attempts
-        .values()
-        .filter(|attempt| attempt.completed.is_none());
-    if active_attempts.clone().next().is_none()
-        || active_attempts
-            .any(|attempt| now.saturating_duration_since(attempt.started_at) < detection_window)
-    {
+    // Detection requires at least one still-active attempt that has matured past
+    // the detection window. A younger concurrent attempt must not suppress an
+    // independently matured stuck attempt, and a young-only window must not fire.
+    let has_mature_active_attempt = window.attempts.values().any(|attempt| {
+        attempt.completed.is_none()
+            && now.saturating_duration_since(attempt.started_at) >= detection_window
+    });
+    if !has_mature_active_attempt {
         return false;
     }
     prune_watchdog_progress(window, detection_window, now);
@@ -12465,10 +12465,11 @@ impl BodyCompletion {
 const OBSERVED_UPSTREAM_RELAY_CAPACITY: usize = 16;
 
 /// Pulls the upstream body on a dedicated task so stuck-watchdog progress tracks
-/// engine production rather than client consumption. When the downstream half is
-/// full, additional healthy chunks still update progress and are dropped for the
-/// isolated slow client instead of being treated as an engine stall. Dropping the
-/// downstream half stops the pump so cancellation still reaches upstream.
+/// engine production rather than client consumption. Every observed response
+/// byte is retained exactly once and in order; when the downstream half is full,
+/// the pump applies backpressure to the retained buffer (and therefore upstream)
+/// instead of discarding healthy chunks. Dropping the downstream half stops the
+/// pump so cancellation still reaches upstream.
 fn observe_upstream_body_independently(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     progress: Option<StuckWatchdogRequest>,
@@ -12482,8 +12483,8 @@ fn observe_upstream_body_independently(
             if tx.is_closed() {
                 return;
             }
-            // Always prefer draining retained items when the client is reading,
-            // but never block upstream observation on a full downstream half.
+            // Prefer draining retained items when the client is reading so the
+            // ordered buffer can accept the next upstream chunk without loss.
             while !pending.is_empty() {
                 match tx.try_send(pending.pop_front().expect("non-empty pending queue")) {
                     Ok(()) => {}
@@ -12498,8 +12499,8 @@ fn observe_upstream_body_independently(
                 if pending.is_empty() {
                     return;
                 }
-                // Upstream finished; it is safe to wait for client capacity while
-                // delivering the retained ordered prefix.
+                // Upstream finished; wait for client capacity while delivering
+                // every retained ordered chunk exactly once.
                 let item = pending.pop_front().expect("non-empty pending queue");
                 if tx.send(item).await.is_err() {
                     return;
@@ -12526,30 +12527,18 @@ fn observe_upstream_body_independently(
                 }
                 continue;
             }
-            // Downstream is not draining. Keep observing healthy upstream output so
-            // progress samples refresh; drop excess body for this isolated client.
-            // Stop as soon as the downstream half is dropped so cancellation reaches
-            // the upstream connection.
+            // Downstream is not draining and the ordered buffer is full. Wait for
+            // either client capacity or cancellation; never poll and discard more
+            // upstream body while the still-open stream cannot retain it.
             tokio::select! {
                 biased;
                 () = tx.closed() => return,
-                item = stream.next() => match item {
-                    Some(Ok(bytes)) => {
-                        if let Some(progress) = &progress {
-                            progress.record_upstream_emitted_chunk(&bytes);
-                        }
+                result = tx.reserve() => match result {
+                    Ok(permit) => {
+                        let item = pending.pop_front().expect("full pending queue is non-empty");
+                        permit.send(item);
                     }
-                    Some(Err(error)) => {
-                        // Prefer surfaceable transport failure over a retained
-                        // healthy chunk once the slow client finally drains.
-                        if pending.len() >= OBSERVED_UPSTREAM_RELAY_CAPACITY {
-                            let _ = pending.pop_back();
-                        }
-                        pending.push_back(Err(error));
-                    }
-                    None => {
-                        upstream_open = false;
-                    }
+                    Err(_) => return,
                 },
             }
         }
