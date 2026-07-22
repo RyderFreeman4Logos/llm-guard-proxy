@@ -1,7 +1,12 @@
 use axum::http::Uri;
 use serde_json::Value;
 
-const MAX_PENDING_PROGRESS_BYTES: usize = 64 * 1024;
+/// Incomplete SSE residual after complete frames are drained.
+const MAX_PENDING_SSE_RESIDUAL_BYTES: usize = 64 * 1024;
+/// Incomplete non-SSE JSON documents (embeddings/rerank) may exceed one SSE frame
+/// and arrive across many TCP chunks; keep a larger bound so progress is only
+/// recognized once the full document parses.
+const MAX_PENDING_RESULT_DOCUMENT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WatchdogProgressUnit {
@@ -11,12 +16,18 @@ pub(super) enum WatchdogProgressUnit {
     Reranker,
 }
 
-pub(super) fn watchdog_progress_unit(uri: &Uri) -> WatchdogProgressUnit {
+/// Maps a request path to an explicit progress protocol.
+///
+/// Unknown routes return `None` so the stuck-engine watchdog excludes them
+/// rather than defaulting to Chat deltas (e.g. Responses API events would never
+/// match Chat parsing and would falsely look stalled).
+pub(super) fn watchdog_progress_unit(uri: &Uri) -> Option<WatchdogProgressUnit> {
     match uri.path() {
-        "/v1/completions" => WatchdogProgressUnit::Completion,
-        "/v1/embeddings" => WatchdogProgressUnit::Embedding,
-        "/v1/rerank" | "/v1/score" => WatchdogProgressUnit::Reranker,
-        _ => WatchdogProgressUnit::Chat,
+        "/v1/chat/completions" | "/chat/completions" => Some(WatchdogProgressUnit::Chat),
+        "/v1/completions" | "/completions" => Some(WatchdogProgressUnit::Completion),
+        "/v1/embeddings" | "/embeddings" => Some(WatchdogProgressUnit::Embedding),
+        "/v1/rerank" | "/v1/score" | "/rerank" | "/score" => Some(WatchdogProgressUnit::Reranker),
+        _ => None,
     }
 }
 
@@ -37,9 +48,17 @@ pub(super) fn emitted_progress(
             complete_result_progress(progress_unit, pending)
         }
     };
-    if pending.len() > MAX_PENDING_PROGRESS_BYTES {
-        // Incomplete tail only: discarding an oversized residual avoids unbounded growth
-        // without dropping already-recognized complete progress frames.
+    let residual_cap = match progress_unit {
+        WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker
+            if !has_sse_framing(pending) =>
+        {
+            MAX_PENDING_RESULT_DOCUMENT_BYTES
+        }
+        _ => MAX_PENDING_SSE_RESIDUAL_BYTES,
+    };
+    if pending.len() > residual_cap {
+        // Incomplete residual only: discarding an oversized residual avoids unbounded
+        // growth without dropping already-recognized complete progress frames.
         pending.clear();
     }
     progress

@@ -67,7 +67,7 @@ use tokio::task::JoinSet;
 use tokio::{
     net::TcpListener,
     process::Command,
-    sync::{Mutex as AsyncMutex, Notify, Semaphore, futures::OwnedNotified, oneshot},
+    sync::{Mutex as AsyncMutex, Notify, Semaphore, futures::OwnedNotified, mpsc, oneshot},
     time::{Instant, Interval, MissedTickBehavior, Sleep, timeout},
 };
 
@@ -3075,10 +3075,12 @@ async fn forward_openai_request(
         .upstream_profile
         .stuck_watchdog
         .enabled
-        .then(|| {
+        .then(|| watchdog_progress_unit(&prepared_request.forward_uri))
+        .flatten()
+        .map(|progress_unit| {
             state.stuck_watchdog_tokens.watch_request(
                 &prepared_request.upstream_profile.name,
-                watchdog_progress_unit(&prepared_request.forward_uri),
+                progress_unit,
                 Duration::from_secs(
                     prepared_request
                         .upstream_profile
@@ -6750,6 +6752,10 @@ impl StuckWatchdogRequest {
 }
 
 impl StuckWatchdogAttemptLease {
+    fn progress_request(&self) -> StuckWatchdogRequest {
+        self.request.clone()
+    }
+
     fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
         self.request.record_response(response_body, sse_body);
     }
@@ -6988,7 +6994,7 @@ async fn run_stuck_engine_watchdog(
                 Duration::from_secs(profile.restart_queue.restart_timeout_secs),
                 coordinator,
                 client.clone(),
-                profile.base_url.clone(),
+                profile.primary_base_url().to_owned(),
                 Arc::clone(&shutdown),
             ));
         }
@@ -9295,7 +9301,7 @@ async fn wait_for_hot_restart_recovery(runtime: &ShieldedRetryRuntime) -> HotRes
     let mut state = coordinator.state.lock().await;
     if state.in_progress.is_none() {
         let client = runtime.client.clone();
-        let base_url = runtime.upstream_profile.base_url.clone();
+        let base_url = runtime.upstream_profile.primary_base_url().to_owned();
         let config = runtime.upstream_profile.hot_restart.clone();
         let model_id = hot_restart_probe_model(runtime);
         let join_handle =
@@ -9713,7 +9719,7 @@ async fn run_local_recovery(
         &runtime.local_recovery_policy,
         &runtime.local_recovery,
         runtime.client.clone(),
-        runtime.upstream_profile.base_url.clone(),
+        runtime.upstream_profile.primary_base_url().to_owned(),
         cause,
         Some(Duration::from_secs(
             runtime.upstream_profile.restart_queue.restart_timeout_secs,
@@ -12015,13 +12021,16 @@ struct ForwardedBodyObserver {
 }
 
 impl ForwardedBodyObserver {
-    fn record_chunk(&self, chunk: &[u8]) {
-        if self.attempt_progress.is_none()
-            && let Some(stuck_watchdog_attempt) = &self.stuck_watchdog_attempt
-        {
-            // This is invoked from the body poll that yields the chunk downstream.
-            stuck_watchdog_attempt.record_emitted_chunk(chunk);
+    fn stuck_watchdog_progress_request(&self) -> Option<StuckWatchdogRequest> {
+        // Shielded aggregation records progress on its internal inspect path; the
+        // independent relay is only for bodies whose progress would otherwise be
+        // coupled to downstream poll_next.
+        if self.attempt_progress.is_some() {
+            return None;
         }
+        self.stuck_watchdog_attempt
+            .as_ref()
+            .map(StuckWatchdogAttemptLease::progress_request)
     }
 
     fn record(mut self, body_bytes: u64, completion: &BodyCompletion, response_body: &Bytes) {
@@ -12398,6 +12407,85 @@ impl BodyCompletion {
     }
 }
 
+/// Capacity of the downstream-facing half of the independent upstream body relay.
+const OBSERVED_UPSTREAM_RELAY_CAPACITY: usize = 16;
+
+/// Pulls the upstream body on a dedicated task so stuck-watchdog progress tracks
+/// engine production rather than client consumption. When the downstream half is
+/// full, additional healthy chunks still update progress and are dropped for the
+/// isolated slow client instead of being treated as an engine stall. Dropping the
+/// downstream half stops the pump so cancellation still reaches upstream.
+fn observe_upstream_body_independently(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    progress: Option<StuckWatchdogRequest>,
+) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send {
+    let (tx, rx) = mpsc::channel(OBSERVED_UPSTREAM_RELAY_CAPACITY);
+    tokio::spawn(async move {
+        let mut stream = std::pin::pin!(stream);
+        let mut pending: VecDeque<Result<Bytes, reqwest::Error>> = VecDeque::new();
+        let mut upstream_open = true;
+        loop {
+            if !pending.is_empty() {
+                let item = pending.pop_front().expect("non-empty pending queue");
+                if tx.send(item).await.is_err() {
+                    return;
+                }
+                continue;
+            }
+            if !upstream_open {
+                return;
+            }
+            if tx.is_closed() {
+                return;
+            }
+            if pending.len() < OBSERVED_UPSTREAM_RELAY_CAPACITY {
+                tokio::select! {
+                    biased;
+                    () = tx.closed() => return,
+                    item = stream.next() => match item {
+                        Some(item) => {
+                            if let Ok(bytes) = &item
+                                && let Some(progress) = &progress
+                            {
+                                progress.record_upstream_emitted_chunk(bytes);
+                            }
+                            pending.push_back(item);
+                        }
+                        None => {
+                            upstream_open = false;
+                        }
+                    },
+                }
+                continue;
+            }
+            // Downstream is not draining. Keep observing healthy upstream output so
+            // progress samples refresh; drop excess body for this isolated client.
+            // Stop as soon as the downstream half is dropped so cancellation reaches
+            // the upstream connection.
+            tokio::select! {
+                biased;
+                () = tx.closed() => return,
+                item = stream.next() => match item {
+                    Some(Ok(bytes)) => {
+                        if let Some(progress) = &progress {
+                            progress.record_upstream_emitted_chunk(&bytes);
+                        }
+                    }
+                    Some(Err(error)) => {
+                        pending.push_back(Err(error));
+                    }
+                    None => {
+                        upstream_open = false;
+                    }
+                },
+            }
+        }
+    });
+    futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
+}
+
 struct ObservedUpstreamBody {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     observer: Option<ForwardedBodyObserver>,
@@ -12452,8 +12540,10 @@ impl ObservedUpstreamBody {
         shutdown: ShutdownSubscription,
         deadline: Option<ShieldedRequestDeadline>,
     ) -> Self {
+        let progress = observer.stuck_watchdog_progress_request();
+        let relayed = observe_upstream_body_independently(stream, progress);
         Self {
-            inner: Box::pin(stream),
+            inner: Box::pin(relayed),
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
             shutdown,
@@ -12494,9 +12584,9 @@ impl Stream for ObservedUpstreamBody {
             Poll::Ready(Some(Ok(bytes))) => {
                 let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 this.bytes_seen = this.bytes_seen.saturating_add(chunk_len);
-                if let Some(observer) = &this.observer {
-                    observer.record_chunk(&bytes);
-                }
+                // Watchdog progress is recorded by the independent upstream relay
+                // before chunks enter this downstream-facing stream. Do not couple
+                // engine liveness to whether the client polls the body.
                 if this.body_buffer.len() < TOKEN_USAGE_BODY_CAP {
                     let remaining = TOKEN_USAGE_BODY_CAP - this.body_buffer.len();
                     let take = remaining.min(bytes.len());

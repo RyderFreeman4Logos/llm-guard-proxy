@@ -50,7 +50,8 @@ fn watchdog_recognizes_every_supported_chat_delta_progress_field() {
 fn watchdog_maps_completions_and_records_text_progress() {
     let tracker = Arc::new(StuckWatchdogTokenTracker::default());
     let completions_uri: Uri = "/v1/completions".parse().expect("URI should parse");
-    let progress_unit = watchdog_progress_unit(&completions_uri);
+    let progress_unit =
+        watchdog_progress_unit(&completions_uri).expect("completions must be watched");
     let request = tracker.watch_request("completions", progress_unit, WATCHDOG_WINDOW);
 
     assert_eq!(progress_unit, WatchdogProgressUnit::Completion);
@@ -212,9 +213,65 @@ fn watchdog_chat_routing_and_tool_calls_fail_closed() {
     let score_substring_path: Uri = "/v1/models/scorecard".parse().expect("URI should parse");
     assert_eq!(
         watchdog_progress_unit(&score_substring_path),
-        WatchdogProgressUnit::Chat,
+        None,
         "only registered endpoint paths may select non-chat progress parsing"
     );
+}
+
+#[test]
+fn watchdog_excludes_unknown_protocols_instead_of_defaulting_to_chat() {
+    let responses: Uri = "/v1/responses".parse().expect("URI should parse");
+    let models: Uri = "/v1/models".parse().expect("URI should parse");
+    assert_eq!(
+        watchdog_progress_unit(&responses),
+        None,
+        "Responses API must not be treated as Chat delta progress"
+    );
+    assert_eq!(
+        watchdog_progress_unit(&models),
+        None,
+        "unknown control-plane routes must be excluded from the stuck watchdog"
+    );
+
+    let chat: Uri = "/v1/chat/completions".parse().expect("URI should parse");
+    assert_eq!(
+        watchdog_progress_unit(&chat),
+        Some(WatchdogProgressUnit::Chat)
+    );
+}
+
+#[test]
+fn watchdog_records_multi_chunk_non_sse_json_above_64kib() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    for (unit, prefix, suffix) in [
+        (
+            WatchdogProgressUnit::Embedding,
+            r#"{"data":[{"embedding":[0.1],"text":""#,
+            r#""}]}"#,
+        ),
+        (
+            WatchdogProgressUnit::Reranker,
+            r#"{"results":[{"index":0,"relevance_score":0.9,"document":""#,
+            r#""}]}"#,
+        ),
+    ] {
+        let profile = format!("multi-chunk-{unit:?}");
+        let request = tracker.watch_request(&profile, unit, WATCHDOG_WINDOW);
+        let filler = "x".repeat(70_000);
+        assert!(
+            !request.record_emitted_chunk(prefix.as_bytes()),
+            "incomplete document start is not progress"
+        );
+        assert!(
+            !request.record_emitted_chunk(filler.as_bytes()),
+            "incomplete mid-document payload is not progress"
+        );
+        assert!(
+            request.record_emitted_chunk(suffix.as_bytes()),
+            "complete multi-chunk non-SSE JSON over 64KiB must count as progress"
+        );
+        assert_eq!(tracker.sample_count(&profile), 1);
+    }
 }
 
 #[tokio::test]
@@ -331,12 +388,18 @@ async fn watchdog_lifecycle_records_progress_while_rewriting_a_heterogeneous_rer
 }
 
 #[tokio::test]
-async fn watchdog_lifecycle_restarts_when_backpressure_stops_upstream_body_progress() {
+async fn watchdog_lifecycle_does_not_restart_when_downstream_stops_reading_healthy_sse() {
     let upstream = BackpressureUpstream::spawn().await;
     let test_root = create_watchdog_test_root("downstream-backpressure");
     let _cleanup = TestDirectoryCleanup::new(&test_root);
     let marker = test_root.join("restart.marker");
-    let config = touch_recovery_watchdog_config(&marker, 1);
+    let config = format!(
+        r"
+[shielding]
+enabled = false
+{}",
+        touch_recovery_watchdog_config(&marker, 1)
+    );
     let proxy = spawn_watchdog_proxy(&upstream.base_url, &config).await;
 
     let response = proxy
@@ -359,9 +422,149 @@ async fn watchdog_lifecycle_restarts_when_backpressure_stops_upstream_body_progr
     drop(response);
     stop_watchdog(&proxy, watchdog).await;
     assert!(
-        restarted,
-        "an active response without recent upstream body progress must trigger watchdog recovery"
+        !restarted,
+        "healthy upstream production under downstream backpressure must not trigger shared recovery"
     );
+}
+
+#[tokio::test]
+async fn watchdog_recovery_readiness_probes_primary_base_url_not_legacy() {
+    let decoy_hits = Arc::new(AtomicU64::new(0));
+    let primary_hits = Arc::new(AtomicU64::new(0));
+    let decoy =
+        CountingProbeUpstream::spawn(Arc::clone(&decoy_hits), StatusCode::SERVICE_UNAVAILABLE)
+            .await;
+    let primary = CountingProbeUpstream::spawn(Arc::clone(&primary_hits), StatusCode::OK).await;
+    let test_root = create_watchdog_test_root("primary-readiness");
+    let _cleanup = TestDirectoryCleanup::new(&test_root);
+    let marker = test_root.join("restart.marker");
+    let proxy = spawn_watchdog_proxy(
+        &decoy.base_url,
+        &primary_readiness_watchdog_config(&decoy.base_url, &primary.base_url, &marker),
+    )
+    .await;
+    apply_decoy_legacy_base_url_with_primary_endpoint(&proxy, &decoy.base_url, &primary.base_url);
+
+    let _lease = proxy.state.stuck_watchdog_tokens.begin_request(
+        "primary-profile",
+        WatchdogProgressUnit::Chat,
+        WATCHDOG_WINDOW,
+    );
+    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+    let restarted = wait_for_path(&marker, Duration::from_secs(4)).await;
+    let primary_seen = wait_for_atomic_at_least(&primary_hits, 1, Duration::from_secs(4)).await;
+    sleep(Duration::from_millis(200)).await;
+    let decoy_seen = decoy_hits.load(Ordering::Relaxed);
+
+    stop_watchdog(&proxy, watchdog).await;
+    assert!(
+        restarted,
+        "watchdog recovery must run against the stuck attempt"
+    );
+    assert!(
+        primary_seen,
+        "readiness probes must target primary_base_url, not the decoy legacy base_url"
+    );
+    assert_eq!(
+        decoy_seen, 0,
+        "legacy decoy base_url must not receive watchdog recovery readiness probes"
+    );
+}
+
+fn primary_readiness_watchdog_config(decoy: &str, primary: &str, marker: &Path) -> String {
+    // Named multi-endpoint profile owns recovery. Default [upstream] stays decoy-only
+    // and has watchdog/recovery disabled so only the named profile is sampled.
+    format!(
+        r#"
+[retry]
+enabled = false
+
+[upstream.stuck_watchdog]
+enabled = false
+
+[upstream.local_recovery]
+enabled = false
+
+[[upstreams]]
+name = "primary-profile"
+base_url = "{decoy}"
+match_models = ["test-chat"]
+
+[[upstreams.endpoints]]
+base_url = "{primary}"
+priority = "primary"
+protocol = "openai"
+
+[[upstreams.endpoints]]
+base_url = "{decoy}"
+priority = "failover"
+protocol = "openai"
+
+[upstreams.stuck_watchdog]
+enabled = true
+detection_window_secs = 1
+min_output_progress_units_in_window = 1
+check_interval_secs = 1
+
+[upstreams.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/touch", "{marker}"]
+restart_timeout_ms = 1000
+readiness_request_timeout_ms = 200
+readiness_deadline_ms = 1500
+readiness_interval_ms = 25
+cooldown_ms = 1
+budget_window_ms = 10000
+max_per_window = 10
+
+[upstreams.restart_queue]
+enabled = true
+queue_deadline_secs = 2
+restart_timeout_secs = 2
+"#,
+        decoy = decoy,
+        primary = primary,
+        marker = marker.display(),
+    )
+}
+
+fn apply_decoy_legacy_base_url_with_primary_endpoint(
+    proxy: &ProxyFixture,
+    decoy_base_url: &str,
+    primary_base_url: &str,
+) {
+    // Parse synchronizes base_url to the primary endpoint. Restore a stale legacy
+    // decoy base_url while leaving the primary endpoint intact — recovery readiness
+    // must still probe primary_base_url().
+    let mut live = proxy
+        .state
+        .config
+        .snapshot()
+        .expect("live config should snapshot");
+    let profile = live
+        .upstream_profiles
+        .iter_mut()
+        .find(|profile| profile.name == "primary-profile")
+        .expect("named multi-endpoint profile must load");
+    profile.base_url = decoy_base_url.to_owned();
+    assert_eq!(profile.primary_base_url(), primary_base_url);
+    assert_ne!(profile.base_url, profile.primary_base_url());
+    proxy
+        .state
+        .config
+        .apply_reloadable(&live)
+        .expect("decoy legacy base_url override should apply when topology is unchanged");
+    let applied = proxy
+        .state
+        .config
+        .snapshot()
+        .expect("applied config should snapshot")
+        .upstream_profiles
+        .into_iter()
+        .find(|profile| profile.name == "primary-profile")
+        .expect("named multi-endpoint profile must remain after reload");
+    assert_eq!(applied.base_url, decoy_base_url);
+    assert_eq!(applied.primary_base_url(), primary_base_url);
 }
 
 #[tokio::test]
@@ -1093,12 +1296,15 @@ async fn slow_heterogeneous_reranker_handler() -> Response<Body> {
 async fn backpressure_stream_handler(
     State(chunks_pulled): State<Arc<AtomicU64>>,
 ) -> Response<Body> {
-    let content = "x".repeat(64 * 1024);
-    let frame = chat_delta_sse(&serde_json::json!({"content": content}));
+    // Keep each SSE frame small so HTTP re-chunking cannot exceed the incomplete
+    // residual cap before a frame boundary; the contract under test is independent
+    // upstream observation, not oversized-frame residual retention.
+    let frame = chat_delta_sse(&serde_json::json!({"content": "healthy"}));
     let body = Body::from_stream(stream::unfold(
         (chunks_pulled, frame),
         |(chunks_pulled, frame)| async move {
             chunks_pulled.fetch_add(1, Ordering::Relaxed);
+            sleep(Duration::from_millis(20)).await;
             Some((
                 Ok::<Bytes, Infallible>(frame.clone()),
                 (chunks_pulled, frame),
@@ -1125,23 +1331,76 @@ async fn pending_sse_handler() -> Response<Body> {
 }
 
 async fn wait_for_upstream_backpressure(chunks_pulled: &AtomicU64) {
+    // Independent relay keeps observing healthy upstream production even when the
+    // client stops reading, so chunk counts may keep rising. Wait only for enough
+    // production to prove the upstream half is being driven without client polls.
     timeout(Duration::from_secs(3), async {
         while chunks_pulled.load(Ordering::Relaxed) < 8 {
             sleep(Duration::from_millis(10)).await;
         }
-        let mut stable_checks = 0_u8;
-        let mut previous = chunks_pulled.load(Ordering::Relaxed);
-        while stable_checks < 5 {
-            sleep(Duration::from_millis(25)).await;
-            let current = chunks_pulled.load(Ordering::Relaxed);
-            if current == previous {
-                stable_checks = stable_checks.saturating_add(1);
-            } else {
-                stable_checks = 0;
-                previous = current;
-            }
+    })
+    .await
+    .expect("healthy upstream production must be observed independently of downstream body polls");
+}
+
+async fn wait_for_atomic_at_least(counter: &AtomicU64, minimum: u64, wait: Duration) -> bool {
+    timeout(wait, async {
+        while counter.load(Ordering::Relaxed) < minimum {
+            sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("unconsumed downstream response should apply bounded backpressure");
+    .is_ok()
+}
+
+struct CountingProbeUpstream {
+    base_url: String,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl CountingProbeUpstream {
+    async fn spawn(hits: Arc<AtomicU64>, status: StatusCode) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("counting probe upstream should bind");
+        let address = listener
+            .local_addr()
+            .expect("counting probe upstream address should resolve");
+        let app = Router::new()
+            .fallback(move |request: Request<Body>| {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, Ordering::Relaxed);
+                    let body = if request.uri().path().ends_with("/chat/completions") {
+                        Bytes::from_static(
+                            br#"{"id":"probe","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
+                        )
+                    } else {
+                        Bytes::from_static(br#"{"object":"list","data":[]}"#)
+                    };
+                    let mut response = Response::new(Body::from(body));
+                    *response.status_mut() = status;
+                    response.headers_mut().insert(
+                        CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    response
+                }
+            });
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("counting probe upstream should serve");
+        });
+        Self {
+            base_url: format!("http://{address}/v1"),
+            server,
+        }
+    }
+}
+
+impl Drop for CountingProbeUpstream {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
 }
