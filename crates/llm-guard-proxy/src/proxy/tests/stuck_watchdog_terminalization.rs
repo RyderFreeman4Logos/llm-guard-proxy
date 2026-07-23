@@ -412,7 +412,7 @@ async fn buffered_adapter_ends_watchdog_lease_before_constructing_unread_downstr
     let upstream_response = proxy
         .state
         .client
-        .post(format!("{}/v1/rerank", fake.base_url))
+        .post(format!("{}/rerank", fake.base_url))
         .body("{}")
         .send()
         .await
@@ -456,5 +456,15 @@ async fn buffered_adapter_ends_watchdog_lease_before_constructing_unread_downstr
         !tracker.has_active_requests("buffered-adapter"),
         "buffered adapters must end their lease once their upstream body is fully read, before downstream body consumption"
     );
+    assert_eq!(
+        tracker.sample_count("buffered-adapter"),
+        1,
+        "a complete successful buffered reranker result must record one sample before downstream consumption"
+    );
     drop(unread_downstream);
+    assert_eq!(
+        tracker.sample_count("buffered-adapter"),
+        1,
+        "dropping the downstream buffered body must not duplicate upstream progress"
+    );
 }

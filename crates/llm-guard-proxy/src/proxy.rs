@@ -8418,6 +8418,14 @@ impl ForwardedResponseParts {
         }
     }
 
+    fn record_stuck_watchdog_upstream_progress(&self, response_body: &[u8]) {
+        if let Some(stuck_watchdog_attempt) = &self.stuck_watchdog_attempt {
+            let _ = stuck_watchdog_attempt
+                .progress_request()
+                .record_upstream_emitted_chunk(response_body);
+        }
+    }
+
     fn shutdown_subscription(&self) -> ShutdownSubscription {
         self.shutdown.subscribe()
     }

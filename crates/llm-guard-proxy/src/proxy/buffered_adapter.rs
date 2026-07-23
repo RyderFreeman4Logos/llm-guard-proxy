@@ -310,17 +310,31 @@ pub(super) async fn rewrite_buffered_adapter_response_from_upstream(
             ));
         }
     };
-    response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
     let upstream_body_bytes = body.len();
     let (body, response_headers) = if upstream_status.is_success() {
         match adapter.rewrite(&body, model_id) {
-            Ok(body) => {
+            Ok(rewritten_body) => {
+                // Buffered reranker results arrive complete at upstream EOF. Record
+                // the successful raw result against this exact attempt before its
+                // terminalization makes downstream observation a no-op.
+                // HeterogeneousReranker records its rewritten result while the
+                // physical endpoint is finalized, so this path is only for the
+                // adapters whose result remains buffered here.
+                if matches!(
+                    &adapter,
+                    BufferedResponseAdapter::ScoreFromRerank(_)
+                        | BufferedResponseAdapter::DeepInfraQwen3Rerank(_)
+                ) {
+                    response_parts.record_stuck_watchdog_upstream_progress(&body);
+                }
+                response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
                 // Transformed body: clean downstream headers only; keep original
                 // upstream headers on response_parts for attempt observability.
                 let headers = transformed_json_response_headers();
-                (body, headers)
+                (rewritten_body, headers)
             }
             Err(error) => {
+                response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
                 return Err(response_parts.into_response_process_error(
                     ProxyError::upstream_body(format!(
                         "{} response rewrite failed: {error}",
@@ -334,6 +348,7 @@ pub(super) async fn rewrite_buffered_adapter_response_from_upstream(
             }
         }
     } else {
+        response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
         (
             body,
             transformed_error_response_headers(&response_parts.upstream_headers),

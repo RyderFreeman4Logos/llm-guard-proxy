@@ -530,6 +530,107 @@ async fn watchdog_lifecycle_records_progress_while_rewriting_a_heterogeneous_rer
 }
 
 #[tokio::test]
+async fn buffered_reranker_adapters_record_one_upstream_sample_and_suppress_restart_for_mature_overlap()
+ {
+    let upstream = PendingAndBufferedRerankerUpstream::spawn().await;
+    for (adapter, uri, body) in [
+        (
+            "score-from-rerank",
+            "/v1/score",
+            r#"{"model":"qwen3-reranker-8b","text_1":"query","text_2":"document"}"#,
+        ),
+        (
+            "deepinfra-qwen3-rerank",
+            "/v1/inference/Qwen/Qwen3-Reranker-8B?test=deepinfra-rerank",
+            r#"{"queries":["query"],"documents":["document"]}"#,
+        ),
+    ] {
+        let test_root = create_watchdog_test_root(adapter);
+        let _cleanup = TestDirectoryCleanup::new(&test_root);
+        let marker = test_root.join("restart.marker");
+        let detection_window = Duration::from_secs(2);
+        let proxy = spawn_watchdog_proxy(
+            &upstream.base_url,
+            &recovery_watchdog_config(&marker, 1, detection_window.as_secs(), 1),
+        )
+        .await;
+
+        let stalled_request = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"test-chat","messages":[{"role":"user","content":"pending"}],"stream":true}"#,
+            ))
+            .expect("stalled overlapping request should build");
+        let stalled_response = proxy_handler(State(proxy.state.clone()), stalled_request).await;
+        assert_eq!(stalled_response.status(), StatusCode::OK);
+
+        {
+            let mut windows = proxy
+                .state
+                .stuck_watchdog_tokens
+                .windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stalled_attempt = windows
+                .get_mut("default")
+                .and_then(|window| window.attempts.values_mut().next())
+                .expect("stalled forwarded request must own the only active attempt");
+            stalled_attempt.started_at = Instant::now()
+                .checked_sub(Duration::from_secs(3))
+                .expect("test Instant supports deterministic watchdog maturation");
+        }
+        assert!(
+            proxy
+                .state
+                .stuck_watchdog_tokens
+                .has_too_few_output_progress_units("default", detection_window, 1,),
+            "the {adapter} test must begin with a mature stalled overlap"
+        );
+
+        let completed_request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body))
+            .expect("successful buffered reranker request should build");
+        let completed_response = proxy_handler(State(proxy.state.clone()), completed_request).await;
+        assert_eq!(completed_response.status(), StatusCode::OK);
+        assert_eq!(
+            proxy.state.stuck_watchdog_tokens.sample_count("default"),
+            1,
+            "a successful {adapter} body must record one result sample before downstream draining"
+        );
+        assert!(
+            !proxy
+                .state
+                .stuck_watchdog_tokens
+                .has_too_few_output_progress_units("default", detection_window, 1,),
+            "the {adapter} upstream-time sample must suppress recovery for the mature overlap"
+        );
+
+        let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+        let restarted = wait_for_path(&marker, Duration::from_millis(1_100)).await;
+        let _drained_completed_response = to_bytes(completed_response.into_body(), 1024 * 1024)
+            .await
+            .expect("successful buffered reranker response should drain");
+        assert_eq!(
+            proxy.state.stuck_watchdog_tokens.sample_count("default"),
+            1,
+            "downstream draining and dropping a {adapter} response must not duplicate upstream progress"
+        );
+
+        drop(stalled_response);
+        stop_watchdog(&proxy, watchdog).await;
+        assert!(
+            !restarted,
+            "a successful {adapter} response must suppress the configured watchdog restart"
+        );
+    }
+}
+
+#[tokio::test]
 async fn watchdog_lifecycle_does_not_restart_when_downstream_stops_reading_healthy_sse() {
     let upstream = BackpressureUpstream::spawn().await;
     let test_root = create_watchdog_test_root("downstream-backpressure");
@@ -1920,6 +2021,38 @@ impl Drop for SlowHeterogeneousRerankerUpstream {
     }
 }
 
+struct PendingAndBufferedRerankerUpstream {
+    base_url: String,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl PendingAndBufferedRerankerUpstream {
+    async fn spawn() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("pending buffered reranker upstream should bind");
+        let address = listener
+            .local_addr()
+            .expect("pending buffered reranker upstream address should resolve");
+        let app = Router::new().fallback(pending_and_buffered_reranker_handler);
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("pending buffered reranker upstream should serve");
+        });
+        Self {
+            base_url: format!("http://{address}/v1"),
+            server,
+        }
+    }
+}
+
+impl Drop for PendingAndBufferedRerankerUpstream {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
 struct BackpressureUpstream {
     base_url: String,
     chunks_pulled: Arc<AtomicU64>,
@@ -2066,6 +2199,42 @@ impl Drop for PendingSseUpstream {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+
+async fn pending_and_buffered_reranker_handler(request: Request<Body>) -> Response<Body> {
+    match request.uri().path() {
+        "/v1/chat/completions" => {
+            let mut response = Response::new(Body::from_stream(stream::pending::<
+                Result<Bytes, Infallible>,
+            >()));
+            *response.status_mut() = StatusCode::OK;
+            response
+                .headers_mut()
+                .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+            response
+        }
+        "/v1/rerank" => buffered_reranker_json_response(
+            br#"{"id":"rerank","model":"qwen3-reranker-8b","results":[{"index":0,"score":0.9}]}"#,
+        ),
+        "/v1/score" => buffered_reranker_json_response(
+            br#"{"id":"score","data":[{"index":0,"score":0.0}],"usage":{"prompt_tokens":1}}"#,
+        ),
+        "/v1/models" => buffered_reranker_json_response(br#"{"object":"list","data":[]}"#),
+        _ => {
+            let mut response = buffered_reranker_json_response(br#"{"error":"unsupported"}"#);
+            *response.status_mut() = StatusCode::NOT_FOUND;
+            response
+        }
+    }
+}
+
+fn buffered_reranker_json_response(body: &'static [u8]) -> Response<Body> {
+    let mut response = Response::new(Body::from(Bytes::from_static(body)));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response
 }
 
 async fn slow_heterogeneous_reranker_handler() -> Response<Body> {
