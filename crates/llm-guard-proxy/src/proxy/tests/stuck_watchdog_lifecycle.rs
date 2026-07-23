@@ -1332,6 +1332,9 @@ async fn watchdog_lifecycle_never_waits_after_recovery_starts_without_a_queue_pe
         let mut recovery = starter_coordinator.state.lock().await;
         let now = Instant::now();
         recovery.running = true;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("test recovery must allocate an active episode");
         recovery.recovery_started = Some(now);
         recovery.recovery_deadline = Some(now + Duration::from_secs(1));
     });
@@ -1589,6 +1592,9 @@ async fn restart_queue_waiter_uses_the_episode_observed_at_permit_acquisition() 
         let mut recovery = coordinator.state.lock().await;
         let now = Instant::now();
         recovery.running = true;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("test recovery must allocate an active episode");
         recovery.recovery_started = Some(now);
         recovery.recovery_deadline = Some(now + Duration::from_secs(2));
     }
@@ -1611,6 +1617,9 @@ async fn restart_queue_waiter_uses_the_episode_observed_at_permit_acquisition() 
         let mut recovery = coordinator.state.lock().await;
         let now = Instant::now();
         recovery.running = true;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("test recovery must allocate an active episode");
         recovery.recovery_started = Some(now);
         recovery.recovery_deadline = Some(now + Duration::from_secs(2));
     }
