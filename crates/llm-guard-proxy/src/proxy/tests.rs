@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        Arc, Mutex,
+        Arc, Barrier, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -35,6 +35,21 @@ use super::*;
 
 #[path = "tests/shielded_endpoint_rendering.rs"]
 mod shielded_endpoint_rendering;
+#[cfg(unix)]
+#[path = "tests/stuck_watchdog_lifecycle.rs"]
+mod stuck_watchdog_lifecycle;
+#[path = "tests/stuck_watchdog_terminalization.rs"]
+mod stuck_watchdog_terminalization;
+#[path = "tests/watchdog_sse_event_framing.rs"]
+mod watchdog_sse_event_framing;
+#[path = "tests/watchdog_sse_fast_path_dispatch.rs"]
+mod watchdog_sse_fast_path_dispatch;
+#[path = "tests/watchdog_sse_fast_path_lifecycle.rs"]
+mod watchdog_sse_fast_path_lifecycle;
+#[path = "tests/watchdog_sse_fast_path_line_endings.rs"]
+mod watchdog_sse_fast_path_line_endings;
+#[path = "tests/watchdog_sse_fast_path_residual.rs"]
+mod watchdog_sse_fast_path_residual;
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;
@@ -120,6 +135,1015 @@ data: [DONE]
             cached_input_tokens: Some(2),
             reasoning_tokens: Some(4),
         }
+    );
+}
+
+#[test]
+fn stuck_watchdog_counts_non_stream_and_sse_output_progress_units_in_trailing_window() {
+    let tracker = StuckWatchdogTokenTracker::default();
+    let tracker = Arc::new(tracker);
+    let request = tracker.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    let mut windows = tracker
+        .windows
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let attempt = windows
+        .get_mut("default")
+        .and_then(|window| window.attempts.get_mut(&request.attempt_id))
+        .expect("active test request must be tracked");
+    attempt.started_at = Instant::now()
+        .checked_sub(Duration::from_secs(2))
+        .expect("test Instant supports a two-second adjustment");
+    drop(windows);
+    tracker.record_response(
+        "default",
+        Duration::from_secs(1),
+        br#"{"usage":{"completion_tokens":3}}"#,
+        b"",
+    );
+    tracker.record_response(
+        "default",
+        Duration::from_secs(1),
+        b"",
+        br#"data: {"usage":{"completion_tokens":2}}
+
+data: [DONE]
+"#,
+    );
+
+    assert!(!tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 2));
+    assert!(tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 3));
+}
+
+#[test]
+fn stuck_watchdog_waits_for_a_complete_detection_window_before_declaring_a_new_request_stuck() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    assert!(!tracker.has_active_requests("default"));
+
+    let request = tracker.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    assert!(tracker.has_active_requests("default"));
+    assert!(
+        !tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1),
+        "a request that just began has not yet had a full detection window to produce output"
+    );
+
+    request.record_response(br#"{"usage":{"completion_tokens":1}}"#, b"");
+    assert!(!tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1));
+
+    drop(request);
+    assert!(!tracker.has_active_requests("default"));
+    assert!(
+        !tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 2),
+        "a completed-only window must not be considered an active stuck request"
+    );
+}
+
+#[test]
+fn young_active_attempt_does_not_suppress_old_stuck_detection() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let old_request = tracker.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    {
+        let mut windows = tracker
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let attempt = windows
+            .get_mut("default")
+            .and_then(|window| window.attempts.get_mut(&old_request.attempt_id))
+            .expect("old attempt must be tracked");
+        attempt.started_at = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test Instant supports a two-second adjustment");
+    }
+
+    assert!(
+        tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1),
+        "an output-starved attempt past the detection window must trigger recovery"
+    );
+
+    let young_request = tracker.begin_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    assert!(
+        tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1),
+        "a young concurrent attempt must not suppress an independently matured stuck attempt"
+    );
+
+    drop(old_request);
+    assert!(
+        !tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1),
+        "after the old attempt ends, a remaining young attempt alone must not trigger recovery"
+    );
+    drop(young_request);
+}
+
+#[test]
+fn shielded_watchdog_counts_a_stream_delta_and_terminal_usage_once() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let request = tracker.begin_request(
+        "shielded",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+
+    request.record_upstream_emitted_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"answer\"}}]}\n\n",
+    );
+    request.record_response(
+        b"",
+        b"data: {\"usage\":{\"completion_tokens\":1}}\n\ndata: [DONE]\n\n",
+    );
+
+    assert_eq!(
+        tracker.sample_count("shielded"),
+        1,
+        "a shielded upstream delta must not be counted again from terminal usage"
+    );
+}
+
+#[test]
+fn watchdog_metrics_count_only_started_commands_and_timeout_kills() {
+    let coordinator = UpstreamStallRecoveryCoordinator::default();
+    let skipped = BTreeMap::from([(
+        String::from("local_recovery_status"),
+        String::from("skipped_cooldown"),
+    )]);
+    record_watchdog_recovery_result(&coordinator, "default", &skipped);
+    assert_eq!(coordinator.watchdog_restarts.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        coordinator
+            .watchdog_recovery_timeouts
+            .load(Ordering::Relaxed),
+        0
+    );
+
+    let timeout_killed = BTreeMap::from([
+        (
+            String::from("local_recovery_restart_ran"),
+            String::from("true"),
+        ),
+        (
+            String::from("local_recovery_status"),
+            String::from("timeout_killed"),
+        ),
+    ]);
+    record_watchdog_recovery_result(&coordinator, "default", &timeout_killed);
+
+    assert_eq!(
+        coordinator.watchdog_restarts.load(Ordering::Relaxed),
+        1,
+        "only a recovery command that actually started is a watchdog restart"
+    );
+    assert_eq!(
+        coordinator
+            .watchdog_recovery_timeouts
+            .load(Ordering::Relaxed),
+        1,
+        "a killed restart command is a timed-out watchdog recovery"
+    );
+}
+
+#[test]
+fn restart_queue_wait_deadline_caps_recovery_episode_timeout() {
+    let queue = RestartQueueConfig {
+        enabled: true,
+        queue_deadline_secs: 60,
+        restart_timeout_secs: 30,
+    };
+
+    assert_eq!(restart_queue_wait_deadline(&queue), Duration::from_secs(30));
+}
+
+#[tokio::test]
+async fn restart_queue_waits_for_readiness_result_and_times_out_without_it() {
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+
+    let episode_id = {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
+    let waiting = {
+        let coordinator = Arc::clone(&coordinator);
+        tokio::spawn(async move {
+            wait_for_restart_queue_episode(&coordinator, Duration::from_millis(200), episode_id)
+                .await
+        })
+    };
+
+    sleep(Duration::from_millis(20)).await;
+    assert!(
+        !waiting.is_finished(),
+        "request must remain queued during recovery"
+    );
+    finish_active_upstream_stall_recovery_for_test(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+    assert_eq!(
+        waiting.await.expect("queued request task should join"),
+        RestartQueueWaitResult::Ready
+    );
+
+    let episode_id = {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
+    assert_eq!(
+        wait_for_restart_queue_episode(&coordinator, Duration::from_millis(5), episode_id).await,
+        RestartQueueWaitResult::TimedOut
+    );
+}
+
+#[tokio::test]
+async fn restart_queue_consumes_failed_episode_completed_between_permit_and_wait() {
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery.recovery_started = Some(Instant::now());
+        recovery.recovery_deadline = Some(Instant::now() + Duration::from_secs(2));
+    }
+
+    // A permit is only issued while recovery is running. Completing the episode
+    // before the waiter re-locks must still consume that episode's result.
+    let observed_recovery_episode_id = {
+        let mut recovery = coordinator.state.lock().await;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
+    finish_active_upstream_stall_recovery_for_test(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("spawn_failed"),
+        )]),
+    )
+    .await;
+
+    assert_eq!(
+        wait_for_restart_queue_episode(
+            &coordinator,
+            Duration::from_millis(50),
+            observed_recovery_episode_id
+        )
+        .await,
+        RestartQueueWaitResult::Failed,
+        "queue permit holders must not re-infer NotRecovering after the observed episode ends"
+    );
+}
+
+#[tokio::test]
+async fn restart_queue_consumes_successful_episode_completed_between_permit_and_wait() {
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery.recovery_started = Some(Instant::now());
+        recovery.recovery_deadline = Some(Instant::now() + Duration::from_secs(2));
+    }
+
+    let observed_recovery_episode_id = {
+        let mut recovery = coordinator.state.lock().await;
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
+    finish_active_upstream_stall_recovery_for_test(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+
+    assert_eq!(
+        wait_for_restart_queue_episode(
+            &coordinator,
+            Duration::from_millis(50),
+            observed_recovery_episode_id
+        )
+        .await,
+        RestartQueueWaitResult::Ready
+    );
+}
+
+#[tokio::test]
+async fn restart_queue_permit_retains_success_after_completion_history_eviction() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let profile = AppConfig::default().default_upstream_profile();
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    {
+        let mut recovery = coordinator.state.lock().await;
+        let now = Instant::now();
+        recovery.running = true;
+        recovery.recovery_started = Some(now);
+        recovery.recovery_deadline = Some(now + Duration::from_secs(2));
+    }
+    let permit = proxy
+        .state
+        .acquire_restart_queue_permit(&profile, &coordinator, 0)
+        .await
+        .expect("active recovery should admit a restart-queue permit")
+        .expect("active recovery must produce a restart-queue permit");
+
+    finish_active_upstream_stall_recovery_for_test(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+    for _ in 0..COMPLETED_RECOVERY_EPISODE_CAPACITY {
+        {
+            let mut recovery = coordinator.state.lock().await;
+            let now = Instant::now();
+            recovery.running = true;
+            recovery.recovery_started = Some(now);
+            recovery.recovery_deadline = Some(now + Duration::from_secs(2));
+            recovery
+                .ensure_active_recovery_episode()
+                .expect("later recovery must allocate an episode");
+        }
+        finish_active_upstream_stall_recovery_for_test(
+            &coordinator,
+            BTreeMap::from([(
+                String::from("local_recovery_status"),
+                String::from("succeeded"),
+            )]),
+        )
+        .await;
+    }
+
+    let mut metadata = BTreeMap::new();
+    let outcome =
+        wait_for_restart_queue_with_held_permit(&proxy.state, &profile, &mut metadata, permit)
+            .await
+            .expect("a permit must retain its successful recovery result after history eviction");
+    assert_eq!(outcome.outcome, RestartQueueOutcome::ReleasedAfterRecovery);
+}
+
+#[test]
+fn watchdog_records_streaming_and_non_chat_progress_when_emitted() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let chat = tracker.begin_request("chat", WatchdogProgressUnit::Chat, Duration::from_secs(1));
+    let embedding = tracker.begin_request(
+        "embedding",
+        WatchdogProgressUnit::Embedding,
+        Duration::from_secs(1),
+    );
+    let reranker = tracker.begin_request(
+        "reranker",
+        WatchdogProgressUnit::Reranker,
+        Duration::from_secs(1),
+    );
+
+    chat.record_emitted_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"healthy stream\"}}]}\n\n",
+    );
+    embedding.record_emitted_chunk(br#"{"data":[{"embedding":[0.1,0.2]}]}"#);
+    reranker.record_emitted_chunk(br#"{"results":[{"index":0,"relevance_score":0.9}]}"#);
+
+    assert!(!tracker.has_too_few_output_progress_units("chat", Duration::from_secs(1), 1));
+    assert!(!tracker.has_too_few_output_progress_units("embedding", Duration::from_secs(1), 1));
+    assert!(!tracker.has_too_few_output_progress_units("reranker", Duration::from_secs(1), 1));
+}
+
+#[test]
+fn watchdog_ignores_sse_heartbeats_and_control_frames_but_records_content() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let chat = tracker.begin_request("chat", WatchdogProgressUnit::Chat, Duration::from_secs(1));
+
+    chat.record_emitted_chunk(b": llm-guard-proxy heartbeat\n\n");
+    chat.record_emitted_chunk(b"event: ping\ndata: {}\n\n");
+    chat.record_emitted_chunk(b"data: [DONE]\n\n");
+    assert_eq!(
+        tracker.sample_count("chat"),
+        0,
+        "transport heartbeats and terminal control frames are not model output"
+    );
+
+    chat.record_emitted_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"healthy stream\"}}]}\n\n",
+    );
+    assert_eq!(tracker.sample_count("chat"), 1);
+}
+
+#[test]
+fn watchdog_token_samples_are_capped_and_maintained_without_active_requests() {
+    let tracker = StuckWatchdogTokenTracker::default();
+    for _ in 0..=STUCK_WATCHDOG_PROGRESS_SAMPLE_CAP {
+        tracker.record_progress("default", Duration::from_secs(1), 1);
+    }
+    assert_eq!(
+        tracker.sample_count("default"),
+        STUCK_WATCHDOG_PROGRESS_SAMPLE_CAP,
+        "insertion must cap remotely supplied output samples"
+    );
+
+    tracker.prune_profile("default", Duration::ZERO);
+    assert_eq!(
+        tracker.sample_count("default"),
+        0,
+        "maintenance must prune samples even after every request has completed"
+    );
+}
+
+#[test]
+fn watchdog_does_not_prune_shared_samples_using_request_snapshots() {
+    let tracker = StuckWatchdogTokenTracker::default();
+
+    tracker.record_progress("default", Duration::ZERO, 1);
+    tracker.record_progress("default", Duration::ZERO, 1);
+
+    assert_eq!(
+        tracker.sample_count("default"),
+        2,
+        "per-request snapshot windows must not prune shared samples"
+    );
+    tracker.prune_profile("default", Duration::ZERO);
+    assert_eq!(
+        tracker.sample_count("default"),
+        0,
+        "the current watchdog window owns shared-sample retention"
+    );
+}
+
+#[test]
+fn watchdog_physical_attempt_lease_resets_age_and_ends_before_persistence() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let request = tracker.watch_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    let first_attempt = request.begin_attempt();
+    {
+        let mut windows = tracker
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let first = windows
+            .get_mut("default")
+            .and_then(|window| window.attempts.get_mut(&first_attempt.attempt_id))
+            .expect("first physical attempt must be active");
+        first.started_at = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test Instant supports a two-second adjustment");
+    }
+
+    first_attempt.end();
+    let retry_attempt = request.begin_attempt();
+    let persistence_runtime = request.clone();
+
+    assert!(
+        !tracker.has_too_few_output_progress_units("default", Duration::from_secs(1), 1),
+        "a retry is a new physical attempt with a full output window"
+    );
+    retry_attempt.end();
+    assert!(
+        !tracker.has_active_requests("default"),
+        "ending the network attempt must not wait for persistence runtime clones"
+    );
+    drop(persistence_runtime);
+}
+
+#[test]
+fn watchdog_prune_and_insert_are_atomic_against_detection() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let request = tracker.watch_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    let attempt = request.begin_attempt();
+    {
+        let mut windows = tracker
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let window = windows
+            .get_mut("default")
+            .expect("attempt window must exist");
+        let active = window
+            .attempts
+            .get_mut(&attempt.attempt_id)
+            .expect("attempt must be active");
+        active.started_at = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test Instant supports a two-second adjustment");
+        window.samples.push_back((
+            Instant::now()
+                .checked_sub(Duration::from_secs(2))
+                .expect("test Instant supports a two-second adjustment"),
+            1,
+        ));
+    }
+
+    let producer_tracker = Arc::clone(&tracker);
+    let entered_pruned_state = Arc::new(Barrier::new(2));
+    let release_producer = Arc::new(Barrier::new(2));
+    let producer_entered = Arc::clone(&entered_pruned_state);
+    let producer_release = Arc::clone(&release_producer);
+    let producer = std::thread::spawn(move || {
+        producer_tracker.record_progress_with_hook("default", Duration::from_secs(1), 1, || {
+            producer_entered.wait();
+            producer_release.wait();
+        });
+    });
+    entered_pruned_state.wait();
+
+    let detector_tracker = Arc::clone(&tracker);
+    let (detector_tx, detector_rx) = std::sync::mpsc::channel();
+    let detector = std::thread::spawn(move || {
+        let _ignored = detector_tx.send(detector_tracker.has_too_few_output_progress_units(
+            "default",
+            Duration::from_secs(1),
+            1,
+        ));
+    });
+    assert!(
+        detector_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+        "the detector must remain blocked while producer prunes and inserts under one lock"
+    );
+
+    release_producer.wait();
+    producer.join().expect("producer must join");
+    assert!(
+        !detector_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("detector must observe the completed transition"),
+        "the detector must see the fresh progress sample, never a pruned empty window"
+    );
+    detector.join().expect("detector must join");
+    attempt.end();
+}
+
+#[test]
+fn watchdog_progress_units_count_one_multi_token_chat_delta() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let request = tracker.watch_request(
+        "default",
+        WatchdogProgressUnit::Chat,
+        Duration::from_secs(1),
+    );
+    let attempt = request.begin_attempt();
+    attempt.record_emitted_chunk(
+        b"data: {\"choices\":[{\"delta\":{\"content\":\"many distinct model tokens\"}}]}\n\n",
+    );
+
+    assert_eq!(tracker.sample_count("default"), 1);
+    attempt.end();
+}
+
+#[test]
+fn watchdog_records_complete_progress_frames_at_and_above_pending_buffer_cap() {
+    // 64 KiB is the incomplete-tail residual cap. Complete protocol frames must
+    // be drained first so a single large healthy emission still counts.
+    for payload_len in [65_536_usize, 65_537_usize] {
+        let cases = [
+            (
+                WatchdogProgressUnit::Chat,
+                format!(
+                    "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{}\"}}}}]}}\n\n",
+                    "c".repeat(payload_len)
+                )
+                .into_bytes(),
+            ),
+            (
+                WatchdogProgressUnit::Completion,
+                format!(
+                    "data: {{\"choices\":[{{\"text\":\"{}\"}}]}}\n\n",
+                    "t".repeat(payload_len)
+                )
+                .into_bytes(),
+            ),
+            (
+                WatchdogProgressUnit::Embedding,
+                format!(
+                    "{{\"data\":[{{\"embedding\":[0.1],\"text\":\"{}\"}}]}}",
+                    "e".repeat(payload_len)
+                )
+                .into_bytes(),
+            ),
+            (
+                WatchdogProgressUnit::Reranker,
+                format!(
+                    "{{\"results\":[{{\"index\":0,\"relevance_score\":0.9,\"document\":\"{}\"}}]}}",
+                    "r".repeat(payload_len)
+                )
+                .into_bytes(),
+            ),
+        ];
+
+        for (unit, frame) in cases {
+            assert!(
+                frame.len() >= payload_len,
+                "constructed progress frame must cover the requested boundary"
+            );
+            let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+            let profile = format!("{unit:?}-{payload_len}");
+            let request = tracker.watch_request(&profile, unit, Duration::from_secs(1));
+            let attempt = request.begin_attempt();
+            assert!(
+                attempt.record_emitted_chunk(&frame),
+                "complete {unit:?} frame of {} bytes must count as progress",
+                frame.len()
+            );
+            assert_eq!(
+                tracker.sample_count(&profile),
+                1,
+                "complete {unit:?} progress must survive the incomplete-tail cap"
+            );
+            attempt.end();
+        }
+    }
+}
+
+#[tokio::test]
+async fn restart_queue_rejects_when_aggregate_queued_body_budget_is_exhausted() {
+    // Concurrent large bodies with an explicit aggregate ceiling smaller than
+    // request-count × per-body size prove the independent body budget.
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        4,
+        "max_queued_generation_requests = 8\nmax_restart_queue_body_bytes = 100\n",
+    )
+    .await;
+    let mut profile = AppConfig::default().default_upstream_profile();
+    profile.restart_queue.enabled = true;
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    coordinator.state.lock().await.running = true;
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let state = proxy.state.clone();
+        let profile = profile.clone();
+        let coordinator = Arc::clone(&coordinator);
+        join_set.spawn(async move {
+            state
+                .acquire_restart_queue_permit(&profile, &coordinator, 40)
+                .await
+                .map_err(|error| error.status())
+        });
+    }
+
+    let mut admitted = Vec::new();
+    let mut rejected = 0_usize;
+    while let Some(result) = join_set.join_next().await {
+        match result.expect("concurrent restart-queue admission task must join") {
+            Ok(Some(permit)) => admitted.push(permit),
+            Ok(None) => panic!("active recovery must attempt queue admission"),
+            Err(status) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                rejected = rejected.saturating_add(1);
+            }
+        }
+    }
+
+    let reserved = proxy.state.restart_queue_body_budget.reserved_bytes();
+    assert_eq!(reserved, admitted.len() as u64 * 40);
+    assert!(
+        reserved <= 100,
+        "aggregate queued body reservation must stay within the explicit ceiling"
+    );
+    assert_eq!(
+        admitted.len(),
+        2,
+        "equal concurrent bodies must saturate the independent aggregate ceiling exactly"
+    );
+    assert_eq!(
+        rejected, 2,
+        "over-budget concurrent admissions must fail closed before retaining body"
+    );
+    assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 2);
+
+    drop(admitted);
+    assert_eq!(proxy.state.restart_queue_body_budget.reserved_bytes(), 0);
+    assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 0);
+}
+
+#[tokio::test]
+async fn restart_queue_body_budget_is_global_across_named_profiles() {
+    // Named profiles with independent generation limiters must still share one
+    // server-level restart-queue body budget; per-profile count isolation must
+    // not multiply retained body bytes.
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        4,
+        "max_queued_generation_requests = 8\nmax_restart_queue_body_bytes = 100\n",
+    )
+    .await;
+
+    let mut alpha = AppConfig::default().default_upstream_profile();
+    alpha.name = String::from("alpha");
+    alpha.max_in_flight_requests = Some(4);
+    alpha.max_queued_generation_requests = Some(8);
+    alpha.restart_queue.enabled = true;
+    let mut beta = AppConfig::default().default_upstream_profile();
+    beta.name = String::from("beta");
+    beta.max_in_flight_requests = Some(4);
+    beta.max_queued_generation_requests = Some(8);
+    beta.restart_queue.enabled = true;
+
+    let alpha_coordinator = proxy.state.local_recovery.coordinator_for(&alpha.name);
+    let beta_coordinator = proxy.state.local_recovery.coordinator_for(&beta.name);
+    alpha_coordinator.state.lock().await.running = true;
+    beta_coordinator.state.lock().await.running = true;
+
+    let mut join_set = tokio::task::JoinSet::new();
+    for (profile, coordinator) in [
+        (alpha.clone(), Arc::clone(&alpha_coordinator)),
+        (alpha.clone(), Arc::clone(&alpha_coordinator)),
+        (beta.clone(), Arc::clone(&beta_coordinator)),
+        (beta.clone(), Arc::clone(&beta_coordinator)),
+    ] {
+        let state = proxy.state.clone();
+        join_set.spawn(async move {
+            state
+                .acquire_restart_queue_permit(&profile, &coordinator, 40)
+                .await
+                .map_err(|error| error.status())
+        });
+    }
+
+    let mut admitted = Vec::new();
+    let mut rejected = 0_usize;
+    while let Some(result) = join_set.join_next().await {
+        match result.expect("cross-profile restart-queue admission task must join") {
+            Ok(Some(permit)) => admitted.push(permit),
+            Ok(None) => panic!("active recovery must attempt queue admission"),
+            Err(status) => {
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                rejected = rejected.saturating_add(1);
+            }
+        }
+    }
+
+    let reserved = proxy.state.restart_queue_body_budget.reserved_bytes();
+    assert_eq!(reserved, admitted.len() as u64 * 40);
+    assert!(
+        reserved <= 100,
+        "cross-profile restart waiters must share one global body budget, reserved={reserved}"
+    );
+    assert_eq!(
+        admitted.len(),
+        2,
+        "two 40-byte bodies must fill the global 100-byte budget regardless of profile count"
+    );
+    assert_eq!(
+        rejected, 2,
+        "additional named-profile waiters must fail closed once the global body budget is exhausted"
+    );
+
+    drop(admitted);
+    assert_eq!(proxy.state.restart_queue_body_budget.reserved_bytes(), 0);
+}
+
+#[test]
+fn completed_watchdog_attempts_are_removed_and_stay_bounded_after_disable() {
+    let tracker = Arc::new(StuckWatchdogTokenTracker::default());
+    let profile = "high-throughput";
+    for _ in 0..12_000 {
+        let lease = tracker.begin_request(
+            profile,
+            WatchdogProgressUnit::Chat,
+            Duration::from_secs(3_600),
+        );
+        drop(lease);
+    }
+    assert_eq!(
+        tracker.attempt_count(profile),
+        0,
+        "completed physical attempts must be deleted on lease end instead of retained for the detection window"
+    );
+
+    // Hot-reload disable stops periodic prune; completed attempts must still not
+    // accumulate from completed request throughput.
+    for _ in 0..4_000 {
+        let lease = tracker.begin_request(
+            profile,
+            WatchdogProgressUnit::Chat,
+            Duration::from_secs(86_400),
+        );
+        drop(lease);
+    }
+    assert_eq!(
+        tracker.attempt_count(profile),
+        0,
+        "disabled/idle watchdog paths must not retain completed attempts indefinitely"
+    );
+
+    let active = tracker.begin_request(profile, WatchdogProgressUnit::Chat, Duration::from_secs(1));
+    assert_eq!(tracker.attempt_count(profile), 1);
+    assert!(tracker.has_active_requests(profile));
+    drop(active);
+    assert_eq!(tracker.attempt_count(profile), 0);
+    assert!(!tracker.has_active_requests(profile));
+}
+
+#[tokio::test]
+async fn restart_queue_uses_episode_deadline_not_a_fresh_wait_per_request() {
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    let episode_id = {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery.recovery_started = Some(Instant::now());
+        recovery.recovery_deadline = Some(Instant::now());
+        recovery
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
+
+    assert_eq!(
+        timeout(
+            Duration::from_millis(20),
+            wait_for_restart_queue_episode(&coordinator, Duration::from_secs(1), episode_id),
+        )
+        .await
+        .expect("an expired episode deadline must not start a fresh per-request wait"),
+        RestartQueueWaitResult::TimedOut,
+        "an already-running recovery has one deadline shared by every queued request"
+    );
+}
+
+#[tokio::test]
+async fn restart_queue_waiters_consume_queue_capacity_not_in_flight_capacity() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &fake.base_url,
+        true,
+        1,
+        "max_queued_generation_requests = 1\n",
+    )
+    .await;
+    let mut profile = AppConfig::default().default_upstream_profile();
+    profile.restart_queue.enabled = true;
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    coordinator.state.lock().await.running = true;
+
+    let permit = proxy
+        .state
+        .acquire_restart_queue_permit(&profile, &coordinator, 0)
+        .await
+        .expect("restart queue admission should succeed")
+        .expect("active recovery should acquire a queue permit");
+    let counts = proxy.state.generation_requests.snapshot_counts();
+    assert_eq!(counts.active, 0);
+    assert_eq!(counts.queued, 1);
+
+    drop(permit);
+    assert_eq!(proxy.state.generation_requests.snapshot_counts().queued, 0);
+}
+
+#[tokio::test]
+async fn real_default_profile_requests_wait_in_the_restart_queue_until_recovery_finishes() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_full_options_and_extra(ProxyFixtureSpawnOptions {
+        upstream_base_url: &fake.base_url,
+        observability_enabled: true,
+        max_in_flight_requests: 1,
+        server_config: "",
+        metadata_config: "",
+        observability_config: "",
+        evidence_config: "",
+        extra_config: r"
+[upstream.restart_queue]
+enabled = true
+queue_deadline_secs = 1
+restart_timeout_secs = 1
+",
+    })
+    .await;
+    let coordinator = proxy.state.local_recovery.coordinator_for("default");
+    {
+        let mut recovery = coordinator.state.lock().await;
+        recovery.running = true;
+        recovery.recovery_started = Some(Instant::now());
+        recovery.recovery_deadline = Some(Instant::now() + Duration::from_secs(1));
+    }
+
+    let request = {
+        let client = proxy.client.clone();
+        let base_url = proxy.base_url.clone();
+        tokio::spawn(async move {
+            client
+                .post(format!("{base_url}/v1/chat/completions?test=restart-queue"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"queue me"}]}"#)
+                .send()
+                .await
+                .expect("queued proxy request should complete")
+        })
+    };
+
+    sleep(Duration::from_millis(40)).await;
+    assert!(
+        !request.is_finished(),
+        "the actual default-profile request must wait during the recovery episode"
+    );
+    assert!(
+        fake.recv_within(Duration::from_millis(40)).await.is_none(),
+        "a queued request must not reach the upstream before recovery is ready"
+    );
+
+    finish_active_upstream_stall_recovery_for_test(
+        &coordinator,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+
+    let response = request.await.expect("queued request task should join");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _body = response
+        .text()
+        .await
+        .expect("response body should be readable");
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=restart-queue"
+    );
+}
+
+#[test]
+fn watchdog_schedule_keeps_profile_intervals_independent() {
+    let now = Instant::now();
+    let mut schedule = WatchdogSchedule::default();
+    let profiles = vec![
+        (String::from("fast"), Duration::from_secs(30)),
+        (String::from("slow"), Duration::from_secs(600)),
+    ];
+    assert_eq!(
+        schedule.due_profiles(now, &profiles),
+        vec![String::from("fast"), String::from("slow")]
+    );
+    assert_eq!(
+        schedule.due_profiles(now + Duration::from_secs(30), &profiles),
+        vec![String::from("fast")],
+        "a fast profile must not make a 600-second profile due every 30 seconds"
+    );
+}
+
+#[test]
+fn watchdog_schedule_reenables_a_disabled_profile_without_waiting_for_its_old_due_time() {
+    let now = Instant::now();
+    let profile = String::from("reloadable");
+    let long_interval = Duration::from_secs(86_400);
+    let mut schedule = WatchdogSchedule::default();
+
+    assert_eq!(
+        schedule.due_profiles(now, &[(profile.clone(), long_interval)]),
+        vec![profile.clone()],
+        "the initially enabled profile must be scheduled"
+    );
+    assert!(
+        schedule
+            .due_profiles(now + Duration::from_secs(1), &[])
+            .is_empty(),
+        "disabled profiles must not be evaluated"
+    );
+    assert_eq!(
+        schedule.due_profiles(
+            now + Duration::from_secs(2),
+            &[(profile.clone(), long_interval)]
+        ),
+        vec![profile],
+        "re-enabling the same interval must schedule an immediate evaluation instead of retaining a stale future due time"
     );
 }
 
@@ -231,6 +1255,32 @@ async fn metrics_expose_retained_gauges_without_secrets() {
     assert_metric_type(&body, "llm_guard_proxy_generation_queued", "gauge");
     assert_metric_type(&body, "llm_guard_proxy_generation_profile_active", "gauge");
     assert_metric_type(&body, "llm_guard_proxy_generation_profile_queued", "gauge");
+    assert_metric_type(&body, "llm_guard_proxy_restart_queue_depth", "gauge");
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_stuck_watchdog_detections_total",
+        "counter",
+    );
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_stuck_watchdog_restarts_total",
+        "counter",
+    );
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_stuck_watchdog_recovery_successes_total",
+        "counter",
+    );
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_stuck_watchdog_recovery_timeouts_total",
+        "counter",
+    );
+    assert_metric_type(
+        &body,
+        "llm_guard_proxy_stuck_watchdog_recovery_task_failures_total",
+        "counter",
+    );
     assert_metric_type(&body, "llm_guard_proxy_current_retained_requests", "gauge");
     assert_metric_type(
         &body,
@@ -561,6 +1611,7 @@ fn admin_token_matcher_accepts_only_exact_values() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn persistence_tasks_contain_spawn_blocking_panics() {
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
     let tasks = Arc::new(PersistenceTasks::default());
 
     tasks.spawn_blocking(|| panic!("simulated persistence store teardown failure"));
@@ -576,6 +1627,7 @@ async fn persistence_tasks_contain_spawn_blocking_panics() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
     let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
     let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -732,6 +1784,8 @@ async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
         "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
     const OVERFLOW_BURST: usize = 128;
 
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
+
     if std::env::var_os(CHILD_ENV).is_none() {
         let output = run_bounded_test_child(TEST_NAME, CHILD_ENV).await;
         assert!(
@@ -804,6 +1858,8 @@ async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
     const HANG_CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_HANG_CHILD";
     const TEST_NAME: &str =
         "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
+
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
 
     let mut command = tokio::process::Command::new(
         std::env::current_exe().expect("test binary path should be available"),
@@ -879,6 +1935,7 @@ async fn error_shutdown_signals_persistence_tracked_shadow_work_before_flushing(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistence_flush_does_not_miss_a_zero_transition_after_observing_work() {
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
     let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
     let release = Arc::new(std::sync::Barrier::new(2));
     let notification_registered = Arc::new(AtomicBool::new(false));
@@ -1795,28 +2852,29 @@ async fn hermes_like_context_extraction_reads_enriched_model_length() {
     let _observed = fake.recv().await;
 }
 
-#[tokio::test]
-async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
-    let mut fake = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
-    let body = Bytes::from_static(
-        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"thinking":{"budget_tokens":1},"stream":false}"#,
-    );
+async fn spawn_shielded_watchdog_proxy(upstream_base_url: &str) -> ProxyFixture {
+    ProxyFixture::spawn_with_full_options_and_extra(ProxyFixtureSpawnOptions {
+        upstream_base_url,
+        observability_enabled: true,
+        max_in_flight_requests: 8,
+        metadata_config: "",
+        server_config: "",
+        observability_config: "",
+        evidence_config: "",
+        extra_config: r"
+[upstream.stuck_watchdog]
+enabled = true
+detection_window_secs = 60
+min_output_progress_units_in_window = 1
+check_interval_secs = 1
+",
+    })
+    .await
+}
 
-    let response = proxy
-        .client
-        .post(format!(
-            "{}/v1/chat/completions?test=request-id-collision",
-            proxy.base_url
-        ))
-        .header(CONTENT_TYPE, "application/json")
-        .body(body.clone())
-        .send()
-        .await
-        .expect("proxy request should complete");
-
+fn assert_shielded_response_headers(response: &reqwest::Response) -> String {
     assert_eq!(response.status(), StatusCode::OK);
-    let response_request_id = response
+    let request_id = response
         .headers()
         .get("x-request-id")
         .expect("terminal response should include x-request-id")
@@ -1824,7 +2882,7 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
         .expect("x-request-id should be valid header text")
         .to_owned();
     assert_ne!(
-        response_request_id, "upstream-request-id-collision",
+        request_id, "upstream-request-id-collision",
         "proxy terminal response must overwrite the upstream request ID"
     );
     assert_eq!(
@@ -1841,6 +2899,38 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
             .expect("shielded fake upstream SSE should be used"),
         "chat-completions-sse"
     );
+    request_id
+}
+
+fn assert_shielded_watchdog_progress(proxy: &ProxyFixture) {
+    assert!(
+        proxy.state.stuck_watchdog_tokens.sample_count("default") > 0,
+        "shielded upstream SSE content must reach the watchdog before aggregation completes"
+    );
+}
+
+#[tokio::test]
+async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = spawn_shielded_watchdog_proxy(&fake.base_url).await;
+    let body = Bytes::from_static(
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"thinking":{"budget_tokens":1},"stream":false}"#,
+    );
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=request-id-collision",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body.clone())
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    let response_request_id = assert_shielded_response_headers(&response);
+    assert_shielded_watchdog_progress(&proxy);
     let response_body = response.text().await.expect("response body should be text");
     assert!(
         !response_body.starts_with(": llm-guard-proxy heartbeat"),
@@ -5783,7 +6873,8 @@ async fn local_recovery_restart_command() {
         budget_window: Duration::from_secs(60),
         max_per_window: 1,
     };
-    let success = run_local_recovery_restart_command(&success_policy).await;
+    let success_ran = AtomicBool::new(false);
+    let success = run_local_recovery_restart_command(&success_policy, &success_ran).await;
     assert_eq!(success["local_recovery_restart_status"], "succeeded");
 
     let timeout_policy = LocalRecoveryPolicy {
@@ -5791,7 +6882,8 @@ async fn local_recovery_restart_command() {
         restart_timeout: Duration::from_millis(50),
         ..success_policy
     };
-    let timeout = run_local_recovery_restart_command(&timeout_policy).await;
+    let timeout_ran = AtomicBool::new(false);
+    let timeout = run_local_recovery_restart_command(&timeout_policy, &timeout_ran).await;
     assert_eq!(timeout["local_recovery_restart_status"], "timeout_killed");
     assert_eq!(timeout["local_recovery_status"], "timeout_killed");
 }
@@ -5891,6 +6983,93 @@ max_per_window = 1
     assert_eq!(attempts[1].status, "succeeded");
 
     remove_dir_all(&recovery_root);
+}
+
+#[tokio::test]
+async fn disabled_restart_queue_does_not_cap_local_recovery_episode_timeout() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+
+[upstream.stall]
+enabled = true
+first_chunk_timeout_ms = 50
+idle_timeout_ms = 50
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/bin/sleep", "2"]
+restart_timeout_ms = 3000
+readiness_body = {"model":"test-chat","messages":[{"role":"user","content":"disabled queue recovery ready"}],"max_tokens":1}
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 50
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+
+[upstream.restart_queue]
+enabled = false
+queue_deadline_secs = 1
+restart_timeout_secs = 1
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=stall-once-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"wait for recovery"}]}"#)
+        .send()
+        .await
+        .expect("request should finish after local recovery");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "a disabled restart queue must not cancel a local recovery whose own timeout budget permits completion"
+    );
+    let aggregated = shielded_final_json(response).await;
+    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+
+    let first = fake.recv_next().await;
+    let probe = fake.recv_next().await;
+    let replay = fake.recv_next().await;
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=stall-once-then-success"
+    );
+    assert_eq!(probe.path_and_query, "/v1/chat/completions");
+    assert!(body_contains_text(
+        &probe.body,
+        "disabled queue recovery ready"
+    ));
+    assert_eq!(replay.path_and_query, first.path_and_query);
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_status"],
+        "succeeded"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_permits_retry"],
+        "true"
+    );
+    assert_eq!(attempts[1].status, "succeeded");
 }
 
 #[tokio::test]
@@ -18782,6 +19961,9 @@ fn fake_streaming_chat_completion_response(
     state: &FakeUpstreamState,
     body: &Bytes,
 ) -> Option<Response<Body>> {
+    if path_and_query.contains("test=watchdog-tool-call-only") {
+        return Some(repeated_tool_fingerprint_sse_response());
+    }
     if let Some(response) =
         fake_compat_and_loop_once_chat_completion_response(path_and_query, state, body)
     {

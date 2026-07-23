@@ -10,6 +10,7 @@ const TEST_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistence_flush_returns_when_spawn_blocking_task_exceeds_shutdown_deadline() {
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
     let tasks = Arc::new(PersistenceTasks::default());
     let (started_tx, started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();

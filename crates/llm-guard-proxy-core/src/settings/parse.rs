@@ -16,10 +16,10 @@ use super::{
     DownstreamDropPolicy, EndpointSelectionMode, GuardianConfig, GuardianKillAction,
     HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig, LocalRecoveryConfig,
     LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy,
-    ObservabilityConfig, RetentionConfig, RetryConfig, RetryLadderConfig, ServerConfig,
-    ShadowComparisonAttempt, ShieldingConfig, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamEndpointConfig, UpstreamEndpointProtocol,
-    UpstreamPriority, UpstreamProfileConfig, UpstreamStallConfig,
+    ObservabilityConfig, RestartQueueConfig, RetentionConfig, RetryConfig, RetryLadderConfig,
+    ServerConfig, ShadowComparisonAttempt, ShieldingConfig, StuckWatchdogConfig, ThinkingConfig,
+    ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamEndpointConfig,
+    UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig, UpstreamStallConfig,
 };
 #[cfg(feature = "guard")]
 use super::{UnknownKeyPolicy, VirtualKeyConfig};
@@ -33,6 +33,8 @@ enum Section {
     UpstreamMetadata,
     UpstreamHotRestart,
     UpstreamLocalRecovery,
+    UpstreamStuckWatchdog,
+    UpstreamRestartQueue,
     UpstreamProfile(usize),
     UpstreamProfileEndpoint {
         profile: usize,
@@ -41,6 +43,8 @@ enum Section {
     UpstreamProfileMetadata(usize),
     UpstreamProfileHotRestart(usize),
     UpstreamProfileLocalRecovery(usize),
+    UpstreamProfileStuckWatchdog(usize),
+    UpstreamProfileRestartQueue(usize),
     UpstreamProfileThinking(usize),
     #[cfg(feature = "param-override")]
     UpstreamProfileParamOverride(usize),
@@ -265,6 +269,8 @@ fn parse_section(
         "upstream.metadata" => Ok(Section::UpstreamMetadata),
         "upstream.hot_restart" => Ok(Section::UpstreamHotRestart),
         "upstream.local_recovery" => Ok(Section::UpstreamLocalRecovery),
+        "upstream.stuck_watchdog" => Ok(Section::UpstreamStuckWatchdog),
+        "upstream.restart_queue" => Ok(Section::UpstreamRestartQueue),
         "upstreams.metadata" => current_upstream_profile.map_or_else(
             || {
                 Err(ConfigParseError::new(
@@ -291,6 +297,24 @@ fn parse_section(
                 ))
             },
             |index| Ok(Section::UpstreamProfileLocalRecovery(index)),
+        ),
+        "upstreams.stuck_watchdog" => current_upstream_profile.map_or_else(
+            || {
+                Err(ConfigParseError::new(
+                    line_number,
+                    "[upstreams.stuck_watchdog] must follow a [[upstreams]] profile",
+                ))
+            },
+            |index| Ok(Section::UpstreamProfileStuckWatchdog(index)),
+        ),
+        "upstreams.restart_queue" => current_upstream_profile.map_or_else(
+            || {
+                Err(ConfigParseError::new(
+                    line_number,
+                    "[upstreams.restart_queue] must follow a [[upstreams]] profile",
+                ))
+            },
+            |index| Ok(Section::UpstreamProfileRestartQueue(index)),
         ),
         "upstreams.thinking" => current_upstream_profile.map_or_else(
             || {
@@ -439,11 +463,15 @@ fn assign_value(
         | Section::UpstreamMetadata
         | Section::UpstreamHotRestart
         | Section::UpstreamLocalRecovery
+        | Section::UpstreamStuckWatchdog
+        | Section::UpstreamRestartQueue
         | Section::UpstreamProfile(_)
         | Section::UpstreamProfileEndpoint { .. }
         | Section::UpstreamProfileMetadata(_)
         | Section::UpstreamProfileHotRestart(_)
         | Section::UpstreamProfileLocalRecovery(_)
+        | Section::UpstreamProfileStuckWatchdog(_)
+        | Section::UpstreamProfileRestartQueue(_)
         | Section::UpstreamProfileThinking(_) => {
             unreachable!("upstream sections are handled before this match")
         }
@@ -461,31 +489,10 @@ fn assign_upstream_value(
     value: &str,
     line_number: usize,
 ) -> Option<Result<(), ConfigParseError>> {
+    if let Some(result) = assign_default_upstream_value(config, section, key, value, line_number) {
+        return Some(result);
+    }
     match section {
-        Section::Upstream => Some(assign_upstream(
-            &mut config.upstream,
-            key,
-            value,
-            line_number,
-        )),
-        Section::UpstreamMetadata => Some(assign_metadata(
-            &mut config.upstream.metadata,
-            key,
-            value,
-            line_number,
-        )),
-        Section::UpstreamHotRestart => Some(assign_hot_restart(
-            &mut config.upstream.hot_restart,
-            key,
-            value,
-            line_number,
-        )),
-        Section::UpstreamLocalRecovery => Some(assign_local_recovery(
-            &mut config.upstream.local_recovery,
-            key,
-            value,
-            line_number,
-        )),
         Section::UpstreamProfile(index) => Some(assign_upstream_profile(
             &mut config.upstream_profiles[*index],
             key,
@@ -530,6 +537,18 @@ fn assign_upstream_value(
             value,
             line_number,
         )),
+        Section::UpstreamProfileStuckWatchdog(index) => Some(assign_stuck_watchdog(
+            &mut config.upstream_profiles[*index].stuck_watchdog,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamProfileRestartQueue(index) => Some(assign_restart_queue(
+            &mut config.upstream_profiles[*index].restart_queue,
+            key,
+            value,
+            line_number,
+        )),
         Section::UpstreamProfileThinking(index) => Some(assign_thinking(
             &mut config.upstream_profiles[*index].thinking,
             key,
@@ -539,6 +558,54 @@ fn assign_upstream_value(
         #[cfg(feature = "param-override")]
         Section::UpstreamProfileParamOverride(index) => Some(assign_param_override(
             &mut config.upstream_profiles[*index].param_override,
+            key,
+            value,
+            line_number,
+        )),
+        _ => None,
+    }
+}
+
+fn assign_default_upstream_value(
+    config: &mut AppConfig,
+    section: &Section,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Option<Result<(), ConfigParseError>> {
+    match section {
+        Section::Upstream => Some(assign_upstream(
+            &mut config.upstream,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamMetadata => Some(assign_metadata(
+            &mut config.upstream.metadata,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamHotRestart => Some(assign_hot_restart(
+            &mut config.upstream.hot_restart,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamLocalRecovery => Some(assign_local_recovery(
+            &mut config.upstream.local_recovery,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamStuckWatchdog => Some(assign_stuck_watchdog(
+            &mut config.upstream.stuck_watchdog,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamRestartQueue => Some(assign_restart_queue(
+            &mut config.upstream.restart_queue,
             key,
             value,
             line_number,
@@ -1103,6 +1170,10 @@ fn assign_server(
             config.max_request_body_bytes =
                 parse_usize(value, line_number, "server.max_request_body_bytes")?;
         }
+        "max_restart_queue_body_bytes" => {
+            config.max_restart_queue_body_bytes =
+                parse_u64(value, line_number, "server.max_restart_queue_body_bytes")?;
+        }
         "shutdown_drain_timeout_ms" => {
             config.shutdown_drain_timeout_ms =
                 parse_u64(value, line_number, "server.shutdown_drain_timeout_ms")?;
@@ -1262,6 +1333,55 @@ fn assign_local_recovery(
             config.max_per_window = parse_u32(value, line_number, "local_recovery.max_per_window")?;
         }
         _ => return unknown_key("local_recovery", key, line_number),
+    }
+    Ok(())
+}
+
+fn assign_stuck_watchdog(
+    config: &mut StuckWatchdogConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "detection_window_secs" => {
+            config.detection_window_secs =
+                parse_u64(value, line_number, "stuck_watchdog.detection_window_secs")?;
+        }
+        "min_output_progress_units_in_window" => {
+            config.min_output_progress_units_in_window = parse_u64(
+                value,
+                line_number,
+                "stuck_watchdog.min_output_progress_units_in_window",
+            )?;
+        }
+        "check_interval_secs" => {
+            config.check_interval_secs =
+                parse_u64(value, line_number, "stuck_watchdog.check_interval_secs")?;
+        }
+        _ => return unknown_key("stuck_watchdog", key, line_number),
+    }
+    Ok(())
+}
+
+fn assign_restart_queue(
+    config: &mut RestartQueueConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "queue_deadline_secs" => {
+            config.queue_deadline_secs =
+                parse_u64(value, line_number, "restart_queue.queue_deadline_secs")?;
+        }
+        "restart_timeout_secs" => {
+            config.restart_timeout_secs =
+                parse_u64(value, line_number, "restart_queue.restart_timeout_secs")?;
+        }
+        _ => return unknown_key("restart_queue", key, line_number),
     }
     Ok(())
 }

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque, hash_map::DefaultHasher},
     convert::Infallible,
     fmt,
     future::{Future, IntoFuture},
@@ -9,7 +9,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -43,10 +43,10 @@ use llm_guard_proxy_core::{
 use llm_guard_proxy_core::{
     AppConfig, ConfigHandle, DefaultInjectionSchema, DownstreamDropPolicy, Health, HeartbeatMode,
     LICENSE, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
-    MetadataConfig, RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile,
-    ShadowComparisonAttempt, ThinkingConfig, ThinkingMode, UpstreamEndpointConfig,
-    UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason,
-    UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    MetadataConfig, RestartQueueConfig, RetryConfig, RetryLadderConfig, SERVICE_NAME,
+    SelectedUpstreamProfile, ShadowComparisonAttempt, ThinkingConfig, ThinkingMode,
+    UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 use llm_guard_proxy_state::{
     AttemptId, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
@@ -63,10 +63,14 @@ use serde_json::json;
 use thiserror::Error;
 #[cfg(feature = "upstream-hot-restart")]
 use tokio::task::JoinHandle;
+use tokio::task::{AbortHandle, JoinSet};
 use tokio::{
     net::TcpListener,
     process::Command,
-    sync::{Mutex as AsyncMutex, Notify, Semaphore, futures::OwnedNotified, oneshot},
+    sync::{
+        Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, futures::OwnedNotified, mpsc,
+        oneshot,
+    },
     time::{Instant, Interval, MissedTickBehavior, Sleep, timeout},
 };
 
@@ -81,9 +85,14 @@ mod reranker_protocol;
 mod score_adapter;
 mod shielded_chat;
 mod upstream_failover;
+mod watchdog_progress;
 
 use upstream_failover::{
     EndpointSelectionConstraints, EndpointSelectionError, UpstreamHealthRegistry,
+};
+use watchdog_progress::{
+    WatchdogProgressParser, WatchdogProgressState, WatchdogProgressUnit, emitted_progress,
+    non_sse_progress_at_eof, watchdog_progress_unit,
 };
 
 use buffered_adapter::{
@@ -119,6 +128,9 @@ const FINAL_DIRECT_RELAY_TERMINATED_ABORT_REASON: &str = "final_direct_relay_ter
 const MAX_PERSISTENCE_TASKS: usize = 64;
 const PERSISTENCE_BACKLOG_DROP_LOG_INTERVAL_MS: u64 = 10_000;
 const PERSISTENCE_BACKLOG_DROP_LOG_NEVER_EMITTED: u64 = u64::MAX;
+/// Per-profile hard cap for watchdog output-progress samples. Upstream chunk cadence is
+/// peer-controlled, so this is deliberately independent of request activity.
+const STUCK_WATCHDOG_PROGRESS_SAMPLE_CAP: usize = 4_096;
 #[cfg(feature = "guard")]
 const X_VIRTUAL_KEY_HEADER: &str = "x-virtual-key";
 
@@ -136,12 +148,16 @@ pub(crate) struct ProxyState {
     generation_requests: Arc<InFlightLimiter>,
     generation_body_routing_requests: Arc<InFlightLimiter>,
     generation_profile_requests: Arc<Mutex<HashMap<String, Arc<InFlightLimiter>>>>,
+    /// Server-wide retained restart-queue body budget. Profile generation limiters
+    /// only bound waiter count; body bytes share this single reservation pool.
+    restart_queue_body_budget: Arc<RestartQueueBodyBudget>,
     control_plane_requests: Arc<InFlightLimiter>,
     #[cfg(feature = "guard")]
     workflow_execution_requests: Arc<InFlightLimiter>,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     upstream_health: Arc<UpstreamHealthRegistry>,
     local_recovery: Arc<LocalRecoveryCoordinatorSet>,
+    stuck_watchdog_tokens: Arc<StuckWatchdogTokenTracker>,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     repeat_inputs: Arc<RepeatInputCache>,
@@ -266,12 +282,14 @@ impl ProxyState {
             generation_requests: Arc::new(InFlightLimiter::default()),
             generation_body_routing_requests: Arc::new(InFlightLimiter::default()),
             generation_profile_requests: Arc::new(Mutex::new(HashMap::new())),
+            restart_queue_body_budget: Arc::new(RestartQueueBodyBudget::default()),
             control_plane_requests: Arc::new(InFlightLimiter::default()),
             #[cfg(feature = "guard")]
             workflow_execution_requests: Arc::new(InFlightLimiter::default()),
             upstream_stall_recovery: Arc::new(UpstreamStallRecoveryCoordinator::default()),
             upstream_health: Arc::new(UpstreamHealthRegistry::default()),
             local_recovery: Arc::new(LocalRecoveryCoordinatorSet::default()),
+            stuck_watchdog_tokens: Arc::new(StuckWatchdogTokenTracker::default()),
             #[cfg(feature = "upstream-hot-restart")]
             hot_restart_recovery: Arc::new(HotRestartCoordinator::default()),
             repeat_inputs: Arc::new(RepeatInputCache::default()),
@@ -492,6 +510,51 @@ impl ProxyState {
         .await
     }
 
+    async fn reacquire_generation_permit_for_model(
+        &self,
+        model_id: Option<&str>,
+        record_context: AdmissionRecordContext,
+    ) -> Result<GenerationAdmission, AdmissionFailure> {
+        let config = self
+            .config
+            .snapshot()
+            .map_err(|error| AdmissionFailure::ConfigSnapshot(error.to_string()))?;
+        if self.shutdown.is_shutting_down() {
+            return Err(AdmissionFailure::ShuttingDown { queued: None });
+        }
+        let selected_profile = select_allowed_upstream_profile(&config, &self.listener, model_id)
+            .map_err(AdmissionFailure::ListenerUpstreamDenied)?;
+        let limiter = self.generation_limiter_for_profile(&selected_profile.profile);
+        let max_in_flight_requests = selected_profile
+            .profile
+            .effective_max_in_flight_requests(&config.server);
+        if let Some(permit) = limiter.try_acquire(max_in_flight_requests) {
+            return Ok(GenerationAdmission::acquired(
+                config,
+                permit,
+                Duration::ZERO,
+            ));
+        }
+
+        let max_queued_generation_requests = selected_profile
+            .profile
+            .effective_max_queued_generation_requests(&config.server);
+        let Some(queue_permit) = limiter.try_enqueue(max_queued_generation_requests) else {
+            return Err(AdmissionFailure::GenerationQueueFull {
+                max_queued_generation_requests,
+                status: config.server.generation_queue_full_status,
+                retry_after_secs: config.server.generation_queue_retry_after_secs,
+            });
+        };
+        self.wait_for_profile_generation_capacity(
+            queue_permit,
+            model_id.map(str::to_owned),
+            config.server.generation_queue_timeout_ms,
+            record_context,
+        )
+        .await
+    }
+
     async fn wait_for_profile_generation_capacity(
         &self,
         _queue_permit: QueuedAdmissionPermit,
@@ -572,6 +635,65 @@ impl ProxyState {
                 .entry(profile.name.clone())
                 .or_insert_with(|| Arc::new(InFlightLimiter::default())),
         )
+    }
+
+    async fn acquire_restart_queue_permit(
+        &self,
+        profile: &UpstreamProfileConfig,
+        coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+        body_bytes: u64,
+    ) -> Result<Option<RestartQueuePermit>, ProxyError> {
+        let config = self
+            .config
+            .snapshot()
+            .map_err(|error| ProxyError::config_snapshot(error.to_string()))?;
+        let max_queued = profile.effective_max_queued_generation_requests(&config.server);
+        let max_queued_body_bytes = config.server.max_restart_queue_body_bytes;
+        let limiter = self.generation_limiter_for_profile(profile);
+        // Recovery may start or finish while requests are admitted. Hold its
+        // coordinator state lock through queue registration so every request
+        // that observes a running episode owns a bounded queue permit. Body
+        // bytes are reserved against the server-global budget for the full
+        // waiter lifetime so aggregate memory cannot exceed
+        // max_restart_queue_body_bytes independently of profile count.
+        let mut recovery = coordinator.state.lock().await;
+        if !recovery.running {
+            return Ok(None);
+        }
+        let Some((observed_recovery_episode_id, recovery_episode_permit_reference)) =
+            recovery.acquire_active_recovery_episode_permit()
+        else {
+            return Err(ProxyError::upstream_unavailable(
+                profile.name.clone(),
+                config.server.generation_queue_timeout_ms,
+            ));
+        };
+        let Some(body_reservation) = self
+            .restart_queue_body_budget
+            .try_reserve(max_queued_body_bytes, body_bytes)
+        else {
+            return Err(ProxyError::upstream_unavailable(
+                profile.name.clone(),
+                config.server.generation_queue_timeout_ms,
+            ));
+        };
+        let Some(queued) = limiter.try_enqueue(max_queued) else {
+            return Err(ProxyError::upstream_unavailable(
+                profile.name.clone(),
+                config.server.generation_queue_timeout_ms,
+            ));
+        };
+        coordinator
+            .restart_queue_depth
+            .fetch_add(1, Ordering::Relaxed);
+        drop(recovery);
+        Ok(Some(RestartQueuePermit {
+            _queued: queued,
+            _body: body_reservation,
+            coordinator: Arc::clone(coordinator),
+            observed_recovery_episode_id,
+            _recovery_episode_permit_reference: recovery_episode_permit_reference,
+        }))
     }
 
     fn try_acquire_control_plane_permit(
@@ -817,6 +939,15 @@ impl PersistenceTasks {
         }
     }
 
+    #[cfg(test)]
+    fn worker_test_lock() -> Arc<AsyncMutex<()>> {
+        static LOCK: std::sync::OnceLock<Arc<AsyncMutex<()>>> = std::sync::OnceLock::new();
+        // The libtest target also runs nested persistence-worker fixtures. Serialize tests that
+        // assert bounded `spawn_blocking` lifecycles so they observe their own worker completion,
+        // rather than host scheduling contention from another persistence-worker test.
+        Arc::clone(LOCK.get_or_init(|| Arc::new(AsyncMutex::new(()))))
+    }
+
     fn track(self: &Arc<Self>) -> PersistenceTaskGuard {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         PersistenceTaskGuard {
@@ -1031,6 +1162,62 @@ struct AdmissionCounts {
     queued: usize,
 }
 
+/// Server-global retained restart-queue body reservation. Profile generation
+/// limiters own waiter cardinality only; every waiter holds one RAII reservation
+/// from this pool so aggregate body retention cannot multiply by profile count.
+#[derive(Debug, Default)]
+struct RestartQueueBodyBudget {
+    reserved: Mutex<u64>,
+}
+
+impl RestartQueueBodyBudget {
+    fn try_reserve(
+        self: &Arc<Self>,
+        max_queued_body_bytes: u64,
+        body_bytes: u64,
+    ) -> Option<RestartQueueBodyReservation> {
+        let mut reserved = match self.reserved.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if reserved
+            .checked_add(body_bytes)
+            .is_none_or(|total| total > max_queued_body_bytes)
+        {
+            return None;
+        }
+        *reserved = reserved.saturating_add(body_bytes);
+        Some(RestartQueueBodyReservation {
+            budget: Arc::clone(self),
+            body_bytes,
+        })
+    }
+
+    #[cfg(test)]
+    fn reserved_bytes(&self) -> u64 {
+        match self.reserved.lock() {
+            Ok(guard) => *guard,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RestartQueueBodyReservation {
+    budget: Arc<RestartQueueBodyBudget>,
+    body_bytes: u64,
+}
+
+impl Drop for RestartQueueBodyReservation {
+    fn drop(&mut self) {
+        let mut reserved = match self.budget.reserved.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *reserved = reserved.saturating_sub(self.body_bytes);
+    }
+}
+
 #[derive(Debug)]
 struct AdmissionMetricsSnapshot {
     generation: AdmissionCounts,
@@ -1198,6 +1385,29 @@ struct QueuedAdmissionPermit {
 impl Drop for QueuedAdmissionPermit {
     fn drop(&mut self) {
         self.limiter.leave_queue();
+    }
+}
+
+#[derive(Debug)]
+struct RestartQueuePermit {
+    _queued: QueuedAdmissionPermit,
+    _body: RestartQueueBodyReservation,
+    coordinator: Arc<UpstreamStallRecoveryCoordinator>,
+    /// Permit acquisition holds the coordinator lock and only succeeds while an
+    /// episode is running. That observation must survive into the waiter so a
+    /// completion that races between registration and the first re-lock still
+    /// consumes the episode result instead of re-inferring "no recovery".
+    observed_recovery_episode_id: u64,
+    /// Keeps the completed recovery result resident until this waiter has
+    /// consumed it, even when later recoveries fill the normal history bound.
+    _recovery_episode_permit_reference: RecoveryEpisodePermitReference,
+}
+
+impl Drop for RestartQueuePermit {
+    fn drop(&mut self) {
+        self.coordinator
+            .restart_queue_depth
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -1580,6 +1790,7 @@ async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
                         state.malformed_response_counter.load(Ordering::Relaxed);
                     let persistence_dropped = state.persistence_tasks.dropped_total();
                     let upstream_failures = state.upstream_failure_counters.snapshot();
+                    let watchdog = state.local_recovery.watchdog_metrics_snapshot();
                     text_response(
                         StatusCode::OK,
                         render_metrics(
@@ -1588,6 +1799,7 @@ async fn metrics_handler(State(state): State<ProxyState>) -> Response<Body> {
                             malformed_responses,
                             persistence_dropped,
                             upstream_failures,
+                            watchdog,
                         ),
                     )
                 }
@@ -1978,9 +2190,11 @@ fn render_metrics(
     malformed_responses: u64,
     persistence_dropped: u64,
     upstream_failures: UpstreamFailureSnapshot,
+    watchdog: WatchdogMetricsSnapshot,
 ) -> String {
     let mut output = String::new();
     push_admission_metrics(&mut output, admission);
+    push_watchdog_metrics(&mut output, watchdog);
     push_request_metrics(&mut output, snapshot);
     push_request_terminal_metrics(&mut output, snapshot);
     push_attempt_metrics(&mut output, snapshot);
@@ -2046,6 +2260,56 @@ fn push_admission_metrics(output: &mut String, admission: &AdmissionMetricsSnaps
             &[("profile", &profile.profile)],
             usize_to_u64(profile.counts.queued),
         );
+    }
+}
+
+fn push_watchdog_metrics(output: &mut String, watchdog: WatchdogMetricsSnapshot) {
+    for (name, help, metric_type, value) in [
+        (
+            "llm_guard_proxy_stuck_watchdog_detections_total",
+            "Stuck-engine watchdog detections.",
+            "counter",
+            watchdog.detections,
+        ),
+        (
+            "llm_guard_proxy_stuck_watchdog_restarts_total",
+            "Stuck-engine watchdog recovery restarts.",
+            "counter",
+            watchdog.restarts,
+        ),
+        (
+            "llm_guard_proxy_stuck_watchdog_recovery_successes_total",
+            "Successful stuck-engine watchdog recoveries.",
+            "counter",
+            watchdog.recovery_successes,
+        ),
+        (
+            "llm_guard_proxy_stuck_watchdog_recovery_timeouts_total",
+            "Timed-out stuck-engine watchdog recoveries.",
+            "counter",
+            watchdog.recovery_timeouts,
+        ),
+        (
+            "llm_guard_proxy_stuck_watchdog_recovery_task_failures_total",
+            "Failed stuck-engine watchdog recovery tasks.",
+            "counter",
+            watchdog.recovery_task_failures,
+        ),
+        (
+            "llm_guard_proxy_restart_queue_depth",
+            "Requests currently waiting for a recovery restart.",
+            "gauge",
+            watchdog.restart_queue_depth,
+        ),
+        (
+            "llm_guard_proxy_stuck_watchdog_restart_queue_depth",
+            "Requests currently waiting for a watchdog restart.",
+            "gauge",
+            watchdog.restart_queue_depth,
+        ),
+    ] {
+        push_metric_header(output, name, help, metric_type);
+        push_metric_line(output, name, &[], value);
     }
 }
 
@@ -2880,6 +3144,24 @@ async fn forward_openai_request(
     )
     .await
     .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+    let stuck_watchdog_request = prepared_request
+        .upstream_profile
+        .stuck_watchdog
+        .enabled
+        .then(|| watchdog_progress_unit(&prepared_request.forward_uri))
+        .flatten()
+        .map(|progress_unit| {
+            state.stuck_watchdog_tokens.watch_request(
+                &prepared_request.upstream_profile.name,
+                progress_unit,
+                Duration::from_secs(
+                    prepared_request
+                        .upstream_profile
+                        .stuck_watchdog
+                        .detection_window_secs,
+                ),
+            )
+        });
     let endpoint_retry_body = prepared_request.shielded_chat_plan.upstream_body.clone();
     let mut _initial_recovery_trial_lease = None;
     if prepared_request.upstream_profile.has_endpoint_failover() {
@@ -3023,6 +3305,7 @@ async fn forward_openai_request(
                 request_id: request_id.clone(),
                 started_at_unix_ms,
                 model_id: prepared_request.model_id,
+                stuck_watchdog_request,
                 request_metadata,
                 listener: state.listener.clone(),
                 upstream_profile: prepared_request.upstream_profile,
@@ -3080,6 +3363,7 @@ async fn forward_openai_request(
         request_id,
         started_at_unix_ms,
         model_id: prepared_request.model_id,
+        stuck_watchdog_request,
         request_metadata,
         in_flight_permit,
         response_adapter: prepared_request.response_adapter,
@@ -3119,6 +3403,39 @@ async fn read_body_and_admit_generation(
     max_request_body_bytes: usize,
     request: BodyAdmissionContext<'_>,
 ) -> Result<OpenAiBodyAdmission, ProxyError> {
+    let (body, body_read_request_metadata) =
+        read_body_for_generation_admission(state, body, max_request_body_bytes, &request).await?;
+    let config = state.config.snapshot().map_err(|error| {
+        ProxyError::config_snapshot(error.to_string())
+            .with_request_metadata(body_read_request_metadata.clone())
+    })?;
+    if is_control_plane_models_request(request.method, request.uri) {
+        return Ok(OpenAiBodyAdmission {
+            config,
+            body,
+            in_flight_permit,
+            admission_metadata: request.admission_metadata,
+        });
+    }
+
+    admit_generation_after_body(
+        state,
+        body,
+        config,
+        in_flight_permit,
+        admission_permit_kind,
+        body_read_request_metadata,
+        request,
+    )
+    .await
+}
+
+async fn read_body_for_generation_admission(
+    state: &ProxyState,
+    body: Body,
+    max_request_body_bytes: usize,
+    request: &BodyAdmissionContext<'_>,
+) -> Result<(Bytes, BTreeMap<String, String>), ProxyError> {
     let mut pre_body_request_metadata = pre_upstream_request_metadata(
         request.method,
         request.uri,
@@ -3143,36 +3460,39 @@ async fn read_body_and_admit_generation(
         request.shielding_enabled_hint,
     );
     add_listener_metadata(&mut body_read_request_metadata, &state.listener);
-    let config = state.config.snapshot().map_err(|error| {
-        ProxyError::config_snapshot(error.to_string())
-            .with_request_metadata(body_read_request_metadata.clone())
-    })?;
-    if is_control_plane_models_request(request.method, request.uri) {
-        return Ok(OpenAiBodyAdmission {
-            config,
-            body,
-            in_flight_permit,
-            admission_metadata: request.admission_metadata,
-        });
-    }
+    Ok((body, body_read_request_metadata))
+}
 
-    if admission_permit_kind != AdmissionPermitKind::BodyRouting
-        && !config.has_upstream_profile_generation_limits()
-    {
-        return Ok(OpenAiBodyAdmission {
-            config,
-            body,
-            in_flight_permit,
-            admission_metadata: request.admission_metadata,
-        });
-    }
-
+async fn admit_generation_after_body(
+    state: &ProxyState,
+    body: Bytes,
+    config: AppConfig,
+    in_flight_permit: InFlightPermit,
+    admission_permit_kind: AdmissionPermitKind,
+    body_read_request_metadata: BTreeMap<String, String>,
+    request: BodyAdmissionContext<'_>,
+) -> Result<OpenAiBodyAdmission, ProxyError> {
     let model_id_for_admission = extract_model_id(request.method, request.uri, &body);
-    select_allowed_upstream_profile(&config, &state.listener, model_id_for_admission.as_deref())
-        .map_err(|error| {
-            ProxyError::listener_denied(error)
-                .with_request_metadata(body_read_request_metadata.clone())
-        })?;
+    let selected_profile = select_allowed_upstream_profile(
+        &config,
+        &state.listener,
+        model_id_for_admission.as_deref(),
+    )
+    .map_err(|error| {
+        ProxyError::listener_denied(error).with_request_metadata(body_read_request_metadata.clone())
+    })?;
+    if selected_profile.profile.restart_queue.enabled {
+        return wait_for_restart_queue_and_readmit(
+            state,
+            body,
+            in_flight_permit,
+            model_id_for_admission,
+            selected_profile.profile,
+            body_read_request_metadata,
+            request,
+        )
+        .await;
+    }
     if admission_permit_kind == AdmissionPermitKind::Generation {
         return Ok(OpenAiBodyAdmission {
             config,
@@ -3181,13 +3501,9 @@ async fn read_body_and_admit_generation(
             admission_metadata: request.admission_metadata,
         });
     }
-    let record_context = AdmissionRecordContext {
-        store: state.store.clone(),
-        persistence_tasks: Arc::clone(&state.persistence_tasks),
-        request_id: request.request_id.clone(),
-        started_at_unix_ms: request.started_at_unix_ms,
-        request_metadata: body_read_request_metadata.clone(),
-    };
+
+    let record_context =
+        body_admission_record_context(state, &request, &body_read_request_metadata);
     let admission = state
         .acquire_generation_permit_for_model(
             model_id_for_admission.as_deref(),
@@ -3195,11 +3511,7 @@ async fn read_body_and_admit_generation(
             record_context,
         )
         .await
-        .map_err(|error| {
-            let mut metadata = body_read_request_metadata;
-            metadata.extend(error.request_metadata());
-            ProxyError::admission(error).with_request_metadata(metadata)
-        })?;
+        .map_err(|error| admission_proxy_error(error, body_read_request_metadata))?;
     let mut admission_metadata = request.admission_metadata;
     admission_metadata.extend(acquired_admission_metadata(admission.queue_wait));
     Ok(OpenAiBodyAdmission {
@@ -3208,6 +3520,68 @@ async fn read_body_and_admit_generation(
         in_flight_permit: admission.permit,
         admission_metadata,
     })
+}
+
+async fn wait_for_restart_queue_and_readmit(
+    state: &ProxyState,
+    body: Bytes,
+    in_flight_permit: InFlightPermit,
+    model_id: Option<String>,
+    profile: UpstreamProfileConfig,
+    mut body_read_request_metadata: BTreeMap<String, String>,
+    request: BodyAdmissionContext<'_>,
+) -> Result<OpenAiBodyAdmission, ProxyError> {
+    // Both provisional admission paths use capacity only to route/read the body.
+    // A restart waiter must release that capacity before entering the dedicated queue.
+    // Body retention is admitted under max_restart_queue_body_bytes before waiting.
+    drop(in_flight_permit);
+    let body_bytes = u64::try_from(body.len()).unwrap_or(u64::MAX);
+    let restart_queue_outcome = wait_for_profile_restart_queue(
+        state,
+        &profile,
+        body_bytes,
+        &mut body_read_request_metadata,
+    )
+    .await?;
+    let restart_queue_metadata = restart_queue_outcome.request_metadata();
+    body_read_request_metadata.extend(restart_queue_metadata.clone());
+    let record_context =
+        body_admission_record_context(state, &request, &body_read_request_metadata);
+    let admission = state
+        .reacquire_generation_permit_for_model(model_id.as_deref(), record_context)
+        .await
+        .map_err(|error| admission_proxy_error(error, body_read_request_metadata))?;
+    let mut admission_metadata = request.admission_metadata;
+    admission_metadata.extend(restart_queue_metadata);
+    admission_metadata.extend(acquired_admission_metadata(admission.queue_wait));
+    Ok(OpenAiBodyAdmission {
+        config: admission.config,
+        body,
+        in_flight_permit: admission.permit,
+        admission_metadata,
+    })
+}
+
+fn body_admission_record_context(
+    state: &ProxyState,
+    request: &BodyAdmissionContext<'_>,
+    request_metadata: &BTreeMap<String, String>,
+) -> AdmissionRecordContext {
+    AdmissionRecordContext {
+        store: state.store.clone(),
+        persistence_tasks: Arc::clone(&state.persistence_tasks),
+        request_id: request.request_id.clone(),
+        started_at_unix_ms: request.started_at_unix_ms,
+        request_metadata: request_metadata.clone(),
+    }
+}
+
+fn admission_proxy_error(
+    error: AdmissionFailure,
+    mut request_metadata: BTreeMap<String, String>,
+) -> ProxyError {
+    request_metadata.extend(error.request_metadata());
+    ProxyError::admission(error).with_request_metadata(request_metadata)
 }
 
 async fn read_body_with_adapter_limit(
@@ -4390,6 +4764,7 @@ struct GenericForwardContext<'request> {
     request_id: &'request RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
+    stuck_watchdog_request: Option<StuckWatchdogRequest>,
     request_metadata: BTreeMap<String, String>,
     in_flight_permit: InFlightPermit,
     response_adapter: Option<BufferedResponseAdapter>,
@@ -4591,6 +4966,7 @@ async fn forward_generic_openai_request(
         }),
         model_id: context.model_id.as_deref(),
         request_deadline: context.upstream_deadline,
+        stuck_watchdog_request: context.stuck_watchdog_request.as_ref(),
     })
     .await?;
     let GenericForwardedResponse {
@@ -4693,6 +5069,7 @@ fn generic_forwarded_response(
         attempt_request_metadata: sent_upstream_response.attempt_request_metadata,
         completed_attempt_records: sent_upstream_response.completed_attempt_records,
         shutdown: Arc::clone(&context.state.shutdown),
+        stuck_watchdog_attempt: sent_upstream_response.stuck_watchdog_attempt,
     };
     GenericForwardedResponse {
         response_parts,
@@ -4836,6 +5213,7 @@ async fn forward_merged_models_response(
         attempt_request_metadata: BTreeMap::new(),
         completed_attempt_records: Vec::new(),
         shutdown: Arc::clone(&context.state.shutdown),
+        stuck_watchdog_attempt: None,
     };
     let shutdown = response_parts.shutdown_subscription();
     let mut observer = response_parts.into_observer();
@@ -4947,6 +5325,7 @@ async fn fetch_models_upstream_group(
         decode_heterogeneous_reranker: false,
         model_id: None,
         request_deadline: Some(group.request_deadline),
+        stuck_watchdog_request: None,
     })
     .await?;
     let SentUpstreamResponse {
@@ -5083,6 +5462,7 @@ struct UpstreamAttemptContext<'request> {
     decode_heterogeneous_reranker: bool,
     model_id: Option<&'request str>,
     request_deadline: Option<Instant>,
+    stuck_watchdog_request: Option<&'request StuckWatchdogRequest>,
 }
 
 struct SentUpstreamResponse {
@@ -5095,6 +5475,7 @@ struct SentUpstreamResponse {
     did_failover: bool,
     terminal_endpoint: Option<UpstreamEndpointConfig>,
     terminal_endpoint_protocol: UpstreamEndpointProtocol,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
 struct PhysicalEndpointAttempt {
@@ -5105,6 +5486,7 @@ struct PhysicalEndpointAttempt {
     endpoint: Option<UpstreamEndpointConfig>,
     protocol: UpstreamEndpointProtocol,
     observed_response: Option<ObservedEndpointResponse>,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
 struct EndpointFailoverOutcome {
@@ -5122,6 +5504,7 @@ struct EndpointFailoverRuntime<'request> {
     request_id: &'request RequestId,
     decode_heterogeneous_reranker: bool,
     model_id: Option<&'request str>,
+    stuck_watchdog_request: Option<&'request StuckWatchdogRequest>,
 }
 
 struct EndpointFailoverProgress {
@@ -5191,6 +5574,7 @@ async fn send_first_upstream_attempt(
         endpoint: terminal_endpoint,
         protocol: context.terminal_endpoint_protocol,
         observed_response: None,
+        stuck_watchdog_attempt: None,
     };
     annotate_physical_endpoint_attempt(
         &mut initial_attempt.request_metadata,
@@ -5211,6 +5595,9 @@ async fn send_first_upstream_attempt(
     );
     let result = match initial_timeout {
         Ok(timeout) => {
+            initial_attempt.stuck_watchdog_attempt = context
+                .stuck_watchdog_request
+                .map(StuckWatchdogRequest::begin_attempt);
             send_upstream_request_until_shutdown(
                 context.client,
                 context.method.clone(),
@@ -5250,6 +5637,7 @@ async fn send_first_upstream_attempt(
                     request_id: context.request_id,
                     decode_heterogeneous_reranker: context.decode_heterogeneous_reranker,
                     model_id: context.model_id,
+                    stuck_watchdog_request: context.stuck_watchdog_request,
                 },
                 EndpointFailoverProgress {
                     result,
@@ -5291,18 +5679,32 @@ fn finalize_sent_upstream_response(
         String::from(disposition),
     );
     match result {
-        Ok(response) => Ok(SentUpstreamResponse {
-            response,
-            attempt_id: terminal_attempt.attempt_id,
-            attempt_number: terminal_attempt.attempt_number,
-            attempt_started_at_unix_ms: terminal_attempt.started_at_unix_ms,
-            attempt_request_metadata: terminal_attempt.request_metadata,
-            did_failover: !completed_attempt_records.is_empty(),
-            completed_attempt_records,
-            terminal_endpoint: terminal_attempt.endpoint.clone(),
-            terminal_endpoint_protocol: terminal_attempt.protocol,
-        }),
+        Ok(response) => {
+            let stuck_watchdog_attempt = if matches!(&response, EndpointResponse::Upstream(_)) {
+                terminal_attempt.stuck_watchdog_attempt.take()
+            } else {
+                if let Some(lease) = terminal_attempt.stuck_watchdog_attempt.take() {
+                    lease.end();
+                }
+                None
+            };
+            Ok(SentUpstreamResponse {
+                response,
+                attempt_id: terminal_attempt.attempt_id,
+                attempt_number: terminal_attempt.attempt_number,
+                attempt_started_at_unix_ms: terminal_attempt.started_at_unix_ms,
+                attempt_request_metadata: terminal_attempt.request_metadata,
+                did_failover: !completed_attempt_records.is_empty(),
+                completed_attempt_records,
+                terminal_endpoint: terminal_attempt.endpoint.clone(),
+                terminal_endpoint_protocol: terminal_attempt.protocol,
+                stuck_watchdog_attempt,
+            })
+        }
         Err(error) => {
+            if let Some(lease) = terminal_attempt.stuck_watchdog_attempt.take() {
+                lease.end();
+            }
             let finished_at_unix_ms = unix_time_millis();
             let error_reason = error.to_string();
             let mut attempt_record = failed_attempt_record(FailedAttemptRecordInput {
@@ -5365,6 +5767,7 @@ async fn continue_endpoint_failover(
         terminal_attempt.endpoint.as_ref(),
     ) {
         mark_retryable_endpoint_failure(runtime.retry.registry, &terminal_attempt, &result);
+        end_stuck_watchdog_attempt(&mut terminal_attempt.stuck_watchdog_attempt);
         if attempted_base_urls.len() >= eligible_endpoint_count {
             break;
         }
@@ -5481,6 +5884,7 @@ async fn send_selected_failover_endpoint(
         endpoint: Some(selected.endpoint.clone()),
         protocol: selected.endpoint.protocol,
         observed_response: None,
+        stuck_watchdog_attempt: None,
     };
     let response = match rendered {
         Ok(rendered) => {
@@ -5498,6 +5902,9 @@ async fn send_selected_failover_endpoint(
                 endpoint_attempts_remaining,
             ) {
                 Ok(timeout) => {
+                    attempt.stuck_watchdog_attempt = runtime
+                        .stuck_watchdog_request
+                        .map(StuckWatchdogRequest::begin_attempt);
                     send_upstream_request_until_shutdown(
                         runtime.client,
                         runtime.retry_method.clone(),
@@ -5571,6 +5978,9 @@ async fn finalize_endpoint_response(
             "heterogeneous reranker response rewrite failed: {error}"
         ))
     })?;
+    if let Some(lease) = attempt.stuck_watchdog_attempt.as_ref() {
+        let _ = lease.record_emitted_chunk(&body);
+    }
     Ok(EndpointResponse::Rewritten(RewrittenEndpointResponse {
         body,
         upstream_body_bytes,
@@ -6141,15 +6551,1355 @@ impl LocalRecoveryPolicy {
 struct UpstreamStallRecoveryCoordinator {
     state: AsyncMutex<UpstreamStallRecoveryState>,
     notify: Notify,
+    restart_queue_depth: AtomicU64,
+    watchdog_detections: AtomicU64,
+    watchdog_restarts: AtomicU64,
+    watchdog_recovery_successes: AtomicU64,
+    watchdog_recovery_timeouts: AtomicU64,
+    watchdog_recovery_task_failures: AtomicU64,
 }
 
 #[derive(Debug, Default)]
 struct UpstreamStallRecoveryState {
     running: bool,
+    recovery_started: Option<Instant>,
+    recovery_deadline: Option<Instant>,
     last_finished: Option<Instant>,
     window_started: Option<Instant>,
     runs_in_window: u32,
     last_result: Option<BTreeMap<String, String>>,
+    next_recovery_episode_id: u64,
+    active_recovery_episode_id: Option<u64>,
+    active_recovery_episode_permits: Option<Arc<AtomicUsize>>,
+    active_local_recovery_task: Option<AbortHandle>,
+    completed_recovery_episodes: VecDeque<CompletedRecoveryEpisode>,
+}
+
+const COMPLETED_RECOVERY_EPISODE_CAPACITY: usize = 8;
+
+#[derive(Debug)]
+struct CompletedRecoveryEpisode {
+    id: u64,
+    result: BTreeMap<String, String>,
+    permit_references: Arc<AtomicUsize>,
+}
+
+#[derive(Debug)]
+struct RecoveryEpisodePermitReference(Arc<AtomicUsize>);
+
+impl Drop for RecoveryEpisodePermitReference {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Release);
+    }
+}
+
+impl UpstreamStallRecoveryState {
+    /// Allocates an episode identity while recovery is running. A queue permit
+    /// retains this identity so it cannot consume a later recovery's result.
+    fn ensure_active_recovery_episode(&mut self) -> Option<u64> {
+        if let Some(id) = self.active_recovery_episode_id {
+            self.active_recovery_episode_permits
+                .get_or_insert_with(|| Arc::new(AtomicUsize::new(0)));
+            return Some(id);
+        }
+        let id = self.next_recovery_episode_id.checked_add(1)?;
+        self.next_recovery_episode_id = id;
+        self.active_recovery_episode_id = Some(id);
+        self.active_recovery_episode_permits = Some(Arc::new(AtomicUsize::new(0)));
+        Some(id)
+    }
+
+    fn acquire_active_recovery_episode_permit(
+        &mut self,
+    ) -> Option<(u64, RecoveryEpisodePermitReference)> {
+        let id = self.ensure_active_recovery_episode()?;
+        let permit_references = Arc::clone(self.active_recovery_episode_permits.as_ref()?);
+        permit_references.fetch_add(1, Ordering::Relaxed);
+        Some((id, RecoveryEpisodePermitReference(permit_references)))
+    }
+
+    fn completed_recovery_result(&self, episode_id: u64) -> Option<&BTreeMap<String, String>> {
+        self.completed_recovery_episodes
+            .iter()
+            .find(|episode| episode.id == episode_id)
+            .map(|episode| &episode.result)
+    }
+
+    fn finish_recovery(&mut self, result: BTreeMap<String, String>) {
+        let episode_id = self.active_recovery_episode_id.take();
+        self.active_local_recovery_task = None;
+        let permit_references = self
+            .active_recovery_episode_permits
+            .take()
+            .unwrap_or_else(|| Arc::new(AtomicUsize::new(0)));
+        self.running = false;
+        self.last_finished = Some(Instant::now());
+        self.last_result = Some(result.clone());
+        if let Some(id) = episode_id {
+            self.completed_recovery_episodes
+                .push_back(CompletedRecoveryEpisode {
+                    id,
+                    result,
+                    permit_references,
+                });
+            self.prune_completed_recovery_episodes();
+        }
+    }
+
+    /// Publishes a local-recovery result only if its episode still owns the
+    /// coordinator. A delayed task from an older episode must not clear or
+    /// overwrite a newer recovery.
+    fn finish_recovery_for_episode(
+        &mut self,
+        episode_id: u64,
+        result: BTreeMap<String, String>,
+    ) -> bool {
+        if self.active_recovery_episode_id != Some(episode_id) {
+            return false;
+        }
+        self.finish_recovery(result);
+        true
+    }
+
+    fn prune_completed_recovery_episodes(&mut self) {
+        while self.completed_recovery_episodes.len() > COMPLETED_RECOVERY_EPISODE_CAPACITY {
+            let Some(index) = self
+                .completed_recovery_episodes
+                .iter()
+                .position(|episode| episode.permit_references.load(Ordering::Acquire) == 0)
+            else {
+                return;
+            };
+            let _removed = self.completed_recovery_episodes.remove(index);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct StuckWatchdogTokenTracker {
+    windows: Mutex<HashMap<String, StuckWatchdogTokenWindow>>,
+    next_attempt_id: AtomicU64,
+}
+
+#[derive(Debug, Default)]
+struct StuckWatchdogTokenWindow {
+    samples: VecDeque<(Instant, u64)>,
+    attempts: HashMap<u64, StuckWatchdogAttempt>,
+}
+
+/// Upstream liveness is scoped to a concrete attempt rather than a profile-wide
+/// aggregate, so an older completion cannot age a newer request into recovery.
+#[derive(Debug)]
+struct StuckWatchdogAttempt {
+    started_at: Instant,
+    completed: Option<Instant>,
+    observation_suspended: bool,
+    unobservable_progress: bool,
+}
+
+#[derive(Debug)]
+struct StuckWatchdogRequestInner {
+    tracker: Arc<StuckWatchdogTokenTracker>,
+    profile: String,
+    progress_unit: WatchdogProgressUnit,
+    detection_window: Duration,
+    #[cfg(test)]
+    fallback_progress_parser: Mutex<WatchdogProgressParser>,
+}
+
+#[derive(Clone, Debug)]
+struct StuckWatchdogRequest {
+    inner: Arc<StuckWatchdogRequestInner>,
+}
+
+/// Owns exactly one physical upstream send/stream lifetime. It deliberately
+/// cannot be cloned: request runtimes may be cloned for observers and
+/// persistence, but only the network attempt can keep watchdog activity alive.
+#[derive(Debug)]
+struct StuckWatchdogAttemptLease {
+    request: StuckWatchdogRequest,
+    attempt_id: u64,
+    progress_parser: Arc<Mutex<WatchdogProgressParser>>,
+    progress_state: Arc<AtomicU8>,
+    upstream_terminalized: Arc<AtomicBool>,
+    ended: bool,
+}
+
+/// Cloneable progress handle for one physical upstream attempt. The lease remains
+/// the sole owner that keeps that attempt active in the watchdog tracker.
+#[derive(Clone, Debug)]
+struct StuckWatchdogAttemptProgress {
+    request: StuckWatchdogRequest,
+    attempt_id: u64,
+    progress_parser: Arc<Mutex<WatchdogProgressParser>>,
+    progress_state: Arc<AtomicU8>,
+    upstream_terminalized: Arc<AtomicBool>,
+}
+
+const WATCHDOG_PROGRESS_OPEN: u8 = 0;
+const WATCHDOG_PROGRESS_STREAMING: u8 = 1;
+const WATCHDOG_PROGRESS_TERMINAL_CLAIMED: u8 = 2;
+
+fn claim_watchdog_terminal_progress(progress_state: &AtomicU8) -> bool {
+    progress_state
+        .compare_exchange(
+            WATCHDOG_PROGRESS_OPEN,
+            WATCHDOG_PROGRESS_TERMINAL_CLAIMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn claim_watchdog_stream_progress(progress_state: &AtomicU8) -> bool {
+    let mut state = progress_state.load(Ordering::Acquire);
+    loop {
+        match state {
+            WATCHDOG_PROGRESS_OPEN => match progress_state.compare_exchange_weak(
+                WATCHDOG_PROGRESS_OPEN,
+                WATCHDOG_PROGRESS_STREAMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) | Err(WATCHDOG_PROGRESS_STREAMING) => return true,
+                Err(next_state) => state = next_state,
+            },
+            WATCHDOG_PROGRESS_STREAMING => return true,
+            WATCHDOG_PROGRESS_TERMINAL_CLAIMED => return false,
+            _ => unreachable!("watchdog progress state must stay in the defined state machine"),
+        }
+    }
+}
+
+impl StuckWatchdogTokenTracker {
+    /// Starts a lease immediately. Kept for unit-level lifecycle tests; request
+    /// forwarding uses `watch_request` plus `begin_attempt` at the actual send.
+    #[cfg(test)]
+    fn begin_request(
+        self: &Arc<Self>,
+        profile: &str,
+        progress_unit: WatchdogProgressUnit,
+        detection_window: Duration,
+    ) -> StuckWatchdogAttemptLease {
+        self.watch_request(profile, progress_unit, detection_window)
+            .begin_attempt()
+    }
+
+    fn watch_request(
+        self: &Arc<Self>,
+        profile: &str,
+        progress_unit: WatchdogProgressUnit,
+        detection_window: Duration,
+    ) -> StuckWatchdogRequest {
+        StuckWatchdogRequest {
+            inner: Arc::new(StuckWatchdogRequestInner {
+                tracker: Arc::clone(self),
+                profile: profile.to_owned(),
+                progress_unit,
+                detection_window,
+                #[cfg(test)]
+                fallback_progress_parser: Mutex::new(WatchdogProgressParser::default()),
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn record_response(
+        &self,
+        profile: &str,
+        detection_window: Duration,
+        response_body: &[u8],
+        sse_body: &[u8],
+    ) {
+        let Some(_output_tokens) = parse_token_usage(response_body, sse_body).output_tokens else {
+            return;
+        };
+        // Non-streaming responses expose a completion token count but the
+        // watchdog contract is progress units, so one successful response is
+        // one unit rather than a provider-specific token estimate.
+        self.record_progress(profile, detection_window, 1);
+    }
+
+    fn record_progress(&self, profile: &str, detection_window: Duration, progress: u64) {
+        self.record_progress_with_hook(profile, detection_window, progress, || {});
+    }
+
+    fn record_progress_with_hook<F>(
+        &self,
+        profile: &str,
+        detection_window: Duration,
+        progress: u64,
+        after_prune: F,
+    ) where
+        F: FnOnce(),
+    {
+        if progress == 0 {
+            return;
+        }
+        let mut windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let now = Instant::now();
+        let window = windows.entry(profile.to_owned()).or_default();
+        // Samples are shared by all requests for a profile. A request can retain
+        // an old configuration snapshot, so only the watchdog's current-window
+        // read path is allowed to prune shared progress samples.
+        prune_watchdog_attempts(window, detection_window, now);
+        after_prune();
+        record_watchdog_progress(window, now, progress);
+    }
+
+    #[cfg(test)]
+    fn sample_count(&self, profile: &str) -> usize {
+        let windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        windows
+            .get(profile)
+            .map_or(0, |window| window.samples.len())
+    }
+
+    fn prune_profile(&self, profile: &str, detection_window: Duration) {
+        let mut windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(window) = windows.get_mut(profile) {
+            let now = Instant::now();
+            prune_watchdog_progress(window, detection_window, now);
+            prune_watchdog_attempts(window, detection_window, now);
+        }
+    }
+
+    fn has_too_few_output_progress_units(
+        &self,
+        profile: &str,
+        detection_window: Duration,
+        minimum_output_tokens: u64,
+    ) -> bool {
+        let mut windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(window) = windows.get_mut(profile) else {
+            return false;
+        };
+        window_has_too_few_output_progress_units(
+            window,
+            detection_window,
+            minimum_output_tokens,
+            Instant::now(),
+        )
+    }
+
+    #[cfg(test)]
+    fn has_active_requests(&self, profile: &str) -> bool {
+        let windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        windows.get(profile).is_some_and(|window| {
+            window
+                .attempts
+                .values()
+                .any(|attempt| attempt.completed.is_none())
+        })
+    }
+
+    #[cfg(test)]
+    fn attempt_count(&self, profile: &str) -> usize {
+        let windows = match self.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        windows
+            .get(profile)
+            .map_or(0, |window| window.attempts.len())
+    }
+}
+
+impl StuckWatchdogRequest {
+    fn begin_attempt(&self) -> StuckWatchdogAttemptLease {
+        let mut windows = match self.inner.tracker.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let attempt_id = self
+            .inner
+            .tracker
+            .next_attempt_id
+            .fetch_add(1, Ordering::Relaxed);
+        windows
+            .entry(self.inner.profile.clone())
+            .or_default()
+            .attempts
+            .insert(
+                attempt_id,
+                StuckWatchdogAttempt {
+                    started_at: Instant::now(),
+                    completed: None,
+                    observation_suspended: false,
+                    unobservable_progress: false,
+                },
+            );
+        StuckWatchdogAttemptLease {
+            request: self.clone(),
+            attempt_id,
+            progress_parser: Arc::new(Mutex::new(WatchdogProgressParser::default())),
+            progress_state: Arc::new(AtomicU8::new(WATCHDOG_PROGRESS_OPEN)),
+            upstream_terminalized: Arc::new(AtomicBool::new(false)),
+            ended: false,
+        }
+    }
+
+    fn finish_attempt(&self, attempt_id: u64) {
+        let mut windows = match self.inner.tracker.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        // A physical attempt has reached an upstream terminal state. It cannot
+        // become stalled while a downstream observer still retains its body.
+        if let Some(window) = windows.get_mut(&self.inner.profile) {
+            window.attempts.remove(&attempt_id);
+            if window.attempts.is_empty() && window.samples.is_empty() {
+                windows.remove(&self.inner.profile);
+            }
+        }
+    }
+
+    fn response_has_progress(response_body: &[u8], sse_body: &[u8]) -> bool {
+        parse_token_usage(response_body, sse_body)
+            .output_tokens
+            .is_some()
+    }
+
+    fn record_response_progress(&self) {
+        self.record_progress(1);
+    }
+
+    fn record_progress(&self, progress: u64) {
+        self.inner.tracker.record_progress(
+            &self.inner.profile,
+            self.inner.detection_window,
+            progress,
+        );
+    }
+
+    fn record_emitted_progress(
+        &self,
+        parser: &Mutex<WatchdogProgressParser>,
+        chunk: &[u8],
+    ) -> WatchdogProgressState {
+        {
+            let mut parser = parser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            emitted_progress(self.inner.progress_unit, &mut parser, chunk)
+        }
+    }
+
+    fn record_non_sse_progress_at_upstream_eof(
+        &self,
+        parser: &Mutex<WatchdogProgressParser>,
+    ) -> WatchdogProgressState {
+        {
+            let mut parser = parser
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            non_sse_progress_at_eof(self.inner.progress_unit, &mut parser)
+        }
+    }
+
+    #[cfg(test)]
+    fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
+        let state = self.record_emitted_progress(&self.inner.fallback_progress_parser, chunk);
+        if let WatchdogProgressState::Progress(progress) = state {
+            self.record_progress(progress);
+            return true;
+        }
+        false
+    }
+
+    fn set_attempt_observation_suspended(&self, attempt_id: u64, suspended: bool) {
+        let mut windows = match self.inner.tracker.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(attempt) = windows
+            .get_mut(&self.inner.profile)
+            .and_then(|window| window.attempts.get_mut(&attempt_id))
+        else {
+            return;
+        };
+        if suspended {
+            attempt.observation_suspended = true;
+        } else if attempt.observation_suspended && !attempt.unobservable_progress {
+            attempt.observation_suspended = false;
+            // Restart maturity once downstream capacity makes upstream observation
+            // possible again; samples from the hidden interval cannot prove liveness.
+            attempt.started_at = Instant::now();
+        }
+    }
+
+    fn set_attempt_unobservable_progress(&self, attempt_id: u64) {
+        let mut windows = match self.inner.tracker.windows.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(attempt) = windows
+            .get_mut(&self.inner.profile)
+            .and_then(|window| window.attempts.get_mut(&attempt_id))
+        else {
+            return;
+        };
+        attempt.observation_suspended = true;
+        attempt.unobservable_progress = true;
+    }
+}
+
+impl StuckWatchdogAttemptLease {
+    fn progress_request(&self) -> StuckWatchdogAttemptProgress {
+        StuckWatchdogAttemptProgress {
+            request: self.request.clone(),
+            attempt_id: self.attempt_id,
+            progress_parser: Arc::clone(&self.progress_parser),
+            progress_state: Arc::clone(&self.progress_state),
+            upstream_terminalized: Arc::clone(&self.upstream_terminalized),
+        }
+    }
+
+    fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
+        if self.upstream_terminalized.load(Ordering::Acquire)
+            || !StuckWatchdogRequest::response_has_progress(response_body, sse_body)
+            || !claim_watchdog_terminal_progress(&self.progress_state)
+        {
+            return;
+        }
+        self.request.record_response_progress();
+    }
+
+    fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
+        let state = self
+            .request
+            .record_emitted_progress(&self.progress_parser, chunk);
+        if let WatchdogProgressState::Progress(progress) = state
+            && claim_watchdog_stream_progress(&self.progress_state)
+        {
+            self.request.record_progress(progress);
+            return true;
+        }
+        if matches!(state, WatchdogProgressState::UnobservableOversize) {
+            self.request
+                .set_attempt_unobservable_progress(self.attempt_id);
+        }
+        false
+    }
+
+    #[cfg(test)]
+    fn record_upstream_emitted_chunk(&self, chunk: &[u8]) {
+        let _ = self.record_emitted_chunk(chunk);
+    }
+
+    fn end(mut self) {
+        self.finish();
+    }
+
+    fn finish(&mut self) {
+        if self.ended {
+            return;
+        }
+        self.request.finish_attempt(self.attempt_id);
+        self.ended = true;
+    }
+}
+
+impl StuckWatchdogAttemptProgress {
+    fn end_attempt(&self) {
+        self.upstream_terminalized.store(true, Ordering::Release);
+        self.request.finish_attempt(self.attempt_id);
+    }
+
+    fn record_upstream_emitted_chunk(&self, chunk: &[u8]) -> bool {
+        let state = self
+            .request
+            .record_emitted_progress(&self.progress_parser, chunk);
+        if let WatchdogProgressState::Progress(progress) = state
+            && claim_watchdog_stream_progress(&self.progress_state)
+        {
+            self.request.record_progress(progress);
+            return true;
+        }
+        if matches!(state, WatchdogProgressState::UnobservableOversize) {
+            self.request
+                .set_attempt_unobservable_progress(self.attempt_id);
+        }
+        false
+    }
+
+    fn record_non_sse_progress_at_upstream_eof(&self) {
+        let state = self
+            .request
+            .record_non_sse_progress_at_upstream_eof(&self.progress_parser);
+        if let WatchdogProgressState::Progress(progress) = state
+            && claim_watchdog_terminal_progress(&self.progress_state)
+        {
+            self.request.record_progress(progress);
+        }
+    }
+
+    fn suspend_observation(&self) {
+        self.request
+            .set_attempt_observation_suspended(self.attempt_id, true);
+    }
+
+    fn resume_observation(&self) {
+        self.request
+            .set_attempt_observation_suspended(self.attempt_id, false);
+    }
+}
+
+impl Drop for StuckWatchdogAttemptLease {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn end_stuck_watchdog_attempt(lease: &mut Option<StuckWatchdogAttemptLease>) {
+    if let Some(lease) = lease.take() {
+        lease.progress_request().end_attempt();
+    }
+}
+
+fn window_has_too_few_output_progress_units(
+    window: &mut StuckWatchdogTokenWindow,
+    detection_window: Duration,
+    minimum_output_tokens: u64,
+    now: Instant,
+) -> bool {
+    prune_watchdog_attempts(window, detection_window, now);
+    // Detection requires at least one still-active attempt that has matured past
+    // the detection window. A younger concurrent attempt must not suppress an
+    // independently matured stuck attempt, and a young-only window must not fire.
+    let has_mature_active_attempt = window.attempts.values().any(|attempt| {
+        attempt.completed.is_none()
+            && !attempt.observation_suspended
+            && now.saturating_duration_since(attempt.started_at) >= detection_window
+    });
+    if !has_mature_active_attempt {
+        return false;
+    }
+    prune_watchdog_progress(window, detection_window, now);
+    window
+        .samples
+        .iter()
+        .fold(0_u64, |total, (_, output_tokens)| {
+            total.saturating_add(*output_tokens)
+        })
+        < minimum_output_tokens
+}
+
+fn record_watchdog_progress(window: &mut StuckWatchdogTokenWindow, now: Instant, progress: u64) {
+    window.samples.push_back((now, progress));
+    while window.samples.len() > STUCK_WATCHDOG_PROGRESS_SAMPLE_CAP {
+        let _ = window.samples.pop_front();
+    }
+}
+
+fn prune_watchdog_progress(
+    window: &mut StuckWatchdogTokenWindow,
+    detection_window: Duration,
+    now: Instant,
+) {
+    if let Some(threshold) = now.checked_sub(detection_window) {
+        while window
+            .samples
+            .front()
+            .is_some_and(|(recorded_at, _)| *recorded_at < threshold)
+        {
+            let _ = window.samples.pop_front();
+        }
+    }
+}
+
+fn prune_watchdog_attempts(
+    window: &mut StuckWatchdogTokenWindow,
+    detection_window: Duration,
+    now: Instant,
+) {
+    let Some(threshold) = now.checked_sub(detection_window) else {
+        return;
+    };
+    window.attempts.retain(|_, attempt| {
+        attempt
+            .completed
+            .is_none_or(|completed_at| completed_at >= threshold)
+    });
+}
+
+#[derive(Debug, Default)]
+struct WatchdogSchedule {
+    next_due: HashMap<String, WatchdogScheduleEntry>,
+}
+
+#[derive(Debug)]
+struct WatchdogScheduleEntry {
+    next_due: Instant,
+    applied_interval: Duration,
+}
+
+/// Associates a watchdog wrapper task with the exact recovery episode its
+/// inner local-recovery future started or joined. `0` means the wrapper failed
+/// before it observed an episode, so collector cleanup must be a no-op.
+#[derive(Debug)]
+struct WatchdogRecoveryTask {
+    profile: String,
+    recovery_episode_id: Arc<AtomicU64>,
+}
+
+struct LocalRecoveryEndpoint {
+    client: Client,
+    base_url: String,
+}
+
+impl WatchdogRecoveryTask {
+    fn observed_recovery_episode_id(&self) -> Option<u64> {
+        Self::observed_recovery_episode_id_from(&self.recovery_episode_id)
+    }
+
+    fn observed_recovery_episode_id_from(recovery_episode_id: &AtomicU64) -> Option<u64> {
+        match recovery_episode_id.load(Ordering::Acquire) {
+            0 => None,
+            recovery_episode_id => Some(recovery_episode_id),
+        }
+    }
+}
+
+fn checked_instant_add(now: Instant, duration: Duration) -> Instant {
+    now.checked_add(duration).unwrap_or(now)
+}
+
+impl WatchdogSchedule {
+    fn due_profiles(&mut self, now: Instant, profiles: &[(String, Duration)]) -> Vec<String> {
+        let enabled_profiles = profiles
+            .iter()
+            .map(|(name, _interval)| name.as_str())
+            .collect::<HashSet<_>>();
+        self.next_due
+            .retain(|name, _entry| enabled_profiles.contains(name.as_str()));
+        profiles
+            .iter()
+            .filter_map(|(name, interval)| {
+                let due = self.next_due.get(name).is_none_or(|entry| {
+                    entry.next_due <= now || entry.applied_interval != *interval
+                });
+                due.then(|| {
+                    self.next_due.insert(
+                        name.clone(),
+                        WatchdogScheduleEntry {
+                            next_due: checked_instant_add(now, *interval),
+                            applied_interval: *interval,
+                        },
+                    );
+                    name.clone()
+                })
+            })
+            .collect()
+    }
+}
+
+async fn run_stuck_engine_watchdog(
+    config: ConfigHandle,
+    client: Client,
+    local_recovery: Arc<LocalRecoveryCoordinatorSet>,
+    tokens: Arc<StuckWatchdogTokenTracker>,
+    shutdown: Arc<ShutdownGate>,
+) {
+    let mut schedule = WatchdogSchedule::default();
+    let mut recovery_tasks = JoinSet::<(String, BTreeMap<String, String>)>::new();
+    let mut recovering_profiles = HashSet::new();
+    let mut recovery_task_profiles: HashMap<tokio::task::Id, WatchdogRecoveryTask> = HashMap::new();
+    while !shutdown.is_shutting_down() {
+        collect_finished_watchdog_recoveries(
+            &mut recovery_tasks,
+            &mut recovering_profiles,
+            &mut recovery_task_profiles,
+            &local_recovery,
+        )
+        .await;
+        let Ok(snapshot) = config.snapshot() else {
+            if wait_for_watchdog_interval(&shutdown, Duration::from_secs(60)).await {
+                break;
+            }
+            continue;
+        };
+        let profiles = watchdog_upstream_profiles(&snapshot);
+        let scheduled_profiles = scheduled_watchdog_profiles(&profiles);
+        prune_enabled_watchdog_tokens(&tokens, &profiles);
+        let due_profiles = schedule.due_profiles(Instant::now(), &scheduled_profiles);
+        for profile in profiles {
+            if !due_profiles
+                .iter()
+                .any(|due_profile| due_profile == &profile.name)
+            {
+                continue;
+            }
+            let watchdog = &profile.stuck_watchdog;
+            if recovering_profiles.contains(&profile.name) {
+                continue;
+            }
+            let detection_window = Duration::from_secs(watchdog.detection_window_secs);
+            if !tokens.has_too_few_output_progress_units(
+                &profile.name,
+                detection_window,
+                watchdog.min_output_progress_units_in_window,
+            ) {
+                continue;
+            }
+
+            let policy = LocalRecoveryPolicy::from_config(&profile.local_recovery);
+            if !policy.is_configured() {
+                continue;
+            }
+            // Re-check at the dispatch boundary: shutdown can begin after this
+            // iteration's entry check but before a due profile is spawned.
+            if shutdown.is_shutting_down() {
+                break;
+            }
+            eprintln!(
+                "llm_guard_proxy_stuck_watchdog profile={} event=detected detection_window_secs={} min_output_progress_units={}",
+                profile.name,
+                watchdog.detection_window_secs,
+                watchdog.min_output_progress_units_in_window,
+            );
+            let coordinator = local_recovery.coordinator_for(&profile.name);
+            coordinator
+                .watchdog_detections
+                .fetch_add(1, Ordering::Relaxed);
+            let profile_name = profile.name.clone();
+            recovering_profiles.insert(profile_name.clone());
+            let episode_timeout = profile
+                .restart_queue
+                .enabled
+                .then(|| Duration::from_secs(profile.restart_queue.restart_timeout_secs));
+            let recovery_episode_id = Arc::new(AtomicU64::new(0));
+            let task = recovery_tasks.spawn(run_watchdog_recovery(
+                profile_name.clone(),
+                policy,
+                episode_timeout,
+                coordinator,
+                LocalRecoveryEndpoint {
+                    client: client.clone(),
+                    base_url: profile.primary_base_url().to_owned(),
+                },
+                Arc::clone(&shutdown),
+                Arc::clone(&recovery_episode_id),
+            ));
+            recovery_task_profiles.insert(
+                task.id(),
+                WatchdogRecoveryTask {
+                    profile: profile_name,
+                    recovery_episode_id,
+                },
+            );
+        }
+        // The loop wakes cheaply, while `schedule` enforces each profile's own
+        // cadence instead of collapsing all intervals to a global minimum.
+        if wait_for_watchdog_interval(&shutdown, Duration::from_secs(1)).await {
+            break;
+        }
+    }
+    drain_watchdog_recoveries(
+        &mut recovery_tasks,
+        &mut recovering_profiles,
+        &mut recovery_task_profiles,
+        &local_recovery,
+    )
+    .await;
+}
+
+async fn wait_for_watchdog_interval(shutdown: &ShutdownGate, interval: Duration) -> bool {
+    let mut shutdown_gate = shutdown.subscribe();
+    tokio::select! {
+        () = tokio::time::sleep(interval) => false,
+        () = shutdown_gate.cancelled() => true,
+    }
+}
+
+fn scheduled_watchdog_profiles(profiles: &[UpstreamProfileConfig]) -> Vec<(String, Duration)> {
+    profiles
+        .iter()
+        .filter(|profile| profile.stuck_watchdog.enabled)
+        .map(|profile| {
+            (
+                profile.name.clone(),
+                Duration::from_secs(profile.stuck_watchdog.check_interval_secs),
+            )
+        })
+        .collect()
+}
+
+/// Bound retention every watchdog tick, including idle profiles. Retention
+/// must not depend on an active request that might never finish.
+fn prune_enabled_watchdog_tokens(
+    tokens: &StuckWatchdogTokenTracker,
+    profiles: &[UpstreamProfileConfig],
+) {
+    for profile in profiles {
+        if profile.stuck_watchdog.enabled {
+            tokens.prune_profile(
+                &profile.name,
+                Duration::from_secs(profile.stuck_watchdog.detection_window_secs),
+            );
+        }
+    }
+}
+
+async fn drain_watchdog_recoveries(
+    recovery_tasks: &mut JoinSet<(String, BTreeMap<String, String>)>,
+    recovering_profiles: &mut HashSet<String>,
+    recovery_task_profiles: &mut HashMap<tokio::task::Id, WatchdogRecoveryTask>,
+    local_recovery: &LocalRecoveryCoordinatorSet,
+) {
+    while let Some(result) = recovery_tasks.join_next_with_id().await {
+        match result {
+            Ok((task_id, (profile, recovery))) => {
+                recovery_task_profiles.remove(&task_id);
+                recovering_profiles.remove(&profile);
+                record_watchdog_recovery_result(
+                    &local_recovery.coordinator_for(&profile),
+                    &profile,
+                    &recovery,
+                );
+            }
+            Err(error) => {
+                if let Some(task) = recovery_task_profiles.remove(&error.id()) {
+                    recovering_profiles.remove(&task.profile);
+                    record_watchdog_recovery_task_failure(local_recovery, &task).await;
+                }
+            }
+        }
+    }
+}
+
+async fn collect_finished_watchdog_recoveries(
+    recovery_tasks: &mut JoinSet<(String, BTreeMap<String, String>)>,
+    recovering_profiles: &mut HashSet<String>,
+    recovery_task_profiles: &mut HashMap<tokio::task::Id, WatchdogRecoveryTask>,
+    local_recovery: &LocalRecoveryCoordinatorSet,
+) {
+    while let Some(result) = recovery_tasks.try_join_next_with_id() {
+        match result {
+            Ok((task_id, (profile, recovery))) => {
+                recovery_task_profiles.remove(&task_id);
+                recovering_profiles.remove(&profile);
+                record_watchdog_recovery_result(
+                    &local_recovery.coordinator_for(&profile),
+                    &profile,
+                    &recovery,
+                );
+            }
+            Err(error) => {
+                if let Some(task) = recovery_task_profiles.remove(&error.id()) {
+                    recovering_profiles.remove(&task.profile);
+                    record_watchdog_recovery_task_failure(local_recovery, &task).await;
+                }
+            }
+        }
+    }
+}
+
+async fn record_watchdog_recovery_task_failure(
+    local_recovery: &LocalRecoveryCoordinatorSet,
+    task: &WatchdogRecoveryTask,
+) {
+    let coordinator = local_recovery.coordinator_for(&task.profile);
+    let metadata = BTreeMap::from([(
+        String::from("local_recovery_status"),
+        String::from("task_failed"),
+    )]);
+    if let Some(recovery_episode_id) = task.observed_recovery_episode_id() {
+        let _aborted =
+            abort_local_recovery_episode(&coordinator, recovery_episode_id, metadata).await;
+    }
+    coordinator
+        .watchdog_recovery_task_failures
+        .fetch_add(1, Ordering::Relaxed);
+    eprintln!(
+        "llm_guard_proxy_stuck_watchdog profile={} event=recovery_task_failed",
+        task.profile
+    );
+}
+
+/// Contains the child represented by an inner watchdog `JoinError`. The wrapper
+/// may observe the error after a later recovery has started, so terminalization
+/// is compare-and-act on the child episode rather than the coordinator's
+/// currently active handle.
+async fn watchdog_recovery_join_error_metadata(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    recovery_episode_id: Option<u64>,
+    error: tokio::task::JoinError,
+) -> BTreeMap<String, String> {
+    let recovery = BTreeMap::from([(
+        String::from("local_recovery_status"),
+        if error.is_cancelled() {
+            String::from("cancelled")
+        } else {
+            String::from("task_failed")
+        },
+    )]);
+    if let Some(recovery_episode_id) = recovery_episode_id {
+        let _aborted =
+            abort_local_recovery_episode(coordinator, recovery_episode_id, recovery.clone()).await;
+    }
+    recovery
+}
+
+async fn run_watchdog_recovery(
+    profile_name: String,
+    policy: LocalRecoveryPolicy,
+    episode_timeout: Option<Duration>,
+    coordinator: Arc<UpstreamStallRecoveryCoordinator>,
+    endpoint: LocalRecoveryEndpoint,
+    shutdown: Arc<ShutdownGate>,
+    recovery_episode_id: Arc<AtomicU64>,
+) -> (String, BTreeMap<String, String>) {
+    let mut shutdown_gate = shutdown.subscribe();
+    let recovery_policy = policy.clone();
+    let recovery_coordinator = Arc::clone(&coordinator);
+    let recovery_shutdown = Arc::clone(&shutdown);
+    let recovery_episode_observer = Arc::clone(&recovery_episode_id);
+    let mut local_recovery = tokio::spawn(async move {
+        if recovery_shutdown.is_shutting_down() {
+            return BTreeMap::from([(
+                String::from("local_recovery_status"),
+                String::from("shutdown_cancelled"),
+            )]);
+        }
+        run_local_recovery_for_profile_observing(
+            &recovery_policy,
+            &recovery_coordinator,
+            endpoint.client,
+            endpoint.base_url,
+            watchdog_recovery_cause(),
+            episode_timeout,
+            Some(&recovery_episode_observer),
+        )
+        .await
+    });
+    let mut recovery = tokio::select! {
+        result = &mut local_recovery => match result {
+            Ok(recovery) => recovery,
+            Err(error) => watchdog_recovery_join_error_metadata(
+                &coordinator,
+                WatchdogRecoveryTask::observed_recovery_episode_id_from(&recovery_episode_id),
+                error,
+            ).await,
+        },
+        () = shutdown_gate.cancelled() => {
+            local_recovery.abort();
+            let _ = local_recovery.await;
+            let recovery = BTreeMap::from([(
+                String::from("local_recovery_status"),
+                String::from("shutdown_cancelled"),
+            )]);
+            if let Some(recovery_episode_id) =
+                WatchdogRecoveryTask::observed_recovery_episode_id_from(&recovery_episode_id)
+            {
+                let _aborted = abort_local_recovery_episode(
+                    &coordinator,
+                    recovery_episode_id,
+                    recovery.clone(),
+                )
+                .await;
+            }
+            recovery
+        },
+    };
+    if recovery
+        .get("local_recovery_status")
+        .is_some_and(|status| status == "completion_timeout")
+        && let Some(recovery_episode_id) =
+            WatchdogRecoveryTask::observed_recovery_episode_id_from(&recovery_episode_id)
+        && let Some(completed) =
+            wait_for_started_local_recovery_result(&coordinator, recovery_episode_id).await
+    {
+        recovery = completed;
+    }
+    (profile_name, recovery)
+}
+
+async fn wait_for_started_local_recovery_result(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    recovery_episode_id: u64,
+) -> Option<BTreeMap<String, String>> {
+    wait_for_started_local_recovery_result_after_state_check(
+        coordinator,
+        recovery_episode_id,
+        || {},
+    )
+    .await
+}
+
+async fn wait_for_started_local_recovery_result_after_state_check<F>(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    recovery_episode_id: u64,
+    after_state_check: F,
+) -> Option<BTreeMap<String, String>>
+where
+    F: FnOnce(),
+{
+    let notified = coordinator.notify.notified();
+    tokio::pin!(notified);
+    let _ = notified.as_mut().enable();
+
+    {
+        let state = coordinator.state.lock().await;
+        if let Some(result) = state.completed_recovery_result(recovery_episode_id) {
+            return Some(result.clone());
+        }
+        if state.active_recovery_episode_id != Some(recovery_episode_id) {
+            return None;
+        }
+    }
+    after_state_check();
+    if timeout(Duration::from_millis(250), notified).await.is_err() {
+        let state = coordinator.state.lock().await;
+        return state
+            .completed_recovery_result(recovery_episode_id)
+            .cloned();
+    }
+    let state = coordinator.state.lock().await;
+    state
+        .completed_recovery_result(recovery_episode_id)
+        .cloned()
+}
+
+fn record_watchdog_recovery_result(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    profile: &str,
+    recovery: &BTreeMap<String, String>,
+) {
+    if recovery
+        .get("local_recovery_restart_ran")
+        .is_some_and(|started| started == "true")
+    {
+        coordinator
+            .watchdog_restarts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    match recovery.get("local_recovery_status").map(String::as_str) {
+        Some("succeeded") => {
+            coordinator
+                .watchdog_recovery_successes
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        Some(
+            "completion_timeout" | "episode_timeout" | "join_timeout" | "readiness_timeout"
+            | "timeout_killed",
+        ) => {
+            coordinator
+                .watchdog_recovery_timeouts
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        _ => {}
+    }
+    eprintln!(
+        "llm_guard_proxy_stuck_watchdog profile={profile} event=recovery_finished status={}",
+        recovery
+            .get("local_recovery_status")
+            .map_or("missing", String::as_str),
+    );
+}
+
+pub(crate) fn spawn_stuck_engine_watchdog(state: &ProxyState) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(run_stuck_engine_watchdog(
+        state.config.clone(),
+        state.client.clone(),
+        Arc::clone(&state.local_recovery),
+        Arc::clone(&state.stuck_watchdog_tokens),
+        Arc::clone(&state.shutdown),
+    ))
+}
+
+fn watchdog_upstream_profiles(config: &AppConfig) -> Vec<UpstreamProfileConfig> {
+    let mut profiles = Vec::with_capacity(config.upstream_profiles.len().saturating_add(1));
+    profiles.push(config.default_upstream_profile());
+    profiles.extend(config.upstream_profiles.iter().cloned());
+    profiles
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestartQueueWaitResult {
+    Ready,
+    Failed,
+    TimedOut,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RestartQueueOutcome {
+    NotRecovering,
+    ReleasedAfterRecovery,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RestartQueueWaitOutcome {
+    outcome: RestartQueueOutcome,
+    elapsed: Duration,
+}
+
+impl RestartQueueWaitOutcome {
+    fn request_metadata(self) -> BTreeMap<String, String> {
+        match self.outcome {
+            RestartQueueOutcome::NotRecovering => BTreeMap::new(),
+            RestartQueueOutcome::ReleasedAfterRecovery => BTreeMap::from([
+                (
+                    String::from("restart_queue_outcome"),
+                    String::from("released_after_recovery"),
+                ),
+                (
+                    String::from("restart_queue_wait_ms"),
+                    duration_millis_u64(self.elapsed).to_string(),
+                ),
+            ]),
+        }
+    }
+}
+
+async fn wait_for_restart_queue_episode(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    queue_deadline: Duration,
+    episode_id: u64,
+) -> RestartQueueWaitResult {
+    let deadline = checked_instant_add(Instant::now(), queue_deadline);
+    loop {
+        let notified = coordinator.notify.notified();
+        tokio::pin!(notified);
+        let _ = notified.as_mut().enable();
+        let state = coordinator.state.lock().await;
+        if let Some(result) = state.completed_recovery_result(episode_id) {
+            return if local_recovery_completed_ready(result) {
+                RestartQueueWaitResult::Ready
+            } else {
+                RestartQueueWaitResult::Failed
+            };
+        }
+        if !state.running || state.active_recovery_episode_id != Some(episode_id) {
+            return RestartQueueWaitResult::Failed;
+        }
+        let recovery_deadline = state.recovery_deadline.unwrap_or(deadline);
+        drop(state);
+        let remaining = deadline
+            .min(recovery_deadline)
+            .saturating_duration_since(Instant::now());
+        if remaining.is_zero() || timeout(remaining, notified).await.is_err() {
+            return RestartQueueWaitResult::TimedOut;
+        }
+    }
+}
+
+async fn wait_for_profile_restart_queue(
+    state: &ProxyState,
+    profile: &UpstreamProfileConfig,
+    body_bytes: u64,
+    request_metadata: &mut BTreeMap<String, String>,
+) -> Result<RestartQueueWaitOutcome, ProxyError> {
+    let wait_started = Instant::now();
+    let queue = &profile.restart_queue;
+    if !queue.enabled {
+        return Ok(RestartQueueWaitOutcome {
+            outcome: RestartQueueOutcome::NotRecovering,
+            elapsed: wait_started.elapsed(),
+        });
+    }
+
+    let coordinator = state.local_recovery.coordinator_for(&profile.name);
+    // Restart waiters are deliberately accounted in the bounded queue, never in
+    // generation in-flight capacity. The caller has released its routing permit
+    // before reaching this wait. Body-byte budget is reserved with the permit.
+    let Some(restart_queue_permit) = state
+        .acquire_restart_queue_permit(profile, &coordinator, body_bytes)
+        .await?
+    else {
+        // This request atomically observed no recovery while registering, so it
+        // must not wait for a later episode without a queue admission permit.
+        return Ok(RestartQueueWaitOutcome {
+            outcome: RestartQueueOutcome::NotRecovering,
+            elapsed: wait_started.elapsed(),
+        });
+    };
+    wait_for_restart_queue_with_held_permit(state, profile, request_metadata, restart_queue_permit)
+        .await
+}
+
+/// Consume the recovery episode observed when the queue permit was acquired.
+///
+/// Callers that already hold a `RestartQueuePermit` must use this path so a
+/// completion that races between permit registration and the waiter's first
+/// state check still reads `last_result` instead of re-inferring `NotRecovering`.
+async fn wait_for_restart_queue_with_held_permit(
+    state: &ProxyState,
+    profile: &UpstreamProfileConfig,
+    request_metadata: &mut BTreeMap<String, String>,
+    restart_queue_permit: RestartQueuePermit,
+) -> Result<RestartQueueWaitOutcome, ProxyError> {
+    let wait_started = Instant::now();
+    let queue = &profile.restart_queue;
+    let queue_deadline = restart_queue_wait_deadline(queue);
+    let coordinator = state.local_recovery.coordinator_for(&profile.name);
+    let episode_id = restart_queue_permit.observed_recovery_episode_id;
+    match wait_for_restart_queue_episode(&coordinator, queue_deadline, episode_id).await {
+        RestartQueueWaitResult::Ready => {
+            eprintln!(
+                "llm_guard_proxy_restart_queue profile={} event=released_after_recovery",
+                profile.name
+            );
+            drop(restart_queue_permit);
+            Ok(RestartQueueWaitOutcome {
+                outcome: RestartQueueOutcome::ReleasedAfterRecovery,
+                elapsed: wait_started.elapsed(),
+            })
+        }
+        result @ (RestartQueueWaitResult::Failed | RestartQueueWaitResult::TimedOut) => {
+            let outcome = match result {
+                RestartQueueWaitResult::Failed => "recovery_failed",
+                RestartQueueWaitResult::TimedOut => "timeout",
+                RestartQueueWaitResult::Ready => {
+                    unreachable!("only failed or timed-out restart queues reach this branch")
+                }
+            };
+            request_metadata.insert(String::from("restart_queue_outcome"), String::from(outcome));
+            request_metadata.insert(
+                String::from("restart_queue_deadline_secs"),
+                queue.queue_deadline_secs.to_string(),
+            );
+            eprintln!(
+                "llm_guard_proxy_restart_queue profile={} event={outcome}",
+                profile.name
+            );
+            drop(restart_queue_permit);
+            Err(ProxyError::upstream_unavailable(
+                profile.name.clone(),
+                u64::try_from(queue_deadline.as_millis()).unwrap_or(u64::MAX),
+            )
+            .with_request_metadata(request_metadata.clone()))
+        }
+    }
+}
+
+fn restart_queue_wait_deadline(queue: &RestartQueueConfig) -> Duration {
+    Duration::from_secs(queue.queue_deadline_secs.min(queue.restart_timeout_secs))
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct WatchdogMetricsSnapshot {
+    detections: u64,
+    restarts: u64,
+    recovery_successes: u64,
+    recovery_timeouts: u64,
+    recovery_task_failures: u64,
+    restart_queue_depth: u64,
 }
 
 #[derive(Debug, Default)]
@@ -6167,6 +7917,43 @@ impl LocalRecoveryCoordinatorSet {
             .entry(profile.to_owned())
             .or_insert_with(|| Arc::new(UpstreamStallRecoveryCoordinator::default()))
             .clone()
+    }
+
+    fn watchdog_metrics_snapshot(&self) -> WatchdogMetricsSnapshot {
+        let coordinators = match self.coordinators.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        coordinators.values().fold(
+            WatchdogMetricsSnapshot::default(),
+            |mut metrics, coordinator| {
+                metrics.detections = metrics
+                    .detections
+                    .saturating_add(coordinator.watchdog_detections.load(Ordering::Relaxed));
+                metrics.restarts = metrics
+                    .restarts
+                    .saturating_add(coordinator.watchdog_restarts.load(Ordering::Relaxed));
+                metrics.recovery_successes = metrics.recovery_successes.saturating_add(
+                    coordinator
+                        .watchdog_recovery_successes
+                        .load(Ordering::Relaxed),
+                );
+                metrics.recovery_timeouts = metrics.recovery_timeouts.saturating_add(
+                    coordinator
+                        .watchdog_recovery_timeouts
+                        .load(Ordering::Relaxed),
+                );
+                metrics.recovery_task_failures = metrics.recovery_task_failures.saturating_add(
+                    coordinator
+                        .watchdog_recovery_task_failures
+                        .load(Ordering::Relaxed),
+                );
+                metrics.restart_queue_depth = metrics
+                    .restart_queue_depth
+                    .saturating_add(coordinator.restart_queue_depth.load(Ordering::Relaxed));
+                metrics
+            },
+        )
     }
 }
 
@@ -6709,9 +8496,24 @@ struct ForwardedResponseParts {
     attempt_request_metadata: BTreeMap<String, String>,
     completed_attempt_records: Vec<AttemptRecord>,
     shutdown: Arc<ShutdownGate>,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
 impl ForwardedResponseParts {
+    fn end_stuck_watchdog_attempt_at_upstream_terminal(&self) {
+        if let Some(stuck_watchdog_attempt) = &self.stuck_watchdog_attempt {
+            stuck_watchdog_attempt.progress_request().end_attempt();
+        }
+    }
+
+    fn record_stuck_watchdog_upstream_progress(&self, response_body: &[u8]) {
+        if let Some(stuck_watchdog_attempt) = &self.stuck_watchdog_attempt {
+            let _ = stuck_watchdog_attempt
+                .progress_request()
+                .record_upstream_emitted_chunk(response_body);
+        }
+    }
+
     fn shutdown_subscription(&self) -> ShutdownSubscription {
         self.shutdown.subscribe()
     }
@@ -6769,6 +8571,7 @@ impl ForwardedResponseParts {
             extra_response_metadata,
             raw_payloads,
             completed_attempt_records: self.completed_attempt_records,
+            stuck_watchdog_attempt: self.stuck_watchdog_attempt,
             final_attempt: Some(final_attempt),
             retry_observation: None,
             attempt_progress: None,
@@ -6867,6 +8670,7 @@ async fn forward_buffered_models_response(
         Ok(body) => body,
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
+    response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
     let body = filter_models_body_for_listener(config, listener, body);
     let body = model_metadata::enrich_models_body(config, metadata_config, body);
     let shutdown = response_parts.shutdown_subscription();
@@ -6943,6 +8747,7 @@ struct ShieldedRetryRuntime {
     request_id: RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
+    stuck_watchdog_request: Option<StuckWatchdogRequest>,
     request_metadata: BTreeMap<String, String>,
     listener: ListenerConfig,
     upstream_profile: UpstreamProfileConfig,
@@ -7077,6 +8882,7 @@ struct ShieldedStartedAttempt {
     terminal_endpoint_protocol: UpstreamEndpointProtocol,
     endpoint_retry_order: Vec<String>,
     ignores_request_deadline: bool,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
 struct ShieldedAcceptedOutcome {
@@ -7239,6 +9045,7 @@ fn shielded_liveness_stream_response(
             completed_attempt_records: prior_attempt_records.clone(),
             final_attempt: None,
             attempt_progress: Some(attempt_progress.clone()),
+            stuck_watchdog_attempt: None,
         },
     );
     let aggregate_runtime = runtime.clone();
@@ -7435,7 +9242,7 @@ async fn shielded_start_failure_step(
 
 async fn shielded_started_attempt_step(
     runtime: &ShieldedRetryRuntime,
-    started: ShieldedStartedAttempt,
+    mut started: ShieldedStartedAttempt,
     attempt_records: &mut Vec<AttemptRecord>,
     allow_terminal_forward: bool,
 ) -> ShieldedAttemptStep {
@@ -7446,6 +9253,7 @@ async fn shielded_started_attempt_step(
 
     if !started.info.upstream_status.is_success() {
         if let Some(cause) = retry_cause_for_upstream_status(started.info.upstream_status) {
+            end_stuck_watchdog_attempt(&mut started.stuck_watchdog_attempt);
             return shielded_retryable_status_step(runtime, &started.info, cause, attempt_records)
                 .await;
         }
@@ -7639,8 +9447,16 @@ async fn aggregate_shielded_attempt(
 ) -> Result<ShieldedAggregatedAttempt, ShieldedAttemptFailure> {
     let request_id = runtime.request_id.as_str().to_owned();
     let request_model_id = runtime.model_id.clone();
+    let stuck_watchdog_attempt = started.stuck_watchdog_attempt.as_ref();
+    let upstream_stream = started.response.bytes_stream().inspect(move |chunk| {
+        if let (Some(attempt), Ok(chunk)) = (stuck_watchdog_attempt, chunk) {
+            // Shielded calls aggregate upstream SSE internally, so this is the
+            // only place their sustained model output reaches the watchdog.
+            attempt.record_emitted_chunk(chunk);
+        }
+    });
     let aggregate = shielded_chat::aggregate_stream(
-        started.response.bytes_stream(),
+        upstream_stream,
         started.info.started_at_unix_ms,
         &request_id,
         request_model_id.as_deref(),
@@ -8080,7 +9896,7 @@ async fn wait_for_hot_restart_recovery(runtime: &ShieldedRetryRuntime) -> HotRes
     let mut state = coordinator.state.lock().await;
     if state.in_progress.is_none() {
         let client = runtime.client.clone();
-        let base_url = runtime.upstream_profile.base_url.clone();
+        let base_url = runtime.upstream_profile.primary_base_url().to_owned();
         let config = runtime.upstream_profile.hot_restart.clone();
         let model_id = hot_restart_probe_model(runtime);
         let join_handle =
@@ -8259,6 +10075,7 @@ fn hot_restart_recovery_metadata(configured: bool) -> BTreeMap<String, String> {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalRecoveryCause {
+    StuckWatchdog,
     UpstreamStall,
     TransientStatus,
     TransientTransport,
@@ -8268,12 +10085,17 @@ enum LocalRecoveryCause {
 impl LocalRecoveryCause {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::StuckWatchdog => "stuck_watchdog",
             Self::UpstreamStall => "upstream_stall",
             Self::TransientStatus => "transient_status",
             Self::TransientTransport => "transient_transport",
             Self::RequestDeadline => "request_deadline",
         }
     }
+}
+
+const fn watchdog_recovery_cause() -> LocalRecoveryCause {
+    LocalRecoveryCause::StuckWatchdog
 }
 
 struct LocalRecoveryGate {
@@ -8488,12 +10310,64 @@ async fn run_local_recovery(
     runtime: &ShieldedRetryRuntime,
     cause: LocalRecoveryCause,
 ) -> BTreeMap<String, String> {
-    let policy = &runtime.local_recovery_policy;
-    let coordinator = &runtime.local_recovery;
+    let restart_queue = &runtime.upstream_profile.restart_queue;
+    let episode_timeout = restart_queue
+        .enabled
+        .then(|| Duration::from_secs(restart_queue.restart_timeout_secs));
+    run_local_recovery_for_profile(
+        &runtime.local_recovery_policy,
+        &runtime.local_recovery,
+        runtime.client.clone(),
+        runtime.upstream_profile.primary_base_url().to_owned(),
+        cause,
+        episode_timeout,
+    )
+    .await
+}
+
+async fn run_local_recovery_for_profile(
+    policy: &LocalRecoveryPolicy,
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+    client: Client,
+    base_url: String,
+    cause: LocalRecoveryCause,
+    episode_timeout: Option<Duration>,
+) -> BTreeMap<String, String> {
+    run_local_recovery_for_profile_observing(
+        policy,
+        coordinator,
+        client,
+        base_url,
+        cause,
+        episode_timeout,
+        None,
+    )
+    .await
+}
+
+async fn run_local_recovery_for_profile_observing(
+    policy: &LocalRecoveryPolicy,
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+    client: Client,
+    base_url: String,
+    cause: LocalRecoveryCause,
+    episode_timeout: Option<Duration>,
+    recovery_episode_observer: Option<&AtomicU64>,
+) -> BTreeMap<String, String> {
     let mut state = coordinator.state.lock().await;
     if state.running {
+        let Some(recovery_episode_id) = state.ensure_active_recovery_episode() else {
+            return BTreeMap::from([(
+                String::from("local_recovery_status"),
+                String::from("episode_id_exhausted"),
+            )]);
+        };
+        if let Some(observer) = recovery_episode_observer {
+            observer.store(recovery_episode_id, Ordering::Release);
+        }
         drop(state);
-        return wait_for_local_recovery_result(policy, coordinator, true).await;
+        return wait_for_local_recovery_result(policy, coordinator, true, recovery_episode_id)
+            .await;
     }
 
     let mut metadata = BTreeMap::new();
@@ -8540,24 +10414,118 @@ async fn run_local_recovery(
     }
 
     state.running = true;
+    let Some(recovery_episode_id) = state.ensure_active_recovery_episode() else {
+        state.running = false;
+        return BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("episode_id_exhausted"),
+        )]);
+    };
+    if let Some(observer) = recovery_episode_observer {
+        observer.store(recovery_episode_id, Ordering::Release);
+    }
+    state.recovery_started = Some(now);
+    let recovery_timeout = policy
+        .restart_timeout
+        .saturating_add(policy.readiness_deadline)
+        .saturating_add(Duration::from_secs(1));
+    state.recovery_deadline = Some(checked_instant_add(
+        now,
+        episode_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
+    ));
     state.runs_in_window = state.runs_in_window.saturating_add(1);
+    let recovery_task = tokio::spawn(run_local_recovery_task(
+        policy.clone(),
+        client,
+        base_url,
+        cause,
+        episode_timeout,
+    ));
+    state.active_local_recovery_task = Some(recovery_task.abort_handle());
     drop(state);
 
-    let task_policy = policy.clone();
-    let task_coordinator = Arc::clone(coordinator);
-    let client = runtime.client.clone();
-    let base_url = runtime.upstream_profile.base_url.clone();
-    tokio::spawn(async move {
+    spawn_local_recovery_terminalizer(coordinator, recovery_episode_id, recovery_task);
+
+    wait_for_local_recovery_result(policy, coordinator, false, recovery_episode_id).await
+}
+
+fn spawn_local_recovery_terminalizer(
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+    recovery_episode_id: u64,
+    recovery_task: tokio::task::JoinHandle<BTreeMap<String, String>>,
+) {
+    let coordinator = Arc::clone(coordinator);
+    let _terminalizer = tokio::spawn(async move {
+        let metadata = match recovery_task.await {
+            Ok(metadata) => metadata,
+            Err(error) => BTreeMap::from([(
+                String::from("local_recovery_status"),
+                if error.is_cancelled() {
+                    String::from("cancelled")
+                } else {
+                    String::from("task_failed")
+                },
+            )]),
+        };
+        let _published =
+            finish_local_recovery_episode(&coordinator, recovery_episode_id, metadata).await;
+    });
+}
+
+async fn finish_local_recovery_episode(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    recovery_episode_id: u64,
+    metadata: BTreeMap<String, String>,
+) -> bool {
+    let mut state = coordinator.state.lock().await;
+    if !state.finish_recovery_for_episode(recovery_episode_id, metadata) {
+        return false;
+    }
+    drop(state);
+    coordinator.notify.notify_waiters();
+    true
+}
+
+async fn abort_local_recovery_episode(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    recovery_episode_id: u64,
+    metadata: BTreeMap<String, String>,
+) -> bool {
+    let recovery_task = {
+        let state = coordinator.state.lock().await;
+        if state.active_recovery_episode_id != Some(recovery_episode_id) {
+            return false;
+        }
+        state.active_local_recovery_task.clone()
+    };
+    if let Some(recovery_task) = recovery_task {
+        recovery_task.abort();
+    }
+    finish_local_recovery_episode(coordinator, recovery_episode_id, metadata).await
+}
+
+async fn run_local_recovery_task(
+    policy: LocalRecoveryPolicy,
+    client: Client,
+    base_url: String,
+    cause: LocalRecoveryCause,
+    episode_timeout: Option<Duration>,
+) -> BTreeMap<String, String> {
+    let trigger_cause = cause.as_str().to_owned();
+    let recovery_trigger_cause = trigger_cause.clone();
+    let restart_ran = Arc::new(AtomicBool::new(false));
+    let recovery_restart_ran = Arc::clone(&restart_ran);
+    let recovery = async {
         let mut metadata = BTreeMap::from([(
             String::from("local_recovery_trigger_cause"),
-            cause.as_str().to_owned(),
+            recovery_trigger_cause,
         )]);
-        metadata.extend(run_local_recovery_restart_command(&task_policy).await);
+        metadata.extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
         if metadata
             .get("local_recovery_restart_status")
             .is_some_and(|status| status == "succeeded")
         {
-            metadata.extend(run_local_recovery_readiness(client, base_url, &task_policy).await);
+            metadata.extend(run_local_recovery_readiness(client, base_url, &policy).await);
         }
         if !metadata.contains_key("local_recovery_status") {
             let status = match metadata
@@ -8572,38 +10540,72 @@ async fn run_local_recovery(
             };
             metadata.insert(String::from("local_recovery_status"), status.to_owned());
         }
-        finish_upstream_stall_recovery(&task_coordinator, metadata).await;
-    });
-
-    wait_for_local_recovery_result(policy, coordinator, false).await
+        metadata
+    };
+    match episode_timeout {
+        Some(timeout_duration) => match timeout(timeout_duration, recovery).await {
+            Ok(metadata) => metadata,
+            Err(_elapsed) => {
+                let mut metadata = BTreeMap::from([
+                    (String::from("local_recovery_trigger_cause"), trigger_cause),
+                    (
+                        String::from("local_recovery_status"),
+                        String::from("episode_timeout"),
+                    ),
+                ]);
+                if restart_ran.load(Ordering::Relaxed) {
+                    metadata.insert(
+                        String::from("local_recovery_restart_ran"),
+                        String::from("true"),
+                    );
+                }
+                metadata
+            }
+        },
+        None => recovery.await,
+    }
 }
 
 async fn wait_for_local_recovery_result(
     policy: &LocalRecoveryPolicy,
     coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
     joined_inflight: bool,
+    recovery_episode_id: u64,
 ) -> BTreeMap<String, String> {
-    let deadline = Instant::now()
-        + policy
-            .restart_timeout
-            .saturating_add(policy.readiness_deadline)
-            .saturating_add(Duration::from_secs(1));
+    let mut state = coordinator.state.lock().await;
+    let recovery_started = *state.recovery_started.get_or_insert_with(Instant::now);
+    let deadline = *state.recovery_deadline.get_or_insert_with(|| {
+        checked_instant_add(
+            recovery_started,
+            policy
+                .restart_timeout
+                .saturating_add(policy.readiness_deadline)
+                .saturating_add(Duration::from_secs(1)),
+        )
+    });
+    drop(state);
     loop {
         let notified = coordinator.notify.notified();
         tokio::pin!(notified);
         let _ = notified.as_mut().enable();
 
         let state = coordinator.state.lock().await;
-        if !state.running {
-            return completed_local_recovery_metadata(&state, joined_inflight);
+        if let Some(result) = state.completed_recovery_result(recovery_episode_id) {
+            return completed_local_recovery_metadata(Some(result), joined_inflight);
+        }
+        if state.active_recovery_episode_id != Some(recovery_episode_id) {
+            return completed_local_recovery_metadata(None, joined_inflight);
         }
         drop(state);
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() || timeout(remaining, notified).await.is_err() {
             let state = coordinator.state.lock().await;
-            if !state.running {
-                return completed_local_recovery_metadata(&state, joined_inflight);
+            if let Some(result) = state.completed_recovery_result(recovery_episode_id) {
+                return completed_local_recovery_metadata(Some(result), joined_inflight);
+            }
+            if state.active_recovery_episode_id != Some(recovery_episode_id) {
+                return completed_local_recovery_metadata(None, joined_inflight);
             }
             drop(state);
 
@@ -8620,23 +10622,23 @@ async fn wait_for_local_recovery_result(
 }
 
 fn completed_local_recovery_metadata(
-    state: &UpstreamStallRecoveryState,
+    result: Option<&BTreeMap<String, String>>,
     joined_inflight: bool,
 ) -> BTreeMap<String, String> {
-    let Some(last_result) = &state.last_result else {
+    let Some(result) = result else {
         return BTreeMap::from([(
             String::from("local_recovery_status"),
             String::from("missing_result"),
         )]);
     };
     if !joined_inflight {
-        return last_result.clone();
+        return result.clone();
     }
     let mut joined = BTreeMap::from([(
         String::from("local_recovery_status"),
         String::from("joined_inflight"),
     )]);
-    if let Some(status) = last_result.get("local_recovery_status") {
+    if let Some(status) = result.get("local_recovery_status") {
         joined.insert(String::from("local_recovery_joined_status"), status.clone());
     }
     joined
@@ -8644,11 +10646,9 @@ fn completed_local_recovery_metadata(
 
 async fn run_local_recovery_restart_command(
     policy: &LocalRecoveryPolicy,
+    restart_ran: &AtomicBool,
 ) -> BTreeMap<String, String> {
-    let mut metadata = BTreeMap::from([(
-        String::from("local_recovery_restart_ran"),
-        String::from("true"),
-    )]);
+    let mut metadata = BTreeMap::new();
     let program = &policy.restart_command[0];
     let args = &policy.restart_command[1..];
     let mut command = Command::new(program);
@@ -8677,6 +10677,11 @@ async fn run_local_recovery_restart_command(
             return metadata;
         }
     };
+    restart_ran.store(true, Ordering::Relaxed);
+    metadata.insert(
+        String::from("local_recovery_restart_ran"),
+        String::from("true"),
+    );
     match timeout(policy.restart_timeout, child.wait()).await {
         Ok(Ok(status)) => {
             let restart_status = if status.success() {
@@ -8930,6 +10935,14 @@ async fn run_upstream_stall_recovery(
     }
 
     state.running = true;
+    let Some(recovery_episode_id) = state.ensure_active_recovery_episode() else {
+        state.running = false;
+        metadata.insert(
+            String::from("upstream_stall_recovery_status"),
+            String::from("episode_id_exhausted"),
+        );
+        return metadata;
+    };
     state.runs_in_window = state.runs_in_window.saturating_add(1);
     drop(state);
 
@@ -8938,7 +10951,8 @@ async fn run_upstream_stall_recovery(
     tokio::spawn(async move {
         let mut metadata = upstream_stall_recovery_metadata(true);
         metadata.extend(run_upstream_stall_recovery_command(&task_policy).await);
-        finish_upstream_stall_recovery(&task_coordinator, metadata).await;
+        let _published =
+            finish_upstream_stall_recovery(&task_coordinator, recovery_episode_id, metadata).await;
     });
 
     wait_for_upstream_stall_recovery_result(policy, coordinator, false).await
@@ -9025,14 +11039,31 @@ fn completed_upstream_stall_recovery_metadata(
 
 async fn finish_upstream_stall_recovery(
     coordinator: &UpstreamStallRecoveryCoordinator,
+    recovery_episode_id: u64,
     metadata: BTreeMap<String, String>,
-) {
+) -> bool {
     let mut state = coordinator.state.lock().await;
-    state.running = false;
-    state.last_finished = Some(Instant::now());
-    state.last_result = Some(metadata);
+    if !state.finish_recovery_for_episode(recovery_episode_id, metadata) {
+        return false;
+    }
     drop(state);
     coordinator.notify.notify_waiters();
+    true
+}
+
+#[cfg(test)]
+async fn finish_active_upstream_stall_recovery_for_test(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    metadata: BTreeMap<String, String>,
+) {
+    let recovery_episode_id = coordinator
+        .state
+        .lock()
+        .await
+        .active_recovery_episode_id
+        .expect("test recovery must own an active episode");
+    let _published =
+        finish_upstream_stall_recovery(coordinator, recovery_episode_id, metadata).await;
 }
 
 fn upstream_stall_recovery_metadata(configured: bool) -> BTreeMap<String, String> {
@@ -9224,6 +11255,7 @@ async fn start_shielded_attempt(
         terminal_endpoint_protocol: sent.terminal_endpoint_protocol,
         endpoint_retry_order,
         ignores_request_deadline,
+        stuck_watchdog_attempt: sent.stuck_watchdog_attempt,
     })
 }
 
@@ -9344,6 +11376,7 @@ async fn send_shielded_upstream_attempt(
         decode_heterogeneous_reranker: false,
         model_id: None,
         request_deadline,
+        stuck_watchdog_request: runtime.stuck_watchdog_request.as_ref(),
     })
     .await
 }
@@ -10390,6 +12423,7 @@ fn shielded_retry_success_response(
             completed_attempt_records: outcome.prior_attempt_records,
             final_attempt: Some(outcome.final_attempt),
             attempt_progress: None,
+            stuck_watchdog_attempt: None,
         },
     );
     let response_body = ObservedBufferedBody::new(
@@ -10445,6 +12479,7 @@ fn shielded_retry_error_response(
             completed_attempt_records: failure.attempt_records,
             final_attempt: None,
             attempt_progress: None,
+            stuck_watchdog_attempt: None,
         },
     );
     let completion = if is_shutdown_failure {
@@ -10493,6 +12528,7 @@ async fn shielded_retry_terminal_forward_response(
             completed_attempt_records: terminal.prior_attempt_records,
             final_attempt: Some(final_attempt),
             attempt_progress: None,
+            stuck_watchdog_attempt: terminal.started.stuck_watchdog_attempt,
         },
     );
     let response_body = ObservedUpstreamBody::new(
@@ -10543,6 +12579,7 @@ async fn shielded_retry_direct_relay_response(
             completed_attempt_records: outcome.prior_attempt_records,
             final_attempt: Some(final_attempt),
             attempt_progress: None,
+            stuck_watchdog_attempt: outcome.started.stuck_watchdog_attempt,
         },
     );
     let response_body = ObservedUpstreamBody::new_with_deadline(
@@ -10577,6 +12614,7 @@ struct ShieldedRetryObserverInput {
     completed_attempt_records: Vec<AttemptRecord>,
     final_attempt: Option<FinalAttemptContext>,
     attempt_progress: Option<ShieldedAttemptProgressHandle>,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
 fn shielded_retry_observer(
@@ -10602,6 +12640,7 @@ fn shielded_retry_observer(
         extra_response_metadata: input.extra_response_metadata,
         raw_payloads: input.raw_payloads,
         completed_attempt_records: input.completed_attempt_records,
+        stuck_watchdog_attempt: input.stuck_watchdog_attempt,
         final_attempt: input.final_attempt,
         retry_observation: Some(RetryObservation {
             policy: runtime.retry_policy.clone(),
@@ -10697,13 +12736,26 @@ struct ForwardedBodyObserver {
     extra_response_metadata: BTreeMap<String, String>,
     raw_payloads: RawPayloads,
     completed_attempt_records: Vec<AttemptRecord>,
+    stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
     final_attempt: Option<FinalAttemptContext>,
     retry_observation: Option<RetryObservation>,
     attempt_progress: Option<ShieldedAttemptProgressHandle>,
 }
 
 impl ForwardedBodyObserver {
-    fn record(self, body_bytes: u64, completion: &BodyCompletion, response_body: &Bytes) {
+    fn stuck_watchdog_progress_request(&self) -> Option<StuckWatchdogAttemptProgress> {
+        // Shielded aggregation records progress on its internal inspect path; the
+        // independent relay is only for bodies whose progress would otherwise be
+        // coupled to downstream poll_next.
+        if self.attempt_progress.is_some() {
+            return None;
+        }
+        self.stuck_watchdog_attempt
+            .as_ref()
+            .map(StuckWatchdogAttemptLease::progress_request)
+    }
+
+    fn record(mut self, body_bytes: u64, completion: &BodyCompletion, response_body: &Bytes) {
         let finished_at_unix_ms = unix_time_millis();
         let mut attempts = self.completed_attempt_records;
         let mut final_attempt = self.final_attempt;
@@ -10720,6 +12772,15 @@ impl ForwardedBodyObserver {
         let upstream_mode = final_attempt
             .as_ref()
             .map_or(self.upstream_mode, |attempt| attempt.upstream_mode);
+        if let Some(stuck_watchdog_attempt) = self.stuck_watchdog_attempt.take() {
+            let sse_body = final_attempt
+                .as_ref()
+                .map(|attempt| attempt.sse_body.as_ref())
+                .unwrap_or_default();
+            stuck_watchdog_attempt.record_response(response_body, sse_body);
+            // Do not retain an active lease in the persistence runtime below.
+            stuck_watchdog_attempt.end();
+        }
         if let Some(final_attempt) = &mut final_attempt
             && final_attempt.response_body.is_empty()
         {
@@ -11068,6 +13129,247 @@ impl BodyCompletion {
     }
 }
 
+/// Capacity of the downstream-facing half of the independent upstream body relay.
+const OBSERVED_UPSTREAM_RELAY_CAPACITY: usize = 16;
+/// Total retained payload bytes shared by the relay channel and its ordered pending queue.
+/// One oversized source chunk is admitted losslessly while consuming the entire budget, so
+/// subsequent polling still remains flow-controlled until that chunk is delivered or dropped.
+const OBSERVED_UPSTREAM_RELAY_BYTE_BUDGET: usize = 384 * 1024;
+
+struct RetainedObservedUpstreamItem {
+    item: Result<Bytes, reqwest::Error>,
+    byte_budget_permit: Option<OwnedSemaphorePermit>,
+}
+
+fn relay_byte_budget_permits(bytes_len: usize) -> u32 {
+    u32::try_from(bytes_len.min(OBSERVED_UPSTREAM_RELAY_BYTE_BUDGET))
+        .expect("observed relay byte budget fits in Tokio semaphore permits")
+}
+
+fn drain_relay_pending(
+    tx: &mpsc::Sender<RetainedObservedUpstreamItem>,
+    pending: &mut VecDeque<RetainedObservedUpstreamItem>,
+) -> bool {
+    while let Some(item) = pending.pop_front() {
+        match tx.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                pending.push_front(item);
+                break;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    }
+    true
+}
+
+async fn send_relay_pending(
+    tx: &mpsc::Sender<RetainedObservedUpstreamItem>,
+    pending: &mut VecDeque<RetainedObservedUpstreamItem>,
+) -> bool {
+    let item = pending.pop_front().expect("non-empty pending queue");
+    tx.send(item).await.is_ok()
+}
+
+async fn acquire_relay_byte_budget(
+    tx: &mpsc::Sender<RetainedObservedUpstreamItem>,
+    byte_budget: &Arc<Semaphore>,
+    bytes_len: usize,
+    progress: Option<&StuckWatchdogAttemptProgress>,
+) -> Result<Option<OwnedSemaphorePermit>, ()> {
+    let permit_count = relay_byte_budget_permits(bytes_len);
+    if permit_count == 0 {
+        return Ok(None);
+    }
+    if byte_budget.available_permits() < permit_count as usize
+        && let Some(progress) = progress
+    {
+        progress.suspend_observation();
+    }
+    let permit = tokio::select! {
+        biased;
+        () = tx.closed() => return Err(()),
+        permit = Arc::clone(byte_budget).acquire_many_owned(permit_count) => {
+            permit.expect("observed relay owns the only byte-budget semaphore handle")
+        }
+    };
+    if let Some(progress) = progress {
+        progress.resume_observation();
+    }
+    Ok(Some(permit))
+}
+
+async fn retain_observed_upstream_item(
+    item: Option<Result<Bytes, reqwest::Error>>,
+    tx: &mpsc::Sender<RetainedObservedUpstreamItem>,
+    byte_budget: &Arc<Semaphore>,
+    progress: Option<&StuckWatchdogAttemptProgress>,
+    pending: &mut VecDeque<RetainedObservedUpstreamItem>,
+) -> Result<bool, ()> {
+    match item {
+        Some(Ok(bytes)) => {
+            let Ok(byte_budget_permit) =
+                acquire_relay_byte_budget(tx, byte_budget, bytes.len(), progress).await
+            else {
+                return Err(());
+            };
+            if let Some(progress) = progress {
+                progress.record_upstream_emitted_chunk(&bytes);
+            }
+            pending.push_back(RetainedObservedUpstreamItem {
+                item: Ok(bytes),
+                byte_budget_permit,
+            });
+            Ok(true)
+        }
+        Some(Err(error)) => {
+            if let Some(progress) = progress {
+                progress.end_attempt();
+            }
+            pending.push_back(RetainedObservedUpstreamItem {
+                item: Err(error),
+                byte_budget_permit: None,
+            });
+            Ok(false)
+        }
+        None => {
+            if let Some(progress) = progress {
+                progress.record_non_sse_progress_at_upstream_eof();
+                progress.end_attempt();
+            }
+            Ok(false)
+        }
+    }
+}
+
+async fn run_observed_upstream_relay(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    tx: mpsc::Sender<RetainedObservedUpstreamItem>,
+    byte_budget: Arc<Semaphore>,
+    progress: Option<StuckWatchdogAttemptProgress>,
+) {
+    let mut stream = std::pin::pin!(stream);
+    let mut pending: VecDeque<RetainedObservedUpstreamItem> = VecDeque::new();
+    let mut upstream_open = true;
+    loop {
+        if tx.is_closed() {
+            return;
+        }
+        // Prefer draining retained items when the client is reading so the
+        // ordered buffer can accept the next upstream chunk without loss.
+        if !drain_relay_pending(&tx, &mut pending) {
+            return;
+        }
+        if !upstream_open {
+            if pending.is_empty() {
+                return;
+            }
+            // Upstream finished; wait for client capacity while delivering
+            // every retained ordered chunk exactly once.
+            if let Some(progress) = &progress {
+                progress.suspend_observation();
+            }
+            if !send_relay_pending(&tx, &mut pending).await {
+                return;
+            }
+            continue;
+        }
+        if pending.len() < OBSERVED_UPSTREAM_RELAY_CAPACITY && byte_budget.available_permits() > 0 {
+            if let Some(progress) = &progress {
+                progress.resume_observation();
+            }
+            let item = tokio::select! {
+                biased;
+                () = tx.closed() => return,
+                item = stream.next() => item,
+            };
+            upstream_open = match retain_observed_upstream_item(
+                item,
+                &tx,
+                &byte_budget,
+                progress.as_ref(),
+                &mut pending,
+            )
+            .await
+            {
+                Ok(upstream_open) => upstream_open,
+                Err(()) => return,
+            };
+            continue;
+        }
+        if pending.is_empty() {
+            // All retained bytes are already in the channel. Do not poll upstream
+            // again until downstream consumption releases the shared byte budget.
+            if let Some(progress) = &progress {
+                progress.suspend_observation();
+            }
+            let permit = tokio::select! {
+                biased;
+                () = tx.closed() => return,
+                permit = Arc::clone(&byte_budget).acquire_owned() => {
+                    permit.expect("observed relay owns the only byte-budget semaphore handle")
+                }
+            };
+            drop(permit);
+            continue;
+        }
+        // Downstream is not draining and the ordered buffer is full. Wait for
+        // either client capacity or cancellation; never poll and discard more
+        // upstream body while the still-open stream cannot retain it.
+        // Mark the attempt before `reserve()` can park: while flow control
+        // blocks this relay, the proxy has no observation path to upstream.
+        if let Some(progress) = &progress {
+            progress.suspend_observation();
+        }
+        tokio::select! {
+            biased;
+            () = tx.closed() => return,
+            result = tx.reserve() => match result {
+                Ok(permit) => {
+                    let item = pending.pop_front().expect("full pending queue is non-empty");
+                    // A downstream read released capacity. Resume observation
+                    // immediately so the next upstream poll has a fresh maturity window.
+                    if let Some(progress) = &progress {
+                        progress.resume_observation();
+                    }
+                    permit.send(item);
+                }
+                Err(_) => return,
+            },
+        }
+    }
+}
+
+/// Pulls the upstream body on a dedicated task so stuck-watchdog progress tracks
+/// engine production rather than client consumption. Every observed response
+/// byte is retained exactly once and in order; when the downstream half is full,
+/// the pump applies backpressure to the retained buffer (and therefore upstream)
+/// instead of discarding healthy chunks. Dropping the downstream half stops the
+/// pump so cancellation still reaches upstream.
+fn observe_upstream_body_independently(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    progress: Option<StuckWatchdogAttemptProgress>,
+) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send {
+    let (tx, rx) = mpsc::channel(OBSERVED_UPSTREAM_RELAY_CAPACITY);
+    let byte_budget = Arc::new(Semaphore::new(OBSERVED_UPSTREAM_RELAY_BYTE_BUDGET));
+    tokio::spawn(run_observed_upstream_relay(
+        stream,
+        tx,
+        byte_budget,
+        progress,
+    ));
+    futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|retained| {
+            let RetainedObservedUpstreamItem {
+                item,
+                byte_budget_permit,
+            } = retained;
+            drop(byte_budget_permit);
+            (item, rx)
+        })
+    })
+}
+
 struct ObservedUpstreamBody {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     observer: Option<ForwardedBodyObserver>,
@@ -11122,8 +13424,10 @@ impl ObservedUpstreamBody {
         shutdown: ShutdownSubscription,
         deadline: Option<ShieldedRequestDeadline>,
     ) -> Self {
+        let progress = observer.stuck_watchdog_progress_request();
+        let relayed = observe_upstream_body_independently(stream, progress);
         Self {
-            inner: Box::pin(stream),
+            inner: Box::pin(relayed),
             observer: Some(observer),
             _in_flight_permit: in_flight_permit,
             shutdown,
@@ -11164,6 +13468,9 @@ impl Stream for ObservedUpstreamBody {
             Poll::Ready(Some(Ok(bytes))) => {
                 let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                 this.bytes_seen = this.bytes_seen.saturating_add(chunk_len);
+                // Watchdog progress is recorded by the independent upstream relay
+                // before chunks enter this downstream-facing stream. Do not couple
+                // engine liveness to whether the client polls the body.
                 if this.body_buffer.len() < TOKEN_USAGE_BODY_CAP {
                     let remaining = TOKEN_USAGE_BODY_CAP - this.body_buffer.len();
                     let take = remaining.min(bytes.len());

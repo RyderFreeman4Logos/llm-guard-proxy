@@ -30,6 +30,8 @@ use llm_guard_proxy_state::{
 };
 use tokio::{net::TcpListener, sync::watch, task::JoinSet};
 
+const WATCHDOG_SHUTDOWN_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn main() -> ExitCode {
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -443,6 +445,7 @@ async fn serve_bound_listeners(
         shutdown_signal().await;
         let _ignored = shutdown_tx.send(true);
     });
+    let stuck_engine_watchdog = proxy::spawn_stuck_engine_watchdog(&state);
 
     let mut servers = JoinSet::new();
     for (listener_config, listener, _local_addr) in bound_listeners {
@@ -483,8 +486,30 @@ async fn serve_bound_listeners(
         state.begin_shutdown();
         while servers.join_next().await.is_some() {}
     }
+    state.begin_shutdown();
+    if let Err(error) =
+        join_stuck_engine_watchdog(stuck_engine_watchdog, WATCHDOG_SHUTDOWN_JOIN_TIMEOUT).await
+    {
+        eprintln!("stuck-engine watchdog task failed during shutdown: {error}");
+    }
     state.flush_persistence().await;
     result
+}
+
+async fn join_stuck_engine_watchdog(
+    mut watchdog: tokio::task::JoinHandle<()>,
+    max_wait: Duration,
+) -> Result<(), tokio::task::JoinError> {
+    match tokio::time::timeout(max_wait, &mut watchdog).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            watchdog.abort();
+            match watchdog.await {
+                Err(error) if error.is_cancelled() => Ok(()),
+                result => result,
+            }
+        }
+    }
 }
 
 fn render_listening(
@@ -1142,6 +1167,33 @@ mod tests {
         assert!(!rendered.contains("x-api-key"));
         assert!(!rendered.contains("safe=ok"));
         assert!(!rendered.contains("token=sk-test"));
+    }
+
+    #[tokio::test]
+    async fn watchdog_join_is_bounded_during_shutdown() {
+        let watchdog = tokio::spawn(std::future::pending::<()>());
+        let joined = tokio::time::timeout(
+            Duration::from_millis(100),
+            super::join_stuck_engine_watchdog(watchdog, Duration::from_millis(1)),
+        )
+        .await;
+
+        assert!(
+            joined
+                .expect("shutdown must not await a stalled watchdog")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_join_reports_task_failure() {
+        let watchdog = tokio::spawn(async { panic!("watchdog task failed") });
+
+        assert!(
+            super::join_stuck_engine_watchdog(watchdog, Duration::from_millis(100))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

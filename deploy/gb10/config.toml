@@ -30,6 +30,10 @@ max_control_plane_in_flight_requests = 128
 # exhaustion from large payloads.
 max_request_body_bytes = 4194304
 
+# Aggregate body bytes retained across restart-queue waiters while recovery
+# runs. Independent of max_queued_generation_requests × max_request_body_bytes.
+max_restart_queue_body_bytes = 134217728
+
 # Maximum graceful shutdown drain wait after SIGTERM starts cancellation.
 # shutdown_drain_timeout_ms = 30000
 
@@ -124,6 +128,20 @@ recovery_max_per_window = 2              # Max recovery attempts per window
 #| budget_window_ms = 900000                                          # Rolling recovery budget window
 #| max_per_window = 2                                                 # Max recoveries per budget window
 # END PARSEABLE EXAMPLE: upstream-local-recovery
+
+# BEGIN PARSEABLE EXAMPLE: upstream-stuck-watchdog-and-restart-queue
+# Safe defaults: both sections are disabled. Defaults are a 1800-second detection/window/queue/restart limit and a 60-second watchdog check; all *_secs values are capped at 86400 seconds.
+#| [upstream.stuck_watchdog]
+#| enabled = true                                                     # Detect active output-starved requests
+#| check_interval_secs = 30                                           # Polling interval
+#| detection_window_secs = 180                                       # Trailing output-progress window
+#| min_output_progress_units_in_window = 1                           # Restart when active requests emit fewer model-progress units
+#|
+#| [upstream.restart_queue]
+#| enabled = true                                                     # Wait for an in-progress local recovery
+#| queue_deadline_secs = 300                                         # Return 503 if recovery exceeds this wait
+#| restart_timeout_secs = 300                                       # Cap one restart/readiness episode
+# END PARSEABLE EXAMPLE: upstream-stuck-watchdog-and-restart-queue
 
 # ── Upstream metadata discovery ──────────────────────────────────────────────
 # Automatically discovers model metadata from /v1/models.

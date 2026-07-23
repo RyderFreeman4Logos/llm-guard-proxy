@@ -216,6 +216,7 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.server.generation_queue_retry_after_secs, None);
     assert_eq!(config.server.max_control_plane_in_flight_requests, 128);
     assert_eq!(config.server.max_request_body_bytes, 67_108_864);
+    assert_eq!(config.server.max_restart_queue_body_bytes, 268_435_456);
     assert_eq!(config.upstream.base_url, "http://gb10:18009/v1");
     assert_eq!(config.upstream.request_timeout_ms, 120_000);
     assert!(config.upstream.metadata.discovery_enabled);
@@ -290,12 +291,7 @@ fn defaults_match_issue_contract() {
     assert_eq!(config.upstream_stall.recovery_cooldown_ms, 300_000);
     assert_eq!(config.upstream_stall.recovery_budget_window_ms, 900_000);
     assert_eq!(config.upstream_stall.recovery_max_per_window, 2);
-    assert!(!config.upstream.local_recovery.enabled);
-    assert!(config.upstream.local_recovery.restart_command.is_empty());
-    assert_eq!(
-        config.upstream.local_recovery.readiness_endpoint,
-        "/v1/chat/completions"
-    );
+    assert_default_recovery_watchdog_and_restart_queue_configs(&config);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
     assert!(config.cloudflare.enabled);
     assert!(config.upstream_profiles.is_empty());
@@ -305,6 +301,28 @@ fn defaults_match_issue_contract() {
         assert!(config.workflows.is_empty());
     }
     assert_eq!(config.default_upstream_profile().name, "default");
+}
+
+fn assert_default_recovery_watchdog_and_restart_queue_configs(config: &AppConfig) {
+    assert!(!config.upstream.local_recovery.enabled);
+    assert!(config.upstream.local_recovery.restart_command.is_empty());
+    assert_eq!(
+        config.upstream.local_recovery.readiness_endpoint,
+        "/v1/chat/completions"
+    );
+    assert!(!config.upstream.stuck_watchdog.enabled);
+    assert_eq!(config.upstream.stuck_watchdog.detection_window_secs, 1_800);
+    assert_eq!(
+        config
+            .upstream
+            .stuck_watchdog
+            .min_output_progress_units_in_window,
+        1
+    );
+    assert_eq!(config.upstream.stuck_watchdog.check_interval_secs, 60);
+    assert!(!config.upstream.restart_queue.enabled);
+    assert_eq!(config.upstream.restart_queue.queue_deadline_secs, 1_800);
+    assert_eq!(config.upstream.restart_queue.restart_timeout_secs, 1_800);
 }
 
 #[test]
@@ -3180,6 +3198,19 @@ fn validates_request_body_limit_bounds() {
     assert_eq!(error.field(), "server.max_request_body_bytes");
 
     config = AppConfig::default();
+    config.server.max_restart_queue_body_bytes = 0;
+    let error = config
+        .validate()
+        .expect_err("zero restart-queue body budget should fail");
+    assert_eq!(error.field(), "server.max_restart_queue_body_bytes");
+
+    config.server.max_restart_queue_body_bytes = 4_294_967_297;
+    let error = config
+        .validate()
+        .expect_err("excessive restart-queue body budget should fail");
+    assert_eq!(error.field(), "server.max_restart_queue_body_bytes");
+
+    config = AppConfig::default();
     config.server.shutdown_drain_timeout_ms = 0;
     let error = config
         .validate()
@@ -3444,6 +3475,140 @@ interval_secs = 4
 }
 
 #[test]
+fn named_upstream_watchdog_and_restart_queue_parse_and_hot_reload() {
+    let current = AppConfig::parse(
+        r#"
+[[upstreams]]
+name = "named"
+base_url = "http://127.0.0.1:19000/v1"
+
+[upstreams.stuck_watchdog]
+enabled = false
+detection_window_secs = 90
+min_output_progress_units_in_window = 2
+check_interval_secs = 5
+
+[upstreams.restart_queue]
+enabled = false
+queue_deadline_secs = 45
+restart_timeout_secs = 30
+"#,
+    )
+    .expect("named current config should parse");
+    let requested = AppConfig::parse(
+        r#"
+[[upstreams]]
+name = "named"
+base_url = "http://127.0.0.1:19000/v1"
+
+[upstreams.stuck_watchdog]
+enabled = true
+detection_window_secs = 120
+min_output_progress_units_in_window = 3
+check_interval_secs = 7
+
+[upstreams.restart_queue]
+enabled = true
+queue_deadline_secs = 60
+restart_timeout_secs = 40
+"#,
+    )
+    .expect("named requested config should parse");
+    let handle = ConfigHandle::new(current);
+
+    let outcome = handle
+        .apply_reloadable(&requested)
+        .expect("named reloadable transition should succeed");
+    let snapshot = handle.snapshot().expect("snapshot should succeed");
+    let named = snapshot
+        .upstream_profiles
+        .first()
+        .expect("named profile should remain configured");
+
+    assert!(outcome.applied);
+    assert!(named.stuck_watchdog.enabled);
+    assert_eq!(named.stuck_watchdog.detection_window_secs, 120);
+    assert_eq!(named.stuck_watchdog.min_output_progress_units_in_window, 3);
+    assert_eq!(named.stuck_watchdog.check_interval_secs, 7);
+    assert!(named.restart_queue.enabled);
+    assert_eq!(named.restart_queue.queue_deadline_secs, 60);
+    assert_eq!(named.restart_queue.restart_timeout_secs, 40);
+}
+
+#[test]
+fn watchdog_progress_unit_threshold_is_hot_reloadable() {
+    let current = AppConfig::parse(
+        r"
+[upstream.stuck_watchdog]
+min_output_progress_units_in_window = 1
+",
+    )
+    .expect("current progress-unit watchdog config should parse");
+    let requested = AppConfig::parse(
+        r"
+[upstream.stuck_watchdog]
+min_output_progress_units_in_window = 2
+",
+    )
+    .expect("requested progress-unit watchdog config should parse");
+    let handle = ConfigHandle::new(current);
+
+    let outcome = handle
+        .apply_reloadable(&requested)
+        .expect("progress-unit threshold reload should succeed");
+
+    assert!(
+        outcome.applied,
+        "changing only the progress-unit threshold must apply without a restart"
+    );
+}
+
+#[test]
+fn rejects_watchdog_progress_unit_threshold_above_sample_retention() {
+    let error = parse_config_text(
+        "[upstream.stuck_watchdog]\nmin_output_progress_units_in_window = 4097\n",
+    )
+    .expect("progress-unit threshold syntax should parse before validation")
+    .validate()
+    .expect_err("a progress-unit threshold above retained samples must be rejected");
+
+    assert_eq!(
+        error.field(),
+        "upstream.stuck_watchdog.min_output_progress_units_in_window"
+    );
+}
+
+#[test]
+fn rejects_unbounded_watchdog_and_restart_queue_durations() {
+    let cases = [
+        (
+            "[upstream.stuck_watchdog]\ndetection_window_secs = 18446744073709551615\n",
+            "upstream.stuck_watchdog.detection_window_secs",
+        ),
+        (
+            "[upstream.stuck_watchdog]\ncheck_interval_secs = 18446744073709551615\n",
+            "upstream.stuck_watchdog.check_interval_secs",
+        ),
+        (
+            "[upstream.restart_queue]\nqueue_deadline_secs = 18446744073709551615\n",
+            "upstream.restart_queue.queue_deadline_secs",
+        ),
+        (
+            "[upstream.restart_queue]\nrestart_timeout_secs = 18446744073709551615\n",
+            "upstream.restart_queue.restart_timeout_secs",
+        ),
+    ];
+
+    for (contents, field) in cases {
+        let error = parse_config_text(contents)
+            .expect("duration syntax should parse before validation")
+            .validate()
+            .expect_err("unbounded duration must be rejected before Instant arithmetic");
+        assert_eq!(error.field(), field);
+    }
+}
+
+#[test]
 fn parses_and_validates_guardian_policy_from_the_shared_config() {
     let config = AppConfig::parse(
         r#"
@@ -3668,6 +3833,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"server.generation_queue_retry_after_secs"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_control_plane_in_flight_requests"));
     assert!(RELOADABLE_FIELDS.contains(&"server.max_request_body_bytes"));
+    assert!(RELOADABLE_FIELDS.contains(&"server.max_restart_queue_body_bytes"));
     assert!(RELOADABLE_FIELDS.contains(&"server.shutdown_drain_timeout_ms"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.mode"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.on_reasoning_loop"));
