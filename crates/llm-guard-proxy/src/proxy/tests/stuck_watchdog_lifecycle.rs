@@ -53,15 +53,28 @@ async fn watchdog_panicked_recovery_releases_profile_for_a_later_schedule() {
     let profile = String::from("panic-profile");
     let mut recovering_profiles = std::collections::HashSet::from([profile.clone()]);
     let mut recovery_task_profiles = std::collections::HashMap::new();
+    let recovery_episode_id = Arc::new(AtomicU64::new(0));
     {
         let coordinator = local_recovery.coordinator_for(&profile);
         let mut state = coordinator.state.lock().await;
         state.running = true;
+        recovery_episode_id.store(
+            state
+                .ensure_active_recovery_episode()
+                .expect("panicked recovery must own an episode"),
+            Ordering::Release,
+        );
     }
     let task = recovery_tasks.spawn(async {
         panic!("injected watchdog recovery panic");
     });
-    recovery_task_profiles.insert(task.id(), profile.clone());
+    recovery_task_profiles.insert(
+        task.id(),
+        WatchdogRecoveryTask {
+            profile: profile.clone(),
+            recovery_episode_id,
+        },
+    );
 
     tokio::task::yield_now().await;
     collect_finished_watchdog_recoveries(
@@ -98,6 +111,214 @@ async fn watchdog_panicked_recovery_releases_profile_for_a_later_schedule() {
             .load(Ordering::Relaxed),
         1,
         "panic cleanup must increment the bounded watchdog task-failure metric"
+    );
+}
+
+#[tokio::test]
+async fn watchdog_delayed_task_failure_does_not_cancel_later_recovery_episode() {
+    let local_recovery = LocalRecoveryCoordinatorSet::default();
+    let profile = String::from("delayed-task-failure");
+    let coordinator = local_recovery.coordinator_for(&profile);
+    let episode_a = {
+        let mut state = coordinator.state.lock().await;
+        state.running = true;
+        state
+            .ensure_active_recovery_episode()
+            .expect("recovery A must receive an episode identity")
+    };
+    finish_local_recovery_episode(
+        &coordinator,
+        episode_a,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    )
+    .await;
+
+    let (b_started_tx, b_started_rx) = oneshot::channel();
+    let recovery_b = tokio::spawn(async move {
+        let _started = b_started_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    b_started_rx
+        .await
+        .expect("recovery B task must enter before delayed A cleanup");
+    let episode_b = {
+        let mut state = coordinator.state.lock().await;
+        state.running = true;
+        let episode_b = state
+            .ensure_active_recovery_episode()
+            .expect("recovery B must receive a distinct episode identity");
+        state.active_local_recovery_task = Some(recovery_b.abort_handle());
+        episode_b
+    };
+    assert_ne!(episode_a, episode_b);
+
+    // Simulate the collector observing A's JoinError only after B has started.
+    record_watchdog_recovery_task_failure(
+        &local_recovery,
+        &WatchdogRecoveryTask {
+            profile: profile.clone(),
+            recovery_episode_id: Arc::new(AtomicU64::new(episode_a)),
+        },
+    )
+    .await;
+
+    let state = coordinator.state.lock().await;
+    assert!(state.running, "stale A cleanup must not terminalize live B");
+    assert_eq!(state.active_recovery_episode_id, Some(episode_b));
+    assert!(
+        state.completed_recovery_result(episode_b).is_none(),
+        "stale A cleanup must not publish task_failed for B"
+    );
+    assert_eq!(
+        state
+            .completed_recovery_result(episode_a)
+            .and_then(|metadata| metadata.get("local_recovery_status"))
+            .map(String::as_str),
+        Some("succeeded"),
+        "A's already-published result must remain intact"
+    );
+    drop(state);
+    assert!(
+        !recovery_b.is_finished(),
+        "stale A cleanup must not abort B's live child task"
+    );
+
+    recovery_b.abort();
+    let _cancelled = recovery_b
+        .await
+        .expect_err("test-owned recovery B task should be cancelled during cleanup");
+    let _published = finish_local_recovery_episode(
+        &coordinator,
+        episode_b,
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("cancelled"),
+        )]),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn watchdog_inner_child_failure_contains_only_its_exact_episode() {
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    let (child_started_tx, child_started_rx) = oneshot::channel();
+    let child = tokio::spawn(async move {
+        let _sent = child_started_tx.send(());
+        std::future::pending::<()>().await;
+    });
+    child_started_rx
+        .await
+        .expect("recovery child must be live before containment");
+
+    let episode = {
+        let mut state = coordinator.state.lock().await;
+        state.running = true;
+        let episode = state
+            .ensure_active_recovery_episode()
+            .expect("child must own an episode");
+        state.active_local_recovery_task = Some(child.abort_handle());
+        episode
+    };
+    let join_error = tokio::spawn(async {
+        panic!("injected inner watchdog local-recovery panic");
+    })
+    .await
+    .expect_err("injected inner child must report a JoinError");
+    let terminal =
+        watchdog_recovery_join_error_metadata(&coordinator, Some(episode), join_error).await;
+    assert_eq!(
+        terminal.get("local_recovery_status").map(String::as_str),
+        Some("task_failed"),
+        "inner JoinError must retain its failure result"
+    );
+    assert!(
+        child
+            .await
+            .expect_err("exact recovery child must be cancelled")
+            .is_cancelled(),
+        "inner JoinError must contain its live child task"
+    );
+    assert!(
+        !finish_local_recovery_episode(&coordinator, episode, terminal).await,
+        "the same terminal episode may only publish once"
+    );
+    let state = coordinator.state.lock().await;
+    assert!(!state.running);
+    assert_eq!(
+        state
+            .completed_recovery_result(episode)
+            .and_then(|metadata| metadata.get("local_recovery_status"))
+            .map(String::as_str),
+        Some("task_failed")
+    );
+}
+
+#[tokio::test]
+async fn started_recovery_waiter_returns_observed_episode_not_later_result() {
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    let episode_a = {
+        let mut state = coordinator.state.lock().await;
+        state.running = true;
+        state
+            .ensure_active_recovery_episode()
+            .expect("episode A must be allocated")
+    };
+    let episode_b = AtomicU64::new(0);
+
+    // Publish A and complete B exactly after A's state precheck but before the
+    // first `Notified` poll. The fifty-millisecond deadline is far shorter than
+    // the 250ms wait and proves the waiter retained the notification permit.
+    let result = timeout(
+        Duration::from_millis(50),
+        wait_for_started_local_recovery_result_after_state_check(&coordinator, episode_a, || {
+            let mut state = coordinator
+                .state
+                .try_lock()
+                .expect("state check must release coordinator before the wait");
+            assert!(state.finish_recovery_for_episode(
+                episode_a,
+                BTreeMap::from([(
+                    String::from("local_recovery_status"),
+                    String::from("succeeded"),
+                )]),
+            ));
+            state.running = true;
+            let next_episode = state
+                .ensure_active_recovery_episode()
+                .expect("episode B must be allocated");
+            episode_b.store(next_episode, Ordering::Release);
+            assert!(state.finish_recovery_for_episode(
+                next_episode,
+                BTreeMap::from([(
+                    String::from("local_recovery_status"),
+                    String::from("task_failed"),
+                )]),
+            ));
+            drop(state);
+            coordinator.notify.notify_waiters();
+        }),
+    )
+    .await
+    .expect("enabled notification must complete without waiting for the timeout")
+    .expect("A's exact completed result must be available");
+    assert_eq!(
+        result.get("local_recovery_status").map(String::as_str),
+        Some("succeeded"),
+        "a later completion must not replace A's observed result"
+    );
+    let episode_b = episode_b.load(Ordering::Acquire);
+    assert_ne!(episode_a, episode_b);
+    let state = coordinator.state.lock().await;
+    assert_eq!(
+        state
+            .completed_recovery_result(episode_b)
+            .and_then(|metadata| metadata.get("local_recovery_status"))
+            .map(String::as_str),
+        Some("task_failed"),
+        "the deterministic later completion must be present to prove attribution is episode-bound"
     );
 }
 
@@ -1123,7 +1344,7 @@ async fn watchdog_lifecycle_never_waits_after_recovery_starts_without_a_queue_pe
     let returned_before_recovery_finished = timeout(Duration::from_millis(100), &mut waiting)
         .await
         .is_ok();
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -1175,7 +1396,7 @@ async fn restart_queue_recovery_success_metadata_persists_on_the_completed_reque
             .expect("queued proxy request should complete")
     });
     sleep(Duration::from_millis(40)).await;
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -1252,7 +1473,7 @@ async fn restart_queue_completion_race_failed_recovery_returns_unavailable() {
 
     // Finish the observed episode after the permit is held and before the
     // waiter's first state check, matching the production completion race.
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -1313,7 +1534,7 @@ async fn restart_queue_completion_race_successful_recovery_retains_metadata() {
         .expect("restart queue admission should succeed")
         .expect("active recovery should acquire a queue permit");
 
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -1378,7 +1599,7 @@ async fn restart_queue_waiter_uses_the_episode_observed_at_permit_acquisition() 
         .expect("restart queue admission should succeed")
         .expect("recovery A must yield a queue permit");
 
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -1393,7 +1614,7 @@ async fn restart_queue_waiter_uses_the_episode_observed_at_permit_acquisition() 
         recovery.recovery_started = Some(now);
         recovery.recovery_deadline = Some(now + Duration::from_secs(2));
     }
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -1536,9 +1757,12 @@ async fn watchdog_recovery_preclosed_shutdown_does_not_spawn_restart_command() {
             policy.clone(),
             Some(Duration::from_secs(1)),
             Arc::clone(&coordinator),
-            client.clone(),
-            fake.base_url.clone(),
+            LocalRecoveryEndpoint {
+                client: client.clone(),
+                base_url: fake.base_url.clone(),
+            },
             Arc::clone(&shutdown),
+            Arc::new(AtomicU64::new(0)),
         ));
     }
 

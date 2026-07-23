@@ -342,7 +342,7 @@ async fn restart_queue_waits_for_readiness_result_and_times_out_without_it() {
         !waiting.is_finished(),
         "request must remain queued during recovery"
     );
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -386,7 +386,7 @@ async fn restart_queue_consumes_failed_episode_completed_between_permit_and_wait
             .ensure_active_recovery_episode()
             .expect("running recovery must have an episode")
     };
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -423,7 +423,7 @@ async fn restart_queue_consumes_successful_episode_completed_between_permit_and_
             .ensure_active_recovery_episode()
             .expect("running recovery must have an episode")
     };
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -463,7 +463,7 @@ async fn restart_queue_permit_retains_success_after_completion_history_eviction(
         .expect("active recovery should admit a restart-queue permit")
         .expect("active recovery must produce a restart-queue permit");
 
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
@@ -482,7 +482,7 @@ async fn restart_queue_permit_retains_success_after_completion_history_eviction(
                 .ensure_active_recovery_episode()
                 .expect("later recovery must allocate an episode");
         }
-        finish_upstream_stall_recovery(
+        finish_active_upstream_stall_recovery_for_test(
             &coordinator,
             BTreeMap::from([(
                 String::from("local_recovery_status"),
@@ -1068,7 +1068,7 @@ restart_timeout_secs = 1
         "a queued request must not reach the upstream before recovery is ready"
     );
 
-    finish_upstream_stall_recovery(
+    finish_active_upstream_stall_recovery_for_test(
         &coordinator,
         BTreeMap::from([(
             String::from("local_recovery_status"),
