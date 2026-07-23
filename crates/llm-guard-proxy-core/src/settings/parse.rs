@@ -46,6 +46,12 @@ enum Section {
     UpstreamProfileStuckWatchdog(usize),
     UpstreamProfileRestartQueue(usize),
     UpstreamProfileThinking(usize),
+    UpstreamProfileLoopGuard(usize),
+    UpstreamProfileLoopGuardEmbedding(usize),
+    UpstreamProfileRetryLadder {
+        profile: usize,
+        rung: usize,
+    },
     #[cfg(feature = "param-override")]
     UpstreamProfileParamOverride(usize),
     #[cfg(feature = "guard")]
@@ -193,6 +199,22 @@ fn parse_section(
         let index = config.model_aliases.len() - 1;
         return Ok(Section::ModelAlias(index));
     }
+    if line == "[[upstreams.retry.ladder]]" {
+        let profile = current_upstream_profile.ok_or_else(|| {
+            ConfigParseError::new(
+                line_number,
+                "[[upstreams.retry.ladder]] must follow a [[upstreams]] profile",
+            )
+        })?;
+        let retry_ladder = config.upstream_profiles[profile]
+            .retry_ladder
+            .get_or_insert_with(Vec::new);
+        retry_ladder.push(RetryLadderConfig::default());
+        return Ok(Section::UpstreamProfileRetryLadder {
+            profile,
+            rung: retry_ladder.len() - 1,
+        });
+    }
     if line == "[[retry.ladder]]" {
         config.retry.ladder.push(RetryLadderConfig::default());
         return Ok(Section::RetryLadder(config.retry.ladder.len() - 1));
@@ -324,6 +346,24 @@ fn parse_section(
                 ))
             },
             |index| Ok(Section::UpstreamProfileThinking(index)),
+        ),
+        "upstreams.loop_guard" => current_upstream_profile.map_or_else(
+            || {
+                Err(ConfigParseError::new(
+                    line_number,
+                    "[upstreams.loop_guard] must follow a [[upstreams]] profile",
+                ))
+            },
+            |index| Ok(Section::UpstreamProfileLoopGuard(index)),
+        ),
+        "upstreams.loop_guard.embedding" => current_upstream_profile.map_or_else(
+            || {
+                Err(ConfigParseError::new(
+                    line_number,
+                    "[upstreams.loop_guard.embedding] must follow a [[upstreams]] profile",
+                ))
+            },
+            |index| Ok(Section::UpstreamProfileLoopGuardEmbedding(index)),
         ),
         #[cfg(feature = "param-override")]
         "upstreams.param_override" => current_upstream_profile.map_or_else(
@@ -472,7 +512,10 @@ fn assign_value(
         | Section::UpstreamProfileLocalRecovery(_)
         | Section::UpstreamProfileStuckWatchdog(_)
         | Section::UpstreamProfileRestartQueue(_)
-        | Section::UpstreamProfileThinking(_) => {
+        | Section::UpstreamProfileThinking(_)
+        | Section::UpstreamProfileLoopGuard(_)
+        | Section::UpstreamProfileLoopGuardEmbedding(_)
+        | Section::UpstreamProfileRetryLadder { .. } => {
             unreachable!("upstream sections are handled before this match")
         }
         #[cfg(feature = "param-override")]
@@ -490,6 +533,11 @@ fn assign_upstream_value(
     line_number: usize,
 ) -> Option<Result<(), ConfigParseError>> {
     if let Some(result) = assign_default_upstream_value(config, section, key, value, line_number) {
+        return Some(result);
+    }
+    if let Some(result) =
+        assign_upstream_profile_policy_value(config, section, key, value, line_number)
+    {
         return Some(result);
     }
     match section {
@@ -564,6 +612,80 @@ fn assign_upstream_value(
         )),
         _ => None,
     }
+}
+
+fn assign_upstream_profile_policy_value(
+    config: &mut AppConfig,
+    section: &Section,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Option<Result<(), ConfigParseError>> {
+    match section {
+        Section::UpstreamProfileLoopGuard(index) => Some(assign_upstream_profile_loop_guard(
+            config,
+            *index,
+            key,
+            value,
+            line_number,
+        )),
+        Section::UpstreamProfileLoopGuardEmbedding(index) => Some(
+            assign_upstream_profile_loop_guard_embedding(config, *index, key, value, line_number),
+        ),
+        Section::UpstreamProfileRetryLadder { profile, rung } => Some(
+            assign_upstream_profile_retry_ladder(config, *profile, *rung, key, value, line_number),
+        ),
+        _ => None,
+    }
+}
+
+fn assign_upstream_profile_loop_guard(
+    config: &mut AppConfig,
+    index: usize,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    let loop_guard = config.upstream_profiles[index]
+        .loop_guard
+        .get_or_insert_with(LoopGuardConfig::default);
+    assign_loop_guard(loop_guard, key, value, line_number)
+}
+
+fn assign_upstream_profile_loop_guard_embedding(
+    config: &mut AppConfig,
+    index: usize,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    let loop_guard = config.upstream_profiles[index]
+        .loop_guard
+        .get_or_insert_with(LoopGuardConfig::default);
+    assign_loop_guard_embedding(&mut loop_guard.embedding, key, value, line_number)
+}
+
+fn assign_upstream_profile_retry_ladder(
+    config: &mut AppConfig,
+    profile: usize,
+    rung: usize,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    config.upstream_profiles[profile]
+        .retry_ladder
+        .as_mut()
+        .and_then(|ladder| ladder.get_mut(rung))
+        .map_or_else(
+            || {
+                Err(ConfigParseError::new(
+                    line_number,
+                    "upstream retry ladder section was not initialized",
+                ))
+            },
+            |entry| assign_retry_ladder(entry, key, value, line_number),
+        )
 }
 
 fn assign_default_upstream_value(
@@ -981,6 +1103,7 @@ fn assign_listener(
         "allowed_upstreams" => {
             config.allowed_upstreams = Some(parse_string_array(value, line_number)?);
         }
+        "upstream_profile" => config.upstream_profile = Some(parse_string(value, line_number)?),
         _ => return unknown_key("listeners", key, line_number),
     }
     Ok(())

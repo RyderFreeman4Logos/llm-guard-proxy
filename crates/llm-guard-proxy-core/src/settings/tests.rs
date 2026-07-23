@@ -3,10 +3,10 @@ use super::GuardWorkflowConfig;
 use super::{
     AppConfig, ConfigHandle, ConfigParseError, DefaultInjectionSchema, DownstreamDropPolicy,
     EndpointSelectionMode, GuardianKillAction, HeartbeatMode, LoopFailurePolicy, LoopGuardMode,
-    NoThinkingMarkerPolicy, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, ShadowComparisonAttempt,
-    ThinkingMode, ToolRequestThinkingPolicy, UpstreamEndpointProtocol, UpstreamPriority,
-    UpstreamRouteReason, ValidationError, apply_reloadable, parse::parse_config_text,
-    redact_upstream_base_url,
+    NoThinkingMarkerPolicy, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, RetryLadderConfig,
+    ShadowComparisonAttempt, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy,
+    UpstreamEndpointProtocol, UpstreamPriority, UpstreamRouteReason, ValidationError,
+    apply_reloadable, parse::parse_config_text, redact_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 use crate::{
@@ -1379,6 +1379,172 @@ fn validates_enabled_upstream_stall_first_chunk_timeout_precedes_request_timeout
             .message()
             .contains("less than upstream.request_timeout_ms")
     );
+}
+
+#[test]
+fn parses_listener_forced_profiles_with_duplicate_models_and_profile_policies() {
+    let config = parse_config_text(
+        r#"
+[[upstreams]]
+name = "max-thinking"
+base_url = "http://max.example/v1"
+match_models = ["aeon-ultimate"]
+
+[upstreams.loop_guard]
+mode = "enforce"
+max_repeated_inputs = 3
+
+[[upstreams.retry.ladder]]
+name = "max-thinking-first"
+thinking_mode = "force_thinking"
+thinking_token_budget = 32768
+
+[[upstreams]]
+name = "no-thinking"
+base_url = "http://no-thinking.example/v1"
+match_models = ["aeon-ultimate"]
+
+[upstreams.loop_guard]
+mode = "disabled"
+
+[[upstreams.retry.ladder]]
+name = "no-thinking-first"
+thinking_mode = "force_disable"
+
+[[listeners]]
+name = "guard-max-thinking"
+bind_host = "127.0.0.1"
+port = 18111
+upstream_profile = "max-thinking"
+
+[[listeners]]
+name = "guard-no-thinking"
+bind_host = "127.0.0.1"
+port = 18113
+upstream_profile = "no-thinking"
+"#,
+    )
+    .expect("listener-scoped upstream policy config should parse");
+
+    assert_eq!(
+        config.listeners[0].upstream_profile.as_deref(),
+        Some("max-thinking")
+    );
+    assert_eq!(
+        config.listeners[1].upstream_profile.as_deref(),
+        Some("no-thinking")
+    );
+    let max_thinking = &config.upstream_profiles[0];
+    assert_eq!(
+        max_thinking.loop_guard.as_ref().map(|guard| guard.mode),
+        Some(LoopGuardMode::Enforce)
+    );
+    assert_eq!(
+        max_thinking
+            .loop_guard
+            .as_ref()
+            .map(|guard| guard.max_repeated_inputs),
+        Some(3)
+    );
+    assert_eq!(
+        max_thinking.retry_ladder.as_deref(),
+        Some(
+            &[RetryLadderConfig {
+                name: String::from("max-thinking-first"),
+                thinking: ThinkingConfig {
+                    mode: ThinkingMode::ForceThinking,
+                    budget_tokens: 32_768,
+                    ..ThinkingConfig::default()
+                },
+                ..RetryLadderConfig::default()
+            }][..]
+        )
+    );
+    let no_thinking = &config.upstream_profiles[1];
+    assert_eq!(
+        no_thinking.loop_guard.as_ref().map(|guard| guard.mode),
+        Some(LoopGuardMode::Disabled)
+    );
+    assert_eq!(
+        no_thinking
+            .retry_ladder
+            .as_ref()
+            .map(|ladder| ladder[0].thinking.mode),
+        Some(ThinkingMode::ForceDisable)
+    );
+
+    config
+        .validate()
+        .expect("forced listeners should disambiguate duplicate model aliases");
+}
+
+#[test]
+fn forced_listener_profiles_validate_reference_and_ambiguity_constraints() {
+    let unknown_profile = parse_config_text(
+        r#"
+[[listeners]]
+name = "unknown-profile"
+bind_host = "127.0.0.1"
+port = 18111
+upstream_profile = "missing"
+"#,
+    )
+    .expect("unknown profile configuration should parse before validation");
+    let unknown_error = unknown_profile
+        .validate()
+        .expect_err("listener must reference a configured upstream profile");
+    assert_eq!(unknown_error.field(), "listeners.upstream_profile");
+
+    let incompatible_allow_list = parse_config_text(
+        r#"
+[[upstreams]]
+name = "alpha"
+base_url = "http://alpha.example/v1"
+match_models = ["alpha-model"]
+
+[[upstreams]]
+name = "beta"
+base_url = "http://beta.example/v1"
+match_models = ["beta-model"]
+
+[[listeners]]
+name = "incompatible-allow-list"
+bind_host = "127.0.0.1"
+port = 18112
+allowed_upstreams = ["beta"]
+upstream_profile = "alpha"
+"#,
+    )
+    .expect("incompatible allow-list configuration should parse before validation");
+    let compatibility_error = incompatible_allow_list
+        .validate()
+        .expect_err("forced profile must be allowed by its listener allow-list");
+    assert_eq!(compatibility_error.field(), "listeners.upstream_profile");
+
+    let partially_forced_duplicates = parse_config_text(
+        r#"
+[[upstreams]]
+name = "alpha"
+base_url = "http://alpha.example/v1"
+match_models = ["shared-model"]
+
+[[upstreams]]
+name = "beta"
+base_url = "http://beta.example/v1"
+match_models = ["shared-model"]
+
+[[listeners]]
+name = "alpha-listener"
+bind_host = "127.0.0.1"
+port = 18113
+upstream_profile = "alpha"
+"#,
+    )
+    .expect("partially forced duplicate configuration should parse before validation");
+    let ambiguity_error = partially_forced_duplicates
+        .validate()
+        .expect_err("unforced duplicate model routing must remain invalid");
+    assert_eq!(ambiguity_error.field(), "upstreams.match_models");
 }
 
 #[test]
@@ -3492,6 +3658,12 @@ check_interval_secs = 5
 enabled = false
 queue_deadline_secs = 45
 restart_timeout_secs = 30
+
+[upstreams.loop_guard]
+max_repeated_inputs = 1
+
+[[upstreams.retry.ladder]]
+name = "initial"
 "#,
     )
     .expect("named current config should parse");
@@ -3511,6 +3683,12 @@ check_interval_secs = 7
 enabled = true
 queue_deadline_secs = 60
 restart_timeout_secs = 40
+
+[upstreams.loop_guard]
+max_repeated_inputs = 3
+
+[[upstreams.retry.ladder]]
+name = "replacement"
 "#,
     )
     .expect("named requested config should parse");
@@ -3533,6 +3711,20 @@ restart_timeout_secs = 40
     assert!(named.restart_queue.enabled);
     assert_eq!(named.restart_queue.queue_deadline_secs, 60);
     assert_eq!(named.restart_queue.restart_timeout_secs, 40);
+    assert_eq!(
+        named
+            .loop_guard
+            .as_ref()
+            .map(|guard| guard.max_repeated_inputs),
+        Some(3)
+    );
+    assert_eq!(
+        named
+            .retry_ladder
+            .as_ref()
+            .map(|ladder| ladder[0].name.as_str()),
+        Some("replacement")
+    );
 }
 
 #[test]
@@ -3809,6 +4001,7 @@ fn guardian_reload_metadata_lists_all_policy_fields() {
 }
 
 mod endpoint_reload;
+mod profile_policy;
 
 #[test]
 fn reload_metadata_lists_cover_expected_fields() {

@@ -65,6 +65,29 @@ name = "aggregate"
 bind_host = "100.105.4.92"
 port = 18005
 
+# BEGIN PARSEABLE EXAMPLE: listener-profile-policy
+# Use upstream_profile to force all requests (including /v1/models) to one
+# named profile. Profile loop_guard and retry.ladder override their global peers.
+#| [[upstreams]]
+#| name = "profile-policy"
+#| base_url = "http://127.0.0.1:18010/v1"
+#| match_models = ["profile-policy-model"]
+#|
+#| [upstreams.loop_guard]
+#| normalized_input_window_secs = 120
+#| max_repeated_inputs = 2
+#|
+#| [[upstreams.retry.ladder]]
+#| name = "profile-first"
+#| default_injection_schema = "canonical"
+#|
+#| [[listeners]]
+#| name = "forced-profile-policy"
+#| bind_host = "127.0.0.1"
+#| port = 18006
+#| upstream_profile = "profile-policy"
+# END PARSEABLE EXAMPLE: listener-profile-policy
+
 ## ───────────────────────── Upstream (single) ────────────────────────────────
 ## The default upstream inference endpoint. For multi-upstream routing, use
 ## the [upstreams.*] topology below instead.

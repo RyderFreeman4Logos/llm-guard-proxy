@@ -241,6 +241,8 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstreams.thinking.no_thinking_marker_policy",
     "upstreams.thinking.default_injection_schema",
     "upstreams.thinking.apply_to_tool_requests",
+    "upstreams.loop_guard",
+    "upstreams.retry.ladder",
     #[cfg(feature = "param-override")]
     "upstreams.param_override.enabled",
     #[cfg(feature = "param-override")]

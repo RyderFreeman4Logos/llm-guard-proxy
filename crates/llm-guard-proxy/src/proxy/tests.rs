@@ -33,6 +33,8 @@ use tokio::{
 
 use super::*;
 
+#[path = "tests/listener_profile_policy.rs"]
+mod listener_profile_policy;
 #[path = "tests/shielded_endpoint_rendering.rs"]
 mod shielded_endpoint_rendering;
 #[cfg(unix)]
@@ -13834,14 +13836,36 @@ fn assert_budget_change_is_not_repeated(base_body: &Bytes, changed_body: &Bytes)
     assert_ne!(base_fingerprint, changed_fingerprint);
 
     let repeat_inputs = RepeatInputCache::default();
-    let first_observation = repeat_inputs.observe(&base_fingerprint, 1_000, 120, 1);
-    let changed_observation = repeat_inputs.observe(&changed_fingerprint, 2_000, 120, 1);
-    let repeated_base_observation = repeat_inputs.observe(&base_fingerprint, 3_000, 120, 1);
+    let first_observation = repeat_inputs.observe("test", &base_fingerprint, 1_000, 120, 1);
+    let changed_observation = repeat_inputs.observe("test", &changed_fingerprint, 2_000, 120, 1);
+    let repeated_base_observation = repeat_inputs.observe("test", &base_fingerprint, 3_000, 120, 1);
 
     assert_eq!(first_observation, RepeatInputObservation::default());
     assert_eq!(changed_observation, RepeatInputObservation::default());
     assert_eq!(
         repeated_base_observation,
+        RepeatInputObservation {
+            repeated: true,
+            prior_count: 1
+        }
+    );
+}
+
+#[test]
+fn repeat_input_cache_isolated_by_upstream_profile() {
+    let repeat_inputs = RepeatInputCache::default();
+    let fingerprint = "siphash64:profile-isolation";
+
+    assert_eq!(
+        repeat_inputs.observe("alpha", fingerprint, 1_000, 120, 1),
+        RepeatInputObservation::default()
+    );
+    assert_eq!(
+        repeat_inputs.observe("beta", fingerprint, 2_000, 120, 1),
+        RepeatInputObservation::default()
+    );
+    assert_eq!(
+        repeat_inputs.observe("alpha", fingerprint, 3_000, 120, 1),
         RepeatInputObservation {
             repeated: true,
             prior_count: 1
@@ -15161,6 +15185,160 @@ async fn saturated_generation_requests_wait_for_in_flight_capacity() {
     assert_eq!(
         second_observed.path_and_query,
         "/v1/completions?slot=queued"
+    );
+}
+
+fn forced_listener_profile_config() -> AppConfig {
+    let mut config = AppConfig::default();
+    config.retry.ladder = vec![RetryLadderConfig {
+        name: String::from("global"),
+        ..RetryLadderConfig::default()
+    }];
+
+    let mut alpha = config.default_upstream_profile();
+    alpha.name = String::from("alpha");
+    alpha.match_models = vec![String::from("shared-model")];
+    alpha.thinking.mode = ThinkingMode::ForceThinking;
+    alpha.thinking.budget_tokens = 32_768;
+    alpha.loop_guard = Some(LoopGuardConfig {
+        max_repeated_inputs: 2,
+        ..LoopGuardConfig::default()
+    });
+    alpha.retry_ladder = Some(vec![RetryLadderConfig {
+        name: String::from("alpha-first"),
+        ..RetryLadderConfig::default()
+    }]);
+
+    let mut beta = alpha.clone();
+    beta.name = String::from("beta");
+    beta.thinking.mode = ThinkingMode::ForceDisable;
+    beta.loop_guard = Some(LoopGuardConfig {
+        max_repeated_inputs: 3,
+        ..LoopGuardConfig::default()
+    });
+    beta.retry_ladder = Some(vec![RetryLadderConfig {
+        name: String::from("beta-first"),
+        ..RetryLadderConfig::default()
+    }]);
+
+    config.upstream_profiles = vec![alpha, beta];
+    config.listeners = vec![
+        ListenerConfig {
+            name: String::from("alpha-listener"),
+            bind_host: String::from("127.0.0.1"),
+            port: 18_011,
+            allowed_upstreams: Some(vec![String::from("alpha")]),
+            upstream_profile: Some(String::from("alpha")),
+        },
+        ListenerConfig {
+            name: String::from("beta-listener"),
+            bind_host: String::from("127.0.0.1"),
+            port: 18_013,
+            allowed_upstreams: Some(vec![String::from("beta")]),
+            upstream_profile: Some(String::from("beta")),
+        },
+    ];
+    config
+        .validate()
+        .expect("forced duplicate-model profile configuration should validate");
+    config
+}
+
+#[test]
+fn listener_forced_profiles_override_duplicate_model_routing() {
+    let config = forced_listener_profile_config();
+
+    let alpha_selected =
+        select_allowed_upstream_profile(&config, &config.listeners[0], Some("shared-model"))
+            .expect("alpha listener should select alpha");
+    let beta_selected =
+        select_allowed_upstream_profile(&config, &config.listeners[1], Some("shared-model"))
+            .expect("beta listener should select beta");
+
+    assert_eq!(alpha_selected.profile.name, "alpha");
+    assert_eq!(
+        alpha_selected.profile.thinking.mode,
+        ThinkingMode::ForceThinking
+    );
+    assert_eq!(alpha_selected.profile.thinking.budget_tokens, 32_768);
+    assert_eq!(
+        alpha_selected.route_reason,
+        UpstreamRouteReason::ListenerForced
+    );
+    assert_eq!(beta_selected.profile.name, "beta");
+    assert_eq!(
+        beta_selected.profile.thinking.mode,
+        ThinkingMode::ForceDisable
+    );
+    assert_eq!(
+        beta_selected.route_reason,
+        UpstreamRouteReason::ListenerForced
+    );
+}
+
+#[test]
+fn listener_forced_profile_applies_to_models_endpoint() {
+    let config = forced_listener_profile_config();
+
+    let selected = select_profile_for_request(
+        &config,
+        &config.listeners[1],
+        &Method::GET,
+        &"/v1/models".parse().expect("models URI should parse"),
+        None,
+    )
+    .expect("forced listener should select beta for the models endpoint");
+
+    assert_eq!(selected.profile.name, "beta");
+    assert_eq!(selected.route_reason, UpstreamRouteReason::ListenerForced);
+}
+
+#[test]
+fn listener_without_forced_profile_retains_model_routing() {
+    let config = forced_listener_profile_config();
+    let legacy_listener = ListenerConfig {
+        name: String::from("legacy-listener"),
+        bind_host: String::from("127.0.0.1"),
+        port: 18_015,
+        allowed_upstreams: None,
+        upstream_profile: None,
+    };
+
+    let selected = select_allowed_upstream_profile(&config, &legacy_listener, Some("shared-model"))
+        .expect("listener without a forced profile should retain first-match routing");
+
+    assert_eq!(selected.profile.name, "alpha");
+    assert_eq!(selected.route_reason, UpstreamRouteReason::MatchedModel);
+}
+
+#[test]
+fn listener_forced_profiles_select_profile_scope_policies() {
+    let config = forced_listener_profile_config();
+    let alpha_selected =
+        select_allowed_upstream_profile(&config, &config.listeners[0], Some("shared-model"))
+            .expect("alpha listener should select alpha");
+    let beta_selected =
+        select_allowed_upstream_profile(&config, &config.listeners[1], Some("shared-model"))
+            .expect("beta listener should select beta");
+
+    let alpha_loop_guard = alpha_selected
+        .profile
+        .effective_loop_guard(&config.loop_guard);
+    let beta_loop_guard = beta_selected
+        .profile
+        .effective_loop_guard(&config.loop_guard);
+    assert_eq!(alpha_loop_guard.max_repeated_inputs, 2);
+    assert_eq!(beta_loop_guard.max_repeated_inputs, 3);
+
+    let alpha_retry_ladder = alpha_selected.profile.effective_retry_ladder(&config.retry);
+    let beta_retry_ladder = beta_selected.profile.effective_retry_ladder(&config.retry);
+    assert_eq!(alpha_retry_ladder[0].name, "alpha-first");
+    assert_eq!(beta_retry_ladder[0].name, "beta-first");
+    assert_eq!(
+        ShieldedRetryPolicy::from_config(&config.retry, alpha_loop_guard, alpha_retry_ladder)
+            .ladder[0]
+            .name,
+        "alpha-first"
     );
 }
 

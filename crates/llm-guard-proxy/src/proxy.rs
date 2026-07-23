@@ -273,6 +273,7 @@ impl ProxyState {
                 bind_host: String::from("0.0.0.0"),
                 port: 0,
                 allowed_upstreams: None,
+                upstream_profile: None,
             },
             store,
             evidence_store,
@@ -1588,13 +1589,20 @@ struct ListenerUpstreamDenied {
 
 #[derive(Debug, Default)]
 struct RepeatInputCache {
-    entries: Mutex<HashMap<String, RepeatInputEntry>>,
+    entries: Mutex<HashMap<RepeatInputKey, RepeatInputEntry>>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct RepeatInputKey {
+    upstream_profile: String,
+    fingerprint: String,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct RepeatInputEntry {
     count: u32,
     last_seen_unix_ms: u64,
+    expires_at_unix_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1606,6 +1614,7 @@ struct RepeatInputObservation {
 impl RepeatInputCache {
     fn observe(
         &self,
+        upstream_profile: &str,
         fingerprint: &str,
         now_unix_ms: u64,
         window_secs: u64,
@@ -1613,24 +1622,26 @@ impl RepeatInputCache {
     ) -> RepeatInputObservation {
         let window_ms = window_secs.saturating_mul(1_000);
         let mut entries = repeat_input_entries(&self.entries);
-        entries.retain(|_fingerprint, entry| {
-            now_unix_ms.saturating_sub(entry.last_seen_unix_ms) <= window_ms
-        });
+        entries.retain(|_fingerprint, entry| entry.expires_at_unix_ms >= now_unix_ms);
 
         let observation = {
             let entry = entries
-                .entry(fingerprint.to_owned())
+                .entry(RepeatInputKey {
+                    upstream_profile: upstream_profile.to_owned(),
+                    fingerprint: fingerprint.to_owned(),
+                })
                 .or_insert(RepeatInputEntry {
                     count: 0,
                     last_seen_unix_ms: now_unix_ms,
+                    expires_at_unix_ms: now_unix_ms.saturating_add(window_ms),
                 });
-            let prior_count = if now_unix_ms.saturating_sub(entry.last_seen_unix_ms) <= window_ms {
-                entry.count
-            } else {
-                0
-            };
+            if now_unix_ms.saturating_sub(entry.last_seen_unix_ms) > window_ms {
+                entry.count = 0;
+            }
+            let prior_count = entry.count;
             entry.count = prior_count.saturating_add(1);
             entry.last_seen_unix_ms = now_unix_ms;
+            entry.expires_at_unix_ms = now_unix_ms.saturating_add(window_ms);
 
             RepeatInputObservation {
                 repeated: prior_count >= max_repeated_inputs,
@@ -1644,15 +1655,15 @@ impl RepeatInputCache {
 }
 
 fn repeat_input_entries(
-    entries: &Mutex<HashMap<String, RepeatInputEntry>>,
-) -> MutexGuard<'_, HashMap<String, RepeatInputEntry>> {
+    entries: &Mutex<HashMap<RepeatInputKey, RepeatInputEntry>>,
+) -> MutexGuard<'_, HashMap<RepeatInputKey, RepeatInputEntry>> {
     match entries.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
 }
 
-fn prune_repeat_input_entries(entries: &mut HashMap<String, RepeatInputEntry>) {
+fn prune_repeat_input_entries(entries: &mut HashMap<RepeatInputKey, RepeatInputEntry>) {
     if entries.len() <= MAX_REPEAT_FINGERPRINT_ENTRIES {
         return;
     }
@@ -1660,11 +1671,11 @@ fn prune_repeat_input_entries(entries: &mut HashMap<String, RepeatInputEntry>) {
     let remove_count = entries.len().saturating_sub(MAX_REPEAT_FINGERPRINT_ENTRIES);
     let mut oldest_entries = entries
         .iter()
-        .map(|(fingerprint, entry)| (fingerprint.clone(), entry.last_seen_unix_ms))
+        .map(|(key, entry)| (key.clone(), entry.expires_at_unix_ms))
         .collect::<Vec<_>>();
-    oldest_entries.sort_by_key(|(_fingerprint, last_seen_unix_ms)| *last_seen_unix_ms);
-    for (fingerprint, _last_seen_unix_ms) in oldest_entries.into_iter().take(remove_count) {
-        entries.remove(&fingerprint);
+    oldest_entries.sort_by_key(|(_key, expires_at_unix_ms)| *expires_at_unix_ms);
+    for (key, _expires_at_unix_ms) in oldest_entries.into_iter().take(remove_count) {
+        entries.remove(&key);
     }
 }
 
@@ -3266,7 +3277,13 @@ async fn forward_openai_request(
         );
         _initial_recovery_trial_lease = selected.recovery_trial_lease;
     }
-    let retry_policy = ShieldedRetryPolicy::from_config(&config.retry, &config.loop_guard);
+    let loop_guard = prepared_request
+        .upstream_profile
+        .effective_loop_guard(&config.loop_guard);
+    let retry_ladder = prepared_request
+        .upstream_profile
+        .effective_retry_ladder(&config.retry);
+    let retry_policy = ShieldedRetryPolicy::from_config(&config.retry, loop_guard, retry_ladder);
     let upstream_stall_policy = UpstreamStallPolicy::from_config(&config.upstream_stall);
     let upstream_timeout =
         Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
@@ -4015,12 +4032,15 @@ fn validate_vllm_native_request_controls(
 ) -> Result<(), ProxyError> {
     let vllm_native_configured = profile.thinking.default_injection_schema
         == DefaultInjectionSchema::VllmNative
-        || config.retry.ladder.iter().any(|entry| {
-            entry
-                .default_injection_schema
-                .unwrap_or(profile.thinking.default_injection_schema)
-                == DefaultInjectionSchema::VllmNative
-        });
+        || profile
+            .effective_retry_ladder(&config.retry)
+            .iter()
+            .any(|entry| {
+                entry
+                    .default_injection_schema
+                    .unwrap_or(profile.thinking.default_injection_schema)
+                    == DefaultInjectionSchema::VllmNative
+            });
     if !is_chat_completions_request(method, uri)
         || !vllm_native_configured
         || !shielded_chat::has_conflicting_vllm_native_controls(body)
@@ -4633,7 +4653,8 @@ fn select_profile_for_request(
     uri: &Uri,
     model: Option<&str>,
 ) -> Result<SelectedUpstreamProfile, ProxyError> {
-    if is_control_plane_models_request(method, uri)
+    if listener.upstream_profile.is_none()
+        && is_control_plane_models_request(method, uri)
         && let Some(allowed_upstreams) = listener.allowed_upstreams.as_ref()
         && let Some(profile_name) = allowed_upstreams.first()
         && let Some(profile) = config.upstream_profile_by_name(profile_name)
@@ -4651,6 +4672,20 @@ fn select_allowed_upstream_profile(
     listener: &ListenerConfig,
     model: Option<&str>,
 ) -> Result<SelectedUpstreamProfile, ListenerUpstreamDenied> {
+    if let Some(profile_name) = listener.upstream_profile.as_deref() {
+        let Some(profile) = config.upstream_profile_by_name(profile_name) else {
+            return Err(ListenerUpstreamDenied {
+                listener_name: listener.name.clone(),
+                listener_port: listener.port,
+                upstream_profile: profile_name.to_owned(),
+                model_id: denied_model_id_summary(model),
+            });
+        };
+        return Ok(SelectedUpstreamProfile {
+            profile,
+            route_reason: UpstreamRouteReason::ListenerForced,
+        });
+    }
     #[cfg(feature = "guard")]
     if let Some(selected) = select_profile_from_model_alias(config, listener, model)? {
         return Ok(selected);
@@ -6257,7 +6292,9 @@ fn plan_shielded_chat(
     body: &Bytes,
 ) -> ShieldedChatPlan {
     let thinking = &upstream_profile.thinking;
-    let retry_initial_thinking = config.retry.ladder.first().map_or_else(
+    let loop_guard = upstream_profile.effective_loop_guard(&config.loop_guard);
+    let retry_ladder = upstream_profile.effective_retry_ladder(&config.retry);
+    let retry_initial_thinking = retry_ladder.first().map_or_else(
         || thinking.clone(),
         |entry| retry_ladder_thinking(entry, thinking),
     );
@@ -6297,11 +6334,19 @@ fn plan_shielded_chat(
         .as_ref()
         .map_or_else(BTreeMap::new, |request| request.thinking_metadata().clone());
     let thinking_policy_applied = request.is_some();
-    let liveness = select_shielded_liveness(state, config, body, kind, unix_time_millis());
+    let liveness = select_shielded_liveness(
+        state,
+        config,
+        loop_guard,
+        &upstream_profile.name,
+        body,
+        kind,
+        unix_time_millis(),
+    );
     let loop_context = if intercepted {
-        shielded_chat::LoopInspectionContext::from_request_body(&config.loop_guard, body)
+        shielded_chat::LoopInspectionContext::from_request_body(loop_guard, body)
     } else {
-        shielded_chat::LoopInspectionContext::empty(&config.loop_guard)
+        shielded_chat::LoopInspectionContext::empty(loop_guard)
     };
 
     ShieldedChatPlan {
@@ -6363,14 +6408,18 @@ struct ShieldedRetryPolicy {
 }
 
 impl ShieldedRetryPolicy {
-    fn from_config(config: &RetryConfig, loop_guard: &LoopGuardConfig) -> Self {
+    fn from_config(
+        config: &RetryConfig,
+        loop_guard: &LoopGuardConfig,
+        ladder: &[RetryLadderConfig],
+    ) -> Self {
         let max_attempts = if config.enabled {
-            if config.ladder.is_empty() {
+            if ladder.is_empty() {
                 config.max_attempts
             } else {
                 config
                     .max_attempts
-                    .min(u32::try_from(config.ladder.len()).unwrap_or(u32::MAX))
+                    .min(u32::try_from(ladder.len()).unwrap_or(u32::MAX))
             }
         } else {
             1
@@ -6383,7 +6432,7 @@ impl ShieldedRetryPolicy {
             shielded_streaming_enabled: config.shielded_streaming_enabled,
             downstream_drop_policy: config.downstream_drop_policy,
             loop_failure_policy: loop_guard.on_reasoning_loop,
-            ladder: config.ladder.clone(),
+            ladder: ladder.to_vec(),
         }
     }
 
@@ -8689,6 +8738,14 @@ fn filter_models_body_for_listener(
     listener: &ListenerConfig,
     body: Bytes,
 ) -> Bytes {
+    if let Some(profile_name) = listener.upstream_profile.as_deref() {
+        let Some(profile) = config.upstream_profile_by_name(profile_name) else {
+            return body;
+        };
+        return model_metadata::filter_models_body_by_id(body, |model_id| {
+            profile.match_models.is_empty() || profile.matches_model(model_id)
+        });
+    }
     if listener.allowed_upstreams.is_none() {
         return body;
     }
@@ -8709,6 +8766,12 @@ fn listener_models_upstream_profiles(
     config: &AppConfig,
     listener: &ListenerConfig,
 ) -> Vec<UpstreamProfileConfig> {
+    if let Some(profile_name) = listener.upstream_profile.as_deref() {
+        return config
+            .upstream_profile_by_name(profile_name)
+            .into_iter()
+            .collect();
+    }
     if let Some(allowed_upstreams) = listener.allowed_upstreams.as_ref() {
         return allowed_upstreams
             .iter()
@@ -8981,7 +9044,11 @@ async fn forward_shielded_chat_with_retries(
     if runtime.liveness.mode == ShieldedLivenessMode::Disabled
         && runtime.chat_kind != ShieldedChatKind::Stream
     {
-        return Ok(immediate_shielded_retry_response(&runtime, in_flight_permit).await);
+        return Ok(Box::pin(immediate_shielded_retry_response(
+            &runtime,
+            in_flight_permit,
+        ))
+        .await);
     }
 
     match begin_shielded_retry(&runtime).await {
@@ -14239,13 +14306,15 @@ fn add_listener_metadata(metadata: &mut BTreeMap<String, String>, listener: &Lis
     metadata.insert(String::from("listener_port"), listener.port.to_string());
     metadata.insert(
         String::from("listener_restricted"),
-        listener.allowed_upstreams.is_some().to_string(),
+        (listener.allowed_upstreams.is_some() || listener.upstream_profile.is_some()).to_string(),
     );
 }
 
 fn select_shielded_liveness(
     state: &ProxyState,
     config: &AppConfig,
+    loop_guard: &LoopGuardConfig,
+    upstream_profile: &str,
     body: &Bytes,
     kind: ShieldedChatKind,
     now_unix_ms: u64,
@@ -14256,13 +14325,14 @@ fn select_shielded_liveness(
         .flatten();
     let repeat_observation = input_fingerprint
         .as_deref()
-        .filter(|_fingerprint| !config.loop_guard.effective_mode().is_disabled())
+        .filter(|_fingerprint| !loop_guard.effective_mode().is_disabled())
         .map_or_else(RepeatInputObservation::default, |fingerprint| {
             state.repeat_inputs.observe(
+                upstream_profile,
                 fingerprint,
                 now_unix_ms,
-                config.loop_guard.normalized_input_window_secs,
-                config.loop_guard.max_repeated_inputs,
+                loop_guard.normalized_input_window_secs,
+                loop_guard.max_repeated_inputs,
             )
         });
     let mode = match kind {
@@ -14285,8 +14355,8 @@ fn select_shielded_liveness(
         heartbeat_interval_secs: config.heartbeat.interval_secs,
         input_fingerprint,
         repeat_observation,
-        repeat_window_secs: config.loop_guard.normalized_input_window_secs,
-        repeat_max_inputs: config.loop_guard.max_repeated_inputs,
+        repeat_window_secs: loop_guard.normalized_input_window_secs,
+        repeat_max_inputs: loop_guard.max_repeated_inputs,
     }
 }
 

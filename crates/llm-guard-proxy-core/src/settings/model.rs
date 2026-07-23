@@ -333,6 +333,11 @@ impl AppConfig {
     fn validate_upstream_profiles(&self) -> Result<(), ValidationError> {
         let mut names = HashSet::from([DEFAULT_UPSTREAM_PROFILE_NAME.to_owned()]);
         let mut match_models = HashSet::new();
+        let forced_profile_names = self
+            .listeners
+            .iter()
+            .filter_map(|listener| listener.upstream_profile.as_deref())
+            .collect::<HashSet<_>>();
 
         for profile in &self.upstream_profiles {
             profile.validate()?;
@@ -347,11 +352,18 @@ impl AppConfig {
                     "upstreams.match_models",
                     "must not contain empty model aliases",
                 )?;
-                require(
-                    match_models.insert(model.clone()),
-                    "upstreams.match_models",
-                    "model aliases must be unique across upstream profiles",
-                )?;
+                if !match_models.insert(model.clone()) {
+                    let every_matching_profile_is_forced = self
+                        .upstream_profiles
+                        .iter()
+                        .filter(|candidate| candidate.matches_model(model))
+                        .all(|candidate| forced_profile_names.contains(candidate.name.as_str()));
+                    require(
+                        every_matching_profile_is_forced,
+                        "upstreams.match_models",
+                        "model aliases must be unique across upstream profiles unless every matching profile is forced by a listener",
+                    )?;
+                }
             }
         }
 
@@ -394,6 +406,22 @@ impl AppConfig {
                         allowed_profile_names.contains(upstream),
                         "listeners.allowed_upstreams",
                         "must reference default or a configured upstream profile name",
+                    )?;
+                }
+            }
+            if let Some(upstream_profile) = listener.upstream_profile.as_deref() {
+                require(
+                    allowed_profile_names.contains(upstream_profile),
+                    "listeners.upstream_profile",
+                    "must reference default or a configured upstream profile name",
+                )?;
+                if let Some(allowed_upstreams) = &listener.allowed_upstreams {
+                    require(
+                        allowed_upstreams
+                            .iter()
+                            .any(|name| name == upstream_profile),
+                        "listeners.upstream_profile",
+                        "must be included in listeners.allowed_upstreams when both are set",
                     )?;
                 }
             }
@@ -795,6 +823,8 @@ impl AppConfig {
             stuck_watchdog: self.upstream.stuck_watchdog.clone(),
             restart_queue: self.upstream.restart_queue.clone(),
             thinking: self.thinking.clone(),
+            loop_guard: None,
+            retry_ladder: None,
             #[cfg(feature = "param-override")]
             param_override: ParamOverrideConfig::default(),
         }
@@ -843,6 +873,7 @@ impl AppConfig {
             bind_host: self.server.bind_host.clone(),
             port: self.server.port,
             allowed_upstreams: None,
+            upstream_profile: None,
         }
     }
 
@@ -1061,6 +1092,8 @@ impl AppConfig {
             active.stuck_watchdog = requested.stuck_watchdog.clone();
             active.restart_queue = requested.restart_queue.clone();
             active.thinking = requested.thinking.clone();
+            active.loop_guard = requested.loop_guard.clone();
+            active.retry_ladder = requested.retry_ladder.clone();
             apply_reloadable_param_override(active, requested);
         }
     }
@@ -1254,6 +1287,7 @@ struct ListenerTopology {
     bind_host: String,
     port: u16,
     allowed_upstreams: Option<Vec<String>>,
+    upstream_profile: Option<String>,
 }
 
 impl From<&ListenerConfig> for ListenerTopology {
@@ -1263,6 +1297,7 @@ impl From<&ListenerConfig> for ListenerTopology {
             bind_host: listener.bind_host.clone(),
             port: listener.port,
             allowed_upstreams: listener.allowed_upstreams.clone(),
+            upstream_profile: listener.upstream_profile.clone(),
         }
     }
 }
@@ -1423,7 +1458,7 @@ impl Default for ServerConfig {
     }
 }
 
-/// One downstream TCP listener and optional upstream profile allow-list.
+/// One downstream TCP listener with optional upstream routing policy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListenerConfig {
     /// Stable listener identity stored in observability metadata.
@@ -1434,6 +1469,8 @@ pub struct ListenerConfig {
     pub port: u16,
     /// Allowed upstream profile names. `None` means all configured profiles.
     pub allowed_upstreams: Option<Vec<String>>,
+    /// Upstream profile selected for every request received on this listener.
+    pub upstream_profile: Option<String>,
 }
 
 impl ListenerConfig {
@@ -1482,6 +1519,23 @@ impl ListenerConfig {
                 )?;
             }
         }
+        if let Some(upstream_profile) = &self.upstream_profile {
+            require(
+                !upstream_profile.trim().is_empty(),
+                "listeners.upstream_profile",
+                "must not be empty when set",
+            )?;
+            require(
+                upstream_profile == upstream_profile.trim(),
+                "listeners.upstream_profile",
+                "must not have leading or trailing whitespace",
+            )?;
+            require(
+                upstream_profile.len() <= MAX_UPSTREAM_PROFILE_NAME_BYTES,
+                "listeners.upstream_profile",
+                "must be at most 128 bytes",
+            )?;
+        }
         Ok(())
     }
 
@@ -1513,6 +1567,7 @@ impl Default for ListenerConfig {
             bind_host: server.bind_host,
             port: server.port,
             allowed_upstreams: None,
+            upstream_profile: None,
         }
     }
 }
@@ -2129,6 +2184,10 @@ pub struct UpstreamProfileConfig {
     pub restart_queue: RestartQueueConfig,
     /// Thinking budget policy for this profile.
     pub thinking: ThinkingConfig,
+    /// Optional loop detection policy overriding the global loop guard.
+    pub loop_guard: Option<LoopGuardConfig>,
+    /// Optional retry ladder overriding the global retry ladder.
+    pub retry_ladder: Option<Vec<RetryLadderConfig>>,
     /// Inference parameter override policy for this profile.
     #[cfg(feature = "param-override")]
     pub param_override: ParamOverrideConfig,
@@ -2205,6 +2264,28 @@ impl UpstreamProfileConfig {
         self.restart_queue
             .validate(RestartQueueValidationFields::upstream_profile())?;
         self.thinking.validate("upstreams.thinking.max_tokens")?;
+        if let Some(loop_guard) = &self.loop_guard {
+            loop_guard
+                .validate()
+                .map_err(upstream_profile_loop_guard_validation_error)?;
+        }
+        if let Some(retry_ladder) = &self.retry_ladder {
+            require(
+                !retry_ladder.is_empty(),
+                "upstreams.retry.ladder",
+                "must contain at least one entry when set",
+            )?;
+            require(
+                retry_ladder.len() <= 10,
+                "upstreams.retry.ladder",
+                "must contain at most 10 entries",
+            )?;
+            for (index, entry) in retry_ladder.iter().enumerate() {
+                entry
+                    .validate(index)
+                    .map_err(upstream_profile_retry_ladder_validation_error)?;
+            }
+        }
         #[cfg(feature = "param-override")]
         self.param_override.validate("upstreams.param_override")?;
         Ok(())
@@ -2311,6 +2392,24 @@ impl UpstreamProfileConfig {
                 endpoint.base_url.as_str()
             })
     }
+
+    /// Returns this profile's loop guard or the global default when unset.
+    #[must_use]
+    pub fn effective_loop_guard<'a>(
+        &'a self,
+        global_loop_guard: &'a LoopGuardConfig,
+    ) -> &'a LoopGuardConfig {
+        self.loop_guard.as_ref().unwrap_or(global_loop_guard)
+    }
+
+    /// Returns this profile's retry ladder or the global default when unset.
+    #[must_use]
+    pub fn effective_retry_ladder<'a>(
+        &'a self,
+        global_retry: &'a RetryConfig,
+    ) -> &'a [RetryLadderConfig] {
+        self.retry_ladder.as_deref().unwrap_or(&global_retry.ladder)
+    }
 }
 
 impl Default for UpstreamProfileConfig {
@@ -2334,6 +2433,8 @@ impl Default for UpstreamProfileConfig {
             stuck_watchdog: upstream.stuck_watchdog,
             restart_queue: upstream.restart_queue,
             thinking: ThinkingConfig::default(),
+            loop_guard: None,
+            retry_ladder: None,
             #[cfg(feature = "param-override")]
             param_override: ParamOverrideConfig::default(),
         }
@@ -2471,6 +2572,8 @@ impl Default for ParamOverrideConfig {
 /// Bounded route reason stored in observability metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UpstreamRouteReason {
+    /// Listener configuration selected a named profile for every request.
+    ListenerForced,
     /// Request model matched a named profile alias.
     MatchedModel,
     /// Request had no usable model, so the implicit default profile was used.
@@ -2484,6 +2587,7 @@ impl UpstreamRouteReason {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::ListenerForced => "listener_forced",
             Self::MatchedModel => "matched_model",
             Self::DefaultNoModel => "default_no_model",
             Self::DefaultUnmatchedModel => "default_unmatched_model",
@@ -4019,6 +4123,58 @@ fn validate_guardian_systemd_unit(systemd_unit: &str) -> Result<(), ValidationEr
         "guardian.systemd_unit",
         "must be a valid single user service unit name",
     )
+}
+
+fn upstream_profile_loop_guard_validation_error(error: ValidationError) -> ValidationError {
+    let field = match error.field() {
+        "loop_guard.normalized_input_window_secs" => {
+            "upstreams.loop_guard.normalized_input_window_secs"
+        }
+        "loop_guard.max_repeated_inputs" => "upstreams.loop_guard.max_repeated_inputs",
+        "loop_guard.output_repeated_line_threshold" => {
+            "upstreams.loop_guard.output_repeated_line_threshold"
+        }
+        "loop_guard.output_token_window_size" => "upstreams.loop_guard.output_token_window_size",
+        "loop_guard.output_repeated_token_window_threshold" => {
+            "upstreams.loop_guard.output_repeated_token_window_threshold"
+        }
+        "loop_guard.output_suffix_cycle_threshold" => {
+            "upstreams.loop_guard.output_suffix_cycle_threshold"
+        }
+        "loop_guard.output_low_progress_min_bytes" => {
+            "upstreams.loop_guard.output_low_progress_min_bytes"
+        }
+        "loop_guard.output_low_progress_unique_ratio_percent" => {
+            "upstreams.loop_guard.output_low_progress_unique_ratio_percent"
+        }
+        "loop_guard.input_overlap_threshold_multiplier" => {
+            "upstreams.loop_guard.input_overlap_threshold_multiplier"
+        }
+        "loop_guard.reasoning_semantic_similarity_threshold_percent" => {
+            "upstreams.loop_guard.reasoning_semantic_similarity_threshold_percent"
+        }
+        "loop_guard.reasoning_semantic_window_token_count" => {
+            "upstreams.loop_guard.reasoning_semantic_window_token_count"
+        }
+        "loop_guard.reasoning_semantic_minimum_token_count" => {
+            "upstreams.loop_guard.reasoning_semantic_minimum_token_count"
+        }
+        "loop_guard.reasoning_semantic_history_window_count" => {
+            "upstreams.loop_guard.reasoning_semantic_history_window_count"
+        }
+        _ => return error,
+    };
+    ValidationError::new(field, error.message())
+}
+
+fn upstream_profile_retry_ladder_validation_error(error: ValidationError) -> ValidationError {
+    let field = match error.field() {
+        "retry.ladder.name" => "upstreams.retry.ladder.name",
+        "retry.ladder.max_tokens" => "upstreams.retry.ladder.max_tokens",
+        "retry.ladder.anti_loop_hint" => "upstreams.retry.ladder.anti_loop_hint",
+        _ => return error,
+    };
+    ValidationError::new(field, error.message())
 }
 
 fn require(
