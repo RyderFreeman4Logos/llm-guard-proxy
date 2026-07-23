@@ -9,7 +9,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex, MutexGuard,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -67,7 +67,10 @@ use tokio::task::{AbortHandle, JoinSet};
 use tokio::{
     net::TcpListener,
     process::Command,
-    sync::{Mutex as AsyncMutex, Notify, Semaphore, futures::OwnedNotified, mpsc, oneshot},
+    sync::{
+        Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, futures::OwnedNotified, mpsc,
+        oneshot,
+    },
     time::{Instant, Interval, MissedTickBehavior, Sleep, timeout},
 };
 
@@ -6717,7 +6720,7 @@ struct StuckWatchdogAttemptLease {
     request: StuckWatchdogRequest,
     attempt_id: u64,
     progress_parser: Arc<Mutex<WatchdogProgressParser>>,
-    upstream_progress_recorded: Arc<AtomicBool>,
+    progress_state: Arc<AtomicU8>,
     upstream_terminalized: Arc<AtomicBool>,
     ended: bool,
 }
@@ -6729,8 +6732,43 @@ struct StuckWatchdogAttemptProgress {
     request: StuckWatchdogRequest,
     attempt_id: u64,
     progress_parser: Arc<Mutex<WatchdogProgressParser>>,
-    upstream_progress_recorded: Arc<AtomicBool>,
+    progress_state: Arc<AtomicU8>,
     upstream_terminalized: Arc<AtomicBool>,
+}
+
+const WATCHDOG_PROGRESS_OPEN: u8 = 0;
+const WATCHDOG_PROGRESS_STREAMING: u8 = 1;
+const WATCHDOG_PROGRESS_TERMINAL_CLAIMED: u8 = 2;
+
+fn claim_watchdog_terminal_progress(progress_state: &AtomicU8) -> bool {
+    progress_state
+        .compare_exchange(
+            WATCHDOG_PROGRESS_OPEN,
+            WATCHDOG_PROGRESS_TERMINAL_CLAIMED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_ok()
+}
+
+fn claim_watchdog_stream_progress(progress_state: &AtomicU8) -> bool {
+    let mut state = progress_state.load(Ordering::Acquire);
+    loop {
+        match state {
+            WATCHDOG_PROGRESS_OPEN => match progress_state.compare_exchange_weak(
+                WATCHDOG_PROGRESS_OPEN,
+                WATCHDOG_PROGRESS_STREAMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) | Err(WATCHDOG_PROGRESS_STREAMING) => return true,
+                Err(next_state) => state = next_state,
+            },
+            WATCHDOG_PROGRESS_STREAMING => return true,
+            WATCHDOG_PROGRESS_TERMINAL_CLAIMED => return false,
+            _ => unreachable!("watchdog progress state must stay in the defined state machine"),
+        }
+    }
 }
 
 impl StuckWatchdogTokenTracker {
@@ -6765,6 +6803,7 @@ impl StuckWatchdogTokenTracker {
         }
     }
 
+    #[cfg(test)]
     fn record_response(
         &self,
         profile: &str,
@@ -6909,7 +6948,7 @@ impl StuckWatchdogRequest {
             request: self.clone(),
             attempt_id,
             progress_parser: Arc::new(Mutex::new(WatchdogProgressParser::default())),
-            upstream_progress_recorded: Arc::new(AtomicBool::new(false)),
+            progress_state: Arc::new(AtomicU8::new(WATCHDOG_PROGRESS_OPEN)),
             upstream_terminalized: Arc::new(AtomicBool::new(false)),
             ended: false,
         }
@@ -6930,12 +6969,21 @@ impl StuckWatchdogRequest {
         }
     }
 
-    fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
-        self.inner.tracker.record_response(
+    fn response_has_progress(response_body: &[u8], sse_body: &[u8]) -> bool {
+        parse_token_usage(response_body, sse_body)
+            .output_tokens
+            .is_some()
+    }
+
+    fn record_response_progress(&self) {
+        self.record_progress(1);
+    }
+
+    fn record_progress(&self, progress: u64) {
+        self.inner.tracker.record_progress(
             &self.inner.profile,
             self.inner.detection_window,
-            response_body,
-            sse_body,
+            progress,
         );
     }
 
@@ -6944,48 +6992,34 @@ impl StuckWatchdogRequest {
         parser: &Mutex<WatchdogProgressParser>,
         chunk: &[u8],
     ) -> WatchdogProgressState {
-        let state = {
+        {
             let mut parser = parser
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             emitted_progress(self.inner.progress_unit, &mut parser, chunk)
-        };
-        if let WatchdogProgressState::Progress(progress) = state {
-            self.inner.tracker.record_progress(
-                &self.inner.profile,
-                self.inner.detection_window,
-                progress,
-            );
         }
-        state
     }
 
     fn record_non_sse_progress_at_upstream_eof(
         &self,
         parser: &Mutex<WatchdogProgressParser>,
     ) -> WatchdogProgressState {
-        let state = {
+        {
             let mut parser = parser
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             non_sse_progress_at_eof(self.inner.progress_unit, &mut parser)
-        };
-        if let WatchdogProgressState::Progress(progress) = state {
-            self.inner.tracker.record_progress(
-                &self.inner.profile,
-                self.inner.detection_window,
-                progress,
-            );
         }
-        state
     }
 
     #[cfg(test)]
     fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
-        matches!(
-            self.record_emitted_progress(&self.inner.fallback_progress_parser, chunk),
-            WatchdogProgressState::Progress(_)
-        )
+        let state = self.record_emitted_progress(&self.inner.fallback_progress_parser, chunk);
+        if let WatchdogProgressState::Progress(progress) = state {
+            self.record_progress(progress);
+            return true;
+        }
+        false
     }
 
     fn set_attempt_observation_suspended(&self, attempt_id: u64, suspended: bool) {
@@ -7031,33 +7065,36 @@ impl StuckWatchdogAttemptLease {
             request: self.request.clone(),
             attempt_id: self.attempt_id,
             progress_parser: Arc::clone(&self.progress_parser),
-            upstream_progress_recorded: Arc::clone(&self.upstream_progress_recorded),
+            progress_state: Arc::clone(&self.progress_state),
             upstream_terminalized: Arc::clone(&self.upstream_terminalized),
         }
     }
 
     fn record_response(&self, response_body: &[u8], sse_body: &[u8]) {
-        if self.upstream_progress_recorded.load(Ordering::Relaxed)
-            || self.upstream_terminalized.load(Ordering::Relaxed)
+        if self.upstream_terminalized.load(Ordering::Acquire)
+            || !StuckWatchdogRequest::response_has_progress(response_body, sse_body)
+            || !claim_watchdog_terminal_progress(&self.progress_state)
         {
             return;
         }
-        self.request.record_response(response_body, sse_body);
+        self.request.record_response_progress();
     }
 
     fn record_emitted_chunk(&self, chunk: &[u8]) -> bool {
         let state = self
             .request
             .record_emitted_progress(&self.progress_parser, chunk);
-        if matches!(state, WatchdogProgressState::Progress(_)) {
-            self.upstream_progress_recorded
-                .store(true, Ordering::Relaxed);
+        if let WatchdogProgressState::Progress(progress) = state
+            && claim_watchdog_stream_progress(&self.progress_state)
+        {
+            self.request.record_progress(progress);
+            return true;
         }
         if matches!(state, WatchdogProgressState::UnobservableOversize) {
             self.request
                 .set_attempt_unobservable_progress(self.attempt_id);
         }
-        matches!(state, WatchdogProgressState::Progress(_))
+        false
     }
 
     #[cfg(test)]
@@ -7080,7 +7117,7 @@ impl StuckWatchdogAttemptLease {
 
 impl StuckWatchdogAttemptProgress {
     fn end_attempt(&self) {
-        self.upstream_terminalized.store(true, Ordering::Relaxed);
+        self.upstream_terminalized.store(true, Ordering::Release);
         self.request.finish_attempt(self.attempt_id);
     }
 
@@ -7088,27 +7125,27 @@ impl StuckWatchdogAttemptProgress {
         let state = self
             .request
             .record_emitted_progress(&self.progress_parser, chunk);
-        if matches!(state, WatchdogProgressState::Progress(_)) {
-            self.upstream_progress_recorded
-                .store(true, Ordering::Relaxed);
+        if let WatchdogProgressState::Progress(progress) = state
+            && claim_watchdog_stream_progress(&self.progress_state)
+        {
+            self.request.record_progress(progress);
+            return true;
         }
         if matches!(state, WatchdogProgressState::UnobservableOversize) {
             self.request
                 .set_attempt_unobservable_progress(self.attempt_id);
         }
-        matches!(state, WatchdogProgressState::Progress(_))
+        false
     }
 
     fn record_non_sse_progress_at_upstream_eof(&self) {
-        if self.upstream_progress_recorded.load(Ordering::Relaxed) {
-            return;
-        }
         let state = self
             .request
             .record_non_sse_progress_at_upstream_eof(&self.progress_parser);
-        if matches!(state, WatchdogProgressState::Progress(_)) {
-            self.upstream_progress_recorded
-                .store(true, Ordering::Relaxed);
+        if let WatchdogProgressState::Progress(progress) = state
+            && claim_watchdog_terminal_progress(&self.progress_state)
+        {
+            self.request.record_progress(progress);
         }
     }
 
@@ -12920,6 +12957,214 @@ impl BodyCompletion {
 
 /// Capacity of the downstream-facing half of the independent upstream body relay.
 const OBSERVED_UPSTREAM_RELAY_CAPACITY: usize = 16;
+/// Total retained payload bytes shared by the relay channel and its ordered pending queue.
+/// One oversized source chunk is admitted losslessly while consuming the entire budget, so
+/// subsequent polling still remains flow-controlled until that chunk is delivered or dropped.
+const OBSERVED_UPSTREAM_RELAY_BYTE_BUDGET: usize = 384 * 1024;
+
+struct RetainedObservedUpstreamItem {
+    item: Result<Bytes, reqwest::Error>,
+    byte_budget_permit: Option<OwnedSemaphorePermit>,
+}
+
+fn relay_byte_budget_permits(bytes_len: usize) -> u32 {
+    u32::try_from(bytes_len.min(OBSERVED_UPSTREAM_RELAY_BYTE_BUDGET))
+        .expect("observed relay byte budget fits in Tokio semaphore permits")
+}
+
+fn drain_relay_pending(
+    tx: &mpsc::Sender<RetainedObservedUpstreamItem>,
+    pending: &mut VecDeque<RetainedObservedUpstreamItem>,
+) -> bool {
+    while let Some(item) = pending.pop_front() {
+        match tx.try_send(item) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(item)) => {
+                pending.push_front(item);
+                break;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return false,
+        }
+    }
+    true
+}
+
+async fn send_relay_pending(
+    tx: &mpsc::Sender<RetainedObservedUpstreamItem>,
+    pending: &mut VecDeque<RetainedObservedUpstreamItem>,
+) -> bool {
+    let item = pending.pop_front().expect("non-empty pending queue");
+    tx.send(item).await.is_ok()
+}
+
+async fn acquire_relay_byte_budget(
+    tx: &mpsc::Sender<RetainedObservedUpstreamItem>,
+    byte_budget: &Arc<Semaphore>,
+    bytes_len: usize,
+    progress: Option<&StuckWatchdogAttemptProgress>,
+) -> Result<Option<OwnedSemaphorePermit>, ()> {
+    let permit_count = relay_byte_budget_permits(bytes_len);
+    if permit_count == 0 {
+        return Ok(None);
+    }
+    if byte_budget.available_permits() < permit_count as usize
+        && let Some(progress) = progress
+    {
+        progress.suspend_observation();
+    }
+    let permit = tokio::select! {
+        biased;
+        () = tx.closed() => return Err(()),
+        permit = Arc::clone(byte_budget).acquire_many_owned(permit_count) => {
+            permit.expect("observed relay owns the only byte-budget semaphore handle")
+        }
+    };
+    if let Some(progress) = progress {
+        progress.resume_observation();
+    }
+    Ok(Some(permit))
+}
+
+async fn retain_observed_upstream_item(
+    item: Option<Result<Bytes, reqwest::Error>>,
+    tx: &mpsc::Sender<RetainedObservedUpstreamItem>,
+    byte_budget: &Arc<Semaphore>,
+    progress: Option<&StuckWatchdogAttemptProgress>,
+    pending: &mut VecDeque<RetainedObservedUpstreamItem>,
+) -> Result<bool, ()> {
+    match item {
+        Some(Ok(bytes)) => {
+            let Ok(byte_budget_permit) =
+                acquire_relay_byte_budget(tx, byte_budget, bytes.len(), progress).await
+            else {
+                return Err(());
+            };
+            if let Some(progress) = progress {
+                progress.record_upstream_emitted_chunk(&bytes);
+            }
+            pending.push_back(RetainedObservedUpstreamItem {
+                item: Ok(bytes),
+                byte_budget_permit,
+            });
+            Ok(true)
+        }
+        Some(Err(error)) => {
+            if let Some(progress) = progress {
+                progress.end_attempt();
+            }
+            pending.push_back(RetainedObservedUpstreamItem {
+                item: Err(error),
+                byte_budget_permit: None,
+            });
+            Ok(false)
+        }
+        None => {
+            if let Some(progress) = progress {
+                progress.record_non_sse_progress_at_upstream_eof();
+                progress.end_attempt();
+            }
+            Ok(false)
+        }
+    }
+}
+
+async fn run_observed_upstream_relay(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    tx: mpsc::Sender<RetainedObservedUpstreamItem>,
+    byte_budget: Arc<Semaphore>,
+    progress: Option<StuckWatchdogAttemptProgress>,
+) {
+    let mut stream = std::pin::pin!(stream);
+    let mut pending: VecDeque<RetainedObservedUpstreamItem> = VecDeque::new();
+    let mut upstream_open = true;
+    loop {
+        if tx.is_closed() {
+            return;
+        }
+        // Prefer draining retained items when the client is reading so the
+        // ordered buffer can accept the next upstream chunk without loss.
+        if !drain_relay_pending(&tx, &mut pending) {
+            return;
+        }
+        if !upstream_open {
+            if pending.is_empty() {
+                return;
+            }
+            // Upstream finished; wait for client capacity while delivering
+            // every retained ordered chunk exactly once.
+            if let Some(progress) = &progress {
+                progress.suspend_observation();
+            }
+            if !send_relay_pending(&tx, &mut pending).await {
+                return;
+            }
+            continue;
+        }
+        if pending.len() < OBSERVED_UPSTREAM_RELAY_CAPACITY && byte_budget.available_permits() > 0 {
+            if let Some(progress) = &progress {
+                progress.resume_observation();
+            }
+            let item = tokio::select! {
+                biased;
+                () = tx.closed() => return,
+                item = stream.next() => item,
+            };
+            upstream_open = match retain_observed_upstream_item(
+                item,
+                &tx,
+                &byte_budget,
+                progress.as_ref(),
+                &mut pending,
+            )
+            .await
+            {
+                Ok(upstream_open) => upstream_open,
+                Err(()) => return,
+            };
+            continue;
+        }
+        if pending.is_empty() {
+            // All retained bytes are already in the channel. Do not poll upstream
+            // again until downstream consumption releases the shared byte budget.
+            if let Some(progress) = &progress {
+                progress.suspend_observation();
+            }
+            let permit = tokio::select! {
+                biased;
+                () = tx.closed() => return,
+                permit = Arc::clone(&byte_budget).acquire_owned() => {
+                    permit.expect("observed relay owns the only byte-budget semaphore handle")
+                }
+            };
+            drop(permit);
+            continue;
+        }
+        // Downstream is not draining and the ordered buffer is full. Wait for
+        // either client capacity or cancellation; never poll and discard more
+        // upstream body while the still-open stream cannot retain it.
+        // Mark the attempt before `reserve()` can park: while flow control
+        // blocks this relay, the proxy has no observation path to upstream.
+        if let Some(progress) = &progress {
+            progress.suspend_observation();
+        }
+        tokio::select! {
+            biased;
+            () = tx.closed() => return,
+            result = tx.reserve() => match result {
+                Ok(permit) => {
+                    let item = pending.pop_front().expect("full pending queue is non-empty");
+                    // A downstream read released capacity. Resume observation
+                    // immediately so the next upstream poll has a fresh maturity window.
+                    if let Some(progress) = &progress {
+                        progress.resume_observation();
+                    }
+                    permit.send(item);
+                }
+                Err(_) => return,
+            },
+        }
+    }
+}
 
 /// Pulls the upstream body on a dedicated task so stuck-watchdog progress tracks
 /// engine production rather than client consumption. Every observed response
@@ -12932,101 +13177,22 @@ fn observe_upstream_body_independently(
     progress: Option<StuckWatchdogAttemptProgress>,
 ) -> impl Stream<Item = Result<Bytes, reqwest::Error>> + Send {
     let (tx, rx) = mpsc::channel(OBSERVED_UPSTREAM_RELAY_CAPACITY);
-    tokio::spawn(async move {
-        let mut stream = std::pin::pin!(stream);
-        let mut pending: VecDeque<Result<Bytes, reqwest::Error>> = VecDeque::new();
-        let mut upstream_open = true;
-        loop {
-            if tx.is_closed() {
-                return;
-            }
-            // Prefer draining retained items when the client is reading so the
-            // ordered buffer can accept the next upstream chunk without loss.
-            while !pending.is_empty() {
-                match tx.try_send(pending.pop_front().expect("non-empty pending queue")) {
-                    Ok(()) => {}
-                    Err(mpsc::error::TrySendError::Full(item)) => {
-                        pending.push_front(item);
-                        break;
-                    }
-                    Err(mpsc::error::TrySendError::Closed(_)) => return,
-                }
-            }
-            if !upstream_open {
-                if pending.is_empty() {
-                    return;
-                }
-                // Upstream finished; wait for client capacity while delivering
-                // every retained ordered chunk exactly once.
-                if let Some(progress) = &progress {
-                    progress.suspend_observation();
-                }
-                let item = pending.pop_front().expect("non-empty pending queue");
-                if tx.send(item).await.is_err() {
-                    return;
-                }
-                continue;
-            }
-            if pending.len() < OBSERVED_UPSTREAM_RELAY_CAPACITY {
-                if let Some(progress) = &progress {
-                    progress.resume_observation();
-                }
-                tokio::select! {
-                    biased;
-                    () = tx.closed() => return,
-                    item = stream.next() => match item {
-                        Some(Ok(bytes)) => {
-                            if let Some(progress) = &progress {
-                                progress.record_upstream_emitted_chunk(&bytes);
-                            }
-                            pending.push_back(Ok(bytes));
-                        }
-                        Some(Err(error)) => {
-                            if let Some(progress) = &progress {
-                                progress.end_attempt();
-                            }
-                            pending.push_back(Err(error));
-                            upstream_open = false;
-                        }
-                        None => {
-                            if let Some(progress) = &progress {
-                                progress.record_non_sse_progress_at_upstream_eof();
-                                progress.end_attempt();
-                            }
-                            upstream_open = false;
-                        }
-                    },
-                }
-                continue;
-            }
-            // Downstream is not draining and the ordered buffer is full. Wait for
-            // either client capacity or cancellation; never poll and discard more
-            // upstream body while the still-open stream cannot retain it.
-            // Mark the attempt before `reserve()` can park: while flow control
-            // blocks this relay, the proxy has no observation path to upstream.
-            if let Some(progress) = &progress {
-                progress.suspend_observation();
-            }
-            tokio::select! {
-                biased;
-                () = tx.closed() => return,
-                result = tx.reserve() => match result {
-                    Ok(permit) => {
-                        let item = pending.pop_front().expect("full pending queue is non-empty");
-                        // A downstream read released capacity. Resume observation
-                        // immediately so the next upstream poll has a fresh maturity window.
-                        if let Some(progress) = &progress {
-                            progress.resume_observation();
-                        }
-                        permit.send(item);
-                    }
-                    Err(_) => return,
-                },
-            }
-        }
-    });
+    let byte_budget = Arc::new(Semaphore::new(OBSERVED_UPSTREAM_RELAY_BYTE_BUDGET));
+    tokio::spawn(run_observed_upstream_relay(
+        stream,
+        tx,
+        byte_budget,
+        progress,
+    ));
     futures_util::stream::unfold(rx, |mut rx| async move {
-        rx.recv().await.map(|item| (item, rx))
+        rx.recv().await.map(|retained| {
+            let RetainedObservedUpstreamItem {
+                item,
+                byte_budget_permit,
+            } = retained;
+            drop(byte_budget_permit);
+            (item, rx)
+        })
     })
 }
 
