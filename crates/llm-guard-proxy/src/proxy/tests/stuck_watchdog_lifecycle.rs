@@ -615,6 +615,93 @@ async fn watchdog_lifecycle_does_not_restart_for_large_complete_chat_progress() 
 }
 
 #[tokio::test]
+async fn watchdog_sse_event_framing_records_healthy_events_before_suppressing_mature_overlap_recovery()
+ {
+    let detection_window = Duration::from_secs(2);
+    for (name, chunks) in [
+        (
+            "multiline-data",
+            vec![
+                b"data: {\"choices\":[{\"delta\":\ndata: {\"content\":\"healthy\"}}]}\n\n"
+                    .as_slice(),
+            ],
+        ),
+        (
+            "cr-only",
+            vec![b"data: {\"choices\":[{\"delta\":{\"content\":\"healthy\"}}]}\r\r".as_slice()],
+        ),
+    ] {
+        let fake = FakeUpstream::spawn().await;
+        let test_root = create_watchdog_test_root(&format!("sse-event-framing-{name}"));
+        let _cleanup = TestDirectoryCleanup::new(&test_root);
+        let marker = test_root.join("restart.marker");
+        let proxy = spawn_watchdog_proxy(
+            &fake.base_url,
+            &recovery_watchdog_config(&marker, 1, detection_window.as_secs(), 1),
+        )
+        .await;
+        let stalled = proxy.state.stuck_watchdog_tokens.begin_request(
+            "default",
+            WatchdogProgressUnit::Chat,
+            detection_window,
+        );
+        {
+            let mut windows = proxy
+                .state
+                .stuck_watchdog_tokens
+                .windows
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let stalled_attempt = windows
+                .get_mut("default")
+                .and_then(|window| window.attempts.values_mut().next())
+                .expect("the stalled request must own the active watchdog attempt");
+            stalled_attempt.started_at = Instant::now()
+                .checked_sub(Duration::from_secs(3))
+                .expect("test Instant supports deterministic watchdog maturation");
+        }
+        assert!(
+            proxy
+                .state
+                .stuck_watchdog_tokens
+                .has_too_few_output_progress_units("default", detection_window, 1,),
+            "the {name} lifecycle must begin with a mature stalled overlap"
+        );
+
+        let healthy = proxy.state.stuck_watchdog_tokens.begin_request(
+            "default",
+            WatchdogProgressUnit::Chat,
+            detection_window,
+        );
+        for chunk in chunks {
+            healthy.record_upstream_emitted_chunk(chunk);
+        }
+        assert_eq!(
+            proxy.state.stuck_watchdog_tokens.sample_count("default"),
+            1,
+            "the healthy {name} event must record one upstream progress sample"
+        );
+        assert!(
+            !proxy
+                .state
+                .stuck_watchdog_tokens
+                .has_too_few_output_progress_units("default", detection_window, 1,),
+            "the healthy {name} sample must suppress recovery for the mature overlap"
+        );
+
+        let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+        let restarted = wait_for_path(&marker, Duration::from_millis(1_100)).await;
+        drop(healthy);
+        drop(stalled);
+        stop_watchdog(&proxy, watchdog).await;
+        assert!(
+            !restarted,
+            "a healthy {name} event must suppress the configured watchdog restart"
+        );
+    }
+}
+
+#[tokio::test]
 async fn watchdog_lifecycle_suspends_split_oversized_progress_for_every_protocol() {
     for (name, unit, residual_cap) in [
         ("chat", WatchdogProgressUnit::Chat, 64 * 1024),

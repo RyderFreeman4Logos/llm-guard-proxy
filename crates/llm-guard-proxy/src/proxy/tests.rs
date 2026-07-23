@@ -40,6 +40,8 @@ mod shielded_endpoint_rendering;
 mod stuck_watchdog_lifecycle;
 #[path = "tests/stuck_watchdog_terminalization.rs"]
 mod stuck_watchdog_terminalization;
+#[path = "tests/watchdog_sse_event_framing.rs"]
+mod watchdog_sse_event_framing;
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;

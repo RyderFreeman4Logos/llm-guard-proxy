@@ -41,13 +41,45 @@ pub(super) enum WatchdogProgressState {
 #[derive(Debug)]
 pub(super) struct WatchdogProgressParser {
     pending: Vec<u8>,
+    sse: SseEventParser,
+    sse_framing: bool,
     state: WatchdogProgressState,
+}
+
+/// Incrementally accumulates one SSE event without retaining prior dispatched
+/// events. `line` owns the field currently crossing a chunk boundary and
+/// `data` owns only the current event's joined `data:` values.
+#[derive(Debug, Default)]
+struct SseEventParser {
+    line: Vec<u8>,
+    data: Vec<u8>,
+    has_data: bool,
+    skip_lf_after_cr: bool,
+}
+
+impl SseEventParser {
+    fn is_empty(&self) -> bool {
+        self.line.is_empty() && self.data.is_empty() && !self.has_data && !self.skip_lf_after_cr
+    }
+
+    fn clear(&mut self) {
+        self.line.clear();
+        self.data.clear();
+        self.has_data = false;
+        self.skip_lf_after_cr = false;
+    }
+
+    fn retained_len(&self) -> usize {
+        self.line.len().saturating_add(self.data.len())
+    }
 }
 
 impl Default for WatchdogProgressParser {
     fn default() -> Self {
         Self {
             pending: Vec::new(),
+            sse: SseEventParser::default(),
+            sse_framing: false,
             state: WatchdogProgressState::Incomplete,
         }
     }
@@ -62,40 +94,66 @@ pub(super) fn emitted_progress(
         return parser.state;
     }
 
+    if parser.sse_framing {
+        let progress = if parser.sse.is_empty() && chunk.len() > MAX_PENDING_SSE_RESIDUAL_BYTES {
+            complete_sse_progress_without_buffering(progress_unit, chunk).ok_or(())
+        } else {
+            parser.sse.consume(chunk, progress_unit)
+        };
+        return record_sse_progress(parser, progress);
+    }
+
     let pending_cap = residual_cap(progress_unit, &parser.pending, chunk);
-    let retained_chunk_len = chunk.iter().filter(|byte| **byte != b'\r').count();
-    if retained_chunk_len > pending_cap.saturating_sub(parser.pending.len()) {
+    if chunk.len() > pending_cap.saturating_sub(parser.pending.len()) {
         if parser.pending.is_empty()
             && let Some(progress) = complete_progress_without_buffering(progress_unit, chunk)
         {
             parser.state = progress_state(progress);
             return parser.state;
         }
-        parser.state = WatchdogProgressState::UnobservableOversize;
-        return parser.state;
+        return mark_unobservable_oversize(parser);
     }
 
-    parser
-        .pending
-        .extend(chunk.iter().copied().filter(|byte| *byte != b'\r'));
-    let progress = match progress_unit {
-        WatchdogProgressUnit::Chat => {
-            complete_sse_progress(&mut parser.pending, sse_event_has_model_content)
-        }
-        WatchdogProgressUnit::Completion => {
-            complete_sse_progress(&mut parser.pending, sse_event_has_completion_text)
-        }
-        WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
-            complete_result_progress(progress_unit, &mut parser.pending)
-        }
-    };
-    let pending_cap = residual_cap(progress_unit, &parser.pending, &[]);
-    if parser.pending.len() > pending_cap {
-        parser.pending.truncate(pending_cap);
-        parser.state = WatchdogProgressState::UnobservableOversize;
-    } else {
-        parser.state = progress_state(progress);
+    parser.pending.extend_from_slice(chunk);
+    if has_sse_framing(&parser.pending) {
+        parser.sse_framing = true;
+        let buffered = std::mem::take(&mut parser.pending);
+        let progress = parser.sse.consume(&buffered, progress_unit);
+        return record_sse_progress(parser, progress);
     }
+
+    let progress = match progress_unit {
+        WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
+            let Ok(event) = serde_json::from_slice::<Value>(&parser.pending) else {
+                parser.state = WatchdogProgressState::Incomplete;
+                return parser.state;
+            };
+            parser.pending.clear();
+            u64::from(result_event_has_progress(progress_unit, &event))
+        }
+        WatchdogProgressUnit::Chat | WatchdogProgressUnit::Completion => 0,
+    };
+    parser.state = progress_state(progress);
+    parser.state
+}
+
+fn record_sse_progress(
+    parser: &mut WatchdogProgressParser,
+    progress: Result<u64, ()>,
+) -> WatchdogProgressState {
+    match progress {
+        Ok(progress) => {
+            parser.state = progress_state(progress);
+            parser.state
+        }
+        Err(()) => mark_unobservable_oversize(parser),
+    }
+}
+
+fn mark_unobservable_oversize(parser: &mut WatchdogProgressParser) -> WatchdogProgressState {
+    parser.pending.clear();
+    parser.sse.clear();
+    parser.state = WatchdogProgressState::UnobservableOversize;
     parser.state
 }
 
@@ -112,7 +170,7 @@ pub(super) fn non_sse_progress_at_eof(
             progress_unit,
             WatchdogProgressUnit::Chat | WatchdogProgressUnit::Completion
         )
-        || has_sse_framing(&parser.pending)
+        || parser.sse_framing
     {
         return parser.state;
     }
@@ -125,6 +183,13 @@ pub(super) fn non_sse_progress_at_eof(
     parser.pending.clear();
     parser.state = progress_state(progress);
     parser.state
+}
+
+fn complete_chat_or_completion_response(response: &Value) -> bool {
+    response
+        .get("choices")
+        .and_then(Value::as_array)
+        .is_some_and(|choices| !choices.is_empty())
 }
 
 const fn progress_state(progress: u64) -> WatchdogProgressState {
@@ -150,101 +215,190 @@ fn complete_progress_without_buffering(
     progress_unit: WatchdogProgressUnit,
     chunk: &[u8],
 ) -> Option<u64> {
+    if has_sse_framing(chunk) {
+        return complete_sse_progress_without_buffering(progress_unit, chunk);
+    }
+
     match progress_unit {
-        WatchdogProgressUnit::Chat => {
-            complete_sse_progress_without_buffering(chunk, sse_event_has_model_content)
-        }
-        WatchdogProgressUnit::Completion => {
-            complete_sse_progress_without_buffering(chunk, sse_event_has_completion_text)
-        }
-        WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker
-            if has_sse_framing(chunk) =>
-        {
-            complete_sse_progress_without_buffering(chunk, |event| {
-                result_event_has_progress(progress_unit, event)
-            })
-        }
         WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
             serde_json::from_slice::<Value>(chunk)
                 .ok()
                 .map(|event| u64::from(result_event_has_progress(progress_unit, &event)))
         }
+        WatchdogProgressUnit::Chat | WatchdogProgressUnit::Completion => None,
     }
 }
 
-fn complete_sse_progress_without_buffering<F>(chunk: &[u8], event_has_progress: F) -> Option<u64>
-where
-    F: Fn(&Value) -> bool,
-{
-    if chunk.contains(&b'\r') {
-        return None;
-    }
-    let mut remaining = chunk;
+/// Parses a complete oversized SSE chunk while retaining only the current
+/// event's joined data. A single oversized data field is parsed from its
+/// borrowed input slice; multi-data events must fit the normal event cap.
+fn complete_sse_progress_without_buffering(
+    progress_unit: WatchdogProgressUnit,
+    chunk: &[u8],
+) -> Option<u64> {
+    let mut offset = 0;
     let mut progress = 0_u64;
-    while let Some(frame_end) = remaining.windows(2).position(|window| window == b"\n\n") {
-        let frame_end = frame_end.saturating_add(2);
-        progress =
-            progress.saturating_add(sse_progress(&remaining[..frame_end], &event_has_progress));
-        remaining = &remaining[frame_end..];
+    let mut data = Vec::new();
+    let mut large_single_data: Option<&[u8]> = None;
+    let mut has_data = false;
+
+    while offset < chunk.len() {
+        let (line, next_offset) = next_sse_line(chunk, offset)?;
+        offset = next_offset;
+        if line.is_empty() {
+            if has_data {
+                let event_data = large_single_data.unwrap_or(&data);
+                progress = progress
+                    .saturating_add(u64::from(sse_data_has_progress(progress_unit, event_data)));
+            }
+            data.clear();
+            large_single_data = None;
+            has_data = false;
+            continue;
+        }
+        if let Some(field_data) = line.strip_prefix(b"data:") {
+            let field_data = field_data.strip_prefix(b" ").unwrap_or(field_data);
+            if large_single_data.is_some() {
+                return None;
+            }
+            if !has_data && field_data.len() > MAX_PENDING_SSE_RESIDUAL_BYTES {
+                large_single_data = Some(field_data);
+                has_data = true;
+                continue;
+            }
+            let joined_len = data
+                .len()
+                .saturating_add(usize::from(has_data))
+                .saturating_add(field_data.len());
+            if joined_len > MAX_PENDING_SSE_RESIDUAL_BYTES {
+                return None;
+            }
+            if has_data {
+                data.push(b'\n');
+            }
+            data.extend_from_slice(field_data);
+            has_data = true;
+        }
     }
-    remaining.is_empty().then_some(progress)
+
+    Some(progress)
 }
 
-fn complete_sse_progress<F>(pending: &mut Vec<u8>, event_has_progress: F) -> u64
-where
-    F: Fn(&Value) -> bool,
-{
-    let mut progress = 0_u64;
-    while let Some(frame_end) = pending.windows(2).position(|window| window == b"\n\n") {
-        let frame = pending.drain(..frame_end + 2).collect::<Vec<_>>();
-        progress = progress.saturating_add(sse_progress(&frame, &event_has_progress));
-    }
-    progress
-}
-
-fn complete_result_progress(progress_unit: WatchdogProgressUnit, pending: &mut Vec<u8>) -> u64 {
-    if has_sse_framing(pending) {
-        return complete_sse_progress(pending, |event| {
-            result_event_has_progress(progress_unit, event)
-        });
-    }
-
-    let Ok(event) = serde_json::from_slice::<Value>(pending) else {
-        return 0;
+fn next_sse_line(input: &[u8], offset: usize) -> Option<(&[u8], usize)> {
+    let line_end = input[offset..]
+        .iter()
+        .position(|byte| matches!(byte, b'\n' | b'\r'))?
+        .saturating_add(offset);
+    let after_line_end = if input[line_end] == b'\r' && input.get(line_end + 1) == Some(&b'\n') {
+        line_end.saturating_add(2)
+    } else {
+        line_end.saturating_add(1)
     };
-    pending.clear();
-    u64::from(result_event_has_progress(progress_unit, &event))
+    Some((&input[offset..line_end], after_line_end))
 }
 
-fn complete_chat_or_completion_response(response: &Value) -> bool {
-    response
-        .get("choices")
-        .and_then(Value::as_array)
-        .is_some_and(|choices| !choices.is_empty())
+impl SseEventParser {
+    fn consume(&mut self, chunk: &[u8], progress_unit: WatchdogProgressUnit) -> Result<u64, ()> {
+        let mut progress = 0_u64;
+        for byte in chunk {
+            if self.skip_lf_after_cr {
+                self.skip_lf_after_cr = false;
+                if *byte == b'\n' {
+                    continue;
+                }
+            }
+            match *byte {
+                b'\r' => {
+                    progress = progress.saturating_add(self.finish_line(progress_unit)?);
+                    self.skip_lf_after_cr = true;
+                }
+                b'\n' => {
+                    progress = progress.saturating_add(self.finish_line(progress_unit)?);
+                }
+                byte => {
+                    self.line.push(byte);
+                    if self.retained_len() > MAX_PENDING_SSE_RESIDUAL_BYTES {
+                        return Err(());
+                    }
+                }
+            }
+        }
+        Ok(progress)
+    }
+
+    fn finish_line(&mut self, progress_unit: WatchdogProgressUnit) -> Result<u64, ()> {
+        let line = std::mem::take(&mut self.line);
+        if line.is_empty() {
+            let progress = if self.has_data {
+                u64::from(sse_data_has_progress(progress_unit, &self.data))
+            } else {
+                0
+            };
+            self.data.clear();
+            self.has_data = false;
+            return Ok(progress);
+        }
+
+        if let Some(data) = line.strip_prefix(b"data:") {
+            let data = data.strip_prefix(b" ").unwrap_or(data);
+            let joined_len = self
+                .data
+                .len()
+                .saturating_add(usize::from(self.has_data))
+                .saturating_add(data.len());
+            if joined_len > MAX_PENDING_SSE_RESIDUAL_BYTES {
+                return Err(());
+            }
+            if self.has_data {
+                self.data.push(b'\n');
+            }
+            self.data.extend_from_slice(data);
+            self.has_data = true;
+        }
+        Ok(0)
+    }
 }
 
-fn has_sse_framing(pending: &[u8]) -> bool {
-    pending.split(|byte| *byte == b'\n').any(|line| {
-        [b"data:".as_slice(), b"event:", b"id:", b"retry:", b":"]
+fn has_sse_framing(bytes: &[u8]) -> bool {
+    let mut line_start = 0;
+    while line_start < bytes.len() {
+        if [b"data:".as_slice(), b"event:", b"id:", b"retry:", b":"]
             .iter()
-            .any(|prefix| line.starts_with(prefix))
-    })
+            .any(|prefix| bytes[line_start..].starts_with(prefix))
+        {
+            return true;
+        }
+        let Some(line_end) = bytes[line_start..]
+            .iter()
+            .position(|byte| matches!(byte, b'\n' | b'\r'))
+        else {
+            return false;
+        };
+        line_start = line_start.saturating_add(line_end + 1);
+        if bytes[line_start.saturating_sub(1)] == b'\r' && bytes.get(line_start) == Some(&b'\n') {
+            line_start = line_start.saturating_add(1);
+        }
+    }
+    false
 }
 
-fn sse_progress<F>(frame: &[u8], event_has_progress: &F) -> u64
-where
-    F: Fn(&Value) -> bool,
-{
-    frame
-        .split(|byte| *byte == b'\n')
-        .filter_map(|line| line.strip_prefix(b"data:"))
-        .map(trim_ascii)
-        .filter(|data| !data.is_empty() && *data != b"[DONE]")
-        .filter_map(|data| serde_json::from_slice::<Value>(data).ok())
-        .filter(|event| event_has_progress(event))
-        .count()
-        .try_into()
-        .unwrap_or(u64::MAX)
+fn sse_data_has_progress(progress_unit: WatchdogProgressUnit, data: &[u8]) -> bool {
+    let data = trim_ascii(data);
+    !data.is_empty()
+        && data != b"[DONE]"
+        && serde_json::from_slice::<Value>(data)
+            .ok()
+            .is_some_and(|event| sse_event_has_progress(progress_unit, &event))
+}
+
+fn sse_event_has_progress(progress_unit: WatchdogProgressUnit, event: &Value) -> bool {
+    match progress_unit {
+        WatchdogProgressUnit::Chat => sse_event_has_model_content(event),
+        WatchdogProgressUnit::Completion => sse_event_has_completion_text(event),
+        WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
+            result_event_has_progress(progress_unit, event)
+        }
+    }
 }
 
 fn trim_ascii(mut bytes: &[u8]) -> &[u8] {
