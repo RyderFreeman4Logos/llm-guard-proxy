@@ -42,6 +42,14 @@ mod stuck_watchdog_lifecycle;
 mod stuck_watchdog_terminalization;
 #[path = "tests/watchdog_sse_event_framing.rs"]
 mod watchdog_sse_event_framing;
+#[path = "tests/watchdog_sse_fast_path_dispatch.rs"]
+mod watchdog_sse_fast_path_dispatch;
+#[path = "tests/watchdog_sse_fast_path_lifecycle.rs"]
+mod watchdog_sse_fast_path_lifecycle;
+#[path = "tests/watchdog_sse_fast_path_line_endings.rs"]
+mod watchdog_sse_fast_path_line_endings;
+#[path = "tests/watchdog_sse_fast_path_residual.rs"]
+mod watchdog_sse_fast_path_residual;
 
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;

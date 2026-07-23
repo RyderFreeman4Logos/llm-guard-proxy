@@ -57,6 +57,23 @@ struct SseEventParser {
     skip_lf_after_cr: bool,
 }
 
+/// Outcome of parsing an oversized SSE source chunk without retaining its
+/// already-dispatched or non-data bytes.
+#[derive(Debug)]
+enum FastSseProgress {
+    Drained {
+        progress: u64,
+    },
+    ProgressWithResidual {
+        progress: u64,
+        residual: SseEventParser,
+    },
+    Incomplete {
+        residual: SseEventParser,
+    },
+    UnobservableOversize,
+}
+
 impl SseEventParser {
     fn is_empty(&self) -> bool {
         self.line.is_empty() && self.data.is_empty() && !self.has_data && !self.skip_lf_after_cr
@@ -95,21 +112,30 @@ pub(super) fn emitted_progress(
     }
 
     if parser.sse_framing {
-        let progress = if parser.sse.is_empty() && chunk.len() > MAX_PENDING_SSE_RESIDUAL_BYTES {
-            complete_sse_progress_without_buffering(progress_unit, chunk).ok_or(())
-        } else {
-            parser.sse.consume(chunk, progress_unit)
-        };
+        if parser.sse.is_empty() && chunk.len() > MAX_PENDING_SSE_RESIDUAL_BYTES {
+            return record_fast_sse_progress(
+                parser,
+                complete_sse_progress_without_buffering(progress_unit, chunk),
+            );
+        }
+        let progress = parser.sse.consume(chunk, progress_unit);
         return record_sse_progress(parser, progress);
     }
 
     let pending_cap = residual_cap(progress_unit, &parser.pending, chunk);
     if chunk.len() > pending_cap.saturating_sub(parser.pending.len()) {
-        if parser.pending.is_empty()
-            && let Some(progress) = complete_progress_without_buffering(progress_unit, chunk)
-        {
-            parser.state = progress_state(progress);
-            return parser.state;
+        if parser.pending.is_empty() {
+            if has_sse_framing(chunk) {
+                parser.sse_framing = true;
+                return record_fast_sse_progress(
+                    parser,
+                    complete_sse_progress_without_buffering(progress_unit, chunk),
+                );
+            }
+            if let Some(progress) = complete_progress_without_buffering(progress_unit, chunk) {
+                parser.state = progress_state(progress);
+                return parser.state;
+            }
         }
         return mark_unobservable_oversize(parser);
     }
@@ -148,6 +174,28 @@ fn record_sse_progress(
         }
         Err(()) => mark_unobservable_oversize(parser),
     }
+}
+
+fn record_fast_sse_progress(
+    parser: &mut WatchdogProgressParser,
+    progress: FastSseProgress,
+) -> WatchdogProgressState {
+    match progress {
+        FastSseProgress::Drained { progress } => {
+            parser.sse.clear();
+            parser.state = progress_state(progress);
+        }
+        FastSseProgress::ProgressWithResidual { progress, residual } => {
+            parser.sse = residual;
+            parser.state = progress_state(progress);
+        }
+        FastSseProgress::Incomplete { residual } => {
+            parser.sse = residual;
+            parser.state = WatchdogProgressState::Incomplete;
+        }
+        FastSseProgress::UnobservableOversize => return mark_unobservable_oversize(parser),
+    }
+    parser.state
 }
 
 fn mark_unobservable_oversize(parser: &mut WatchdogProgressParser) -> WatchdogProgressState {
@@ -215,10 +263,6 @@ fn complete_progress_without_buffering(
     progress_unit: WatchdogProgressUnit,
     chunk: &[u8],
 ) -> Option<u64> {
-    if has_sse_framing(chunk) {
-        return complete_sse_progress_without_buffering(progress_unit, chunk);
-    }
-
     match progress_unit {
         WatchdogProgressUnit::Embedding | WatchdogProgressUnit::Reranker => {
             serde_json::from_slice::<Value>(chunk)
@@ -229,21 +273,37 @@ fn complete_progress_without_buffering(
     }
 }
 
-/// Parses a complete oversized SSE chunk while retaining only the current
-/// event's joined data. A single oversized data field is parsed from its
-/// borrowed input slice; multi-data events must fit the normal event cap.
+/// Parses an oversized SSE chunk while retaining only the current event's joined
+/// data and partial line. A single oversized data field is parsed from its
+/// borrowed input slice only when its event is complete; otherwise observation
+/// becomes explicitly unobservable.
 fn complete_sse_progress_without_buffering(
     progress_unit: WatchdogProgressUnit,
     chunk: &[u8],
-) -> Option<u64> {
+) -> FastSseProgress {
     let mut offset = 0;
     let mut progress = 0_u64;
     let mut data = Vec::new();
     let mut large_single_data: Option<&[u8]> = None;
     let mut has_data = false;
+    let mut skip_lf_after_cr = false;
 
     while offset < chunk.len() {
-        let (line, next_offset) = next_sse_line(chunk, offset)?;
+        let Some((line, next_offset)) = next_sse_line(chunk, offset) else {
+            if large_single_data.is_some() {
+                return FastSseProgress::UnobservableOversize;
+            }
+            let residual = SseEventParser {
+                line: chunk[offset..].to_vec(),
+                data,
+                has_data,
+                skip_lf_after_cr: false,
+            };
+            if residual.retained_len() > MAX_PENDING_SSE_RESIDUAL_BYTES {
+                return FastSseProgress::UnobservableOversize;
+            }
+            return fast_sse_progress_outcome(progress, residual);
+        };
         offset = next_offset;
         if line.is_empty() {
             if has_data {
@@ -254,12 +314,10 @@ fn complete_sse_progress_without_buffering(
             data.clear();
             large_single_data = None;
             has_data = false;
-            continue;
-        }
-        if let Some(field_data) = line.strip_prefix(b"data:") {
+        } else if let Some(field_data) = line.strip_prefix(b"data:") {
             let field_data = field_data.strip_prefix(b" ").unwrap_or(field_data);
             if large_single_data.is_some() {
-                return None;
+                return FastSseProgress::UnobservableOversize;
             }
             if !has_data && field_data.len() > MAX_PENDING_SSE_RESIDUAL_BYTES {
                 large_single_data = Some(field_data);
@@ -271,7 +329,7 @@ fn complete_sse_progress_without_buffering(
                 .saturating_add(usize::from(has_data))
                 .saturating_add(field_data.len());
             if joined_len > MAX_PENDING_SSE_RESIDUAL_BYTES {
-                return None;
+                return FastSseProgress::UnobservableOversize;
             }
             if has_data {
                 data.push(b'\n');
@@ -279,9 +337,32 @@ fn complete_sse_progress_without_buffering(
             data.extend_from_slice(field_data);
             has_data = true;
         }
+        skip_lf_after_cr =
+            offset == chunk.len() && chunk.get(offset.saturating_sub(1)) == Some(&b'\r');
     }
 
-    Some(progress)
+    if large_single_data.is_some() {
+        return FastSseProgress::UnobservableOversize;
+    }
+    fast_sse_progress_outcome(
+        progress,
+        SseEventParser {
+            line: Vec::new(),
+            data,
+            has_data,
+            skip_lf_after_cr,
+        },
+    )
+}
+
+fn fast_sse_progress_outcome(progress: u64, residual: SseEventParser) -> FastSseProgress {
+    if residual.is_empty() {
+        FastSseProgress::Drained { progress }
+    } else if progress > 0 {
+        FastSseProgress::ProgressWithResidual { progress, residual }
+    } else {
+        FastSseProgress::Incomplete { residual }
+    }
 }
 
 fn next_sse_line(input: &[u8], offset: usize) -> Option<(&[u8], usize)> {
