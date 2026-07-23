@@ -281,6 +281,7 @@ mod tests {
         ffi::OsString,
         fs,
         path::{Path, PathBuf},
+        sync::atomic::{AtomicU64, Ordering},
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -452,19 +453,17 @@ mod tests {
     #[test]
     fn polling_watcher_applies_reloadable_changes() {
         let path = unique_test_path("polling.toml");
-        fs::write(&path, "[heartbeat]\nmode = \"sse\"\ninterval_secs = 15\n")
-            .expect("write initial config");
+        replace_config_atomically(&path, "[heartbeat]\nmode = \"sse\"\ninterval_secs = 15\n");
         let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
         let handle = manager.handle();
         let watcher = manager
             .spawn_polling(Duration::from_millis(10))
             .expect("start watcher");
 
-        fs::write(
+        replace_config_atomically(
             &path,
             "[heartbeat]\nmode = \"disabled\"\ninterval_secs = 4\n",
-        )
-        .expect("write reload config");
+        );
         let mut observed = false;
         for _attempt in 0..50 {
             let snapshot = handle.snapshot().expect("snapshot");
@@ -478,7 +477,7 @@ mod tests {
         }
         assert!(observed, "polling watcher should apply reload");
 
-        fs::write(&path, "not toml").expect("write broken polling config");
+        replace_config_atomically(&path, "not toml");
         let mut observed_error = false;
         for _attempt in 0..50 {
             if manager.last_error().expect("reload health").is_some() {
@@ -492,8 +491,7 @@ mod tests {
             "polling failure should update reload health"
         );
 
-        fs::write(&path, "[heartbeat]\nmode = \"sse\"\ninterval_secs = 3\n")
-            .expect("write recovered polling config");
+        replace_config_atomically(&path, "[heartbeat]\nmode = \"sse\"\ninterval_secs = 3\n");
         let mut recovered = false;
         for _attempt in 0..50 {
             let snapshot = handle.snapshot().expect("snapshot");
@@ -517,22 +515,20 @@ mod tests {
     #[test]
     fn polling_watcher_hot_reloads_guardian_policy_and_retains_last_good() {
         let path = unique_test_path("guardian-polling.toml");
-        fs::write(
+        replace_config_atomically(
             &path,
             "[guardian]\nenabled = true\ntarget_label = \"aeon-text\"\nmem_threshold_gib = 2\nkill_action = \"cgroup.kill\"\npoll_interval_secs = 1\nregistration_file = \"text-cgroup.v1\"\n",
-        )
-        .expect("write initial guardian config");
+        );
         let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
         let handle = manager.handle();
         let watcher = manager
             .spawn_polling(Duration::from_millis(10))
             .expect("start watcher");
 
-        fs::write(
+        replace_config_atomically(
             &path,
             "[guardian]\nenabled = true\ntarget_label = \"replacement\"\nmem_threshold_gib = 5\nkill_action = \"systemctl_restart\"\npoll_interval_secs = 4\nsystemd_unit = \"replacement.service\"\n",
-        )
-        .expect("write replacement guardian config");
+        );
         let mut observed = false;
         for _attempt in 0..50 {
             let snapshot = handle.snapshot().expect("snapshot");
@@ -549,11 +545,10 @@ mod tests {
         assert!(observed, "guardian policy should be hot reloaded");
         let last_good = handle.snapshot().expect("last-good snapshot");
 
-        fs::write(
+        replace_config_atomically(
             &path,
             "[guardian]\nenabled = true\ntarget_label = \"\"\nmem_threshold_gib = 0\n",
-        )
-        .expect("write invalid guardian config");
+        );
         let mut observed_error = false;
         for _attempt in 0..50 {
             if manager.last_error().expect("reload health").is_some() {
@@ -587,12 +582,27 @@ mod tests {
         remove_file(&path);
     }
 
+    static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn replace_config_atomically(path: &Path, contents: &str) {
+        let replacement = path.with_extension(format!(
+            "replacement-{}",
+            TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&replacement, contents).expect("write replacement config");
+        fs::rename(&replacement, path).expect("atomically replace config");
+    }
+
     fn unique_test_path(file_name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("system time should be after epoch")
             .as_nanos();
-        std::env::temp_dir().join(format!("llm-guard-proxy-config-reload-{nanos}-{file_name}"))
+        let counter = TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "llm-guard-proxy-config-reload-{}-{nanos}-{counter}-{file_name}",
+            std::process::id()
+        ))
     }
 
     fn remove_file(path: &Path) {
