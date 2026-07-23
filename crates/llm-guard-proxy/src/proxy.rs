@@ -1601,7 +1601,7 @@ struct RepeatInputKey {
 #[derive(Clone, Copy, Debug)]
 struct RepeatInputEntry {
     count: u32,
-    last_seen_unix_ms: u64,
+    expires_at_unix_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1621,9 +1621,7 @@ impl RepeatInputCache {
     ) -> RepeatInputObservation {
         let window_ms = window_secs.saturating_mul(1_000);
         let mut entries = repeat_input_entries(&self.entries);
-        entries.retain(|_fingerprint, entry| {
-            now_unix_ms.saturating_sub(entry.last_seen_unix_ms) <= window_ms
-        });
+        entries.retain(|_fingerprint, entry| entry.expires_at_unix_ms >= now_unix_ms);
 
         let observation = {
             let entry = entries
@@ -1633,15 +1631,11 @@ impl RepeatInputCache {
                 })
                 .or_insert(RepeatInputEntry {
                     count: 0,
-                    last_seen_unix_ms: now_unix_ms,
+                    expires_at_unix_ms: now_unix_ms.saturating_add(window_ms),
                 });
-            let prior_count = if now_unix_ms.saturating_sub(entry.last_seen_unix_ms) <= window_ms {
-                entry.count
-            } else {
-                0
-            };
+            let prior_count = entry.count;
             entry.count = prior_count.saturating_add(1);
-            entry.last_seen_unix_ms = now_unix_ms;
+            entry.expires_at_unix_ms = now_unix_ms.saturating_add(window_ms);
 
             RepeatInputObservation {
                 repeated: prior_count >= max_repeated_inputs,
@@ -1671,10 +1665,10 @@ fn prune_repeat_input_entries(entries: &mut HashMap<RepeatInputKey, RepeatInputE
     let remove_count = entries.len().saturating_sub(MAX_REPEAT_FINGERPRINT_ENTRIES);
     let mut oldest_entries = entries
         .iter()
-        .map(|(key, entry)| (key.clone(), entry.last_seen_unix_ms))
+        .map(|(key, entry)| (key.clone(), entry.expires_at_unix_ms))
         .collect::<Vec<_>>();
-    oldest_entries.sort_by_key(|(_key, last_seen_unix_ms)| *last_seen_unix_ms);
-    for (key, _last_seen_unix_ms) in oldest_entries.into_iter().take(remove_count) {
+    oldest_entries.sort_by_key(|(_key, expires_at_unix_ms)| *expires_at_unix_ms);
+    for (key, _expires_at_unix_ms) in oldest_entries.into_iter().take(remove_count) {
         entries.remove(&key);
     }
 }
@@ -4032,12 +4026,15 @@ fn validate_vllm_native_request_controls(
 ) -> Result<(), ProxyError> {
     let vllm_native_configured = profile.thinking.default_injection_schema
         == DefaultInjectionSchema::VllmNative
-        || config.retry.ladder.iter().any(|entry| {
-            entry
-                .default_injection_schema
-                .unwrap_or(profile.thinking.default_injection_schema)
-                == DefaultInjectionSchema::VllmNative
-        });
+        || profile
+            .effective_retry_ladder(&config.retry)
+            .iter()
+            .any(|entry| {
+                entry
+                    .default_injection_schema
+                    .unwrap_or(profile.thinking.default_injection_schema)
+                    == DefaultInjectionSchema::VllmNative
+            });
     if !is_chat_completions_request(method, uri)
         || !vllm_native_configured
         || !shielded_chat::has_conflicting_vllm_native_controls(body)
@@ -8735,6 +8732,14 @@ fn filter_models_body_for_listener(
     listener: &ListenerConfig,
     body: Bytes,
 ) -> Bytes {
+    if let Some(profile_name) = listener.upstream_profile.as_deref() {
+        let Some(profile) = config.upstream_profile_by_name(profile_name) else {
+            return body;
+        };
+        return model_metadata::filter_models_body_by_id(body, |model_id| {
+            profile.match_models.is_empty() || profile.matches_model(model_id)
+        });
+    }
     if listener.allowed_upstreams.is_none() {
         return body;
     }
@@ -8755,6 +8760,12 @@ fn listener_models_upstream_profiles(
     config: &AppConfig,
     listener: &ListenerConfig,
 ) -> Vec<UpstreamProfileConfig> {
+    if let Some(profile_name) = listener.upstream_profile.as_deref() {
+        return config
+            .upstream_profile_by_name(profile_name)
+            .into_iter()
+            .collect();
+    }
     if let Some(allowed_upstreams) = listener.allowed_upstreams.as_ref() {
         return allowed_upstreams
             .iter()
@@ -14289,7 +14300,7 @@ fn add_listener_metadata(metadata: &mut BTreeMap<String, String>, listener: &Lis
     metadata.insert(String::from("listener_port"), listener.port.to_string());
     metadata.insert(
         String::from("listener_restricted"),
-        listener.allowed_upstreams.is_some().to_string(),
+        (listener.allowed_upstreams.is_some() || listener.upstream_profile.is_some()).to_string(),
     );
 }
 

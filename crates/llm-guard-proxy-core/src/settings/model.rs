@@ -2265,7 +2265,9 @@ impl UpstreamProfileConfig {
             .validate(RestartQueueValidationFields::upstream_profile())?;
         self.thinking.validate("upstreams.thinking.max_tokens")?;
         if let Some(loop_guard) = &self.loop_guard {
-            loop_guard.validate()?;
+            loop_guard
+                .validate()
+                .map_err(upstream_profile_loop_guard_validation_error)?;
         }
         if let Some(retry_ladder) = &self.retry_ladder {
             require(
@@ -2279,7 +2281,9 @@ impl UpstreamProfileConfig {
                 "must contain at most 10 entries",
             )?;
             for (index, entry) in retry_ladder.iter().enumerate() {
-                entry.validate(index)?;
+                entry
+                    .validate(index)
+                    .map_err(upstream_profile_retry_ladder_validation_error)?;
             }
         }
         #[cfg(feature = "param-override")]
@@ -4119,6 +4123,58 @@ fn validate_guardian_systemd_unit(systemd_unit: &str) -> Result<(), ValidationEr
         "guardian.systemd_unit",
         "must be a valid single user service unit name",
     )
+}
+
+fn upstream_profile_loop_guard_validation_error(error: ValidationError) -> ValidationError {
+    let field = match error.field() {
+        "loop_guard.normalized_input_window_secs" => {
+            "upstreams.loop_guard.normalized_input_window_secs"
+        }
+        "loop_guard.max_repeated_inputs" => "upstreams.loop_guard.max_repeated_inputs",
+        "loop_guard.output_repeated_line_threshold" => {
+            "upstreams.loop_guard.output_repeated_line_threshold"
+        }
+        "loop_guard.output_token_window_size" => "upstreams.loop_guard.output_token_window_size",
+        "loop_guard.output_repeated_token_window_threshold" => {
+            "upstreams.loop_guard.output_repeated_token_window_threshold"
+        }
+        "loop_guard.output_suffix_cycle_threshold" => {
+            "upstreams.loop_guard.output_suffix_cycle_threshold"
+        }
+        "loop_guard.output_low_progress_min_bytes" => {
+            "upstreams.loop_guard.output_low_progress_min_bytes"
+        }
+        "loop_guard.output_low_progress_unique_ratio_percent" => {
+            "upstreams.loop_guard.output_low_progress_unique_ratio_percent"
+        }
+        "loop_guard.input_overlap_threshold_multiplier" => {
+            "upstreams.loop_guard.input_overlap_threshold_multiplier"
+        }
+        "loop_guard.reasoning_semantic_similarity_threshold_percent" => {
+            "upstreams.loop_guard.reasoning_semantic_similarity_threshold_percent"
+        }
+        "loop_guard.reasoning_semantic_window_token_count" => {
+            "upstreams.loop_guard.reasoning_semantic_window_token_count"
+        }
+        "loop_guard.reasoning_semantic_minimum_token_count" => {
+            "upstreams.loop_guard.reasoning_semantic_minimum_token_count"
+        }
+        "loop_guard.reasoning_semantic_history_window_count" => {
+            "upstreams.loop_guard.reasoning_semantic_history_window_count"
+        }
+        _ => return error,
+    };
+    ValidationError::new(field, error.message())
+}
+
+fn upstream_profile_retry_ladder_validation_error(error: ValidationError) -> ValidationError {
+    let field = match error.field() {
+        "retry.ladder.name" => "upstreams.retry.ladder.name",
+        "retry.ladder.max_tokens" => "upstreams.retry.ladder.max_tokens",
+        "retry.ladder.anti_loop_hint" => "upstreams.retry.ladder.anti_loop_hint",
+        _ => return error,
+    };
+    ValidationError::new(field, error.message())
 }
 
 fn require(

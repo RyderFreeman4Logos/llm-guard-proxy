@@ -4001,6 +4001,7 @@ fn guardian_reload_metadata_lists_all_policy_fields() {
 }
 
 mod endpoint_reload;
+mod profile_policy;
 
 #[test]
 fn reload_metadata_lists_cover_expected_fields() {

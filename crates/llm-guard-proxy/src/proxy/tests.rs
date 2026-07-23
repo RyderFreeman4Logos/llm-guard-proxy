@@ -33,6 +33,8 @@ use tokio::{
 
 use super::*;
 
+#[path = "tests/listener_profile_policy.rs"]
+mod listener_profile_policy;
 #[path = "tests/shielded_endpoint_rendering.rs"]
 mod shielded_endpoint_rendering;
 #[cfg(unix)]
