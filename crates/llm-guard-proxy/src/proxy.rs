@@ -936,6 +936,15 @@ impl PersistenceTasks {
         }
     }
 
+    #[cfg(test)]
+    fn worker_test_lock() -> Arc<AsyncMutex<()>> {
+        static LOCK: std::sync::OnceLock<Arc<AsyncMutex<()>>> = std::sync::OnceLock::new();
+        // The libtest target also runs nested persistence-worker fixtures. Serialize tests that
+        // assert bounded `spawn_blocking` lifecycles so they observe their own worker completion,
+        // rather than host scheduling contention from another persistence-worker test.
+        Arc::clone(LOCK.get_or_init(|| Arc::new(AsyncMutex::new(()))))
+    }
+
     fn track(self: &Arc<Self>) -> PersistenceTaskGuard {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         PersistenceTaskGuard {

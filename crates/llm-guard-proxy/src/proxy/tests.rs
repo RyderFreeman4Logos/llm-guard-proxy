@@ -1601,6 +1601,7 @@ fn admin_token_matcher_accepts_only_exact_values() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn persistence_tasks_contain_spawn_blocking_panics() {
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
     let tasks = Arc::new(PersistenceTasks::default());
 
     tasks.spawn_blocking(|| panic!("simulated persistence store teardown failure"));
@@ -1616,6 +1617,7 @@ async fn persistence_tasks_contain_spawn_blocking_panics() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
     let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
     let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -1772,6 +1774,8 @@ async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
         "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
     const OVERFLOW_BURST: usize = 128;
 
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
+
     if std::env::var_os(CHILD_ENV).is_none() {
         let output = run_bounded_test_child(TEST_NAME, CHILD_ENV).await;
         assert!(
@@ -1844,6 +1848,8 @@ async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
     const HANG_CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_HANG_CHILD";
     const TEST_NAME: &str =
         "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
+
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
 
     let mut command = tokio::process::Command::new(
         std::env::current_exe().expect("test binary path should be available"),
@@ -1919,6 +1925,7 @@ async fn error_shutdown_signals_persistence_tracked_shadow_work_before_flushing(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistence_flush_does_not_miss_a_zero_transition_after_observing_work() {
+    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
     let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
     let release = Arc::new(std::sync::Barrier::new(2));
     let notification_registered = Arc::new(AtomicBool::new(false));
