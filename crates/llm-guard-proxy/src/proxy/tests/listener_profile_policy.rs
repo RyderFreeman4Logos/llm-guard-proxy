@@ -191,3 +191,19 @@ fn repeat_input_cache_keeps_long_window_records_when_short_window_profile_observ
         }
     );
 }
+
+#[test]
+fn repeat_input_cache_expires_entry_against_hot_reloaded_shorter_window() {
+    let repeat_inputs = RepeatInputCache::default();
+    let fingerprint = "siphash64:hot-reloaded-window";
+
+    assert_eq!(
+        repeat_inputs.observe("alpha", fingerprint, 1_000, 120, 1),
+        RepeatInputObservation::default()
+    );
+    assert_eq!(
+        repeat_inputs.observe("alpha", fingerprint, 2_001, 1, 1),
+        RepeatInputObservation::default(),
+        "an entry older than the hot-reloaded one-second window must be fresh"
+    );
+}

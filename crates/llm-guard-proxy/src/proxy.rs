@@ -1601,6 +1601,7 @@ struct RepeatInputKey {
 #[derive(Clone, Copy, Debug)]
 struct RepeatInputEntry {
     count: u32,
+    last_seen_unix_ms: u64,
     expires_at_unix_ms: u64,
 }
 
@@ -1631,10 +1632,15 @@ impl RepeatInputCache {
                 })
                 .or_insert(RepeatInputEntry {
                     count: 0,
+                    last_seen_unix_ms: now_unix_ms,
                     expires_at_unix_ms: now_unix_ms.saturating_add(window_ms),
                 });
+            if now_unix_ms.saturating_sub(entry.last_seen_unix_ms) > window_ms {
+                entry.count = 0;
+            }
             let prior_count = entry.count;
             entry.count = prior_count.saturating_add(1);
+            entry.last_seen_unix_ms = now_unix_ms;
             entry.expires_at_unix_ms = now_unix_ms.saturating_add(window_ms);
 
             RepeatInputObservation {
