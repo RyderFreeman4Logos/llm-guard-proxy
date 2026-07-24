@@ -483,6 +483,10 @@ no_thinking_marker_policy = "respect_no_thinking_markers"
 enabled = true
 mode = "enforce"
 on_reasoning_loop = "bounded_answer_from_cot"
+# First-attempt private reasoning retained for bounded CoT answer salvage.
+cot_salvage_prefix_max_bytes = 4096
+# Thinking tokens allowed for the salvage attempt (not the retry ladder rung).
+cot_salvage_retry_thinking_budget = 1024
 normalized_input_window_secs = 120         # Dedup window for identical inputs
 max_repeated_inputs = 1                    # Max identical inputs before blocking
 output_repeated_line_threshold = 24        # Lines before loop detection triggers

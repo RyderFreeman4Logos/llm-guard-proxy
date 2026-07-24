@@ -115,8 +115,6 @@ const HEADER_VALUE_REDACTED: &str = "[redacted]";
 const DEBUG_SUMMARY_PATH: &str = "/debug/recent-requests";
 const IN_FLIGHT_CAPACITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100);
 const ADMISSION_RETRY_AFTER_SECS: u32 = 1;
-const COT_SALVAGE_PREFIX_MAX_BYTES: usize = 4_096;
-const COT_SALVAGE_THINKING_BUDGET_TOKENS: u32 = 1_024;
 const TOKEN_USAGE_BODY_CAP: usize = 64 * 1024;
 const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
 const PAIRED_SAMPLE_DENOMINATOR: u64 = 1_000_000;
@@ -6404,6 +6402,8 @@ struct ShieldedRetryPolicy {
     shielded_streaming_enabled: bool,
     downstream_drop_policy: DownstreamDropPolicy,
     loop_failure_policy: LoopFailurePolicy,
+    cot_salvage_prefix_max_bytes: usize,
+    cot_salvage_retry_thinking_budget: u32,
     ladder: Vec<RetryLadderConfig>,
 }
 
@@ -6432,6 +6432,8 @@ impl ShieldedRetryPolicy {
             shielded_streaming_enabled: config.shielded_streaming_enabled,
             downstream_drop_policy: config.downstream_drop_policy,
             loop_failure_policy: loop_guard.on_reasoning_loop,
+            cot_salvage_prefix_max_bytes: loop_guard.cot_salvage_prefix_max_bytes,
+            cot_salvage_retry_thinking_budget: loop_guard.cot_salvage_retry_thinking_budget,
             ladder: ladder.to_vec(),
         }
     }
@@ -6464,7 +6466,11 @@ impl ShieldedRetryPolicy {
                 },
             );
         if let Some(cot_salvage) = cot_salvage {
-            plan.thinking = cot_salvage_thinking(cot_salvage.policy, &plan.thinking);
+            plan.thinking = cot_salvage_thinking(
+                cot_salvage.policy,
+                &plan.thinking,
+                self.cot_salvage_retry_thinking_budget,
+            );
         }
         plan
     }
@@ -6491,7 +6497,11 @@ fn retry_ladder_thinking(
     thinking
 }
 
-fn cot_salvage_thinking(policy: LoopFailurePolicy, current: &ThinkingConfig) -> ThinkingConfig {
+fn cot_salvage_thinking(
+    policy: LoopFailurePolicy,
+    current: &ThinkingConfig,
+    bounded_answer_budget: u32,
+) -> ThinkingConfig {
     let mut thinking = current.clone();
     match policy {
         LoopFailurePolicy::RetryLadder => {}
@@ -6506,7 +6516,7 @@ fn cot_salvage_thinking(policy: LoopFailurePolicy, current: &ThinkingConfig) -> 
             thinking.mode = ThinkingMode::BoundedThinking;
             thinking.enabled = true;
             thinking.force_disable = false;
-            thinking.budget_tokens = COT_SALVAGE_THINKING_BUDGET_TOKENS;
+            thinking.budget_tokens = bounded_answer_budget;
             thinking.preserve_answer_budget = false;
         }
     }
@@ -9576,6 +9586,7 @@ async fn run_shielded_attempts(
     let mut retry_cause = None;
     let mut cot_salvage = None;
     let mut cot_salvage_attempted = false;
+    let mut first_attempt_cot_salvage = None;
     loop {
         let mut started = if let Some(started) = current_attempt.take() {
             started
@@ -9670,6 +9681,10 @@ async fn run_shielded_attempts(
                 if runtime.request_deadline.is_exhausted() {
                     mark_request_deadline_attempt_failure(&mut failure);
                 }
+                if first_attempt_cot_salvage.is_none() {
+                    first_attempt_cot_salvage =
+                        first_attempt_cot_salvage_context(&runtime, &failure);
+                }
                 let next_retry_cause = failure.retry_cause;
                 let mut can_retry = should_retry_after_shielded_failure(&runtime, &failure);
                 let local_recovery_gate =
@@ -9683,7 +9698,11 @@ async fn run_shielded_attempts(
                 }
                 let next_cot_salvage =
                     if can_retry && cot_salvage.is_none() && !cot_salvage_attempted {
-                        cot_salvage_context_for_failure(&runtime, &failure)
+                        cot_salvage_context_for_failure(
+                            &runtime,
+                            &failure,
+                            first_attempt_cot_salvage.as_ref(),
+                        )
                     } else {
                         None
                     };
@@ -12064,21 +12083,16 @@ fn mark_request_deadline_attempt_failure(failure: &mut ShieldedAttemptFailure) {
     );
 }
 
-fn cot_salvage_context_for_failure(
+fn first_attempt_cot_salvage_context(
     runtime: &ShieldedRetryRuntime,
     failure: &ShieldedAttemptFailure,
 ) -> Option<CotSalvageContext> {
-    if failure.retry_cause != Some(ShieldedRetryCause::LoopDetected)
-        || !runtime.retry_policy.loop_failure_policy.uses_cot_salvage()
-        || failure
-            .response_metadata
-            .get("loop_channel")
-            .is_none_or(|channel| channel != "reasoning")
-    {
+    if failure.attempt_number != 1 || !runtime.retry_policy.loop_failure_policy.uses_cot_salvage() {
         return None;
     }
     let reasoning = failure.raw_payloads.reasoning.as_deref()?;
-    let reasoning_prefix = bounded_utf8_prefix(reasoning, COT_SALVAGE_PREFIX_MAX_BYTES);
+    let reasoning_prefix =
+        bounded_utf8_prefix(reasoning, runtime.retry_policy.cot_salvage_prefix_max_bytes);
     if reasoning_prefix.trim().is_empty() {
         return None;
     }
@@ -12091,6 +12105,23 @@ fn cot_salvage_context_for_failure(
             .saturating_sub(failure.started_at_unix_ms),
         reasoning_prefix,
     })
+}
+
+fn cot_salvage_context_for_failure(
+    runtime: &ShieldedRetryRuntime,
+    failure: &ShieldedAttemptFailure,
+    first_attempt_cot_salvage: Option<&CotSalvageContext>,
+) -> Option<CotSalvageContext> {
+    if failure.retry_cause != Some(ShieldedRetryCause::LoopDetected)
+        || !runtime.retry_policy.loop_failure_policy.uses_cot_salvage()
+        || failure
+            .response_metadata
+            .get("loop_channel")
+            .is_none_or(|channel| channel != "reasoning")
+    {
+        return None;
+    }
+    first_attempt_cot_salvage.cloned()
 }
 
 fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> String {
@@ -12431,6 +12462,8 @@ fn terminal_forward_failure(
         shielded_streaming_enabled: false,
         downstream_drop_policy: DownstreamDropPolicy::Cancel,
         loop_failure_policy: LoopFailurePolicy::RetryLadder,
+        cot_salvage_prefix_max_bytes: 4_096,
+        cot_salvage_retry_thinking_budget: 1_024,
         ladder: Vec::new(),
     };
     attempt_records.push(attempt_failure_record(
@@ -15467,12 +15500,17 @@ fn shadow_comparison_attempt_plan(
     source: &AttemptRecord,
     comparison: ShadowComparisonAttempt,
 ) -> Option<ShadowAttemptPlan> {
-    let thinking = shadow_comparison_thinking(comparison, &runtime.upstream_profile.thinking);
+    let thinking = shadow_comparison_thinking(
+        comparison,
+        &runtime.upstream_profile.thinking,
+        runtime.retry_policy.cot_salvage_retry_thinking_budget,
+    );
     let mut prepared = prepared_shadow_body(runtime, &thinking);
     let mut upstream_body = prepared.upstream_body;
     if comparison == ShadowComparisonAttempt::CotSalvage {
         let reasoning = failure.raw_payloads.reasoning.as_deref()?;
-        let reasoning_prefix = bounded_utf8_prefix(reasoning, COT_SALVAGE_PREFIX_MAX_BYTES);
+        let reasoning_prefix =
+            bounded_utf8_prefix(reasoning, runtime.retry_policy.cot_salvage_prefix_max_bytes);
         if reasoning_prefix.trim().is_empty() {
             return None;
         }
@@ -15526,7 +15564,11 @@ fn paired_shadow_comparison_attempt_plan(
     if comparison == ShadowComparisonAttempt::CotSalvage {
         return None;
     }
-    let thinking = shadow_comparison_thinking(comparison, &runtime.upstream_profile.thinking);
+    let thinking = shadow_comparison_thinking(
+        comparison,
+        &runtime.upstream_profile.thinking,
+        runtime.retry_policy.cot_salvage_retry_thinking_budget,
+    );
     let mut prepared = prepared_shadow_body(runtime, &thinking);
     let upstream_body = apply_shielded_param_override_to_body_or_original(
         prepared.upstream_body,
@@ -15611,6 +15653,7 @@ fn prepared_shadow_body(
 fn shadow_comparison_thinking(
     comparison: ShadowComparisonAttempt,
     current: &ThinkingConfig,
+    cot_salvage_retry_thinking_budget: u32,
 ) -> ThinkingConfig {
     let mut thinking = current.clone();
     match comparison {
@@ -15625,7 +15668,7 @@ fn shadow_comparison_thinking(
             thinking.mode = ThinkingMode::BoundedThinking;
             thinking.enabled = true;
             thinking.force_disable = false;
-            thinking.budget_tokens = COT_SALVAGE_THINKING_BUDGET_TOKENS;
+            thinking.budget_tokens = cot_salvage_retry_thinking_budget;
             thinking.preserve_answer_budget = false;
         }
         ShadowComparisonAttempt::NoThinking => {

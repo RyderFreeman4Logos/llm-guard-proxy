@@ -756,6 +756,8 @@ fn assert_default_loop_guard_fields(config: &AppConfig) {
         config.loop_guard.on_reasoning_loop,
         LoopFailurePolicy::RetryLadder
     );
+    assert_eq!(config.loop_guard.cot_salvage_prefix_max_bytes, 4_096);
+    assert_eq!(config.loop_guard.cot_salvage_retry_thinking_budget, 1_024);
     assert_eq!(config.loop_guard.normalized_input_window_secs, 120);
     assert_eq!(config.loop_guard.max_repeated_inputs, 1);
     assert_eq!(config.loop_guard.output_repeated_line_threshold, 24);
@@ -781,6 +783,24 @@ fn assert_default_loop_guard_fields(config: &AppConfig) {
         config.loop_guard.reasoning_semantic_history_window_count,
         16
     );
+}
+
+#[test]
+fn parses_cot_salvage_tuning_values() {
+    let config = parse_config_text(
+        r"
+[loop_guard]
+cot_salvage_prefix_max_bytes = 16384
+cot_salvage_retry_thinking_budget = 2048
+",
+    )
+    .expect("CoT salvage tuning values should parse");
+
+    config
+        .validate()
+        .expect("CoT salvage tuning values should validate");
+    assert_eq!(config.loop_guard.cot_salvage_prefix_max_bytes, 16_384);
+    assert_eq!(config.loop_guard.cot_salvage_retry_thinking_budget, 2_048);
 }
 
 #[test]

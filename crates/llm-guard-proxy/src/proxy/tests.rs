@@ -33,6 +33,8 @@ use tokio::{
 
 use super::*;
 
+#[path = "tests/cot_salvage_issue_211.rs"]
+mod cot_salvage_issue_211;
 #[path = "tests/listener_profile_policy.rs"]
 mod listener_profile_policy;
 #[path = "tests/shielded_endpoint_rendering.rs"]
