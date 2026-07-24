@@ -3470,6 +3470,10 @@ pub struct LoopGuardConfig {
     pub mode: LoopGuardMode,
     /// Failure policy used when reasoning loop abort candidates are enforced.
     pub on_reasoning_loop: LoopFailurePolicy,
+    /// Maximum number of first-attempt reasoning bytes retained for `CoT` salvage.
+    pub cot_salvage_prefix_max_bytes: usize,
+    /// Thinking-token budget for a bounded-answer `CoT` salvage retry.
+    pub cot_salvage_retry_thinking_budget: u32,
     /// Time window used to compare normalized inputs.
     pub normalized_input_window_secs: u64,
     /// Repeat threshold that triggers loop-protection behavior.
@@ -3560,6 +3564,16 @@ impl LoopGuardConfig {
             "must be greater than zero",
         )?;
         require(
+            self.cot_salvage_prefix_max_bytes > 0,
+            "loop_guard.cot_salvage_prefix_max_bytes",
+            "must be greater than zero",
+        )?;
+        require(
+            self.cot_salvage_retry_thinking_budget > 0,
+            "loop_guard.cot_salvage_retry_thinking_budget",
+            "must be greater than zero",
+        )?;
+        require(
             (1..=100).contains(&self.reasoning_semantic_similarity_threshold_percent),
             "loop_guard.reasoning_semantic_similarity_threshold_percent",
             "must be between 1 and 100",
@@ -3598,6 +3612,8 @@ impl Default for LoopGuardConfig {
             enabled: true,
             mode: LoopGuardMode::Monitor,
             on_reasoning_loop: LoopFailurePolicy::RetryLadder,
+            cot_salvage_prefix_max_bytes: 4_096,
+            cot_salvage_retry_thinking_budget: 1_024,
             normalized_input_window_secs: 120,
             max_repeated_inputs: 1,
             output_repeated_line_threshold: 24,

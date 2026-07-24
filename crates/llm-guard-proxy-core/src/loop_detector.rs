@@ -2550,6 +2550,8 @@ mod tests {
         LoopGuardConfig {
             enabled: true,
             mode: LoopGuardMode::Enforce,
+            cot_salvage_prefix_max_bytes: 4_096,
+            cot_salvage_retry_thinking_budget: 1_024,
             normalized_input_window_secs: 120,
             max_repeated_inputs: 1,
             output_repeated_line_threshold: 4,

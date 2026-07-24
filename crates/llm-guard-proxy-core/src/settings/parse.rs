@@ -1961,6 +1961,9 @@ fn assign_loop_guard(
     value: &str,
     line_number: usize,
 ) -> Result<(), ConfigParseError> {
+    if assign_loop_guard_cot_salvage(config, key, value, line_number)? {
+        return Ok(());
+    }
     match key {
         "enabled" => config.enabled = parse_bool(value, line_number)?,
         "mode" => config.mode = parse_loop_guard_mode(value, line_number)?,
@@ -2058,6 +2061,33 @@ fn assign_loop_guard(
         _ => return unknown_key("loop_guard", key, line_number),
     }
     Ok(())
+}
+
+fn assign_loop_guard_cot_salvage(
+    config: &mut LoopGuardConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<bool, ConfigParseError> {
+    match key {
+        "cot_salvage_prefix_max_bytes" => {
+            config.cot_salvage_prefix_max_bytes = parse_usize(
+                value,
+                line_number,
+                "loop_guard.cot_salvage_prefix_max_bytes",
+            )?;
+            Ok(true)
+        }
+        "cot_salvage_retry_thinking_budget" => {
+            config.cot_salvage_retry_thinking_budget = parse_u32(
+                value,
+                line_number,
+                "loop_guard.cot_salvage_retry_thinking_budget",
+            )?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 fn assign_loop_guard_embedding(
