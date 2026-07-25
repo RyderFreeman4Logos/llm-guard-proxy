@@ -6467,7 +6467,11 @@ impl ShieldedRetryPolicy {
                 },
             );
         if let Some(cot_salvage) = cot_salvage {
-            plan.thinking = cot_salvage_thinking(cot_salvage.policy, &plan.thinking);
+            plan.thinking = cot_salvage_thinking(
+                cot_salvage.policy,
+                &plan.thinking,
+                self.cot_salvage_retry_thinking_budget,
+            );
         } else if force_disable_after_salvage_loop {
             plan.thinking = force_disable_thinking(&plan.thinking);
         }
@@ -6496,13 +6500,27 @@ fn retry_ladder_thinking(
     thinking
 }
 
-fn cot_salvage_thinking(policy: LoopFailurePolicy, current: &ThinkingConfig) -> ThinkingConfig {
+fn cot_salvage_thinking(
+    policy: LoopFailurePolicy,
+    current: &ThinkingConfig,
+    cot_salvage_retry_thinking_budget: u32,
+) -> ThinkingConfig {
     match policy {
         LoopFailurePolicy::RetryLadder => current.clone(),
-        // Both salvage policies answer from the preserved notes. Re-enabling
-        // thinking here would create a second looping trajectory.
-        LoopFailurePolicy::TruncateCotThenAnswer | LoopFailurePolicy::BoundedAnswerFromCot => {
-            force_disable_thinking(current)
+        // Truncation asks for a direct answer from the preserved notes, so it
+        // deliberately does not begin another reasoning trajectory.
+        LoopFailurePolicy::TruncateCotThenAnswer => force_disable_thinking(current),
+        // This public, validated setting is the bounded continuation budget
+        // for `bounded_answer_from_cot`; preserve its contract instead of
+        // silently replacing it with a no-thinking retry.
+        LoopFailurePolicy::BoundedAnswerFromCot => {
+            let mut thinking = current.clone();
+            thinking.mode = ThinkingMode::BoundedThinking;
+            thinking.enabled = true;
+            thinking.force_disable = false;
+            thinking.budget_tokens = cot_salvage_retry_thinking_budget;
+            thinking.preserve_answer_budget = false;
+            thinking
         }
     }
 }
@@ -12218,7 +12236,8 @@ fn pre_loop_reasoning_for_salvage(
         .response_metadata
         .get("loop_signal")
         .is_some_and(|signal| signal == "repeated_line")
-        && let Some(pre_loop_reasoning) = reasoning_before_repeated_line_tail(reasoning)
+        && let Some(pre_loop_reasoning) =
+            repeated_line_pre_loop_reasoning(reasoning, &failure.response_metadata)
     {
         return Some(SalvagedPreLoopReasoning {
             post_loop_bytes_discarded: reasoning.len().saturating_sub(pre_loop_reasoning.len()),
@@ -12228,30 +12247,24 @@ fn pre_loop_reasoning_for_salvage(
     }
     Some(SalvagedPreLoopReasoning {
         pre_loop_reasoning: reasoning,
-        // The detector has no usable character offset when a triggering
-        // fragment is not committed. This includes low repeated-line
-        // thresholds whose aggregate has no duplicated line yet. Retain the
-        // safe pre-abort prefix while documenting the approximation.
+        // The detector has no character offset for these signals. The
+        // triggering fragment was never committed to the aggregate, so this
+        // retains the safe pre-abort prefix while documenting the approximation.
         post_loop_bytes_discarded: 0,
         boundary: CotSalvageBoundary::AbortFragment,
     })
 }
 
-fn reasoning_before_repeated_line_tail(reasoning: &str) -> Option<&str> {
-    const MIN_LOOP_LINE_CHARS: usize = 8;
-    let mut first_offsets = BTreeMap::new();
-    let mut offset = 0;
-    for line in reasoning.split_inclusive('\n') {
-        let normalized = line.split_whitespace().collect::<Vec<_>>().join(" ");
-        if normalized.chars().count() >= MIN_LOOP_LINE_CHARS {
-            let normalized = normalized.to_lowercase();
-            if let Some(first_offset) = first_offsets.insert(normalized, offset) {
-                return Some(&reasoning[..first_offset]);
-            }
-        }
-        offset = offset.saturating_add(line.len());
-    }
-    None
+fn repeated_line_pre_loop_reasoning<'reasoning>(
+    reasoning: &'reasoning str,
+    response_metadata: &BTreeMap<String, String>,
+) -> Option<&'reasoning str> {
+    let boundary = response_metadata
+        .get("cot_salvage_repeated_line_boundary_bytes")?
+        .parse::<usize>()
+        .ok()?;
+    (boundary <= reasoning.len() && reasoning.is_char_boundary(boundary))
+        .then(|| &reasoning[..boundary])
 }
 
 fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> String {

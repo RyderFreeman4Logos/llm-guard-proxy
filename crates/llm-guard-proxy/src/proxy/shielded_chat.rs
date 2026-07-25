@@ -2332,6 +2332,7 @@ struct ChatAggregation {
     first_token_latency_ms: Option<u64>,
     stats: DeltaStats,
     raw_stream_chunks: Vec<RawPayloadChunk>,
+    reasoning_stream_order: String,
 }
 
 impl ChatAggregation {
@@ -2425,18 +2426,25 @@ impl ChatAggregation {
             }
             if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
                 self.stats.delta_count = self.stats.delta_count.saturating_add(1);
-                let apply_result = builder.apply_delta(
-                    delta,
-                    &mut self.stats,
-                    &mut self.first_token_latency_ms,
-                    self.attempt_started_at_unix_ms,
-                    &mut self.loop_detector,
-                    &mut self.raw_stream_chunks,
-                );
+                let apply_result = {
+                    let mut raw_stream = RawStreamState {
+                        chunks: &mut self.raw_stream_chunks,
+                        reasoning_stream_order: &mut self.reasoning_stream_order,
+                    };
+                    builder.apply_delta(
+                        delta,
+                        &mut self.stats,
+                        &mut self.first_token_latency_ms,
+                        self.attempt_started_at_unix_ms,
+                        &mut self.loop_detector,
+                        &mut raw_stream,
+                    )
+                };
                 if let Err(error) = apply_result {
                     return Err(error.with_raw_payloads(raw_payloads_from_choices(
                         &self.choices,
                         &self.raw_stream_chunks,
+                        &self.reasoning_stream_order,
                     )));
                 }
             }
@@ -2454,6 +2462,7 @@ impl ChatAggregation {
             return Err(error.with_raw_payloads(raw_payloads_from_choices(
                 &self.choices,
                 &self.raw_stream_chunks,
+                &self.reasoning_stream_order,
             )));
         }
         let response_metadata = response_metadata(&self);
@@ -2595,6 +2604,7 @@ fn finalize_choices(choices: BTreeMap<u64, ChoiceBuilder>) -> FinalizedChoices {
 fn raw_payloads_from_choices(
     choices: &BTreeMap<u64, ChoiceBuilder>,
     raw_stream_chunks: &[RawPayloadChunk],
+    reasoning_stream_order: &str,
 ) -> RawPayloads {
     let mut raw_output = String::new();
     let mut raw_reasoning = String::new();
@@ -2614,7 +2624,9 @@ fn raw_payloads_from_choices(
     RawPayloads {
         input: None,
         output: (!raw_output.is_empty()).then_some(raw_output),
-        reasoning: (!raw_reasoning.is_empty()).then_some(raw_reasoning),
+        reasoning: (!reasoning_stream_order.is_empty())
+            .then(|| reasoning_stream_order.to_owned())
+            .or_else(|| (!raw_reasoning.is_empty()).then_some(raw_reasoning)),
         tool_calls: (!raw_tool_calls.is_empty())
             .then(|| serde_json::to_string(&raw_tool_calls).ok())
             .flatten(),
@@ -2858,6 +2870,11 @@ struct ChoiceBuilder {
     tool_calls: BTreeMap<u64, ToolCallBuilder>,
 }
 
+struct RawStreamState<'a> {
+    chunks: &'a mut Vec<RawPayloadChunk>,
+    reasoning_stream_order: &'a mut String,
+}
+
 impl ChoiceBuilder {
     fn merge_logprobs(&mut self, next: &Value) {
         let Some(existing) = self.logprobs.as_mut() else {
@@ -2930,7 +2947,7 @@ impl ChoiceBuilder {
         first_token_latency_ms: &mut Option<u64>,
         attempt_started_at_unix_ms: u64,
         loop_detector: &mut Option<LoopDetector>,
-        raw_stream_chunks: &mut Vec<RawPayloadChunk>,
+        raw_stream: &mut RawStreamState<'_>,
     ) -> Result<(), AggregationError> {
         copy_extension_fields(
             delta,
@@ -2947,23 +2964,37 @@ impl ChoiceBuilder {
             stats.content_delta_count = stats.content_delta_count.saturating_add(1);
             mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
             observe_fragment(loop_detector, StreamChannel::Content, content)?;
-            push_raw_stream_chunk(raw_stream_chunks, StreamChannel::Content, content);
+            push_raw_stream_chunk(raw_stream.chunks, StreamChannel::Content, content);
         }
         for field in ["reasoning_content", "reasoning", "thinking"] {
             if let Some(reasoning) = delta.get(field).and_then(Value::as_str)
                 && !reasoning.is_empty()
             {
-                observe_fragment(loop_detector, StreamChannel::Reasoning, reasoning)?;
+                if let Err(error) =
+                    observe_fragment(loop_detector, StreamChannel::Reasoning, reasoning)
+                {
+                    // The detector boundary can land inside the fragment that emitted the
+                    // repeated-line signal. Retain that fragment only for raw salvage
+                    // slicing; it remains absent from the aggregated choice.
+                    if error
+                        .response_metadata()
+                        .contains_key("cot_salvage_repeated_line_boundary_bytes")
+                    {
+                        raw_stream.reasoning_stream_order.push_str(reasoning);
+                    }
+                    return Err(error);
+                }
                 self.reasoning.push_str(reasoning);
+                raw_stream.reasoning_stream_order.push_str(reasoning);
                 stats.reasoning_delta_count = stats.reasoning_delta_count.saturating_add(1);
                 mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
-                push_raw_stream_chunk(raw_stream_chunks, StreamChannel::Reasoning, reasoning);
+                push_raw_stream_chunk(raw_stream.chunks, StreamChannel::Reasoning, reasoning);
             }
         }
         if let Some(function_call) = delta.get("function_call").and_then(Value::as_object) {
             self.function_call
                 .get_or_insert_with(FunctionCallBuilder::default)
-                .apply_delta(function_call, loop_detector, raw_stream_chunks)?;
+                .apply_delta(function_call, loop_detector, raw_stream.chunks)?;
             mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
         }
         if let Some(refusal) = delta.get("refusal") {
@@ -2988,7 +3019,7 @@ impl ChoiceBuilder {
                             index,
                             ..ToolCallBuilder::default()
                         })
-                        .apply_delta(tool_call, loop_detector, raw_stream_chunks)?;
+                        .apply_delta(tool_call, loop_detector, raw_stream.chunks)?;
                     stats.tool_call_delta_count = stats.tool_call_delta_count.saturating_add(1);
                     mark_first_token(first_token_latency_ms, attempt_started_at_unix_ms);
                 }

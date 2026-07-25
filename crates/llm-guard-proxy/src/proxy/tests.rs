@@ -6533,7 +6533,7 @@ thinking_mode = "force_disable"
     let second_attempt = fake.recv_next().await;
     let third_attempt = fake.recv_next().await;
     assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
-    assert_eq!(body_thinking_budget(&second_attempt.body), Some(0));
+    assert_eq!(body_thinking_budget(&second_attempt.body), Some(1_024));
     assert_eq!(body_thinking_budget(&third_attempt.body), Some(0));
     let second_body_text = String::from_utf8_lossy(&second_attempt.body);
     let third_body_text = String::from_utf8_lossy(&third_attempt.body);
@@ -6548,7 +6548,7 @@ thinking_mode = "force_disable"
     assert_eq!(attempts[1].response_metadata["cot_salvage_used"], "true");
     assert_eq!(
         attempts[1].response_metadata["attempt_thinking_budget_tokens"],
-        "0"
+        "1024"
     );
     assert_eq!(attempts[2].response_metadata["attempt_name"], "no-thinking");
     assert_eq!(attempts[2].response_metadata["cot_salvage_used"], "false");
@@ -6621,7 +6621,7 @@ thinking_mode = "force_disable"
     let second_attempt = fake.recv_next().await;
     let third_attempt = fake.recv_next().await;
     assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
-    assert_eq!(body_thinking_budget(&second_attempt.body), Some(0));
+    assert_eq!(body_thinking_budget(&second_attempt.body), Some(1_024));
     assert_eq!(body_thinking_budget(&third_attempt.body), Some(0));
 
     let second_body_text = String::from_utf8_lossy(&second_attempt.body);
@@ -20679,6 +20679,20 @@ fn fake_compat_and_loop_once_chat_completion_response(
             _ => chat_completion_sse_response(body),
         });
     }
+    if path_and_query.contains("test=loop-with-early-repeat-then-success") {
+        return Some(if body_contains_retry_hint(body) {
+            chat_completion_sse_response(body)
+        } else {
+            early_repeat_then_repeated_reasoning_sse_response()
+        });
+    }
+    if path_and_query.contains("test=loop-with-intra-fragment-tail-then-success") {
+        return Some(if body_contains_retry_hint(body) {
+            chat_completion_sse_response(body)
+        } else {
+            intra_fragment_prelude_then_repeated_reasoning_sse_response()
+        });
+    }
     if path_and_query.contains("test=loop-with-prelude-then-success") {
         return Some(if body_contains_retry_hint(body) {
             chat_completion_sse_response(body)
@@ -20847,6 +20861,37 @@ fn prelude_then_repeated_reasoning_sse_response() -> Response<Body> {
         }));
     }
     delta_vec_sse_response("chat-completions-prelude-loop-reasoning-sse", deltas)
+}
+
+fn early_repeat_then_repeated_reasoning_sse_response() -> Response<Body> {
+    let mut deltas = Vec::with_capacity(12);
+    for reasoning in [
+        "harmless repeated framing\n",
+        "derive the first useful invariant\n",
+        "harmless repeated framing\n",
+        "apply the second useful invariant\n",
+    ] {
+        deltas.push(serde_json::json!({ "reasoning_content": reasoning }));
+    }
+    for _ in 0..8 {
+        deltas.push(serde_json::json!({
+            "reasoning_content": "actual repeated loop tail\n",
+        }));
+    }
+    delta_vec_sse_response("chat-completions-early-repeat-loop-reasoning-sse", deltas)
+}
+
+fn intra_fragment_prelude_then_repeated_reasoning_sse_response() -> Response<Body> {
+    delta_vec_sse_response(
+        "chat-completions-intra-fragment-prelude-loop-reasoning-sse",
+        vec![serde_json::json!({
+            "reasoning_content": concat!(
+                "derive the invariant before answering\n",
+                "repeat the broken branch\n",
+                "repeat the broken branch\n",
+            ),
+        })],
+    )
 }
 
 fn cancellable_repeated_reasoning_line_sse_response(

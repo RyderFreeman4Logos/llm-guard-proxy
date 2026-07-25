@@ -937,6 +937,21 @@ impl ChannelizedLoopDetector {
         }
     }
 
+    /// Returns the content-free byte boundary before the first line matching
+    /// the repeated-line signal most recently emitted for `channel`.
+    #[must_use]
+    pub fn repeated_line_first_byte_offset(&self, channel: StreamChannel) -> Option<usize> {
+        let state = match channel {
+            StreamChannel::Content => &self.content,
+            StreamChannel::Reasoning => &self.reasoning,
+            StreamChannel::ToolArguments => &self.tool_arguments,
+            StreamChannel::ToolFingerprint => return None,
+        };
+        state
+            .last_repeated_line_first_byte_offset
+            .and_then(|offset| usize::try_from(offset).ok())
+    }
+
     /// Observes a completed tool call and emits argument/fingerprint signals.
     pub fn observe_tool_call(&mut self, input: ToolCallFingerprintInput<'_>) -> Vec<LoopSignal> {
         let signals = match canonical_json_hash(input.arguments) {
@@ -1085,8 +1100,11 @@ struct LoopChannelState {
     fragment_count: u64,
     bytes_seen: u64,
     pending_line: String,
+    pending_line_start_byte: u64,
     line_counts: BTreeMap<u64, u32>,
+    line_first_byte_offsets: BTreeMap<u64, u64>,
     line_count_capped: u64,
+    last_repeated_line_first_byte_offset: Option<u64>,
     current_token: String,
     recent_token_hashes: VecDeque<u64>,
     token_window_counts: BTreeMap<u64, u32>,
@@ -1110,12 +1128,13 @@ impl LoopChannelState {
         input_profile: &LoopInputProfile,
     ) -> Vec<LoopSignal> {
         self.fragment_count = self.fragment_count.saturating_add(1);
+        let fragment_start_byte = self.bytes_seen;
         self.bytes_seen = self
             .bytes_seen
             .saturating_add(u64::try_from(input.fragment.len()).unwrap_or(u64::MAX));
 
         let detection = self
-            .observe_lines(input, config, input_profile)
+            .observe_lines(input, config, input_profile, fragment_start_byte)
             .or_else(|| self.observe_tokens(input, config, input_profile))
             .or_else(|| {
                 self.observe_recent_chars(input.fragment);
@@ -1133,11 +1152,15 @@ impl LoopChannelState {
         input: LoopDetectorInput<'_>,
         config: &LoopGuardConfig,
         input_profile: &LoopInputProfile,
+        fragment_start_byte: u64,
     ) -> Option<FeatureDetection> {
-        for character in input.fragment.chars() {
+        for (index, character) in input.fragment.char_indices() {
             if character == '\n' {
                 let detection = self.finish_line(input.channel, config, input_profile);
                 self.pending_line.clear();
+                self.pending_line_start_byte = fragment_start_byte.saturating_add(
+                    u64::try_from(index.saturating_add(character.len_utf8())).unwrap_or(u64::MAX),
+                );
                 if detection.is_some() {
                     return detection;
                 }
@@ -1174,12 +1197,17 @@ impl LoopChannelState {
             LOOP_OUTPUT_LINE_COUNT_CAP,
             &mut self.line_count_capped,
         )?;
+        let first_byte_offset = *self
+            .line_first_byte_offsets
+            .entry(hash)
+            .or_insert(self.pending_line_start_byte);
         let threshold = Self::adjusted_threshold(
             u64::from(config.output_repeated_line_threshold),
             input_overlap,
             config,
         );
         (u64::from(count) >= threshold).then(|| {
+            self.last_repeated_line_first_byte_offset = Some(first_byte_offset);
             FeatureDetection::new(
                 LoopReasonCode::RepeatedLine,
                 self.feature_evidence(
@@ -2352,6 +2380,66 @@ mod tests {
         assert_eq!(
             signals[0].feature_summary.fields()["input_overlap_applied"],
             "true"
+        );
+    }
+
+    #[test]
+    fn repeated_line_boundary_tracks_the_detector_selected_line_with_input_overlap() {
+        let mut config = test_loop_config();
+        config.output_repeated_line_threshold = 4;
+        config.output_repeated_token_window_threshold = u32::MAX;
+        config.output_suffix_cycle_threshold = u32::MAX;
+        config.output_low_progress_min_bytes = u64::MAX;
+        config.input_overlap_threshold_multiplier = 2;
+        config.reasoning_semantic_detection_enabled = false;
+        let repeated_tail = "actual repeated loop tail\n";
+        let profile = LoopInputProfile::from_texts(
+            &[format!("{repeated_tail}{repeated_tail}")],
+            config.output_token_window_size,
+        );
+        let mut detector = ChannelizedLoopDetector::new(config, profile);
+        let pre_loop = [
+            "harmless repeated framing\n",
+            "derive the first useful invariant\n",
+            "harmless repeated framing\n",
+            "apply the second useful invariant\n",
+        ];
+        let expected_boundary = pre_loop
+            .iter()
+            .map(|fragment| fragment.len())
+            .sum::<usize>();
+
+        for fragment in pre_loop {
+            assert!(
+                detector
+                    .observe(LoopDetectorInput::fragment(
+                        StreamChannel::Reasoning,
+                        fragment
+                    ))
+                    .is_empty()
+            );
+        }
+        for _ in 0..7 {
+            assert!(
+                detector
+                    .observe(LoopDetectorInput::fragment(
+                        StreamChannel::Reasoning,
+                        repeated_tail,
+                    ))
+                    .is_empty()
+            );
+        }
+        let signals = detector.observe(LoopDetectorInput::fragment(
+            StreamChannel::Reasoning,
+            repeated_tail,
+        ));
+
+        assert_eq!(signals.len(), 1);
+        assert_eq!(signals[0].reason_code, LoopReasonCode::RepeatedLine);
+        assert_eq!(signals[0].feature_summary.fields()["threshold"], "8");
+        assert_eq!(
+            detector.repeated_line_first_byte_offset(StreamChannel::Reasoning),
+            Some(expected_boundary)
         );
     }
 

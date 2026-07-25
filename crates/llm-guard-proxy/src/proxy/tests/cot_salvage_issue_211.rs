@@ -1,7 +1,7 @@
 use super::*;
 
 #[tokio::test]
-async fn bounded_cot_salvage_uses_configured_note_limit_and_forces_no_thinking() {
+async fn bounded_cot_salvage_uses_configured_note_limit_and_thinking_budget() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -59,7 +59,7 @@ thinking_mode = "force_disable"
     let first_attempt = fake.recv_next().await;
     let salvage_attempt = fake.recv_next().await;
     assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
-    assert_eq!(body_thinking_budget(&salvage_attempt.body), Some(0));
+    assert_eq!(body_thinking_budget(&salvage_attempt.body), Some(2_048));
 
     let salvage_request: serde_json::Value =
         serde_json::from_slice(&salvage_attempt.body).expect("salvage body should be JSON");
@@ -82,7 +82,7 @@ thinking_mode = "force_disable"
     );
     assert_eq!(
         attempts[1].response_metadata["cot_salvage_thinking_mode"],
-        "force_disable"
+        "bounded_thinking"
     );
 }
 
@@ -142,7 +142,7 @@ thinking_token_budget = 8192
 
     let _first_attempt = fake.recv_next().await;
     let salvage_attempt = fake.recv_next().await;
-    assert_eq!(body_thinking_budget(&salvage_attempt.body), Some(0));
+    assert_eq!(body_thinking_budget(&salvage_attempt.body), Some(1_024));
     let salvage_request: serde_json::Value =
         serde_json::from_slice(&salvage_attempt.body).expect("salvage body should be JSON");
     let salvage_messages = salvage_request["messages"]
@@ -165,7 +165,7 @@ thinking_token_budget = 8192
     );
     assert_eq!(
         attempts[1].response_metadata["cot_salvage_post_loop_bytes_discarded"],
-        (LOOPING_TAIL.len() * 3).to_string()
+        (LOOPING_TAIL.len() * 4).to_string()
     );
     assert_eq!(
         attempts[1].response_metadata["cot_salvage_boundary"],
@@ -176,6 +176,7 @@ thinking_token_budget = 8192
 #[tokio::test]
 async fn bounded_cot_salvage_uses_pre_abort_reasoning_when_repeated_line_tail_is_unavailable() {
     const PRE_LOOP_REASONING: &str = "derive the invariant before answering\n";
+    const LOOPING_TAIL: &str = "repeat the broken branch\n";
 
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -228,7 +229,7 @@ thinking_token_budget = 8192
 
     let _first_attempt = fake.recv_next().await;
     let salvage_attempt = fake.recv_next().await;
-    assert_eq!(body_thinking_budget(&salvage_attempt.body), Some(0));
+    assert_eq!(body_thinking_budget(&salvage_attempt.body), Some(1_024));
     let salvage_request: serde_json::Value =
         serde_json::from_slice(&salvage_attempt.body).expect("salvage body should be JSON");
     let salvage_messages = salvage_request["messages"]
@@ -244,11 +245,178 @@ thinking_token_budget = 8192
     assert_eq!(attempts[1].response_metadata["cot_salvage_used"], "true");
     assert_eq!(
         attempts[1].response_metadata["cot_salvage_boundary"],
-        "abort_fragment"
+        "repeated_line"
     );
     assert_eq!(
         attempts[1].response_metadata["cot_salvage_post_loop_bytes_discarded"],
-        "0"
+        (LOOPING_TAIL.len() * 2).to_string()
+    );
+}
+
+#[tokio::test]
+async fn bounded_cot_salvage_keeps_pre_loop_reasoning_when_the_boundary_is_in_the_abort_fragment() {
+    const PRE_LOOP_REASONING: &str = "derive the invariant before answering\n";
+    const LOOPING_TAIL: &str = "repeat the broken branch\n";
+
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+on_reasoning_loop = "bounded_answer_from_cot"
+output_repeated_line_threshold = 2
+cot_salvage_prefix_max_bytes = 1024
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "salvage-answer"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-with-intra-fragment-tail-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let _first_attempt = fake.recv_next().await;
+    let salvage_attempt = fake.recv_next().await;
+    let salvage_request: serde_json::Value =
+        serde_json::from_slice(&salvage_attempt.body).expect("salvage body should be JSON");
+    let salvage_system_content = salvage_request["messages"]
+        .as_array()
+        .expect("salvage request should include messages")[0]["content"]
+        .as_str()
+        .expect("salvage system message should contain text");
+    assert!(salvage_system_content.contains(PRE_LOOP_REASONING));
+    assert!(!salvage_system_content.contains(LOOPING_TAIL));
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[1].response_metadata["cot_salvage_boundary"],
+        "repeated_line"
+    );
+    assert_eq!(
+        attempts[1].response_metadata["cot_salvage_post_loop_bytes_discarded"],
+        (LOOPING_TAIL.len() * 2).to_string()
+    );
+}
+
+#[tokio::test]
+async fn bounded_cot_salvage_preserves_reasoning_before_the_detector_selected_repeated_line() {
+    const EARLY_REPEAT: &str = "harmless repeated framing\n";
+    const USEFUL_ONE: &str = "derive the first useful invariant\n";
+    const USEFUL_TWO: &str = "apply the second useful invariant\n";
+    const LOOPING_TAIL: &str = "actual repeated loop tail\n";
+
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+on_reasoning_loop = "bounded_answer_from_cot"
+output_repeated_line_threshold = 4
+input_overlap_threshold_multiplier = 2
+cot_salvage_prefix_max_bytes = 4096
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "salvage-answer"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-with-early-repeat-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"actual repeated loop tail\nactual repeated loop tail\n"}]}"#,
+        )
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        shielded_final_json(response).await["choices"][0]["message"]["content"],
+        "Hello"
+    );
+
+    let _first_attempt = fake.recv_next().await;
+    let salvage_attempt = fake.recv_next().await;
+    let salvage_request: serde_json::Value =
+        serde_json::from_slice(&salvage_attempt.body).expect("salvage body should be JSON");
+    let salvage_system_content = salvage_request["messages"]
+        .as_array()
+        .expect("salvage request should include messages")[0]["content"]
+        .as_str()
+        .expect("salvage system message should contain text");
+    assert!(salvage_system_content.contains(EARLY_REPEAT));
+    assert!(salvage_system_content.contains(USEFUL_ONE));
+    assert!(salvage_system_content.contains(USEFUL_TWO));
+    assert!(!salvage_system_content.contains(LOOPING_TAIL));
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].response_metadata["loop_signal_0_feature_threshold"],
+        "8"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["loop_signal_0_feature_input_overlap_applied"],
+        "true"
+    );
+    assert_eq!(attempts[1].response_metadata["cot_salvage_used"], "true");
+    assert_eq!(
+        attempts[1].response_metadata["cot_salvage_boundary"],
+        "repeated_line"
+    );
+    assert_eq!(
+        attempts[1].response_metadata["cot_salvage_post_loop_bytes_discarded"],
+        (LOOPING_TAIL.len() * 8).to_string()
     );
 }
 
