@@ -3160,16 +3160,22 @@ async fn forward_openai_request(
         .then(|| watchdog_progress_unit(&prepared_request.forward_uri))
         .flatten()
         .map(|progress_unit| {
-            state.stuck_watchdog_tokens.watch_request(
-                &prepared_request.upstream_profile.name,
-                progress_unit,
-                Duration::from_secs(
-                    prepared_request
-                        .upstream_profile
-                        .stuck_watchdog
-                        .detection_window_secs,
-                ),
-            )
+            state
+                .stuck_watchdog_tokens
+                .watch_request_with_unobservable_progress(
+                    &prepared_request.upstream_profile.name,
+                    progress_unit,
+                    Duration::from_secs(
+                        prepared_request
+                            .upstream_profile
+                            .stuck_watchdog
+                            .detection_window_secs,
+                    ),
+                    matches!(
+                        prepared_request.shielded_chat_plan.kind,
+                        ShieldedChatKind::NonStream
+                    ),
+                )
         });
     let endpoint_retry_body = prepared_request.shielded_chat_plan.upstream_body.clone();
     let mut _initial_recovery_trial_lease = None;
@@ -6800,6 +6806,7 @@ struct StuckWatchdogRequestInner {
     profile: String,
     progress_unit: WatchdogProgressUnit,
     detection_window: Duration,
+    unobservable_progress: bool,
     #[cfg(test)]
     fallback_progress_parser: Mutex<WatchdogProgressParser>,
 }
@@ -6882,11 +6889,27 @@ impl StuckWatchdogTokenTracker {
             .begin_attempt()
     }
 
+    #[cfg(test)]
     fn watch_request(
         self: &Arc<Self>,
         profile: &str,
         progress_unit: WatchdogProgressUnit,
         detection_window: Duration,
+    ) -> StuckWatchdogRequest {
+        self.watch_request_with_unobservable_progress(
+            profile,
+            progress_unit,
+            detection_window,
+            false,
+        )
+    }
+
+    fn watch_request_with_unobservable_progress(
+        self: &Arc<Self>,
+        profile: &str,
+        progress_unit: WatchdogProgressUnit,
+        detection_window: Duration,
+        unobservable_progress: bool,
     ) -> StuckWatchdogRequest {
         StuckWatchdogRequest {
             inner: Arc::new(StuckWatchdogRequestInner {
@@ -6894,6 +6917,7 @@ impl StuckWatchdogTokenTracker {
                 profile: profile.to_owned(),
                 progress_unit,
                 detection_window,
+                unobservable_progress,
                 #[cfg(test)]
                 fallback_progress_parser: Mutex::new(WatchdogProgressParser::default()),
             }),
@@ -7037,8 +7061,8 @@ impl StuckWatchdogRequest {
                 StuckWatchdogAttempt {
                     started_at: Instant::now(),
                     completed: None,
-                    observation_suspended: false,
-                    unobservable_progress: false,
+                    observation_suspended: self.inner.unobservable_progress,
+                    unobservable_progress: self.inner.unobservable_progress,
                 },
             );
         StuckWatchdogAttemptLease {
