@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use axum::body::Bytes;
-use llm_guard_proxy_core::{AppConfig, MetadataConfig};
+use llm_guard_proxy_core::{AppConfig, MetadataConfig, UpstreamProfileConfig};
 use serde_json::{Map, Number, Value};
 
 /// Enriches OpenAI-compatible model list responses with normalized context metadata.
@@ -61,6 +61,77 @@ pub(super) fn filter_models_body_by_id(
             .is_some_and(&mut allow_model_id)
     });
     serde_json::to_vec(&value).map_or(body, Bytes::from)
+}
+
+/// Injects each missing `match_models` alias with metadata from its profile's first model.
+///
+/// This runs before listener filtering so aliases selected by the listener remain discoverable.
+pub(super) fn append_match_model_aliases(profiles: &[UpstreamProfileConfig], body: Bytes) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    let Some(models) = value.get_mut("data").and_then(Value::as_array_mut) else {
+        return body;
+    };
+    let mut changed = false;
+    for profile in profiles {
+        changed |= append_match_model_alias_records(profile, models);
+    }
+    if !changed {
+        return body;
+    }
+    serde_json::to_vec(&value).map_or(body, Bytes::from)
+}
+
+fn append_match_model_alias_records(
+    profile: &UpstreamProfileConfig,
+    models: &mut Vec<Value>,
+) -> bool {
+    let Some(template) = models
+        .iter()
+        .find(|model| model.get("id").and_then(Value::as_str).is_some())
+        .cloned()
+    else {
+        return false;
+    };
+    let mut seen = models
+        .iter()
+        .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect::<HashSet<_>>();
+    let mut changed = false;
+    for alias in &profile.match_models {
+        if !seen.insert(alias.clone()) {
+            continue;
+        }
+        if let Some(record) = match_model_alias_record(profile, alias, &template) {
+            models.push(record);
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn match_model_alias_record(
+    profile: &UpstreamProfileConfig,
+    alias: &str,
+    template: &Value,
+) -> Option<Value> {
+    let mut record = template.as_object()?.clone();
+    record.insert(String::from("id"), Value::String(alias.to_owned()));
+    record.insert(
+        String::from("owned_by"),
+        Value::String(String::from("llm-guard-proxy")),
+    );
+    record.insert(String::from("llm_guard_proxy_alias"), Value::Bool(true));
+    record.insert(
+        String::from("alias_kind"),
+        Value::String(String::from("upstream")),
+    );
+    record.insert(
+        String::from("upstream_profile"),
+        Value::String(profile.name.clone()),
+    );
+    Some(Value::Object(record))
 }
 
 /// Merges already-filtered OpenAI-compatible model list responses.

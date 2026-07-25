@@ -90,6 +90,9 @@ const DISTINCT_UPSTREAM_EMBEDDING_MODELS_BODY: &str = r#"{"object":"list","data"
 const DISTINCT_UPSTREAM_RERANK_MODELS_BODY: &str = r#"{"object":"list","data":[{"id":"chat-model","object":"model","owned_by":"vllm"},{"id":"rerank-model","object":"model","owned_by":"vllm"}]}"#;
 const DISTINCT_UPSTREAM_SLOW_MODELS_BODY: &str =
     r#"{"object":"list","data":[{"id":"slow-model","object":"model","owned_by":"vllm"}]}"#;
+const MATCH_MODELS_DEFAULT_BODY: &str = r#"{"object":"list","data":[{"id":"default-real","object":"model","owned_by":"default-upstream","created":1,"max_model_len":8192,"context_length":8192,"max_context_length":8192}]}"#;
+const MATCH_MODELS_PROFILE_BODY: &str = r#"{"object":"list","data":[{"id":"profile-first","object":"model","owned_by":"profile-upstream","created":2,"max_model_len":32768,"context_length":32768,"max_context_length":32768,"permission":["profile-only"],"extra":"copied"},{"id":"profile-second","object":"model","owned_by":"profile-upstream","created":3,"max_model_len":16384,"context_length":16384,"max_context_length":16384}]}"#;
+const MATCH_MODELS_DUPLICATE_BODY: &str = r#"{"object":"list","data":[{"id":"already-upstream","object":"model","owned_by":"profile-upstream","created":4,"max_model_len":4096,"context_length":4096,"max_context_length":4096,"extra":"unchanged"},{"id":"profile-real","object":"model","owned_by":"profile-upstream","created":5,"max_model_len":8192,"context_length":8192,"max_context_length":8192}]}"#;
 const REPEATED_INPUT_LOOP_LINE: &str = "legitimate repeated input line for issue ten";
 const LARGE_MODEL_METADATA_EXTRA_BYTES: usize = 1024 * 1024;
 static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -3445,6 +3448,287 @@ workflow_id = "child_safe_general_v1"
     assert_eq!(alias_record["owned_by"], "llm-guard-proxy");
     assert_eq!(alias_record["llm_guard_proxy_alias"], true);
     assert_eq!(alias_record["alias_kind"], "upstream");
+}
+
+#[tokio::test]
+async fn models_endpoint_includes_missing_match_models_aliases() {
+    let default_upstream = FakeUpstream::spawn_with_models_body(MATCH_MODELS_DEFAULT_BODY).await;
+    let matching_upstream = FakeUpstream::spawn_with_models_body(MATCH_MODELS_PROFILE_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &default_upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "matching"
+base_url = "{}"
+match_models = ["qwen3.6-27b-decensored", "qwen3.6-27b-reasoning"]
+"#,
+            matching_upstream.base_url
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=distinct-multi-upstream-models",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("models request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    let models = json["data"]
+        .as_array()
+        .expect("models data should be an array");
+    let model_ids = models
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert!(model_ids.contains(&"default-real"));
+    assert!(model_ids.contains(&"profile-first"));
+    assert!(model_ids.contains(&"qwen3.6-27b-decensored"));
+    assert!(model_ids.contains(&"qwen3.6-27b-reasoning"));
+}
+
+#[tokio::test]
+async fn models_endpoint_includes_match_models_from_profiles_sharing_an_upstream_endpoint() {
+    let upstream = FakeUpstream::spawn_with_models_body(MATCH_MODELS_DEFAULT_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "matching"
+base_url = "{}"
+match_models = ["shared-endpoint-alias"]
+"#,
+            upstream.base_url
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=distinct-multi-upstream-models",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("models request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    let model_ids = json["data"]
+        .as_array()
+        .expect("models data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert!(model_ids.contains(&"shared-endpoint-alias"));
+}
+
+#[tokio::test]
+async fn profile_listener_lists_match_models_when_metadata_enrichment_is_disabled() {
+    let upstream = FakeUpstream::spawn_with_models_body(MATCH_MODELS_PROFILE_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "matching"
+base_url = "{}"
+match_models = ["listener-only-alias"]
+
+[upstreams.metadata]
+discovery_enabled = false
+enrich_responses = false
+
+[[listeners]]
+name = "profile-only"
+bind_host = "127.0.0.1"
+port = 18004
+upstream_profile = "matching"
+"#,
+            upstream.base_url
+        ),
+    )
+    .await;
+    let listener = listener_config(&proxy, "profile-only");
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models body should read");
+    let json: serde_json::Value = serde_json::from_slice(&body).expect("models should be JSON");
+    let model_ids = json["data"]
+        .as_array()
+        .expect("models data should be an array")
+        .iter()
+        .map(|model| model["id"].as_str().expect("model id should be string"))
+        .collect::<Vec<_>>();
+
+    assert!(
+        model_ids.contains(&"listener-only-alias"),
+        "model ids were {model_ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn models_endpoint_does_not_duplicate_match_models_aliases_already_upstream() {
+    let default_upstream = FakeUpstream::spawn_with_models_body(MATCH_MODELS_DEFAULT_BODY).await;
+    let matching_upstream = FakeUpstream::spawn_with_models_body(MATCH_MODELS_DUPLICATE_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &default_upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "matching"
+base_url = "{}"
+match_models = ["already-upstream", "missing-upstream"]
+
+[[model_aliases]]
+id = "missing-upstream"
+kind = "upstream"
+upstream_profile = "matching"
+"#,
+            matching_upstream.base_url
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=distinct-multi-upstream-models",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("models request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    let models = json["data"]
+        .as_array()
+        .expect("models data should be an array");
+    let upstream_records = models
+        .iter()
+        .filter(|model| model["id"] == "already-upstream")
+        .collect::<Vec<_>>();
+
+    assert_eq!(upstream_records.len(), 1);
+    assert_eq!(
+        upstream_records[0],
+        &serde_json::json!({
+            "id": "already-upstream",
+            "object": "model",
+            "owned_by": "profile-upstream",
+            "created": 4,
+            "max_model_len": 4096,
+            "context_length": 4096,
+            "max_context_length": 4096,
+            "extra": "unchanged",
+        })
+    );
+    let missing_alias_records = models
+        .iter()
+        .filter(|model| model["id"] == "missing-upstream")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        missing_alias_records.len(),
+        1,
+        "the match_models alias and model_alias must share one synthetic record"
+    );
+    assert_eq!(
+        missing_alias_records[0],
+        &serde_json::json!({
+            "id": "missing-upstream",
+            "object": "model",
+            "owned_by": "llm-guard-proxy",
+            "created": 4,
+            "max_model_len": 4096,
+            "context_length": 4096,
+            "max_context_length": 4096,
+            "extra": "unchanged",
+            "llm_guard_proxy_alias": true,
+            "alias_kind": "upstream",
+            "upstream_profile": "matching",
+        })
+    );
+}
+
+#[tokio::test]
+async fn match_models_alias_copies_first_matching_profile_model_metadata() {
+    let default_upstream = FakeUpstream::spawn_with_models_body(MATCH_MODELS_DEFAULT_BODY).await;
+    let matching_upstream = FakeUpstream::spawn_with_models_body(MATCH_MODELS_PROFILE_BODY).await;
+    let proxy = ProxyFixture::spawn_with_admission_config(
+        &default_upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[[upstreams]]
+name = "matching"
+base_url = "{}"
+match_models = ["qwen3.6-27b-decensored"]
+"#,
+            matching_upstream.base_url
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!(
+            "{}/v1/models?test=distinct-multi-upstream-models",
+            proxy.base_url
+        ))
+        .send()
+        .await
+        .expect("models request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = response_json(response).await;
+    let models = json["data"]
+        .as_array()
+        .expect("models data should be an array");
+    let alias_record = models
+        .iter()
+        .find(|model| model["id"] == "qwen3.6-27b-decensored")
+        .expect("match_models alias should be present");
+
+    assert_eq!(
+        alias_record,
+        &serde_json::json!({
+            "id": "qwen3.6-27b-decensored",
+            "object": "model",
+            "owned_by": "llm-guard-proxy",
+            "created": 2,
+            "max_model_len": 32768,
+            "context_length": 32768,
+            "max_context_length": 32768,
+            "permission": ["profile-only"],
+            "extra": "copied",
+            "llm_guard_proxy_alias": true,
+            "alias_kind": "upstream",
+            "upstream_profile": "matching",
+        })
+    );
 }
 
 #[tokio::test]
