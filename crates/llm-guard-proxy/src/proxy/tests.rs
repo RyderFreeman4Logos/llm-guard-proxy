@@ -2879,12 +2879,16 @@ check_interval_secs = 1
     .await
 }
 
-async fn spawn_shielded_watchdog_proxy_with_detection_window(
+async fn spawn_watchdog_proxy_with_detection_window(
     upstream_base_url: &str,
     detection_window_secs: u64,
+    shielding_enabled: bool,
 ) -> ProxyFixture {
     let extra_config = format!(
         r"
+[shielding]
+enabled = {shielding_enabled}
+
 [upstream.stuck_watchdog]
 enabled = true
 detection_window_secs = {detection_window_secs}
@@ -3032,7 +3036,7 @@ async fn shielded_non_stream_chat_forces_upstream_sse_and_aggregates_json() {
 #[tokio::test]
 async fn shielded_non_stream_chat_does_not_trigger_watchdog_without_visible_progress() {
     let mut fake = FakeUpstream::spawn_with_pre_response_delay(Duration::from_secs(2)).await;
-    let proxy = spawn_shielded_watchdog_proxy_with_detection_window(&fake.base_url, 1).await;
+    let proxy = spawn_watchdog_proxy_with_detection_window(&fake.base_url, 1, true).await;
     let request_client = proxy.client.clone();
     let request_url = format!(
         "{}/v1/chat/completions?test=watchdog-non-stream",
@@ -3066,6 +3070,51 @@ async fn shielded_non_stream_chat_does_not_trigger_watchdog_without_visible_prog
             .stuck_watchdog_tokens
             .has_too_few_output_progress_units("default", Duration::from_secs(1), 1,),
         "non-streaming requests have no proxy-visible progress before completion and must not trigger recovery"
+    );
+
+    let response = request.await.expect("non-stream request task should join");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+/// Regression test for #216 when shielding is disabled: generic non-streaming
+/// forwarding remains response-buffered and must be exempt from the watchdog.
+#[tokio::test]
+async fn generic_non_stream_chat_does_not_trigger_watchdog_without_visible_progress() {
+    let mut fake = FakeUpstream::spawn_with_pre_response_delay(Duration::from_secs(2)).await;
+    let proxy = spawn_watchdog_proxy_with_detection_window(&fake.base_url, 1, false).await;
+    let request_client = proxy.client.clone();
+    let request_url = format!(
+        "{}/v1/chat/completions?test=watchdog-generic-non-stream",
+        proxy.base_url
+    );
+    let request = tokio::spawn(async move {
+        request_client
+            .post(request_url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(
+                r#"{"model":"test-chat","messages":[{"role":"user","content":"think"}],"stream":false}"#,
+            )
+            .send()
+            .await
+            .expect("non-stream proxy request should complete")
+    });
+
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=watchdog-generic-non-stream"
+    );
+    sleep(Duration::from_millis(1_100)).await;
+    assert!(
+        !request.is_finished(),
+        "the delayed upstream response must still be active after the detection window"
+    );
+    assert!(
+        !proxy
+            .state
+            .stuck_watchdog_tokens
+            .has_too_few_output_progress_units("default", Duration::from_secs(1), 1,),
+        "generic non-streaming requests have no proxy-visible progress before completion and must not trigger recovery"
     );
 
     let response = request.await.expect("non-stream request task should join");

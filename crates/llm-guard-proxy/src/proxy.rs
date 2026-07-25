@@ -3171,10 +3171,7 @@ async fn forward_openai_request(
                             .stuck_watchdog
                             .detection_window_secs,
                     ),
-                    matches!(
-                        prepared_request.shielded_chat_plan.kind,
-                        ShieldedChatKind::NonStream
-                    ),
+                    is_non_streaming_chat_request(&method, &uri, &body),
                 )
         });
     let endpoint_retry_body = prepared_request.shielded_chat_plan.upstream_body.clone();
@@ -8267,6 +8264,21 @@ fn should_buffer_models_response(
 
 fn should_intercept_non_stream_chat(method: &Method, uri: &Uri, config: &AppConfig) -> bool {
     method == Method::POST && uri.path() == "/v1/chat/completions" && config.shielding.enabled
+}
+
+/// Output from a non-streaming chat request is not observable until the
+/// upstream finishes, including when shielding is disabled and the request
+/// follows generic forwarding.
+fn is_non_streaming_chat_request(method: &Method, uri: &Uri, body: &Bytes) -> bool {
+    if method != Method::POST || uri.path() != "/v1/chat/completions" {
+        return false;
+    }
+    let Ok(serde_json::Value::Object(request)) = serde_json::from_slice(body) else {
+        return false;
+    };
+    request
+        .get("stream")
+        .is_none_or(|stream| matches!(stream, serde_json::Value::Bool(false)))
 }
 
 fn context_budget_preflight(
