@@ -6447,6 +6447,7 @@ impl ShieldedRetryPolicy {
         attempt_number: u32,
         upstream_profile: &UpstreamProfileConfig,
         cot_salvage: Option<&CotSalvageContext>,
+        force_disable_after_salvage_loop: bool,
     ) -> ShieldedAttemptPlan {
         let fallback_thinking = &upstream_profile.thinking;
         let index = attempt_number.saturating_sub(1);
@@ -6471,6 +6472,8 @@ impl ShieldedRetryPolicy {
                 &plan.thinking,
                 self.cot_salvage_retry_thinking_budget,
             );
+        } else if force_disable_after_salvage_loop {
+            plan.thinking = force_disable_thinking(&plan.thinking);
         }
         plan
     }
@@ -6500,26 +6503,35 @@ fn retry_ladder_thinking(
 fn cot_salvage_thinking(
     policy: LoopFailurePolicy,
     current: &ThinkingConfig,
-    bounded_answer_budget: u32,
+    cot_salvage_retry_thinking_budget: u32,
 ) -> ThinkingConfig {
-    let mut thinking = current.clone();
     match policy {
-        LoopFailurePolicy::RetryLadder => {}
-        LoopFailurePolicy::TruncateCotThenAnswer => {
-            thinking.mode = ThinkingMode::ForceDisable;
-            thinking.enabled = false;
-            thinking.force_disable = true;
-            thinking.budget_tokens = 0;
-            thinking.preserve_answer_budget = false;
-        }
+        LoopFailurePolicy::RetryLadder => current.clone(),
+        // Truncation asks for a direct answer from the preserved notes, so it
+        // deliberately does not begin another reasoning trajectory.
+        LoopFailurePolicy::TruncateCotThenAnswer => force_disable_thinking(current),
+        // This public, validated setting is the bounded continuation budget
+        // for `bounded_answer_from_cot`; preserve its contract instead of
+        // silently replacing it with a no-thinking retry.
         LoopFailurePolicy::BoundedAnswerFromCot => {
+            let mut thinking = current.clone();
             thinking.mode = ThinkingMode::BoundedThinking;
             thinking.enabled = true;
             thinking.force_disable = false;
-            thinking.budget_tokens = bounded_answer_budget;
+            thinking.budget_tokens = cot_salvage_retry_thinking_budget;
             thinking.preserve_answer_budget = false;
+            thinking
         }
     }
+}
+
+fn force_disable_thinking(current: &ThinkingConfig) -> ThinkingConfig {
+    let mut thinking = current.clone();
+    thinking.mode = ThinkingMode::ForceDisable;
+    thinking.enabled = false;
+    thinking.force_disable = true;
+    thinking.budget_tokens = 0;
+    thinking.preserve_answer_budget = false;
     thinking
 }
 
@@ -8855,6 +8867,22 @@ struct ShieldedRetryRuntime {
     shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
 
+impl ShieldedRetryRuntime {
+    fn plan(
+        &self,
+        attempt_number: u32,
+        cot_salvage: Option<&CotSalvageContext>,
+        force_disable_after_salvage_loop: bool,
+    ) -> ShieldedAttemptPlan {
+        self.retry_policy.attempt_plan(
+            attempt_number,
+            &self.upstream_profile,
+            cot_salvage,
+            force_disable_after_salvage_loop,
+        )
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct DownstreamDropSignal {
     dropped: Arc<AtomicBool>,
@@ -9038,12 +9066,37 @@ struct CotSalvageContext {
     source_attempt_id: AttemptId,
     source_attempt_number: u32,
     source_attempt_duration_ms: u64,
-    reasoning_prefix: String,
+    pre_loop_reasoning: String,
+    pre_loop_bytes_available: usize,
+    post_loop_bytes_discarded: usize,
+    boundary: CotSalvageBoundary,
 }
 
 impl CotSalvageContext {
-    fn prefix_bytes(&self) -> usize {
-        self.reasoning_prefix.len()
+    fn retained_pre_loop_bytes(&self) -> usize {
+        self.pre_loop_reasoning.len()
+    }
+
+    fn capped_pre_loop_bytes(&self) -> usize {
+        self.pre_loop_bytes_available
+            .saturating_sub(self.retained_pre_loop_bytes())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CotSalvageBoundary {
+    RepeatedLine,
+    AbortFragment,
+    FirstAttemptWithoutLoopBoundary,
+}
+
+impl CotSalvageBoundary {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RepeatedLine => "repeated_line",
+            Self::AbortFragment => "abort_fragment",
+            Self::FirstAttemptWithoutLoopBoundary => "first_attempt_without_loop_boundary",
+        }
     }
 }
 
@@ -9473,6 +9526,7 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
             attempt_number,
             retry_cause,
             None,
+            false,
             ignores_request_deadline,
         )
         .await
@@ -9587,6 +9641,7 @@ async fn run_shielded_attempts(
     let mut cot_salvage = None;
     let mut cot_salvage_attempted = false;
     let mut first_attempt_cot_salvage = None;
+    let mut force_disable_after_salvage_loop = false;
     loop {
         let mut started = if let Some(started) = current_attempt.take() {
             started
@@ -9604,6 +9659,7 @@ async fn run_shielded_attempts(
                 attempt_number,
                 retry_cause,
                 cot_salvage.as_ref(),
+                force_disable_after_salvage_loop,
                 ignores_request_deadline,
             )
             .await
@@ -9619,6 +9675,7 @@ async fn run_shielded_attempts(
                             attempt_number = next_attempt_number;
                             retry_cause = next_retry_cause;
                             cot_salvage = None;
+                            force_disable_after_salvage_loop = false;
                             continue;
                         }
                         ShieldedStartFailureStep::Failed(outcome) => {
@@ -9684,6 +9741,14 @@ async fn run_shielded_attempts(
                 if first_attempt_cot_salvage.is_none() {
                     first_attempt_cot_salvage =
                         first_attempt_cot_salvage_context(&runtime, &failure);
+                    if first_attempt_cot_salvage.is_none()
+                        && is_reasoning_loop_failure(&runtime, &failure)
+                    {
+                        failure.response_metadata.insert(
+                            String::from("cot_salvage_unavailable_reason"),
+                            String::from("no_pre_loop_reasoning"),
+                        );
+                    }
                 }
                 let next_retry_cause = failure.retry_cause;
                 let mut can_retry = should_retry_after_shielded_failure(&runtime, &failure);
@@ -9729,6 +9794,8 @@ async fn run_shielded_attempts(
                     if next_cot_salvage.is_some() {
                         cot_salvage_attempted = true;
                     }
+                    force_disable_after_salvage_loop = cot_salvage.is_some()
+                        && next_retry_cause == Some(ShieldedRetryCause::LoopDetected);
                     cot_salvage = next_cot_salvage;
                     continue;
                 }
@@ -11243,27 +11310,24 @@ async fn start_shielded_attempt(
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
     cot_salvage: Option<&CotSalvageContext>,
+    force_disable_after_salvage_loop: bool,
     ignores_request_deadline: bool,
 ) -> Result<ShieldedStartedAttempt, ShieldedAttemptFailure> {
     let attempt_id = AttemptId::for_request(&runtime.request_id, attempt_number);
     let attempt_started_at_unix_ms = unix_time_millis();
-    let attempt_plan =
-        runtime
-            .retry_policy
-            .attempt_plan(attempt_number, &runtime.upstream_profile, cot_salvage);
-    let (upstream_body, anti_loop_hint_applied, attempt_thinking_metadata) = shielded_attempt_body(
-        runtime,
+    let plan = runtime.plan(
         attempt_number,
-        retry_cause,
-        &attempt_plan,
         cot_salvage,
+        force_disable_after_salvage_loop,
     );
+    let (upstream_body, anti_loop_hint_applied, attempt_thinking_metadata) =
+        shielded_attempt_body(runtime, attempt_number, retry_cause, &plan, cot_salvage);
     let request_metadata = shielded_attempt_request_metadata(
         runtime,
         attempt_number,
         retry_cause,
         anti_loop_hint_applied,
-        &attempt_plan,
+        &plan,
         cot_salvage,
         &attempt_thinking_metadata,
     );
@@ -11659,7 +11723,7 @@ fn shielded_attempt_body(
             attempt_number,
             runtime.retry_policy.max_attempts,
             cot_salvage.policy.as_str(),
-            &cot_salvage.reasoning_prefix,
+            &cot_salvage.pre_loop_reasoning,
             attempt_plan.anti_loop_hint.as_deref(),
         )
     {
@@ -11862,8 +11926,24 @@ fn add_cot_salvage_request_metadata(
         cot_salvage.source_attempt_duration_ms.to_string(),
     );
     metadata.insert(
-        String::from("cot_salvage_reasoning_prefix_bytes"),
-        cot_salvage.prefix_bytes().to_string(),
+        String::from("cot_salvage_pre_loop_bytes_available"),
+        cot_salvage.pre_loop_bytes_available.to_string(),
+    );
+    metadata.insert(
+        String::from("cot_salvage_pre_loop_bytes_retained"),
+        cot_salvage.retained_pre_loop_bytes().to_string(),
+    );
+    metadata.insert(
+        String::from("cot_salvage_pre_loop_bytes_capped"),
+        cot_salvage.capped_pre_loop_bytes().to_string(),
+    );
+    metadata.insert(
+        String::from("cot_salvage_post_loop_bytes_discarded"),
+        cot_salvage.post_loop_bytes_discarded.to_string(),
+    );
+    metadata.insert(
+        String::from("cot_salvage_boundary"),
+        cot_salvage.boundary.as_str().to_owned(),
     );
     metadata.insert(
         String::from("cot_salvage_thinking_budget_tokens"),
@@ -12090,10 +12170,12 @@ fn first_attempt_cot_salvage_context(
     if failure.attempt_number != 1 || !runtime.retry_policy.loop_failure_policy.uses_cot_salvage() {
         return None;
     }
-    let reasoning = failure.raw_payloads.reasoning.as_deref()?;
-    let reasoning_prefix =
-        bounded_utf8_prefix(reasoning, runtime.retry_policy.cot_salvage_prefix_max_bytes);
-    if reasoning_prefix.trim().is_empty() {
+    let salvaged_reasoning = pre_loop_reasoning_for_salvage(failure)?;
+    let pre_loop_reasoning = bounded_utf8_prefix(
+        salvaged_reasoning.pre_loop_reasoning,
+        runtime.retry_policy.cot_salvage_prefix_max_bytes,
+    );
+    if pre_loop_reasoning.trim().is_empty() {
         return None;
     }
     Some(CotSalvageContext {
@@ -12103,7 +12185,10 @@ fn first_attempt_cot_salvage_context(
         source_attempt_duration_ms: failure
             .finished_at_unix_ms
             .saturating_sub(failure.started_at_unix_ms),
-        reasoning_prefix,
+        pre_loop_reasoning,
+        pre_loop_bytes_available: salvaged_reasoning.pre_loop_reasoning.len(),
+        post_loop_bytes_discarded: salvaged_reasoning.post_loop_bytes_discarded,
+        boundary: salvaged_reasoning.boundary,
     })
 }
 
@@ -12112,16 +12197,74 @@ fn cot_salvage_context_for_failure(
     failure: &ShieldedAttemptFailure,
     first_attempt_cot_salvage: Option<&CotSalvageContext>,
 ) -> Option<CotSalvageContext> {
-    if failure.retry_cause != Some(ShieldedRetryCause::LoopDetected)
-        || !runtime.retry_policy.loop_failure_policy.uses_cot_salvage()
-        || failure
-            .response_metadata
-            .get("loop_channel")
-            .is_none_or(|channel| channel != "reasoning")
-    {
+    if !is_reasoning_loop_failure(runtime, failure) {
         return None;
     }
     first_attempt_cot_salvage.cloned()
+}
+
+fn is_reasoning_loop_failure(
+    runtime: &ShieldedRetryRuntime,
+    failure: &ShieldedAttemptFailure,
+) -> bool {
+    failure.retry_cause == Some(ShieldedRetryCause::LoopDetected)
+        && runtime.retry_policy.loop_failure_policy.uses_cot_salvage()
+        && failure
+            .response_metadata
+            .get("loop_channel")
+            .is_some_and(|channel| channel == "reasoning")
+}
+
+struct SalvagedPreLoopReasoning<'a> {
+    pre_loop_reasoning: &'a str,
+    post_loop_bytes_discarded: usize,
+    boundary: CotSalvageBoundary,
+}
+
+fn pre_loop_reasoning_for_salvage(
+    failure: &ShieldedAttemptFailure,
+) -> Option<SalvagedPreLoopReasoning<'_>> {
+    let reasoning = failure.raw_payloads.reasoning.as_deref()?;
+    if failure.retry_cause != Some(ShieldedRetryCause::LoopDetected) {
+        return Some(SalvagedPreLoopReasoning {
+            pre_loop_reasoning: reasoning,
+            post_loop_bytes_discarded: 0,
+            boundary: CotSalvageBoundary::FirstAttemptWithoutLoopBoundary,
+        });
+    }
+    if failure
+        .response_metadata
+        .get("loop_signal")
+        .is_some_and(|signal| signal == "repeated_line")
+        && let Some(pre_loop_reasoning) =
+            repeated_line_pre_loop_reasoning(reasoning, &failure.response_metadata)
+    {
+        return Some(SalvagedPreLoopReasoning {
+            post_loop_bytes_discarded: reasoning.len().saturating_sub(pre_loop_reasoning.len()),
+            pre_loop_reasoning,
+            boundary: CotSalvageBoundary::RepeatedLine,
+        });
+    }
+    Some(SalvagedPreLoopReasoning {
+        pre_loop_reasoning: reasoning,
+        // The detector has no character offset for these signals. The
+        // triggering fragment was never committed to the aggregate, so this
+        // retains the safe pre-abort prefix while documenting the approximation.
+        post_loop_bytes_discarded: 0,
+        boundary: CotSalvageBoundary::AbortFragment,
+    })
+}
+
+fn repeated_line_pre_loop_reasoning<'reasoning>(
+    reasoning: &'reasoning str,
+    response_metadata: &BTreeMap<String, String>,
+) -> Option<&'reasoning str> {
+    let boundary = response_metadata
+        .get("cot_salvage_repeated_line_boundary_bytes")?
+        .parse::<usize>()
+        .ok()?;
+    (boundary <= reasoning.len() && reasoning.is_char_boundary(boundary))
+        .then(|| &reasoning[..boundary])
 }
 
 fn bounded_utf8_prefix(value: &str, max_bytes: usize) -> String {
@@ -12325,7 +12468,11 @@ fn copy_attempt_request_metadata(
         "cot_salvage_source_attempt_id",
         "cot_salvage_source_attempt_number",
         "cot_salvage_source_attempt_duration_ms",
-        "cot_salvage_reasoning_prefix_bytes",
+        "cot_salvage_pre_loop_bytes_available",
+        "cot_salvage_pre_loop_bytes_retained",
+        "cot_salvage_pre_loop_bytes_capped",
+        "cot_salvage_post_loop_bytes_discarded",
+        "cot_salvage_boundary",
         "cot_salvage_thinking_budget_tokens",
         "cot_salvage_thinking_mode",
     ] {
@@ -15230,7 +15377,11 @@ fn evidence_detector_features(metadata: &BTreeMap<String, String>) -> BTreeMap<S
                         | "cot_salvage_used"
                         | "cot_salvage_policy"
                         | "cot_salvage_source_attempt_number"
-                        | "cot_salvage_reasoning_prefix_bytes"
+                        | "cot_salvage_pre_loop_bytes_available"
+                        | "cot_salvage_pre_loop_bytes_retained"
+                        | "cot_salvage_pre_loop_bytes_capped"
+                        | "cot_salvage_post_loop_bytes_discarded"
+                        | "cot_salvage_boundary"
                         | "cot_salvage_thinking_budget_tokens"
                         | "shadow_compare_attempt"
                         | "shadow_paired_comparison"

@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt};
 use axum::body::Bytes;
 use llm_guard_proxy_core::{
     ChannelizedLoopDetector, DetectorSummary, LoopDetector as CoreLoopDetector, LoopDetectorInput,
-    LoopGuardConfig, LoopGuardMode, LoopInputProfile, LoopSignal, StreamChannel,
+    LoopGuardConfig, LoopGuardMode, LoopInputProfile, LoopReasonCode, LoopSignal, StreamChannel,
     ToolCallFingerprintInput,
 };
 use llm_guard_proxy_state::RawPayloads;
@@ -66,6 +66,14 @@ impl AggregationError {
 
     pub(super) fn with_raw_payloads(mut self, raw_payloads: RawPayloads) -> Self {
         self.raw_payloads = Box::new(raw_payloads);
+        self
+    }
+
+    fn with_repeated_line_boundary(mut self, boundary: usize) -> Self {
+        self.response_metadata.insert(
+            String::from("cot_salvage_repeated_line_boundary_bytes"),
+            boundary.to_string(),
+        );
         self
     }
 
@@ -193,7 +201,16 @@ impl LoopDetector {
         }
         if let Some(signal) = signals.iter().find(|signal| signal.is_abort_candidate()) {
             let summary = self.summary();
-            return Err(AggregationError::loop_detected(signal, &summary, self.mode));
+            let error = AggregationError::loop_detected(signal, &summary, self.mode);
+            if signal.channel == StreamChannel::Reasoning
+                && signal.reason_code == LoopReasonCode::RepeatedLine
+                && let Some(boundary) = self
+                    .detector
+                    .repeated_line_first_byte_offset(signal.channel)
+            {
+                return Err(error.with_repeated_line_boundary(boundary));
+            }
+            return Err(error);
         }
         Ok(())
     }
