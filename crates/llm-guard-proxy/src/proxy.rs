@@ -4843,7 +4843,10 @@ fn merged_models_profiles(
         return None;
     }
     let profiles = listener_models_upstream_profiles(context.config, &context.state.listener);
-    (profiles.len() > 1).then_some(profiles)
+    let uses_non_current_profile = profiles
+        .first()
+        .is_some_and(|profile| profile.name != context.upstream_profile.name);
+    (profiles.len() > 1 || uses_non_current_profile).then_some(profiles)
 }
 
 async fn begin_models_upstream_group(
@@ -4907,6 +4910,7 @@ async fn begin_models_upstream_group(
         base_url,
         request_timeout_ms: profile.request_timeout_ms,
         metadata: profile.metadata.clone(),
+        match_model_alias_profiles: vec![profile.clone()],
         profile,
         terminal_endpoint,
         endpoint_retry_order,
@@ -5048,6 +5052,7 @@ async fn forward_generic_endpoint_response(
                     uri: &context.uri,
                     config: context.config,
                     listener: &context.state.listener,
+                    upstream_profile: &context.upstream_profile,
                     metadata_config: &context.upstream_profile.metadata,
                     malformed_response_counter: &context.state.malformed_response_counter,
                 },
@@ -5140,6 +5145,7 @@ fn forward_rewritten_endpoint_response(
 
 struct ModelsUpstreamGroup {
     profile: UpstreamProfileConfig,
+    match_model_alias_profiles: Vec<UpstreamProfileConfig>,
     base_url: String,
     request_timeout_ms: u64,
     metadata: MetadataConfig,
@@ -5167,7 +5173,7 @@ async fn forward_merged_models_response(
     let mut response_status = None;
     let mut response_headers = None;
     let mut response_mode = None;
-    let mut filtered_bodies = Vec::with_capacity(profile_count);
+    let mut filtered_bodies: Vec<Bytes> = Vec::with_capacity(profile_count);
     let mut attempt_records = Vec::with_capacity(profile_count);
     let mut selected_groups = Vec::<ModelsUpstreamGroup>::with_capacity(profile_count);
     let mut next_attempt_number = 1;
@@ -5176,10 +5182,16 @@ async fn forward_merged_models_response(
             Ok(group) => group,
             Err(error) => return Err(error.with_completed_attempt_records(attempt_records)),
         };
-        if selected_groups
+        if let Some(index) = selected_groups
             .iter()
-            .any(|selected| same_models_endpoint_identity(selected, &group))
+            .position(|selected| same_models_endpoint_identity(selected, &group))
         {
+            selected_groups[index]
+                .match_model_alias_profiles
+                .extend(group.match_model_alias_profiles);
+            let body = filtered_bodies[index].clone();
+            filtered_bodies[index] =
+                prepare_models_body_for_group(&context, &selected_groups[index], body);
             continue;
         }
         let fetch = match fetch_models_upstream_group(
@@ -5209,19 +5221,12 @@ async fn forward_merged_models_response(
         .first()
         .map_or(&context.upstream_profile.metadata, |group| &group.metadata);
     let merged_body = model_metadata::merge_models_bodies(filtered_bodies);
-    let (upstream_status, upstream_headers, upstream_mode) = if merged_body.has_valid_model_list {
-        (
-            reqwest::StatusCode::OK,
-            models_success_response_headers(),
-            UpstreamMode::NotApplicable,
-        )
-    } else {
-        (
-            response_status.unwrap_or(reqwest::StatusCode::OK),
-            response_headers.unwrap_or_default(),
-            response_mode.unwrap_or(UpstreamMode::NotApplicable),
-        )
-    };
+    let (upstream_status, upstream_headers, upstream_mode) = models_response_details(
+        merged_body.has_valid_model_list,
+        response_status,
+        response_headers,
+        response_mode,
+    );
     let body =
         model_metadata::enrich_models_body(context.config, metadata_config, merged_body.body);
     let response_parts = ForwardedResponseParts {
@@ -5259,6 +5264,26 @@ async fn forward_merged_models_response(
         &upstream_headers,
         Body::from_stream(response_body),
     ))
+}
+
+fn models_response_details(
+    has_valid_model_list: bool,
+    response_status: Option<reqwest::StatusCode>,
+    response_headers: Option<HeaderMap>,
+    response_mode: Option<UpstreamMode>,
+) -> (reqwest::StatusCode, HeaderMap, UpstreamMode) {
+    if has_valid_model_list {
+        return (
+            reqwest::StatusCode::OK,
+            models_success_response_headers(),
+            UpstreamMode::NotApplicable,
+        );
+    }
+    (
+        response_status.unwrap_or(reqwest::StatusCode::OK),
+        response_headers.unwrap_or_default(),
+        response_mode.unwrap_or(UpstreamMode::NotApplicable),
+    )
 }
 
 fn same_models_endpoint_identity(left: &ModelsUpstreamGroup, right: &ModelsUpstreamGroup) -> bool {
@@ -5395,7 +5420,7 @@ async fn fetch_models_upstream_group(
         }
     };
     let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
-    let body = filter_models_body_for_listener(context.config, &context.state.listener, body);
+    let body = prepare_models_body_for_group(context, group, body);
     let attempt_record = final_attempt_record(
         FinalAttemptContext {
             attempt_id,
@@ -6259,6 +6284,7 @@ struct ResponseDispatch<'request> {
     uri: &'request Uri,
     config: &'request AppConfig,
     listener: &'request ListenerConfig,
+    upstream_profile: &'request UpstreamProfileConfig,
     metadata_config: &'request MetadataConfig,
     malformed_response_counter: &'request AtomicU64,
 }
@@ -8101,6 +8127,7 @@ async fn forward_upstream_response(
         dispatch.uri,
         dispatch.metadata_config,
         dispatch.listener,
+        dispatch.upstream_profile,
     ) {
         return forward_buffered_models_response(
             response_parts,
@@ -8108,6 +8135,7 @@ async fn forward_upstream_response(
             in_flight_permit,
             dispatch.config,
             dispatch.listener,
+            dispatch.upstream_profile,
             dispatch.metadata_config,
         )
         .await;
@@ -8204,10 +8232,12 @@ fn should_buffer_models_response(
     uri: &Uri,
     metadata: &MetadataConfig,
     listener: &ListenerConfig,
+    upstream_profile: &UpstreamProfileConfig,
 ) -> bool {
     method == Method::GET
         && uri.path() == "/v1/models"
         && (listener.allowed_upstreams.is_some()
+            || !upstream_profile.match_models.is_empty()
             || should_enrich_models_response(method, uri, metadata))
 }
 
@@ -8728,6 +8758,7 @@ async fn forward_buffered_models_response(
     in_flight_permit: InFlightPermit,
     config: &AppConfig,
     listener: &ListenerConfig,
+    upstream_profile: &UpstreamProfileConfig,
     metadata_config: &MetadataConfig,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
@@ -8742,7 +8773,7 @@ async fn forward_buffered_models_response(
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
     response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
-    let body = filter_models_body_for_listener(config, listener, body);
+    let body = prepare_models_body(config, listener, upstream_profile, body);
     let body = model_metadata::enrich_models_body(config, metadata_config, body);
     let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
@@ -8753,6 +8784,25 @@ async fn forward_buffered_models_response(
         &upstream_headers,
         Body::from_stream(response_body),
     ))
+}
+
+fn prepare_models_body_for_group(
+    context: &GenericForwardContext<'_>,
+    group: &ModelsUpstreamGroup,
+    body: Bytes,
+) -> Bytes {
+    let body = model_metadata::append_match_model_aliases(&group.match_model_alias_profiles, body);
+    filter_models_body_for_listener(context.config, &context.state.listener, body)
+}
+
+fn prepare_models_body(
+    config: &AppConfig,
+    listener: &ListenerConfig,
+    profile: &UpstreamProfileConfig,
+    body: Bytes,
+) -> Bytes {
+    let body = model_metadata::append_match_model_aliases(std::slice::from_ref(profile), body);
+    filter_models_body_for_listener(config, listener, body)
 }
 
 fn filter_models_body_for_listener(
