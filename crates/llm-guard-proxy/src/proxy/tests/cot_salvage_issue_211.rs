@@ -173,6 +173,85 @@ thinking_token_budget = 8192
     );
 }
 
+#[tokio::test]
+async fn bounded_cot_salvage_uses_pre_abort_reasoning_when_repeated_line_tail_is_unavailable() {
+    const PRE_LOOP_REASONING: &str = "derive the invariant before answering\n";
+
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[loop_guard]
+mode = "enforce"
+on_reasoning_loop = "bounded_answer_from_cot"
+output_repeated_line_threshold = 2
+cot_salvage_prefix_max_bytes = 1024
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+
+[[retry.ladder]]
+name = "max-thinking"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "salvage-answer"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=loop-with-prelude-then-success",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        shielded_final_json(response).await["choices"][0]["message"]["content"],
+        "Hello"
+    );
+
+    let _first_attempt = fake.recv_next().await;
+    let salvage_attempt = fake.recv_next().await;
+    assert_eq!(body_thinking_budget(&salvage_attempt.body), Some(0));
+    let salvage_request: serde_json::Value =
+        serde_json::from_slice(&salvage_attempt.body).expect("salvage body should be JSON");
+    let salvage_messages = salvage_request["messages"]
+        .as_array()
+        .expect("salvage request should include messages");
+    let salvage_system_content = salvage_messages[0]["content"]
+        .as_str()
+        .expect("salvage system message should contain text");
+    assert!(salvage_system_content.contains(PRE_LOOP_REASONING));
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[1].response_metadata["cot_salvage_used"], "true");
+    assert_eq!(
+        attempts[1].response_metadata["cot_salvage_boundary"],
+        "abort_fragment"
+    );
+    assert_eq!(
+        attempts[1].response_metadata["cot_salvage_post_loop_bytes_discarded"],
+        "0"
+    );
+}
+
 #[test]
 fn evidence_features_keep_cot_salvage_pre_loop_metadata() {
     let metadata = BTreeMap::from([

@@ -12218,8 +12218,8 @@ fn pre_loop_reasoning_for_salvage(
         .response_metadata
         .get("loop_signal")
         .is_some_and(|signal| signal == "repeated_line")
+        && let Some(pre_loop_reasoning) = reasoning_before_repeated_line_tail(reasoning)
     {
-        let pre_loop_reasoning = reasoning_before_repeated_line_tail(reasoning)?;
         return Some(SalvagedPreLoopReasoning {
             post_loop_bytes_discarded: reasoning.len().saturating_sub(pre_loop_reasoning.len()),
             pre_loop_reasoning,
@@ -12228,9 +12228,10 @@ fn pre_loop_reasoning_for_salvage(
     }
     Some(SalvagedPreLoopReasoning {
         pre_loop_reasoning: reasoning,
-        // The detector has no character offset for these signals. The
-        // triggering fragment was never committed to the aggregate, so this
-        // retains the safe pre-abort prefix while documenting the approximation.
+        // The detector has no usable character offset when a triggering
+        // fragment is not committed. This includes low repeated-line
+        // thresholds whose aggregate has no duplicated line yet. Retain the
+        // safe pre-abort prefix while documenting the approximation.
         post_loop_bytes_discarded: 0,
         boundary: CotSalvageBoundary::AbortFragment,
     })
