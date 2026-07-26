@@ -7265,6 +7265,7 @@ async fn local_recovery_restart_command() {
 
     let success_policy = LocalRecoveryPolicy {
         enabled: true,
+        trigger_on_request_deadline: false,
         restart_command: vec![String::from("/bin/true")],
         restart_timeout: Duration::from_secs(1),
         readiness_endpoint: String::from("/v1/chat/completions"),
@@ -7565,7 +7566,7 @@ max_per_window = 1
 }
 
 #[tokio::test]
-async fn local_recovery_replays_after_request_deadline_recovery() {
+async fn local_recovery_replays_after_request_deadline_recovery_when_enabled() {
     let mut fake = FakeUpstream::spawn().await;
     let recovery_root = unique_test_dir("local-recovery-deadline-replay");
     fs::create_dir_all(&recovery_root).expect("recovery root should be created");
@@ -7586,6 +7587,7 @@ anti_loop_hint_enabled = false
 
 [upstream.local_recovery]
 enabled = true
+trigger_on_request_deadline = true
 restart_command = ["/usr/bin/touch", "{recovery_marker}"]
 restart_timeout_ms = 1000
 readiness_body = {{"model":"test-chat","messages":[{{"role":"user","content":"deadline recovery ready"}}],"max_tokens":1}}
@@ -12105,26 +12107,16 @@ idle_timeout_ms = 50
 #[tokio::test]
 async fn shielded_retry_streaming_request_deadline_exhaustion_stops_waiting() {
     let mut fake = FakeUpstream::spawn().await;
+    let recovery_root = unique_test_dir("local-recovery-deadline-default-disabled");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let recovery_marker = recovery_root.join("recovered");
+    let config = local_recovery_default_deadline_config(&recovery_marker);
     let proxy = ProxyFixture::spawn_with_full_options(
         &fake.base_url,
         true,
         AppConfig::default().server.max_in_flight_requests,
         "",
-        r#"
-[heartbeat]
-mode = "sse"
-interval_secs = 15
-
-[loop_guard]
-mode = "enforce"
-output_repeated_line_threshold = 4
-
-[retry]
-max_attempts = 4
-request_deadline_ms = 100
-anti_loop_hint_enabled = false
-shielded_streaming_enabled = true
-"#,
+        &config,
         r#"debug_summary_enabled = true
 debug_summary_admin_token = "admin-token"
 debug_summary_max_records = 5
@@ -12159,6 +12151,10 @@ debug_summary_max_records = 5
     assert_eq!(
         first_attempt.path_and_query,
         "/v1/chat/completions?test=slow-shielded"
+    );
+    assert!(
+        !recovery_marker.exists(),
+        "request deadline exhaustion must not invoke local recovery by default"
     );
     assert!(
         fake.recv_within(Duration::from_millis(100)).await.is_none(),
@@ -12203,6 +12199,40 @@ debug_summary_max_records = 5
     );
 
     assert_deadline_debug_summary(&proxy).await;
+    remove_dir_all(&recovery_root);
+}
+
+fn local_recovery_default_deadline_config(recovery_marker: &std::path::Path) -> String {
+    format!(
+        r#"
+[heartbeat]
+mode = "sse"
+interval_secs = 15
+
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 4
+request_deadline_ms = 100
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/touch", "{recovery_marker}"]
+restart_timeout_ms = 1000
+readiness_body = {{"model":"test-chat","messages":[{{"role":"user","content":"deadline recovery ready"}}],"max_tokens":1}}
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 100
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+"#,
+        recovery_marker = recovery_marker.display()
+    )
 }
 
 #[tokio::test]

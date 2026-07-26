@@ -1644,6 +1644,8 @@ impl Default for UpstreamConfig {
 pub struct LocalRecoveryConfig {
     /// Enables restart and readiness recovery for this upstream.
     pub enabled: bool,
+    /// Allows an individual request-deadline exhaustion to trigger recovery.
+    pub trigger_on_request_deadline: bool,
     /// Restart command executed as argv. Empty means no command is executed.
     pub restart_command: Vec<String>,
     /// Maximum milliseconds to wait for the restart command.
@@ -1808,6 +1810,7 @@ impl Default for LocalRecoveryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            trigger_on_request_deadline: false,
             restart_command: Vec::new(),
             restart_timeout_ms: 300_000,
             readiness_endpoint: String::from("/v1/chat/completions"),

@@ -6611,6 +6611,7 @@ struct UpstreamStreamTimeouts {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct LocalRecoveryPolicy {
     enabled: bool,
+    trigger_on_request_deadline: bool,
     restart_command: Vec<String>,
     restart_timeout: Duration,
     readiness_endpoint: String,
@@ -6628,6 +6629,7 @@ impl LocalRecoveryPolicy {
     fn from_config(config: &LocalRecoveryConfig) -> Self {
         Self {
             enabled: config.enabled,
+            trigger_on_request_deadline: config.trigger_on_request_deadline,
             restart_command: config.restart_command.clone(),
             restart_timeout: Duration::from_millis(config.restart_timeout_ms),
             readiness_endpoint: config.readiness_endpoint.clone(),
@@ -10402,6 +10404,11 @@ async fn local_recovery_gate(
     let Some(cause) = cause else {
         return unapplied_local_recovery_gate();
     };
+    if cause == LocalRecoveryCause::RequestDeadline
+        && !runtime.local_recovery_policy.trigger_on_request_deadline
+    {
+        return unapplied_local_recovery_gate();
+    }
     if (!can_retry && cause != LocalRecoveryCause::RequestDeadline)
         || (!runtime.local_recovery_policy.enabled
             && runtime.local_recovery_policy.restart_command.is_empty())
