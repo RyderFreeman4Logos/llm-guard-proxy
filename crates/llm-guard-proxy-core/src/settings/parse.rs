@@ -1409,6 +1409,9 @@ fn assign_local_recovery(
 ) -> Result<(), ConfigParseError> {
     match key {
         "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "trigger_on_request_deadline" => {
+            config.trigger_on_request_deadline = parse_bool(value, line_number)?;
+        }
         "restart_command" => {
             config.restart_command = parse_string_array(value, line_number)?;
         }

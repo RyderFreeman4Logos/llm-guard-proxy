@@ -305,6 +305,7 @@ fn defaults_match_issue_contract() {
 
 fn assert_default_recovery_watchdog_and_restart_queue_configs(config: &AppConfig) {
     assert!(!config.upstream.local_recovery.enabled);
+    assert!(!config.upstream.local_recovery.trigger_on_request_deadline);
     assert!(config.upstream.local_recovery.restart_command.is_empty());
     assert_eq!(
         config.upstream.local_recovery.readiness_endpoint,
@@ -331,6 +332,7 @@ fn local_recovery_config_defaults_are_safe_and_parse_per_upstream() {
         r#"
 [upstream.local_recovery]
 enabled = true
+trigger_on_request_deadline = true
 restart_command = ["systemctl", "--user", "restart", "vllm-default.service"]
 restart_timeout_ms = 120000
 readiness_endpoint = "/v1/chat/completions"
@@ -350,6 +352,7 @@ match_models = ["aeon-ultimate"]
 
 [upstreams.local_recovery]
 enabled = true
+trigger_on_request_deadline = false
 restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash.service"]
 restart_timeout_ms = 60000
 readiness_body = {"model":"aeon-ultimate","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}
@@ -369,6 +372,7 @@ max_per_window = 1
         .expect("local recovery config should validate");
     let default_recovery = &config.upstream.local_recovery;
     assert!(default_recovery.enabled);
+    assert!(default_recovery.trigger_on_request_deadline);
     assert_eq!(
         default_recovery.restart_command,
         vec![
@@ -397,6 +401,7 @@ max_per_window = 1
         .expect("aeon profile should parse");
     let aeon_recovery = &aeon.local_recovery;
     assert!(aeon_recovery.enabled);
+    assert!(!aeon_recovery.trigger_on_request_deadline);
     assert_eq!(
         aeon_recovery.restart_command,
         vec![

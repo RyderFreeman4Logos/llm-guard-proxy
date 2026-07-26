@@ -128,9 +128,9 @@ recovery_max_per_window = 2              # Max recovery attempts per window
 # END PARSEABLE EXAMPLE: upstream-stall-recovery
 
 # ── Local upstream recovery (OPT-IN command execution) ───────────────────────
-# Restarts a co-located upstream service after a stall/deadline-class failure,
-# waits for a real chat completion readiness probe, then replays the original
-# shielded request if the downstream connection is still alive.
+# Restart recovery may follow eligible upstream failures. Request-deadline exhaustion
+# is an individual-request failure and only triggers recovery when
+# trigger_on_request_deadline is explicitly enabled.
 #
 # Safe default: disabled and no command is executed. restart_command is argv;
 # the proxy never runs it through a shell and never connects request content to
@@ -139,6 +139,7 @@ recovery_max_per_window = 2              # Max recovery attempts per window
 # BEGIN PARSEABLE EXAMPLE: upstream-local-recovery
 #| [upstream.local_recovery]
 #| enabled = true                                                     # Enable local restart recovery
+#| trigger_on_request_deadline = false                                 # Keep individual request deadlines from restarting the backend (default)
 #| restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash.service"]  # argv restart command
 #| restart_timeout_ms = 300000                                        # Max wait for restart command
 #| readiness_endpoint = "/v1/chat/completions"                        # Real chat readiness endpoint

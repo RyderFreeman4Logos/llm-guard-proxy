@@ -1831,6 +1831,7 @@ async fn watchdog_recovery_preclosed_shutdown_does_not_spawn_restart_command() {
     shutdown.begin_shutdown();
     let policy = LocalRecoveryPolicy {
         enabled: true,
+        trigger_on_request_deadline: false,
         restart_command: vec![String::from("/usr/bin/touch"), marker.display().to_string()],
         restart_timeout: Duration::from_secs(1),
         readiness_endpoint: String::from("/v1/chat/completions"),
@@ -2006,6 +2007,7 @@ fn blocked_local_recovery_policy(
 ) -> LocalRecoveryPolicy {
     LocalRecoveryPolicy {
         enabled: true,
+        trigger_on_request_deadline: false,
         restart_command: vec![
             script_path.display().to_string(),
             started_path.display().to_string(),
