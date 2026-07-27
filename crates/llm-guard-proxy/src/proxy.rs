@@ -348,10 +348,12 @@ impl ProxyState {
     async fn acquire_generation_permit(
         &self,
         record_context: AdmissionRecordContext,
+        timeout_ms: u64,
     ) -> Result<GenerationAdmission, AdmissionFailure> {
         self.acquire_generation_permit_with_limiter(
             Arc::clone(&self.generation_requests),
             record_context,
+            timeout_ms,
         )
         .await
     }
@@ -359,10 +361,12 @@ impl ProxyState {
     async fn acquire_generation_body_routing_permit(
         &self,
         record_context: AdmissionRecordContext,
+        timeout_ms: u64,
     ) -> Result<GenerationAdmission, AdmissionFailure> {
         self.acquire_generation_permit_with_limiter(
             Arc::clone(&self.generation_body_routing_requests),
             record_context,
+            timeout_ms,
         )
         .await
     }
@@ -371,6 +375,7 @@ impl ProxyState {
         &self,
         limiter: Arc<InFlightLimiter>,
         record_context: AdmissionRecordContext,
+        timeout_ms: u64,
     ) -> Result<GenerationAdmission, AdmissionFailure> {
         let config = self
             .config
@@ -399,7 +404,7 @@ impl ProxyState {
         self.wait_for_generation_capacity(
             limiter,
             queue_permit,
-            config.server.generation_queue_timeout_ms,
+            timeout_ms.min(config.server.generation_queue_timeout_ms),
             record_context,
         )
         .await
@@ -462,6 +467,7 @@ impl ProxyState {
         model_id: Option<&str>,
         body_routing_permit: InFlightPermit,
         record_context: AdmissionRecordContext,
+        admission_queue_timeout_ms: u64,
     ) -> Result<GenerationAdmission, AdmissionFailure> {
         let config = self
             .config
@@ -503,7 +509,7 @@ impl ProxyState {
         self.wait_for_profile_generation_capacity(
             queue_permit,
             model_id.map(str::to_owned),
-            config.server.generation_queue_timeout_ms,
+            admission_queue_timeout_ms.min(config.server.generation_queue_timeout_ms),
             record_context,
         )
         .await
@@ -2693,6 +2699,7 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
     }
 
     let request_id = RequestId::generate();
+    let request_started_at = Instant::now();
     let started_at_unix_ms = unix_time_millis();
     // Register the request in the live observability registry. We use
     // "streaming" as the default mode; the forwarder will refine it if the
@@ -2739,27 +2746,35 @@ async fn proxy_handler_inner(state: ProxyState, request: Request<Body>) -> Respo
     }
 
     let admission_request = AdmissionRequestMetadata::from_request(&request);
-    let admission =
-        match admit_request(&state, &request_id, started_at_unix_ms, admission_request).await {
-            AdmissionOutcome::Accepted(admission) => {
-                state
-                    .live_registry
-                    .update_state(request_id.as_str(), LiveRequestState::Admitted);
-                *admission
-            }
-            AdmissionOutcome::Rejected(response) => {
-                state
-                    .live_registry
-                    .update_state(request_id.as_str(), LiveRequestState::Failed);
-                state.live_registry.fail(request_id.as_str());
-                return finalize_proxy_terminal_response(response, &request_id);
-            }
-        };
+    let admission = match admit_request(
+        &state,
+        &request_id,
+        started_at_unix_ms,
+        request_started_at,
+        admission_request,
+    )
+    .await
+    {
+        AdmissionOutcome::Accepted(admission) => {
+            state
+                .live_registry
+                .update_state(request_id.as_str(), LiveRequestState::Admitted);
+            *admission
+        }
+        AdmissionOutcome::Rejected(response) => {
+            state
+                .live_registry
+                .update_state(request_id.as_str(), LiveRequestState::Failed);
+            state.live_registry.fail(request_id.as_str());
+            return finalize_proxy_terminal_response(response, &request_id);
+        }
+    };
 
     let forward_result = Box::pin(forward_openai_request(
         &state,
         &request_id,
         started_at_unix_ms,
+        request_started_at,
         request,
         admission.permit,
         admission.permit_kind,
@@ -2857,6 +2872,7 @@ async fn admit_request(
     state: &ProxyState,
     request_id: &RequestId,
     started_at_unix_ms: u64,
+    request_started_at: Instant,
     request: AdmissionRequestMetadata,
 ) -> AdmissionOutcome {
     let config = match state.config.snapshot() {
@@ -2889,6 +2905,12 @@ async fn admit_request(
             return AdmissionOutcome::Rejected(response);
         }
     };
+    let admission_queue_timeout_ms = shielded_admission_queue_timeout_ms(
+        &config,
+        &request.method,
+        &request.uri,
+        request_started_at,
+    );
 
     if is_control_plane_models_request(&request.method, &request.uri) {
         let permit = match state
@@ -2923,7 +2945,7 @@ async fn admit_request(
             Some(config.shielding.enabled),
         );
         let admission = match state
-            .acquire_generation_body_routing_permit(record_context)
+            .acquire_generation_body_routing_permit(record_context, admission_queue_timeout_ms)
             .await
         {
             Ok(admission) => admission,
@@ -2956,7 +2978,10 @@ async fn admit_request(
         &request,
         Some(config.shielding.enabled),
     );
-    let admission = match state.acquire_generation_permit(record_context).await {
+    let admission = match state
+        .acquire_generation_permit(record_context, admission_queue_timeout_ms)
+        .await
+    {
         Ok(admission) => admission,
         Err(error) => {
             return reject_admission(
@@ -3066,11 +3091,30 @@ fn is_control_plane_models_request(method: &Method, uri: &Uri) -> bool {
     method == Method::GET && uri.path() == "/v1/models"
 }
 
+/// Bounds queue admission for a request that may enter the shielded retry path.
+/// The budget starts when the downstream request arrives, rather than after
+/// body-routing admission has completed.
+fn shielded_admission_queue_timeout_ms(
+    config: &AppConfig,
+    method: &Method,
+    uri: &Uri,
+    request_started_at: Instant,
+) -> u64 {
+    if !should_intercept_non_stream_chat(method, uri, config) {
+        return config.server.generation_queue_timeout_ms;
+    }
+
+    let request_budget = Duration::from_millis(config.retry.request_deadline_ms);
+    let remaining_budget = request_budget.saturating_sub(request_started_at.elapsed());
+    duration_millis_u64(remaining_budget).min(config.server.generation_queue_timeout_ms)
+}
+
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn forward_openai_request(
     state: &ProxyState,
     request_id: &RequestId,
     started_at_unix_ms: u64,
+    request_started_at: Instant,
     request: Request<Body>,
     in_flight_permit: InFlightPermit,
     admission_permit_kind: AdmissionPermitKind,
@@ -3096,6 +3140,7 @@ async fn forward_openai_request(
             admission_metadata,
             request_id,
             started_at_unix_ms,
+            request_started_at,
         },
     )
     .await?;
@@ -3290,7 +3335,10 @@ async fn forward_openai_request(
         Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
     if prepared_request.shielded_chat_plan.intercepted {
         add_retry_request_metadata(&mut request_metadata, &retry_policy);
-        let request_deadline = ShieldedRequestDeadline::new(retry_policy.request_deadline);
+        let request_deadline = ShieldedRequestDeadline::from_started_at(
+            request_started_at,
+            retry_policy.request_deadline,
+        );
         let local_recovery_policy =
             LocalRecoveryPolicy::from_config(&prepared_request.upstream_profile.local_recovery);
         let local_recovery = state
@@ -3411,6 +3459,7 @@ struct BodyAdmissionContext<'request> {
     admission_metadata: BTreeMap<String, String>,
     request_id: &'request RequestId,
     started_at_unix_ms: u64,
+    request_started_at: Instant,
 }
 
 async fn read_body_and_admit_generation(
@@ -3490,6 +3539,12 @@ async fn admit_generation_after_body(
     body_read_request_metadata: BTreeMap<String, String>,
     request: BodyAdmissionContext<'_>,
 ) -> Result<OpenAiBodyAdmission, ProxyError> {
+    let admission_queue_timeout_ms = shielded_admission_queue_timeout_ms(
+        &config,
+        request.method,
+        request.uri,
+        request.request_started_at,
+    );
     let model_id_for_admission = extract_model_id(request.method, request.uri, &body);
     let selected_profile = select_allowed_upstream_profile(
         &config,
@@ -3527,6 +3582,7 @@ async fn admit_generation_after_body(
             model_id_for_admission.as_deref(),
             in_flight_permit,
             record_context,
+            admission_queue_timeout_ms,
         )
         .await
         .map_err(|error| admission_proxy_error(error, body_read_request_metadata))?;
@@ -8993,9 +9049,9 @@ struct ShieldedRequestDeadline {
 }
 
 impl ShieldedRequestDeadline {
-    fn new(max_duration: Duration) -> Self {
+    fn from_started_at(started_at: Instant, max_duration: Duration) -> Self {
         Self {
-            started_at: Instant::now(),
+            started_at,
             max_duration,
         }
     }

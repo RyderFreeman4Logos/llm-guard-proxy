@@ -538,7 +538,11 @@ history_window_count = 64
 batch_max_windows = 64
 batch_max_wait_ms = 75
 queue_max_windows = 4096
-on_queue_full = "block"
+# Embedding work is advisory: queue pressure must never hold generation open.
+# `block` remains accepted for legacy configuration but is non-blocking; prefer
+# deterministic_only so deterministic loop detection continues without the
+# semantic window when the queue is saturated.
+on_queue_full = "deterministic_only"
 vector_dim = 256
 
 ## ───────────────────────── Retry ───────────────────────────────────────────

@@ -3691,7 +3691,8 @@ pub enum EmbeddingQueuePolicy {
     Skip,
     /// Fall back to deterministic-only detection for this request.
     DeterministicOnly,
-    /// Block the hot path until queue space is available.
+    /// Legacy compatibility policy. Full queues skip embedding work rather than
+    /// blocking generation; use `DeterministicOnly` for new configuration.
     Block,
 }
 
