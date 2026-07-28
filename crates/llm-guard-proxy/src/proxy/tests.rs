@@ -3801,7 +3801,7 @@ upstream_profile = "matching"
 }
 
 #[tokio::test]
-async fn match_models_alias_copies_first_matching_profile_model_metadata() {
+async fn match_models_alias_copies_configured_upstream_model_metadata() {
     let default_upstream = FakeUpstream::spawn_with_models_body(MATCH_MODELS_DEFAULT_BODY).await;
     let matching_upstream = FakeUpstream::spawn_with_models_body(MATCH_MODELS_PROFILE_BODY).await;
     let proxy = ProxyFixture::spawn_with_admission_config(
@@ -3814,6 +3814,7 @@ async fn match_models_alias_copies_first_matching_profile_model_metadata() {
 name = "matching"
 base_url = "{}"
 match_models = ["qwen3.6-27b-decensored"]
+upstream_model = "profile-second"
 "#,
             matching_upstream.base_url
         ),
@@ -3845,12 +3846,10 @@ match_models = ["qwen3.6-27b-decensored"]
             "id": "qwen3.6-27b-decensored",
             "object": "model",
             "owned_by": "llm-guard-proxy",
-            "created": 2,
-            "max_model_len": 32768,
-            "context_length": 32768,
-            "max_context_length": 32768,
-            "permission": ["profile-only"],
-            "extra": "copied",
+            "created": 3,
+            "max_model_len": 16384,
+            "context_length": 16384,
+            "max_context_length": 16384,
             "llm_guard_proxy_alias": true,
             "alias_kind": "upstream",
             "upstream_profile": "matching",

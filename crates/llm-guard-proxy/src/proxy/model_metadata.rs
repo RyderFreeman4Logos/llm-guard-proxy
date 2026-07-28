@@ -63,7 +63,7 @@ pub(super) fn filter_models_body_by_id(
     serde_json::to_vec(&value).map_or(body, Bytes::from)
 }
 
-/// Injects each missing `match_models` alias with metadata from its profile's first model.
+/// Injects each missing `match_models` alias with metadata from its configured upstream model.
 ///
 /// This runs before listener filtering so aliases selected by the listener remain discoverable.
 pub(super) fn append_match_model_aliases(profiles: &[UpstreamProfileConfig], body: Bytes) -> Bytes {
@@ -87,9 +87,19 @@ fn append_match_model_alias_records(
     profile: &UpstreamProfileConfig,
     models: &mut Vec<Value>,
 ) -> bool {
-    let Some(template) = models
-        .iter()
-        .find(|model| model.get("id").and_then(Value::as_str).is_some())
+    let Some(template) = profile
+        .upstream_model
+        .as_deref()
+        .and_then(|upstream_model| {
+            models
+                .iter()
+                .find(|model| model.get("id").and_then(Value::as_str) == Some(upstream_model))
+        })
+        .or_else(|| {
+            models
+                .iter()
+                .find(|model| model.get("id").and_then(Value::as_str).is_some())
+        })
         .cloned()
     else {
         return false;
