@@ -115,6 +115,7 @@ fn is_non_secret_token_metric(normalized_key: &str) -> bool {
             | "prompttokens"
             | "completiontokens"
             | "totaltokens"
+            | "maxtokens"
             | "upstreamcontextwindowtokens"
             | "upstreaminputtokensafetymargin"
             | "contextbudgetwindowtokens"

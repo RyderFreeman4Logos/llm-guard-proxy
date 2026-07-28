@@ -1,6 +1,7 @@
 use super::*;
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn bounded_cot_salvage_uses_configured_note_limit_and_thinking_budget() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -71,7 +72,32 @@ thinking_mode = "force_disable"
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
     assert_eq!(attempts.len(), 2);
     assert_eq!(attempts[0].response_metadata["loop_channel"], "reasoning");
+    assert_eq!(attempts[0].response_metadata["loop_detected"], "true");
+    assert_eq!(attempts[0].response_metadata["loop_detector_class"], "line");
+    assert_eq!(attempts[0].response_metadata["ladder_rung"], "max-thinking");
+    assert_eq!(attempts[0].response_metadata["salvage_used"], "false");
+    assert_eq!(attempts[0].response_metadata["thinking_budget"], "32768");
+    assert_eq!(attempts[0].response_metadata["max_tokens"], "50000");
     assert_eq!(attempts[1].response_metadata["cot_salvage_used"], "true");
+    assert!(
+        attempts[1].response_metadata.get("loop_detected").is_none()
+            || attempts[1].response_metadata["loop_detected"] == "false",
+        "non-loop attempt should not report loop_detected=true"
+    );
+    assert!(
+        attempts[1]
+            .response_metadata
+            .get("loop_detector_class")
+            .is_none()
+            || attempts[1].response_metadata["loop_detector_class"] == "none",
+    );
+    assert_eq!(
+        attempts[1].response_metadata["ladder_rung"],
+        "bounded-thinking"
+    );
+    assert_eq!(attempts[1].response_metadata["salvage_used"], "true");
+    assert_eq!(attempts[1].response_metadata["thinking_budget"], "2048");
+    assert_eq!(attempts[1].response_metadata["max_tokens"], "50000");
     assert_eq!(
         attempts[1].response_metadata["cot_salvage_source_attempt_number"],
         "1"
@@ -84,6 +110,44 @@ thinking_mode = "force_disable"
         attempts[1].response_metadata["cot_salvage_thinking_mode"],
         "bounded_thinking"
     );
+
+    let metrics = fetch_metrics(&proxy).await;
+    assert_metric_type(
+        &metrics,
+        "llm_guard_proxy_current_retained_loop_guard_attempts",
+        "gauge",
+    );
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_current_retained_loop_guard_attempts",
+            &[
+                ("loop_detected", "true"),
+                ("loop_detector_class", "line"),
+                ("ladder_rung", "max-thinking"),
+                ("salvage_used", "false"),
+                ("thinking_budget", "32768"),
+                ("max_tokens", "50000"),
+            ],
+        ),
+        1
+    );
+    assert_eq!(
+        labelled_metric_value(
+            &metrics,
+            "llm_guard_proxy_current_retained_loop_guard_attempts",
+            &[
+                ("loop_detected", "false"),
+                ("loop_detector_class", "none"),
+                ("ladder_rung", "bounded-thinking"),
+                ("salvage_used", "true"),
+                ("thinking_budget", "2048"),
+                ("max_tokens", "50000"),
+            ],
+        ),
+        1
+    );
+    assert!(!metrics.contains("llm-guard-proxy CoT salvage retry hint"));
 }
 
 #[tokio::test]

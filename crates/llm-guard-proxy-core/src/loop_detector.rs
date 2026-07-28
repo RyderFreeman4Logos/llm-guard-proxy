@@ -166,6 +166,26 @@ impl LoopReasonCode {
         }
     }
 
+    /// Returns the bounded, content-free detector class used by telemetry.
+    ///
+    /// Tool-loop reasons intentionally use `none`: the public telemetry
+    /// taxonomy is limited to textual and embedding detector classes.
+    #[must_use]
+    pub const fn telemetry_class(self) -> &'static str {
+        match self {
+            Self::RepeatedLine => "line",
+            Self::RepeatedTokenWindow | Self::SuffixCycle | Self::LowProgressGrowth => "token",
+            Self::ApproximateRepetition => "semantic",
+            Self::ToolArgumentsJsonCompleted
+            | Self::ToolArgumentsRepeatedJson
+            | Self::ToolFingerprintRepeated
+            | Self::ToolArgumentsInvalidJson
+            | Self::ToolFingerprintRepeat
+            | Self::ToolAlternationCycle
+            | Self::ToolOutputBlockedEcho => "none",
+        }
+    }
+
     pub(crate) fn legacy_signal(self) -> &'static str {
         match self {
             Self::ApproximateRepetition => "semantic_jaccard",
@@ -604,6 +624,10 @@ impl LoopSignal {
     pub fn legacy_abort_metadata(&self) -> BTreeMap<String, String> {
         let mut metadata = BTreeMap::from([
             (String::from("loop_detected"), String::from("true")),
+            (
+                String::from("loop_detector_class"),
+                self.reason_code.telemetry_class().to_owned(),
+            ),
             (
                 String::from("loop_signal"),
                 self.reason_code.legacy_signal().to_owned(),

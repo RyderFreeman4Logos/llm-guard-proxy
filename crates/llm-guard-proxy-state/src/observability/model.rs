@@ -307,6 +307,18 @@ pub struct AttemptMetricCount {
     pub count: u64,
 }
 
+/// Content-free loop/salvage telemetry grouped by sanitized attempt metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LoopGuardAttemptMetricCount {
+    pub loop_detected: String,
+    pub detector_class: String,
+    pub ladder_rung: String,
+    pub salvage_used: String,
+    pub thinking_budget: String,
+    pub max_tokens: String,
+    pub count: u64,
+}
+
 /// Low-cardinality upstream-error metric row.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpstreamErrorMetricCount {
@@ -356,6 +368,8 @@ pub struct ObservabilityMetricsSnapshot {
     pub request_terminal_counts: Vec<RequestTerminalMetricCount>,
     /// Attempt rows grouped by low-cardinality lifecycle labels.
     pub attempt_counts: Vec<AttemptMetricCount>,
+    /// Content-free loop/salvage attempt rows grouped by bounded labels.
+    pub loop_guard_attempt_counts: Vec<LoopGuardAttemptMetricCount>,
     /// Attempts that were retried or recorded a retry reason.
     pub retry_count: u64,
     /// Attempts or requests aborted by loop protection.
