@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{fs, io, path::Path, time::Duration};
 
 use axum::{
     Router,
@@ -8,8 +8,12 @@ use axum::{
     response::Response,
     routing::post,
 };
-use futures_util::stream;
-use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+use futures_util::{StreamExt, stream};
+use tokio::{
+    net::TcpListener,
+    sync::mpsc,
+    time::{sleep, timeout},
+};
 
 use super::*;
 
@@ -155,6 +159,100 @@ async fn native_json_fallback_requires_remaining_attempt_budget() {
     );
     assert_eq!(attempts[0].response_metadata["retry_budget_remaining"], "0");
     assert_eq!(attempts[0].response_metadata["retry_exhausted"], "true");
+}
+
+#[tokio::test]
+async fn native_json_fallback_does_not_follow_request_deadline_recovery() {
+    // Delay past request_deadline_ms so the body failure is reclassified as a deadline
+    // abort while still retaining sse_failure_class=body_failure (the F1 regression path).
+    let mut upstream =
+        NativeJsonFallbackUpstream::spawn_with_forced_sse_error_delay(Duration::from_millis(250))
+            .await;
+    let recovery_root = unique_test_dir("native-json-fallback-deadline-recovery");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let recovery_marker = recovery_root.join("recovered");
+    let proxy = ProxyFixture::spawn_with_options(
+        &upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &native_json_fallback_deadline_recovery_config(&recovery_marker),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"deadline body failure"}],"stream":false}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_GATEWAY,
+        "deadline recovery may replay protected SSE, but must not select native JSON"
+    );
+    let _error_body = response
+        .text()
+        .await
+        .expect("deadline failure response should be readable");
+    assert!(
+        recovery_marker.exists(),
+        "the deadline recovery hook must run before the protected replay"
+    );
+
+    let mut requests = Vec::new();
+    while let Some(request) = upstream
+        .recv_request_within(Duration::from_millis(250))
+        .await
+    {
+        requests.push(request);
+    }
+    assert!(
+        requests.len() >= 2,
+        "expected at least first SSE plus readiness/replay; got {}",
+        requests.len()
+    );
+    assert_eq!(requests[0]["stream"], true);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["stream"].as_bool() != Some(false)),
+        "request-deadline recovery must never send a native JSON stream:false request"
+    );
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert!(!attempts.is_empty());
+    assert_eq!(
+        attempts[0].response_metadata["request_deadline_exhausted"],
+        "true"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["native_json_fallback_eligible"],
+        "false"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["native_json_fallback_used"],
+        "false"
+    );
+    assert!(
+        attempts.iter().all(|attempt| {
+            attempt
+                .response_metadata
+                .get("upstream_wire_mode")
+                .and_then(serde_json::Value::as_str)
+                != Some("native_json_fallback")
+                && attempt
+                    .response_metadata
+                    .get("native_json_fallback_used")
+                    .and_then(serde_json::Value::as_str)
+                    != Some("true")
+        }),
+        "deadline recovery must not select native JSON wire mode"
+    );
+
+    remove_dir_all(&recovery_root);
 }
 
 #[tokio::test]
@@ -320,6 +418,34 @@ thinking_token_budget = 8192
     }
 }
 
+fn native_json_fallback_deadline_recovery_config(recovery_marker: &Path) -> String {
+    format!(
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 1
+request_deadline_ms = 100
+anti_loop_hint_enabled = false
+
+[upstream.local_recovery]
+enabled = true
+trigger_on_request_deadline = true
+restart_command = ["/usr/bin/touch", "{recovery_marker}"]
+restart_timeout_ms = 1000
+readiness_body = {{"model":"test-chat","messages":[{{"role":"user","content":"deadline recovery ready"}}],"max_tokens":1}}
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 100
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+"#,
+        recovery_marker = recovery_marker.display()
+    )
+}
+
 fn body_thinking_budget_json(body: &serde_json::Value) -> Option<u64> {
     body.get("thinking")
         .and_then(|value| value.get("budget_tokens"))
@@ -367,14 +493,22 @@ struct NativeJsonFallbackUpstream {
 #[derive(Clone)]
 struct NativeJsonFallbackState {
     sender: mpsc::Sender<serde_json::Value>,
+    forced_sse_error_delay: Duration,
 }
 
 impl NativeJsonFallbackUpstream {
     async fn spawn() -> Self {
+        Self::spawn_with_forced_sse_error_delay(Duration::ZERO).await
+    }
+
+    async fn spawn_with_forced_sse_error_delay(forced_sse_error_delay: Duration) -> Self {
         let (sender, receiver) = mpsc::channel(4);
         let app = Router::new()
             .route("/v1/chat/completions", post(native_json_fallback_handler))
-            .with_state(NativeJsonFallbackState { sender });
+            .with_state(NativeJsonFallbackState {
+                sender,
+                forced_sse_error_delay,
+            });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("native JSON fallback upstream should bind");
@@ -421,10 +555,16 @@ async fn native_json_fallback_handler(
         .expect("native JSON fallback upstream observation should send");
 
     if upstream_streaming {
-        let stream = stream::iter([
-            Ok::<Bytes, io::Error>(Bytes::from_static(b"data: {\"id\":\"partial\"}\n\n")),
-            Err(io::Error::other("synthetic truncated forced SSE body")),
-        ]);
+        let forced_sse_error_delay = state.forced_sse_error_delay;
+        let stream = stream::iter([Ok::<Bytes, io::Error>(Bytes::from_static(
+            b"data: {\"id\":\"partial\"}\n\n",
+        ))])
+        .chain(stream::once(async move {
+            if !forced_sse_error_delay.is_zero() {
+                sleep(forced_sse_error_delay).await;
+            }
+            Err(io::Error::other("synthetic truncated forced SSE body"))
+        }));
         let mut response = Response::new(Body::from_stream(stream));
         response
             .headers_mut()

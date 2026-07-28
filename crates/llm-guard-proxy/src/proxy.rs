@@ -10095,6 +10095,20 @@ fn native_json_fallback_eligible(
     failure: &ShieldedAttemptFailure,
     can_retry: bool,
 ) -> bool {
+    // Fail closed for deadline/shutdown recovery paths: those may still replay SSE, but
+    // must never select native JSON or bypass ordinary max_attempts budget.
+    if is_server_shutdown_failure(failure)
+        || failure.abort_reason.as_deref() == Some(REQUEST_DEADLINE_ABORT_REASON)
+        || failure
+            .response_metadata
+            .get("request_deadline_exhausted")
+            .is_some_and(|value| value == "true")
+        || !runtime
+            .retry_policy
+            .allows_retry_after(failure.attempt_number)
+    {
+        return false;
+    }
     can_retry
         && runtime.chat_kind == ShieldedChatKind::NonStream
         && failure.attempt_number == 1
