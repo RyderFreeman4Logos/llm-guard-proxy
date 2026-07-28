@@ -11317,6 +11317,103 @@ force_disable = true
 }
 
 #[tokio::test]
+async fn force_disable_first_attempt_stream_relays_true_multi_delta_not_single_aggregate() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r"
+[thinking]
+force_disable = true
+
+[retry]
+shielded_streaming_enabled = true
+",
+    )
+    .await;
+
+    // The default fake SSE fixture emits multiple content deltas ("Hel" then
+    // "lo") across separate chat.completion.chunk frames. A true multi-delta
+    // relay must preserve them as distinct downstream chunks rather than
+    // buffering into one aggregated content frame. This reproduces the GB10
+    // deploy scenario (shielded_streaming_enabled=true) where the bug was
+    // observed: force_disable first-attempt streams were aggregated into a
+    // single content frame instead of being relayed token-by-token.
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(Bytes::from_static(
+            br#"{"model":"test-chat","messages":[{"role":"user","content":"ping"}],"stream":true,"chat_template_kwargs":{"enable_thinking":true},"max_tokens":64}"#,
+        ))
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-upstream-endpoint")
+            .expect("streaming fake upstream SSE should be used"),
+        "chat-completions-sse"
+    );
+    let response_body = response.text().await.expect("stream body should be text");
+
+    let chunks = openai_sse_json_chunks(&response_body);
+    let content_deltas: Vec<&str> = chunks
+        .iter()
+        .filter_map(|chunk| {
+            chunk["choices"][0]["delta"]["content"]
+                .as_str()
+                .filter(|content| !content.is_empty())
+        })
+        .collect();
+    assert!(
+        content_deltas.len() > 1,
+        "force-disable first-attempt stream must relay true multi-delta content (saw \
+         {content_deltas:?}; full body:\n{response_body})"
+    );
+    assert!(
+        content_deltas.contains(&"Hel") && content_deltas.contains(&"lo"),
+        "multi-delta relay must preserve distinct upstream content deltas, saw \
+         {content_deltas:?}; full body:\n{response_body}"
+    );
+
+    // The direct relay path must not masquerade as the buffer-then-dump
+    // aggregate; there should be no synthetic "final" event.
+    assert!(!response_body.contains("event: final"));
+
+    let observed = fake.recv_next().await;
+    let observed_body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+    assert_eq!(observed_body["stream"], true);
+    assert_eq!(observed_body["chat_template_kwargs"]["thinking_budget"], 0);
+    assert_eq!(
+        observed_body["chat_template_kwargs"]["enable_thinking"],
+        false
+    );
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(
+        attempts.len(),
+        1,
+        "first-attempt force-disable relay must not retry"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["shielded_direct_streaming_relay"],
+        "true"
+    );
+    let request_metadata = read_attempt_request_metadata_rows(&proxy.sqlite_path);
+    assert_eq!(request_metadata.len(), 1);
+    assert_eq!(
+        request_metadata[0].request_metadata["attempt_thinking_mode"],
+        "force_disable"
+    );
+}
+
+#[tokio::test]
 async fn shielded_streaming_commit_gate_sends_heartbeat_before_openai_sse_release() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(

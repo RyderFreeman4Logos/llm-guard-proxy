@@ -10295,6 +10295,16 @@ async fn run_shielded_attempts(
             }
         };
 
+        if should_direct_relay_first_attempt_force_disable_stream(&runtime, &started.info) {
+            return ShieldedRunOutcome::DirectRelay(
+                direct_relay_first_attempt_force_disable_stream_outcome(
+                    started,
+                    &attempt_records,
+                    runtime.request_deadline,
+                ),
+            );
+        }
+
         if should_direct_relay_no_thinking_stream(&runtime, &started.info, retry_cause) {
             return ShieldedRunOutcome::DirectRelay(direct_relay_no_thinking_stream_outcome(
                 started,
@@ -10465,6 +10475,19 @@ fn direct_relay_no_thinking_stream_outcome(
     }
 }
 
+fn direct_relay_first_attempt_force_disable_stream_outcome(
+    started: ShieldedStartedAttempt,
+    attempt_records: &[AttemptRecord],
+    request_deadline: ShieldedRequestDeadline,
+) -> ShieldedDirectRelayOutcome {
+    ShieldedDirectRelayOutcome {
+        started,
+        prior_attempt_records: attempt_records.to_vec(),
+        response_metadata: first_attempt_force_disable_direct_relay_metadata(),
+        request_deadline,
+    }
+}
+
 fn should_direct_relay_no_thinking_stream(
     runtime: &ShieldedRetryRuntime,
     info: &ShieldedAttemptInfo,
@@ -10473,6 +10496,30 @@ fn should_direct_relay_no_thinking_stream(
     runtime.chat_kind == ShieldedChatKind::Stream
         && info.attempt_number > 1
         && matches!(retry_cause, Some(ShieldedRetryCause::LoopDetected))
+        && info
+            .request_metadata
+            .get("cot_salvage_used")
+            .is_none_or(|used| used != "true")
+        && info
+            .request_metadata
+            .get("attempt_thinking_mode")
+            .is_some_and(|mode| mode == ThinkingMode::ForceDisable.as_str())
+}
+
+/// A first-attempt `force_disable` stream has nothing to inspect or salvage:
+/// reasoning is disabled and the loop guard cannot detect a reasoning loop
+/// before the first chunk arrives. Such requests must direct-relay upstream
+/// SSE tokens to the client as true multi-delta events instead of buffering
+/// the whole stream into one aggregated content frame (issue #229). The
+/// deadline is still honored so a stalled force-disable stream cannot hang a
+/// client indefinitely; reasoning-enabled and non-stream paths keep the
+/// aggregation / salvage pipeline intact.
+fn should_direct_relay_first_attempt_force_disable_stream(
+    runtime: &ShieldedRetryRuntime,
+    info: &ShieldedAttemptInfo,
+) -> bool {
+    runtime.chat_kind == ShieldedChatKind::Stream
+        && info.attempt_number == 1
         && info
             .request_metadata
             .get("cot_salvage_used")
@@ -10496,6 +10543,23 @@ fn no_thinking_direct_relay_metadata() -> BTreeMap<String, String> {
         (
             String::from("shielded_loop_inspection_skipped"),
             String::from("no_thinking_direct_streaming_relay"),
+        ),
+    ])
+}
+
+fn first_attempt_force_disable_direct_relay_metadata() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            String::from("shielded_direct_streaming_relay"),
+            String::from("true"),
+        ),
+        (
+            String::from("shielded_direct_streaming_relay_deadline_bound"),
+            String::from("true"),
+        ),
+        (
+            String::from("shielded_loop_inspection_skipped"),
+            String::from("first_attempt_force_disable_direct_streaming_relay"),
         ),
     ])
 }
