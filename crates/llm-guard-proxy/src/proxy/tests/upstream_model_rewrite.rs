@@ -259,3 +259,62 @@ match_models = ["alias-chat"]
         "without upstream_model the client model name must pass through"
     );
 }
+
+#[tokio::test]
+async fn upstream_model_rewrite_sse_buffer_overflows_with_controlled_error() {
+    // Feed the rewriter a stream of bytes that exceeds the frame cap without
+    // any SSE delimiter. The body must terminate with a controlled error
+    // rather than buffering indefinitely.
+    let cap = SSE_REWRITE_FRAME_BYTE_LIMIT;
+    let oversized: Vec<Result<Bytes, std::io::Error>> = vec![
+        Ok(Bytes::from(vec![b'A'; cap])),
+        Ok(Bytes::from(vec![b'B'; cap])),
+    ];
+    let input = futures_util::stream::iter(oversized);
+    let mut body = ResponseModelRewriteBody::new(
+        input,
+        ResponseModelRewriteMode::OpenAiSse,
+        String::from("alias-chat"),
+    );
+
+    let mut saw_overflow = false;
+    while let Some(result) = body.next().await {
+        if let Err(ResponseModelRewriteError::FrameOverflow { .. }) = result {
+            saw_overflow = true;
+        }
+    }
+    assert!(
+        saw_overflow,
+        "stream must surface a controlled FrameOverflow error when the SSE \
+         frame exceeds the byte cap without a delimiter"
+    );
+}
+
+#[tokio::test]
+async fn upstream_model_rewrite_sse_buffer_releases_after_overflow() {
+    // After an overflow, the buffered bytes must be released (not retained
+    // for future scans) and the stream must terminate quickly.
+    let cap = SSE_REWRITE_FRAME_BYTE_LIMIT;
+    let oversized: Vec<Result<Bytes, std::io::Error>> = vec![Ok(Bytes::from(vec![b'X'; cap + 1]))];
+    let input = futures_util::stream::iter(oversized);
+    let mut body = ResponseModelRewriteBody::new(
+        input,
+        ResponseModelRewriteMode::OpenAiSse,
+        String::from("alias-chat"),
+    );
+
+    let mut count = 0;
+    while let Some(result) = body.next().await {
+        let _ = result;
+        count += 1;
+        assert!(
+            count <= 10,
+            "stream should terminate after bounded overflow, not loop"
+        );
+    }
+    // The overflow should emit exactly one error then None — at most 2 polls.
+    assert!(
+        count <= 2,
+        "overflowed stream must terminate quickly, got {count} items"
+    );
+}

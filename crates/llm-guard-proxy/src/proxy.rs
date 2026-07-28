@@ -29,7 +29,7 @@ use axum::{
     routing::get,
 };
 use bytes::BytesMut;
-use futures_util::{Stream, StreamExt};
+use futures_util::{Stream, StreamExt, TryStreamExt};
 #[cfg(feature = "upstream-hot-restart")]
 use llm_guard_proxy_core::HotRestartConfig;
 #[cfg(feature = "param-override")]
@@ -4737,6 +4737,14 @@ fn response_model_rewrite_mode(headers: &HeaderMap) -> Option<ResponseModelRewri
     None
 }
 
+/// Maximum bytes buffered while waiting for a complete SSE frame delimiter.
+///
+/// A single `OpenAI` chat completion event is well under a few KiB. This cap
+/// bounds memory and CPU when an upstream sends an unterminated stream: once
+/// exceeded, the rewrite body emits a controlled error and releases the buffer
+/// instead of growing without limit and rescanning from the start.
+const SSE_REWRITE_FRAME_BYTE_LIMIT: usize = 1 << 20; // 1 MiB
+
 struct ResponseModelRewriteBody<S> {
     stream: Pin<Box<S>>,
     mode: ResponseModelRewriteMode,
@@ -4761,7 +4769,7 @@ impl<S, E> Stream for ResponseModelRewriteBody<S>
 where
     S: Stream<Item = Result<Bytes, E>>,
 {
-    type Item = Result<Bytes, E>;
+    type Item = Result<Bytes, ResponseModelRewriteError<E>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
@@ -4780,20 +4788,27 @@ where
         match this.stream.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => {
                 this.buffered.extend_from_slice(&bytes);
-                if matches!(this.mode, ResponseModelRewriteMode::OpenAiSse)
-                    && let Some(frame) = take_sse_frame(&mut this.buffered)
-                {
-                    return Poll::Ready(Some(Ok(rewrite_sse_response_model_body(
-                        &frame,
-                        &this.client_model,
-                    ))));
+                if matches!(this.mode, ResponseModelRewriteMode::OpenAiSse) {
+                    if this.buffered.len() > SSE_REWRITE_FRAME_BYTE_LIMIT {
+                        this.completed = true;
+                        this.buffered.clear();
+                        return Poll::Ready(Some(Err(ResponseModelRewriteError::FrameOverflow {
+                            limit: SSE_REWRITE_FRAME_BYTE_LIMIT,
+                        })));
+                    }
+                    if let Some(frame) = take_sse_frame(&mut this.buffered) {
+                        return Poll::Ready(Some(Ok(rewrite_sse_response_model_body(
+                            &frame,
+                            &this.client_model,
+                        ))));
+                    }
                 }
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
             Poll::Ready(Some(Err(error))) => {
                 this.completed = true;
-                Poll::Ready(Some(Err(error)))
+                Poll::Ready(Some(Err(ResponseModelRewriteError::Upstream(error))))
             }
             Poll::Ready(None) => {
                 this.completed = true;
@@ -4812,6 +4827,37 @@ where
                 Poll::Ready(Some(Ok(body)))
             }
             Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+/// Error produced by [`ResponseModelRewriteBody`].
+///
+/// Wraps the underlying stream error or signals that an SSE frame exceeded the
+/// configured byte limit, allowing callers to release resources deterministically.
+#[derive(Debug)]
+enum ResponseModelRewriteError<E> {
+    Upstream(E),
+    FrameOverflow { limit: usize },
+}
+
+impl<E: fmt::Display> fmt::Display for ResponseModelRewriteError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Upstream(error) => write!(formatter, "upstream stream error: {error}"),
+            Self::FrameOverflow { limit } => write!(
+                formatter,
+                "SSE rewrite frame exceeded {limit} byte limit without a frame delimiter"
+            ),
+        }
+    }
+}
+
+impl<E: std::error::Error + 'static> std::error::Error for ResponseModelRewriteError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Upstream(error) => Some(error),
+            Self::FrameOverflow { .. } => None,
         }
     }
 }
@@ -14577,7 +14623,8 @@ enum ShieldedAggregateOutcome {
 
 type ShieldedAggregateFuture =
     Pin<Box<dyn Future<Output = Result<ShieldedAggregateOutcome, ShieldedFailureOutcome>> + Send>>;
-type DirectRelayStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+type DirectRelayStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, ResponseModelRewriteError<reqwest::Error>>> + Send>>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShieldedAcceptedResponseMode {
@@ -14741,7 +14788,7 @@ impl ShieldedLivenessBody {
                 ResponseModelRewriteMode::OpenAiSse,
                 client_model.clone(),
             )),
-            None => Box::pin(stream),
+            None => Box::pin(stream.map_err(ResponseModelRewriteError::Upstream)),
         });
         None
     }
@@ -14766,12 +14813,25 @@ impl ShieldedLivenessBody {
         match stream.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(bytes))) => self.count_and_emit(bytes),
             Poll::Ready(Some(Err(error))) => {
-                self.upstream_failure_counters.increment(
-                    UpstreamFailureCause::from_reqwest_failure(ReqwestFailureKind::from_error(
-                        &error,
-                    )),
-                );
-                let error_message = sanitized_reqwest_error(&error);
+                let failure_cause = match &error {
+                    ResponseModelRewriteError::Upstream(reqwest_error) => {
+                        UpstreamFailureCause::from_reqwest_failure(ReqwestFailureKind::from_error(
+                            reqwest_error,
+                        ))
+                    }
+                    ResponseModelRewriteError::FrameOverflow { .. } => {
+                        UpstreamFailureCause::BodyError
+                    }
+                };
+                self.upstream_failure_counters.increment(failure_cause);
+                let error_message = match &error {
+                    ResponseModelRewriteError::Upstream(reqwest_error) => {
+                        sanitized_reqwest_error(reqwest_error)
+                    }
+                    ResponseModelRewriteError::FrameOverflow { limit } => {
+                        format!("upstream SSE frame exceeded {limit} byte limit")
+                    }
+                };
                 let chunk = self.error_chunk("llm_guard_upstream_error", &error_message);
                 self.terminal_completion = Some(BodyCompletion::UpstreamStreamError(error_message));
                 self.direct_stream = None;
