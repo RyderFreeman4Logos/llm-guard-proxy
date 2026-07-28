@@ -429,16 +429,28 @@ retention_days = 14
 
 `upstream.request_timeout_ms` bounds a single upstream HTTP attempt. It does not
 bound the full shielded retry ladder. `retry.request_deadline_ms` is the
-request-level wall-clock budget shared across all shielded attempts and the
-final no-thinking direct relay. If the budget expires before the next attempt,
-the proxy returns a structured `llm_guard_request_deadline_exhausted` error
-without sending another upstream request. If it expires during the final direct
-relay, observability records `final_direct_relay_terminated` instead of
+request-level wall-clock budget shared across ordinary shielded generation
+admission, all shielded attempts, and the final no-thinking direct relay. For a
+potential shielded `/v1/chat/completions` request, generation/body-routing queue
+wait is capped to the *remaining* request deadline even when
+`server.generation_queue_timeout_ms` is longer. A queue cap returns the
+classified Guard error `proxy_generation_queue_timeout` rather than leaving the
+client to time out. If the budget expires before the next attempt, the proxy
+returns a structured `llm_guard_request_deadline_exhausted` error without
+sending another upstream request. If it expires during the final direct relay,
+observability records `final_direct_relay_terminated` instead of
 `downstream_body_dropped_before_eof`.
 
+The Guard cannot infer a downstream client's timeout. Configure it above
+`retry.request_deadline_ms` plus transport/scheduling margin, or deliberately
+choose a shorter Guard deadline. In particular, Aeon `OpenAITarget` defaults to
+180 seconds while the GB10 quality-first configuration uses 1,200 seconds;
+leaving those values mismatched can still produce client-side `TimeoutError` for
+valid long generations.
+
 The Aeon-Bench-Pod logging proxy streaming buffering issue is separate: it can
-delay small SSE chunks and heartbeats for that runner, but this guard-side fix
-only bounds the guard retry ladder and relay lifetime.
+delay small SSE chunks and heartbeats for that runner, while this guard-side
+change bounds ordinary admission, retry-ladder, and relay lifetime.
 
 ### Benchmark 5xx/stall reliability checklist
 

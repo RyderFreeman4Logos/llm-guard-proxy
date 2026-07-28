@@ -516,25 +516,26 @@ pub enum EmbeddingQueueResult {
     /// The window was skipped (queue overflow under a non-blocking policy, or
     /// a duplicate of a window already present in the queue).
     Skipped,
-    /// The queue is full and the configured policy is `block`. Callers on the
-    /// SSE hot path must wait for space before retrying; callers that cannot
-    /// block should treat this as a hard skip.
+    /// Reserved compatibility result for external queue implementations. The
+    /// built-in overflow policies never return it because embedding work must
+    /// not block the generation hot path.
     QueueFull,
 }
 
 /// Synchronous bounded queue that buffers streaming windows pending embedding.
 ///
 /// The queue itself is synchronous (`std::collections::VecDeque`) because the
-/// core crate is `#![forbid(unsafe_code)]` and has no async runtime. The async
-/// batch worker that drains the queue lives in the proxy crate.
+/// core crate is `#![forbid(unsafe_code)]` and has no async runtime. Callers
+/// that need asynchronous batching own the drain loop outside this type.
 ///
 /// Overflow behavior is governed by the [`EmbeddingQueuePolicy`][policy] passed
 /// at construction:
 /// - `Skip` (default): silently drop the window and return [`Skipped`](EmbeddingQueueResult::Skipped).
 /// - `DeterministicOnly`: drop the window but signal the caller to fall back to
 ///   deterministic hash-based detection (also reported as `Skipped`).
-/// - `Block`: refuse the push and return [`QueueFull`](EmbeddingQueueResult::QueueFull)
-///   so the caller can retry after space frees up.
+/// - `Block` (legacy): also drops the window and returns
+///   [`Skipped`](EmbeddingQueueResult::Skipped), so queue pressure never blocks
+///   generation.
 ///
 /// Windows with a `(request_id, attempt_id, channel, window_seq)` tuple already
 /// present in the queue are treated as duplicates and skipped.
@@ -586,9 +587,7 @@ impl EmbeddingQueue {
     ///
     /// Returns [`Accepted`](EmbeddingQueueResult::Accepted) if the window was
     /// enqueued, [`Skipped`](EmbeddingQueueResult::Skipped) if it was dropped
-    /// (overflow under a non-blocking policy, or a duplicate), or
-    /// [`QueueFull`](EmbeddingQueueResult::QueueFull) if the queue is full and
-    /// the policy is `block`.
+    /// (overflow under any built-in policy, or a duplicate).
     pub fn push(
         &mut self,
         request_id: impl Into<String>,
@@ -626,14 +625,12 @@ impl EmbeddingQueue {
         }
 
         if self.queue.len() >= self.capacity {
+            // `Block` is retained to read legacy configuration, but embedding work
+            // is advisory and must never hold the generation hot path open.
             return match self.policy {
-                crate::settings::EmbeddingQueuePolicy::Block => EmbeddingQueueResult::QueueFull,
-                // Skip and DeterministicOnly both drop the window; the caller
-                // distinguishes them via the policy field when needed.
                 crate::settings::EmbeddingQueuePolicy::Skip
-                | crate::settings::EmbeddingQueuePolicy::DeterministicOnly => {
-                    EmbeddingQueueResult::Skipped
-                }
+                | crate::settings::EmbeddingQueuePolicy::DeterministicOnly
+                | crate::settings::EmbeddingQueuePolicy::Block => EmbeddingQueueResult::Skipped,
             };
         }
 
@@ -830,16 +827,16 @@ mod tests {
     }
 
     #[test]
-    fn queue_overflow_block_policy() {
+    fn queue_overflow_legacy_block_policy_is_non_blocking() {
         let mut q = EmbeddingQueue::new(1, EmbeddingQueuePolicy::Block);
         assert_eq!(
             q.push("r", "a", EmbeddingChannel::Content, 0, 0, "x"),
             EmbeddingQueueResult::Accepted
         );
-        // Block policy refuses the push when full.
+        // A legacy `block` setting must never make generation wait on embedding work.
         assert_eq!(
             q.push("r", "a", EmbeddingChannel::Content, 1, 1, "y"),
-            EmbeddingQueueResult::QueueFull
+            EmbeddingQueueResult::Skipped
         );
         assert_eq!(q.len(), 1);
     }
@@ -958,12 +955,12 @@ mod tests {
     }
 
     #[test]
-    fn queue_block_policy_then_drain_allows_refill() {
+    fn queue_legacy_block_policy_then_drain_allows_refill() {
         let mut q = EmbeddingQueue::new(1, EmbeddingQueuePolicy::Block);
         q.push("r", "a", EmbeddingChannel::Content, 0, 0, "t");
         assert_eq!(
             q.push("r", "a", EmbeddingChannel::Content, 1, 1, "t"),
-            EmbeddingQueueResult::QueueFull
+            EmbeddingQueueResult::Skipped
         );
         q.drain_all();
         assert_eq!(
