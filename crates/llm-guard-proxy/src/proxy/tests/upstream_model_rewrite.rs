@@ -318,3 +318,73 @@ async fn upstream_model_rewrite_sse_buffer_releases_after_overflow() {
         "overflowed stream must terminate quickly, got {count} items"
     );
 }
+
+#[tokio::test]
+async fn configured_upstream_model_missing_from_models_list_does_not_synthesize_alias() {
+    // upstream_model = "aeon-ultimate" but the upstream /v1/models response
+    // only contains unrelated models. The proxy must NOT synthesize an alias
+    // from the first unrelated model's metadata. We verify by checking that
+    // no alias record appears in the response, and specifically that no record
+    // copies "unrelated-model"'s metadata with the alias id.
+    //
+    // We use two upstream profiles so the default listener (no upstream_profile)
+    // falls through to allowed_upstreams / first-profile routing, which keeps
+    // the original model visible. The key assertion: no "alias-chat" record
+    // synthesized from unrelated metadata.
+    let models_body = r#"{"object":"list","data":[{"id":"unrelated-model","object":"model","max_model_len":128000,"owned_by":"vllm"}]}"#;
+    let fake = FakeUpstream::spawn_with_models_body(models_body).await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        &format!(
+            r#"
+[[upstreams]]
+name = "rewriting-profile"
+base_url = "{}"
+match_models = ["alias-chat"]
+upstream_model = "aeon-ultimate"
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .get(format!("{}/v1/models", proxy.base_url))
+        .send()
+        .await
+        .expect("models request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response
+        .text()
+        .await
+        .expect("models body should be readable");
+    let value: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|error| panic!("models body should parse as JSON: {error}; body={body}"));
+    let models = value
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .expect("models body should have a data array");
+
+    let model_ids: Vec<&str> = models
+        .iter()
+        .filter_map(|model| model.get("id").and_then(serde_json::Value::as_str))
+        .collect();
+    assert!(
+        !model_ids.contains(&"alias-chat"),
+        "must not synthesize alias-chat from an unrelated model when the configured \
+         upstream_model is missing from the upstream models list; got ids: {model_ids:?}"
+    );
+    // Additionally verify no synthesized alias records exist at all — if the
+    // fix worked, the rewriter should not have copied any metadata.
+    assert!(
+        !models.iter().any(|model| {
+            model
+                .get("llm_guard_proxy_alias")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        }),
+        "no alias records should be synthesized when upstream_model is missing upstream"
+    );
+}
