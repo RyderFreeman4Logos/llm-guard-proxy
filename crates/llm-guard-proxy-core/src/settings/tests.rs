@@ -1641,6 +1641,7 @@ mode = "force_disable"
             String::from("qwen3.6-27b-decensor-by-aeon"),
         ]
     );
+    assert_eq!(aeon.upstream_model, None);
     assert_eq!(aeon.request_timeout_ms, 7_200_000);
     assert_eq!(aeon.max_in_flight_requests, Some(8));
     assert_eq!(aeon.max_queued_generation_requests, Some(16));
@@ -1665,6 +1666,60 @@ mode = "force_disable"
     assert_eq!(fast.thinking.mode, ThinkingMode::ForceDisable);
 
     config.validate().expect("profile config should validate");
+}
+
+#[test]
+fn parses_upstream_model_rewrite_field() {
+    let config = parse_config_text(
+        r#"
+[upstream]
+base_url = "http://default.example/v1"
+
+[[upstreams]]
+name = "rewriting"
+base_url = "http://aeon.example/v1"
+match_models = ["alias-chat", "qwen3.6-27b-abliterated-nothinking"]
+upstream_model = "aeon-ultimate"
+"#,
+    )
+    .expect("upstream_model config should parse");
+
+    assert_eq!(config.upstream_profiles.len(), 1);
+    let profile = &config.upstream_profiles[0];
+    assert_eq!(profile.name, "rewriting");
+    assert_eq!(profile.upstream_model.as_deref(), Some("aeon-ultimate"));
+    assert_eq!(
+        profile.match_models,
+        vec![
+            String::from("alias-chat"),
+            String::from("qwen3.6-27b-abliterated-nothinking"),
+        ]
+    );
+    config
+        .validate()
+        .expect("upstream_model config should validate");
+}
+
+#[test]
+fn rejects_empty_upstream_model() {
+    let error = parse_config_text(
+        r#"
+[upstream]
+base_url = "http://default.example/v1"
+
+[[upstreams]]
+name = "rewriting"
+base_url = "http://aeon.example/v1"
+match_models = ["alias-chat"]
+upstream_model = ""
+"#,
+    )
+    .expect_err("empty upstream_model should fail");
+    let message = error.to_string();
+    assert!(
+        message.contains("upstream_model") || message.contains("must not be empty"),
+        "error should mention empty upstream_model: {message}"
+    );
 }
 
 #[cfg(feature = "param-override")]

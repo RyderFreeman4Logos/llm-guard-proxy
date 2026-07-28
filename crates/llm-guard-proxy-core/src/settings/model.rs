@@ -808,6 +808,7 @@ impl AppConfig {
         UpstreamProfileConfig {
             name: DEFAULT_UPSTREAM_PROFILE_NAME.to_owned(),
             match_models: Vec::new(),
+            upstream_model: None,
             base_url: self.upstream.base_url.clone(),
             endpoints: Vec::new(),
             endpoint_selection: EndpointSelectionMode::PriorityFailover,
@@ -1081,6 +1082,7 @@ impl AppConfig {
             active.endpoint_selection = requested.endpoint_selection;
             active.base_url.clone_from(&requested.base_url);
             active.endpoints.clone_from(&requested.endpoints);
+            active.upstream_model.clone_from(&requested.upstream_model);
             active.health_probe_interval_ms = requested.health_probe_interval_ms;
             active.health_probe_timeout_ms = requested.health_probe_timeout_ms;
             active.health_probe_max_wait_ms = requested.health_probe_max_wait_ms;
@@ -1306,6 +1308,7 @@ impl From<&ListenerConfig> for ListenerTopology {
 struct UpstreamProfileTopology {
     name: String,
     match_models: Vec<String>,
+    upstream_model: Option<String>,
 }
 
 impl From<&UpstreamProfileConfig> for UpstreamProfileTopology {
@@ -1313,6 +1316,7 @@ impl From<&UpstreamProfileConfig> for UpstreamProfileTopology {
         Self {
             name: profile.name.clone(),
             match_models: profile.match_models.clone(),
+            upstream_model: profile.upstream_model.clone(),
         }
     }
 }
@@ -2157,6 +2161,12 @@ pub struct UpstreamProfileConfig {
     pub name: String,
     /// Request JSON `model` aliases routed to this profile.
     pub match_models: Vec<String>,
+    /// Optional model name written into the forwarded request `model` field
+    /// before sending to the upstream. When set, the upstream sees this name
+    /// instead of the client's requested alias, and the response `model` field
+    /// is rewritten back to the client's original alias. Absent preserves the
+    /// legacy passthrough behavior.
+    pub upstream_model: Option<String>,
     /// Legacy single base URL for OpenAI-compatible requests.
     pub base_url: String,
     /// Ordered same-model endpoints. Empty preserves the legacy single `base_url` behavior.
@@ -2213,23 +2223,7 @@ impl UpstreamProfileConfig {
             "upstreams.name",
             "must be at most 128 bytes",
         )?;
-        require(
-            !self.match_models.is_empty(),
-            "upstreams.match_models",
-            "must contain at least one model alias",
-        )?;
-        for model in &self.match_models {
-            require(
-                model == model.trim(),
-                "upstreams.match_models",
-                "model aliases must not have leading or trailing whitespace",
-            )?;
-            require(
-                model.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
-                "upstreams.match_models",
-                "model aliases must be at most 256 bytes",
-            )?;
-        }
+        self.validate_match_models_and_upstream_model()?;
         validate_upstream_base_url(self.primary_base_url())?;
         self.validate_endpoints()?;
         self.validate_health_probe_fields()?;
@@ -2318,6 +2312,39 @@ impl UpstreamProfileConfig {
                     .any(|earlier| earlier.base_url == endpoint.base_url),
                 "profile.upstream.base_url",
                 "must not contain duplicate endpoints",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn validate_match_models_and_upstream_model(&self) -> Result<(), ValidationError> {
+        require(
+            !self.match_models.is_empty(),
+            "upstreams.match_models",
+            "must contain at least one model alias",
+        )?;
+        for model in &self.match_models {
+            require(
+                model == model.trim(),
+                "upstreams.match_models",
+                "model aliases must not have leading or trailing whitespace",
+            )?;
+            require(
+                model.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+                "upstreams.match_models",
+                "model aliases must be at most 256 bytes",
+            )?;
+        }
+        if let Some(upstream_model) = &self.upstream_model {
+            require(
+                !upstream_model.is_empty(),
+                "upstreams.upstream_model",
+                "must not be empty when set",
+            )?;
+            require(
+                upstream_model.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+                "upstreams.upstream_model",
+                "must be at most 256 bytes",
             )?;
         }
         Ok(())
@@ -2421,6 +2448,7 @@ impl Default for UpstreamProfileConfig {
         Self {
             name: String::new(),
             match_models: Vec::new(),
+            upstream_model: None,
             base_url: upstream.base_url,
             endpoints: Vec::new(),
             endpoint_selection: EndpointSelectionMode::PriorityFailover,

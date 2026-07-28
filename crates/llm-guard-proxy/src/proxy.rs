@@ -4673,6 +4673,41 @@ fn replace_chat_messages(
     Ok(Bytes::from(value.to_string()))
 }
 
+/// Rewrites the top-level `model` field in a request JSON body to
+/// `upstream_model` before forwarding to the upstream. Falls back to the
+/// original body when it is not a JSON object, preserving passthrough for
+/// non-JSON or malformed payloads.
+fn rewrite_request_model_body(body: &Bytes, upstream_model: &str) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body.clone();
+    };
+    object.insert(
+        String::from("model"),
+        serde_json::Value::String(upstream_model.to_owned()),
+    );
+    Bytes::from(value.to_string())
+}
+
+/// Rewrites the top-level `model` field in a response JSON body back to the
+/// client's original model alias when an upstream model rewrite was applied.
+/// Falls back to the original body for non-JSON or non-object payloads.
+fn rewrite_response_model_body(body: &Bytes, client_model: &str) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body.clone();
+    };
+    object.insert(
+        String::from("model"),
+        serde_json::Value::String(client_model.to_owned()),
+    );
+    Bytes::from(value.to_string())
+}
+
 #[cfg(feature = "guard")]
 fn replace_aggregated_response_body(aggregated: &mut ShieldedAggregatedAttempt, body: &Bytes) {
     aggregated.body = body.clone();
@@ -6439,6 +6474,10 @@ fn plan_shielded_chat(
         || body.clone(),
         shielded_chat::PreparedChatRequest::upstream_body,
     );
+    let upstream_body = match upstream_profile.upstream_model.as_deref() {
+        Some(upstream_model) => rewrite_request_model_body(&upstream_body, upstream_model),
+        None => upstream_body,
+    };
     let thinking_metadata = request
         .as_ref()
         .map_or_else(BTreeMap::new, |request| request.thinking_metadata().clone());
@@ -12105,6 +12144,12 @@ fn shielded_attempt_body(
         },
         |request| (request.upstream_body(), request.thinking_metadata().clone()),
     );
+    // Retry/ladder paths rebuild from the original downstream body; re-apply
+    // profile-level model rewrite so every attempt sees the same upstream model.
+    let prepared_body = match runtime.upstream_profile.upstream_model.as_deref() {
+        Some(upstream_model) => rewrite_request_model_body(&prepared_body, upstream_model),
+        None => prepared_body,
+    };
 
     if let Some(cot_salvage) = cot_salvage
         && let Some(body) = shielded_chat::body_with_cot_salvage_retry_hint(
@@ -13092,6 +13137,11 @@ fn shielded_retry_success_response(
     mut outcome: ShieldedAcceptedOutcome,
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
+    if runtime.upstream_profile.upstream_model.is_some()
+        && let Some(client_model) = runtime.model_id.as_deref()
+    {
+        outcome.body = rewrite_response_model_body(&outcome.body, client_model);
+    }
     let body_len = outcome.body.len();
     let upstream_headers = outcome.final_attempt.upstream_headers.clone();
     let upstream_status = outcome.final_attempt.upstream_status;
@@ -16259,9 +16309,17 @@ fn prepared_shadow_body(
             upstream_body: runtime.upstream_body.clone(),
             thinking_metadata: runtime.thinking_metadata.clone(),
         },
-        |request| PreparedShadowBody {
-            upstream_body: request.upstream_body(),
-            thinking_metadata: request.thinking_metadata().clone(),
+        |request| {
+            let upstream_body = match runtime.upstream_profile.upstream_model.as_deref() {
+                Some(upstream_model) => {
+                    rewrite_request_model_body(&request.upstream_body(), upstream_model)
+                }
+                None => request.upstream_body(),
+            };
+            PreparedShadowBody {
+                upstream_body,
+                thinking_metadata: request.thinking_metadata().clone(),
+            }
         },
     )
 }

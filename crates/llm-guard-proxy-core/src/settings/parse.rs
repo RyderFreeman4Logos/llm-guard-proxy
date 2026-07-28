@@ -1124,6 +1124,16 @@ fn assign_upstream_profile(
         }
         "base_url" => config.base_url = parse_string(value, line_number)?,
         "match_models" => config.match_models = parse_string_array(value, line_number)?,
+        "upstream_model" => {
+            let model = parse_string(value, line_number)?;
+            if model.is_empty() {
+                return Err(ConfigParseError::new(
+                    line_number,
+                    "upstreams.upstream_model must not be empty when set",
+                ));
+            }
+            config.upstream_model = Some(model);
+        }
         "endpoint_selection" => {
             config.endpoint_selection = parse_endpoint_selection_mode(value, line_number)?;
         }
