@@ -28,6 +28,7 @@ const REDACTED_URL_PART: &str = "redacted";
 const INVALID_URL_DISPLAY: &str = "[invalid URL]";
 const LOOP_GUARD_MAX_SEMANTIC_WINDOW_TOKENS: u32 = 256;
 const LOOP_GUARD_MAX_SEMANTIC_HISTORY_WINDOWS: u32 = 256;
+const LOOP_GUARD_MAX_SEMANTIC_REPEAT_WINDOW_COUNT: u32 = 256;
 const DEFAULT_UPSTREAM_PROFILE_NAME: &str = "default";
 const MAX_UPSTREAM_PROFILE_NAME_BYTES: usize = 128;
 const MAX_UPSTREAM_MODEL_ALIAS_BYTES: usize = 256;
@@ -3538,6 +3539,13 @@ pub struct LoopGuardConfig {
     pub reasoning_semantic_minimum_token_count: u32,
     /// Maximum completed semantic windows kept for bounded history comparison.
     pub reasoning_semantic_history_window_count: u32,
+    /// Consecutive high-similarity semantic windows required to corroborate a
+    /// reasoning loop before firing an abort candidate. The default of `2`
+    /// delays the cut by one corroboration window, reducing false positives on
+    /// constrained prose/instruction (acrostics, refrains, lipograms) that
+    /// legitimately repeat one prior window but diverge on the next. Set to `1`
+    /// to restore single-window firing (pre-#224 behavior).
+    pub reasoning_semantic_repeat_window_count: u32,
     /// Embedding backend configuration for higher-recall semantic detection.
     pub embedding: LoopGuardEmbeddingConfig,
 }
@@ -3638,6 +3646,13 @@ impl LoopGuardConfig {
                     <= LOOP_GUARD_MAX_SEMANTIC_HISTORY_WINDOWS,
             "loop_guard.reasoning_semantic_history_window_count",
             "must be between 1 and 256",
+        )?;
+        require(
+            self.reasoning_semantic_repeat_window_count > 0
+                && self.reasoning_semantic_repeat_window_count
+                    <= LOOP_GUARD_MAX_SEMANTIC_REPEAT_WINDOW_COUNT,
+            "loop_guard.reasoning_semantic_repeat_window_count",
+            "must be between 1 and 256",
         )
     }
 }
@@ -3664,6 +3679,7 @@ impl Default for LoopGuardConfig {
             reasoning_semantic_window_token_count: 24,
             reasoning_semantic_minimum_token_count: 8,
             reasoning_semantic_history_window_count: 16,
+            reasoning_semantic_repeat_window_count: 2,
             embedding: LoopGuardEmbeddingConfig::default(),
         }
     }
@@ -4214,6 +4230,9 @@ fn upstream_profile_loop_guard_validation_error(error: ValidationError) -> Valid
         }
         "loop_guard.reasoning_semantic_history_window_count" => {
             "upstreams.loop_guard.reasoning_semantic_history_window_count"
+        }
+        "loop_guard.reasoning_semantic_repeat_window_count" => {
+            "upstreams.loop_guard.reasoning_semantic_repeat_window_count"
         }
         _ => return error,
     };

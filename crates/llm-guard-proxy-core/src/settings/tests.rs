@@ -788,6 +788,7 @@ fn assert_default_loop_guard_fields(config: &AppConfig) {
         config.loop_guard.reasoning_semantic_history_window_count,
         16
     );
+    assert_eq!(config.loop_guard.reasoning_semantic_repeat_window_count, 2);
 }
 
 #[test]
@@ -3026,6 +3027,7 @@ reasoning_semantic_similarity_threshold_percent = 70
 reasoning_semantic_window_token_count = 32
 reasoning_semantic_minimum_token_count = 16
 reasoning_semantic_history_window_count = 20
+reasoning_semantic_repeat_window_count = 3
 ",
     )
     .expect("semantic loop guard config should parse");
@@ -3043,6 +3045,7 @@ reasoning_semantic_history_window_count = 20
         config.loop_guard.reasoning_semantic_history_window_count,
         20
     );
+    assert_eq!(config.loop_guard.reasoning_semantic_repeat_window_count, 3);
 }
 
 #[test]
@@ -3579,6 +3582,26 @@ fn validates_loop_guard_semantic_bounds() {
     assert_eq!(
         error.field(),
         "loop_guard.reasoning_semantic_history_window_count"
+    );
+
+    config = AppConfig::default();
+    config.loop_guard.reasoning_semantic_repeat_window_count = 0;
+    let error = config
+        .validate()
+        .expect_err("zero semantic repeat window count should fail");
+    assert_eq!(
+        error.field(),
+        "loop_guard.reasoning_semantic_repeat_window_count"
+    );
+
+    config = AppConfig::default();
+    config.loop_guard.reasoning_semantic_repeat_window_count = 257;
+    let error = config
+        .validate()
+        .expect_err("semantic repeat window count should be capped");
+    assert_eq!(
+        error.field(),
+        "loop_guard.reasoning_semantic_repeat_window_count"
     );
 }
 
@@ -4159,6 +4182,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_window_token_count"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_minimum_token_count"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_history_window_count"));
+    assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_repeat_window_count"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.request_deadline_ms"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.anti_loop_hint_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.shielded_streaming_enabled"));

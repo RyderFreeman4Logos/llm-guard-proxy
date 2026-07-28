@@ -672,11 +672,13 @@ mod tests {
     use super::*;
 
     /// Builds a synthetic hard-loop record: the same reasoning paragraph
-    /// repeated many times.
+    /// repeated many times. A true hard loop is sustained window after window;
+    /// enough repetitions are emitted to complete several semantic windows so
+    /// the corroboration policy (issue #224) confirms the loop before firing.
     fn hard_loop_record() -> ReplayRecord {
         let paragraph = "I need to reconsider the approach to this problem carefully. ";
         let mut events = Vec::new();
-        for offset in 0..20_u64 {
+        for offset in 0..40_u64 {
             events.push(SseEvent {
                 channel: ReplayChannel::Reasoning,
                 text: paragraph.to_owned(),
@@ -689,7 +691,7 @@ mod tests {
             is_labeled_loop: true,
             label_severity: Some(String::from(SEVERITY_HARD)),
             sse_events: events,
-            generated_token_count: 160,
+            generated_token_count: 320,
         }
     }
 

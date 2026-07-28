@@ -1142,6 +1142,13 @@ struct LoopChannelState {
     semantic_window_tokens: Vec<u64>,
     semantic_windows: VecDeque<SemanticWindow>,
     semantic_history_window_capped: u64,
+    /// Consecutive high-similarity semantic windows seen since the last reset.
+    /// A true loop sustains high similarity window after window; legitimate
+    /// constrained prose (acrostics, refrains, lipograms) typically matches one
+    /// prior window but diverges on the next. Corroborating across consecutive
+    /// windows before firing reduces false-positive loop cuts without disabling
+    /// semantic detection (issue #224).
+    semantic_consecutive_repeat_count: u32,
 }
 
 impl LoopChannelState {
@@ -1459,7 +1466,24 @@ impl LoopChannelState {
             .map(|previous| window.similarity_percent(previous))
             .max()
             .unwrap_or(0);
-        if similarity >= threshold {
+
+        // Issue #224: require corroboration across consecutive high-similarity
+        // windows before firing. A single structural match is common in
+        // constrained prose (acrostics, refrains) and is a false positive; a
+        // true loop sustains high similarity window after window. The streak is
+        // incremented on each high-similarity window and reset on a dissimilar
+        // one, so the cut is delayed by exactly (repeat_window_count - 1)
+        // windows without disabling semantic detection.
+        let required_repeat_count = config.reasoning_semantic_repeat_window_count;
+        let matched = similarity >= threshold;
+        if matched {
+            self.semantic_consecutive_repeat_count =
+                self.semantic_consecutive_repeat_count.saturating_add(1);
+        } else {
+            self.semantic_consecutive_repeat_count = 0;
+        }
+
+        if matched && self.semantic_consecutive_repeat_count >= required_repeat_count {
             let mut detection = FeatureDetection::new(
                 LoopReasonCode::ApproximateRepetition,
                 self.feature_evidence(
@@ -2200,6 +2224,157 @@ mod tests {
     }
 
     #[test]
+    fn semantic_reasoning_loop_requires_corroboration_before_abort() {
+        // Issue #224: constrained prose/instruction (acrostics, refrains,
+        // lipograms) legitimately repeats structure. A single high-similarity
+        // reasoning window above threshold must NOT immediately cut generation
+        // with an abort candidate; only sustained repetition across consecutive
+        // windows corroborates a true loop and warrants the cut.
+        let mut config = test_loop_config();
+        // Ensure the semantic detector is the only one that can fire here: raise
+        // the deterministic line/token/suffix thresholds so repeated structural
+        // stanzas do not trip them.
+        config.output_repeated_line_threshold = u32::MAX;
+        config.output_repeated_token_window_threshold = u32::MAX;
+        config.output_suffix_cycle_threshold = u32::MAX;
+        config.output_low_progress_min_bytes = u64::MAX;
+        config.reasoning_semantic_window_token_count = 6;
+        config.reasoning_semantic_minimum_token_count = 6;
+        config.reasoning_semantic_similarity_threshold_percent = 55;
+        config.reasoning_semantic_repeat_window_count = 2;
+        let mut detector = ChannelizedLoopDetector::new(config, LoopInputProfile::default());
+
+        // First reasoning window: establishes history (no match possible yet).
+        let stanza = "brave ravens approach carefully drafting each frozen stanza verbatim lines\n";
+        assert!(
+            detector
+                .observe(LoopDetectorInput::fragment(
+                    StreamChannel::Reasoning,
+                    stanza,
+                ))
+                .is_empty()
+        );
+
+        // Second near-identical structural stanza: this is legitimate
+        // constrained-repetition (e.g. the next stanza of an acrostic reusing
+        // structure). A single high-similarity window must NOT cut here.
+        let near_match =
+            "brave ravens approach carefully drafting each frozen stanza verbatim lines\n";
+        let early_signals = detector.observe(LoopDetectorInput::fragment(
+            StreamChannel::Reasoning,
+            near_match,
+        ));
+        let early_cut = early_signals.iter().any(|s| {
+            s.is_abort_candidate() && s.reason_code == LoopReasonCode::ApproximateRepetition
+        });
+        assert!(
+            !early_cut,
+            "single high-similarity window must not cut constrained prose (false positive)"
+        );
+
+        // Sustained repetition: a third consecutive near-identical window
+        // corroborates a true loop and SHOULD fire an abort candidate.
+        let mut corroborated = false;
+        for _ in 0..3 {
+            let signals = detector.observe(LoopDetectorInput::fragment(
+                StreamChannel::Reasoning,
+                near_match,
+            ));
+            if signals.iter().any(|s| {
+                s.is_abort_candidate() && s.reason_code == LoopReasonCode::ApproximateRepetition
+            }) {
+                corroborated = true;
+                break;
+            }
+        }
+        assert!(
+            corroborated,
+            "sustained repetition across consecutive windows must still cut a true loop"
+        );
+    }
+
+    #[test]
+    fn semantic_reasoning_loop_corroboration_resets_on_dissimilar_window() {
+        // Issue #224: the corroboration counter must reset when a dissimilar
+        // reasoning window breaks the streak, so a stray structural repeat
+        // followed by fresh reasoning cannot accumulate into a false cut.
+        let mut config = test_loop_config();
+        config.output_repeated_line_threshold = u32::MAX;
+        config.output_repeated_token_window_threshold = u32::MAX;
+        config.output_suffix_cycle_threshold = u32::MAX;
+        config.output_low_progress_min_bytes = u64::MAX;
+        config.reasoning_semantic_window_token_count = 6;
+        config.reasoning_semantic_minimum_token_count = 6;
+        config.reasoning_semantic_similarity_threshold_percent = 55;
+        config.reasoning_semantic_repeat_window_count = 2;
+        let mut detector = ChannelizedLoopDetector::new(config, LoopInputProfile::default());
+
+        let stanza = "brave ravens approach carefully drafting each frozen stanza verbatim lines\n";
+        let near_match =
+            "brave ravens approach carefully drafting each frozen stanza verbatim lines\n";
+        detector.observe(LoopDetectorInput::fragment(
+            StreamChannel::Reasoning,
+            stanza,
+        ));
+        detector.observe(LoopDetectorInput::fragment(
+            StreamChannel::Reasoning,
+            near_match,
+        ));
+
+        // A dissimilar window breaks the streak.
+        let fresh =
+            "meanwhile completely different reasoning explores novel ground quietly always\n";
+        detector.observe(LoopDetectorInput::fragment(StreamChannel::Reasoning, fresh));
+
+        // One more structural repeat after the break must not be enough to cut.
+        let signals = detector.observe(LoopDetectorInput::fragment(
+            StreamChannel::Reasoning,
+            near_match,
+        ));
+        let cut = signals.iter().any(|s| {
+            s.is_abort_candidate() && s.reason_code == LoopReasonCode::ApproximateRepetition
+        });
+        assert!(
+            !cut,
+            "corroboration streak must reset on a dissimilar window"
+        );
+    }
+
+    #[test]
+    fn semantic_reasoning_loop_single_window_policy_restores_immediate_detection() {
+        let mut config = test_loop_config();
+        config.output_repeated_line_threshold = u32::MAX;
+        config.output_repeated_token_window_threshold = u32::MAX;
+        config.output_suffix_cycle_threshold = u32::MAX;
+        config.output_low_progress_min_bytes = u64::MAX;
+        config.reasoning_semantic_window_token_count = 6;
+        config.reasoning_semantic_minimum_token_count = 6;
+        config.reasoning_semantic_similarity_threshold_percent = 55;
+        config.reasoning_semantic_repeat_window_count = 1;
+        let mut detector = ChannelizedLoopDetector::new(config, LoopInputProfile::default());
+        let repeated =
+            "brave ravens approach carefully drafting each frozen stanza verbatim lines\n";
+
+        assert!(
+            detector
+                .observe(LoopDetectorInput::fragment(
+                    StreamChannel::Reasoning,
+                    repeated,
+                ))
+                .is_empty()
+        );
+        let signals = detector.observe(LoopDetectorInput::fragment(
+            StreamChannel::Reasoning,
+            repeated,
+        ));
+
+        assert!(signals.iter().any(|signal| {
+            signal.is_abort_candidate()
+                && signal.reason_code == LoopReasonCode::ApproximateRepetition
+        }));
+    }
+
+    #[test]
     fn loop_detector_content_repetition_is_suspect_not_abort_candidate() {
         let mut config = test_loop_config();
         config.output_token_window_size = 2;
@@ -2678,6 +2853,7 @@ mod tests {
             reasoning_semantic_window_token_count: 24,
             reasoning_semantic_minimum_token_count: 8,
             reasoning_semantic_history_window_count: 16,
+            reasoning_semantic_repeat_window_count: 2,
             on_reasoning_loop: crate::settings::LoopFailurePolicy::default(),
             embedding: crate::settings::LoopGuardEmbeddingConfig::default(),
         }

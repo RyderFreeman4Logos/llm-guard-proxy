@@ -518,6 +518,9 @@ reasoning_semantic_similarity_threshold_percent = 55
 reasoning_semantic_window_token_count = 24
 reasoning_semantic_minimum_token_count = 8
 reasoning_semantic_history_window_count = 16
+# Require this many consecutive high-similarity reasoning windows before aborting.
+# Set to 1 for earliest detection; 2 avoids constrained-prose false positives.
+# reasoning_semantic_repeat_window_count = 2
 
 input_overlap_threshold_multiplier = 4     # Input/output overlap sensitivity
 
