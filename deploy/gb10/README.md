@@ -428,10 +428,18 @@ retention_days = 14
 ### Shielded retry runtime budget
 
 `upstream.request_timeout_ms` bounds a single upstream HTTP attempt. It does not
-bound the full shielded retry ladder. `retry.request_deadline_ms` is the
-request-level wall-clock budget shared across ordinary shielded generation
-admission, all shielded attempts, and the final no-thinking direct relay. For a
-potential shielded `/v1/chat/completions` request, generation/body-routing queue
+bound the full shielded retry ladder. `retry.max_attempts` is the **total** cap
+for upstream attempts for one client request, including the initial attempt:
+`max_attempts = 1` sends no retry, and `max_attempts = 2` permits at most one
+additional upstream attempt. For shielded non-stream chat, the primary attempt
+continues to force upstream SSE for inspection. Only a classified forced-SSE
+body failure can use one remaining attempt as a native-JSON fallback; this
+bounded recovery does not disable forced SSE for later non-stream requests.
+
+`retry.request_deadline_ms` is the request-level wall-clock budget shared across
+ordinary shielded generation admission, all shielded attempts (including a
+native-JSON fallback), and the final no-thinking direct relay. For a potential
+shielded `/v1/chat/completions` request, generation/body-routing queue
 wait is capped to the *remaining* request deadline even when
 `server.generation_queue_timeout_ms` is longer. A queue cap returns the
 classified Guard error `proxy_generation_queue_timeout` rather than leaving the

@@ -16,7 +16,7 @@ use super::{
 };
 
 mod loop_guard;
-pub(super) use loop_guard::{AggregationError, LoopInspectionContext};
+pub(super) use loop_guard::{AggregationError, AggregationFailureKind, LoopInspectionContext};
 use loop_guard::{LoopDetector, observe_completed_tool_call, observe_fragment};
 
 const RAW_STREAM_CHUNK_LIMIT: usize = 2_048;
@@ -42,6 +42,25 @@ pub(super) fn prepare_non_stream_request(
     body: &Bytes,
     thinking: &ThinkingConfig,
 ) -> Option<PreparedChatRequest> {
+    prepare_non_stream_request_with_wire_mode(body, thinking, true)
+}
+
+/// Preserves an upstream native JSON response for a bounded non-stream recovery.
+///
+/// This intentionally applies the same request-side thinking policy as the
+/// protected SSE path, but never injects streaming or usage-frame controls.
+pub(super) fn prepare_native_non_stream_request(
+    body: &Bytes,
+    thinking: &ThinkingConfig,
+) -> Option<PreparedChatRequest> {
+    prepare_non_stream_request_with_wire_mode(body, thinking, false)
+}
+
+fn prepare_non_stream_request_with_wire_mode(
+    body: &Bytes,
+    thinking: &ThinkingConfig,
+    force_stream: bool,
+) -> Option<PreparedChatRequest> {
     let mut value = serde_json::from_slice::<Value>(body).ok()?;
     let object = value.as_object_mut()?;
     if let Some(stream) = object.get("stream")
@@ -58,14 +77,16 @@ pub(super) fn prepare_non_stream_request(
 
     let mut thinking_metadata = apply_thinking_policy(object, thinking);
     add_final_answer_budget_metadata(object, &mut thinking_metadata);
-    object.insert(String::from("stream"), Value::Bool(true));
-    let stream_options = object
-        .entry(String::from("stream_options"))
-        .or_insert_with(|| Value::Object(Map::new()));
-    if let Value::Object(stream_options) = stream_options {
-        stream_options.insert(String::from("include_usage"), Value::Bool(true));
-    } else {
-        *stream_options = json!({ "include_usage": true });
+    if force_stream {
+        object.insert(String::from("stream"), Value::Bool(true));
+        let stream_options = object
+            .entry(String::from("stream_options"))
+            .or_insert_with(|| Value::Object(Map::new()));
+        if let Value::Object(stream_options) = stream_options {
+            stream_options.insert(String::from("include_usage"), Value::Bool(true));
+        } else {
+            *stream_options = json!({ "include_usage": true });
+        }
     }
     let upstream_body = serde_json::to_vec(&value).ok()?;
 
@@ -2225,10 +2246,13 @@ pub(super) async fn aggregate_stream(
     .await?
     {
         let chunk = chunk.map_err(|error| {
-            AggregationError::plain(format!(
-                "upstream SSE stream failed: {}",
-                sanitized_reqwest_error(&error)
-            ))
+            AggregationError::upstream_stream_failure(
+                AggregationFailureKind::from_reqwest_error(&error),
+                format!(
+                    "upstream SSE stream failed: {}",
+                    sanitized_reqwest_error(&error)
+                ),
+            )
         })?;
         saw_first_chunk = true;
         if state.first_byte_latency_ms.is_none() {

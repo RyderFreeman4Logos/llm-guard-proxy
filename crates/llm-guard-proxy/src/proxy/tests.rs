@@ -37,6 +37,8 @@ use super::*;
 mod cot_salvage_issue_211;
 #[path = "tests/listener_profile_policy.rs"]
 mod listener_profile_policy;
+#[path = "tests/native_json_fallback_issue_219.rs"]
+mod native_json_fallback_issue_219;
 #[path = "tests/quality_first_timeouts_issue_222.rs"]
 mod quality_first_timeouts_issue_222;
 #[path = "tests/shielded_endpoint_rendering.rs"]

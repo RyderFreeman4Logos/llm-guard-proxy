@@ -9065,6 +9065,36 @@ impl ShieldedRequestDeadline {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShieldedUpstreamWireMode {
+    ShieldedSse,
+    NativeJsonFallback,
+}
+
+impl ShieldedUpstreamWireMode {
+    const fn upstream_wire_mode(self) -> &'static str {
+        match self {
+            Self::ShieldedSse => "shielded_sse",
+            Self::NativeJsonFallback => "native_json_fallback",
+        }
+    }
+
+    const fn upstream_stream_forced(self) -> bool {
+        matches!(self, Self::ShieldedSse)
+    }
+
+    const fn native_json_fallback_used(self) -> bool {
+        matches!(self, Self::NativeJsonFallback)
+    }
+
+    const fn loop_guard_coverage(self) -> &'static str {
+        match self {
+            Self::ShieldedSse => "full_sse",
+            Self::NativeJsonFallback => "unavailable_native_json",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ShieldedAttemptInfo {
     attempt_id: AttemptId,
@@ -9075,6 +9105,7 @@ struct ShieldedAttemptInfo {
     upstream_status: reqwest::StatusCode,
     upstream_headers: HeaderMap,
     upstream_mode: UpstreamMode,
+    wire_mode: ShieldedUpstreamWireMode,
     request_metadata: BTreeMap<String, String>,
     raw_request_body: Option<String>,
     upstream_body: Bytes,
@@ -9191,6 +9222,8 @@ struct ShieldedAttemptFailure {
     finished_at_unix_ms: u64,
     upstream_mode: UpstreamMode,
     http_status: Option<u16>,
+    wire_mode: ShieldedUpstreamWireMode,
+    sse_failure_kind: Option<shielded_chat::AggregationFailureKind>,
     #[cfg(feature = "upstream-hot-restart")]
     transport_failure: Option<ReqwestFailureKind>,
     error_type: &'static str,
@@ -9439,6 +9472,7 @@ enum ShieldedStartFailureStep {
     Retry {
         attempt_number: u32,
         retry_cause: Option<ShieldedRetryCause>,
+        wire_mode: ShieldedUpstreamWireMode,
     },
     Failed(ShieldedFailureOutcome),
 }
@@ -9451,7 +9485,7 @@ async fn shielded_start_failure_step(
     attempt_records.append(&mut failure.completed_endpoint_attempt_records);
     let next_retry_cause = failure.retry_cause;
     let can_retry = should_retry_after_shielded_failure(runtime, &failure);
-    let (failure, can_retry) = {
+    let (mut failure, can_retry) = {
         let mut failure = failure;
         let mut can_retry = can_retry;
         let local_recovery_gate =
@@ -9466,8 +9500,7 @@ async fn shielded_start_failure_step(
         (failure, can_retry)
     };
     #[cfg(feature = "upstream-hot-restart")]
-    let (failure, can_retry, terminal) = {
-        let mut failure = failure;
+    let (mut failure, can_retry, terminal) = {
         let mut can_retry = can_retry;
         let mut terminal = None;
         if !failure
@@ -9485,6 +9518,11 @@ async fn shielded_start_failure_step(
         }
         (failure, can_retry, terminal)
     };
+    let native_json_fallback = native_json_fallback_eligible(runtime, &failure, can_retry);
+    failure.response_metadata.insert(
+        String::from("native_json_fallback_eligible"),
+        native_json_fallback.to_string(),
+    );
     attempt_records.push(attempt_failure_record(
         &failure,
         shielded_failed_attempt_status(can_retry, &failure),
@@ -9495,6 +9533,11 @@ async fn shielded_start_failure_step(
         return ShieldedStartFailureStep::Retry {
             attempt_number: failure.attempt_number.saturating_add(1),
             retry_cause: next_retry_cause,
+            wire_mode: if native_json_fallback {
+                ShieldedUpstreamWireMode::NativeJsonFallback
+            } else {
+                ShieldedUpstreamWireMode::ShieldedSse
+            },
         };
     }
     let outcome = shielded_failure_outcome(
@@ -9520,7 +9563,9 @@ async fn shielded_started_attempt_step(
     attempt_records: &mut Vec<AttemptRecord>,
     allow_terminal_forward: bool,
 ) -> ShieldedAttemptStep {
-    if started.info.upstream_status.is_success() && is_event_stream(&started.info.upstream_headers)
+    if started.info.upstream_status.is_success()
+        && (is_event_stream(&started.info.upstream_headers)
+            || started.info.wire_mode == ShieldedUpstreamWireMode::NativeJsonFallback)
     {
         return ShieldedAttemptStep::Aggregatable(started);
     }
@@ -9655,6 +9700,7 @@ async fn shielded_retryable_status_step(
 async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOutcome {
     let mut attempt_number = 1;
     let mut retry_cause = None;
+    let mut wire_mode = ShieldedUpstreamWireMode::ShieldedSse;
     let mut attempt_records = Vec::new();
     loop {
         let ignores_request_deadline = consume_local_recovery_deadline_replay_permit(runtime);
@@ -9669,6 +9715,7 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
             runtime,
             attempt_number,
             retry_cause,
+            wire_mode,
             None,
             false,
             ignores_request_deadline,
@@ -9681,9 +9728,11 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
                     ShieldedStartFailureStep::Retry {
                         attempt_number: next_attempt_number,
                         retry_cause: next_retry_cause,
+                        wire_mode: next_wire_mode,
                     } => {
                         attempt_number = next_attempt_number;
                         retry_cause = next_retry_cause;
+                        wire_mode = next_wire_mode;
                         continue;
                     }
                     ShieldedStartFailureStep::Failed(outcome) => {
@@ -9707,6 +9756,7 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
             } => {
                 attempt_number = next_attempt_number;
                 retry_cause = next_retry_cause;
+                wire_mode = ShieldedUpstreamWireMode::ShieldedSse;
             }
             ShieldedAttemptStep::Failed(outcome) => return ShieldedBeginOutcome::Failed(outcome),
             ShieldedAttemptStep::TerminalForward(terminal) => {
@@ -9720,6 +9770,9 @@ async fn aggregate_shielded_attempt(
     runtime: &ShieldedRetryRuntime,
     started: ShieldedStartedAttempt,
 ) -> Result<ShieldedAggregatedAttempt, ShieldedAttemptFailure> {
+    if started.info.wire_mode == ShieldedUpstreamWireMode::NativeJsonFallback {
+        return aggregate_native_json_shielded_attempt(runtime, started).await;
+    }
     let request_id = runtime.request_id.as_str().to_owned();
     let request_model_id = runtime.model_id.clone();
     let stuck_watchdog_attempt = started.stuck_watchdog_attempt.as_ref();
@@ -9769,6 +9822,58 @@ async fn aggregate_shielded_attempt(
     }
 }
 
+async fn aggregate_native_json_shielded_attempt(
+    runtime: &ShieldedRetryRuntime,
+    started: ShieldedStartedAttempt,
+) -> Result<ShieldedAggregatedAttempt, ShieldedAttemptFailure> {
+    let ShieldedStartedAttempt {
+        info,
+        response,
+        ignores_request_deadline,
+        ..
+    } = started;
+    let aggregate = read_upstream_body_bytes(response.bytes_stream());
+    let remaining_deadline = if ignores_request_deadline {
+        runtime.upstream_timeout
+    } else {
+        let Some(remaining_deadline) = runtime.request_deadline.remaining() else {
+            return Err(request_deadline_shielded_attempt_failure(&info));
+        };
+        remaining_deadline
+    };
+    let mut shutdown = runtime.shutdown.subscribe();
+    let body = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => return Err(shutdown_shielded_attempt_failure(&info)),
+        () = tokio::time::sleep(remaining_deadline) => return Err(request_deadline_shielded_attempt_failure(&info)),
+        result = aggregate => result,
+    }
+    .map_err(|_error| {
+        status_failure_without_retry(&info, "native JSON fallback response body could not be read")
+    })?;
+    if !is_application_json_response(&info.upstream_headers) || !response_has_valid_choices(&body) {
+        return Err(status_failure_without_retry(
+            &info,
+            "native JSON fallback returned an invalid non-stream chat completion",
+        ));
+    }
+    let response_metadata = BTreeMap::from([(
+        String::from("native_json_fallback_response_validated"),
+        String::from("true"),
+    )]);
+    Ok(ShieldedAggregatedAttempt {
+        final_attempt: info.into_final_context(
+            response_metadata.clone(),
+            RawPayloads::default(),
+            body.clone(),
+            Bytes::new(),
+        ),
+        body,
+        sse_body: Bytes::new(),
+        response_metadata,
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_shielded_attempts(
     mut runtime: ShieldedRetryRuntime,
@@ -9782,6 +9887,7 @@ async fn run_shielded_attempts(
         .as_ref()
         .map_or(1, |attempt| attempt.info.attempt_number);
     let mut retry_cause = None;
+    let mut next_wire_mode = ShieldedUpstreamWireMode::ShieldedSse;
     let mut cot_salvage = None;
     let mut cot_salvage_attempted = false;
     let mut first_attempt_cot_salvage = None;
@@ -9802,6 +9908,7 @@ async fn run_shielded_attempts(
                 &runtime,
                 attempt_number,
                 retry_cause,
+                next_wire_mode,
                 cot_salvage.as_ref(),
                 force_disable_after_salvage_loop,
                 ignores_request_deadline,
@@ -9815,9 +9922,11 @@ async fn run_shielded_attempts(
                         ShieldedStartFailureStep::Retry {
                             attempt_number: next_attempt_number,
                             retry_cause: next_retry_cause,
+                            wire_mode: retry_wire_mode,
                         } => {
                             attempt_number = next_attempt_number;
                             retry_cause = next_retry_cause;
+                            next_wire_mode = retry_wire_mode;
                             cot_salvage = None;
                             force_disable_after_salvage_loop = false;
                             continue;
@@ -9853,6 +9962,7 @@ async fn run_shielded_attempts(
                 update_shielded_attempt_progress(attempt_progress.as_ref(), &attempt_records, None);
                 attempt_number = next_attempt_number;
                 retry_cause = next_retry_cause;
+                next_wire_mode = ShieldedUpstreamWireMode::ShieldedSse;
                 cot_salvage = None;
                 continue;
             }
@@ -9895,6 +10005,11 @@ async fn run_shielded_attempts(
                     }
                 }
                 let next_retry_cause = failure.retry_cause;
+                let requires_explicit_recovery_for_non_stream_sse_stall = runtime.chat_kind
+                    == ShieldedChatKind::NonStream
+                    && failure.wire_mode == ShieldedUpstreamWireMode::ShieldedSse
+                    && failure.sse_failure_kind
+                        == Some(shielded_chat::AggregationFailureKind::UpstreamStall);
                 let mut can_retry = should_retry_after_shielded_failure(&runtime, &failure);
                 let local_recovery_gate =
                     local_recovery_gate_for_attempt_failure(&runtime, can_retry, &failure).await;
@@ -9922,7 +10037,24 @@ async fn run_shielded_attempts(
                 )
                 .await;
                 can_retry = can_retry && recovery_gate.permits_retry;
+                // General stalls preserve their existing retry behavior, but #219 must not
+                // turn a forced-SSE non-stream stall with no configured recovery into a
+                // blind second SSE request.
+                if requires_explicit_recovery_for_non_stream_sse_stall
+                    && recovery_gate
+                        .metadata
+                        .get("upstream_stall_recovery_status")
+                        .is_some_and(|status| status == "skipped_no_command")
+                {
+                    can_retry = false;
+                }
                 failure.response_metadata.extend(recovery_gate.metadata);
+                let native_json_fallback_eligible =
+                    native_json_fallback_eligible(&runtime, &failure, can_retry);
+                failure.response_metadata.insert(
+                    String::from("native_json_fallback_eligible"),
+                    native_json_fallback_eligible.to_string(),
+                );
                 let attempt_record = attempt_failure_record(
                     &failure,
                     shielded_failed_attempt_status(can_retry, &failure),
@@ -9935,6 +10067,11 @@ async fn run_shielded_attempts(
                 if can_retry {
                     attempt_number = failure.attempt_number.saturating_add(1);
                     retry_cause = next_retry_cause;
+                    next_wire_mode = if native_json_fallback_eligible {
+                        ShieldedUpstreamWireMode::NativeJsonFallback
+                    } else {
+                        ShieldedUpstreamWireMode::ShieldedSse
+                    };
                     if next_cot_salvage.is_some() {
                         cot_salvage_attempted = true;
                     }
@@ -9951,6 +10088,32 @@ async fn run_shielded_attempts(
             }
         }
     }
+}
+
+fn native_json_fallback_eligible(
+    runtime: &ShieldedRetryRuntime,
+    failure: &ShieldedAttemptFailure,
+    can_retry: bool,
+) -> bool {
+    // Fail closed for deadline/shutdown recovery paths: those may still replay SSE, but
+    // must never select native JSON or bypass ordinary max_attempts budget.
+    if is_server_shutdown_failure(failure)
+        || failure.abort_reason.as_deref() == Some(REQUEST_DEADLINE_ABORT_REASON)
+        || failure
+            .response_metadata
+            .get("request_deadline_exhausted")
+            .is_some_and(|value| value == "true")
+        || !runtime
+            .retry_policy
+            .allows_retry_after(failure.attempt_number)
+    {
+        return false;
+    }
+    can_retry
+        && runtime.chat_kind == ShieldedChatKind::NonStream
+        && failure.attempt_number == 1
+        && failure.wire_mode == ShieldedUpstreamWireMode::ShieldedSse
+        && failure.sse_failure_kind == Some(shielded_chat::AggregationFailureKind::BodyFailure)
 }
 
 fn shielded_accepted_outcome(
@@ -11454,10 +11617,12 @@ async fn wait_for_recovery_child_with_timeout(
     metadata
 }
 
+#[allow(clippy::too_many_lines)]
 async fn start_shielded_attempt(
     runtime: &ShieldedRetryRuntime,
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
+    wire_mode: ShieldedUpstreamWireMode,
     cot_salvage: Option<&CotSalvageContext>,
     force_disable_after_salvage_loop: bool,
     ignores_request_deadline: bool,
@@ -11469,12 +11634,19 @@ async fn start_shielded_attempt(
         cot_salvage,
         force_disable_after_salvage_loop,
     );
-    let (upstream_body, anti_loop_hint_applied, attempt_thinking_metadata) =
-        shielded_attempt_body(runtime, attempt_number, retry_cause, &plan, cot_salvage);
+    let (upstream_body, anti_loop_hint_applied, attempt_thinking_metadata) = shielded_attempt_body(
+        runtime,
+        attempt_number,
+        retry_cause,
+        wire_mode,
+        &plan,
+        cot_salvage,
+    );
     let request_metadata = shielded_attempt_request_metadata(
         runtime,
         attempt_number,
         retry_cause,
+        wire_mode,
         anti_loop_hint_applied,
         &plan,
         cot_salvage,
@@ -11486,6 +11658,7 @@ async fn start_shielded_attempt(
             attempt_id: attempt_id.clone(),
             attempt_number,
             attempt_started_at_unix_ms,
+            wire_mode,
             request_metadata: request_metadata.clone(),
             raw_request_body: None,
             evidence_upstream_body: upstream_body.clone(),
@@ -11500,6 +11673,7 @@ async fn start_shielded_attempt(
         attempt_id: attempt_id.clone(),
         attempt_number,
         attempt_started_at_unix_ms,
+        wire_mode,
         request_metadata: request_metadata.clone(),
         raw_request_body: raw_request_body.clone(),
         evidence_upstream_body: evidence_upstream_body.clone(),
@@ -11544,6 +11718,7 @@ async fn start_shielded_attempt(
             upstream_status,
             upstream_headers,
             upstream_mode,
+            wire_mode,
             request_metadata: sent.attempt_request_metadata,
             raw_request_body,
             upstream_body: evidence_upstream_body,
@@ -11685,6 +11860,7 @@ struct ShieldedStartFailureInput<'runtime> {
     attempt_id: AttemptId,
     attempt_number: u32,
     attempt_started_at_unix_ms: u64,
+    wire_mode: ShieldedUpstreamWireMode,
     request_metadata: BTreeMap<String, String>,
     raw_request_body: Option<String>,
     evidence_upstream_body: Bytes,
@@ -11707,6 +11883,24 @@ fn shielded_start_error_type(error: &ProxyError, request_deadline_exhausted: boo
     }
 }
 
+fn forced_sse_body_failure_kind(
+    error: &ProxyError,
+    wire_mode: ShieldedUpstreamWireMode,
+) -> Option<shielded_chat::AggregationFailureKind> {
+    (wire_mode == ShieldedUpstreamWireMode::ShieldedSse
+        && matches!(
+            error,
+            ProxyError::UpstreamTransport {
+                failure: ReqwestFailureKind::Body
+                    | ReqwestFailureKind::Request
+                    | ReqwestFailureKind::Other,
+                ..
+            } | ProxyError::UpstreamBody { .. }
+        ))
+    .then_some(shielded_chat::AggregationFailureKind::BodyFailure)
+}
+
+#[allow(clippy::too_many_lines)]
 fn shielded_start_transport_failure(
     input: ShieldedStartFailureInput<'_>,
 ) -> ShieldedAttemptFailure {
@@ -11719,9 +11913,12 @@ fn shielded_start_transport_failure(
                 ..
             }
         );
+    let sse_failure_kind = forced_sse_body_failure_kind(&input.error, input.wire_mode);
     let retry_cause =
         if matches!(&input.error, ProxyError::Shutdown { .. }) || request_deadline_exhausted {
             None
+        } else if sse_failure_kind.is_some() {
+            Some(ShieldedRetryCause::TransientStream)
         } else {
             transport_retry_cause(&input.error)
         };
@@ -11768,6 +11965,12 @@ fn shielded_start_transport_failure(
         String::from("upstream_response_received"),
         String::from("false"),
     );
+    if let Some(failure_kind) = sse_failure_kind {
+        response_metadata.insert(
+            String::from("sse_failure_class"),
+            failure_kind.as_str().to_owned(),
+        );
+    }
     if let Some(reason) = &abort_reason {
         response_metadata.insert(String::from("abort_reason"), reason.clone());
         response_metadata.insert(String::from("shielded_terminal_reason"), reason.clone());
@@ -11786,6 +11989,8 @@ fn shielded_start_transport_failure(
         finished_at_unix_ms,
         upstream_mode,
         http_status,
+        wire_mode: input.wire_mode,
+        sse_failure_kind,
         #[cfg(feature = "upstream-hot-restart")]
         transport_failure: match &input.error {
             ProxyError::UpstreamTransport { failure, .. } => Some(*failure),
@@ -11843,14 +12048,23 @@ fn shielded_attempt_body(
     runtime: &ShieldedRetryRuntime,
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
+    wire_mode: ShieldedUpstreamWireMode,
     attempt_plan: &ShieldedAttemptPlan,
     cot_salvage: Option<&CotSalvageContext>,
 ) -> (Bytes, bool, BTreeMap<String, String>) {
     let prepared_request = match runtime.chat_kind {
-        ShieldedChatKind::NonStream => shielded_chat::prepare_non_stream_request(
-            &runtime.downstream_body,
-            &attempt_plan.thinking,
-        ),
+        ShieldedChatKind::NonStream => match wire_mode {
+            ShieldedUpstreamWireMode::ShieldedSse => shielded_chat::prepare_non_stream_request(
+                &runtime.downstream_body,
+                &attempt_plan.thinking,
+            ),
+            ShieldedUpstreamWireMode::NativeJsonFallback => {
+                shielded_chat::prepare_native_non_stream_request(
+                    &runtime.downstream_body,
+                    &attempt_plan.thinking,
+                )
+            }
+        },
         ShieldedChatKind::Stream => {
             shielded_chat::prepare_stream_request(&runtime.downstream_body, &attempt_plan.thinking)
         }
@@ -11937,10 +12151,12 @@ fn apply_shielded_param_override_to_body_or_original(
     body
 }
 
+#[allow(clippy::too_many_arguments)]
 fn shielded_attempt_request_metadata(
     runtime: &ShieldedRetryRuntime,
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
+    wire_mode: ShieldedUpstreamWireMode,
     anti_loop_hint_applied: bool,
     attempt_plan: &ShieldedAttemptPlan,
     cot_salvage: Option<&CotSalvageContext>,
@@ -11973,7 +12189,48 @@ fn shielded_attempt_request_metadata(
         attempt_plan,
         cot_salvage,
     );
+    add_shielded_wire_metadata(&mut metadata, runtime, attempt_number, wire_mode);
     metadata
+}
+
+fn add_shielded_wire_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    runtime: &ShieldedRetryRuntime,
+    attempt_number: u32,
+    wire_mode: ShieldedUpstreamWireMode,
+) {
+    if runtime.chat_kind != ShieldedChatKind::NonStream {
+        return;
+    }
+    metadata.insert(
+        String::from("upstream_wire_mode"),
+        wire_mode.upstream_wire_mode().to_owned(),
+    );
+    metadata.insert(
+        String::from("upstream_stream_forced"),
+        wire_mode.upstream_stream_forced().to_string(),
+    );
+    metadata.insert(String::from("sse_failure_class"), String::from("none"));
+    metadata.insert(
+        String::from("native_json_fallback_eligible"),
+        String::from("false"),
+    );
+    metadata.insert(
+        String::from("native_json_fallback_used"),
+        wire_mode.native_json_fallback_used().to_string(),
+    );
+    metadata.insert(
+        String::from("retry_budget_remaining"),
+        runtime
+            .retry_policy
+            .max_attempts
+            .saturating_sub(attempt_number)
+            .to_string(),
+    );
+    metadata.insert(
+        String::from("loop_guard_coverage"),
+        wire_mode.loop_guard_coverage().to_owned(),
+    );
 }
 
 fn add_retry_attempt_metadata(
@@ -12160,14 +12417,15 @@ fn aggregation_failure(
     error: &shielded_chat::AggregationError,
 ) -> ShieldedAttemptFailure {
     let finished_at_unix_ms = unix_time_millis();
+    let failure_kind = error.failure_kind();
     let retry_cause = if error.is_loop_detected() {
         Some(ShieldedRetryCause::LoopDetected)
     } else if error.is_upstream_stall() {
         Some(ShieldedRetryCause::UpstreamStall)
+    } else if failure_kind.is_transient_stream_failure() {
+        Some(ShieldedRetryCause::TransientStream)
     } else {
-        error
-            .transient_stream_retry_reason()
-            .map(|_reason| ShieldedRetryCause::TransientStream)
+        None
     };
     let mut response_metadata = failed_response_metadata(
         info.started_at_unix_ms,
@@ -12182,6 +12440,10 @@ fn aggregation_failure(
         String::from("http_status_success"),
         info.upstream_status.is_success().to_string(),
     );
+    response_metadata.insert(
+        String::from("sse_failure_class"),
+        failure_kind.as_str().to_owned(),
+    );
     response_metadata.extend(error.response_metadata().clone());
     let mut raw_payloads = error.raw_payloads().clone();
     if raw_payloads.input.is_none() {
@@ -12194,6 +12456,8 @@ fn aggregation_failure(
         started_at_unix_ms: info.started_at_unix_ms,
         finished_at_unix_ms,
         upstream_mode: info.upstream_mode,
+        wire_mode: info.wire_mode,
+        sse_failure_kind: Some(failure_kind),
         http_status: Some(info.upstream_status.as_u16()),
         #[cfg(feature = "upstream-hot-restart")]
         transport_failure: None,
@@ -12235,6 +12499,8 @@ fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAtte
         started_at_unix_ms: info.started_at_unix_ms,
         finished_at_unix_ms,
         upstream_mode: info.upstream_mode,
+        wire_mode: info.wire_mode,
+        sse_failure_kind: None,
         http_status: Some(info.upstream_status.as_u16()),
         #[cfg(feature = "upstream-hot-restart")]
         transport_failure: None,
@@ -12279,6 +12545,8 @@ fn request_deadline_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> Shie
         started_at_unix_ms: info.started_at_unix_ms,
         finished_at_unix_ms,
         upstream_mode: info.upstream_mode,
+        wire_mode: info.wire_mode,
+        sse_failure_kind: None,
         http_status: Some(info.upstream_status.as_u16()),
         #[cfg(feature = "upstream-hot-restart")]
         transport_failure: None,
@@ -12458,6 +12726,8 @@ fn status_failure(
         started_at_unix_ms: info.started_at_unix_ms,
         finished_at_unix_ms,
         upstream_mode: info.upstream_mode,
+        wire_mode: info.wire_mode,
+        sse_failure_kind: None,
         http_status: Some(info.upstream_status.as_u16()),
         #[cfg(feature = "upstream-hot-restart")]
         transport_failure: None,
@@ -12498,6 +12768,8 @@ fn status_failure_without_retry(
         started_at_unix_ms: info.started_at_unix_ms,
         finished_at_unix_ms,
         upstream_mode: info.upstream_mode,
+        wire_mode: info.wire_mode,
+        sse_failure_kind: None,
         http_status: Some(info.upstream_status.as_u16()),
         #[cfg(feature = "upstream-hot-restart")]
         transport_failure: None,
@@ -12522,8 +12794,9 @@ fn attempt_failure_record(
     retry_cause: Option<ShieldedRetryCause>,
     policy: &ShieldedRetryPolicy,
 ) -> AttemptRecord {
-    let mut response_metadata = failure.response_metadata.clone();
+    let mut response_metadata = BTreeMap::new();
     copy_attempt_request_metadata(&mut response_metadata, &failure.request_metadata);
+    response_metadata.extend(failure.response_metadata.clone());
     response_metadata.insert(
         String::from("attempt_number"),
         failure.attempt_number.to_string(),
@@ -12612,6 +12885,13 @@ fn copy_attempt_request_metadata(
         "attempt_thinking_mode",
         "attempt_thinking_budget_tokens",
         "attempt_thinking_max_tokens",
+        "upstream_wire_mode",
+        "upstream_stream_forced",
+        "sse_failure_class",
+        "native_json_fallback_eligible",
+        "native_json_fallback_used",
+        "retry_budget_remaining",
+        "loop_guard_coverage",
         "cot_salvage_used",
         "cot_salvage_policy",
         "cot_salvage_source_attempt_id",
