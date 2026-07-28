@@ -5,8 +5,8 @@ use super::{
     EndpointSelectionMode, GuardianKillAction, HeartbeatMode, LoopFailurePolicy, LoopGuardMode,
     NoThinkingMarkerPolicy, RELOADABLE_FIELDS, RESTART_REQUIRED_FIELDS, RetryLadderConfig,
     ShadowComparisonAttempt, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy,
-    UpstreamEndpointProtocol, UpstreamPriority, UpstreamRouteReason, ValidationError,
-    apply_reloadable, parse::parse_config_text, redact_upstream_base_url,
+    UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason,
+    ValidationError, apply_reloadable, parse::parse_config_text, redact_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 use crate::{
@@ -1720,6 +1720,46 @@ upstream_model = ""
         message.contains("upstream_model") || message.contains("must not be empty"),
         "error should mention empty upstream_model: {message}"
     );
+}
+
+#[test]
+fn rejects_whitespace_in_upstream_model() {
+    for upstream_model in ["   ", " aeon-ultimate", "aeon-ultimate "] {
+        let contents = format!(
+            r#"
+[upstream]
+base_url = "http://default.example/v1"
+
+[[upstreams]]
+name = "rewriting"
+base_url = "http://aeon.example/v1"
+match_models = ["alias-chat"]
+upstream_model = "{upstream_model}"
+"#
+        );
+        let error = parse_config_text(&contents)
+            .expect_err("whitespace in upstream_model should fail during parsing");
+        assert!(
+            error.to_string().contains("upstream_model"),
+            "error should mention upstream_model: {error}"
+        );
+    }
+
+    for upstream_model in ["   ", " aeon-ultimate", "aeon-ultimate "] {
+        let mut config = AppConfig::default();
+        let profile = UpstreamProfileConfig {
+            name: String::from("rewriting"),
+            match_models: vec![String::from("alias-chat")],
+            upstream_model: Some(String::from(upstream_model)),
+            ..Default::default()
+        };
+        config.upstream_profiles.push(profile);
+
+        let error = config
+            .validate()
+            .expect_err("whitespace in upstream_model should fail validation");
+        assert_eq!(error.field(), "upstreams.upstream_model");
+    }
 }
 
 #[cfg(feature = "param-override")]

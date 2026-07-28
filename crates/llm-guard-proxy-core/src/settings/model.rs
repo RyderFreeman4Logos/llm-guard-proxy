@@ -2342,6 +2342,11 @@ impl UpstreamProfileConfig {
                 "must not be empty when set",
             )?;
             require(
+                upstream_model == upstream_model.trim(),
+                "upstreams.upstream_model",
+                "must not have leading or trailing whitespace",
+            )?;
+            require(
                 upstream_model.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
                 "upstreams.upstream_model",
                 "must be at most 256 bytes",

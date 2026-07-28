@@ -1132,6 +1132,12 @@ fn assign_upstream_profile(
                     "upstreams.upstream_model must not be empty when set",
                 ));
             }
+            if model != model.trim() {
+                return Err(ConfigParseError::new(
+                    line_number,
+                    "upstreams.upstream_model must not have leading or trailing whitespace",
+                ));
+            }
             config.upstream_model = Some(model);
         }
         "endpoint_selection" => {
