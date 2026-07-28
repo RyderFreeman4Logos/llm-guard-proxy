@@ -9,8 +9,61 @@ use llm_guard_proxy_core::{
 use llm_guard_proxy_state::RawPayloads;
 
 /// Stream aggregation failure with bounded response metadata for observability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::proxy) enum AggregationFailureKind {
+    BodyFailure,
+    TimeoutFailure,
+    ConnectFailure,
+    RequestFailure,
+    DecodeFailure,
+    UnknownFailure,
+    UpstreamStall,
+    MalformedProtocol,
+    LoopDetected,
+}
+
+impl AggregationFailureKind {
+    pub(super) fn from_reqwest_error(error: &reqwest::Error) -> Self {
+        if error.is_timeout() {
+            Self::TimeoutFailure
+        } else if error.is_connect() {
+            Self::ConnectFailure
+        } else if error.is_body() {
+            Self::BodyFailure
+        } else if error.is_decode() {
+            Self::DecodeFailure
+        } else if error.is_request() {
+            Self::RequestFailure
+        } else {
+            Self::UnknownFailure
+        }
+    }
+
+    pub(in crate::proxy) const fn as_str(self) -> &'static str {
+        match self {
+            Self::BodyFailure => "body_failure",
+            Self::TimeoutFailure => "timeout_failure",
+            Self::ConnectFailure => "connect_failure",
+            Self::RequestFailure => "request_failure",
+            Self::DecodeFailure => "decode_failure",
+            Self::UnknownFailure => "unknown_failure",
+            Self::UpstreamStall => "upstream_stall",
+            Self::MalformedProtocol => "malformed_protocol",
+            Self::LoopDetected => "loop_detected",
+        }
+    }
+
+    pub(in crate::proxy) const fn is_transient_stream_failure(self) -> bool {
+        matches!(
+            self,
+            Self::BodyFailure | Self::TimeoutFailure | Self::ConnectFailure | Self::UnknownFailure
+        )
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(in crate::proxy) struct AggregationError {
+    kind: AggregationFailureKind,
     message: String,
     response_metadata: BTreeMap<String, String>,
     raw_payloads: Box<RawPayloads>,
@@ -19,6 +72,19 @@ pub(in crate::proxy) struct AggregationError {
 impl AggregationError {
     pub(super) fn plain(message: impl Into<String>) -> Self {
         Self {
+            kind: AggregationFailureKind::MalformedProtocol,
+            message: message.into(),
+            response_metadata: BTreeMap::new(),
+            raw_payloads: Box::default(),
+        }
+    }
+
+    pub(super) fn upstream_stream_failure(
+        kind: AggregationFailureKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
             message: message.into(),
             response_metadata: BTreeMap::new(),
             raw_payloads: Box::default(),
@@ -27,6 +93,7 @@ impl AggregationError {
 
     pub(super) fn upstream_stall(idle_timeout_ms: u64) -> Self {
         Self {
+            kind: AggregationFailureKind::UpstreamStall,
             message: format!("upstream SSE stream stalled: no chunk for {idle_timeout_ms}ms"),
             response_metadata: BTreeMap::from([
                 (
@@ -58,6 +125,7 @@ impl AggregationError {
             signal.severity.as_str().to_owned(),
         );
         Self {
+            kind: AggregationFailureKind::LoopDetected,
             message: loop_detection_message(signal),
             response_metadata,
             raw_payloads: Box::default(),
@@ -85,38 +153,16 @@ impl AggregationError {
         self.raw_payloads.as_ref()
     }
 
+    pub(in crate::proxy) const fn failure_kind(&self) -> AggregationFailureKind {
+        self.kind
+    }
+
     pub(in crate::proxy) fn is_loop_detected(&self) -> bool {
-        self.response_metadata
-            .get("loop_detected")
-            .is_some_and(|value| value == "true")
+        self.kind == AggregationFailureKind::LoopDetected
     }
 
     pub(in crate::proxy) fn is_upstream_stall(&self) -> bool {
-        self.response_metadata
-            .get("upstream_stall_detected")
-            .is_some_and(|value| value == "true")
-    }
-
-    pub(in crate::proxy) fn transient_stream_retry_reason(&self) -> Option<&'static str> {
-        if self.is_upstream_stall() {
-            Some("upstream_stall")
-        } else if self
-            .message
-            .contains("upstream SSE stream failed: timeout_failure")
-            || self
-                .message
-                .contains("upstream SSE stream failed: connect_failure")
-            || self
-                .message
-                .contains("upstream SSE stream failed: body_failure")
-            || self
-                .message
-                .contains("upstream SSE stream failed: unknown_failure")
-        {
-            Some("transient_upstream_stream_failure")
-        } else {
-            None
-        }
+        self.kind == AggregationFailureKind::UpstreamStall
     }
 }
 
