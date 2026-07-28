@@ -222,6 +222,20 @@ max_tokens = 50000                 # Supplies the same total cap when thinking p
 frequency_penalty = 0.0
 presence_penalty = 0.0
 
+## ── upstream_model (optional, same-PR config-doc sync per CLAUDE.md) ─────────
+## When set, the proxy rewrites the upstream request body and streaming response
+## "model" field to this value for every matched alias, and synthesizes alias
+## records in /v1/models using this model's metadata as the template. Safe
+## default is to leave it unset (commented): aliases are then served with the
+## first upstream model record's metadata.
+##
+## Requirements: must be a non-empty, non-whitespace model id that exists in the
+## upstream /v1/models response. If the configured target is missing upstream,
+## aliases are NOT synthesized (no fallback to an unrelated model's metadata).
+##
+## Uncomment and set to the real upstream model id to enable rewriting:
+# upstream_model = "aeon-ultimate"
+
 [[upstreams]]
 name = "qwen3-embedding-8b"
 base_url = "http://100.105.4.92:18012/v1"
