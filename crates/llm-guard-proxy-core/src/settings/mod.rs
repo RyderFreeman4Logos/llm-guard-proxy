@@ -122,6 +122,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "loop_guard.reasoning_semantic_window_token_count",
     "loop_guard.reasoning_semantic_minimum_token_count",
     "loop_guard.reasoning_semantic_history_window_count",
+    "loop_guard.reasoning_semantic_repeat_window_count",
     "loop_guard.embedding.provider",
     "loop_guard.embedding.endpoint",
     "loop_guard.embedding.model",

@@ -328,12 +328,23 @@ reasoning_semantic_similarity_threshold_percent = 55
 reasoning_semantic_window_token_count = 24
 reasoning_semantic_minimum_token_count = 8
 reasoning_semantic_history_window_count = 16
+reasoning_semantic_repeat_window_count = 2
 
 # Semantic loop detection is reasoning-only and compares bounded normalized
 # token/ngram windows with Jaccard similarity. The default is enabled with a
 # conservative majority-overlap threshold; raise the threshold to reduce false
 # positives, lower it to catch looser paraphrases, or disable it to keep only
 # the hash, suffix-cycle, and low-progress detectors.
+#
+# `reasoning_semantic_repeat_window_count` is the number of consecutive
+# high-similarity windows that must corroborate before the semantic detector
+# fires an abort candidate. The default of 2 delays the cut by one window so
+# that constrained prose/instruction (acrostics, refrains, lipograms) that
+# legitimately repeats a single structural window is not cut mid-answer, while
+# a true loop (sustained repetition window after window) is still caught. Set
+# it to 1 to restore immediate single-window firing. Trade-off: the default
+# permits one additional matching window before intervention, so operators who
+# prefer the earliest possible cut can choose 1.
 #
 # Detector mode controls channelized output-loop decisions. `disabled` skips
 # detector work, `monitor` writes bounded content-free signal summaries, and
@@ -479,6 +490,7 @@ Reloadable fields:
 - `loop_guard.reasoning_semantic_window_token_count`
 - `loop_guard.reasoning_semantic_minimum_token_count`
 - `loop_guard.reasoning_semantic_history_window_count`
+- `loop_guard.reasoning_semantic_repeat_window_count`
 - `retry.enabled`
 - `retry.max_attempts`
 - `retry.anti_loop_hint_enabled`
