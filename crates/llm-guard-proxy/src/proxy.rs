@@ -2213,6 +2213,7 @@ fn render_metrics(
     push_request_metrics(&mut output, snapshot);
     push_request_terminal_metrics(&mut output, snapshot);
     push_attempt_metrics(&mut output, snapshot);
+    push_loop_guard_attempt_metrics(&mut output, snapshot);
     push_retry_and_error_metrics(&mut output, snapshot);
     push_malformed_response_metrics(&mut output, malformed_responses);
     push_persistence_drop_metrics(&mut output, persistence_dropped);
@@ -2386,6 +2387,31 @@ fn push_attempt_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnap
                 ("status", &row.status),
                 ("upstream_mode", &row.upstream_mode),
                 ("http_status_class", &row.http_status_class),
+            ],
+            row.count,
+        );
+    }
+}
+
+fn push_loop_guard_attempt_metrics(output: &mut String, snapshot: &ObservabilityMetricsSnapshot) {
+    const METRIC: &str = "llm_guard_proxy_current_retained_loop_guard_attempts";
+    push_metric_header(
+        output,
+        METRIC,
+        "Currently retained content-free loop/salvage ladder attempts by sanitized labels.",
+        "gauge",
+    );
+    for row in &snapshot.loop_guard_attempt_counts {
+        push_metric_line(
+            output,
+            METRIC,
+            &[
+                ("loop_detected", &row.loop_detected),
+                ("loop_detector_class", &row.detector_class),
+                ("ladder_rung", &row.ladder_rung),
+                ("salvage_used", &row.salvage_used),
+                ("thinking_budget", &row.thinking_budget),
+                ("max_tokens", &row.max_tokens),
             ],
             row.count,
         );
@@ -12248,6 +12274,7 @@ fn add_retry_attempt_metadata(
         attempt_number.saturating_sub(1).to_string(),
     );
     metadata.insert(String::from("attempt_name"), attempt_plan.name.clone());
+    metadata.insert(String::from("ladder_rung"), attempt_plan.name.clone());
     metadata.insert(
         String::from("retry_policy_enabled"),
         policy.enabled.to_string(),
@@ -12291,17 +12318,21 @@ fn add_retry_attempt_metadata(
         String::from("attempt_thinking_mode"),
         attempt_plan.thinking.effective_mode().as_str().to_owned(),
     );
+    let thinking_budget = attempt_plan.thinking.budget_tokens.to_string();
     metadata.insert(
         String::from("attempt_thinking_budget_tokens"),
-        attempt_plan.thinking.budget_tokens.to_string(),
+        thinking_budget.clone(),
     );
+    metadata.insert(String::from("thinking_budget"), thinking_budget);
+    let max_tokens = attempt_plan
+        .thinking
+        .max_tokens
+        .map_or_else(|| String::from("unset"), |value| value.to_string());
     metadata.insert(
         String::from("attempt_thinking_max_tokens"),
-        attempt_plan
-            .thinking
-            .max_tokens
-            .map_or_else(|| String::from("unset"), |value| value.to_string()),
+        max_tokens.clone(),
     );
+    metadata.insert(String::from("max_tokens"), max_tokens);
     add_cot_salvage_request_metadata(metadata, cot_salvage, &attempt_plan.thinking);
 }
 
@@ -12312,9 +12343,11 @@ fn add_cot_salvage_request_metadata(
 ) {
     let Some(cot_salvage) = cot_salvage else {
         metadata.insert(String::from("cot_salvage_used"), String::from("false"));
+        metadata.insert(String::from("salvage_used"), String::from("false"));
         return;
     };
     metadata.insert(String::from("cot_salvage_used"), String::from("true"));
+    metadata.insert(String::from("salvage_used"), String::from("true"));
     metadata.insert(
         String::from("cot_salvage_policy"),
         cot_salvage.policy.as_str().to_owned(),
@@ -12876,6 +12909,7 @@ fn copy_attempt_request_metadata(
     for key in [
         "attempt_index",
         "attempt_name",
+        "ladder_rung",
         "retry_request_deadline_ms",
         "retry_previous_reason",
         "retry_anti_loop_hint_applied",
@@ -12885,6 +12919,7 @@ fn copy_attempt_request_metadata(
         "attempt_thinking_mode",
         "attempt_thinking_budget_tokens",
         "attempt_thinking_max_tokens",
+        "max_tokens",
         "upstream_wire_mode",
         "upstream_stream_forced",
         "sse_failure_class",
@@ -12893,6 +12928,7 @@ fn copy_attempt_request_metadata(
         "retry_budget_remaining",
         "loop_guard_coverage",
         "cot_salvage_used",
+        "salvage_used",
         "cot_salvage_policy",
         "cot_salvage_source_attempt_id",
         "cot_salvage_source_attempt_number",

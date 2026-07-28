@@ -23,9 +23,9 @@ pub use evidence::{
 pub use observability::{
     AttemptId, AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary,
     DownstreamMode, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram, LiveRequestEntry,
-    LiveRequestRegistry, LiveRequestState, LiveRequestSummary, ObservabilityError,
-    ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloadChunk, RawPayloads, RequestId,
-    RequestMetricCount, RequestRecord, RequestStatus, RequestTerminalMetricCount,
-    RetentionPruningStats, RetentionUsage, StoreWrite, TimelineEvent, TokenUsage,
-    TokenUsageByEndpoint, UpstreamErrorMetricCount, UpstreamMode,
+    LiveRequestRegistry, LiveRequestState, LiveRequestSummary, LoopGuardAttemptMetricCount,
+    ObservabilityError, ObservabilityMetricsSnapshot, ObservabilityStore, RawPayloadChunk,
+    RawPayloads, RequestId, RequestMetricCount, RequestRecord, RequestStatus,
+    RequestTerminalMetricCount, RetentionPruningStats, RetentionUsage, StoreWrite, TimelineEvent,
+    TokenUsage, TokenUsageByEndpoint, UpstreamErrorMetricCount, UpstreamMode,
 };

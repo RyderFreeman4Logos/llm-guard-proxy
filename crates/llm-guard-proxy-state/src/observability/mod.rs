@@ -23,9 +23,9 @@ pub use live_registry::{
 };
 pub use model::{
     AttemptMetricCount, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
-    HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram, ObservabilityMetricsSnapshot,
-    RawPayloadChunk, RawPayloads, RequestMetricCount, RequestRecord, RequestStatus,
-    RequestTerminalMetricCount, RetentionPruningStats, RetentionUsage, StoreWrite, TokenUsage,
-    TokenUsageByEndpoint, UpstreamErrorMetricCount, UpstreamMode,
+    HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram, LoopGuardAttemptMetricCount,
+    ObservabilityMetricsSnapshot, RawPayloadChunk, RawPayloads, RequestMetricCount, RequestRecord,
+    RequestStatus, RequestTerminalMetricCount, RetentionPruningStats, RetentionUsage, StoreWrite,
+    TokenUsage, TokenUsageByEndpoint, UpstreamErrorMetricCount, UpstreamMode,
 };
 pub use store::ObservabilityStore;

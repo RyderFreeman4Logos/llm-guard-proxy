@@ -817,6 +817,91 @@ fn metrics_snapshot_buckets_request_terminal_reasons() {
 }
 
 #[test]
+fn metrics_snapshot_groups_content_free_loop_guard_attempt_fields() {
+    let fixture = StoreFixture::new("loop-guard-telemetry-metrics");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let request = request_record("req-loop-guard-telemetry", RequestStatus::Succeeded, 1_000);
+    let loop_attempt = AttemptRecord {
+        response_metadata: BTreeMap::from([
+            (String::from("loop_detected"), String::from("true")),
+            (String::from("loop_detector_class"), String::from("line")),
+            (String::from("ladder_rung"), String::from("max-thinking")),
+            (String::from("salvage_used"), String::from("false")),
+            (String::from("thinking_budget"), String::from("32768")),
+            (String::from("max_tokens"), String::from("50000")),
+        ]),
+        ..attempt_record(
+            "attempt-loop-guard-telemetry",
+            &request.request_id,
+            AttemptStatus::Retried,
+            1,
+            1_010,
+        )
+    };
+    let unsafe_attempt = AttemptRecord {
+        response_metadata: BTreeMap::from([
+            (String::from("loop_detected"), String::from("not-a-bool")),
+            (
+                String::from("loop_detector_class"),
+                String::from("private-class"),
+            ),
+            (
+                String::from("ladder_rung"),
+                String::from("private reasoning snippet"),
+            ),
+            (String::from("salvage_used"), String::from("not-a-bool")),
+            (
+                String::from("thinking_budget"),
+                String::from("not-a-number"),
+            ),
+            (String::from("max_tokens"), String::from("not-a-number")),
+        ]),
+        ..attempt_record(
+            "attempt-loop-guard-unsafe",
+            &request.request_id,
+            AttemptStatus::Succeeded,
+            2,
+            1_020,
+        )
+    };
+
+    store.record_request(&request).expect("request write");
+    store
+        .record_attempt(&loop_attempt)
+        .expect("loop attempt write");
+    store
+        .record_attempt(&unsafe_attempt)
+        .expect("unsafe attempt write");
+
+    let snapshot = store.metrics_snapshot().expect("metrics snapshot");
+    assert!(snapshot.loop_guard_attempt_counts.iter().any(|row| {
+        row.loop_detected == "true"
+            && row.detector_class == "line"
+            && row.ladder_rung == "max-thinking"
+            && row.salvage_used == "false"
+            && row.thinking_budget == "32768"
+            && row.max_tokens == "50000"
+            && row.count == 1
+    }));
+    assert!(snapshot.loop_guard_attempt_counts.iter().any(|row| {
+        row.loop_detected == "false"
+            && row.detector_class == "none"
+            && row.ladder_rung == "other"
+            && row.salvage_used == "false"
+            && row.thinking_budget == "unknown"
+            && row.max_tokens == "unknown"
+            && row.count == 1
+    }));
+    assert!(snapshot.loop_guard_attempt_counts.iter().all(|row| {
+        !row.ladder_rung.contains("private")
+            && !row.detector_class.contains("private")
+            && !row.thinking_budget.contains("number")
+            && !row.max_tokens.contains("number")
+    }));
+    assert_metrics_cache_matches_sql(&store);
+}
+
+#[test]
 fn metrics_snapshot_does_not_wait_for_sqlite_connection_lock() {
     let fixture = StoreFixture::new("metrics-independent-connection-lock");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);

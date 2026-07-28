@@ -4,14 +4,16 @@ use llm_guard_proxy_core::HeartbeatMode;
 
 use super::model::{
     AttemptMetricCount, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram,
-    ObservabilityMetricsSnapshot, RequestMetricCount, RequestTerminalMetricCount,
-    RetentionPruningStats, RetentionUsage, UpstreamErrorMetricCount,
+    LoopGuardAttemptMetricCount, ObservabilityMetricsSnapshot, RequestMetricCount,
+    RequestTerminalMetricCount, RetentionPruningStats, RetentionUsage, UpstreamErrorMetricCount,
 };
 
 const HISTOGRAM_BUCKETS_MS: &[u64] = &[
     10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
 ];
 const OTHER_HEARTBEAT_MODE: &str = "other";
+
+pub(super) type LoopGuardAttemptMetricKey = (String, String, String, String, String, String);
 
 #[derive(Clone, Debug)]
 pub(super) struct RequestMetricObservation {
@@ -65,6 +67,7 @@ pub(super) struct AttemptMetricObservation {
     retried: bool,
     loop_aborted: bool,
     upstream_error_key: Option<(String, String)>,
+    loop_guard_key: Option<LoopGuardAttemptMetricKey>,
     first_token_latency_ms: Option<u64>,
 }
 
@@ -99,6 +102,7 @@ impl AttemptMetricObservation {
             loop_aborted: input.abort_reason == Some("loop_guard")
                 || sqlite_like_loop_detected_true(input.response_metadata_json),
             upstream_error_key,
+            loop_guard_key: loop_guard_attempt_metric_key(input.response_metadata_json),
             first_token_latency_ms: metadata_value(
                 input.response_metadata_json,
                 "first_token_latency_ms",
@@ -113,6 +117,7 @@ pub(super) struct MetricsAccumulator {
     request_counts: BTreeMap<(String, String, String, String), u64>,
     request_terminal_counts: BTreeMap<(String, String, String), u64>,
     attempt_counts: BTreeMap<(String, String, String), u64>,
+    loop_guard_attempt_counts: BTreeMap<LoopGuardAttemptMetricKey, u64>,
     retry_count: u64,
     loop_abort_count: u64,
     upstream_error_counts: BTreeMap<(String, String), u64>,
@@ -129,6 +134,7 @@ impl MetricsAccumulator {
             request_counts: BTreeMap::new(),
             request_terminal_counts: BTreeMap::new(),
             attempt_counts: BTreeMap::new(),
+            loop_guard_attempt_counts: BTreeMap::new(),
             retry_count: 0,
             loop_abort_count: 0,
             upstream_error_counts: BTreeMap::new(),
@@ -182,6 +188,9 @@ impl MetricsAccumulator {
         if let Some(key) = &observation.upstream_error_key {
             increment(&mut self.upstream_error_counts, key.clone());
         }
+        if let Some(key) = &observation.loop_guard_key {
+            increment(&mut self.loop_guard_attempt_counts, key.clone());
+        }
         if let Some(latency_ms) = observation.first_token_latency_ms {
             self.first_token_latency_ms.add(latency_ms);
         }
@@ -197,6 +206,9 @@ impl MetricsAccumulator {
         }
         if let Some(key) = &observation.upstream_error_key {
             decrement(&mut self.upstream_error_counts, key);
+        }
+        if let Some(key) = &observation.loop_guard_key {
+            decrement(&mut self.loop_guard_attempt_counts, key);
         }
         if let Some(latency_ms) = observation.first_token_latency_ms {
             self.first_token_latency_ms.remove(latency_ms);
@@ -253,6 +265,31 @@ impl MetricsAccumulator {
                     },
                 )
                 .collect(),
+            loop_guard_attempt_counts: self
+                .loop_guard_attempt_counts
+                .iter()
+                .map(
+                    |(
+                        (
+                            loop_detected,
+                            detector_class,
+                            ladder_rung,
+                            salvage_used,
+                            thinking_budget,
+                            max_tokens,
+                        ),
+                        count,
+                    )| LoopGuardAttemptMetricCount {
+                        loop_detected: loop_detected.clone(),
+                        detector_class: detector_class.clone(),
+                        ladder_rung: ladder_rung.clone(),
+                        salvage_used: salvage_used.clone(),
+                        thinking_budget: thinking_budget.clone(),
+                        max_tokens: max_tokens.clone(),
+                        count: *count,
+                    },
+                )
+                .collect(),
             retry_count: self.retry_count,
             loop_abort_count: self.loop_abort_count,
             upstream_error_counts: self
@@ -286,6 +323,7 @@ impl MetricsAccumulator {
         self.request_counts.len()
             + self.request_terminal_counts.len()
             + self.attempt_counts.len()
+            + self.loop_guard_attempt_counts.len()
             + self.upstream_error_counts.len()
             + self.heartbeat_mode_counts.len()
             + HISTOGRAM_BUCKETS_MS.len() * 2
@@ -401,6 +439,62 @@ fn request_terminal_reason(status: &str, abort_reason: Option<&str>) -> String {
 fn metadata_value(metadata_json: &str, key: &str) -> Option<String> {
     let value = serde_json::from_str::<serde_json::Value>(metadata_json).ok()?;
     value.as_object()?.get(key)?.as_str().map(ToOwned::to_owned)
+}
+
+pub(super) fn loop_guard_attempt_metric_key(
+    metadata_json: &str,
+) -> Option<LoopGuardAttemptMetricKey> {
+    let metadata = serde_json::from_str::<serde_json::Value>(metadata_json).ok()?;
+    let metadata = metadata.as_object()?;
+    let value = |key| metadata.get(key).and_then(serde_json::Value::as_str);
+    let ladder_rung = value("ladder_rung")?;
+    Some((
+        bool_metric_label(value("loop_detected")),
+        detector_class_metric_label(value("loop_detector_class")),
+        ladder_rung_metric_label(ladder_rung),
+        bool_metric_label(value("salvage_used")),
+        numeric_metric_label(value("thinking_budget")),
+        numeric_metric_label(value("max_tokens")),
+    ))
+}
+
+fn bool_metric_label(value: Option<&str>) -> String {
+    if value.is_some_and(|value| value.eq_ignore_ascii_case("true")) {
+        String::from("true")
+    } else {
+        String::from("false")
+    }
+}
+
+fn detector_class_metric_label(value: Option<&str>) -> String {
+    match value {
+        Some("line") => String::from("line"),
+        Some("token") => String::from("token"),
+        Some("semantic") => String::from("semantic"),
+        Some("embedding") => String::from("embedding"),
+        _ => String::from("none"),
+    }
+}
+
+fn ladder_rung_metric_label(value: &str) -> String {
+    let safe = !value.is_empty()
+        && value.len() <= 64
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        });
+    if safe {
+        value.to_owned()
+    } else {
+        String::from("other")
+    }
+}
+
+fn numeric_metric_label(value: Option<&str>) -> String {
+    match value {
+        Some("unset") => String::from("unset"),
+        Some(value) if value.parse::<u64>().is_ok() => value.to_owned(),
+        _ => String::from("unknown"),
+    }
 }
 
 pub(super) fn normalized_heartbeat_mode_label(value: &str) -> String {

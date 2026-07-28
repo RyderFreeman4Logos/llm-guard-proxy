@@ -16,9 +16,12 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 #[cfg(test)]
+use super::metrics_accumulator::{LoopGuardAttemptMetricKey, loop_guard_attempt_metric_key};
+#[cfg(test)]
 use super::model::{
     AttemptMetricCount, HeartbeatModeMetricCount, HistogramBucket, LatencyHistogram,
-    RequestMetricCount, RequestTerminalMetricCount, UpstreamErrorMetricCount,
+    LoopGuardAttemptMetricCount, RequestMetricCount, RequestTerminalMetricCount,
+    UpstreamErrorMetricCount,
 };
 use super::{
     error::ObservabilityError,
@@ -1402,6 +1405,7 @@ fn read_metrics_snapshot(
         request_counts: read_request_metric_counts(connection)?,
         request_terminal_counts: read_request_terminal_metric_counts(connection)?,
         attempt_counts: read_attempt_metric_counts(connection)?,
+        loop_guard_attempt_counts: read_loop_guard_attempt_metric_counts(connection)?,
         retry_count: read_retry_count(connection)?,
         loop_abort_count: read_loop_abort_count(connection)?,
         upstream_error_counts: read_upstream_error_counts(connection)?,
@@ -1607,6 +1611,59 @@ ORDER BY status, upstream_mode, http_status
                 status,
                 upstream_mode,
                 http_status_class,
+                count,
+            },
+        )
+        .collect())
+}
+
+#[cfg(test)]
+fn read_loop_guard_attempt_metric_counts(
+    connection: &Connection,
+) -> Result<Vec<LoopGuardAttemptMetricCount>, ObservabilityError> {
+    let mut statement = connection
+        .prepare("SELECT response_metadata_json FROM attempts")
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "prepare loop guard attempt metric counts query",
+            source,
+        })?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "query loop guard attempt metric counts",
+            source,
+        })?;
+    let mut counts: BTreeMap<LoopGuardAttemptMetricKey, u64> = BTreeMap::new();
+    for metadata_json in rows {
+        let metadata_json = metadata_json.map_err(|source| ObservabilityError::Sqlite {
+            action: "decode loop guard attempt response metadata",
+            source,
+        })?;
+        if let Some(key) = loop_guard_attempt_metric_key(&metadata_json) {
+            let count = counts.entry(key).or_default();
+            *count = count.saturating_add(1);
+        }
+    }
+    Ok(counts
+        .into_iter()
+        .map(
+            |(
+                (
+                    loop_detected,
+                    detector_class,
+                    ladder_rung,
+                    salvage_used,
+                    thinking_budget,
+                    max_tokens,
+                ),
+                count,
+            )| LoopGuardAttemptMetricCount {
+                loop_detected,
+                detector_class,
+                ladder_rung,
+                salvage_used,
+                thinking_budget,
+                max_tokens,
                 count,
             },
         )
