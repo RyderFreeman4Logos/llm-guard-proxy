@@ -63,7 +63,7 @@ pub(super) fn filter_models_body_by_id(
     serde_json::to_vec(&value).map_or(body, Bytes::from)
 }
 
-/// Injects each missing `match_models` alias with metadata from its profile's first model.
+/// Injects each missing `match_models` alias with metadata from its configured upstream model.
 ///
 /// This runs before listener filtering so aliases selected by the listener remain discoverable.
 pub(super) fn append_match_model_aliases(profiles: &[UpstreamProfileConfig], body: Bytes) -> Bytes {
@@ -87,11 +87,7 @@ fn append_match_model_alias_records(
     profile: &UpstreamProfileConfig,
     models: &mut Vec<Value>,
 ) -> bool {
-    let Some(template) = models
-        .iter()
-        .find(|model| model.get("id").and_then(Value::as_str).is_some())
-        .cloned()
-    else {
+    let Some(template) = match_model_alias_template(profile, models).cloned() else {
         return false;
     };
     let mut seen = models
@@ -109,6 +105,28 @@ fn append_match_model_alias_records(
         }
     }
     changed
+}
+
+/// Selects the template model record for alias synthesis.
+///
+/// When `upstream_model` is configured (`Some(id)`), only an exact match is
+/// accepted — if the configured target is missing from the upstream `/v1/models`
+/// response, no aliases are synthesized to avoid copying unrelated metadata.
+/// When `upstream_model` is absent (`None`), the first record with an `id` is
+/// used as a best-effort fallback, preserving prior behavior for configurations
+/// that only specify `match_models`.
+fn match_model_alias_template<'models>(
+    profile: &UpstreamProfileConfig,
+    models: &'models [Value],
+) -> Option<&'models Value> {
+    match profile.upstream_model.as_deref() {
+        Some(upstream_model) => models
+            .iter()
+            .find(|model| model.get("id").and_then(Value::as_str) == Some(upstream_model)),
+        None => models
+            .iter()
+            .find(|model| model.get("id").and_then(Value::as_str).is_some()),
+    }
 }
 
 fn match_model_alias_record(
