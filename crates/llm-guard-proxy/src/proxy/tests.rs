@@ -33,6 +33,8 @@ use tokio::{
 
 use super::*;
 
+#[path = "tests/constraint_repair.rs"]
+mod constraint_repair;
 #[path = "tests/cot_salvage_issue_211.rs"]
 mod cot_salvage_issue_211;
 #[path = "tests/listener_profile_policy.rs"]
@@ -20676,6 +20678,9 @@ fn fake_streaming_chat_completion_response(
     if path_and_query.contains("test=watchdog-tool-call-only") {
         return Some(repeated_tool_fingerprint_sse_response());
     }
+    if let Some(response) = fake_constraint_repair_chat_completion_response(path_and_query, body) {
+        return Some(response);
+    }
     if let Some(response) =
         fake_compat_and_loop_once_chat_completion_response(path_and_query, state, body)
     {
@@ -20720,6 +20725,42 @@ fn fake_streaming_chat_completion_response(
         return Some(response);
     }
     None
+}
+
+fn fake_constraint_repair_chat_completion_response(
+    path_and_query: &str,
+    body: &Bytes,
+) -> Option<Response<Body>> {
+    let (label, content) = if path_and_query.contains("test=constraint-repair-acrostic-valid") {
+        (
+            "constraint-repair-acrostic-valid",
+            "Storm thunder shakes distant cedars\nTrees bend beneath silver rain\nOceans roar over dark cliffs\nRavens wheel above wet fields\nMist blankets silent village paths",
+        )
+    } else if path_and_query.contains("test=constraint-repair-acrostic") {
+        (
+            "constraint-repair-acrostic",
+            if body_contains_text(body, "llm-guard-proxy constraint-repair retry hint") {
+                "Storm thunder shakes distant cedars\nTrees bend beneath silver rain\nOceans roar over dark cliffs\nRavens wheel above wet fields\nMist blankets silent village paths"
+            } else {
+                "Quiet rain crosses the street;\nAll trees wait"
+            },
+        )
+    } else if path_and_query.contains("test=constraint-repair-lipogram") {
+        (
+            "constraint-repair-lipogram",
+            if body_contains_text(body, "llm-guard-proxy constraint-repair retry hint") {
+                "Never moon amid fog\nNever dim moon afloat\nNever calm moon hum\nNever moon on rim\nNever mild moon aglow\nNever moon in air"
+            } else {
+                "Never stars shine\nNever moon rises\nNever stars gleam\nNever skies glow\nNever night sings\nNever dreams drift"
+            },
+        )
+    } else {
+        return None;
+    };
+    Some(delta_vec_sse_response(
+        label,
+        vec![serde_json::json!({"content": content})],
+    ))
 }
 
 fn fake_loop_three_then_slow_success_response(

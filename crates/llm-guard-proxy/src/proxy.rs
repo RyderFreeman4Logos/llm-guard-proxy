@@ -80,6 +80,7 @@ use crate::{workflow_execution::WorkflowExecutionLease, workflow_runtime::Workfl
 mod buffered_adapter;
 mod deepinfra_rerank_adapter;
 mod model_metadata;
+mod prose_constraints;
 mod recovery;
 mod reranker_protocol;
 mod score_adapter;
@@ -6796,10 +6797,15 @@ impl ShieldedRetryPolicy {
         attempt_number: u32,
         upstream_profile: &UpstreamProfileConfig,
         cot_salvage: Option<&CotSalvageContext>,
+        constraint_repair: bool,
         force_disable_after_salvage_loop: bool,
     ) -> ShieldedAttemptPlan {
         let fallback_thinking = &upstream_profile.thinking;
-        let index = attempt_number.saturating_sub(1);
+        let index = if constraint_repair {
+            0
+        } else {
+            attempt_number.saturating_sub(1)
+        };
         let mut plan = self
             .ladder
             .get(usize::try_from(index).unwrap_or(usize::MAX))
@@ -8428,6 +8434,7 @@ enum HotRestartResult {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShieldedRetryCause {
+    ConstraintViolation,
     LoopDetected,
     TransientUpstreamStatus,
     TransientTransport,
@@ -8438,6 +8445,7 @@ enum ShieldedRetryCause {
 impl ShieldedRetryCause {
     const fn retry_reason(self) -> &'static str {
         match self {
+            Self::ConstraintViolation => "constraint_violation",
             Self::LoopDetected => "loop_detected",
             Self::TransientUpstreamStatus => "transient_upstream_status",
             Self::TransientTransport => "transient_upstream_transport",
@@ -8448,6 +8456,7 @@ impl ShieldedRetryCause {
 
     const fn next_attempt_reason(self) -> &'static str {
         match self {
+            Self::ConstraintViolation => "previous_constraint_violation",
             Self::LoopDetected => "previous_loop_detected",
             Self::TransientUpstreamStatus => "previous_transient_upstream_status",
             Self::TransientTransport => "previous_transient_upstream_transport",
@@ -9332,12 +9341,14 @@ impl ShieldedRetryRuntime {
         &self,
         attempt_number: u32,
         cot_salvage: Option<&CotSalvageContext>,
+        constraint_repair: Option<&prose_constraints::ConstraintRepair>,
         force_disable_after_salvage_loop: bool,
     ) -> ShieldedAttemptPlan {
         self.retry_policy.attempt_plan(
             attempt_number,
             &self.upstream_profile,
             cot_salvage,
+            constraint_repair.is_some(),
             force_disable_after_salvage_loop,
         )
     }
@@ -9545,6 +9556,7 @@ struct ShieldedAttemptFailure {
     error_type: &'static str,
     error_message: String,
     retry_cause: Option<ShieldedRetryCause>,
+    constraint_repair: Option<prose_constraints::ConstraintRepair>,
     abort_reason: Option<String>,
     request_metadata: BTreeMap<String, String>,
     response_metadata: BTreeMap<String, String>,
@@ -9574,6 +9586,13 @@ impl CotSalvageContext {
         self.pre_loop_bytes_available
             .saturating_sub(self.retained_pre_loop_bytes())
     }
+}
+
+#[derive(Clone, Copy)]
+struct ShieldedAttemptSalvage<'a> {
+    cot_salvage: Option<&'a CotSalvageContext>,
+    constraint_repair: Option<&'a prose_constraints::ConstraintRepair>,
+    force_disable_after_salvage_loop: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -9679,13 +9698,13 @@ fn shielded_liveness_stream_response(
     );
     let aggregate_runtime = runtime.clone();
     let aggregate = Box::pin(async move {
-        match run_shielded_attempts(
+        match Box::pin(run_shielded_attempts(
             aggregate_runtime,
             Some(started),
             prior_attempt_records,
             false,
             Some(attempt_progress),
-        )
+        ))
         .await
         {
             ShieldedRunOutcome::Accepted(outcome) => {
@@ -9734,7 +9753,15 @@ async fn immediate_shielded_retry_response(
     runtime: &ShieldedRetryRuntime,
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
-    match run_shielded_attempts(runtime.clone(), None, Vec::new(), true, None).await {
+    match Box::pin(run_shielded_attempts(
+        runtime.clone(),
+        None,
+        Vec::new(),
+        true,
+        None,
+    ))
+    .await
+    {
         ShieldedRunOutcome::Accepted(outcome) => {
             shielded_retry_success_response(runtime, outcome, in_flight_permit)
         }
@@ -10039,8 +10066,11 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
             attempt_number,
             retry_cause,
             wire_mode,
-            None,
-            false,
+            ShieldedAttemptSalvage {
+                cot_salvage: None,
+                constraint_repair: None,
+                force_disable_after_salvage_loop: false,
+            },
             ignores_request_deadline,
         )
         .await
@@ -10130,17 +10160,24 @@ async fn aggregate_shielded_attempt(
         result = aggregate => result,
     };
     match result {
-        Ok(aggregated) => Ok(ShieldedAggregatedAttempt {
-            final_attempt: started.info.into_final_context(
-                aggregated.response_metadata.clone(),
-                aggregated.raw_payloads.clone(),
-                aggregated.body.clone(),
-                aggregated.sse_body.clone(),
-            ),
-            body: aggregated.body,
-            sse_body: aggregated.sse_body,
-            response_metadata: aggregated.response_metadata,
-        }),
+        Ok(aggregated) => {
+            if let Some(repair) =
+                constraint_repair_for_aggregated_response(runtime, &started.info, &aggregated.body)
+            {
+                return Err(constraint_validation_failure(&started.info, repair));
+            }
+            Ok(ShieldedAggregatedAttempt {
+                final_attempt: started.info.into_final_context(
+                    aggregated.response_metadata.clone(),
+                    aggregated.raw_payloads.clone(),
+                    aggregated.body.clone(),
+                    aggregated.sse_body.clone(),
+                ),
+                body: aggregated.body,
+                sse_body: aggregated.sse_body,
+                response_metadata: aggregated.response_metadata,
+            })
+        }
         Err(error) => Err(aggregation_failure(&started.info, &error)),
     }
 }
@@ -10180,6 +10217,9 @@ async fn aggregate_native_json_shielded_attempt(
             "native JSON fallback returned an invalid non-stream chat completion",
         ));
     }
+    if let Some(repair) = constraint_repair_for_aggregated_response(runtime, &info, &body) {
+        return Err(constraint_validation_failure(&info, repair));
+    }
     let response_metadata = BTreeMap::from([(
         String::from("native_json_fallback_response_validated"),
         String::from("true"),
@@ -10197,6 +10237,19 @@ async fn aggregate_native_json_shielded_attempt(
     })
 }
 
+fn constraint_repair_for_aggregated_response(
+    runtime: &ShieldedRetryRuntime,
+    info: &ShieldedAttemptInfo,
+    body: &Bytes,
+) -> Option<prose_constraints::ConstraintRepair> {
+    if runtime.request_deadline.is_exhausted()
+        || !runtime.retry_policy.allows_retry_after(info.attempt_number)
+    {
+        return None;
+    }
+    prose_constraints::repair_context_for_response(&runtime.downstream_body, body)
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_shielded_attempts(
     mut runtime: ShieldedRetryRuntime,
@@ -10212,6 +10265,7 @@ async fn run_shielded_attempts(
     let mut retry_cause = None;
     let mut next_wire_mode = ShieldedUpstreamWireMode::ShieldedSse;
     let mut cot_salvage = None;
+    let mut constraint_repair = None;
     let mut cot_salvage_attempted = false;
     let mut first_attempt_cot_salvage = None;
     let mut force_disable_after_salvage_loop = false;
@@ -10232,8 +10286,11 @@ async fn run_shielded_attempts(
                 attempt_number,
                 retry_cause,
                 next_wire_mode,
-                cot_salvage.as_ref(),
-                force_disable_after_salvage_loop,
+                ShieldedAttemptSalvage {
+                    cot_salvage: cot_salvage.as_ref(),
+                    constraint_repair: constraint_repair.as_ref(),
+                    force_disable_after_salvage_loop,
+                },
                 ignores_request_deadline,
             )
             .await
@@ -10251,6 +10308,7 @@ async fn run_shielded_attempts(
                             retry_cause = next_retry_cause;
                             next_wire_mode = retry_wire_mode;
                             cot_salvage = None;
+                            constraint_repair = None;
                             force_disable_after_salvage_loop = false;
                             continue;
                         }
@@ -10287,6 +10345,7 @@ async fn run_shielded_attempts(
                 retry_cause = next_retry_cause;
                 next_wire_mode = ShieldedUpstreamWireMode::ShieldedSse;
                 cot_salvage = None;
+                constraint_repair = None;
                 continue;
             }
             ShieldedAttemptStep::Failed(outcome) => return ShieldedRunOutcome::Failed(outcome),
@@ -10353,16 +10412,19 @@ async fn run_shielded_attempts(
                         .response_metadata
                         .extend(local_recovery_gate.metadata);
                 }
-                let next_cot_salvage =
-                    if can_retry && cot_salvage.is_none() && !cot_salvage_attempted {
-                        cot_salvage_context_for_failure(
-                            &runtime,
-                            &failure,
-                            first_attempt_cot_salvage.as_ref(),
-                        )
-                    } else {
-                        None
-                    };
+                let next_cot_salvage = if can_retry
+                    && failure.constraint_repair.is_none()
+                    && cot_salvage.is_none()
+                    && !cot_salvage_attempted
+                {
+                    cot_salvage_context_for_failure(
+                        &runtime,
+                        &failure,
+                        first_attempt_cot_salvage.as_ref(),
+                    )
+                } else {
+                    None
+                };
                 let recovery_gate = recovery_gate_for_retryable_upstream_stall(
                     &runtime,
                     can_retry,
@@ -10382,6 +10444,11 @@ async fn run_shielded_attempts(
                     can_retry = false;
                 }
                 failure.response_metadata.extend(recovery_gate.metadata);
+                let next_constraint_repair = if can_retry {
+                    failure.constraint_repair.clone()
+                } else {
+                    None
+                };
                 let native_json_fallback_eligible =
                     native_json_fallback_eligible(&runtime, &failure, can_retry);
                 failure.response_metadata.insert(
@@ -10405,12 +10472,18 @@ async fn run_shielded_attempts(
                     } else {
                         ShieldedUpstreamWireMode::ShieldedSse
                     };
-                    if next_cot_salvage.is_some() {
-                        cot_salvage_attempted = true;
+                    if next_constraint_repair.is_some() {
+                        cot_salvage = None;
+                        force_disable_after_salvage_loop = false;
+                    } else {
+                        if next_cot_salvage.is_some() {
+                            cot_salvage_attempted = true;
+                        }
+                        force_disable_after_salvage_loop = cot_salvage.is_some()
+                            && next_retry_cause == Some(ShieldedRetryCause::LoopDetected);
+                        cot_salvage = next_cot_salvage;
                     }
-                    force_disable_after_salvage_loop = cot_salvage.is_some()
-                        && next_retry_cause == Some(ShieldedRetryCause::LoopDetected);
-                    cot_salvage = next_cot_salvage;
+                    constraint_repair = next_constraint_repair;
                     continue;
                 }
                 return ShieldedRunOutcome::Failed(shielded_failure_outcome(
@@ -12010,24 +12083,30 @@ async fn start_shielded_attempt(
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
     wire_mode: ShieldedUpstreamWireMode,
-    cot_salvage: Option<&CotSalvageContext>,
-    force_disable_after_salvage_loop: bool,
+    salvage: ShieldedAttemptSalvage<'_>,
     ignores_request_deadline: bool,
 ) -> Result<ShieldedStartedAttempt, ShieldedAttemptFailure> {
     let attempt_id = AttemptId::for_request(&runtime.request_id, attempt_number);
     let attempt_started_at_unix_ms = unix_time_millis();
-    let plan = runtime.plan(
+    let attempt_plan = runtime.plan(
         attempt_number,
-        cot_salvage,
-        force_disable_after_salvage_loop,
+        salvage.cot_salvage,
+        salvage.constraint_repair,
+        salvage.force_disable_after_salvage_loop,
     );
-    let (upstream_body, anti_loop_hint_applied, attempt_thinking_metadata) = shielded_attempt_body(
+    let (
+        upstream_body,
+        anti_loop_hint_applied,
+        constraint_repair_hint_applied,
+        attempt_thinking_metadata,
+    ) = shielded_attempt_body(
         runtime,
         attempt_number,
         retry_cause,
         wire_mode,
-        &plan,
-        cot_salvage,
+        &attempt_plan,
+        salvage.cot_salvage,
+        salvage.constraint_repair,
     );
     let request_metadata = shielded_attempt_request_metadata(
         runtime,
@@ -12035,8 +12114,10 @@ async fn start_shielded_attempt(
         retry_cause,
         wire_mode,
         anti_loop_hint_applied,
-        &plan,
-        cot_salvage,
+        constraint_repair_hint_applied,
+        &attempt_plan,
+        salvage.cot_salvage,
+        salvage.constraint_repair,
         &attempt_thinking_metadata,
     );
     let rendered = render_shielded_endpoint_body(runtime, &upstream_body).map_err(|error| {
@@ -12386,6 +12467,7 @@ fn shielded_start_transport_failure(
         error_type,
         error_message,
         retry_cause,
+        constraint_repair: None,
         abort_reason,
         request_metadata,
         response_metadata,
@@ -12438,7 +12520,8 @@ fn shielded_attempt_body(
     wire_mode: ShieldedUpstreamWireMode,
     attempt_plan: &ShieldedAttemptPlan,
     cot_salvage: Option<&CotSalvageContext>,
-) -> (Bytes, bool, BTreeMap<String, String>) {
+    constraint_repair: Option<&prose_constraints::ConstraintRepair>,
+) -> (Bytes, bool, bool, BTreeMap<String, String>) {
     let prepared_request = match runtime.chat_kind {
         ShieldedChatKind::NonStream => match wire_mode {
             ShieldedUpstreamWireMode::ShieldedSse => shielded_chat::prepare_non_stream_request(
@@ -12473,6 +12556,24 @@ fn shielded_attempt_body(
         None => prepared_body,
     };
 
+    if let Some(constraint_repair) = constraint_repair {
+        let retry_hint =
+            constraint_repair.retry_hint(attempt_number, runtime.retry_policy.max_attempts);
+        if let Some(body) = shielded_chat::body_with_anti_loop_retry_hint(
+            &prepared_body,
+            attempt_number,
+            runtime.retry_policy.max_attempts,
+            Some(&retry_hint),
+        ) {
+            let body = apply_shielded_param_override_to_body_or_original(
+                body,
+                &runtime.upstream_profile,
+                &mut thinking_metadata,
+            );
+            return (body, false, true, thinking_metadata);
+        }
+    }
+
     if let Some(cot_salvage) = cot_salvage
         && let Some(body) = shielded_chat::body_with_cot_salvage_retry_hint(
             &prepared_body,
@@ -12488,7 +12589,7 @@ fn shielded_attempt_body(
             &runtime.upstream_profile,
             &mut thinking_metadata,
         );
-        return (body, true, thinking_metadata);
+        return (body, true, false, thinking_metadata);
     }
 
     let (prepared_body, anti_loop_hint_applied) = if attempt_number > 1
@@ -12513,7 +12614,12 @@ fn shielded_attempt_body(
         &runtime.upstream_profile,
         &mut thinking_metadata,
     );
-    (prepared_body, anti_loop_hint_applied, thinking_metadata)
+    (
+        prepared_body,
+        anti_loop_hint_applied,
+        false,
+        thinking_metadata,
+    )
 }
 
 #[cfg(feature = "param-override")]
@@ -12551,8 +12657,10 @@ fn shielded_attempt_request_metadata(
     retry_cause: Option<ShieldedRetryCause>,
     wire_mode: ShieldedUpstreamWireMode,
     anti_loop_hint_applied: bool,
+    constraint_repair_hint_applied: bool,
     attempt_plan: &ShieldedAttemptPlan,
     cot_salvage: Option<&CotSalvageContext>,
+    constraint_repair: Option<&prose_constraints::ConstraintRepair>,
     thinking_metadata: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut metadata = attempt_request_metadata(
@@ -12581,6 +12689,11 @@ fn shielded_attempt_request_metadata(
         anti_loop_hint_applied,
         attempt_plan,
         cot_salvage,
+    );
+    add_constraint_repair_attempt_metadata(
+        &mut metadata,
+        constraint_repair,
+        constraint_repair_hint_applied,
     );
     add_shielded_wire_metadata(&mut metadata, runtime, attempt_number, wire_mode);
     metadata
@@ -12701,6 +12814,26 @@ fn add_retry_attempt_metadata(
     );
     metadata.insert(String::from("max_tokens"), max_tokens);
     add_cot_salvage_request_metadata(metadata, cot_salvage, &attempt_plan.thinking);
+}
+
+fn add_constraint_repair_attempt_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    constraint_repair: Option<&prose_constraints::ConstraintRepair>,
+    constraint_repair_hint_applied: bool,
+) {
+    let constraint_repair_used = constraint_repair.is_some();
+    metadata.insert(
+        String::from("constraint_repair_used"),
+        constraint_repair_used.to_string(),
+    );
+    metadata.insert(
+        String::from("constraint_repair_hint_applied"),
+        constraint_repair_hint_applied.to_string(),
+    );
+    metadata.insert(
+        String::from("constraint_repair_ladder_restart"),
+        constraint_repair_used.to_string(),
+    );
 }
 
 fn add_cot_salvage_request_metadata(
@@ -12864,6 +12997,7 @@ fn aggregation_failure(
         error_type: "upstream_body_error",
         error_message: error.to_string(),
         retry_cause,
+        constraint_repair: None,
         abort_reason: match retry_cause {
             Some(ShieldedRetryCause::LoopDetected) => Some(String::from("loop_guard")),
             Some(ShieldedRetryCause::UpstreamStall) => Some(String::from("upstream_stall")),
@@ -12875,6 +13009,33 @@ fn aggregation_failure(
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
     }
+}
+
+fn constraint_validation_failure(
+    info: &ShieldedAttemptInfo,
+    repair: prose_constraints::ConstraintRepair,
+) -> ShieldedAttemptFailure {
+    let feedback_count = repair.feedback_count();
+    let mut failure = status_failure_without_retry(
+        info,
+        "upstream response violated a mechanically verifiable prose constraint",
+    );
+    failure.error_type = "constraint_validation_failed";
+    failure.retry_cause = Some(ShieldedRetryCause::ConstraintViolation);
+    failure.constraint_repair = Some(repair);
+    failure.response_metadata.insert(
+        String::from("error_type"),
+        String::from("constraint_validation_failed"),
+    );
+    failure.response_metadata.insert(
+        String::from("constraint_validation_failed"),
+        String::from("true"),
+    );
+    failure.response_metadata.insert(
+        String::from("constraint_repair_feedback_count"),
+        feedback_count.to_string(),
+    );
+    failure
 }
 
 fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAttemptFailure {
@@ -12907,6 +13068,7 @@ fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAtte
         error_type: PROXY_SHUTTING_DOWN_ERROR_TYPE,
         error_message: String::from("proxy is shutting down"),
         retry_cause: None,
+        constraint_repair: None,
         abort_reason: Some(SERVER_SHUTDOWN_ABORT_REASON.to_owned()),
         request_metadata: info.request_metadata.clone(),
         response_metadata,
@@ -12953,6 +13115,7 @@ fn request_deadline_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> Shie
         error_type: REQUEST_DEADLINE_ERROR_TYPE,
         error_message: String::from("shielded request deadline exhausted"),
         retry_cause: None,
+        constraint_repair: None,
         abort_reason: Some(REQUEST_DEADLINE_ABORT_REASON.to_owned()),
         request_metadata: info.request_metadata.clone(),
         response_metadata,
@@ -13134,6 +13297,7 @@ fn status_failure(
         error_type: "upstream_status_error",
         error_message: format!("{message}: HTTP {}", info.upstream_status.as_u16()),
         retry_cause: Some(cause),
+        constraint_repair: None,
         abort_reason: None,
         request_metadata: info.request_metadata.clone(),
         response_metadata,
@@ -13176,6 +13340,7 @@ fn status_failure_without_retry(
         error_type: "upstream_body_error",
         error_message: message.to_owned(),
         retry_cause: None,
+        constraint_repair: None,
         abort_reason: None,
         request_metadata: info.request_metadata.clone(),
         response_metadata,
@@ -13280,6 +13445,9 @@ fn copy_attempt_request_metadata(
         "retry_request_deadline_ms",
         "retry_previous_reason",
         "retry_anti_loop_hint_applied",
+        "constraint_repair_used",
+        "constraint_repair_hint_applied",
+        "constraint_repair_ladder_restart",
         "retry_shielded_streaming_enabled",
         "loop_failure_policy",
         "downstream_drop_policy",
