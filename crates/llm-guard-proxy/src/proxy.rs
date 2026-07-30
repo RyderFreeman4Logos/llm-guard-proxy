@@ -9842,6 +9842,7 @@ async fn shielded_start_failure_step(
         let local_recovery_gate =
             local_recovery_gate_for_attempt_failure(runtime, can_retry, &failure).await;
         if local_recovery_gate.applied {
+            // Successful recovery re-opens retry even when the ladder said no.
             can_retry = local_recovery_gate.permits_deadline_replay
                 || (can_retry && local_recovery_gate.permits_retry);
             failure
@@ -10416,6 +10417,7 @@ async fn run_shielded_attempts(
                 let mut can_retry = should_retry_after_shielded_failure(&runtime, &failure);
                 let local_recovery_gate =
                     local_recovery_gate_for_attempt_failure(&runtime, can_retry, &failure).await;
+                let local_recovery_already_applied = local_recovery_gate.applied;
                 if local_recovery_gate.applied {
                     can_retry = local_recovery_gate.permits_deadline_replay
                         || (can_retry && local_recovery_gate.permits_retry);
@@ -10440,6 +10442,7 @@ async fn run_shielded_attempts(
                     &runtime,
                     can_retry,
                     next_retry_cause,
+                    local_recovery_already_applied,
                 )
                 .await;
                 can_retry = can_retry && recovery_gate.permits_retry;
@@ -11050,6 +11053,9 @@ async fn local_recovery_gate_for_attempt_failure(
 }
 
 fn local_recovery_transport_cause(failure: &ShieldedAttemptFailure) -> Option<LocalRecoveryCause> {
+    if failure.sse_failure_kind == Some(shielded_chat::AggregationFailureKind::UpstreamStall) {
+        return Some(LocalRecoveryCause::UpstreamStall);
+    }
     if failure.retry_cause == Some(ShieldedRetryCause::TransientStream) {
         return Some(LocalRecoveryCause::TransientTransport);
     }
@@ -11099,7 +11105,19 @@ async fn local_recovery_gate(
     {
         return unapplied_local_recovery_gate();
     }
-    if (!can_retry && cause != LocalRecoveryCause::RequestDeadline)
+    // Transient upstream failures must still enter local recovery even when the
+    // shielded retry ladder has already exhausted `can_retry`. Otherwise Guard
+    // returns 502 to the client instead of holding for restart/readiness and
+    // replaying (issue #233: hold-and-replay contract).
+    let allow_without_ladder = matches!(
+        cause,
+        LocalRecoveryCause::RequestDeadline
+            | LocalRecoveryCause::TransientTransport
+            | LocalRecoveryCause::TransientStatus
+            | LocalRecoveryCause::UpstreamStall
+            | LocalRecoveryCause::StuckWatchdog
+    );
+    if (!can_retry && !allow_without_ladder)
         || (!runtime.local_recovery_policy.enabled
             && runtime.local_recovery_policy.restart_command.is_empty())
     {
@@ -11142,8 +11160,10 @@ async fn local_recovery_gate(
     let recovery_metadata = run_local_recovery(runtime, cause).await;
     metadata.extend(recovery_metadata);
     let permits_retry = local_recovery_permits_retry(&metadata);
-    let permits_deadline_replay =
-        cause == LocalRecoveryCause::RequestDeadline && local_recovery_completed_ready(&metadata);
+    // Any successful local recovery re-opens a replay attempt, not only the
+    // request-deadline path. Ladder exhaustion must not strand a recovered
+    // upstream with a permanent client 502 (#233).
+    let permits_deadline_replay = local_recovery_completed_ready(&metadata);
     if permits_deadline_replay {
         runtime
             .local_recovery_deadline_replay_permits
@@ -11766,8 +11786,12 @@ async fn recovery_gate_for_retryable_upstream_stall(
     runtime: &ShieldedRetryRuntime,
     can_retry: bool,
     retry_cause: Option<ShieldedRetryCause>,
+    local_recovery_already_applied: bool,
 ) -> UpstreamStallRecoveryGate {
-    if !can_retry || !matches!(retry_cause, Some(ShieldedRetryCause::UpstreamStall)) {
+    if local_recovery_already_applied
+        || !can_retry
+        || !matches!(retry_cause, Some(ShieldedRetryCause::UpstreamStall))
+    {
         return UpstreamStallRecoveryGate {
             metadata: BTreeMap::new(),
             permits_retry: true,

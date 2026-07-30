@@ -7301,7 +7301,7 @@ async fn local_recovery_restart_command() {
 }
 
 #[tokio::test]
-async fn local_recovery_replays_original_request() {
+async fn local_recovery_reopens_ladder_exhausted_stream_replay() {
     let mut fake = FakeUpstream::spawn().await;
     let recovery_root = unique_test_dir("local-recovery-replay");
     fs::create_dir_all(&recovery_root).expect("recovery root should be created");
@@ -7316,7 +7316,7 @@ async fn local_recovery_replays_original_request() {
 mode = "disabled"
 
 [retry]
-max_attempts = 2
+max_attempts = 1
 anti_loop_hint_enabled = false
 
 [upstream.stall]
@@ -8519,7 +8519,7 @@ max_attempts = 5
 }
 
 #[tokio::test]
-async fn shielded_retry_transient_upstream_status_then_success() {
+async fn shielded_retry_reopens_ladder_exhausted_transient_status_after_local_recovery() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -8533,7 +8533,20 @@ mode = "disabled"
 enabled = false
 
 [retry]
-max_attempts = 3
+max_attempts = 1
+anti_loop_hint_enabled = false
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/bin/true"]
+restart_timeout_ms = 1000
+readiness_body = {"model":"test-chat","messages":[],"max_tokens":1}
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 50
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
 "#,
     )
     .await;
@@ -8555,8 +8568,15 @@ max_attempts = 3
         serde_json::from_str(&response.text().await.expect("body should be text"))
             .expect("body should be JSON");
     assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
-    let _first = fake.recv_next().await;
-    let _second = fake.recv_next().await;
+    let first = fake.recv_next().await;
+    let probe = fake.recv_next().await;
+    let replay = fake.recv_next().await;
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=transient-503-then-success"
+    );
+    assert_eq!(probe.path_and_query, "/v1/chat/completions");
+    assert_eq!(replay.path_and_query, first.path_and_query);
     assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
 
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
@@ -8567,7 +8587,85 @@ max_attempts = 3
         Some("transient_upstream_status")
     );
     assert_eq!(attempts[0].response_metadata["status_code"], "503");
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_status"],
+        "succeeded"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_request_attempts_used"],
+        "1"
+    );
     assert_eq!(attempts[1].status, "succeeded");
+}
+
+#[tokio::test]
+async fn local_recovery_does_not_run_for_nonretryable_4xx() {
+    let mut fake = FakeUpstream::spawn().await;
+    let recovery_root = unique_test_dir("local-recovery-4xx");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let recovery_marker = recovery_root.join("recovered");
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 1
+anti_loop_hint_enabled = false
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/touch", "{recovery_marker}"]
+restart_timeout_ms = 1000
+readiness_body = {{"model":"test-chat","messages":[],"max_tokens":1}}
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 50
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+"#,
+            recovery_marker = recovery_marker.display()
+        ),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=bad-request",
+            proxy.base_url
+        ))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[]}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let _body = response.text().await.expect("body should be text");
+    assert!(!recovery_marker.exists());
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/chat/completions?test=bad-request"
+    );
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    assert!(
+        attempts[0]
+            .response_metadata
+            .get("local_recovery_status")
+            .is_none()
+    );
+
+    remove_dir_all(&recovery_root);
 }
 
 #[cfg(feature = "upstream-hot-restart")]
