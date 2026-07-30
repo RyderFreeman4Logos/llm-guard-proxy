@@ -71,7 +71,7 @@ use tokio::{
         Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, futures::OwnedNotified, mpsc,
         oneshot,
     },
-    time::{Instant, Interval, MissedTickBehavior, Sleep, timeout},
+    time::{Instant, Sleep, timeout},
 };
 
 #[cfg(feature = "guard")]
@@ -3421,6 +3421,7 @@ async fn forward_openai_request(
                 local_recovery,
                 local_recovery_attempts: Arc::new(AtomicU64::new(0)),
                 local_recovery_deadline_replay_permits: Arc::new(AtomicU64::new(0)),
+                downstream_commit_signal: DownstreamCommitSignal::default(),
                 #[cfg(feature = "upstream-hot-restart")]
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
@@ -3429,8 +3430,6 @@ async fn forward_openai_request(
                 shadow_evidence: ShadowEvidenceState::default(),
                 malformed_response_counter: state.malformed_response_counter.clone(),
                 upstream_failure_counters: state.upstream_failure_counters.clone(),
-                #[cfg(test)]
-                shielded_heartbeat_ticks: state.shielded_heartbeat_ticks.clone(),
             },
             in_flight_permit,
         ))
@@ -8029,8 +8028,11 @@ async fn run_watchdog_recovery(
             endpoint.client,
             endpoint.base_url,
             watchdog_recovery_cause(),
-            episode_timeout,
-            Some(&recovery_episode_observer),
+            LocalRecoveryRunOptions {
+                episode_timeout,
+                recovery_episode_observer: Some(&recovery_episode_observer),
+                downstream_commit_signal: None,
+            },
         )
         .await
     });
@@ -9324,6 +9326,7 @@ struct ShieldedRetryRuntime {
     local_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     local_recovery_attempts: Arc<AtomicU64>,
     local_recovery_deadline_replay_permits: Arc<AtomicU64>,
+    downstream_commit_signal: DownstreamCommitSignal,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     shadow_attempts: Arc<InFlightLimiter>,
@@ -9332,8 +9335,6 @@ struct ShieldedRetryRuntime {
     shadow_evidence: ShadowEvidenceState,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
-    #[cfg(test)]
-    shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
 
 impl ShieldedRetryRuntime {
@@ -9366,6 +9367,22 @@ impl DownstreamDropSignal {
 
     fn is_dropped(&self) -> bool {
         self.dropped.load(Ordering::SeqCst)
+    }
+}
+
+/// Tracks whether this response has emitted any bytes to the downstream client.
+#[derive(Clone, Debug, Default)]
+struct DownstreamCommitSignal {
+    committed: Arc<AtomicBool>,
+}
+
+impl DownstreamCommitSignal {
+    fn mark_committed(&self) {
+        self.committed.store(true, Ordering::SeqCst);
+    }
+
+    fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::SeqCst)
     }
 }
 
@@ -9730,10 +9747,7 @@ fn shielded_liveness_stream_response(
             ShieldedAcceptedResponseMode::JsonCompletion
         },
         response_model_alias,
-        interval_secs: runtime.liveness.heartbeat_interval_secs,
         upstream_failure_counters: runtime.upstream_failure_counters.clone(),
-        #[cfg(test)]
-        shielded_heartbeat_ticks: runtime.shielded_heartbeat_ticks.clone(),
     };
     let response_body = ShieldedLivenessBody::new(
         aggregate,
@@ -9742,6 +9756,7 @@ fn shielded_liveness_stream_response(
         in_flight_permit,
         runtime.shutdown.subscribe(),
         runtime.downstream_drop_signal.clone(),
+        runtime.downstream_commit_signal.clone(),
     );
     response_with_headers(
         upstream_status,
@@ -9842,6 +9857,7 @@ async fn shielded_start_failure_step(
         let local_recovery_gate =
             local_recovery_gate_for_attempt_failure(runtime, can_retry, &failure).await;
         if local_recovery_gate.applied {
+            // Successful recovery re-opens retry even when the ladder said no.
             can_retry = local_recovery_gate.permits_deadline_replay
                 || (can_retry && local_recovery_gate.permits_retry);
             failure
@@ -10416,6 +10432,7 @@ async fn run_shielded_attempts(
                 let mut can_retry = should_retry_after_shielded_failure(&runtime, &failure);
                 let local_recovery_gate =
                     local_recovery_gate_for_attempt_failure(&runtime, can_retry, &failure).await;
+                let local_recovery_already_applied = local_recovery_gate.applied;
                 if local_recovery_gate.applied {
                     can_retry = local_recovery_gate.permits_deadline_replay
                         || (can_retry && local_recovery_gate.permits_retry);
@@ -10440,6 +10457,7 @@ async fn run_shielded_attempts(
                     &runtime,
                     can_retry,
                     next_retry_cause,
+                    local_recovery_already_applied,
                 )
                 .await;
                 can_retry = can_retry && recovery_gate.permits_retry;
@@ -11050,6 +11068,9 @@ async fn local_recovery_gate_for_attempt_failure(
 }
 
 fn local_recovery_transport_cause(failure: &ShieldedAttemptFailure) -> Option<LocalRecoveryCause> {
+    if failure.sse_failure_kind == Some(shielded_chat::AggregationFailureKind::UpstreamStall) {
+        return Some(LocalRecoveryCause::UpstreamStall);
+    }
     if failure.retry_cause == Some(ShieldedRetryCause::TransientStream) {
         return Some(LocalRecoveryCause::TransientTransport);
     }
@@ -11099,7 +11120,19 @@ async fn local_recovery_gate(
     {
         return unapplied_local_recovery_gate();
     }
-    if (!can_retry && cause != LocalRecoveryCause::RequestDeadline)
+    // Transient upstream failures must still enter local recovery even when the
+    // shielded retry ladder has already exhausted `can_retry`. Otherwise Guard
+    // returns 502 to the client instead of holding for restart/readiness and
+    // replaying (issue #233: hold-and-replay contract).
+    let allow_without_ladder = matches!(
+        cause,
+        LocalRecoveryCause::RequestDeadline
+            | LocalRecoveryCause::TransientTransport
+            | LocalRecoveryCause::TransientStatus
+            | LocalRecoveryCause::UpstreamStall
+            | LocalRecoveryCause::StuckWatchdog
+    );
+    if (!can_retry && !allow_without_ladder)
         || (!runtime.local_recovery_policy.enabled
             && runtime.local_recovery_policy.restart_command.is_empty())
     {
@@ -11115,6 +11148,12 @@ async fn local_recovery_gate(
     let mut metadata = local_recovery_metadata(runtime, cause);
     if runtime.downstream_drop_signal.is_dropped() {
         return skipped_local_recovery_gate(metadata, "skipped_downstream_dropped", false);
+    }
+    if local_recovery_downstream_commit_observed(
+        Some(&runtime.downstream_commit_signal),
+        &mut metadata,
+    ) {
+        return skipped_local_recovery_gate(metadata, "skipped_downstream_committed", false);
     }
     let previous_attempts = runtime
         .local_recovery_attempts
@@ -11141,9 +11180,20 @@ async fn local_recovery_gate(
 
     let recovery_metadata = run_local_recovery(runtime, cause).await;
     metadata.extend(recovery_metadata);
+    if runtime.downstream_drop_signal.is_dropped() {
+        return skipped_local_recovery_gate(metadata, "skipped_downstream_dropped", false);
+    }
+    if local_recovery_downstream_commit_observed(
+        Some(&runtime.downstream_commit_signal),
+        &mut metadata,
+    ) {
+        return skipped_local_recovery_gate(metadata, "skipped_downstream_committed", false);
+    }
     let permits_retry = local_recovery_permits_retry(&metadata);
-    let permits_deadline_replay =
-        cause == LocalRecoveryCause::RequestDeadline && local_recovery_completed_ready(&metadata);
+    // Any successful local recovery re-opens a replay attempt, not only the
+    // request-deadline path. Ladder exhaustion must not strand a recovered
+    // upstream with a permanent client 502 (#233).
+    let permits_deadline_replay = local_recovery_completed_ready(&metadata);
     if permits_deadline_replay {
         runtime
             .local_recovery_deadline_replay_permits
@@ -11154,6 +11204,27 @@ async fn local_recovery_gate(
         permits_retry.to_string(),
     );
     applied_local_recovery_gate(metadata, permits_retry, permits_deadline_replay)
+}
+
+/// A non-empty liveness/final output commits the response. Every recovery
+/// combine site must re-observe it after an await before starting upstream work
+/// or authorizing a replay.
+fn local_recovery_downstream_commit_observed(
+    downstream_commit_signal: Option<&DownstreamCommitSignal>,
+    metadata: &mut BTreeMap<String, String>,
+) -> bool {
+    if !downstream_commit_signal.is_some_and(DownstreamCommitSignal::is_committed) {
+        return false;
+    }
+    metadata.insert(
+        String::from("local_recovery_replay_skipped_downstream_committed"),
+        String::from("true"),
+    );
+    metadata.insert(
+        String::from("local_recovery_status"),
+        String::from("skipped_downstream_committed"),
+    );
+    true
 }
 
 fn unapplied_local_recovery_gate() -> LocalRecoveryGate {
@@ -11242,6 +11313,12 @@ fn consume_local_recovery_deadline_replay_permit(runtime: &ShieldedRetryRuntime)
         .is_ok()
 }
 
+struct LocalRecoveryRunOptions<'a> {
+    episode_timeout: Option<Duration>,
+    recovery_episode_observer: Option<&'a AtomicU64>,
+    downstream_commit_signal: Option<DownstreamCommitSignal>,
+}
+
 async fn run_local_recovery(
     runtime: &ShieldedRetryRuntime,
     cause: LocalRecoveryCause,
@@ -11250,17 +11327,19 @@ async fn run_local_recovery(
     let episode_timeout = restart_queue
         .enabled
         .then(|| Duration::from_secs(restart_queue.restart_timeout_secs));
-    run_local_recovery_for_profile(
+    run_local_recovery_for_profile_with_downstream_commit(
         &runtime.local_recovery_policy,
         &runtime.local_recovery,
         runtime.client.clone(),
         runtime.upstream_profile.primary_base_url().to_owned(),
         cause,
         episode_timeout,
+        Some(runtime.downstream_commit_signal.clone()),
     )
     .await
 }
 
+#[cfg(test)]
 async fn run_local_recovery_for_profile(
     policy: &LocalRecoveryPolicy,
     coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
@@ -11269,7 +11348,7 @@ async fn run_local_recovery_for_profile(
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
 ) -> BTreeMap<String, String> {
-    run_local_recovery_for_profile_observing(
+    run_local_recovery_for_profile_with_downstream_commit(
         policy,
         coordinator,
         client,
@@ -11281,14 +11360,37 @@ async fn run_local_recovery_for_profile(
     .await
 }
 
-async fn run_local_recovery_for_profile_observing(
+async fn run_local_recovery_for_profile_with_downstream_commit(
     policy: &LocalRecoveryPolicy,
     coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
     client: Client,
     base_url: String,
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
-    recovery_episode_observer: Option<&AtomicU64>,
+    downstream_commit_signal: Option<DownstreamCommitSignal>,
+) -> BTreeMap<String, String> {
+    run_local_recovery_for_profile_observing(
+        policy,
+        coordinator,
+        client,
+        base_url,
+        cause,
+        LocalRecoveryRunOptions {
+            episode_timeout,
+            recovery_episode_observer: None,
+            downstream_commit_signal,
+        },
+    )
+    .await
+}
+
+async fn run_local_recovery_for_profile_observing(
+    policy: &LocalRecoveryPolicy,
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+    client: Client,
+    base_url: String,
+    cause: LocalRecoveryCause,
+    options: LocalRecoveryRunOptions<'_>,
 ) -> BTreeMap<String, String> {
     let mut state = coordinator.state.lock().await;
     if state.running {
@@ -11298,7 +11400,7 @@ async fn run_local_recovery_for_profile_observing(
                 String::from("episode_id_exhausted"),
             )]);
         };
-        if let Some(observer) = recovery_episode_observer {
+        if let Some(observer) = options.recovery_episode_observer {
             observer.store(recovery_episode_id, Ordering::Release);
         }
         drop(state);
@@ -11357,7 +11459,7 @@ async fn run_local_recovery_for_profile_observing(
             String::from("episode_id_exhausted"),
         )]);
     };
-    if let Some(observer) = recovery_episode_observer {
+    if let Some(observer) = options.recovery_episode_observer {
         observer.store(recovery_episode_id, Ordering::Release);
     }
     state.recovery_started = Some(now);
@@ -11367,7 +11469,9 @@ async fn run_local_recovery_for_profile_observing(
         .saturating_add(Duration::from_secs(1));
     state.recovery_deadline = Some(checked_instant_add(
         now,
-        episode_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
+        options
+            .episode_timeout
+            .map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
     ));
     state.runs_in_window = state.runs_in_window.saturating_add(1);
     let recovery_task = tokio::spawn(run_local_recovery_task(
@@ -11375,7 +11479,8 @@ async fn run_local_recovery_for_profile_observing(
         client,
         base_url,
         cause,
-        episode_timeout,
+        options.episode_timeout,
+        options.downstream_commit_signal,
     ));
     state.active_local_recovery_task = Some(recovery_task.abort_handle());
     drop(state);
@@ -11446,6 +11551,7 @@ async fn run_local_recovery_task(
     base_url: String,
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
+    downstream_commit_signal: Option<DownstreamCommitSignal>,
 ) -> BTreeMap<String, String> {
     let trigger_cause = cause.as_str().to_owned();
     let recovery_trigger_cause = trigger_cause.clone();
@@ -11456,13 +11562,34 @@ async fn run_local_recovery_task(
             String::from("local_recovery_trigger_cause"),
             recovery_trigger_cause,
         )]);
+        if local_recovery_downstream_commit_observed(
+            downstream_commit_signal.as_ref(),
+            &mut metadata,
+        ) {
+            return metadata;
+        }
         metadata.extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
+        if local_recovery_downstream_commit_observed(
+            downstream_commit_signal.as_ref(),
+            &mut metadata,
+        ) {
+            return metadata;
+        }
         if metadata
             .get("local_recovery_restart_status")
             .is_some_and(|status| status == "succeeded")
         {
-            metadata.extend(run_local_recovery_readiness(client, base_url, &policy).await);
+            metadata.extend(
+                run_local_recovery_readiness(
+                    client,
+                    base_url,
+                    &policy,
+                    downstream_commit_signal.as_ref(),
+                )
+                .await,
+            );
         }
+        local_recovery_downstream_commit_observed(downstream_commit_signal.as_ref(), &mut metadata);
         if !metadata.contains_key("local_recovery_status") {
             let status = match metadata
                 .get("local_recovery_readiness_status")
@@ -11675,9 +11802,14 @@ async fn run_local_recovery_readiness(
     client: Client,
     base_url: String,
     policy: &LocalRecoveryPolicy,
+    downstream_commit_signal: Option<&DownstreamCommitSignal>,
 ) -> BTreeMap<String, String> {
     let deadline = Instant::now() + policy.readiness_deadline;
     loop {
+        let mut metadata = BTreeMap::new();
+        if local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata) {
+            return metadata;
+        }
         if Instant::now() >= deadline {
             return BTreeMap::from([(
                 String::from("local_recovery_readiness_status"),
@@ -11766,8 +11898,12 @@ async fn recovery_gate_for_retryable_upstream_stall(
     runtime: &ShieldedRetryRuntime,
     can_retry: bool,
     retry_cause: Option<ShieldedRetryCause>,
+    local_recovery_already_applied: bool,
 ) -> UpstreamStallRecoveryGate {
-    if !can_retry || !matches!(retry_cause, Some(ShieldedRetryCause::UpstreamStall)) {
+    if local_recovery_already_applied
+        || !can_retry
+        || !matches!(retry_cause, Some(ShieldedRetryCause::UpstreamStall))
+    {
         return UpstreamStallRecoveryGate {
             metadata: BTreeMap::new(),
             permits_retry: true,
@@ -14908,17 +15044,13 @@ struct ShieldedLivenessBodySettings {
     mode: ShieldedLivenessMode,
     accepted_response_mode: ShieldedAcceptedResponseMode,
     response_model_alias: Option<String>,
-    interval_secs: u64,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
-    #[cfg(test)]
-    shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
 
 struct ShieldedLivenessBody {
     aggregate: ShieldedAggregateFuture,
     direct_stream: Option<DirectRelayStream>,
     direct_deadline: Option<Pin<Box<Sleep>>>,
-    interval: Interval,
     mode: ShieldedLivenessMode,
     accepted_response_mode: ShieldedAcceptedResponseMode,
     response_model_alias: Option<String>,
@@ -14926,12 +15058,10 @@ struct ShieldedLivenessBody {
     _in_flight_permit: InFlightPermit,
     shutdown: ShutdownSubscription,
     downstream_drop_signal: DownstreamDropSignal,
+    downstream_commit_signal: DownstreamCommitSignal,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
-    #[cfg(test)]
-    shielded_heartbeat_ticks: Arc<AtomicU64>,
     bytes_seen: u64,
     terminal_completion: Option<BodyCompletion>,
-    json_prefix_pending: bool,
 }
 
 impl ShieldedLivenessBody {
@@ -14942,15 +15072,12 @@ impl ShieldedLivenessBody {
         in_flight_permit: InFlightPermit,
         shutdown: ShutdownSubscription,
         downstream_drop_signal: DownstreamDropSignal,
+        downstream_commit_signal: DownstreamCommitSignal,
     ) -> Self {
-        let period = Duration::from_secs(settings.interval_secs);
-        let mut interval = tokio::time::interval_at(Instant::now() + period, period);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
             aggregate,
             direct_stream: None,
             direct_deadline: None,
-            interval,
             mode: settings.mode,
             accepted_response_mode: settings.accepted_response_mode,
             response_model_alias: settings.response_model_alias.clone(),
@@ -14958,12 +15085,10 @@ impl ShieldedLivenessBody {
             _in_flight_permit: in_flight_permit,
             shutdown,
             downstream_drop_signal,
+            downstream_commit_signal,
             upstream_failure_counters: settings.upstream_failure_counters.clone(),
-            #[cfg(test)]
-            shielded_heartbeat_ticks: settings.shielded_heartbeat_ticks.clone(),
             bytes_seen: 0,
             terminal_completion: None,
-            json_prefix_pending: settings.mode == ShieldedLivenessMode::JsonWhitespace,
         }
     }
 
@@ -14976,6 +15101,9 @@ impl ShieldedLivenessBody {
     fn count_and_emit(&mut self, bytes: Bytes) -> Poll<Option<Result<Bytes, Infallible>>> {
         let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         self.bytes_seen = self.bytes_seen.saturating_add(chunk_len);
+        if !bytes.is_empty() {
+            self.downstream_commit_signal.mark_committed();
+        }
         Poll::Ready(Some(Ok(bytes)))
     }
 
@@ -15134,11 +15262,6 @@ impl Stream for ShieldedLivenessBody {
             return Poll::Ready(None);
         }
 
-        if this.json_prefix_pending {
-            this.json_prefix_pending = false;
-            return this.count_and_emit(json_whitespace_heartbeat());
-        }
-
         if this.direct_stream.is_some() {
             return this.poll_direct_stream(cx);
         }
@@ -15187,14 +15310,10 @@ impl Stream for ShieldedLivenessBody {
             Poll::Pending => {}
         }
 
-        match Pin::new(&mut this.interval).poll_tick(cx) {
-            Poll::Ready(_instant) => {
-                #[cfg(test)]
-                this.shielded_heartbeat_ticks.fetch_add(1, Ordering::SeqCst);
-                this.count_and_emit(heartbeat_chunk(this.mode))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        // The aggregate owns every replay decision.  Any liveness byte would commit the
+        // downstream response before that decision is final, so keep the body silent until
+        // it can emit an accepted result, terminal response, or direct-relay content.
+        Poll::Pending
     }
 }
 
@@ -15317,18 +15436,6 @@ fn shielded_chat_stream_response_headers(
         HeaderValue::from_static("no"),
     );
     headers
-}
-
-fn heartbeat_chunk(mode: ShieldedLivenessMode) -> Bytes {
-    match mode {
-        ShieldedLivenessMode::Sse => Bytes::from_static(b": llm-guard-proxy heartbeat\n\n"),
-        ShieldedLivenessMode::JsonWhitespace => json_whitespace_heartbeat(),
-        ShieldedLivenessMode::Disabled => Bytes::new(),
-    }
-}
-
-fn json_whitespace_heartbeat() -> Bytes {
-    Bytes::from_static(b" \n")
 }
 
 fn sse_final_frame(body: &Bytes) -> Bytes {
