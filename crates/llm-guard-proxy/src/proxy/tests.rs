@@ -20731,6 +20731,41 @@ fn fake_constraint_repair_chat_completion_response(
     path_and_query: &str,
     body: &Bytes,
 ) -> Option<Response<Body>> {
+    if path_and_query.contains("test=constraint-repair-multi-choice-valid-first") {
+        let contents = if body_contains_text(body, "llm-guard-proxy constraint-repair retry hint") {
+            [
+                "First corrected line\nSecond corrected line",
+                "Third corrected line\nFourth corrected line",
+            ]
+        } else {
+            [
+                "First valid line\nSecond valid line",
+                "Only one invalid line",
+            ]
+        };
+        return Some(multi_choice_content_sse_response(
+            "constraint-repair-multi-choice-valid-first",
+            &contents,
+        ));
+    }
+    if path_and_query.contains("test=constraint-repair-multi-choice-invalid-first") {
+        let contents = if body_contains_text(body, "llm-guard-proxy constraint-repair retry hint") {
+            [
+                "First corrected line\nSecond corrected line",
+                "Third corrected line\nFourth corrected line",
+            ]
+        } else {
+            [
+                "Only one invalid line",
+                "First valid line\nSecond valid line",
+            ]
+        };
+        return Some(multi_choice_content_sse_response(
+            "constraint-repair-multi-choice-invalid-first",
+            &contents,
+        ));
+    }
+
     let (label, content) = if path_and_query.contains("test=constraint-repair-acrostic-valid") {
         (
             "constraint-repair-acrostic-valid",
@@ -20761,6 +20796,67 @@ fn fake_constraint_repair_chat_completion_response(
         label,
         vec![serde_json::json!({"content": content})],
     ))
+}
+
+fn multi_choice_content_sse_response(label: &'static str, contents: &[&str]) -> Response<Body> {
+    let role_choices = contents
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            serde_json::json!({
+                "index": index,
+                "delta": {"role": "assistant"},
+                "finish_reason": null,
+            })
+        })
+        .collect::<Vec<_>>();
+    let content_choices = contents
+        .iter()
+        .enumerate()
+        .map(|(index, content)| {
+            serde_json::json!({
+                "index": index,
+                "delta": {"content": content},
+                "finish_reason": null,
+            })
+        })
+        .collect::<Vec<_>>();
+    let completed_choices = contents
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            serde_json::json!({
+                "index": index,
+                "delta": {},
+                "finish_reason": "stop",
+            })
+        })
+        .collect::<Vec<_>>();
+    let chunks = vec![
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": role_choices,
+        })),
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": content_choices,
+        })),
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": completed_choices,
+        })),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    chat_completion_vec_stream_response(label, chunks)
 }
 
 fn fake_loop_three_then_slow_success_response(
