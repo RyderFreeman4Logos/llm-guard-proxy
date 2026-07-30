@@ -71,7 +71,7 @@ use tokio::{
         Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, futures::OwnedNotified, mpsc,
         oneshot,
     },
-    time::{Instant, Interval, MissedTickBehavior, Sleep, timeout},
+    time::{Instant, Sleep, timeout},
 };
 
 #[cfg(feature = "guard")]
@@ -3430,8 +3430,6 @@ async fn forward_openai_request(
                 shadow_evidence: ShadowEvidenceState::default(),
                 malformed_response_counter: state.malformed_response_counter.clone(),
                 upstream_failure_counters: state.upstream_failure_counters.clone(),
-                #[cfg(test)]
-                shielded_heartbeat_ticks: state.shielded_heartbeat_ticks.clone(),
             },
             in_flight_permit,
         ))
@@ -9337,8 +9335,6 @@ struct ShieldedRetryRuntime {
     shadow_evidence: ShadowEvidenceState,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
-    #[cfg(test)]
-    shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
 
 impl ShieldedRetryRuntime {
@@ -9751,10 +9747,7 @@ fn shielded_liveness_stream_response(
             ShieldedAcceptedResponseMode::JsonCompletion
         },
         response_model_alias,
-        interval_secs: runtime.liveness.heartbeat_interval_secs,
         upstream_failure_counters: runtime.upstream_failure_counters.clone(),
-        #[cfg(test)]
-        shielded_heartbeat_ticks: runtime.shielded_heartbeat_ticks.clone(),
     };
     let response_body = ShieldedLivenessBody::new(
         aggregate,
@@ -15051,17 +15044,13 @@ struct ShieldedLivenessBodySettings {
     mode: ShieldedLivenessMode,
     accepted_response_mode: ShieldedAcceptedResponseMode,
     response_model_alias: Option<String>,
-    interval_secs: u64,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
-    #[cfg(test)]
-    shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
 
 struct ShieldedLivenessBody {
     aggregate: ShieldedAggregateFuture,
     direct_stream: Option<DirectRelayStream>,
     direct_deadline: Option<Pin<Box<Sleep>>>,
-    interval: Interval,
     mode: ShieldedLivenessMode,
     accepted_response_mode: ShieldedAcceptedResponseMode,
     response_model_alias: Option<String>,
@@ -15071,11 +15060,8 @@ struct ShieldedLivenessBody {
     downstream_drop_signal: DownstreamDropSignal,
     downstream_commit_signal: DownstreamCommitSignal,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
-    #[cfg(test)]
-    shielded_heartbeat_ticks: Arc<AtomicU64>,
     bytes_seen: u64,
     terminal_completion: Option<BodyCompletion>,
-    json_prefix_pending: bool,
 }
 
 impl ShieldedLivenessBody {
@@ -15088,14 +15074,10 @@ impl ShieldedLivenessBody {
         downstream_drop_signal: DownstreamDropSignal,
         downstream_commit_signal: DownstreamCommitSignal,
     ) -> Self {
-        let period = Duration::from_secs(settings.interval_secs);
-        let mut interval = tokio::time::interval_at(Instant::now() + period, period);
-        interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         Self {
             aggregate,
             direct_stream: None,
             direct_deadline: None,
-            interval,
             mode: settings.mode,
             accepted_response_mode: settings.accepted_response_mode,
             response_model_alias: settings.response_model_alias.clone(),
@@ -15105,11 +15087,8 @@ impl ShieldedLivenessBody {
             downstream_drop_signal,
             downstream_commit_signal,
             upstream_failure_counters: settings.upstream_failure_counters.clone(),
-            #[cfg(test)]
-            shielded_heartbeat_ticks: settings.shielded_heartbeat_ticks.clone(),
             bytes_seen: 0,
             terminal_completion: None,
-            json_prefix_pending: settings.mode == ShieldedLivenessMode::JsonWhitespace,
         }
     }
 
@@ -15283,11 +15262,6 @@ impl Stream for ShieldedLivenessBody {
             return Poll::Ready(None);
         }
 
-        if this.json_prefix_pending {
-            this.json_prefix_pending = false;
-            return this.count_and_emit(json_whitespace_heartbeat());
-        }
-
         if this.direct_stream.is_some() {
             return this.poll_direct_stream(cx);
         }
@@ -15336,14 +15310,10 @@ impl Stream for ShieldedLivenessBody {
             Poll::Pending => {}
         }
 
-        match Pin::new(&mut this.interval).poll_tick(cx) {
-            Poll::Ready(_instant) => {
-                #[cfg(test)]
-                this.shielded_heartbeat_ticks.fetch_add(1, Ordering::SeqCst);
-                this.count_and_emit(heartbeat_chunk(this.mode))
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        // The aggregate owns every replay decision.  Any liveness byte would commit the
+        // downstream response before that decision is final, so keep the body silent until
+        // it can emit an accepted result, terminal response, or direct-relay content.
+        Poll::Pending
     }
 }
 
@@ -15466,18 +15436,6 @@ fn shielded_chat_stream_response_headers(
         HeaderValue::from_static("no"),
     );
     headers
-}
-
-fn heartbeat_chunk(mode: ShieldedLivenessMode) -> Bytes {
-    match mode {
-        ShieldedLivenessMode::Sse => Bytes::from_static(b": llm-guard-proxy heartbeat\n\n"),
-        ShieldedLivenessMode::JsonWhitespace => json_whitespace_heartbeat(),
-        ShieldedLivenessMode::Disabled => Bytes::new(),
-    }
-}
-
-fn json_whitespace_heartbeat() -> Bytes {
-    Bytes::from_static(b" \n")
 }
 
 fn sse_final_frame(body: &Bytes) -> Bytes {

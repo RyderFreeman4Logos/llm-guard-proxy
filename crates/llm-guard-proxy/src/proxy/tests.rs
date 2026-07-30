@@ -73,8 +73,6 @@ const STREAM_SECOND_CHUNK_GUARD: Duration = Duration::from_millis(150);
 const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 const SHIELDED_SLOW_DELAY: Duration = Duration::from_millis(2_500);
 const SHIELDED_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(1_500);
-const SHIELDED_RELOAD_GUARD: Duration = Duration::from_millis(1_500);
-const SHIELDED_RELOAD_TIMEOUT: Duration = Duration::from_millis(2_500);
 const SSE_FIRST_CHUNK: &[u8] = b"data: first\n\n";
 const SSE_SECOND_CHUNK: &[u8] = b"data: second\n\n";
 const LONG_JSON_FIRST_CHUNK: &[u8] = br#"{"object":"list","data":["#;
@@ -1531,11 +1529,6 @@ interval_secs = 1
         .expect("storm response should receive headers");
         assert_eq!(response.status(), StatusCode::OK);
         downstreams.push(response.bytes_stream());
-    }
-
-    for downstream in &mut downstreams {
-        let prefix = next_chunk(downstream, SHIELDED_HEARTBEAT_TIMEOUT, "storm JSON prefix").await;
-        assert_eq!(prefix, Bytes::from_static(b" \n"));
     }
 
     let metrics = timeout(STREAM_HEADER_TIMEOUT, fetch_metrics(&proxy))
@@ -6376,13 +6369,12 @@ downstream_drop_policy = "detach"
         .expect("proxy request should start");
     assert_eq!(response.status(), StatusCode::OK);
     let mut downstream = response.bytes_stream();
-    let heartbeat = next_chunk(
-        &mut downstream,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "drop test shielded heartbeat",
-    )
-    .await;
-    assert_eq!(heartbeat, Bytes::from_static(b" \n"));
+    assert!(
+        timeout(Duration::from_millis(100), downstream.next())
+            .await
+            .is_err(),
+        "held liveness must leave the shadow-retry aggregate uncommitted"
+    );
     drop(downstream);
 
     let first_requests = recv_shadow_timeout_upstream_requests(&mut fake).await;
@@ -7140,7 +7132,8 @@ async fn shielded_retry_runs_recovery_command_after_upstream_stall_then_succeeds
         &format!(
             r#"
 [heartbeat]
-mode = "disabled"
+mode = "json-whitespace"
+interval_secs = 1
 
 [retry]
 max_attempts = 2
@@ -7150,7 +7143,7 @@ anti_loop_hint_enabled = false
 enabled = true
 first_chunk_timeout_ms = 50
 idle_timeout_ms = 50
-recovery_command = ["/usr/bin/touch", "{recovery_marker}"]
+recovery_command = ["/bin/sh", "-c", "sleep 0.2; /usr/bin/touch {recovery_marker}"]
 recovery_timeout_ms = 1000
 recovery_cooldown_ms = 1000
 recovery_budget_window_ms = 10000
@@ -7173,9 +7166,24 @@ recovery_max_per_window = 1
         .await
         .expect("proxy request should complete");
 
+    proxy.state.reset_shielded_heartbeat_ticks_for_tests();
     assert_eq!(response.status(), StatusCode::OK);
-    let aggregated = shielded_final_json(response).await;
+    let response_body = response
+        .bytes()
+        .await
+        .expect("held liveness response body should be readable");
+    assert!(
+        !response_body.starts_with(b" \n"),
+        "stall recovery must not commit JSON liveness before replay"
+    );
+    let aggregated: serde_json::Value =
+        serde_json::from_slice(&response_body).expect("replayed business response should be JSON");
     assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(
+        proxy.state.shielded_heartbeat_ticks_for_tests(),
+        0,
+        "held liveness must not emit while upstream-stall recovery is pending"
+    );
     assert!(recovery_marker.exists());
 
     let _first_attempt = fake.recv_next().await;
@@ -7398,9 +7406,9 @@ max_per_window = 1
 }
 
 #[tokio::test]
-async fn local_recovery_does_not_replay_after_json_liveness_prefix() {
+async fn local_recovery_holds_json_liveness_until_replay_before_first_tick() {
     let mut fake = FakeUpstream::spawn().await;
-    let recovery_root = unique_test_dir("local-recovery-liveness-committed");
+    let recovery_root = unique_test_dir("local-recovery-liveness-held");
     fs::create_dir_all(&recovery_root).expect("recovery root should be created");
     let recovery_marker = recovery_root.join("recovered");
     let proxy = ProxyFixture::spawn_with_options(
@@ -7411,7 +7419,7 @@ async fn local_recovery_does_not_replay_after_json_liveness_prefix() {
             r#"
 [heartbeat]
 mode = "json-whitespace"
-interval_secs = 60
+interval_secs = 1
 
 [retry]
 max_attempts = 1
@@ -7438,6 +7446,7 @@ max_per_window = 1
         ),
     )
     .await;
+    proxy.state.reset_shielded_heartbeat_ticks_for_tests();
 
     let response = proxy_handler(
         State(proxy.state.clone()),
@@ -7450,55 +7459,31 @@ max_per_window = 1
 
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
-    let prefix = next_chunk(
-        &mut body,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "local recovery JSON prefix",
-    )
-    .await;
-    assert_eq!(prefix, Bytes::from_static(b" \n"));
-    let terminal = next_chunk(
-        &mut body,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "committed liveness terminal error",
-    )
-    .await;
-    let terminal_json: serde_json::Value =
-        serde_json::from_slice(&terminal).expect("terminal liveness error should be JSON");
-    assert_eq!(terminal_json["error"]["type"], "llm_guard_attempt_timeout");
+    let response_body = collect_stream_text(&mut body, SHIELDED_HEARTBEAT_TIMEOUT).await;
     assert!(
-        timeout(SHIELDED_HEARTBEAT_TIMEOUT, body.next())
-            .await
-            .expect("terminal liveness body should end")
-            .is_none()
+        !response_body.as_bytes().starts_with(b" \n"),
+        "an immediate recovery must not commit the JSON liveness prefix before replay"
     );
+    let replayed: serde_json::Value =
+        serde_json::from_str(&response_body).expect("replayed business response should be JSON");
+    assert_eq!(replayed["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(proxy.state.shielded_heartbeat_ticks_for_tests(), 0);
+    assert!(recovery_marker.exists());
 
-    assert!(
-        !recovery_marker.exists(),
-        "downstream liveness bytes must prevent unsafe local recovery replay"
-    );
     let first = fake.recv_next().await;
-    assert_eq!(
-        first.path_and_query,
-        "/v1/chat/completions?test=stall-once-then-success"
-    );
-    assert!(
-        fake.recv_within(Duration::from_millis(100)).await.is_none(),
-        "committed downstream bytes must prevent recovery probe and replay"
-    );
+    let probe = fake.recv_next().await;
+    let replay = fake.recv_next().await;
+    assert_eq!(probe.path_and_query, "/v1/chat/completions");
+    assert_eq!(replay.path_and_query, first.path_and_query);
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
 
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(attempts.len(), 2);
     assert_eq!(
         attempts[0].response_metadata["local_recovery_status"],
-        "skipped_downstream_committed"
+        "succeeded"
     );
-    assert_eq!(
-        attempts[0].response_metadata["local_recovery_replay_skipped_downstream_committed"],
-        "true"
-    );
-
+    assert_eq!(attempts[1].status, "succeeded");
     remove_dir_all(&recovery_root);
 }
 
@@ -7548,10 +7533,11 @@ max_per_window = 1
 }
 
 #[tokio::test]
-async fn local_recovery_does_not_probe_or_replay_after_delayed_sse_liveness_commit() {
+async fn local_recovery_replays_after_delayed_sse_liveness_is_held() {
     let mut fake = FakeUpstream::spawn().await;
     let (proxy, recovery_root, recovery_marker) =
         spawn_delayed_sse_liveness_recovery_proxy(&fake).await;
+    proxy.state.reset_shielded_heartbeat_ticks_for_tests();
 
     let response = proxy_handler(
         State(proxy.state.clone()),
@@ -7564,69 +7550,33 @@ async fn local_recovery_does_not_probe_or_replay_after_delayed_sse_liveness_comm
 
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
-    let heartbeat = next_chunk(
-        &mut body,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "delayed local recovery SSE heartbeat",
-    )
-    .await;
-    assert_eq!(
-        heartbeat,
-        Bytes::from_static(b": llm-guard-proxy heartbeat\n\n")
-    );
-    let terminal = timeout(SHIELDED_HEARTBEAT_TIMEOUT, async {
-        loop {
-            let chunk = body
-                .next()
-                .await
-                .expect("committed liveness response must include a terminal error")
-                .expect("committed liveness response body should not fail");
-            if chunk != heartbeat {
-                return chunk;
-            }
-        }
-    })
-    .await
-    .expect("delayed committed liveness terminal error");
-    assert!(terminal.starts_with(b"event: error\ndata: "));
+    let response_body = collect_stream_text(&mut body, Duration::from_secs(4)).await;
     assert!(
-        terminal
-            .windows(b"llm_guard_attempt_timeout".len())
-            .any(|window| { window == b"llm_guard_attempt_timeout" })
+        !response_body.contains(": llm-guard-proxy heartbeat"),
+        "held liveness must not commit SSE heartbeats before replay"
     );
-    assert!(
-        timeout(SHIELDED_HEARTBEAT_TIMEOUT, body.next())
-            .await
-            .expect("terminal liveness body should end")
-            .is_none()
-    );
+    assert!(response_body.contains("Hello"));
+    assert_eq!(proxy.state.shielded_heartbeat_ticks_for_tests(), 0);
+    assert!(recovery_marker.exists());
 
-    assert!(
-        recovery_marker.exists(),
-        "the delayed recovery command should finish before the post-await commit gate"
-    );
     let first = fake.recv_next().await;
+    let probe = fake.recv_next().await;
+    let replay = fake.recv_next().await;
     assert_eq!(
         first.path_and_query,
         "/v1/chat/completions?test=stall-once-then-success"
     );
-    assert!(
-        fake.recv_within(Duration::from_millis(100)).await.is_none(),
-        "a liveness commit during recovery must prevent the readiness probe and replay"
-    );
+    assert_eq!(probe.path_and_query, "/v1/chat/completions");
+    assert_eq!(replay.path_and_query, first.path_and_query);
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
 
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(attempts.len(), 2);
     assert_eq!(
         attempts[0].response_metadata["local_recovery_status"],
-        "skipped_downstream_committed"
+        "succeeded"
     );
-    assert_eq!(
-        attempts[0].response_metadata["local_recovery_replay_skipped_downstream_committed"],
-        "true"
-    );
-
+    assert_eq!(attempts[1].status, "succeeded");
     remove_dir_all(&recovery_root);
 }
 
@@ -11747,7 +11697,7 @@ shielded_streaming_enabled = true
 }
 
 #[tokio::test]
-async fn shielded_streaming_commit_gate_sends_heartbeat_before_openai_sse_release() {
+async fn shielded_streaming_commit_gate_holds_liveness_until_openai_sse_release() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -11781,20 +11731,13 @@ shielded_streaming_enabled = true
         Some("text/event-stream")
     );
     let mut body = response.into_body().into_data_stream();
-    let heartbeat = next_chunk(
-        &mut body,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "shielded stream heartbeat",
-    )
-    .await;
-    assert_eq!(
-        heartbeat,
-        Bytes::from_static(b": llm-guard-proxy heartbeat\n\n")
+    assert!(
+        timeout(Duration::from_millis(100), body.next())
+            .await
+            .is_err(),
+        "liveness must remain held while the aggregate can still choose replay"
     );
-    assert!(!String::from_utf8_lossy(&heartbeat).contains("content"));
-    assert!(!String::from_utf8_lossy(&heartbeat).contains("tool_calls"));
-
-    let released = collect_stream_text(&mut body, STREAM_COMPLETION_TIMEOUT).await;
+    let released = collect_stream_text(&mut body, Duration::from_secs(4)).await;
     assert!(released.contains("data:"));
     assert!(released.contains("chat.completion.chunk"));
     assert!(released.contains("Hel"));
@@ -13146,19 +13089,17 @@ idle_timeout_ms = 200
         .expect("shielded chat request should receive response headers");
 
     assert_eq!(response.status(), StatusCode::OK);
+    let mut downstream = response.bytes_stream();
+    assert!(
+        timeout(Duration::from_millis(100), downstream.next())
+            .await
+            .is_err()
+    );
     let observed = upstream.recv_request().await;
     let observed_body: serde_json::Value =
         serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
     assert_eq!(observed_body["stream"], true);
 
-    let mut downstream = response.bytes_stream();
-    let heartbeat = next_chunk(
-        &mut downstream,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "detach JSON prefix",
-    )
-    .await;
-    assert_eq!(heartbeat, Bytes::from_static(b" \n"));
     drop(downstream);
 
     assert!(
@@ -13247,16 +13188,14 @@ thinking_token_budget = 8192
         .expect("shielded chat request should receive response headers");
 
     assert_eq!(response.status(), StatusCode::OK);
+    let mut downstream = response.bytes_stream();
+    assert!(
+        timeout(Duration::from_millis(100), downstream.next())
+            .await
+            .is_err()
+    );
     let first_attempt = upstream.recv_request().await;
     assert_eq!(body_thinking_budget(&first_attempt.body), Some(32_768));
-    let mut downstream = response.bytes_stream();
-    let heartbeat = next_chunk(
-        &mut downstream,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "detach JSON prefix before retry cancellation",
-    )
-    .await;
-    assert_eq!(heartbeat, Bytes::from_static(b" \n"));
     drop(downstream);
 
     assert!(
@@ -14059,8 +13998,12 @@ interval_secs = 1
 
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
-    let heartbeat = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "shielded heartbeat").await;
-    assert_eq!(heartbeat, Bytes::from_static(b" \n"));
+    assert!(
+        timeout(Duration::from_millis(100), body.next())
+            .await
+            .is_err(),
+        "held liveness must keep the aggregate body pending before upstream content"
+    );
     drop(body);
 
     let _observed = fake.recv_next().await;
@@ -14122,21 +14065,17 @@ anti_loop_hint_enabled = true
 
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
-    let prefix = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "retry JSON prefix").await;
-    assert_eq!(prefix, Bytes::from_static(b" \n"));
-    let heartbeat = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "retry heartbeat").await;
-    assert_eq!(heartbeat, Bytes::from_static(b" \n"));
-    let heartbeat_ticks_before_drop = proxy.state.shielded_heartbeat_ticks_for_tests();
     assert!(
-        heartbeat_ticks_before_drop > 0,
-        "test must observe at least one shielded heartbeat tick before drop"
+        timeout(Duration::from_millis(200), body.next())
+            .await
+            .is_err(),
+        "held liveness must keep the retry aggregate pending before upstream content"
     );
     drop(body);
-    sleep(Duration::from_millis(1_100)).await;
     assert_eq!(
         proxy.state.shielded_heartbeat_ticks_for_tests(),
-        heartbeat_ticks_before_drop,
-        "closed shielded liveness body must not keep ticking heartbeats"
+        0,
+        "held liveness must not commit or schedule heartbeats before the retry chain is final"
     );
 
     let first_attempt = fake.recv_next().await;
@@ -14197,13 +14136,6 @@ interval_secs = 1
 
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.into_body().into_data_stream();
-    let prefix = next_chunk(
-        &mut body,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "terminal JSON prefix",
-    )
-    .await;
-    assert_eq!(prefix, Bytes::from_static(b" \n"));
     let final_chunk = next_chunk(&mut body, SHIELDED_HEARTBEAT_TIMEOUT, "terminal JSON body").await;
     let final_json: serde_json::Value =
         serde_json::from_slice(&final_chunk).expect("terminal JSON body should parse");
@@ -14276,8 +14208,8 @@ interval_secs = 1
     );
     let second_body = second.text().await.expect("second body should be text");
     assert!(
-        second_body.chars().next().is_some_and(char::is_whitespace),
-        "JSON whitespace mode should prefix heartbeat whitespace: {second_body:?}"
+        !second_body.chars().next().is_some_and(char::is_whitespace),
+        "held JSON body must not begin with liveness whitespace: {second_body:?}"
     );
     let second_json: serde_json::Value =
         serde_json::from_str(&second_body).expect("leading whitespace JSON should parse");
@@ -14327,7 +14259,7 @@ interval_secs = 1
 }
 
 #[tokio::test]
-async fn hot_reloaded_heartbeat_interval_changes_without_restart() {
+async fn hot_reloaded_heartbeat_interval_stays_held_until_safe_commit() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -14355,26 +14287,8 @@ enabled = false
         .send()
         .await
         .expect("first shielded request should complete");
-    let mut first_body = first.bytes_stream();
-    let first_prefix = next_chunk(
-        &mut first_body,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "first JSON prefix",
-    )
-    .await;
-    assert_eq!(first_prefix, Bytes::from_static(b" \n"));
-    let first_heartbeat = next_chunk(
-        &mut first_body,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "first interval heartbeat",
-    )
-    .await;
-    assert!(
-        first_heartbeat == Bytes::from_static(b" \n"),
-        "first JSON whitespace heartbeat should be a JSON-safe whitespace chunk"
-    );
-    drop(first_body);
-    let _first_observed = fake.recv_next().await;
+    let first_body = first.text().await.expect("first body should be readable");
+    assert!(!first_body.starts_with(" \n"));
 
     write_proxy_config(
         proxy.manager.path(),
@@ -14407,30 +14321,12 @@ enabled = false
         .send()
         .await
         .expect("second shielded request should complete");
-    let mut second_body = second.bytes_stream();
-    let second_prefix = next_chunk(
-        &mut second_body,
-        SHIELDED_HEARTBEAT_TIMEOUT,
-        "second JSON prefix",
-    )
-    .await;
-    assert_eq!(second_prefix, Bytes::from_static(b" \n"));
-    assert!(
-        timeout(SHIELDED_RELOAD_GUARD, second_body.next())
-            .await
-            .is_err(),
-        "reloaded two-second heartbeat should not arrive within the old interval"
-    );
-    let second_heartbeat = next_chunk(
-        &mut second_body,
-        SHIELDED_RELOAD_TIMEOUT,
-        "second interval heartbeat",
-    )
-    .await;
-    assert!(
-        second_heartbeat == Bytes::from_static(b" \n"),
-        "second JSON whitespace heartbeat should be a JSON-safe whitespace chunk"
-    );
+    let second_body = second.text().await.expect("second body should be readable");
+    assert!(!second_body.starts_with(" \n"));
+    assert!(first_body.contains("Hello"));
+    assert!(second_body.contains("Hello"));
+
+    let _first_observed = fake.recv_next().await;
     let _second_observed = fake.recv_next().await;
 }
 
@@ -18852,13 +18748,11 @@ interval_secs = 1
     }
 
     for downstream in &mut downstreams {
-        let prefix = next_chunk(
-            downstream,
-            SHIELDED_HEARTBEAT_TIMEOUT,
-            "shutdown storm prefix",
-        )
-        .await;
-        assert_eq!(prefix, Bytes::from_static(b" \n"));
+        assert!(
+            timeout(Duration::from_millis(100), downstream.next())
+                .await
+                .is_err()
+        );
     }
 
     shutdown_tx
