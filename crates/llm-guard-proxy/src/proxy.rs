@@ -9562,6 +9562,7 @@ struct ShieldedAttemptFailure {
     response_metadata: BTreeMap<String, String>,
     raw_payloads: RawPayloads,
     upstream_body: Bytes,
+    final_attempt: Option<FinalAttemptContext>,
     completed_endpoint_attempt_records: Vec<AttemptRecord>,
 }
 
@@ -10161,18 +10162,23 @@ async fn aggregate_shielded_attempt(
     };
     match result {
         Ok(aggregated) => {
+            let final_attempt = started.info.clone().into_final_context(
+                aggregated.response_metadata.clone(),
+                aggregated.raw_payloads.clone(),
+                aggregated.body.clone(),
+                aggregated.sse_body.clone(),
+            );
             if let Some(repair) =
                 constraint_repair_for_aggregated_response(runtime, &started.info, &aggregated.body)
             {
-                return Err(constraint_validation_failure(&started.info, repair));
+                return Err(constraint_validation_failure(
+                    &started.info,
+                    repair,
+                    final_attempt,
+                ));
             }
             Ok(ShieldedAggregatedAttempt {
-                final_attempt: started.info.into_final_context(
-                    aggregated.response_metadata.clone(),
-                    aggregated.raw_payloads.clone(),
-                    aggregated.body.clone(),
-                    aggregated.sse_body.clone(),
-                ),
+                final_attempt,
                 body: aggregated.body,
                 sse_body: aggregated.sse_body,
                 response_metadata: aggregated.response_metadata,
@@ -10217,20 +10223,25 @@ async fn aggregate_native_json_shielded_attempt(
             "native JSON fallback returned an invalid non-stream chat completion",
         ));
     }
-    if let Some(repair) = constraint_repair_for_aggregated_response(runtime, &info, &body) {
-        return Err(constraint_validation_failure(&info, repair));
-    }
     let response_metadata = BTreeMap::from([(
         String::from("native_json_fallback_response_validated"),
         String::from("true"),
     )]);
+    let raw_payloads = RawPayloads {
+        output: raw_payload_text(&body),
+        ..RawPayloads::default()
+    };
+    let final_attempt = info.clone().into_final_context(
+        response_metadata.clone(),
+        raw_payloads,
+        body.clone(),
+        Bytes::new(),
+    );
+    if let Some(repair) = constraint_repair_for_aggregated_response(runtime, &info, &body) {
+        return Err(constraint_validation_failure(&info, repair, final_attempt));
+    }
     Ok(ShieldedAggregatedAttempt {
-        final_attempt: info.into_final_context(
-            response_metadata.clone(),
-            RawPayloads::default(),
-            body.clone(),
-            Bytes::new(),
-        ),
+        final_attempt,
         body,
         sse_body: Bytes::new(),
         response_metadata,
@@ -12474,6 +12485,7 @@ fn shielded_start_transport_failure(
         raw_payloads,
         upstream_body: input.evidence_upstream_body,
         completed_endpoint_attempt_records,
+        final_attempt: None,
     }
 }
 
@@ -13008,18 +13020,37 @@ fn aggregation_failure(
         raw_payloads,
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
+        final_attempt: None,
     }
 }
 
 fn constraint_validation_failure(
     info: &ShieldedAttemptInfo,
     repair: prose_constraints::ConstraintRepair,
+    final_attempt: FinalAttemptContext,
 ) -> ShieldedAttemptFailure {
     let feedback_count = repair.feedback_count();
     let mut failure = status_failure_without_retry(
         info,
         "upstream response violated a mechanically verifiable prose constraint",
     );
+    let mut raw_payloads = final_attempt.raw_payloads.clone();
+    if raw_payloads.input.is_none() {
+        raw_payloads.input.clone_from(&info.raw_request_body);
+    }
+    failure.raw_payloads = raw_payloads;
+    failure
+        .response_metadata
+        .extend(final_attempt.extra_response_metadata.clone());
+    failure.response_metadata.insert(
+        String::from("response_body_bytes"),
+        final_attempt.response_body.len().to_string(),
+    );
+    failure.response_metadata.insert(
+        String::from("sse_body_bytes"),
+        final_attempt.sse_body.len().to_string(),
+    );
+    failure.final_attempt = Some(final_attempt);
     failure.error_type = "constraint_validation_failed";
     failure.retry_cause = Some(ShieldedRetryCause::ConstraintViolation);
     failure.constraint_repair = Some(repair);
@@ -13078,6 +13109,7 @@ fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAtte
         },
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
+        final_attempt: None,
     }
 }
 
@@ -13125,6 +13157,7 @@ fn request_deadline_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> Shie
         },
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
+        final_attempt: None,
     }
 }
 
@@ -13307,6 +13340,7 @@ fn status_failure(
         },
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
+        final_attempt: None,
     }
 }
 
@@ -13350,6 +13384,7 @@ fn status_failure_without_retry(
         },
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
+        final_attempt: None,
     }
 }
 
@@ -13421,7 +13456,12 @@ fn attempt_failure_record(
         error_reason: Some(format!("{}: {}", failure.error_type, failure.error_message)),
         retry_reason: retry_cause.map(|cause| cause.retry_reason().to_owned()),
         abort_reason: failure.abort_reason.clone(),
-        token_usage: TokenUsage::default(),
+        token_usage: failure
+            .final_attempt
+            .as_ref()
+            .map_or_else(TokenUsage::default, |attempt| {
+                parse_token_usage(&attempt.response_body, &attempt.sse_body)
+            }),
         request_metadata: failure.request_metadata.clone(),
         response_metadata,
         raw_payloads: failure.raw_payloads.clone(),

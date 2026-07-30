@@ -1,8 +1,14 @@
+use std::collections::HashSet;
+
 use bytes::Bytes;
 use serde_json::Value;
 
 const MAX_CONSTRAINT_VALUE_CHARS: usize = 128;
 const MAX_RETRY_HINT_CHARS: usize = 256;
+const MAX_TEXT_BEARING_CHOICES: usize = 64;
+const MAX_CONSTRAINT_CANDIDATES: usize = 16;
+const MAX_FEEDBACK_PER_CHOICE: usize = 8;
+const MAX_REPAIR_FEEDBACK: usize = 8;
 const RETRY_HINT_PREFIX: &str = "llm-guard-proxy constraint-repair retry hint: ";
 const OUTPUT_CONSTRAINT_VERBS: [&str; 8] = [
     "write", "answer", "respond", "output", "produce", "return", "compose", "generate",
@@ -18,6 +24,35 @@ const OUTPUT_CONSTRAINT_VERBS: [&str; 8] = [
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ConstraintRepair {
     feedback: Vec<String>,
+}
+
+struct FeedbackCollector {
+    entries: Vec<String>,
+    seen: HashSet<String>,
+    limit: usize,
+}
+
+impl FeedbackCollector {
+    fn with_limit(limit: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            seen: HashSet::new(),
+            limit,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn into_entries(self) -> Vec<String> {
+        self.entries
+    }
+}
+
+enum CompletionTexts {
+    Texts(Vec<(usize, String)>),
+    TooMany,
 }
 
 impl ConstraintRepair {
@@ -58,7 +93,6 @@ pub(super) fn repair_context_for_response(
     completion_body: &Bytes,
 ) -> Option<ConstraintRepair> {
     let prompt = request_text(request_body)?;
-    let answers = completion_texts(completion_body)?;
     let lowered = prompt.to_ascii_lowercase();
 
     let anaphora = quoted_value_after(&prompt, &lowered, "every line must begin with the word");
@@ -67,9 +101,19 @@ pub(super) fn repair_context_for_response(
         return None;
     }
 
-    let mut feedback = Vec::new();
+    let answers = match completion_texts(completion_body)? {
+        CompletionTexts::Texts(answers) => answers,
+        CompletionTexts::TooMany => {
+            return Some(ConstraintRepair {
+                feedback: vec![String::from(
+                    "response contains too many textual choices to validate safely",
+                )],
+            });
+        }
+    };
+    let mut feedback = FeedbackCollector::with_limit(MAX_REPAIR_FEEDBACK);
     for (choice_index, answer) in answers {
-        let mut choice_feedback = Vec::new();
+        let mut choice_feedback = FeedbackCollector::with_limit(MAX_FEEDBACK_PER_CHOICE);
         let lines = non_empty_lines(&answer);
         validate_line_count(&lowered, &answer, &lines, &mut choice_feedback);
         validate_sentence_count(&lowered, &answer, &mut choice_feedback);
@@ -81,7 +125,7 @@ pub(super) fn repair_context_for_response(
         validate_line_word_counts(&lowered, &lines, &mut choice_feedback);
         validate_fixed_refrains(&prompt, &lowered, &lines, &mut choice_feedback);
         validate_snowball(&lowered, &answer, &lines, &mut choice_feedback);
-        for failure in choice_feedback {
+        for failure in choice_feedback.into_entries() {
             push_feedback(
                 &mut feedback,
                 format!("Choice {choice_index} violates: {failure}"),
@@ -89,7 +133,9 @@ pub(super) fn repair_context_for_response(
         }
     }
 
-    (!feedback.is_empty()).then_some(ConstraintRepair { feedback })
+    (!feedback.is_empty()).then_some(ConstraintRepair {
+        feedback: feedback.into_entries(),
+    })
 }
 
 fn request_text(request_body: &Bytes) -> Option<String> {
@@ -103,27 +149,29 @@ fn request_text(request_body: &Bytes) -> Option<String> {
         .and_then(content_text)
 }
 
-fn completion_texts(completion_body: &Bytes) -> Option<Vec<(usize, String)>> {
+fn completion_texts(completion_body: &Bytes) -> Option<CompletionTexts> {
     let value: Value = serde_json::from_slice(completion_body).ok()?;
     let choices = value.get("choices")?.as_array()?;
-    let texts = choices
-        .iter()
-        .enumerate()
-        .filter_map(|(array_index, choice)| {
-            let choice_index = choice
-                .get("index")
-                .and_then(Value::as_u64)
-                .and_then(|index| usize::try_from(index).ok())
-                .unwrap_or(array_index);
-            choice
-                .get("message")
-                .and_then(|message| message.get("content"))
-                .and_then(content_text)
-                .or_else(|| choice.get("text").and_then(content_text))
-                .map(|text| (choice_index, text))
-        })
-        .collect::<Vec<_>>();
-    (!texts.is_empty()).then_some(texts)
+    let mut texts = Vec::new();
+    for (array_index, choice) in choices.iter().enumerate() {
+        let choice_index = choice
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .unwrap_or(array_index);
+        if let Some(text) = choice
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(content_text)
+            .or_else(|| choice.get("text").and_then(content_text))
+        {
+            if texts.len() == MAX_TEXT_BEARING_CHOICES {
+                return Some(CompletionTexts::TooMany);
+            }
+            texts.push((choice_index, text));
+        }
+    }
+    (!texts.is_empty()).then_some(CompletionTexts::Texts(texts))
 }
 
 fn bounded_retry_feedback(feedback: &[String], max_chars: usize) -> String {
@@ -171,7 +219,7 @@ fn validate_line_count(
     lowered_prompt: &str,
     answer: &str,
     lines: &[&str],
-    feedback: &mut Vec<String>,
+    feedback: &mut FeedbackCollector,
 ) {
     let expected = expected_count(lowered_prompt, "line")
         .or_else(|| lowered_prompt.contains("single paragraph").then_some(1));
@@ -194,7 +242,7 @@ fn validate_line_count(
     }
 }
 
-fn validate_sentence_count(lowered_prompt: &str, answer: &str, feedback: &mut Vec<String>) {
+fn validate_sentence_count(lowered_prompt: &str, answer: &str, feedback: &mut FeedbackCollector) {
     let Some(expected) = expected_count(lowered_prompt, "sentence") else {
         return;
     };
@@ -213,7 +261,7 @@ fn validate_required_words(
     prompt: &str,
     lowered_prompt: &str,
     answer: &str,
-    feedback: &mut Vec<String>,
+    feedback: &mut FeedbackCollector,
 ) {
     for phrase in [
         "must contain the word",
@@ -235,7 +283,7 @@ fn validate_prohibited_characters(
     lowered_prompt: &str,
     answer: &str,
     prohibited_letter: Option<char>,
-    feedback: &mut Vec<String>,
+    feedback: &mut FeedbackCollector,
 ) {
     for (description, character, phrases) in [
         (
@@ -281,7 +329,7 @@ fn validate_prohibited_characters(
     }
 }
 
-fn validate_anaphora(prefix: Option<&str>, lines: &[&str], feedback: &mut Vec<String>) {
+fn validate_anaphora(prefix: Option<&str>, lines: &[&str], feedback: &mut FeedbackCollector) {
     let Some(prefix) = prefix else {
         return;
     };
@@ -300,7 +348,7 @@ fn validate_acrostic(
     prompt: &str,
     lowered_prompt: &str,
     lines: &[&str],
-    feedback: &mut Vec<String>,
+    feedback: &mut FeedbackCollector,
 ) {
     let Some(target) = word_after(prompt, lowered_prompt, "acrostic spelling") else {
         return;
@@ -327,7 +375,7 @@ fn validate_acrostic(
     }
 }
 
-fn validate_telestich(lowered_prompt: &str, lines: &[&str], feedback: &mut Vec<String>) {
+fn validate_telestich(lowered_prompt: &str, lines: &[&str], feedback: &mut FeedbackCollector) {
     if !lowered_prompt.contains("telestich") {
         return;
     }
@@ -350,7 +398,11 @@ fn validate_telestich(lowered_prompt: &str, lines: &[&str], feedback: &mut Vec<S
     }
 }
 
-fn validate_line_word_counts(lowered_prompt: &str, lines: &[&str], feedback: &mut Vec<String>) {
+fn validate_line_word_counts(
+    lowered_prompt: &str,
+    lines: &[&str],
+    feedback: &mut FeedbackCollector,
+) {
     if let Some(expected) = number_after(lowered_prompt, "every line must contain exactly") {
         for (index, line) in lines.iter().enumerate() {
             if word_count(line) != expected {
@@ -386,7 +438,7 @@ fn validate_fixed_refrains(
     prompt: &str,
     lowered_prompt: &str,
     lines: &[&str],
-    feedback: &mut Vec<String>,
+    feedback: &mut FeedbackCollector,
 ) {
     for (first, second, expected) in fixed_refrains(prompt, lowered_prompt) {
         let first_actual = lines.get(first.saturating_sub(1)).map(|line| line.trim());
@@ -404,12 +456,12 @@ fn validate_snowball(
     lowered_prompt: &str,
     answer: &str,
     lines: &[&str],
-    feedback: &mut Vec<String>,
+    feedback: &mut FeedbackCollector,
 ) {
     if !lowered_prompt.contains("snowball") || !lowered_prompt.contains("successive word") {
         return;
     }
-    let expected_words = expected_count(lowered_prompt, "word").unwrap_or(0);
+    let expected_words = snowball_expected_word_count(lowered_prompt).unwrap_or(0);
     if expected_words == 0 || snowball_is_valid(answer, lines, expected_words) {
         return;
     }
@@ -449,20 +501,34 @@ fn is_explicit_output_count(value: &str, number_start: usize, marker: &str) -> b
         .rfind(['.', '!', '?', '\n'])
         .map_or(0, |index| index.saturating_add(1));
     let instruction = &before_number[clause_start..];
-    if !contains_output_constraint_verb(instruction) {
-        return false;
-    }
-
     let before_number = instruction.trim_end();
-    marker.starts_with('-')
-        || before_number.ends_with("exactly")
-        || output_constraint_verb_immediately_precedes(before_number)
+    output_constraint_verb_immediately_precedes(before_number)
+        || before_number
+            .strip_suffix("exactly")
+            .is_some_and(|prefix| output_constraint_verb_precedes_exactly(prefix.trim_end()))
+        || (marker.starts_with('-') && is_explicit_hyphenated_output_count(before_number))
 }
 
-fn contains_output_constraint_verb(value: &str) -> bool {
-    value
+fn output_constraint_verb_precedes_exactly(value: &str) -> bool {
+    let mut words = value
+        .rsplit(|character: char| !character.is_ascii_alphabetic())
+        .filter(|word| !word.is_empty());
+    let immediately_before_exactly = words.next();
+    let candidate = match immediately_before_exactly {
+        Some("in" | "with" | "as") => words.next(),
+        other => other,
+    };
+    candidate.is_some_and(|word| OUTPUT_CONSTRAINT_VERBS.contains(&word))
+}
+
+fn is_explicit_hyphenated_output_count(value: &str) -> bool {
+    let mut words = value
         .split(|character: char| !character.is_ascii_alphabetic())
-        .any(|word| OUTPUT_CONSTRAINT_VERBS.contains(&word))
+        .filter(|word| !word.is_empty());
+    let Some(first) = words.next() else {
+        return false;
+    };
+    OUTPUT_CONSTRAINT_VERBS.contains(&first) && !words.any(|word| word == "of")
 }
 
 fn output_constraint_verb_immediately_precedes(value: &str) -> bool {
@@ -475,6 +541,22 @@ fn output_constraint_verb_immediately_precedes(value: &str) -> bool {
 fn number_after(value: &str, needle: &str) -> Option<usize> {
     let start = value.find(needle)?.saturating_add(needle.len());
     parse_number_at(&value[start..]).map(|(number, _consumed)| number)
+}
+
+fn snowball_expected_word_count(lowered_prompt: &str) -> Option<usize> {
+    let snowball_start = lowered_prompt.find("snowball")?;
+    let snowball_instruction = &lowered_prompt[snowball_start..];
+    snowball_instruction
+        .match_indices("exactly")
+        .take(MAX_CONSTRAINT_CANDIDATES)
+        .find_map(|(index, _)| {
+            let after_exactly = &snowball_instruction[index + "exactly".len()..];
+            let (count, consumed) = parse_number_at(after_exactly)?;
+            after_exactly[consumed..]
+                .trim_start()
+                .starts_with("word")
+                .then_some(count)
+        })
 }
 
 fn parse_number_at(value: &str) -> Option<(usize, usize)> {
@@ -661,7 +743,12 @@ fn telestich_ending_letters(lowered_prompt: &str) -> Vec<char> {
     };
     let mut expected = Vec::new();
     let mut remaining = &lowered_prompt[start..];
-    while let Some(with_index) = remaining.find("with") {
+    let mut candidates = 0;
+    while candidates < MAX_CONSTRAINT_CANDIDATES {
+        let Some(with_index) = remaining.find("with") else {
+            break;
+        };
+        candidates = candidates.saturating_add(1);
         let after_with = &remaining[with_index + "with".len()..];
         let mut words = after_with
             .split(|character: char| !character.is_ascii_alphabetic())
@@ -694,14 +781,19 @@ fn single_ascii_letter(value: &str) -> Option<char> {
 fn explicit_line_word_counts(lowered_prompt: &str) -> Vec<(usize, usize)> {
     let mut counts = Vec::new();
     let mut remaining = lowered_prompt;
-    while let Some(index) = remaining.find("line ") {
+    let mut candidates = 0;
+    while candidates < MAX_CONSTRAINT_CANDIDATES {
+        let Some(index) = remaining.find("line ") else {
+            break;
+        };
+        candidates = candidates.saturating_add(1);
         let after_line = &remaining[index + "line ".len()..];
         let Some((line_number, line_number_bytes)) = parse_number_at(after_line) else {
-            remaining = &after_line[1.min(after_line.len())..];
+            remaining = after_first_char(after_line);
             continue;
         };
         let after_number = &after_line[line_number_bytes..];
-        let lookahead = &after_number[..after_number.len().min(40)];
+        let lookahead = char_prefix(after_number, 40);
         if let Some(exactly_index) = lookahead.find("exactly")
             && let Some((word_count, _word_count_bytes)) =
                 parse_number_at(&lookahead[exactly_index + "exactly".len()..])
@@ -709,9 +801,23 @@ fn explicit_line_word_counts(lowered_prompt: &str) -> Vec<(usize, usize)> {
         {
             counts.push((line_number, word_count));
         }
-        remaining = &after_line[1.min(after_line.len())..];
+        remaining = after_first_char(after_line);
     }
     counts
+}
+
+fn after_first_char(value: &str) -> &str {
+    value
+        .char_indices()
+        .nth(1)
+        .map_or("", |(index, _character)| &value[index..])
+}
+
+fn char_prefix(value: &str, max_chars: usize) -> &str {
+    value
+        .char_indices()
+        .nth(max_chars)
+        .map_or(value, |(index, _character)| &value[..index])
 }
 
 fn word_count(line: &str) -> usize {
@@ -721,7 +827,12 @@ fn word_count(line: &str) -> usize {
 fn fixed_refrains(prompt: &str, lowered_prompt: &str) -> Vec<(usize, usize, String)> {
     let mut refrains = Vec::new();
     let mut offset = 0;
-    while let Some(relative_index) = lowered_prompt[offset..].find("line ") {
+    let mut candidates = 0;
+    while candidates < MAX_CONSTRAINT_CANDIDATES {
+        let Some(relative_index) = lowered_prompt[offset..].find("line ") else {
+            break;
+        };
+        candidates = candidates.saturating_add(1);
         let line_start = offset + relative_index;
         let after_first = &lowered_prompt[line_start + "line ".len()..];
         let Some((first, first_bytes)) = parse_number_at(after_first) else {
@@ -744,11 +855,20 @@ fn fixed_refrains(prompt: &str, lowered_prompt: &str) -> Vec<(usize, usize, Stri
             .saturating_add(and_line_index)
             .saturating_add("and line ".len())
             .saturating_add(second_bytes);
-        let Some(colon_relative) = lowered_prompt[search_after_second..].find(':') else {
+        let remainder = &lowered_prompt[search_after_second..];
+        let clause_end = remainder
+            .find(['.', '!', '?', '\n'])
+            .unwrap_or(remainder.len());
+        let relation = &remainder[..clause_end];
+        let Some(colon_relative) = relation.find(':') else {
             offset = search_after_second;
             continue;
         };
         let colon = search_after_second + colon_relative;
+        if !is_explicit_fixed_refrain_relation(&relation[..colon_relative]) {
+            offset = colon.saturating_add(1);
+            continue;
+        }
         let target = bounded_refrain_target(&prompt[colon.saturating_add(1)..]);
         if let Some(target) = target {
             refrains.push((first, second, target));
@@ -756,6 +876,13 @@ fn fixed_refrains(prompt: &str, lowered_prompt: &str) -> Vec<(usize, usize, Stri
         offset = colon.saturating_add(1);
     }
     refrains
+}
+
+fn is_explicit_fixed_refrain_relation(value: &str) -> bool {
+    value.contains("must")
+        && ["equal", "match", "same", "identical"]
+            .into_iter()
+            .any(|identity_word| value.contains(identity_word))
 }
 
 fn bounded_refrain_target(value: &str) -> Option<String> {
@@ -799,9 +926,9 @@ fn snowball_is_valid(answer: &str, lines: &[&str], expected_words: usize) -> boo
         })
 }
 
-fn push_feedback(feedback: &mut Vec<String>, message: String) {
-    if !feedback.iter().any(|current| current == &message) {
-        feedback.push(message);
+fn push_feedback(feedback: &mut FeedbackCollector, message: String) {
+    if feedback.entries.len() < feedback.limit && feedback.seen.insert(message.clone()) {
+        feedback.entries.push(message);
     }
 }
 
@@ -1045,6 +1172,35 @@ mod tests {
     }
 
     #[test]
+    fn ignores_descriptive_counts_and_unrelated_line_references() {
+        let descriptive_count = "Write a critique of exactly 2 sentences quoted below.";
+        assert!(
+            repair_context_for_response(
+                &request_body(descriptive_count),
+                &completion_body("One concise critique sentence."),
+            )
+            .is_none(),
+            "a count that describes quoted input must not constrain generated output"
+        );
+
+        let descriptive_lines =
+            "Write a critique of line 1 and line 2 in this poem. Focus on imagery: the moon rises.";
+        let lowered = descriptive_lines.to_ascii_lowercase();
+        assert!(
+            fixed_refrains(descriptive_lines, &lowered).is_empty(),
+            "unrelated line references must not synthesize a fixed refrain"
+        );
+        assert!(
+            repair_context_for_response(
+                &request_body(descriptive_lines),
+                &completion_body("The imagery contrasts motion and stillness."),
+            )
+            .is_none(),
+            "a critique prompt must not retry because a later colon looks like a refrain target"
+        );
+    }
+
+    #[test]
     fn validates_every_textual_completion_choice() {
         let repair = repair_context_for_response(
             &request_body("Write exactly 2 lines."),
@@ -1116,6 +1272,23 @@ mod tests {
             many_choice_hint.contains("Re-read the original user message for literal targets."),
             "the fixed instruction must survive feedback truncation"
         );
+        assert!(
+            many_choice_repair.feedback().len() <= MAX_REPAIR_FEEDBACK,
+            "aggregated feedback must remain bounded across choices"
+        );
+
+        let too_many_choices = vec!["Only one line"; MAX_TEXT_BEARING_CHOICES + 1];
+        let too_many_choice_repair = repair_context_for_response(
+            &request_body("Write exactly 2 lines."),
+            &completion_body_with_choices(&too_many_choices),
+        )
+        .expect("too many textual choices must fail closed rather than evade validation");
+        assert_eq!(too_many_choice_repair.feedback().len(), 1);
+        assert_eq!(
+            too_many_choice_repair.feedback()[0],
+            "response contains too many textual choices to validate safely",
+            "choice validation must have an explicit hard cap"
+        );
 
         let oversized = "x".repeat(129);
         let oversized_prompt = format!("The answer must include the word '{oversized}'.");
@@ -1129,6 +1302,29 @@ mod tests {
         assert!(
             fixed_refrains(&oversized_refrain_prompt, &lowered_refrain).is_empty(),
             "fixed refrain extraction must reject unbounded values"
+        );
+    }
+
+    #[test]
+    fn parses_unicode_constraint_text_without_byte_boundary_panics() {
+        let malformed_prefix = "line “你好” then line 1 must contain exactly two words";
+        assert_eq!(explicit_line_word_counts(malformed_prefix), vec![(1, 2)]);
+
+        let lookahead = format!("line 1 {} exactly two words", "你".repeat(14));
+        let parsed = std::panic::catch_unwind(|| explicit_line_word_counts(&lookahead));
+        assert!(
+            parsed.is_ok(),
+            "UTF-8 lookahead truncation must stay on a boundary"
+        );
+
+        let bounded_constraints = (1..=MAX_CONSTRAINT_CANDIDATES + 4)
+            .map(|line| format!("line {line} must contain exactly one word"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert_eq!(
+            explicit_line_word_counts(&bounded_constraints).len(),
+            MAX_CONSTRAINT_CANDIDATES,
+            "explicit per-line constraints must have a hard candidate cap"
         );
     }
 }
