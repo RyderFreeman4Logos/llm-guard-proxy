@@ -81,11 +81,28 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
 
     def test_operator_idle_timeout_must_exceed_conservative_hold_bound(self) -> None:
         minimum = self.preflight.minimum_downstream_idle_timeout_ms(self.config)
-        self.assertEqual(minimum, 3_900_000)
-        errors, _ = self.preflight.validate_snapshot(self.config, minimum)
-        self.assertTrue(any("strictly greater" in error for error in errors))
+        self.assertEqual(minimum, 3_901_000)
+        for rejected in (minimum - 1, minimum):
+            with self.subTest(rejected=rejected):
+                errors, _ = self.preflight.validate_snapshot(self.config, rejected)
+                self.assertTrue(any("strictly greater" in error for error in errors))
         errors, _ = self.preflight.validate_snapshot(self.config, minimum + 1)
         self.assertEqual(errors, [])
+
+    def test_hold_bound_derives_completion_guard_and_final_replay(self) -> None:
+        retry_deadline = self.config["retry"]["request_deadline_ms"]
+        route = self.config["upstream"]
+        recovery = route["local_recovery"]
+        expected = (
+            retry_deadline
+            + route["request_timeout_ms"]
+            + recovery["restart_timeout_ms"]
+            + recovery["readiness_deadline_ms"]
+            + self.preflight.RECOVERY_COMPLETION_GUARD_MS
+        )
+        self.assertEqual(
+            self.preflight.minimum_downstream_idle_timeout_ms(self.config), expected
+        )
 
 
 if __name__ == "__main__":

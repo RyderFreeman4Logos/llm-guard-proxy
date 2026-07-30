@@ -21,6 +21,7 @@ AEON_RESTART_COMMAND = [
     "restart",
     "vllm-aeon-27b-dflash-n12.service",
 ]
+RECOVERY_COMPLETION_GUARD_MS = 1_000
 
 
 def load_config(path: Path) -> dict[str, JsonValue]:
@@ -86,6 +87,7 @@ def _recovery_errors(label: str, recovery: dict[str, JsonValue]) -> list[str]:
 
 
 def minimum_downstream_idle_timeout_ms(config: dict[str, JsonValue]) -> int | None:
+    """Return the strict byte-silent bound including recovery handoff and replay."""
     retry = _table(config, "retry")
     request_deadline = _positive_int(retry, "request_deadline_ms")
     default_upstream = _table(config, "upstream")
@@ -115,7 +117,14 @@ def minimum_downstream_idle_timeout_ms(config: dict[str, JsonValue]) -> int | No
         readiness_deadline = _positive_int(recovery, "readiness_deadline_ms")
         if request_timeout is None or restart_timeout is None or readiness_deadline is None:
             return None
-        route_bounds.append(request_timeout + restart_timeout + readiness_deadline)
+        # A final physical replay may consume request_timeout after restart,
+        # readiness, and the runtime's completion-publication handoff guard.
+        route_bounds.append(
+            request_timeout
+            + restart_timeout
+            + readiness_deadline
+            + RECOVERY_COMPLETION_GUARD_MS
+        )
     return request_deadline + max(route_bounds)
 
 

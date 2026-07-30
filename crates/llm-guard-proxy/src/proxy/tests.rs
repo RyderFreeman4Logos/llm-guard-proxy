@@ -7758,7 +7758,7 @@ max_per_window = 1
 }
 
 #[tokio::test]
-async fn local_recovery_replays_after_request_deadline_recovery_when_enabled() {
+async fn local_recovery_request_deadline_never_resets_total_budget_when_enabled() {
     let mut fake = FakeUpstream::spawn().await;
     let recovery_root = unique_test_dir("local-recovery-deadline-replay");
     fs::create_dir_all(&recovery_root).expect("recovery root should be created");
@@ -7808,30 +7808,26 @@ max_per_window = 1
         .await
         .expect("proxy request should complete");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let aggregated = shielded_final_json(response).await;
-    assert_eq!(aggregated["choices"][0]["message"]["content"], "Hello");
-    assert!(recovery_marker.exists());
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    response
+        .bytes()
+        .await
+        .expect("deadline failure body should drain");
+    assert!(
+        !recovery_marker.exists(),
+        "an exhausted total deadline must not start recovery"
+    );
 
     let first = fake.recv_next().await;
-    let probe = fake.recv_next().await;
-    let replay = fake.recv_next().await;
     assert_eq!(
         first.path_and_query,
         "/v1/chat/completions?test=stall-once-then-success"
     );
-    assert_eq!(probe.path_and_query, "/v1/chat/completions");
-    assert!(body_contains_text(&probe.body, "deadline recovery ready"));
-    assert_eq!(
-        replay.path_and_query,
-        "/v1/chat/completions?test=stall-once-then-success"
-    );
-    assert_eq!(first.body, replay.body);
     assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
 
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
     assert_eq!(
         attempts[0].abort_reason.as_deref(),
         Some(REQUEST_DEADLINE_ABORT_REASON)
@@ -7842,13 +7838,12 @@ max_per_window = 1
     );
     assert_eq!(
         attempts[0].response_metadata["local_recovery_status"],
-        "succeeded"
+        "skipped_request_deadline_exhausted"
     );
     assert_eq!(
         attempts[0].response_metadata["local_recovery_permits_retry"],
-        "true"
+        "false"
     );
-    assert_eq!(attempts[1].status, "succeeded");
 
     remove_dir_all(&recovery_root);
 }
@@ -20964,6 +20959,11 @@ async fn fake_upstream_handler(
         && let Some(pre_response_delay) = state.pre_response_delay
     {
         sleep(pre_response_delay).await;
+    } else if path_and_query.contains("test=generic-429-then-timeout-then-success") {
+        let delay_key = format!("delay:{path_and_query}");
+        if next_fake_attempt_count(&state, &delay_key) == 2 {
+            sleep(Duration::from_millis(150)).await;
+        }
     } else if path_and_query.contains("test=generic-timeout-once-then-success")
         || path_and_query.contains("test=generic-delayed-503-once-then-success")
     {
@@ -21140,7 +21140,9 @@ fn fake_generic_recovery_chat_completion_response(
     state: &FakeUpstreamState,
     body: &Bytes,
 ) -> Option<Response<Body>> {
-    if path_and_query.contains("test=generic-429-once-then-success") {
+    if path_and_query.contains("test=generic-429-once-then-success")
+        || path_and_query.contains("test=generic-429-then-timeout-then-success")
+    {
         if next_fake_attempt_count(state, path_and_query) == 1 {
             let mut response = upstream_status_json_response(StatusCode::TOO_MANY_REQUESTS);
             response

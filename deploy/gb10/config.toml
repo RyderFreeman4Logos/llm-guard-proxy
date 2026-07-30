@@ -643,7 +643,9 @@ default_injection_schema = "vllm_native"
 ## shielding holds all bytes until an attempt is accepted, so effective
 ## pre-commit liveness is "held" and the emitted heartbeat count is zero.
 ## Operators must configure every downstream idle timeout above the conservative
-## hold bound checked by deploy/gb10/preflight-config.py.
+## hold bound checked by deploy/gb10/preflight-config.py: retry request deadline
+## plus the longest route's final request timeout, restart timeout, readiness
+## deadline, and the 1,000 ms recovery completion-publication guard.
 
 [heartbeat]
 mode = "sse"                               # Final accepted response uses SSE framing

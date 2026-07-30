@@ -44,16 +44,15 @@ pub(super) async fn complete(
 
         let (next_attempt_number, mut completed_attempts) =
             status_retry_attempt_history(context, &current, BTreeMap::new());
-        current = match send_generic_upstream_attempt(context, next_attempt_number).await {
+        let retried = match send_generic_upstream_attempt(context, next_attempt_number).await {
             Ok(mut retried) => {
                 completed_attempts.append(&mut retried.completed_attempt_records);
                 retried.completed_attempt_records = completed_attempts;
-                recover_and_replay(context, Ok(retried)).await?
+                Ok(retried)
             }
-            Err(error) => {
-                return Err(error.with_completed_attempt_records(completed_attempts));
-            }
+            Err(error) => Err(error.with_completed_attempt_records(completed_attempts)),
         };
+        current = recover_and_replay(context, retried).await?;
     }
 }
 
@@ -92,6 +91,7 @@ async fn recover_and_replay(
             attempts: &context.local_recovery_attempts,
             downstream_commit_signal: None,
             downstream_drop_signal: None,
+            request_deadline: context.request_deadline,
             episode_timeout: context.upstream_profile.restart_queue.enabled.then(|| {
                 Duration::from_secs(context.upstream_profile.restart_queue.restart_timeout_secs)
             }),
@@ -100,7 +100,7 @@ async fn recover_and_replay(
         cause,
     )
     .await;
-    if !gate.permits_deadline_replay || context.request_deadline.is_exhausted() {
+    if !gate.permits_replay || context.request_deadline.is_exhausted() {
         return match first {
             Ok(mut sent) => {
                 sent.attempt_request_metadata.extend(gate.metadata);

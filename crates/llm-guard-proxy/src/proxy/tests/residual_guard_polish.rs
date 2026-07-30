@@ -387,6 +387,105 @@ max_per_window = 20
 }
 
 #[tokio::test]
+async fn generic_429_then_transport_timeout_recovers_and_replays_once() {
+    let recovery_root = unique_test_dir("generic-429-transport-recovery");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let marker = recovery_root.join("restart-ran");
+    let mut fake = FakeUpstream::spawn().await;
+    let config = format!(
+        r#"
+[shielding]
+enabled = false
+
+[upstream]
+request_timeout_ms = 50
+
+[upstream.hot_restart]
+enabled = false
+
+[retry]
+max_attempts = 2
+request_deadline_ms = 3000
+max_retry_after_secs = 1
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/touch", "{}"]
+restart_timeout_ms = 500
+readiness_body = {{"model":"test-chat","messages":[],"max_tokens":1}}
+readiness_request_timeout_ms = 500
+readiness_deadline_ms = 1000
+readiness_interval_ms = 10
+max_attempts_per_request = 1
+cooldown_ms = 1
+budget_window_ms = 10000
+max_per_window = 20
+"#,
+        marker.display()
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &config,
+    )
+    .await;
+    let client = proxy.client.clone();
+    let request_url = format!(
+        "{}/v1/chat/completions?test=generic-429-then-timeout-then-success",
+        proxy.base_url
+    );
+    let request = tokio::spawn(async move {
+        client
+            .post(request_url)
+            .json(&json!({"model":"test-chat","messages":[]}))
+            .send()
+            .await
+    });
+
+    let first = fake.recv_next().await;
+    sleep(Duration::from_millis(100)).await;
+    assert!(
+        !marker.exists(),
+        "the valid bounded 429 itself must not start local recovery"
+    );
+    let response = request
+        .await
+        .expect("request task should join")
+        .expect("recovered request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response should drain");
+
+    let timed_out = fake.recv_next().await;
+    let readiness = fake.recv_next().await;
+    let replay = fake.recv_next().await;
+    assert_eq!(first.path_and_query, timed_out.path_and_query);
+    assert_eq!(readiness.path_and_query, "/v1/chat/completions");
+    assert_eq!(replay.path_and_query, first.path_and_query);
+    assert!(marker.exists());
+    assert!(fake.recv_within(Duration::from_millis(200)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0].http_status, Some(429));
+    assert_eq!(
+        attempts[0].retry_reason.as_deref(),
+        Some("transient_upstream_status")
+    );
+    assert_eq!(attempts[1].retry_reason.as_deref(), Some("local_recovery"));
+    assert_eq!(
+        attempts[1].response_metadata["local_recovery_cause"],
+        "transient_transport"
+    );
+    assert_eq!(
+        attempts[1].response_metadata["local_recovery_request_attempts_used"],
+        "1"
+    );
+    assert_eq!(attempts[2].status, "succeeded");
+    remove_dir_all(&recovery_root);
+}
+
+#[tokio::test]
 async fn generic_connect_failure_enters_recovery_but_failed_readiness_prevents_replay() {
     let recovery_root = unique_test_dir("generic-connect-recovery");
     fs::create_dir_all(&recovery_root).expect("recovery root should be created");
@@ -457,6 +556,199 @@ max_per_window = 20
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
     assert_eq!(attempts.len(), 1, "failed readiness must prevent replay");
     remove_dir_all(&recovery_root);
+}
+
+#[tokio::test]
+async fn generic_recovery_cannot_outlive_total_request_deadline() {
+    let mut fake = FakeUpstream::spawn().await;
+    let config = r#"
+[shielding]
+enabled = false
+
+[upstream]
+request_timeout_ms = 1000
+
+[upstream.hot_restart]
+enabled = false
+
+[retry]
+max_attempts = 1
+request_deadline_ms = 80
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/bin/sleep", "0.4"]
+restart_timeout_ms = 1000
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 10
+max_attempts_per_request = 1
+cooldown_ms = 1
+budget_window_ms = 10000
+max_per_window = 20
+"#;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        config,
+    )
+    .await;
+    let started = Instant::now();
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=generic-503-once-then-success",
+            proxy.base_url
+        ))
+        .json(&json!({"model":"test-chat","messages":[]}))
+        .send()
+        .await
+        .expect("deadline-bounded generic request should complete");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _deadline_terminated_body = response.bytes().await;
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "generic recovery must be bounded by the original total deadline"
+    );
+    let _first = fake.recv_next().await;
+    assert!(fake.recv_within(Duration::from_millis(450)).await.is_none());
+}
+
+#[tokio::test]
+async fn shielded_recovery_cannot_replay_after_total_request_deadline() {
+    let mut fake = FakeUpstream::spawn().await;
+    let config = r#"
+[heartbeat]
+mode = "disabled"
+
+[upstream.hot_restart]
+enabled = false
+
+[retry]
+max_attempts = 1
+request_deadline_ms = 80
+anti_loop_hint_enabled = false
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/bin/sleep", "0.4"]
+restart_timeout_ms = 1000
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 10
+max_attempts_per_request = 1
+cooldown_ms = 1
+budget_window_ms = 10000
+max_per_window = 20
+"#;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        config,
+    )
+    .await;
+    let started = Instant::now();
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=transient-503-then-success",
+            proxy.base_url
+        ))
+        .json(&json!({"model":"test-chat","messages":[]}))
+        .send()
+        .await
+        .expect("deadline-bounded shielded request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    response.bytes().await.expect("response should drain");
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "shielded recovery must be bounded by the original total deadline"
+    );
+    let _first = fake.recv_next().await;
+    assert!(fake.recv_within(Duration::from_millis(450)).await.is_none());
+}
+
+#[tokio::test]
+async fn singleflight_joiner_deadline_expires_without_late_replay_permit() {
+    let fake = FakeUpstream::spawn().await;
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    let recovery_episode_id = {
+        let mut state = coordinator.state.lock().await;
+        state.running = true;
+        let now = Instant::now();
+        state.recovery_started = Some(now);
+        state.recovery_deadline = Some(now + Duration::from_secs(1));
+        state
+            .ensure_active_recovery_episode()
+            .expect("running recovery must have an episode")
+    };
+    let completing_coordinator = Arc::clone(&coordinator);
+    let completion = tokio::spawn(async move {
+        sleep(Duration::from_millis(100)).await;
+        finish_local_recovery_episode(
+            &completing_coordinator,
+            recovery_episode_id,
+            BTreeMap::from([(
+                String::from("local_recovery_status"),
+                String::from("succeeded"),
+            )]),
+        )
+        .await
+    });
+    let policy = LocalRecoveryPolicy {
+        enabled: true,
+        trigger_on_request_deadline: false,
+        restart_command: vec![String::from("/bin/true")],
+        restart_timeout: Duration::from_secs(1),
+        readiness_endpoint: String::from("/v1/chat/completions"),
+        readiness_body: json!({"model":"test-chat","messages":[],"max_tokens":1}),
+        readiness_request_timeout: Duration::from_secs(1),
+        readiness_deadline: Duration::from_secs(1),
+        readiness_interval: Duration::from_millis(10),
+        max_attempts_per_request: 1,
+        cooldown: Duration::from_millis(1),
+        budget_window: Duration::from_secs(10),
+        max_per_window: 20,
+    };
+    let attempts = AtomicU64::new(0);
+    let request_deadline = RequestDeadline::from_started_at(
+        Instant::now()
+            .checked_sub(Duration::from_millis(30))
+            .expect("test instant should support a short adjustment"),
+        Duration::from_millis(50),
+    );
+    let started = Instant::now();
+    let gate = precommit_recovery::gate(
+        precommit_recovery::Context {
+            policy: &policy,
+            coordinator: &coordinator,
+            client: build_http_client().expect("test client should build"),
+            base_url: &fake.base_url,
+            profile_name: "default",
+            attempts: &attempts,
+            downstream_commit_signal: None,
+            downstream_drop_signal: None,
+            request_deadline,
+            episode_timeout: None,
+        },
+        false,
+        LocalRecoveryCause::TransientTransport,
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_millis(80));
+    assert!(gate.applied);
+    assert!(!gate.permits_replay);
+    assert_eq!(gate.metadata["local_recovery_status"], "join_timeout");
+    assert!(
+        completion.await.expect("completion task should join"),
+        "the shared episode should still publish its later success"
+    );
+    assert!(
+        !gate.permits_replay,
+        "later singleflight completion must not mutate an expired joiner's replay decision"
+    );
 }
 
 #[tokio::test]
@@ -608,7 +900,7 @@ async fn generic_deadline_and_caller_scoped_statuses_do_not_restart() {
         (
             "deadline",
             "\n[shielding]\nenabled = false\n",
-            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_GATEWAY,
             None,
         ),
         (
