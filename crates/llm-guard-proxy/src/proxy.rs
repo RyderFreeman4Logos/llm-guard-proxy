@@ -8030,8 +8030,11 @@ async fn run_watchdog_recovery(
             endpoint.client,
             endpoint.base_url,
             watchdog_recovery_cause(),
-            episode_timeout,
-            Some(&recovery_episode_observer),
+            LocalRecoveryRunOptions {
+                episode_timeout,
+                recovery_episode_observer: Some(&recovery_episode_observer),
+                downstream_commit_signal: None,
+            },
         )
         .await
     });
@@ -11153,11 +11156,10 @@ async fn local_recovery_gate(
     if runtime.downstream_drop_signal.is_dropped() {
         return skipped_local_recovery_gate(metadata, "skipped_downstream_dropped", false);
     }
-    if runtime.downstream_commit_signal.is_committed() {
-        metadata.insert(
-            String::from("local_recovery_replay_skipped_downstream_committed"),
-            String::from("true"),
-        );
+    if local_recovery_downstream_commit_observed(
+        Some(&runtime.downstream_commit_signal),
+        &mut metadata,
+    ) {
         return skipped_local_recovery_gate(metadata, "skipped_downstream_committed", false);
     }
     let previous_attempts = runtime
@@ -11185,6 +11187,15 @@ async fn local_recovery_gate(
 
     let recovery_metadata = run_local_recovery(runtime, cause).await;
     metadata.extend(recovery_metadata);
+    if runtime.downstream_drop_signal.is_dropped() {
+        return skipped_local_recovery_gate(metadata, "skipped_downstream_dropped", false);
+    }
+    if local_recovery_downstream_commit_observed(
+        Some(&runtime.downstream_commit_signal),
+        &mut metadata,
+    ) {
+        return skipped_local_recovery_gate(metadata, "skipped_downstream_committed", false);
+    }
     let permits_retry = local_recovery_permits_retry(&metadata);
     // Any successful local recovery re-opens a replay attempt, not only the
     // request-deadline path. Ladder exhaustion must not strand a recovered
@@ -11200,6 +11211,27 @@ async fn local_recovery_gate(
         permits_retry.to_string(),
     );
     applied_local_recovery_gate(metadata, permits_retry, permits_deadline_replay)
+}
+
+/// A non-empty liveness/final output commits the response. Every recovery
+/// combine site must re-observe it after an await before starting upstream work
+/// or authorizing a replay.
+fn local_recovery_downstream_commit_observed(
+    downstream_commit_signal: Option<&DownstreamCommitSignal>,
+    metadata: &mut BTreeMap<String, String>,
+) -> bool {
+    if !downstream_commit_signal.is_some_and(DownstreamCommitSignal::is_committed) {
+        return false;
+    }
+    metadata.insert(
+        String::from("local_recovery_replay_skipped_downstream_committed"),
+        String::from("true"),
+    );
+    metadata.insert(
+        String::from("local_recovery_status"),
+        String::from("skipped_downstream_committed"),
+    );
+    true
 }
 
 fn unapplied_local_recovery_gate() -> LocalRecoveryGate {
@@ -11288,6 +11320,12 @@ fn consume_local_recovery_deadline_replay_permit(runtime: &ShieldedRetryRuntime)
         .is_ok()
 }
 
+struct LocalRecoveryRunOptions<'a> {
+    episode_timeout: Option<Duration>,
+    recovery_episode_observer: Option<&'a AtomicU64>,
+    downstream_commit_signal: Option<DownstreamCommitSignal>,
+}
+
 async fn run_local_recovery(
     runtime: &ShieldedRetryRuntime,
     cause: LocalRecoveryCause,
@@ -11296,17 +11334,19 @@ async fn run_local_recovery(
     let episode_timeout = restart_queue
         .enabled
         .then(|| Duration::from_secs(restart_queue.restart_timeout_secs));
-    run_local_recovery_for_profile(
+    run_local_recovery_for_profile_with_downstream_commit(
         &runtime.local_recovery_policy,
         &runtime.local_recovery,
         runtime.client.clone(),
         runtime.upstream_profile.primary_base_url().to_owned(),
         cause,
         episode_timeout,
+        Some(runtime.downstream_commit_signal.clone()),
     )
     .await
 }
 
+#[cfg(test)]
 async fn run_local_recovery_for_profile(
     policy: &LocalRecoveryPolicy,
     coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
@@ -11315,7 +11355,7 @@ async fn run_local_recovery_for_profile(
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
 ) -> BTreeMap<String, String> {
-    run_local_recovery_for_profile_observing(
+    run_local_recovery_for_profile_with_downstream_commit(
         policy,
         coordinator,
         client,
@@ -11327,14 +11367,37 @@ async fn run_local_recovery_for_profile(
     .await
 }
 
-async fn run_local_recovery_for_profile_observing(
+async fn run_local_recovery_for_profile_with_downstream_commit(
     policy: &LocalRecoveryPolicy,
     coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
     client: Client,
     base_url: String,
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
-    recovery_episode_observer: Option<&AtomicU64>,
+    downstream_commit_signal: Option<DownstreamCommitSignal>,
+) -> BTreeMap<String, String> {
+    run_local_recovery_for_profile_observing(
+        policy,
+        coordinator,
+        client,
+        base_url,
+        cause,
+        LocalRecoveryRunOptions {
+            episode_timeout,
+            recovery_episode_observer: None,
+            downstream_commit_signal,
+        },
+    )
+    .await
+}
+
+async fn run_local_recovery_for_profile_observing(
+    policy: &LocalRecoveryPolicy,
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+    client: Client,
+    base_url: String,
+    cause: LocalRecoveryCause,
+    options: LocalRecoveryRunOptions<'_>,
 ) -> BTreeMap<String, String> {
     let mut state = coordinator.state.lock().await;
     if state.running {
@@ -11344,7 +11407,7 @@ async fn run_local_recovery_for_profile_observing(
                 String::from("episode_id_exhausted"),
             )]);
         };
-        if let Some(observer) = recovery_episode_observer {
+        if let Some(observer) = options.recovery_episode_observer {
             observer.store(recovery_episode_id, Ordering::Release);
         }
         drop(state);
@@ -11403,7 +11466,7 @@ async fn run_local_recovery_for_profile_observing(
             String::from("episode_id_exhausted"),
         )]);
     };
-    if let Some(observer) = recovery_episode_observer {
+    if let Some(observer) = options.recovery_episode_observer {
         observer.store(recovery_episode_id, Ordering::Release);
     }
     state.recovery_started = Some(now);
@@ -11413,7 +11476,9 @@ async fn run_local_recovery_for_profile_observing(
         .saturating_add(Duration::from_secs(1));
     state.recovery_deadline = Some(checked_instant_add(
         now,
-        episode_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
+        options
+            .episode_timeout
+            .map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
     ));
     state.runs_in_window = state.runs_in_window.saturating_add(1);
     let recovery_task = tokio::spawn(run_local_recovery_task(
@@ -11421,7 +11486,8 @@ async fn run_local_recovery_for_profile_observing(
         client,
         base_url,
         cause,
-        episode_timeout,
+        options.episode_timeout,
+        options.downstream_commit_signal,
     ));
     state.active_local_recovery_task = Some(recovery_task.abort_handle());
     drop(state);
@@ -11492,6 +11558,7 @@ async fn run_local_recovery_task(
     base_url: String,
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
+    downstream_commit_signal: Option<DownstreamCommitSignal>,
 ) -> BTreeMap<String, String> {
     let trigger_cause = cause.as_str().to_owned();
     let recovery_trigger_cause = trigger_cause.clone();
@@ -11502,13 +11569,34 @@ async fn run_local_recovery_task(
             String::from("local_recovery_trigger_cause"),
             recovery_trigger_cause,
         )]);
+        if local_recovery_downstream_commit_observed(
+            downstream_commit_signal.as_ref(),
+            &mut metadata,
+        ) {
+            return metadata;
+        }
         metadata.extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
+        if local_recovery_downstream_commit_observed(
+            downstream_commit_signal.as_ref(),
+            &mut metadata,
+        ) {
+            return metadata;
+        }
         if metadata
             .get("local_recovery_restart_status")
             .is_some_and(|status| status == "succeeded")
         {
-            metadata.extend(run_local_recovery_readiness(client, base_url, &policy).await);
+            metadata.extend(
+                run_local_recovery_readiness(
+                    client,
+                    base_url,
+                    &policy,
+                    downstream_commit_signal.as_ref(),
+                )
+                .await,
+            );
         }
+        local_recovery_downstream_commit_observed(downstream_commit_signal.as_ref(), &mut metadata);
         if !metadata.contains_key("local_recovery_status") {
             let status = match metadata
                 .get("local_recovery_readiness_status")
@@ -11721,9 +11809,14 @@ async fn run_local_recovery_readiness(
     client: Client,
     base_url: String,
     policy: &LocalRecoveryPolicy,
+    downstream_commit_signal: Option<&DownstreamCommitSignal>,
 ) -> BTreeMap<String, String> {
     let deadline = Instant::now() + policy.readiness_deadline;
     loop {
+        let mut metadata = BTreeMap::new();
+        if local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata) {
+            return metadata;
+        }
         if Instant::now() >= deadline {
             return BTreeMap::from([(
                 String::from("local_recovery_readiness_status"),

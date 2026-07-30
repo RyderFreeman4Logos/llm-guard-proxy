@@ -7502,6 +7502,134 @@ max_per_window = 1
     remove_dir_all(&recovery_root);
 }
 
+async fn spawn_delayed_sse_liveness_recovery_proxy(
+    fake: &FakeUpstream,
+) -> (ProxyFixture, PathBuf, PathBuf) {
+    let recovery_root = unique_test_dir("local-recovery-delayed-sse-liveness");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let recovery_marker = recovery_root.join("recovered");
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[heartbeat]
+mode = "sse"
+interval_secs = 1
+
+[retry]
+max_attempts = 1
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+
+[upstream.stall]
+enabled = true
+first_chunk_timeout_ms = 50
+idle_timeout_ms = 50
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/bin/sh", "-c", "sleep 2; /usr/bin/touch {recovery_marker}"]
+restart_timeout_ms = 3000
+readiness_body = {{"model":"test-chat","messages":[{{"role":"user","content":"delayed recovery ready"}}],"max_tokens":1}}
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 100
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+"#,
+            recovery_marker = recovery_marker.display()
+        ),
+    )
+    .await;
+    (proxy, recovery_root, recovery_marker)
+}
+
+#[tokio::test]
+async fn local_recovery_does_not_probe_or_replay_after_delayed_sse_liveness_commit() {
+    let mut fake = FakeUpstream::spawn().await;
+    let (proxy, recovery_root, recovery_marker) =
+        spawn_delayed_sse_liveness_recovery_proxy(&fake).await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=stall-once-then-success",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"delayed liveness business request"}],"stream":true}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let heartbeat = next_chunk(
+        &mut body,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "delayed local recovery SSE heartbeat",
+    )
+    .await;
+    assert_eq!(
+        heartbeat,
+        Bytes::from_static(b": llm-guard-proxy heartbeat\n\n")
+    );
+    let terminal = timeout(SHIELDED_HEARTBEAT_TIMEOUT, async {
+        loop {
+            let chunk = body
+                .next()
+                .await
+                .expect("committed liveness response must include a terminal error")
+                .expect("committed liveness response body should not fail");
+            if chunk != heartbeat {
+                return chunk;
+            }
+        }
+    })
+    .await
+    .expect("delayed committed liveness terminal error");
+    assert!(terminal.starts_with(b"event: error\ndata: "));
+    assert!(
+        terminal
+            .windows(b"llm_guard_attempt_timeout".len())
+            .any(|window| { window == b"llm_guard_attempt_timeout" })
+    );
+    assert!(
+        timeout(SHIELDED_HEARTBEAT_TIMEOUT, body.next())
+            .await
+            .expect("terminal liveness body should end")
+            .is_none()
+    );
+
+    assert!(
+        recovery_marker.exists(),
+        "the delayed recovery command should finish before the post-await commit gate"
+    );
+    let first = fake.recv_next().await;
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=stall-once-then-success"
+    );
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "a liveness commit during recovery must prevent the readiness probe and replay"
+    );
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_status"],
+        "skipped_downstream_committed"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_replay_skipped_downstream_committed"],
+        "true"
+    );
+
+    remove_dir_all(&recovery_root);
+}
+
 #[tokio::test]
 async fn disabled_restart_queue_does_not_cap_local_recovery_episode_timeout() {
     let mut fake = FakeUpstream::spawn().await;
