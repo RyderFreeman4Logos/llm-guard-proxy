@@ -563,17 +563,19 @@ async fn watchdog_lifecycle_does_not_restart_for_tool_call_only_sse() {
         WatchdogProgressUnit::Chat,
         WATCHDOG_WINDOW,
     );
-    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
-
-    sleep(Duration::from_millis(600)).await;
-    request.record_emitted_chunk(&chat_delta_sse(&serde_json::json!({
+    let tool_call = chat_delta_sse(&serde_json::json!({
         "tool_calls": [{
             "index": 0,
             "id": "call_1",
             "type": "function",
             "function": {"name": "lookup", "arguments": "{}"}
         }]
-    })));
+    }));
+    request.record_emitted_chunk(&tool_call);
+    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
+
+    sleep(Duration::from_millis(600)).await;
+    request.record_emitted_chunk(&tool_call);
     sleep(Duration::from_millis(650)).await;
     let restarted = marker.exists();
 

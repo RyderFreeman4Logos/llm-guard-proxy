@@ -46,6 +46,10 @@ recovery policy relative to the previously installed snapshot:
   the AEON profile, and every retry rung.
 - The integrated guardian is enabled for `aeon-text` with a 5 GiB threshold,
   direct `cgroup-kill`, a three-second poll, and `text-cgroup.v1` registration.
+- Local recovery is active for both the default and named `aeon-chat` routes,
+  targets `vllm-aeon-27b-dflash-n12.service`, and permits one pre-commit
+  recovery replay per downstream request. Named profiles do not inherit the
+  default route's recovery table.
 
 The guardian values must match the operational source of truth exactly. Do not
 replace current listener routing, per-upstream concurrency, timeouts, evidence
@@ -143,7 +147,25 @@ fi
 
 ## Apply service changes
 
-Copy the wrapper assets:
+First validate the reviewed candidate without changing installed files. Set
+`DOWNSTREAM_IDLE_TIMEOUT_MS` to the smallest effective idle timeout across
+clients, tunnels, and reverse proxies. Correctness-first shielding emits no
+pre-commit heartbeat bytes, so this value must be strictly greater than the
+conservative hold bound printed by the preflight (currently 3,900,000 ms):
+
+```bash
+python3 deploy/gb10/preflight-config.py \
+  --config deploy/gb10/config.toml \
+  --downstream-idle-timeout-ms "${DOWNSTREAM_IDLE_TIMEOUT_MS}" \
+  --dry-run
+```
+
+The command must report `result=ok`. It fails closed if either AEON route
+downgrades recovery, the reviewed restart unit changes, `guard_workflows`
+becomes active, Retry-After loses its bound, or the operator timeout cannot
+cover the configured request deadline plus recovery and one replay.
+
+Then copy the wrapper assets:
 
 ```bash
 install -d -m 0700 /home/obj/.config/llm-guard-proxy

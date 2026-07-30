@@ -3774,6 +3774,8 @@ pub struct RetryConfig {
     pub max_attempts: u32,
     /// Total wall-clock budget for one shielded request across all retry attempts.
     pub request_deadline_ms: u64,
+    /// Maximum delta-seconds accepted from an upstream `Retry-After` header.
+    pub max_retry_after_secs: u64,
     /// Adds a bounded deterministic anti-loop hint to retries after loop aborts.
     pub anti_loop_hint_enabled: bool,
     /// Routes downstream `stream=true` chat completions through shielded retry.
@@ -3802,6 +3804,11 @@ impl RetryConfig {
             "must be greater than zero",
         )?;
         require(
+            (1..=300).contains(&self.max_retry_after_secs),
+            "retry.max_retry_after_secs",
+            "must be between 1 and 300",
+        )?;
+        require(
             self.ladder.len() <= 10,
             "retry.ladder",
             "must contain at most 10 entries",
@@ -3819,6 +3826,7 @@ impl Default for RetryConfig {
             enabled: true,
             max_attempts: 5,
             request_deadline_ms: 600_000,
+            max_retry_after_secs: 30,
             anti_loop_hint_enabled: true,
             shielded_streaming_enabled: false,
             downstream_drop_policy: DownstreamDropPolicy::Cancel,
@@ -3996,9 +4004,9 @@ impl Default for UpstreamStallConfig {
 /// Downstream heartbeat strategy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeartbeatConfig {
-    /// Liveness mode used while the proxy shields upstream attempts.
+    /// Configured response framing after replay-safe aggregation completes.
     pub mode: HeartbeatMode,
-    /// Heartbeat interval for streaming or whitespace progress.
+    /// Reserved heartbeat cadence; replay-capable aggregation suppresses emission.
     pub interval_secs: u64,
 }
 
@@ -4021,15 +4029,15 @@ impl Default for HeartbeatConfig {
     }
 }
 
-/// Supported downstream heartbeat modes.
+/// Configured downstream framing modes after replay-safe aggregation.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HeartbeatMode {
-    /// Server-sent-event heartbeat/progress frames.
+    /// Emit the accepted result with server-sent-event framing.
     #[default]
     Sse,
-    /// Leading whitespace heartbeat for non-stream JSON responses.
+    /// Emit the accepted result as buffered JSON.
     JsonWhitespace,
-    /// No heartbeat.
+    /// Preserve the legacy buffered JSON response.
     Disabled,
 }
 

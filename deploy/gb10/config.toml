@@ -127,31 +127,25 @@ recovery_max_per_window = 2              # Max recovery attempts per window
 #| recovery_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash.service"] # argv, never a shell string
 # END PARSEABLE EXAMPLE: upstream-stall-recovery
 
-# ── Local upstream recovery (OPT-IN command execution) ───────────────────────
-# Restart recovery may follow eligible upstream failures. Request-deadline exhaustion
-# is an individual-request failure and only triggers recovery when
-# trigger_on_request_deadline is explicitly enabled.
-#
-# Safe default: disabled and no command is executed. restart_command is argv;
-# the proxy never runs it through a shell and never connects request content to
-# the command's stdin/stdout/stderr.
+# ── Local upstream recovery (reviewed active policy) ─────────────────────────
+# Generic and shielded requests share this pre-commit recovery policy. It never
+# replays after downstream bytes or on 4xx/429. Request-deadline exhaustion
+# alone does not trigger recovery. Probe payload and command output are not recorded.
 
-# BEGIN PARSEABLE EXAMPLE: upstream-local-recovery
-#| [upstream.local_recovery]
-#| enabled = true                                                     # Enable local restart recovery
-#| trigger_on_request_deadline = false                                 # Keep individual request deadlines from restarting the backend (default)
-#| restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash.service"]  # argv restart command
-#| restart_timeout_ms = 300000                                        # Max wait for restart command
-#| readiness_endpoint = "/v1/chat/completions"                        # Real chat readiness endpoint
-#| readiness_body = {"model":"aeon-ultimate","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}  # Probe payload; not recorded
-#| readiness_request_timeout_ms = 30000                               # Max wait for one readiness POST
-#| readiness_deadline_ms = 600000                                     # Total readiness wait after restart
-#| readiness_interval_ms = 5000                                       # Delay between readiness probes
-#| max_attempts_per_request = 1                                       # Per downstream request recovery cap
-#| cooldown_ms = 300000                                               # Cooldown between completed recoveries
-#| budget_window_ms = 900000                                          # Rolling recovery budget window
-#| max_per_window = 2                                                 # Max recoveries per budget window
-# END PARSEABLE EXAMPLE: upstream-local-recovery
+[upstream.local_recovery]
+enabled = true
+trigger_on_request_deadline = false
+restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash-n12.service"]
+restart_timeout_ms = 300000
+readiness_endpoint = "/v1/chat/completions"
+readiness_body = {"model":"aeon-ultimate","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}
+readiness_request_timeout_ms = 30000
+readiness_deadline_ms = 600000
+readiness_interval_ms = 5000
+max_attempts_per_request = 1
+cooldown_ms = 300000
+budget_window_ms = 900000
+max_per_window = 2
 
 # BEGIN PARSEABLE EXAMPLE: upstream-stuck-watchdog-and-restart-queue
 # Safe defaults: both sections are disabled. Defaults are a 1800-second detection/window/queue/restart limit and a 60-second watchdog check; all *_secs values are capped at 86400 seconds.
@@ -201,6 +195,24 @@ enabled = true
 probe_max_tokens = 1
 probe_interval_secs = 5
 probe_timeout_secs = 600
+
+# Named profiles do not inherit [upstream.local_recovery]. Keep the AEON route
+# semantically identical to the default route so model matching cannot
+# accidentally downgrade recovery to disabled.
+[upstreams.local_recovery]
+enabled = true
+trigger_on_request_deadline = false
+restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash-n12.service"]
+restart_timeout_ms = 300000
+readiness_endpoint = "/v1/chat/completions"
+readiness_body = {"model":"aeon-ultimate","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}
+readiness_request_timeout_ms = 30000
+readiness_deadline_ms = 600000
+readiness_interval_ms = 5000
+max_attempts_per_request = 1
+cooldown_ms = 300000
+budget_window_ms = 900000
+max_per_window = 2
 
 [upstreams.thinking]
 mode = "bounded_thinking"
@@ -569,6 +581,7 @@ vector_dim = 256
 enabled = true
 max_attempts = 4                           # Max retry attempts per request
 request_deadline_ms = 1200000             # Total shielded retry wall-clock budget per request
+max_retry_after_secs = 30                  # Retry 429 only for positive bounded delta-seconds
 anti_loop_hint_enabled = true              # Inject anti-loop hints on retry
 
 # ── Shielded streaming retry ─────────────────────────────────────────────────
@@ -625,12 +638,16 @@ tool_request_policy = "apply"
 no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 
-## ───────────────────────── Heartbeat ───────────────────────────────────────
-## SSE heartbeat to keep client connections alive during long generations.
+## ───────────────────────── Held liveness ───────────────────────────────────
+## The configured mode selects the final response framing. Correctness-first
+## shielding holds all bytes until an attempt is accepted, so effective
+## pre-commit liveness is "held" and the emitted heartbeat count is zero.
+## Operators must configure every downstream idle timeout above the conservative
+## hold bound checked by deploy/gb10/preflight-config.py.
 
 [heartbeat]
-mode = "sse"                               # SSE keepalive comments
-interval_secs = 15                         # Send heartbeat every 15s
+mode = "sse"                               # Final accepted response uses SSE framing
+interval_secs = 15                         # Configured interval; no pre-commit bytes are emitted
 
 ## ───────────────────────── Cloudflare ──────────────────────────────────────
 ## Cloudflare integration for external access.

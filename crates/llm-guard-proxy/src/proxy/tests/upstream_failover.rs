@@ -777,7 +777,6 @@ async fn terminal_cloud_retryable_statuses_enter_passive_cooldown() {
     for status in [
         StatusCode::UNAUTHORIZED,
         StatusCode::FORBIDDEN,
-        StatusCode::TOO_MANY_REQUESTS,
         StatusCode::SERVICE_UNAVAILABLE,
     ] {
         let mut cloud =
@@ -812,12 +811,8 @@ async fn terminal_cloud_retryable_statuses_enter_passive_cooldown() {
 }
 
 #[tokio::test]
-async fn configured_openai_auth_and_rate_limit_failures_fail_over_and_enter_cooldown() {
-    for status in [
-        StatusCode::UNAUTHORIZED,
-        StatusCode::FORBIDDEN,
-        StatusCode::TOO_MANY_REQUESTS,
-    ] {
+async fn configured_openai_auth_failures_fail_over_and_enter_cooldown() {
+    for status in [StatusCode::UNAUTHORIZED, StatusCode::FORBIDDEN] {
         let mut primary = FakeUpstream::spawn_with_rerank_status(status).await;
         let mut fallback = FakeUpstream::spawn().await;
         let extra_config = credentialed_openai_primary_failover_profile_config(

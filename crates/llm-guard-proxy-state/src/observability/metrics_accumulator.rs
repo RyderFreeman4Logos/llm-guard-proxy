@@ -498,6 +498,9 @@ fn numeric_metric_label(value: Option<&str>) -> String {
 }
 
 pub(super) fn normalized_heartbeat_mode_label(value: &str) -> String {
+    if value == "held" {
+        return String::from("held");
+    }
     HeartbeatMode::from_label(value).map_or_else(
         || String::from(OTHER_HEARTBEAT_MODE),
         |mode| mode.as_str().to_owned(),

@@ -185,6 +185,7 @@ input_overlap_threshold_multiplier = 5
 [retry]
 max_attempts = 3
 request_deadline_ms = 450000
+max_retry_after_secs = 12
 anti_loop_hint_enabled = false
 shielded_streaming_enabled = true
 downstream_drop_policy = "detach"
@@ -276,6 +277,7 @@ fn defaults_match_issue_contract() {
     assert!(config.retry.enabled);
     assert_eq!(config.retry.max_attempts, 5);
     assert_eq!(config.retry.request_deadline_ms, 600_000);
+    assert_eq!(config.retry.max_retry_after_secs, 30);
     assert!(config.retry.anti_loop_hint_enabled);
     assert!(!config.retry.shielded_streaming_enabled);
     assert_eq!(
@@ -894,7 +896,9 @@ fn gb10_deploy_config_preserves_authoritative_topology_with_native_thinking() {
     assert_eq!(config.upstream_stall.recovery_budget_window_ms, 900_000);
     assert_eq!(config.retry.max_attempts, 4);
     assert_eq!(config.retry.request_deadline_ms, 1_200_000);
+    assert_eq!(config.retry.max_retry_after_secs, 30);
     assert!(config.retry.shielded_streaming_enabled);
+    assert_gb10_local_recovery(&config);
     assert!(config.evidence.include_raw_payloads);
     assert!(config.evidence.include_request_headers);
     assert_eq!(config.loop_guard.embedding.model, "Qwen/Qwen3-Embedding-8B");
@@ -960,6 +964,29 @@ fn gb10_deploy_config_preserves_authoritative_topology_with_native_thinking() {
 }
 
 #[cfg(feature = "param-override")]
+fn assert_gb10_local_recovery(config: &AppConfig) {
+    let default = &config.upstream.local_recovery;
+    assert!(default.enabled);
+    assert!(!default.trigger_on_request_deadline);
+    assert_eq!(default.max_attempts_per_request, 1);
+    assert_eq!(
+        default.restart_command,
+        [
+            "systemctl",
+            "--user",
+            "restart",
+            "vllm-aeon-27b-dflash-n12.service"
+        ]
+    );
+
+    let aeon = &config.upstream_profiles[0].local_recovery;
+    assert!(aeon.enabled);
+    assert!(!aeon.trigger_on_request_deadline);
+    assert_eq!(aeon.max_attempts_per_request, 1);
+    assert_eq!(aeon.restart_command, default.restart_command);
+}
+
+#[cfg(feature = "param-override")]
 fn assert_gb10_failover_topology(config: &AppConfig) {
     let chat = &config.upstream_profiles[0];
     assert_eq!(chat.base_url, "http://100.105.4.92:18010/v1");
@@ -1007,7 +1034,6 @@ fn assert_gb10_failover_topology(config: &AppConfig) {
 fn gb10_deploy_uncomment_ready_examples_parse() {
     for name in [
         "upstream-stall-recovery",
-        "upstream-local-recovery",
         "upstream-profile",
         "heterogeneous-reranker-replicas",
         "generic-openai-reranker-failover",
@@ -3202,6 +3228,7 @@ fn assert_parsed_upstream_stall_overrides(config: &AppConfig) {
 fn assert_parsed_retry_overrides(config: &AppConfig) {
     assert_eq!(config.retry.max_attempts, 3);
     assert_eq!(config.retry.request_deadline_ms, 450_000);
+    assert_eq!(config.retry.max_retry_after_secs, 12);
     assert!(!config.retry.anti_loop_hint_enabled);
     assert!(config.retry.shielded_streaming_enabled);
     assert_eq!(
@@ -3320,6 +3347,22 @@ fn validates_retry_request_deadline_ms() {
         .expect_err("retry request deadline should reject zero");
 
     assert_eq!(error.field(), "retry.request_deadline_ms");
+}
+
+#[test]
+fn validates_retry_after_bound() {
+    let mut config = AppConfig::default();
+    config.retry.max_retry_after_secs = 0;
+    let error = config
+        .validate()
+        .expect_err("zero Retry-After bound must fail");
+    assert_eq!(error.field(), "retry.max_retry_after_secs");
+
+    config.retry.max_retry_after_secs = 301;
+    let error = config
+        .validate()
+        .expect_err("oversized Retry-After bound must fail");
+    assert_eq!(error.field(), "retry.max_retry_after_secs");
 }
 
 #[test]
@@ -4184,6 +4227,7 @@ fn reload_metadata_lists_cover_expected_fields() {
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_history_window_count"));
     assert!(RELOADABLE_FIELDS.contains(&"loop_guard.reasoning_semantic_repeat_window_count"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.request_deadline_ms"));
+    assert!(RELOADABLE_FIELDS.contains(&"retry.max_retry_after_secs"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.anti_loop_hint_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.shielded_streaming_enabled"));
     assert!(RELOADABLE_FIELDS.contains(&"retry.downstream_drop_policy"));

@@ -139,6 +139,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "retry.enabled",
     "retry.max_attempts",
     "retry.request_deadline_ms",
+    "retry.max_retry_after_secs",
     "retry.anti_loop_hint_enabled",
     "retry.shielded_streaming_enabled",
     "retry.downstream_drop_policy",
