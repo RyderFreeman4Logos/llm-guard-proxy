@@ -404,7 +404,7 @@ request_timeout_ms = 50
 enabled = false
 
 [retry]
-max_attempts = 2
+max_attempts = 4
 request_deadline_ms = 3000
 max_retry_after_secs = 1
 

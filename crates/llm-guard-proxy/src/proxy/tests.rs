@@ -9198,7 +9198,7 @@ async fn shielded_retry_exhausted_rate_limit_preserves_429_and_retry_after() {
 mode = "disabled"
 
 [retry]
-max_attempts = 2
+max_attempts = 4
 max_retry_after_secs = 1
 
 [upstream.local_recovery]
@@ -9306,7 +9306,7 @@ async fn shielded_rate_limit_without_usable_retry_after_does_not_retry() {
 mode = "disabled"
 
 [retry]
-max_attempts = 3
+max_attempts = 4
 max_retry_after_secs = 1
 "#,
         )
@@ -9355,7 +9355,7 @@ async fn generic_rate_limit_exhaustion_preserves_429_and_retry_after() {
 enabled = false
 
 [retry]
-max_attempts = 2
+max_attempts = 4
 max_retry_after_secs = 1
 ",
     )
@@ -9396,7 +9396,7 @@ async fn generic_rate_limit_retries_valid_delay_then_succeeds() {
 enabled = false
 
 [retry]
-max_attempts = 2
+max_attempts = 4
 max_retry_after_secs = 1
 ",
     )
@@ -9434,6 +9434,56 @@ max_retry_after_secs = 1
 }
 
 #[tokio::test]
+async fn shielded_rate_limit_retries_valid_delay_then_succeeds() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 4
+max_retry_after_secs = 1
+"#,
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=shielded-429-once-then-success",
+            proxy.base_url
+        ))
+        .json(&json!({"model":"test-chat","messages":[]}))
+        .send()
+        .await
+        .expect("shielded bounded 429 retry should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .bytes()
+        .await
+        .expect("success response should drain");
+
+    let first = fake.recv_next().await;
+    let second = fake.recv_next().await;
+    assert_eq!(first.path_and_query, second.path_and_query);
+    assert!(fake.recv_within(Duration::from_millis(50)).await.is_none());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].status, "retried");
+    assert_eq!(
+        attempts[0].retry_reason.as_deref(),
+        Some("transient_upstream_status")
+    );
+    assert_eq!(attempts[0].http_status, Some(429));
+    assert_eq!(attempts[1].status, "succeeded");
+}
+
+#[tokio::test]
 async fn generic_rate_limit_sanitizes_unusable_retry_after() {
     for case in [
         "retry-after-missing",
@@ -9451,7 +9501,7 @@ async fn generic_rate_limit_sanitizes_unusable_retry_after() {
 enabled = false
 
 [retry]
-max_attempts = 3
+max_attempts = 4
 max_retry_after_secs = 1
 ",
         )
@@ -21142,6 +21192,7 @@ fn fake_generic_recovery_chat_completion_response(
 ) -> Option<Response<Body>> {
     if path_and_query.contains("test=generic-429-once-then-success")
         || path_and_query.contains("test=generic-429-then-timeout-then-success")
+        || path_and_query.contains("test=shielded-429-once-then-success")
     {
         if next_fake_attempt_count(state, path_and_query) == 1 {
             let mut response = upstream_status_json_response(StatusCode::TOO_MANY_REQUESTS);
@@ -21149,6 +21200,9 @@ fn fake_generic_recovery_chat_completion_response(
                 .headers_mut()
                 .insert(RETRY_AFTER, HeaderValue::from_static("1"));
             return Some(response);
+        }
+        if body_requests_stream(body) {
+            return Some(chat_completion_sse_response(body));
         }
         return Some(json_response(
             "generic-rate-limit-success",

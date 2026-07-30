@@ -3437,6 +3437,7 @@ async fn forward_openai_request(
                 shadow_evidence: ShadowEvidenceState::default(),
                 malformed_response_counter: state.malformed_response_counter.clone(),
                 upstream_failure_counters: state.upstream_failure_counters.clone(),
+                rate_limit_retry_budget: retry_after::RetryBudget::default(),
             },
             in_flight_permit,
         ))
@@ -9378,6 +9379,7 @@ struct ShieldedRetryRuntime {
     shadow_evidence: ShadowEvidenceState,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
+    rate_limit_retry_budget: retry_after::RetryBudget,
 }
 
 impl ShieldedRetryRuntime {
@@ -9986,14 +9988,8 @@ async fn shielded_started_attempt_step(
     if !started.info.upstream_status.is_success() {
         if started.info.upstream_status == StatusCode::TOO_MANY_REQUESTS {
             end_stuck_watchdog_attempt(&mut started.stuck_watchdog_attempt);
-            let retry_after = retry_after::bounded_delay(
-                &started.info.upstream_headers,
-                runtime.retry_policy.max_retry_after,
-            );
-            let can_retry = retry_after.is_some()
-                && should_retry_after_rate_limit(runtime, started.info.attempt_number);
+            let retry_after = claim_rate_limit_retry_delay(runtime, &started.info);
             if let Some(delay) = retry_after
-                && can_retry
                 && wait_for_rate_limit_retry(runtime, delay).await
             {
                 let failure = status_failure(
@@ -10066,13 +10062,19 @@ async fn shielded_started_attempt_step(
     ))
 }
 
-fn should_retry_after_rate_limit(runtime: &ShieldedRetryRuntime, attempt_number: u32) -> bool {
-    runtime.retry_policy.allows_retry_after(attempt_number)
-        && !runtime.downstream_drop_signal.is_dropped()
-        && runtime
-            .request_deadline
-            .remaining()
-            .is_some_and(|remaining| !remaining.is_zero())
+fn claim_rate_limit_retry_delay(
+    runtime: &ShieldedRetryRuntime,
+    info: &ShieldedAttemptInfo,
+) -> Option<Duration> {
+    if !runtime.retry_policy.allows_retry_after(info.attempt_number)
+        || runtime.downstream_drop_signal.is_dropped()
+        || runtime.request_deadline.is_exhausted()
+    {
+        return None;
+    }
+    runtime
+        .rate_limit_retry_budget
+        .claim_delay(&info.upstream_headers, runtime.retry_policy.max_retry_after)
 }
 
 async fn wait_for_rate_limit_retry(runtime: &ShieldedRetryRuntime, delay: Duration) -> bool {

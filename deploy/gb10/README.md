@@ -151,7 +151,12 @@ First validate the reviewed candidate without changing installed files. Set
 `DOWNSTREAM_IDLE_TIMEOUT_MS` to the smallest effective idle timeout across
 clients, tunnels, and reverse proxies. Correctness-first shielding emits no
 pre-commit heartbeat bytes, so this value must be strictly greater than the
-conservative hold bound printed by the preflight (currently 3,900,000 ms):
+conservative hold bound printed by the preflight. The bound is the configured
+request deadline plus recovery and one replay plus the completion guard:
+`3,000,000 + 300,000 + 600,000 + 1,000 = 3,901,000 ms`. The operator idle
+timeout must be strictly greater, so the minimum accepted example is
+`3,901,001 ms`. Treat the preflight output as authoritative if configuration
+changes:
 
 ```bash
 python3 deploy/gb10/preflight-config.py \

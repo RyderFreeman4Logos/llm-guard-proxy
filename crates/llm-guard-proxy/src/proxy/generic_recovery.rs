@@ -16,6 +16,7 @@ pub(super) async fn complete(
     first: Result<SentUpstreamResponse, ProxyError>,
 ) -> Result<SentUpstreamResponse, ProxyError> {
     let mut current = recover_and_replay(context, first).await?;
+    let rate_limit_retry_budget = retry_after::RetryBudget::default();
     loop {
         let SentUpstreamResponse {
             response,
@@ -31,13 +32,14 @@ pub(super) async fn complete(
         let Some(remaining) = context.request_deadline.remaining() else {
             return Ok(current);
         };
-        if !retry_after::wait_before_retry(
+        let Some(delay) = rate_limit_retry_budget.claim_delay(
             response.headers(),
             Duration::from_secs(context.config.retry.max_retry_after_secs),
-            remaining,
-            context.state.shutdown.subscribe(),
-        )
-        .await
+        ) else {
+            return Ok(current);
+        };
+        if !retry_after::wait_before_retry(delay, remaining, context.state.shutdown.subscribe())
+            .await
         {
             return Ok(current);
         }

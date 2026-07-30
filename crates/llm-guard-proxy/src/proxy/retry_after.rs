@@ -1,6 +1,23 @@
 //! Strict handling for rate-limit retry delays and downstream headers.
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+
 use super::{Duration, HeaderMap, HeaderValue, RETRY_AFTER, ShutdownSubscription};
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct RetryBudget {
+    consumed: Arc<AtomicBool>,
+}
+
+impl RetryBudget {
+    pub(super) fn claim_delay(&self, headers: &HeaderMap, maximum: Duration) -> Option<Duration> {
+        let delay = bounded_delay(headers, maximum)?;
+        (!self.consumed.swap(true, Ordering::Relaxed)).then_some(delay)
+    }
+}
 
 pub(super) fn bounded_delay(headers: &HeaderMap, maximum: Duration) -> Option<Duration> {
     let seconds = headers
@@ -23,14 +40,10 @@ pub(super) fn sanitize(headers: &mut HeaderMap, maximum: Duration) {
 }
 
 pub(super) async fn wait_before_retry(
-    headers: &HeaderMap,
-    maximum: Duration,
+    delay: Duration,
     remaining: Duration,
     mut shutdown: ShutdownSubscription,
 ) -> bool {
-    let Some(delay) = bounded_delay(headers, maximum) else {
-        return false;
-    };
     if delay >= remaining {
         return false;
     }
@@ -73,5 +86,21 @@ mod tests {
                 expected.map(|_| "1")
             );
         }
+    }
+
+    #[test]
+    fn budget_is_consumed_only_by_the_first_usable_delay() {
+        let budget = RetryBudget::default();
+        let mut invalid = HeaderMap::new();
+        invalid.insert(RETRY_AFTER, HeaderValue::from_static("invalid"));
+        let mut valid = HeaderMap::new();
+        valid.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+
+        assert_eq!(budget.claim_delay(&invalid, Duration::from_secs(1)), None);
+        assert_eq!(
+            budget.claim_delay(&valid, Duration::from_secs(1)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(budget.claim_delay(&valid, Duration::from_secs(1)), None);
     }
 }
