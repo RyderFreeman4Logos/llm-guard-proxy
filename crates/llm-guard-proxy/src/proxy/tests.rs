@@ -7398,6 +7398,111 @@ max_per_window = 1
 }
 
 #[tokio::test]
+async fn local_recovery_does_not_replay_after_json_liveness_prefix() {
+    let mut fake = FakeUpstream::spawn().await;
+    let recovery_root = unique_test_dir("local-recovery-liveness-committed");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let recovery_marker = recovery_root.join("recovered");
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[heartbeat]
+mode = "json-whitespace"
+interval_secs = 60
+
+[retry]
+max_attempts = 1
+anti_loop_hint_enabled = false
+
+[upstream.stall]
+enabled = true
+first_chunk_timeout_ms = 50
+idle_timeout_ms = 50
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/touch", "{recovery_marker}"]
+restart_timeout_ms = 1000
+readiness_body = {{"model":"test-chat","messages":[{{"role":"user","content":"local recovery ready"}}],"max_tokens":1}}
+readiness_request_timeout_ms = 1000
+readiness_deadline_ms = 1000
+readiness_interval_ms = 100
+cooldown_ms = 1000
+budget_window_ms = 10000
+max_per_window = 1
+"#,
+            recovery_marker = recovery_marker.display()
+        ),
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        shielded_chat_request(
+            "/v1/chat/completions?test=stall-once-then-success",
+            r#"{"model":"test-chat","messages":[{"role":"user","content":"original business request"}]}"#,
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.into_body().into_data_stream();
+    let prefix = next_chunk(
+        &mut body,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "local recovery JSON prefix",
+    )
+    .await;
+    assert_eq!(prefix, Bytes::from_static(b" \n"));
+    let terminal = next_chunk(
+        &mut body,
+        SHIELDED_HEARTBEAT_TIMEOUT,
+        "committed liveness terminal error",
+    )
+    .await;
+    let terminal_json: serde_json::Value =
+        serde_json::from_slice(&terminal).expect("terminal liveness error should be JSON");
+    assert_eq!(terminal_json["error"]["type"], "llm_guard_attempt_timeout");
+    assert!(
+        timeout(SHIELDED_HEARTBEAT_TIMEOUT, body.next())
+            .await
+            .expect("terminal liveness body should end")
+            .is_none()
+    );
+
+    assert!(
+        !recovery_marker.exists(),
+        "downstream liveness bytes must prevent unsafe local recovery replay"
+    );
+    let first = fake.recv_next().await;
+    assert_eq!(
+        first.path_and_query,
+        "/v1/chat/completions?test=stall-once-then-success"
+    );
+    assert!(
+        fake.recv_within(Duration::from_millis(100)).await.is_none(),
+        "committed downstream bytes must prevent recovery probe and replay"
+    );
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_status"],
+        "skipped_downstream_committed"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["local_recovery_replay_skipped_downstream_committed"],
+        "true"
+    );
+
+    remove_dir_all(&recovery_root);
+}
+
+#[tokio::test]
 async fn disabled_restart_queue_does_not_cap_local_recovery_episode_timeout() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(

@@ -3421,6 +3421,7 @@ async fn forward_openai_request(
                 local_recovery,
                 local_recovery_attempts: Arc::new(AtomicU64::new(0)),
                 local_recovery_deadline_replay_permits: Arc::new(AtomicU64::new(0)),
+                downstream_commit_signal: DownstreamCommitSignal::default(),
                 #[cfg(feature = "upstream-hot-restart")]
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
@@ -9324,6 +9325,7 @@ struct ShieldedRetryRuntime {
     local_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     local_recovery_attempts: Arc<AtomicU64>,
     local_recovery_deadline_replay_permits: Arc<AtomicU64>,
+    downstream_commit_signal: DownstreamCommitSignal,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     shadow_attempts: Arc<InFlightLimiter>,
@@ -9366,6 +9368,22 @@ impl DownstreamDropSignal {
 
     fn is_dropped(&self) -> bool {
         self.dropped.load(Ordering::SeqCst)
+    }
+}
+
+/// Tracks whether this response has emitted any bytes to the downstream client.
+#[derive(Clone, Debug, Default)]
+struct DownstreamCommitSignal {
+    committed: Arc<AtomicBool>,
+}
+
+impl DownstreamCommitSignal {
+    fn mark_committed(&self) {
+        self.committed.store(true, Ordering::SeqCst);
+    }
+
+    fn is_committed(&self) -> bool {
+        self.committed.load(Ordering::SeqCst)
     }
 }
 
@@ -9742,6 +9760,7 @@ fn shielded_liveness_stream_response(
         in_flight_permit,
         runtime.shutdown.subscribe(),
         runtime.downstream_drop_signal.clone(),
+        runtime.downstream_commit_signal.clone(),
     );
     response_with_headers(
         upstream_status,
@@ -11133,6 +11152,13 @@ async fn local_recovery_gate(
     let mut metadata = local_recovery_metadata(runtime, cause);
     if runtime.downstream_drop_signal.is_dropped() {
         return skipped_local_recovery_gate(metadata, "skipped_downstream_dropped", false);
+    }
+    if runtime.downstream_commit_signal.is_committed() {
+        metadata.insert(
+            String::from("local_recovery_replay_skipped_downstream_committed"),
+            String::from("true"),
+        );
+        return skipped_local_recovery_gate(metadata, "skipped_downstream_committed", false);
     }
     let previous_attempts = runtime
         .local_recovery_attempts
@@ -14950,6 +14976,7 @@ struct ShieldedLivenessBody {
     _in_flight_permit: InFlightPermit,
     shutdown: ShutdownSubscription,
     downstream_drop_signal: DownstreamDropSignal,
+    downstream_commit_signal: DownstreamCommitSignal,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
     #[cfg(test)]
     shielded_heartbeat_ticks: Arc<AtomicU64>,
@@ -14966,6 +14993,7 @@ impl ShieldedLivenessBody {
         in_flight_permit: InFlightPermit,
         shutdown: ShutdownSubscription,
         downstream_drop_signal: DownstreamDropSignal,
+        downstream_commit_signal: DownstreamCommitSignal,
     ) -> Self {
         let period = Duration::from_secs(settings.interval_secs);
         let mut interval = tokio::time::interval_at(Instant::now() + period, period);
@@ -14982,6 +15010,7 @@ impl ShieldedLivenessBody {
             _in_flight_permit: in_flight_permit,
             shutdown,
             downstream_drop_signal,
+            downstream_commit_signal,
             upstream_failure_counters: settings.upstream_failure_counters.clone(),
             #[cfg(test)]
             shielded_heartbeat_ticks: settings.shielded_heartbeat_ticks.clone(),
@@ -15000,6 +15029,9 @@ impl ShieldedLivenessBody {
     fn count_and_emit(&mut self, bytes: Bytes) -> Poll<Option<Result<Bytes, Infallible>>> {
         let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         self.bytes_seen = self.bytes_seen.saturating_add(chunk_len);
+        if !bytes.is_empty() {
+            self.downstream_commit_signal.mark_committed();
+        }
         Poll::Ready(Some(Ok(bytes)))
     }
 
