@@ -33,6 +33,8 @@ use tokio::{
 
 use super::*;
 
+#[path = "tests/constraint_repair.rs"]
+mod constraint_repair;
 #[path = "tests/cot_salvage_issue_211.rs"]
 mod cot_salvage_issue_211;
 #[path = "tests/listener_profile_policy.rs"]
@@ -20676,6 +20678,9 @@ fn fake_streaming_chat_completion_response(
     if path_and_query.contains("test=watchdog-tool-call-only") {
         return Some(repeated_tool_fingerprint_sse_response());
     }
+    if let Some(response) = fake_constraint_repair_chat_completion_response(path_and_query, body) {
+        return Some(response);
+    }
     if let Some(response) =
         fake_compat_and_loop_once_chat_completion_response(path_and_query, state, body)
     {
@@ -20720,6 +20725,138 @@ fn fake_streaming_chat_completion_response(
         return Some(response);
     }
     None
+}
+
+fn fake_constraint_repair_chat_completion_response(
+    path_and_query: &str,
+    body: &Bytes,
+) -> Option<Response<Body>> {
+    if path_and_query.contains("test=constraint-repair-multi-choice-valid-first") {
+        let contents = if body_contains_text(body, "llm-guard-proxy constraint-repair retry hint") {
+            [
+                "First corrected line\nSecond corrected line",
+                "Third corrected line\nFourth corrected line",
+            ]
+        } else {
+            [
+                "First valid line\nSecond valid line",
+                "Only one invalid line",
+            ]
+        };
+        return Some(multi_choice_content_sse_response(
+            "constraint-repair-multi-choice-valid-first",
+            &contents,
+        ));
+    }
+    if path_and_query.contains("test=constraint-repair-multi-choice-invalid-first") {
+        let contents = if body_contains_text(body, "llm-guard-proxy constraint-repair retry hint") {
+            [
+                "First corrected line\nSecond corrected line",
+                "Third corrected line\nFourth corrected line",
+            ]
+        } else {
+            [
+                "Only one invalid line",
+                "First valid line\nSecond valid line",
+            ]
+        };
+        return Some(multi_choice_content_sse_response(
+            "constraint-repair-multi-choice-invalid-first",
+            &contents,
+        ));
+    }
+
+    let (label, content) = if path_and_query.contains("test=constraint-repair-acrostic-valid") {
+        (
+            "constraint-repair-acrostic-valid",
+            "Storm thunder shakes distant cedars\nTrees bend beneath silver rain\nOceans roar over dark cliffs\nRavens wheel above wet fields\nMist blankets silent village paths",
+        )
+    } else if path_and_query.contains("test=constraint-repair-acrostic") {
+        (
+            "constraint-repair-acrostic",
+            if body_contains_text(body, "llm-guard-proxy constraint-repair retry hint") {
+                "Storm thunder shakes distant cedars\nTrees bend beneath silver rain\nOceans roar over dark cliffs\nRavens wheel above wet fields\nMist blankets silent village paths"
+            } else {
+                "Quiet rain crosses the street;\nAll trees wait"
+            },
+        )
+    } else if path_and_query.contains("test=constraint-repair-lipogram") {
+        (
+            "constraint-repair-lipogram",
+            if body_contains_text(body, "llm-guard-proxy constraint-repair retry hint") {
+                "Never moon amid fog\nNever dim moon afloat\nNever calm moon hum\nNever moon on rim\nNever mild moon aglow\nNever moon in air"
+            } else {
+                "Never stars shine\nNever moon rises\nNever stars gleam\nNever skies glow\nNever night sings\nNever dreams drift"
+            },
+        )
+    } else {
+        return None;
+    };
+    Some(delta_vec_sse_response(
+        label,
+        vec![serde_json::json!({"content": content})],
+    ))
+}
+
+fn multi_choice_content_sse_response(label: &'static str, contents: &[&str]) -> Response<Body> {
+    let role_choices = contents
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            serde_json::json!({
+                "index": index,
+                "delta": {"role": "assistant"},
+                "finish_reason": null,
+            })
+        })
+        .collect::<Vec<_>>();
+    let content_choices = contents
+        .iter()
+        .enumerate()
+        .map(|(index, content)| {
+            serde_json::json!({
+                "index": index,
+                "delta": {"content": content},
+                "finish_reason": null,
+            })
+        })
+        .collect::<Vec<_>>();
+    let completed_choices = contents
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            serde_json::json!({
+                "index": index,
+                "delta": {},
+                "finish_reason": "stop",
+            })
+        })
+        .collect::<Vec<_>>();
+    let chunks = vec![
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": role_choices,
+        })),
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": content_choices,
+        })),
+        sse_json(&serde_json::json!({
+            "id": "chatcmpl-shielded",
+            "object": "chat.completion.chunk",
+            "created": 1_710_000_000_u64,
+            "model": "test-chat",
+            "choices": completed_choices,
+        })),
+        Bytes::from_static(b"data: [DONE]\n\n"),
+    ];
+    chat_completion_vec_stream_response(label, chunks)
 }
 
 fn fake_loop_three_then_slow_success_response(
