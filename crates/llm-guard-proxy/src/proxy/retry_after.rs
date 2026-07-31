@@ -9,7 +9,8 @@ use super::{Duration, HeaderMap, HeaderValue, RETRY_AFTER, ShutdownSubscription}
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct RetryBudget {
-    repeated_physical_attempt: Arc<AtomicU32>,
+    rate_limit_replay_attempt: Arc<AtomicU32>,
+    recovery_replay_attempt: Arc<AtomicU32>,
 }
 
 impl RetryBudget {
@@ -20,11 +21,11 @@ impl RetryBudget {
         physical_attempt_number: u32,
     ) -> Option<Duration> {
         let delay = bounded_delay(headers, maximum)?;
-        let repeated_physical_attempt = physical_attempt_number.saturating_add(1);
-        self.repeated_physical_attempt
+        let rate_limit_replay_attempt = physical_attempt_number.saturating_add(1);
+        self.rate_limit_replay_attempt
             .compare_exchange(
                 0,
-                repeated_physical_attempt,
+                rate_limit_replay_attempt,
                 Ordering::Relaxed,
                 Ordering::Relaxed,
             )
@@ -32,17 +33,31 @@ impl RetryBudget {
             .then_some(delay)
     }
 
-    /// Maps a physical telemetry attempt to the ordinary non-429 ladder rung.
+    pub(super) fn claim_recovery_replay(&self, physical_attempt_number: u32) {
+        let _ = self.recovery_replay_attempt.compare_exchange(
+            0,
+            physical_attempt_number.saturating_add(1),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Maps a physical telemetry attempt to its ordinary retry ladder rung.
     ///
-    /// The single accepted rate-limit retry repeats the current ordinary rung
-    /// and therefore cannot spend an ordinary retry slot.
+    /// Accepted rate-limit and local-recovery replays repeat the current
+    /// ordinary rung and therefore cannot spend ordinary retry slots.
     pub(super) fn ordinary_attempt_number(&self, physical_attempt_number: u32) -> u32 {
-        let repeated_physical_attempt = self.repeated_physical_attempt.load(Ordering::Relaxed);
+        let rate_limit_replay_attempt = self.rate_limit_replay_attempt.load(Ordering::Relaxed);
+        let recovery_replay_attempt = self.recovery_replay_attempt.load(Ordering::Relaxed);
         let rate_limit_offset = u32::from(
-            repeated_physical_attempt != 0 && physical_attempt_number >= repeated_physical_attempt,
+            rate_limit_replay_attempt != 0 && physical_attempt_number >= rate_limit_replay_attempt,
+        );
+        let recovery_offset = u32::from(
+            recovery_replay_attempt != 0 && physical_attempt_number >= recovery_replay_attempt,
         );
         physical_attempt_number
             .saturating_sub(rate_limit_offset)
+            .saturating_sub(recovery_offset)
             .max(1)
     }
 }
@@ -165,5 +180,23 @@ mod tests {
         assert_eq!(budget.ordinary_attempt_number(2), 2);
         assert_eq!(budget.ordinary_attempt_number(3), 2);
         assert_eq!(budget.ordinary_attempt_number(4), 3);
+    }
+
+    #[test]
+    fn rate_limit_and_recovery_replays_repeat_the_current_ordinary_attempt() {
+        let budget = RetryBudget::default();
+        let mut valid = HeaderMap::new();
+        valid.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+
+        assert_eq!(
+            budget.claim_delay(&valid, Duration::from_secs(1), 1),
+            Some(Duration::from_secs(1))
+        );
+        budget.claim_recovery_replay(2);
+
+        assert_eq!(budget.ordinary_attempt_number(1), 1);
+        assert_eq!(budget.ordinary_attempt_number(2), 1);
+        assert_eq!(budget.ordinary_attempt_number(3), 1);
+        assert_eq!(budget.ordinary_attempt_number(4), 2);
     }
 }

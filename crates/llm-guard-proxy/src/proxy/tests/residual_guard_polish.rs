@@ -643,11 +643,27 @@ async fn shielded_max_attempts_one_preserves_recovery_after_rate_limit_retry() {
 [heartbeat]
 mode = "disabled"
 
+[evidence]
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = false
+
 [retry]
 max_attempts = 1
 request_deadline_ms = 4000
 max_retry_after_secs = 1
 anti_loop_hint_enabled = false
+
+[[retry.ladder]]
+name = "original-policy"
+thinking_mode = "force_thinking"
+thinking_token_budget = 12345
+
+[[retry.ladder]]
+name = "ordinary-retry-policy"
+thinking_mode = "force_disable"
 
 [upstream.local_recovery]
 enabled = true
@@ -685,6 +701,11 @@ max_per_window = 20
     response.bytes().await.expect("response should drain");
     assert!(marker.exists());
 
+    assert_recovery_keeps_ordinary_rung_one(&proxy);
+    remove_dir_all(&recovery_root);
+}
+
+fn assert_recovery_keeps_ordinary_rung_one(proxy: &ProxyFixture) {
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
     assert_eq!(attempts.len(), 3);
     assert_eq!(attempts[0].http_status, Some(429));
@@ -695,6 +716,22 @@ max_per_window = 20
         "1"
     );
     assert_eq!(
+        request_metadata[2].request_metadata["ordinary_attempt_number"],
+        "1"
+    );
+    assert_eq!(
+        request_metadata[2].request_metadata["attempt_name"],
+        "original-policy"
+    );
+    assert_eq!(
+        request_metadata[2].request_metadata["attempt_thinking_mode"],
+        "force_thinking"
+    );
+    assert_eq!(
+        request_metadata[2].request_metadata["attempt_thinking_budget_tokens"],
+        "12345"
+    );
+    assert_eq!(
         attempts[1].retry_reason.as_deref(),
         Some("transient_upstream_status")
     );
@@ -703,7 +740,71 @@ max_per_window = 20
         "succeeded"
     );
     assert_eq!(attempts[2].status, "succeeded");
-    remove_dir_all(&recovery_root);
+    assert_eq!(
+        read_evidence_attempt_rows(&proxy.evidence_sqlite_path)
+            .iter()
+            .map(|attempt| attempt.role.as_str())
+            .collect::<Vec<_>>(),
+        vec!["primary", "primary", "primary"]
+    );
+}
+
+#[test]
+fn persisted_ordinary_number_drives_evidence_and_shadow_ordinals() {
+    let metadata = BTreeMap::from([(String::from("ordinary_attempt_number"), String::from("1"))]);
+
+    assert_eq!(ordinary_attempt_number_from_metadata(3, &metadata), 1);
+    assert_eq!(next_ordinary_attempt_number_from_metadata(3, &metadata), 2);
+}
+
+#[tokio::test]
+async fn generic_first_attempt_uses_route_timeout_not_remaining_deadline() {
+    let mut fake = FakeUpstream::spawn().await;
+    let config = r"
+[shielding]
+enabled = false
+
+[upstream]
+request_timeout_ms = 250
+
+[upstream.hot_restart]
+enabled = false
+
+[retry]
+max_attempts = 1
+request_deadline_ms = 80
+";
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        config,
+    )
+    .await;
+    let started = Instant::now();
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=generic-delayed-503-once-then-success",
+            proxy.base_url
+        ))
+        .json(&json!({"model":"test-chat","messages":[]}))
+        .send()
+        .await
+        .expect("generic first attempt should complete under route timeout");
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    response.bytes().await.expect("response should drain");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(120),
+        "first generic attempt must wait for the upstream delay even when route timeout exceeds remaining request deadline; elapsed={elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "first generic attempt must still complete promptly under the route timeout; elapsed={elapsed:?}"
+    );
+    let _first = fake.recv_next().await;
+    assert!(fake.recv_within(Duration::from_millis(50)).await.is_none());
 }
 
 #[tokio::test]
@@ -1249,7 +1350,7 @@ async fn generic_deadline_and_caller_scoped_statuses_do_not_restart() {
         (
             "deadline",
             "\n[shielding]\nenabled = false\n",
-            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
             None,
             false,
         ),

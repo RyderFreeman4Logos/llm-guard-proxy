@@ -104,6 +104,20 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
             self.preflight.minimum_downstream_idle_timeout_ms(self.config), expected
         )
 
+    def test_hold_bound_counts_every_recovery_enabled_profile(self) -> None:
+        candidate = copy.deepcopy(self.config)
+        longer = copy.deepcopy(candidate["upstreams"][0])
+        longer["name"] = "longer-recovery-route"
+        longer["request_timeout_ms"] += 60_000
+        candidate["upstreams"].append(longer)
+
+        expected = 3_961_000
+        self.assertEqual(
+            self.preflight.minimum_downstream_idle_timeout_ms(candidate), expected
+        )
+        errors, _ = self.preflight.validate_snapshot(candidate, expected)
+        self.assertTrue(any("strictly greater" in error for error in errors))
+
 
 if __name__ == "__main__":
     unittest.main()

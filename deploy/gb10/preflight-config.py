@@ -91,28 +91,16 @@ def minimum_downstream_idle_timeout_ms(config: dict[str, JsonValue]) -> int | No
     retry = _table(config, "retry")
     request_deadline = _positive_int(retry, "request_deadline_ms")
     default_upstream = _table(config, "upstream")
-    default_recovery = _table(default_upstream, "local_recovery")
-    default_request_timeout = _positive_int(default_upstream, "request_timeout_ms")
     profiles = config.get("upstreams")
-    if request_deadline is None or default_request_timeout is None or not isinstance(profiles, list):
+    if request_deadline is None or not isinstance(profiles, list):
         return None
-    aeon = next(
-        (
-            profile
-            for profile in profiles
-            if isinstance(profile, dict) and profile.get("name") == AEON_PROFILE
-        ),
-        None,
-    )
-    if not isinstance(aeon, dict):
-        return None
-    aeon_recovery = _table(aeon, "local_recovery")
-    aeon_request_timeout = _positive_int(aeon, "request_timeout_ms")
+    routes = [default_upstream, *(profile for profile in profiles if isinstance(profile, dict))]
     route_bounds: list[int] = []
-    for request_timeout, recovery in (
-        (default_request_timeout, default_recovery),
-        (aeon_request_timeout, aeon_recovery),
-    ):
+    for route in routes:
+        recovery = _table(route, "local_recovery")
+        if recovery.get("enabled") is not True:
+            continue
+        request_timeout = _positive_int(route, "request_timeout_ms")
         restart_timeout = _positive_int(recovery, "restart_timeout_ms")
         readiness_deadline = _positive_int(recovery, "readiness_deadline_ms")
         if request_timeout is None or restart_timeout is None or readiness_deadline is None:
@@ -125,7 +113,7 @@ def minimum_downstream_idle_timeout_ms(config: dict[str, JsonValue]) -> int | No
             + readiness_deadline
             + RECOVERY_COMPLETION_GUARD_MS
         )
-    return request_deadline + max(route_bounds)
+    return request_deadline + max(route_bounds) if route_bounds else None
 
 
 def validate_snapshot(
@@ -160,6 +148,18 @@ def validate_snapshot(
                 f"upstreams[{AEON_PROFILE!r}]", _table(aeon, "local_recovery")
             )
         )
+    if isinstance(profiles, list):
+        for profile in profiles:
+            if not isinstance(profile, dict) or profile is aeon:
+                continue
+            recovery = _table(profile, "local_recovery")
+            if recovery.get("enabled") is True:
+                errors.extend(
+                    _recovery_errors(
+                        f"upstreams[{profile.get('name')!r}]",
+                        recovery,
+                    )
+                )
 
     retry = _table(config, "retry")
     maximum_retry_after = _positive_int(retry, "max_retry_after_secs")

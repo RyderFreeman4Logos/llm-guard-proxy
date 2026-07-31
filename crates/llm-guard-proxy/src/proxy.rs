@@ -3254,14 +3254,18 @@ async fn forward_openai_request(
     let endpoint_retry_body = prepared_request.shielded_chat_plan.upstream_body.clone();
     let mut _initial_recovery_trial_lease = None;
     if prepared_request.upstream_profile.has_endpoint_failover() {
-        let upstream_deadline = checked_instant_add(
+        let route_deadline = checked_instant_add(
             Instant::now(),
             Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms),
-        )
-        .min(checked_instant_add(
-            request_started_at,
-            Duration::from_millis(config.retry.request_deadline_ms),
-        ));
+        );
+        let upstream_deadline = if prepared_request.shielded_chat_plan.intercepted {
+            route_deadline.min(checked_instant_add(
+                request_started_at,
+                Duration::from_millis(config.retry.request_deadline_ms),
+            ))
+        } else {
+            route_deadline
+        };
         let selected = state
             .upstream_health
             .select_endpoint(
@@ -5328,10 +5332,14 @@ async fn send_generic_upstream_attempt(
         &context.thinking_metadata,
     );
     copy_endpoint_selection_metadata(&context.request_metadata, &mut attempt_request_metadata);
-    let request_deadline = Some(context.request_deadline.instant())
-        .into_iter()
-        .chain(context.upstream_deadline)
-        .min();
+    let request_deadline = if attempt_number == 1 {
+        context.upstream_deadline
+    } else {
+        Some(context.request_deadline.instant())
+            .into_iter()
+            .chain(context.upstream_deadline)
+            .min()
+    };
     send_first_upstream_attempt(UpstreamAttemptContext {
         client: &context.state.client,
         method: context.reqwest_method.clone(),
@@ -9397,6 +9405,11 @@ impl ShieldedRetryRuntime {
             .ordinary_attempt_number(physical_attempt_number)
     }
 
+    fn claim_recovery_replay(&self, physical_attempt_number: u32) {
+        self.rate_limit_retry_budget
+            .claim_recovery_replay(physical_attempt_number);
+    }
+
     fn allows_ordinary_retry(&self, physical_attempt_number: u32) -> bool {
         self.retry_policy
             .allows_ladder(self.ordinary_attempt_number(physical_attempt_number))
@@ -9924,6 +9937,9 @@ async fn shielded_start_failure_step(
         let local_recovery_gate =
             local_recovery_gate_for_attempt_failure(runtime, can_retry, &failure).await;
         if local_recovery_gate.applied {
+            if local_recovery_gate.permits_replay {
+                runtime.claim_recovery_replay(failure.attempt_number);
+            }
             // Successful recovery re-opens retry even when the ladder said no.
             can_retry = local_recovery_gate.permits_replay
                 || (can_retry && local_recovery_gate.permits_retry);
@@ -10131,6 +10147,9 @@ async fn shielded_retryable_status_step(
         let local_recovery_gate =
             local_recovery_gate_for_status(runtime, can_retry, info.upstream_status).await;
         if local_recovery_gate.applied {
+            if local_recovery_gate.permits_replay {
+                runtime.claim_recovery_replay(info.attempt_number);
+            }
             can_retry = local_recovery_gate.permits_replay
                 || (can_retry && local_recovery_gate.permits_retry);
             failure
@@ -10545,6 +10564,9 @@ async fn run_shielded_attempts(
                     local_recovery_gate_for_attempt_failure(&runtime, can_retry, &failure).await;
                 let local_recovery_already_applied = local_recovery_gate.applied;
                 if local_recovery_gate.applied {
+                    if local_recovery_gate.permits_replay {
+                        runtime.claim_recovery_replay(failure.attempt_number);
+                    }
                     can_retry = local_recovery_gate.permits_replay
                         || (can_retry && local_recovery_gate.permits_retry);
                     failure
@@ -16524,11 +16546,30 @@ fn evidence_attempt_from_observability(
 }
 
 fn evidence_attempt_role(attempt: &AttemptRecord) -> EvidenceAttemptRole {
-    if attempt.attempt_number <= 1 {
+    if ordinary_attempt_number_from_metadata(attempt.attempt_number, &attempt.request_metadata) <= 1
+    {
         EvidenceAttemptRole::Primary
     } else {
         EvidenceAttemptRole::Fallback
     }
+}
+
+fn ordinary_attempt_number_from_metadata(
+    physical_attempt_number: u32,
+    metadata: &BTreeMap<String, String>,
+) -> u32 {
+    metadata
+        .get("ordinary_attempt_number")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(physical_attempt_number)
+}
+
+fn next_ordinary_attempt_number_from_metadata(
+    physical_attempt_number: u32,
+    metadata: &BTreeMap<String, String>,
+) -> u32 {
+    ordinary_attempt_number_from_metadata(physical_attempt_number, metadata).saturating_add(1)
 }
 
 fn attempt_shown_to_downstream(request: &RequestRecord, attempt: &AttemptRecord) -> bool {
@@ -16858,7 +16899,10 @@ fn shadow_comparison_attempt_plan(
         }
         upstream_body = shielded_chat::body_with_cot_salvage_retry_hint(
             &upstream_body,
-            source.attempt_number.saturating_add(1),
+            next_ordinary_attempt_number_from_metadata(
+                source.attempt_number,
+                &source.request_metadata,
+            ),
             runtime.retry_policy.max_attempts,
             comparison.as_str(),
             &reasoning_prefix,
