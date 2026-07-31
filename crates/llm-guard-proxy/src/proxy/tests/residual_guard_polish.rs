@@ -705,6 +705,126 @@ max_per_window = 20
     remove_dir_all(&recovery_root);
 }
 
+fn multi_recovery_max_attempts_two_config(marker: &std::path::Path) -> String {
+    format!(
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[evidence]
+enabled = true
+include_raw_payloads = false
+
+[evidence.shadow]
+enabled = false
+
+[retry]
+max_attempts = 1
+request_deadline_ms = 6000
+max_retry_after_secs = 1
+anti_loop_hint_enabled = false
+
+[[retry.ladder]]
+name = "original-policy"
+thinking_mode = "force_thinking"
+thinking_token_budget = 12345
+
+[[retry.ladder]]
+name = "ordinary-retry-policy"
+thinking_mode = "force_disable"
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/touch", "{}"]
+restart_timeout_ms = 500
+readiness_body = {{"model":"test-chat","messages":[],"max_tokens":1}}
+readiness_request_timeout_ms = 500
+readiness_deadline_ms = 1000
+readiness_interval_ms = 10
+max_attempts_per_request = 2
+cooldown_ms = 1
+budget_window_ms = 10000
+max_per_window = 20
+"#,
+        marker.display()
+    )
+}
+
+fn assert_two_recovery_replays_keep_ordinary_flat(proxy: &ProxyFixture) {
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 4);
+    assert_eq!(attempts[0].http_status, Some(429));
+    assert_eq!(attempts[1].http_status, Some(503));
+    assert_eq!(attempts[2].http_status, Some(503));
+    assert_eq!(
+        attempts[1].response_metadata["local_recovery_request_attempts_used"],
+        "1"
+    );
+    assert_eq!(
+        attempts[2].response_metadata["local_recovery_request_attempts_used"],
+        "2"
+    );
+    let request_metadata = read_attempt_request_metadata_rows(&proxy.sqlite_path);
+    assert_eq!(
+        request_metadata
+            .iter()
+            .map(|attempt| {
+                attempt.request_metadata["ordinary_attempt_number"]
+                    .as_str()
+                    .expect("ordinary attempt number should be a string")
+            })
+            .collect::<Vec<_>>(),
+        vec!["1", "1", "1", "1"]
+    );
+    assert_eq!(
+        request_metadata
+            .iter()
+            .map(|attempt| {
+                attempt.request_metadata["attempt_name"]
+                    .as_str()
+                    .expect("attempt name should be a string")
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            "original-policy",
+            "original-policy",
+            "original-policy",
+            "original-policy"
+        ]
+    );
+    assert_eq!(attempts[3].status, "succeeded");
+}
+
+#[tokio::test]
+async fn shielded_max_attempts_one_keeps_ordinary_flat_across_two_recovery_replays() {
+    let recovery_root = unique_test_dir("shielded-429-two-503-recovery");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let marker = recovery_root.join("restart-ran");
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &multi_recovery_max_attempts_two_config(&marker),
+    )
+    .await;
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=shielded-429-then-two-503-then-success",
+            proxy.base_url
+        ))
+        .json(&json!({"model":"test-chat","messages":[]}))
+        .send()
+        .await
+        .expect("multi-recovery shielded request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response should drain");
+    assert!(marker.exists());
+    assert_two_recovery_replays_keep_ordinary_flat(&proxy);
+    remove_dir_all(&recovery_root);
+}
+
 fn assert_recovery_keeps_ordinary_rung_one(proxy: &ProxyFixture) {
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
     assert_eq!(attempts.len(), 3);

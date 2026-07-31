@@ -21028,6 +21028,13 @@ async fn fake_upstream_handler(
         if next_fake_attempt_count(&state, &delay_key) == 1 {
             sleep(Duration::from_millis(150)).await;
         }
+    } else if path_and_query.contains("test=shielded-429-then-two-503-then-success") {
+        // Second 503 must land after the 1ms recovery cooldown so the second
+        // local-recovery episode is admitted for multi-recovery ladder tests.
+        let delay_key = format!("delay:{path_and_query}");
+        if next_fake_attempt_count(&state, &delay_key) == 3 {
+            sleep(Duration::from_millis(5)).await;
+        }
     } else if path_and_query.contains("test=pre-response-hang") {
         sleep(STREAM_COMPLETION_TIMEOUT.saturating_mul(5)).await;
     }
@@ -21300,6 +21307,7 @@ fn fake_shielded_rate_limit_ladder_response(
     body: &Bytes,
 ) -> Option<Response<Body>> {
     if path_and_query.contains("test=shielded-429-then-503-then-success")
+        || path_and_query.contains("test=shielded-429-then-two-503-then-success")
         || path_and_query.contains("test=shielded-429-then-three-503-then-success")
     {
         let attempt = next_fake_attempt_count(state, path_and_query);
@@ -21312,6 +21320,8 @@ fn fake_shielded_rate_limit_ladder_response(
         }
         let transient_failures = if path_and_query.contains("three-503") {
             3
+        } else if path_and_query.contains("two-503") {
+            2
         } else {
             1
         };

@@ -10,7 +10,13 @@ use super::{Duration, HeaderMap, HeaderValue, RETRY_AFTER, ShutdownSubscription}
 #[derive(Clone, Debug, Default)]
 pub(super) struct RetryBudget {
     rate_limit_replay_attempt: Arc<AtomicU32>,
-    recovery_replay_attempt: Arc<AtomicU32>,
+    /// Count of accepted local-recovery replays for this request.
+    ///
+    /// Unlike the one-shot 429 budget, recovery may run more than once when
+    /// `max_attempts_per_request > 1`. Every successful `permits_replay` claim
+    /// increments this counter so ordinary-ladder mapping stays flat across
+    /// all recovery replays.
+    recovery_replay_count: Arc<AtomicU32>,
 }
 
 impl RetryBudget {
@@ -33,13 +39,8 @@ impl RetryBudget {
             .then_some(delay)
     }
 
-    pub(super) fn claim_recovery_replay(&self, physical_attempt_number: u32) {
-        let _ = self.recovery_replay_attempt.compare_exchange(
-            0,
-            physical_attempt_number.saturating_add(1),
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-        );
+    pub(super) fn claim_recovery_replay(&self, _physical_attempt_number: u32) {
+        self.recovery_replay_count.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Maps a physical telemetry attempt to its ordinary retry ladder rung.
@@ -48,12 +49,9 @@ impl RetryBudget {
     /// ordinary rung and therefore cannot spend ordinary retry slots.
     pub(super) fn ordinary_attempt_number(&self, physical_attempt_number: u32) -> u32 {
         let rate_limit_replay_attempt = self.rate_limit_replay_attempt.load(Ordering::Relaxed);
-        let recovery_replay_attempt = self.recovery_replay_attempt.load(Ordering::Relaxed);
+        let recovery_offset = self.recovery_replay_count.load(Ordering::Relaxed);
         let rate_limit_offset = u32::from(
             rate_limit_replay_attempt != 0 && physical_attempt_number >= rate_limit_replay_attempt,
-        );
-        let recovery_offset = u32::from(
-            recovery_replay_attempt != 0 && physical_attempt_number >= recovery_replay_attempt,
         );
         physical_attempt_number
             .saturating_sub(rate_limit_offset)
@@ -198,5 +196,37 @@ mod tests {
         assert_eq!(budget.ordinary_attempt_number(2), 1);
         assert_eq!(budget.ordinary_attempt_number(3), 1);
         assert_eq!(budget.ordinary_attempt_number(4), 2);
+    }
+
+    #[test]
+    fn multi_recovery_replays_keep_ordinary_rung_flat() {
+        let budget = RetryBudget::default();
+
+        assert_eq!(budget.ordinary_attempt_number(1), 1);
+        budget.claim_recovery_replay(1);
+        assert_eq!(budget.ordinary_attempt_number(2), 1);
+        budget.claim_recovery_replay(2);
+        assert_eq!(budget.ordinary_attempt_number(3), 1);
+        assert_eq!(budget.ordinary_attempt_number(4), 2);
+    }
+
+    #[test]
+    fn multi_recovery_after_rate_limit_keeps_ordinary_rung_flat() {
+        let budget = RetryBudget::default();
+        let mut valid = HeaderMap::new();
+        valid.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+
+        assert_eq!(
+            budget.claim_delay(&valid, Duration::from_secs(1), 1),
+            Some(Duration::from_secs(1))
+        );
+        budget.claim_recovery_replay(2);
+        budget.claim_recovery_replay(3);
+
+        assert_eq!(budget.ordinary_attempt_number(1), 1);
+        assert_eq!(budget.ordinary_attempt_number(2), 1);
+        assert_eq!(budget.ordinary_attempt_number(3), 1);
+        assert_eq!(budget.ordinary_attempt_number(4), 1);
+        assert_eq!(budget.ordinary_attempt_number(5), 2);
     }
 }
