@@ -2280,6 +2280,10 @@ fn assign_retry(
             config.request_deadline_ms =
                 parse_u64(value, line_number, "retry.request_deadline_ms")?;
         }
+        "max_retry_after_secs" => {
+            config.max_retry_after_secs =
+                parse_u64(value, line_number, "retry.max_retry_after_secs")?;
+        }
         "anti_loop_hint_enabled" => {
             config.anti_loop_hint_enabled = parse_bool(value, line_number)?;
         }

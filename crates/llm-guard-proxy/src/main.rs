@@ -1033,7 +1033,7 @@ mod tests {
 
         assert_eq!(
             render_health(&config, Path::new("/tmp/config.toml"), &request_id),
-            "llm-guard-proxy request_id=req-health readiness=ready license=Apache-2.0 config_path=/tmp/config.toml heartbeat_mode=json-whitespace heartbeat_interval_secs=7 observability_enabled=false"
+            "llm-guard-proxy request_id=req-health readiness=ready license=Apache-2.0 config_path=/tmp/config.toml heartbeat_configured_mode=json-whitespace shielded_precommit_liveness_mode=held heartbeat_interval_secs=7 observability_enabled=false"
         );
     }
 

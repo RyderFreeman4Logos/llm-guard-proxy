@@ -79,10 +79,14 @@ use crate::{workflow_execution::WorkflowExecutionLease, workflow_runtime::Workfl
 
 mod buffered_adapter;
 mod deepinfra_rerank_adapter;
+mod effective_liveness;
+mod generic_recovery;
 mod model_metadata;
+mod precommit_recovery;
 mod prose_constraints;
 mod recovery;
 mod reranker_protocol;
+mod retry_after;
 mod score_adapter;
 mod shielded_chat;
 mod upstream_failover;
@@ -100,6 +104,7 @@ use buffered_adapter::{
     BufferedResponseAdapter, adapt_openai_request_if_needed,
     rewrite_buffered_adapter_response_from_upstream, sanitize_transformed_request_headers,
 };
+use precommit_recovery::UpstreamResponse;
 use reranker_protocol::{CanonicalRerankerRequest, RenderedEndpointRequest};
 
 #[cfg(all(test, unix))]
@@ -1741,12 +1746,12 @@ pub(crate) fn render_health(config: &AppConfig, path: &Path, request_id: &Reques
     let license = LICENSE;
     let readiness = health.readiness().as_str();
     let config_path = path.display();
-    let heartbeat_mode = config.heartbeat.mode.as_str();
+    let heartbeat_configured_mode = config.heartbeat.mode.as_str();
     let heartbeat_interval_secs = config.heartbeat.interval_secs;
     let observability_enabled = config.observability.enabled;
 
     format!(
-        "{name} request_id={request_id} readiness={readiness} license={license} config_path={config_path} heartbeat_mode={heartbeat_mode} heartbeat_interval_secs={heartbeat_interval_secs} observability_enabled={observability_enabled}"
+        "{name} request_id={request_id} readiness={readiness} license={license} config_path={config_path} heartbeat_configured_mode={heartbeat_configured_mode} shielded_precommit_liveness_mode=held heartbeat_interval_secs={heartbeat_interval_secs} observability_enabled={observability_enabled}"
     )
 }
 
@@ -3249,8 +3254,18 @@ async fn forward_openai_request(
     let endpoint_retry_body = prepared_request.shielded_chat_plan.upstream_body.clone();
     let mut _initial_recovery_trial_lease = None;
     if prepared_request.upstream_profile.has_endpoint_failover() {
-        let upstream_deadline = Instant::now()
-            + Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
+        let route_deadline = checked_instant_add(
+            Instant::now(),
+            Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms),
+        );
+        let upstream_deadline = if prepared_request.shielded_chat_plan.intercepted {
+            route_deadline.min(checked_instant_add(
+                request_started_at,
+                Duration::from_millis(config.retry.request_deadline_ms),
+            ))
+        } else {
+            route_deadline
+        };
         let selected = state
             .upstream_health
             .select_endpoint(
@@ -3362,10 +3377,8 @@ async fn forward_openai_request(
         Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
     if prepared_request.shielded_chat_plan.intercepted {
         add_retry_request_metadata(&mut request_metadata, &retry_policy);
-        let request_deadline = ShieldedRequestDeadline::from_started_at(
-            request_started_at,
-            retry_policy.request_deadline,
-        );
+        let request_deadline =
+            RequestDeadline::from_started_at(request_started_at, retry_policy.request_deadline);
         let local_recovery_policy =
             LocalRecoveryPolicy::from_config(&prepared_request.upstream_profile.local_recovery);
         let local_recovery = state
@@ -3420,7 +3433,6 @@ async fn forward_openai_request(
                 local_recovery_policy,
                 local_recovery,
                 local_recovery_attempts: Arc::new(AtomicU64::new(0)),
-                local_recovery_deadline_replay_permits: Arc::new(AtomicU64::new(0)),
                 downstream_commit_signal: DownstreamCommitSignal::default(),
                 #[cfg(feature = "upstream-hot-restart")]
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
@@ -3430,6 +3442,7 @@ async fn forward_openai_request(
                 shadow_evidence: ShadowEvidenceState::default(),
                 malformed_response_counter: state.malformed_response_counter.clone(),
                 upstream_failure_counters: state.upstream_failure_counters.clone(),
+                rate_limit_retry_budget: retry_after::RetryBudget::default(),
             },
             in_flight_permit,
         ))
@@ -3466,6 +3479,11 @@ async fn forward_openai_request(
         terminal_endpoint: prepared_request.terminal_endpoint,
         upstream_deadline: prepared_request.upstream_deadline,
         endpoint_retry_order: prepared_request.endpoint_retry_order,
+        request_deadline: RequestDeadline::from_started_at(
+            request_started_at,
+            retry_policy.request_deadline,
+        ),
+        local_recovery_attempts: AtomicU64::new(0),
     })
     .await
 }
@@ -5127,10 +5145,13 @@ struct GenericForwardContext<'request> {
     terminal_endpoint: UpstreamEndpointConfig,
     upstream_deadline: Option<Instant>,
     endpoint_retry_order: Vec<String>,
+    request_deadline: RequestDeadline,
+    local_recovery_attempts: AtomicU64,
 }
 
 fn prepare_generic_attempt_request(
     context: &GenericForwardContext<'_>,
+    attempt_number: u32,
 ) -> (Option<HeaderMap>, BTreeMap<String, String>) {
     let override_headers = context.upstream_headers.clone().or_else(|| {
         context
@@ -5141,6 +5162,7 @@ fn prepare_generic_attempt_request(
         .as_ref()
         .unwrap_or(&context.downstream_headers);
     let mut metadata = attempt_request_metadata(&context.method, &context.uri, headers);
+    metadata.insert(String::from("attempt_number"), attempt_number.to_string());
     metadata.insert(
         String::from("upstream_request_body_bytes"),
         context.upstream_body.len().to_string(),
@@ -5261,10 +5283,37 @@ async fn forward_generic_openai_request(
         return forward_merged_models_response(context, profiles).await;
     }
 
-    let attempt_id = AttemptId::for_request(context.request_id, 1);
+    let sent_upstream_response = send_generic_upstream_attempt(&context, 1).await;
+    let mut sent_upstream_response =
+        generic_recovery::complete(&context, sent_upstream_response).await?;
+    if sent_upstream_response.response.status() == StatusCode::TOO_MANY_REQUESTS {
+        retry_after::sanitize(
+            sent_upstream_response.response.headers_mut(),
+            Duration::from_secs(context.config.retry.max_retry_after_secs),
+        );
+    }
+    let GenericForwardedResponse {
+        response_parts,
+        upstream_response,
+        terminal_endpoint_protocol,
+    } = generic_forwarded_response(&context, sent_upstream_response);
+    forward_generic_endpoint_response(
+        context,
+        response_parts,
+        upstream_response,
+        terminal_endpoint_protocol,
+    )
+    .await
+}
+
+async fn send_generic_upstream_attempt(
+    context: &GenericForwardContext<'_>,
+    attempt_number: u32,
+) -> Result<SentUpstreamResponse, ProxyError> {
+    let attempt_id = AttemptId::for_request(context.request_id, attempt_number);
     let attempt_started_at_unix_ms = unix_time_millis();
     let (transformed_request_headers, mut attempt_request_metadata) =
-        prepare_generic_attempt_request(&context);
+        prepare_generic_attempt_request(context, attempt_number);
     let downstream_headers = match transformed_request_headers.as_ref() {
         Some(headers) => headers,
         None => &context.downstream_headers,
@@ -5283,7 +5332,15 @@ async fn forward_generic_openai_request(
         &context.thinking_metadata,
     );
     copy_endpoint_selection_metadata(&context.request_metadata, &mut attempt_request_metadata);
-    let sent_upstream_response = send_first_upstream_attempt(UpstreamAttemptContext {
+    let request_deadline = if attempt_number == 1 {
+        context.upstream_deadline
+    } else {
+        Some(context.request_deadline.instant())
+            .into_iter()
+            .chain(context.upstream_deadline)
+            .min()
+    };
+    send_first_upstream_attempt(UpstreamAttemptContext {
         client: &context.state.client,
         method: context.reqwest_method.clone(),
         upstream_url: context.upstream_url.clone(),
@@ -5292,7 +5349,7 @@ async fn forward_generic_openai_request(
         retry_body: context.endpoint_retry_body.clone(),
         upstream_timeout: context.upstream_timeout,
         attempt_id: attempt_id.clone(),
-        attempt_number: 1,
+        attempt_number,
         request_id: context.request_id,
         attempt_started_at_unix_ms,
         request_metadata: &context.request_metadata,
@@ -5307,7 +5364,7 @@ async fn forward_generic_openai_request(
                 canonical_reranker: context.canonical_reranker.as_ref(),
                 transformed_request_headers: context.transformed_request_headers,
                 initial_endpoint: &context.terminal_endpoint,
-                request_deadline: context.upstream_deadline,
+                request_deadline,
                 endpoint_retry_order: &context.endpoint_retry_order,
                 shutdown: context.state.shutdown.as_ref(),
             },
@@ -5321,21 +5378,9 @@ async fn forward_generic_openai_request(
             )
         }),
         model_id: context.model_id.as_deref(),
-        request_deadline: context.upstream_deadline,
+        request_deadline,
         stuck_watchdog_request: context.stuck_watchdog_request.as_ref(),
     })
-    .await?;
-    let GenericForwardedResponse {
-        response_parts,
-        upstream_response,
-        terminal_endpoint_protocol,
-    } = generic_forwarded_response(&context, sent_upstream_response);
-    forward_generic_endpoint_response(
-        context,
-        response_parts,
-        upstream_response,
-        terminal_endpoint_protocol,
-    )
     .await
 }
 
@@ -5358,7 +5403,7 @@ async fn forward_generic_endpoint_response(
             {
                 return rewrite_buffered_adapter_response_from_upstream(
                     response_parts,
-                    upstream_response,
+                    upstream_response.into_response(),
                     context.in_flight_permit,
                     adapter,
                     context.model_id.as_deref(),
@@ -5771,7 +5816,7 @@ async fn fetch_models_upstream_group(
     })
 }
 
-fn models_upstream_response(response: EndpointResponse) -> Result<reqwest::Response, ProxyError> {
+fn models_upstream_response(response: EndpointResponse) -> Result<UpstreamResponse, ProxyError> {
     match response {
         EndpointResponse::Upstream(response) => Ok(response),
         EndpointResponse::Rewritten(_) => Err(ProxyError::upstream_body(String::from(
@@ -5895,7 +5940,7 @@ struct ObservedEndpointResponse {
 }
 
 enum EndpointResponse {
-    Upstream(reqwest::Response),
+    Upstream(UpstreamResponse),
     Rewritten(RewrittenEndpointResponse),
 }
 
@@ -5918,6 +5963,20 @@ impl EndpointResponse {
         match self {
             Self::Upstream(response) => response.headers(),
             Self::Rewritten(response) => &response.headers,
+        }
+    }
+
+    fn headers_mut(&mut self) -> &mut HeaderMap {
+        match self {
+            Self::Upstream(response) => response.headers_mut(),
+            Self::Rewritten(response) => &mut response.headers,
+        }
+    }
+
+    async fn hold_first_nonempty_body_chunk(&mut self) -> Result<(), ReqwestFailureKind> {
+        match self {
+            Self::Upstream(response) => response.hold_first_nonempty_body_chunk().await,
+            Self::Rewritten(_) => Ok(()),
         }
     }
 }
@@ -6330,10 +6389,10 @@ async fn finalize_endpoint_response(
         headers: headers.clone(),
     });
     if !decode_heterogeneous_reranker || !status.is_success() {
-        return Ok(EndpointResponse::Upstream(response));
+        return Ok(EndpointResponse::Upstream(UpstreamResponse::new(response)));
     }
     let Some(request) = canonical_reranker else {
-        return Ok(EndpointResponse::Upstream(response));
+        return Ok(EndpointResponse::Upstream(UpstreamResponse::new(response)));
     };
     let Some(shutdown) = shutdown else {
         return Err(ProxyError::upstream_body(String::from(
@@ -6532,7 +6591,6 @@ fn is_retryable_endpoint_result(
                     || endpoint_has_configured_credential(endpoint)
             }
             StatusCode::REQUEST_TIMEOUT
-            | StatusCode::TOO_MANY_REQUESTS
             | StatusCode::INTERNAL_SERVER_ERROR
             | StatusCode::BAD_GATEWAY
             | StatusCode::SERVICE_UNAVAILABLE
@@ -6710,6 +6768,7 @@ fn plan_shielded_chat(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ShieldedLivenessSelection {
+    configured_mode: HeartbeatMode,
     mode: ShieldedLivenessMode,
     heartbeat_interval_secs: u64,
     input_fingerprint: Option<String>,
@@ -6747,6 +6806,7 @@ struct ShieldedRetryPolicy {
     enabled: bool,
     max_attempts: u32,
     request_deadline: Duration,
+    max_retry_after: Duration,
     anti_loop_hint_enabled: bool,
     shielded_streaming_enabled: bool,
     downstream_drop_policy: DownstreamDropPolicy,
@@ -6777,6 +6837,7 @@ impl ShieldedRetryPolicy {
             enabled: config.enabled,
             max_attempts,
             request_deadline: Duration::from_millis(config.request_deadline_ms),
+            max_retry_after: Duration::from_secs(config.max_retry_after_secs),
             anti_loop_hint_enabled: config.anti_loop_hint_enabled,
             shielded_streaming_enabled: config.shielded_streaming_enabled,
             downstream_drop_policy: config.downstream_drop_policy,
@@ -6787,7 +6848,7 @@ impl ShieldedRetryPolicy {
         }
     }
 
-    fn allows_retry_after(&self, attempt_number: u32) -> bool {
+    fn allows_ladder(&self, attempt_number: u32) -> bool {
         self.enabled && attempt_number < self.max_attempts
     }
 
@@ -8030,6 +8091,7 @@ async fn run_watchdog_recovery(
             watchdog_recovery_cause(),
             LocalRecoveryRunOptions {
                 episode_timeout,
+                caller_timeout: None,
                 recovery_episode_observer: Some(&recovery_episode_observer),
                 downstream_commit_signal: None,
             },
@@ -8471,7 +8533,7 @@ impl ShieldedRetryCause {
 async fn forward_upstream_response(
     dispatch: ResponseDispatch<'_>,
     response_parts: ForwardedResponseParts,
-    upstream_response: reqwest::Response,
+    upstream_response: UpstreamResponse,
     in_flight_permit: InFlightPermit,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
@@ -8485,7 +8547,7 @@ async fn forward_upstream_response(
     ) {
         return forward_buffered_models_response(
             response_parts,
-            upstream_response,
+            upstream_response.into_response(),
             in_flight_permit,
             dispatch.config,
             dispatch.listener,
@@ -9318,14 +9380,13 @@ struct ShieldedRetryRuntime {
     thinking_metadata: BTreeMap<String, String>,
     loop_context: shielded_chat::LoopInspectionContext,
     retry_policy: ShieldedRetryPolicy,
-    request_deadline: ShieldedRequestDeadline,
+    request_deadline: RequestDeadline,
     upstream_stall_policy: UpstreamStallPolicy,
     upstream_stall_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     upstream_health: Arc<UpstreamHealthRegistry>,
     local_recovery_policy: LocalRecoveryPolicy,
     local_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     local_recovery_attempts: Arc<AtomicU64>,
-    local_recovery_deadline_replay_permits: Arc<AtomicU64>,
     downstream_commit_signal: DownstreamCommitSignal,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
@@ -9335,9 +9396,25 @@ struct ShieldedRetryRuntime {
     shadow_evidence: ShadowEvidenceState,
     malformed_response_counter: Arc<AtomicU64>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
+    rate_limit_retry_budget: retry_after::RetryBudget,
 }
 
 impl ShieldedRetryRuntime {
+    fn ordinary_attempt_number(&self, physical_attempt_number: u32) -> u32 {
+        self.rate_limit_retry_budget
+            .ordinary_attempt_number(physical_attempt_number)
+    }
+
+    fn claim_recovery_replay(&self, physical_attempt_number: u32) {
+        self.rate_limit_retry_budget
+            .claim_recovery_replay(physical_attempt_number);
+    }
+
+    fn allows_ordinary_retry(&self, physical_attempt_number: u32) -> bool {
+        self.retry_policy
+            .allows_ladder(self.ordinary_attempt_number(physical_attempt_number))
+    }
+
     fn plan(
         &self,
         attempt_number: u32,
@@ -9346,7 +9423,7 @@ impl ShieldedRetryRuntime {
         force_disable_after_salvage_loop: bool,
     ) -> ShieldedAttemptPlan {
         self.retry_policy.attempt_plan(
-            attempt_number,
+            self.ordinary_attempt_number(attempt_number),
             &self.upstream_profile,
             cot_salvage,
             constraint_repair.is_some(),
@@ -9387,12 +9464,12 @@ impl DownstreamCommitSignal {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct ShieldedRequestDeadline {
+struct RequestDeadline {
     started_at: Instant,
     max_duration: Duration,
 }
 
-impl ShieldedRequestDeadline {
+impl RequestDeadline {
     fn from_started_at(started_at: Instant, max_duration: Duration) -> Self {
         Self {
             started_at,
@@ -9402,6 +9479,10 @@ impl ShieldedRequestDeadline {
 
     fn remaining(self) -> Option<Duration> {
         self.max_duration.checked_sub(self.started_at.elapsed())
+    }
+
+    fn instant(self) -> Instant {
+        checked_instant_add(self.started_at, self.max_duration)
     }
 
     fn is_exhausted(self) -> bool {
@@ -9501,7 +9582,6 @@ struct ShieldedStartedAttempt {
     terminal_endpoint: UpstreamEndpointConfig,
     terminal_endpoint_protocol: UpstreamEndpointProtocol,
     endpoint_retry_order: Vec<String>,
-    ignores_request_deadline: bool,
     stuck_watchdog_attempt: Option<StuckWatchdogAttemptLease>,
 }
 
@@ -9517,7 +9597,7 @@ struct ShieldedDirectRelayOutcome {
     started: ShieldedStartedAttempt,
     prior_attempt_records: Vec<AttemptRecord>,
     response_metadata: BTreeMap<String, String>,
-    request_deadline: ShieldedRequestDeadline,
+    request_deadline: RequestDeadline,
 }
 
 struct ShieldedAggregatedAttempt {
@@ -9688,7 +9768,7 @@ fn shielded_liveness_stream_response(
         response_headers.remove(CONTENT_LENGTH);
     }
     let extra_metadata =
-        shielded_liveness_response_metadata(&runtime.liveness, upstream_content_type);
+        effective_liveness::response_metadata(&runtime.liveness, upstream_content_type);
     let attempt_progress = Arc::new(Mutex::new(ShieldedAttemptProgress {
         extra_response_metadata: extra_metadata.clone(),
         completed_attempt_records: prior_attempt_records.clone(),
@@ -9857,8 +9937,11 @@ async fn shielded_start_failure_step(
         let local_recovery_gate =
             local_recovery_gate_for_attempt_failure(runtime, can_retry, &failure).await;
         if local_recovery_gate.applied {
+            if local_recovery_gate.permits_replay {
+                runtime.claim_recovery_replay(failure.attempt_number);
+            }
             // Successful recovery re-opens retry even when the ladder said no.
-            can_retry = local_recovery_gate.permits_deadline_replay
+            can_retry = local_recovery_gate.permits_replay
                 || (can_retry && local_recovery_gate.permits_retry);
             failure
                 .response_metadata
@@ -9938,6 +10021,37 @@ async fn shielded_started_attempt_step(
     }
 
     if !started.info.upstream_status.is_success() {
+        if started.info.upstream_status == StatusCode::TOO_MANY_REQUESTS {
+            end_stuck_watchdog_attempt(&mut started.stuck_watchdog_attempt);
+            let retry_after = claim_rate_limit_retry_delay(runtime, &started.info);
+            if let Some(delay) = retry_after
+                && wait_for_rate_limit_retry(runtime, delay).await
+            {
+                let failure = status_failure(
+                    &started.info,
+                    ShieldedRetryCause::TransientUpstreamStatus,
+                    "bounded upstream rate limit before shielded stream",
+                );
+                attempt_records.push(attempt_failure_record(
+                    &failure,
+                    AttemptStatus::Retried,
+                    Some(ShieldedRetryCause::TransientUpstreamStatus),
+                    &runtime.retry_policy,
+                ));
+                return ShieldedAttemptStep::Retry {
+                    attempt_number: started.info.attempt_number.saturating_add(1),
+                    retry_cause: Some(ShieldedRetryCause::TransientUpstreamStatus),
+                };
+            }
+            retry_after::sanitize(
+                &mut started.info.upstream_headers,
+                runtime.retry_policy.max_retry_after,
+            );
+            return ShieldedAttemptStep::TerminalForward(ShieldedTerminalForward {
+                started,
+                prior_attempt_records: std::mem::take(attempt_records),
+            });
+        }
         if let Some(cause) = retry_cause_for_upstream_status(started.info.upstream_status) {
             end_stuck_watchdog_attempt(&mut started.stuck_watchdog_attempt);
             return shielded_retryable_status_step(runtime, &started.info, cause, attempt_records)
@@ -9983,6 +10097,38 @@ async fn shielded_started_attempt_step(
     ))
 }
 
+fn claim_rate_limit_retry_delay(
+    runtime: &ShieldedRetryRuntime,
+    info: &ShieldedAttemptInfo,
+) -> Option<Duration> {
+    if !runtime.retry_policy.enabled
+        || runtime.downstream_drop_signal.is_dropped()
+        || runtime.request_deadline.is_exhausted()
+    {
+        return None;
+    }
+    runtime.rate_limit_retry_budget.claim_delay(
+        &info.upstream_headers,
+        runtime.retry_policy.max_retry_after,
+        info.attempt_number,
+    )
+}
+
+async fn wait_for_rate_limit_retry(runtime: &ShieldedRetryRuntime, delay: Duration) -> bool {
+    let Some(remaining) = runtime.request_deadline.remaining() else {
+        return false;
+    };
+    if delay >= remaining {
+        return false;
+    }
+    let mut shutdown = runtime.shutdown.subscribe();
+    tokio::select! {
+        biased;
+        () = shutdown.cancelled() => false,
+        () = tokio::time::sleep(delay) => !runtime.downstream_drop_signal.is_dropped(),
+    }
+}
+
 async fn shielded_retryable_status_step(
     runtime: &ShieldedRetryRuntime,
     info: &ShieldedAttemptInfo,
@@ -10001,7 +10147,10 @@ async fn shielded_retryable_status_step(
         let local_recovery_gate =
             local_recovery_gate_for_status(runtime, can_retry, info.upstream_status).await;
         if local_recovery_gate.applied {
-            can_retry = local_recovery_gate.permits_deadline_replay
+            if local_recovery_gate.permits_replay {
+                runtime.claim_recovery_replay(info.attempt_number);
+            }
+            can_retry = local_recovery_gate.permits_replay
                 || (can_retry && local_recovery_gate.permits_retry);
             failure
                 .response_metadata
@@ -10070,8 +10219,7 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
     let mut wire_mode = ShieldedUpstreamWireMode::ShieldedSse;
     let mut attempt_records = Vec::new();
     loop {
-        let ignores_request_deadline = consume_local_recovery_deadline_replay_permit(runtime);
-        if runtime.request_deadline.is_exhausted() && !ignores_request_deadline {
+        if runtime.request_deadline.is_exhausted() {
             return ShieldedBeginOutcome::Failed(request_deadline_exhausted_outcome(
                 runtime,
                 attempt_number,
@@ -10088,7 +10236,6 @@ async fn begin_shielded_retry(runtime: &ShieldedRetryRuntime) -> ShieldedBeginOu
                 constraint_repair: None,
                 force_disable_after_salvage_loop: false,
             },
-            ignores_request_deadline,
         )
         .await
         {
@@ -10161,13 +10308,8 @@ async fn aggregate_shielded_attempt(
         runtime.loop_context.clone(),
         runtime.upstream_stall_policy.stream_timeouts(),
     );
-    let remaining_deadline = if started.ignores_request_deadline {
-        runtime.upstream_timeout
-    } else {
-        let Some(remaining_deadline) = runtime.request_deadline.remaining() else {
-            return Err(request_deadline_shielded_attempt_failure(&started.info));
-        };
-        remaining_deadline
+    let Some(remaining_deadline) = runtime.request_deadline.remaining() else {
+        return Err(request_deadline_shielded_attempt_failure(&started.info));
     };
     let mut shutdown = runtime.shutdown.subscribe();
     let result = tokio::select! {
@@ -10208,20 +10350,10 @@ async fn aggregate_native_json_shielded_attempt(
     runtime: &ShieldedRetryRuntime,
     started: ShieldedStartedAttempt,
 ) -> Result<ShieldedAggregatedAttempt, ShieldedAttemptFailure> {
-    let ShieldedStartedAttempt {
-        info,
-        response,
-        ignores_request_deadline,
-        ..
-    } = started;
+    let ShieldedStartedAttempt { info, response, .. } = started;
     let aggregate = read_upstream_body_bytes(response.bytes_stream());
-    let remaining_deadline = if ignores_request_deadline {
-        runtime.upstream_timeout
-    } else {
-        let Some(remaining_deadline) = runtime.request_deadline.remaining() else {
-            return Err(request_deadline_shielded_attempt_failure(&info));
-        };
-        remaining_deadline
+    let Some(remaining_deadline) = runtime.request_deadline.remaining() else {
+        return Err(request_deadline_shielded_attempt_failure(&info));
     };
     let mut shutdown = runtime.shutdown.subscribe();
     let body = tokio::select! {
@@ -10270,7 +10402,7 @@ fn constraint_repair_for_aggregated_response(
     body: &Bytes,
 ) -> Option<prose_constraints::ConstraintRepair> {
     if runtime.request_deadline.is_exhausted()
-        || !runtime.retry_policy.allows_retry_after(info.attempt_number)
+        || !runtime.allows_ordinary_retry(info.attempt_number)
     {
         return None;
     }
@@ -10300,8 +10432,7 @@ async fn run_shielded_attempts(
         let mut started = if let Some(started) = current_attempt.take() {
             started
         } else {
-            let ignores_request_deadline = consume_local_recovery_deadline_replay_permit(&runtime);
-            if runtime.request_deadline.is_exhausted() && !ignores_request_deadline {
+            if runtime.request_deadline.is_exhausted() {
                 return ShieldedRunOutcome::Failed(request_deadline_exhausted_outcome(
                     &runtime,
                     attempt_number,
@@ -10318,7 +10449,6 @@ async fn run_shielded_attempts(
                     constraint_repair: constraint_repair.as_ref(),
                     force_disable_after_salvage_loop,
                 },
-                ignores_request_deadline,
             )
             .await
             {
@@ -10434,7 +10564,10 @@ async fn run_shielded_attempts(
                     local_recovery_gate_for_attempt_failure(&runtime, can_retry, &failure).await;
                 let local_recovery_already_applied = local_recovery_gate.applied;
                 if local_recovery_gate.applied {
-                    can_retry = local_recovery_gate.permits_deadline_replay
+                    if local_recovery_gate.permits_replay {
+                        runtime.claim_recovery_replay(failure.attempt_number);
+                    }
+                    can_retry = local_recovery_gate.permits_replay
                         || (can_retry && local_recovery_gate.permits_retry);
                     failure
                         .response_metadata
@@ -10538,15 +10671,13 @@ fn native_json_fallback_eligible(
             .response_metadata
             .get("request_deadline_exhausted")
             .is_some_and(|value| value == "true")
-        || !runtime
-            .retry_policy
-            .allows_retry_after(failure.attempt_number)
+        || !runtime.allows_ordinary_retry(failure.attempt_number)
     {
         return false;
     }
     can_retry
         && runtime.chat_kind == ShieldedChatKind::NonStream
-        && failure.attempt_number == 1
+        && runtime.ordinary_attempt_number(failure.attempt_number) == 1
         && failure.wire_mode == ShieldedUpstreamWireMode::ShieldedSse
         && failure.sse_failure_kind == Some(shielded_chat::AggregationFailureKind::BodyFailure)
 }
@@ -10567,7 +10698,7 @@ fn shielded_accepted_outcome(
 fn direct_relay_no_thinking_stream_outcome(
     started: ShieldedStartedAttempt,
     attempt_records: &[AttemptRecord],
-    request_deadline: ShieldedRequestDeadline,
+    request_deadline: RequestDeadline,
 ) -> ShieldedDirectRelayOutcome {
     ShieldedDirectRelayOutcome {
         started,
@@ -10580,7 +10711,7 @@ fn direct_relay_no_thinking_stream_outcome(
 fn direct_relay_first_attempt_force_disable_stream_outcome(
     started: ShieldedStartedAttempt,
     attempt_records: &[AttemptRecord],
-    request_deadline: ShieldedRequestDeadline,
+    request_deadline: RequestDeadline,
 ) -> ShieldedDirectRelayOutcome {
     ShieldedDirectRelayOutcome {
         started,
@@ -10596,7 +10727,7 @@ fn should_direct_relay_no_thinking_stream(
     retry_cause: Option<ShieldedRetryCause>,
 ) -> bool {
     runtime.chat_kind == ShieldedChatKind::Stream
-        && info.attempt_number > 1
+        && runtime.ordinary_attempt_number(info.attempt_number) > 1
         && matches!(retry_cause, Some(ShieldedRetryCause::LoopDetected))
         && info
             .request_metadata
@@ -10621,7 +10752,7 @@ fn should_direct_relay_first_attempt_force_disable_stream(
     info: &ShieldedAttemptInfo,
 ) -> bool {
     runtime.chat_kind == ShieldedChatKind::Stream
-        && info.attempt_number == 1
+        && runtime.ordinary_attempt_number(info.attempt_number) == 1
         && info
             .request_metadata
             .get("cot_salvage_used")
@@ -10697,9 +10828,7 @@ fn should_retry_after_shielded_failure(
     !is_server_shutdown_failure(failure)
         && failure.retry_cause.is_some()
         && !runtime.downstream_drop_signal.is_dropped()
-        && runtime
-            .retry_policy
-            .allows_retry_after(failure.attempt_number)
+        && runtime.allows_ordinary_retry(failure.attempt_number)
 }
 
 #[cfg(feature = "upstream-hot-restart")]
@@ -11051,7 +11180,7 @@ struct LocalRecoveryGate {
     metadata: BTreeMap<String, String>,
     permits_retry: bool,
     applied: bool,
-    permits_deadline_replay: bool,
+    permits_replay: bool,
 }
 
 async fn local_recovery_gate_for_attempt_failure(
@@ -11115,95 +11244,25 @@ async fn local_recovery_gate(
     let Some(cause) = cause else {
         return unapplied_local_recovery_gate();
     };
-    if cause == LocalRecoveryCause::RequestDeadline
-        && !runtime.local_recovery_policy.trigger_on_request_deadline
-    {
-        return unapplied_local_recovery_gate();
-    }
-    // Transient upstream failures must still enter local recovery even when the
-    // shielded retry ladder has already exhausted `can_retry`. Otherwise Guard
-    // returns 502 to the client instead of holding for restart/readiness and
-    // replaying (issue #233: hold-and-replay contract).
-    let allow_without_ladder = matches!(
+    precommit_recovery::gate(
+        precommit_recovery::Context {
+            policy: &runtime.local_recovery_policy,
+            coordinator: &runtime.local_recovery,
+            client: runtime.client.clone(),
+            base_url: runtime.upstream_profile.primary_base_url(),
+            profile_name: &runtime.upstream_profile.name,
+            attempts: &runtime.local_recovery_attempts,
+            downstream_commit_signal: Some(&runtime.downstream_commit_signal),
+            downstream_drop_signal: Some(&runtime.downstream_drop_signal),
+            request_deadline: runtime.request_deadline,
+            episode_timeout: runtime.upstream_profile.restart_queue.enabled.then(|| {
+                Duration::from_secs(runtime.upstream_profile.restart_queue.restart_timeout_secs)
+            }),
+        },
+        can_retry,
         cause,
-        LocalRecoveryCause::RequestDeadline
-            | LocalRecoveryCause::TransientTransport
-            | LocalRecoveryCause::TransientStatus
-            | LocalRecoveryCause::UpstreamStall
-            | LocalRecoveryCause::StuckWatchdog
-    );
-    if (!can_retry && !allow_without_ladder)
-        || (!runtime.local_recovery_policy.enabled
-            && runtime.local_recovery_policy.restart_command.is_empty())
-    {
-        return unapplied_local_recovery_gate();
-    }
-
-    if !runtime.local_recovery_policy.enabled {
-        return unapplied_local_recovery_gate();
-    }
-    if runtime.local_recovery_policy.restart_command.is_empty() {
-        return unapplied_local_recovery_gate();
-    }
-    let mut metadata = local_recovery_metadata(runtime, cause);
-    if runtime.downstream_drop_signal.is_dropped() {
-        return skipped_local_recovery_gate(metadata, "skipped_downstream_dropped", false);
-    }
-    if local_recovery_downstream_commit_observed(
-        Some(&runtime.downstream_commit_signal),
-        &mut metadata,
-    ) {
-        return skipped_local_recovery_gate(metadata, "skipped_downstream_committed", false);
-    }
-    let previous_attempts = runtime
-        .local_recovery_attempts
-        .fetch_add(1, Ordering::SeqCst);
-    if previous_attempts >= u64::from(runtime.local_recovery_policy.max_attempts_per_request) {
-        metadata.insert(
-            String::from("local_recovery_status"),
-            String::from("skipped_request_budget_exhausted"),
-        );
-        metadata.insert(
-            String::from("local_recovery_permits_retry"),
-            String::from("false"),
-        );
-        metadata.insert(
-            String::from("local_recovery_request_attempts_used"),
-            previous_attempts.to_string(),
-        );
-        return applied_local_recovery_gate(metadata, false, false);
-    }
-    metadata.insert(
-        String::from("local_recovery_request_attempts_used"),
-        previous_attempts.saturating_add(1).to_string(),
-    );
-
-    let recovery_metadata = run_local_recovery(runtime, cause).await;
-    metadata.extend(recovery_metadata);
-    if runtime.downstream_drop_signal.is_dropped() {
-        return skipped_local_recovery_gate(metadata, "skipped_downstream_dropped", false);
-    }
-    if local_recovery_downstream_commit_observed(
-        Some(&runtime.downstream_commit_signal),
-        &mut metadata,
-    ) {
-        return skipped_local_recovery_gate(metadata, "skipped_downstream_committed", false);
-    }
-    let permits_retry = local_recovery_permits_retry(&metadata);
-    // Any successful local recovery re-opens a replay attempt, not only the
-    // request-deadline path. Ladder exhaustion must not strand a recovered
-    // upstream with a permanent client 502 (#233).
-    let permits_deadline_replay = local_recovery_completed_ready(&metadata);
-    if permits_deadline_replay {
-        runtime
-            .local_recovery_deadline_replay_permits
-            .fetch_add(1, Ordering::SeqCst);
-    }
-    metadata.insert(
-        String::from("local_recovery_permits_retry"),
-        permits_retry.to_string(),
-    );
-    applied_local_recovery_gate(metadata, permits_retry, permits_deadline_replay)
+    )
+    .await
 }
 
 /// A non-empty liveness/final output commits the response. Every recovery
@@ -11232,7 +11291,7 @@ fn unapplied_local_recovery_gate() -> LocalRecoveryGate {
         metadata: BTreeMap::new(),
         permits_retry: true,
         applied: false,
-        permits_deadline_replay: false,
+        permits_replay: false,
     }
 }
 
@@ -11252,24 +11311,25 @@ fn skipped_local_recovery_gate(
 fn applied_local_recovery_gate(
     metadata: BTreeMap<String, String>,
     permits_retry: bool,
-    permits_deadline_replay: bool,
+    permits_replay: bool,
 ) -> LocalRecoveryGate {
     LocalRecoveryGate {
         metadata,
         permits_retry,
         applied: true,
-        permits_deadline_replay,
+        permits_replay,
     }
 }
 
 fn local_recovery_metadata(
-    runtime: &ShieldedRetryRuntime,
+    policy: &LocalRecoveryPolicy,
+    profile_name: &str,
     cause: LocalRecoveryCause,
 ) -> BTreeMap<String, String> {
     BTreeMap::from([
         (
             String::from("local_recovery_configured"),
-            runtime.local_recovery_policy.is_configured().to_string(),
+            policy.is_configured().to_string(),
         ),
         (
             String::from("local_recovery_cause"),
@@ -11277,7 +11337,7 @@ fn local_recovery_metadata(
         ),
         (
             String::from("local_recovery_profile"),
-            runtime.upstream_profile.name.clone(),
+            profile_name.to_owned(),
         ),
     ])
 }
@@ -11304,39 +11364,11 @@ fn local_recovery_completed_ready(metadata: &BTreeMap<String, String>) -> bool {
             .is_some_and(|status| status == "succeeded"))
 }
 
-fn consume_local_recovery_deadline_replay_permit(runtime: &ShieldedRetryRuntime) -> bool {
-    runtime
-        .local_recovery_deadline_replay_permits
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |permits| {
-            permits.checked_sub(1)
-        })
-        .is_ok()
-}
-
 struct LocalRecoveryRunOptions<'a> {
     episode_timeout: Option<Duration>,
+    caller_timeout: Option<Duration>,
     recovery_episode_observer: Option<&'a AtomicU64>,
     downstream_commit_signal: Option<DownstreamCommitSignal>,
-}
-
-async fn run_local_recovery(
-    runtime: &ShieldedRetryRuntime,
-    cause: LocalRecoveryCause,
-) -> BTreeMap<String, String> {
-    let restart_queue = &runtime.upstream_profile.restart_queue;
-    let episode_timeout = restart_queue
-        .enabled
-        .then(|| Duration::from_secs(restart_queue.restart_timeout_secs));
-    run_local_recovery_for_profile_with_downstream_commit(
-        &runtime.local_recovery_policy,
-        &runtime.local_recovery,
-        runtime.client.clone(),
-        runtime.upstream_profile.primary_base_url().to_owned(),
-        cause,
-        episode_timeout,
-        Some(runtime.downstream_commit_signal.clone()),
-    )
-    .await
 }
 
 #[cfg(test)]
@@ -11348,27 +11380,6 @@ async fn run_local_recovery_for_profile(
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
 ) -> BTreeMap<String, String> {
-    run_local_recovery_for_profile_with_downstream_commit(
-        policy,
-        coordinator,
-        client,
-        base_url,
-        cause,
-        episode_timeout,
-        None,
-    )
-    .await
-}
-
-async fn run_local_recovery_for_profile_with_downstream_commit(
-    policy: &LocalRecoveryPolicy,
-    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
-    client: Client,
-    base_url: String,
-    cause: LocalRecoveryCause,
-    episode_timeout: Option<Duration>,
-    downstream_commit_signal: Option<DownstreamCommitSignal>,
-) -> BTreeMap<String, String> {
     run_local_recovery_for_profile_observing(
         policy,
         coordinator,
@@ -11377,8 +11388,9 @@ async fn run_local_recovery_for_profile_with_downstream_commit(
         cause,
         LocalRecoveryRunOptions {
             episode_timeout,
+            caller_timeout: None,
             recovery_episode_observer: None,
-            downstream_commit_signal,
+            downstream_commit_signal: None,
         },
     )
     .await
@@ -11404,12 +11416,69 @@ async fn run_local_recovery_for_profile_observing(
             observer.store(recovery_episode_id, Ordering::Release);
         }
         drop(state);
-        return wait_for_local_recovery_result(policy, coordinator, true, recovery_episode_id)
-            .await;
+        return wait_for_local_recovery_result_with_options(
+            policy,
+            coordinator,
+            true,
+            recovery_episode_id,
+            &options,
+        )
+        .await;
     }
 
-    let mut metadata = BTreeMap::new();
     let now = Instant::now();
+    if let Some(metadata) = local_recovery_admission_failure(policy, &mut state, now) {
+        return metadata;
+    }
+
+    state.running = true;
+    let Some(recovery_episode_id) = state.ensure_active_recovery_episode() else {
+        state.running = false;
+        return BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("episode_id_exhausted"),
+        )]);
+    };
+    if let Some(observer) = options.recovery_episode_observer {
+        observer.store(recovery_episode_id, Ordering::Release);
+    }
+    state.recovery_started = Some(now);
+    let recovery_timeout = local_recovery_completion_timeout(policy);
+    let task_timeout = minimum_optional_timeout(options.episode_timeout, options.caller_timeout);
+    state.recovery_deadline = Some(checked_instant_add(
+        now,
+        task_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
+    ));
+    state.runs_in_window = state.runs_in_window.saturating_add(1);
+    let recovery_task = tokio::spawn(run_local_recovery_task(
+        policy.clone(),
+        client,
+        base_url,
+        cause,
+        task_timeout,
+        options.downstream_commit_signal.clone(),
+    ));
+    state.active_local_recovery_task = Some(recovery_task.abort_handle());
+    drop(state);
+
+    spawn_local_recovery_terminalizer(coordinator, recovery_episode_id, recovery_task);
+
+    wait_for_local_recovery_result_with_options(
+        policy,
+        coordinator,
+        false,
+        recovery_episode_id,
+        &options,
+    )
+    .await
+}
+
+fn local_recovery_admission_failure(
+    policy: &LocalRecoveryPolicy,
+    state: &mut UpstreamStallRecoveryState,
+    now: Instant,
+) -> Option<BTreeMap<String, String>> {
+    let mut metadata = BTreeMap::new();
     if let Some(last_finished) = state.last_finished {
         let elapsed = now.saturating_duration_since(last_finished);
         if elapsed < policy.cooldown {
@@ -11425,7 +11494,7 @@ async fn run_local_recovery_for_profile_observing(
                     .as_millis()
                     .to_string(),
             );
-            return metadata;
+            return Some(metadata);
         }
     }
 
@@ -11446,48 +11515,45 @@ async fn run_local_recovery_for_profile_observing(
             String::from("local_recovery_budget_max_per_window"),
             policy.max_per_window.to_string(),
         );
-        return metadata;
+        return Some(metadata);
     } else if state.window_started.is_none() {
         state.window_started = Some(now);
     }
+    None
+}
 
-    state.running = true;
-    let Some(recovery_episode_id) = state.ensure_active_recovery_episode() else {
-        state.running = false;
-        return BTreeMap::from([(
-            String::from("local_recovery_status"),
-            String::from("episode_id_exhausted"),
-        )]);
-    };
-    if let Some(observer) = options.recovery_episode_observer {
-        observer.store(recovery_episode_id, Ordering::Release);
-    }
-    state.recovery_started = Some(now);
-    let recovery_timeout = policy
+async fn wait_for_local_recovery_result_with_options(
+    policy: &LocalRecoveryPolicy,
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+    joined_inflight: bool,
+    recovery_episode_id: u64,
+    options: &LocalRecoveryRunOptions<'_>,
+) -> BTreeMap<String, String> {
+    wait_for_local_recovery_result(
+        policy,
+        coordinator,
+        joined_inflight,
+        recovery_episode_id,
+        options.caller_timeout,
+    )
+    .await
+}
+
+const LOCAL_RECOVERY_COMPLETION_GUARD: Duration = Duration::from_secs(1);
+
+fn local_recovery_completion_timeout(policy: &LocalRecoveryPolicy) -> Duration {
+    policy
         .restart_timeout
         .saturating_add(policy.readiness_deadline)
-        .saturating_add(Duration::from_secs(1));
-    state.recovery_deadline = Some(checked_instant_add(
-        now,
-        options
-            .episode_timeout
-            .map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
-    ));
-    state.runs_in_window = state.runs_in_window.saturating_add(1);
-    let recovery_task = tokio::spawn(run_local_recovery_task(
-        policy.clone(),
-        client,
-        base_url,
-        cause,
-        options.episode_timeout,
-        options.downstream_commit_signal,
-    ));
-    state.active_local_recovery_task = Some(recovery_task.abort_handle());
-    drop(state);
+        .saturating_add(LOCAL_RECOVERY_COMPLETION_GUARD)
+}
 
-    spawn_local_recovery_terminalizer(coordinator, recovery_episode_id, recovery_task);
-
-    wait_for_local_recovery_result(policy, coordinator, false, recovery_episode_id).await
+fn minimum_optional_timeout(first: Option<Duration>, second: Option<Duration>) -> Option<Duration> {
+    match (first, second) {
+        (Some(first), Some(second)) => Some(first.min(second)),
+        (Some(timeout), None) | (None, Some(timeout)) => Some(timeout),
+        (None, None) => None,
+    }
 }
 
 fn spawn_local_recovery_terminalizer(
@@ -11634,17 +11700,15 @@ async fn wait_for_local_recovery_result(
     coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
     joined_inflight: bool,
     recovery_episode_id: u64,
+    caller_timeout: Option<Duration>,
 ) -> BTreeMap<String, String> {
     let mut state = coordinator.state.lock().await;
     let recovery_started = *state.recovery_started.get_or_insert_with(Instant::now);
-    let deadline = *state.recovery_deadline.get_or_insert_with(|| {
-        checked_instant_add(
-            recovery_started,
-            policy
-                .restart_timeout
-                .saturating_add(policy.readiness_deadline)
-                .saturating_add(Duration::from_secs(1)),
-        )
+    let recovery_deadline = *state.recovery_deadline.get_or_insert_with(|| {
+        checked_instant_add(recovery_started, local_recovery_completion_timeout(policy))
+    });
+    let deadline = caller_timeout.map_or(recovery_deadline, |timeout| {
+        recovery_deadline.min(checked_instant_add(Instant::now(), timeout))
     });
     drop(state);
     loop {
@@ -12231,7 +12295,6 @@ async fn start_shielded_attempt(
     retry_cause: Option<ShieldedRetryCause>,
     wire_mode: ShieldedUpstreamWireMode,
     salvage: ShieldedAttemptSalvage<'_>,
-    ignores_request_deadline: bool,
 ) -> Result<ShieldedStartedAttempt, ShieldedAttemptFailure> {
     let attempt_id = AttemptId::for_request(&runtime.request_id, attempt_number);
     let attempt_started_at_unix_ms = unix_time_millis();
@@ -12282,7 +12345,7 @@ async fn start_shielded_attempt(
     })?;
     let raw_request_body = raw_payload_text(&rendered.body);
     let evidence_upstream_body = rendered.body.clone();
-    let upstream_timeout = shielded_attempt_upstream_timeout(runtime, ignores_request_deadline);
+    let upstream_timeout = shielded_attempt_upstream_timeout(runtime);
     let start_failure = |error| ShieldedStartFailureInput {
         runtime,
         attempt_id: attempt_id.clone(),
@@ -12305,7 +12368,6 @@ async fn start_shielded_attempt(
         rendered,
         upstream_body,
         upstream_timeout,
-        ignores_request_deadline,
     )
     .await
     {
@@ -12320,6 +12382,7 @@ async fn start_shielded_attempt(
             )),
         )));
     };
+    let response = response.into_response();
     let upstream_status = response.status();
     let upstream_headers = response.headers().clone();
     let upstream_mode = upstream_mode_from_headers(&upstream_headers);
@@ -12343,7 +12406,6 @@ async fn start_shielded_attempt(
         terminal_endpoint,
         terminal_endpoint_protocol: sent.terminal_endpoint_protocol,
         endpoint_retry_order,
-        ignores_request_deadline,
         stuck_watchdog_attempt: sent.stuck_watchdog_attempt,
     })
 }
@@ -12397,20 +12459,13 @@ fn update_shielded_retry_endpoint(
         .clone_from(&started.endpoint_retry_order);
 }
 
-fn shielded_attempt_upstream_timeout(
-    runtime: &ShieldedRetryRuntime,
-    ignores_request_deadline: bool,
-) -> Duration {
-    if ignores_request_deadline {
-        runtime.upstream_timeout
-    } else {
-        runtime
-            .request_deadline
-            .remaining()
-            .map_or(Duration::ZERO, |remaining| {
-                runtime.upstream_timeout.min(remaining)
-            })
-    }
+fn shielded_attempt_upstream_timeout(runtime: &ShieldedRetryRuntime) -> Duration {
+    runtime
+        .request_deadline
+        .remaining()
+        .map_or(Duration::ZERO, |remaining| {
+            runtime.upstream_timeout.min(remaining)
+        })
 }
 
 async fn send_shielded_upstream_attempt(
@@ -12420,17 +12475,9 @@ async fn send_shielded_upstream_attempt(
     rendered: reranker_protocol::RenderedEndpointRequest,
     retry_body: Bytes,
     upstream_timeout: Duration,
-    ignores_request_deadline: bool,
 ) -> Result<SentUpstreamResponse, ProxyError> {
     let (attempt_id, attempt_number, attempt_started_at_unix_ms) = attempt;
-    let request_deadline = (!ignores_request_deadline)
-        .then(|| {
-            runtime
-                .request_deadline
-                .remaining()
-                .map(|remaining| Instant::now() + remaining)
-        })
-        .flatten();
+    let request_deadline = Some(runtime.request_deadline.instant());
     send_first_upstream_attempt(UpstreamAttemptContext {
         client: &runtime.client,
         method: runtime.method.clone(),
@@ -12670,6 +12717,7 @@ fn shielded_attempt_body(
     cot_salvage: Option<&CotSalvageContext>,
     constraint_repair: Option<&prose_constraints::ConstraintRepair>,
 ) -> (Bytes, bool, bool, BTreeMap<String, String>) {
+    let ordinary_attempt_number = runtime.ordinary_attempt_number(attempt_number);
     let prepared_request = match runtime.chat_kind {
         ShieldedChatKind::NonStream => match wire_mode {
             ShieldedUpstreamWireMode::ShieldedSse => shielded_chat::prepare_non_stream_request(
@@ -12705,11 +12753,11 @@ fn shielded_attempt_body(
     };
 
     if let Some(constraint_repair) = constraint_repair {
-        let retry_hint =
-            constraint_repair.retry_hint(attempt_number, runtime.retry_policy.max_attempts);
+        let retry_hint = constraint_repair
+            .retry_hint(ordinary_attempt_number, runtime.retry_policy.max_attempts);
         if let Some(body) = shielded_chat::body_with_anti_loop_retry_hint(
             &prepared_body,
-            attempt_number,
+            ordinary_attempt_number,
             runtime.retry_policy.max_attempts,
             Some(&retry_hint),
         ) {
@@ -12725,7 +12773,7 @@ fn shielded_attempt_body(
     if let Some(cot_salvage) = cot_salvage
         && let Some(body) = shielded_chat::body_with_cot_salvage_retry_hint(
             &prepared_body,
-            attempt_number,
+            ordinary_attempt_number,
             runtime.retry_policy.max_attempts,
             cot_salvage.policy.as_str(),
             &cot_salvage.pre_loop_reasoning,
@@ -12740,13 +12788,13 @@ fn shielded_attempt_body(
         return (body, true, false, thinking_metadata);
     }
 
-    let (prepared_body, anti_loop_hint_applied) = if attempt_number > 1
+    let (prepared_body, anti_loop_hint_applied) = if ordinary_attempt_number > 1
         && runtime.retry_policy.anti_loop_hint_enabled
         && matches!(retry_cause, Some(ShieldedRetryCause::LoopDetected))
     {
         if let Some(body) = shielded_chat::body_with_anti_loop_retry_hint(
             &prepared_body,
-            attempt_number,
+            ordinary_attempt_number,
             runtime.retry_policy.max_attempts,
             attempt_plan.anti_loop_hint.as_deref(),
         ) {
@@ -12831,7 +12879,7 @@ fn shielded_attempt_request_metadata(
     );
     add_retry_attempt_metadata(
         &mut metadata,
-        &runtime.retry_policy,
+        runtime,
         attempt_number,
         retry_cause,
         anti_loop_hint_applied,
@@ -12878,7 +12926,7 @@ fn add_shielded_wire_metadata(
         runtime
             .retry_policy
             .max_attempts
-            .saturating_sub(attempt_number)
+            .saturating_sub(runtime.ordinary_attempt_number(attempt_number))
             .to_string(),
     );
     metadata.insert(
@@ -12889,14 +12937,19 @@ fn add_shielded_wire_metadata(
 
 fn add_retry_attempt_metadata(
     metadata: &mut BTreeMap<String, String>,
-    policy: &ShieldedRetryPolicy,
+    runtime: &ShieldedRetryRuntime,
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
     anti_loop_hint_applied: bool,
     attempt_plan: &ShieldedAttemptPlan,
     cot_salvage: Option<&CotSalvageContext>,
 ) {
+    let policy = &runtime.retry_policy;
     metadata.insert(String::from("attempt_number"), attempt_number.to_string());
+    metadata.insert(
+        String::from("ordinary_attempt_number"),
+        runtime.ordinary_attempt_number(attempt_number).to_string(),
+    );
     metadata.insert(
         String::from("attempt_index"),
         attempt_number.saturating_sub(1).to_string(),
@@ -13059,6 +13112,10 @@ fn add_retry_request_metadata(
         policy.request_deadline.as_millis().to_string(),
     );
     metadata.insert(
+        String::from("retry_max_retry_after_secs"),
+        policy.max_retry_after.as_secs().to_string(),
+    );
+    metadata.insert(
         String::from("retry_anti_loop_hint_enabled"),
         policy.anti_loop_hint_enabled.to_string(),
     );
@@ -13077,7 +13134,7 @@ fn add_retry_request_metadata(
 }
 
 fn retry_cause_for_upstream_status(status: reqwest::StatusCode) -> Option<ShieldedRetryCause> {
-    if matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504) {
+    if matches!(status.as_u16(), 408 | 500 | 502 | 503 | 504) {
         Some(ShieldedRetryCause::TransientUpstreamStatus)
     } else {
         None
@@ -13316,7 +13373,9 @@ fn first_attempt_cot_salvage_context(
     runtime: &ShieldedRetryRuntime,
     failure: &ShieldedAttemptFailure,
 ) -> Option<CotSalvageContext> {
-    if failure.attempt_number != 1 || !runtime.retry_policy.loop_failure_policy.uses_cot_salvage() {
+    if runtime.ordinary_attempt_number(failure.attempt_number) != 1
+        || !runtime.retry_policy.loop_failure_policy.uses_cot_salvage()
+    {
         return None;
     }
     let salvaged_reasoning = pre_loop_reasoning_for_salvage(failure)?;
@@ -13781,6 +13840,7 @@ fn terminal_forward_failure(
         enabled: false,
         max_attempts: 1,
         request_deadline: Duration::from_millis(RetryConfig::default().request_deadline_ms),
+        max_retry_after: Duration::from_secs(RetryConfig::default().max_retry_after_secs),
         anti_loop_hint_enabled: false,
         shielded_streaming_enabled: false,
         downstream_drop_policy: DownstreamDropPolicy::Cancel,
@@ -13824,7 +13884,7 @@ fn shielded_retry_success_response(
     let upstream_content_type = upstream_headers.get(CONTENT_TYPE).map(header_value);
     let response_headers = shielded_chat_response_headers(&upstream_headers, body_len);
     let mut extra_metadata = outcome.response_metadata.clone();
-    extra_metadata.extend(shielded_liveness_response_metadata(
+    extra_metadata.extend(effective_liveness::response_metadata(
         &runtime.liveness,
         upstream_content_type.clone(),
     ));
@@ -13869,7 +13929,7 @@ fn shielded_retry_success_response(
 
 fn shielded_retry_error_response(
     runtime: &ShieldedRetryRuntime,
-    failure: ShieldedFailureOutcome,
+    mut failure: ShieldedFailureOutcome,
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     let request_id = runtime.request_id.clone();
@@ -13895,6 +13955,12 @@ fn shielded_retry_error_response(
         response_headers.insert(RETRY_AFTER, value);
     }
     let downstream_status = failure.downstream_status;
+    failure
+        .response_metadata
+        .extend(effective_liveness::response_metadata(
+            &runtime.liveness,
+            None,
+        ));
     let observer = shielded_retry_observer(
         runtime,
         ShieldedRetryObserverInput {
@@ -13938,8 +14004,12 @@ async fn shielded_retry_terminal_forward_response(
     let request_path = runtime.downstream_uri.path().to_owned();
     let request_id = runtime.request_id.clone();
     let malformed_counter = runtime.malformed_response_counter.clone();
+    let liveness_metadata = effective_liveness::response_metadata(
+        &runtime.liveness,
+        upstream_headers.get(CONTENT_TYPE).map(header_value),
+    );
     let final_attempt = terminal.started.info.clone().into_final_context(
-        BTreeMap::new(),
+        liveness_metadata.clone(),
         RawPayloads::default(),
         Bytes::new(),
         Bytes::new(),
@@ -13951,7 +14021,7 @@ async fn shielded_retry_terminal_forward_response(
             downstream_status: upstream_status,
             downstream_headers: upstream_headers.clone(),
             upstream_mode: final_attempt.upstream_mode,
-            extra_response_metadata: BTreeMap::new(),
+            extra_response_metadata: liveness_metadata,
             raw_payloads: RawPayloads::default(),
             completed_attempt_records: terminal.prior_attempt_records,
             final_attempt: Some(final_attempt),
@@ -14845,7 +14915,7 @@ impl ObservedUpstreamBody {
         in_flight_permit: InFlightPermit,
         terminal_completion: BodyCompletion,
         shutdown: ShutdownSubscription,
-        deadline: Option<ShieldedRequestDeadline>,
+        deadline: Option<RequestDeadline>,
     ) -> Self {
         Self::new_with_completion(
             stream,
@@ -14863,7 +14933,7 @@ impl ObservedUpstreamBody {
         in_flight_permit: InFlightPermit,
         terminal_completion: BodyCompletion,
         shutdown: ShutdownSubscription,
-        deadline: Option<ShieldedRequestDeadline>,
+        deadline: Option<RequestDeadline>,
     ) -> Self {
         let progress = observer.stuck_watchdog_progress_request();
         let relayed = observe_upstream_body_independently(stream, progress);
@@ -15731,6 +15801,7 @@ fn select_shielded_liveness(
     };
 
     ShieldedLivenessSelection {
+        configured_mode: config.heartbeat.mode,
         mode,
         heartbeat_interval_secs: config.heartbeat.interval_secs,
         input_fingerprint,
@@ -15866,7 +15937,7 @@ fn add_shielded_request_metadata(
 ) {
     if shielded_chat {
         add_shielded_chat_request_metadata(metadata);
-        add_shielded_liveness_request_metadata(metadata, liveness);
+        effective_liveness::add_request_metadata(metadata, liveness);
     }
     if thinking_policy_applied {
         metadata.insert(
@@ -15884,64 +15955,6 @@ fn add_shielded_chat_request_metadata(metadata: &mut BTreeMap<String, String>) {
         String::from("policy_transform_applied"),
         String::from("true"),
     );
-}
-
-fn add_shielded_liveness_request_metadata(
-    metadata: &mut BTreeMap<String, String>,
-    liveness: &ShieldedLivenessSelection,
-) {
-    metadata.extend(shielded_liveness_metadata(liveness));
-}
-
-fn shielded_liveness_response_metadata(
-    liveness: &ShieldedLivenessSelection,
-    upstream_content_type: Option<String>,
-) -> BTreeMap<String, String> {
-    let mut metadata = shielded_liveness_metadata(liveness);
-    metadata.insert(
-        String::from("shielded_downstream_streaming"),
-        (liveness.mode == ShieldedLivenessMode::Sse).to_string(),
-    );
-    if let Some(content_type) = upstream_content_type {
-        metadata.insert(
-            String::from("upstream_response_header_content-type"),
-            content_type,
-        );
-    }
-    metadata
-}
-
-fn shielded_liveness_metadata(liveness: &ShieldedLivenessSelection) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        (
-            String::from("downstream_liveness_mode"),
-            liveness.mode.as_str().to_owned(),
-        ),
-        (
-            String::from("heartbeat_interval_secs"),
-            liveness.heartbeat_interval_secs.to_string(),
-        ),
-        (
-            String::from("repeat_input_window_secs"),
-            liveness.repeat_window_secs.to_string(),
-        ),
-        (
-            String::from("repeat_input_max_repeated_inputs"),
-            liveness.repeat_max_inputs.to_string(),
-        ),
-        (
-            String::from("input_fingerprint_present"),
-            liveness.input_fingerprint.is_some().to_string(),
-        ),
-        (
-            String::from("repeat_input_matched"),
-            liveness.repeat_observation.repeated.to_string(),
-        ),
-        (
-            String::from("repeat_input_prior_count"),
-            liveness.repeat_observation.prior_count.to_string(),
-        ),
-    ])
 }
 
 fn attempt_request_metadata(
@@ -16533,11 +16546,30 @@ fn evidence_attempt_from_observability(
 }
 
 fn evidence_attempt_role(attempt: &AttemptRecord) -> EvidenceAttemptRole {
-    if attempt.attempt_number <= 1 {
+    if ordinary_attempt_number_from_metadata(attempt.attempt_number, &attempt.request_metadata) <= 1
+    {
         EvidenceAttemptRole::Primary
     } else {
         EvidenceAttemptRole::Fallback
     }
+}
+
+fn ordinary_attempt_number_from_metadata(
+    physical_attempt_number: u32,
+    metadata: &BTreeMap<String, String>,
+) -> u32 {
+    metadata
+        .get("ordinary_attempt_number")
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(physical_attempt_number)
+}
+
+fn next_ordinary_attempt_number_from_metadata(
+    physical_attempt_number: u32,
+    metadata: &BTreeMap<String, String>,
+) -> u32 {
+    ordinary_attempt_number_from_metadata(physical_attempt_number, metadata).saturating_add(1)
 }
 
 fn attempt_shown_to_downstream(request: &RequestRecord, attempt: &AttemptRecord) -> bool {
@@ -16620,7 +16652,7 @@ fn maybe_schedule_paired_comparison_after_primary(
         return;
     }
     let Some(source) = attempts.iter().find(|attempt| {
-        attempt.attempt_number == 1
+        runtime.ordinary_attempt_number(attempt.attempt_number) == 1
             && attempt.status == AttemptStatus::Succeeded
             && attempt_shown_to_downstream(request, attempt)
     }) else {
@@ -16867,7 +16899,10 @@ fn shadow_comparison_attempt_plan(
         }
         upstream_body = shielded_chat::body_with_cot_salvage_retry_hint(
             &upstream_body,
-            source.attempt_number.saturating_add(1),
+            next_ordinary_attempt_number_from_metadata(
+                source.attempt_number,
+                &source.request_metadata,
+            ),
             runtime.retry_policy.max_attempts,
             comparison.as_str(),
             &reasoning_prefix,

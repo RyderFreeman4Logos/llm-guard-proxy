@@ -46,6 +46,10 @@ recovery policy relative to the previously installed snapshot:
   the AEON profile, and every retry rung.
 - The integrated guardian is enabled for `aeon-text` with a 5 GiB threshold,
   direct `cgroup-kill`, a three-second poll, and `text-cgroup.v1` registration.
+- Local recovery is active for both the default and named `aeon-chat` routes,
+  targets `vllm-aeon-27b-dflash-n12.service`, and permits one pre-commit
+  recovery replay per downstream request. Named profiles do not inherit the
+  default route's recovery table.
 
 The guardian values must match the operational source of truth exactly. Do not
 replace current listener routing, per-upstream concurrency, timeouts, evidence
@@ -143,7 +147,30 @@ fi
 
 ## Apply service changes
 
-Copy the wrapper assets:
+First validate the reviewed candidate without changing installed files. Set
+`DOWNSTREAM_IDLE_TIMEOUT_MS` to the smallest effective idle timeout across
+clients, tunnels, and reverse proxies. Correctness-first shielding emits no
+pre-commit heartbeat bytes, so this value must be strictly greater than the
+conservative hold bound printed by the preflight. The bound is the configured
+request deadline plus recovery and one replay plus the completion guard:
+`3,000,000 + 300,000 + 600,000 + 1,000 = 3,901,000 ms`. The operator idle
+timeout must be strictly greater, so the minimum accepted example is
+`3,901,001 ms`. Treat the preflight output as authoritative if configuration
+changes:
+
+```bash
+python3 deploy/gb10/preflight-config.py \
+  --config deploy/gb10/config.toml \
+  --downstream-idle-timeout-ms "${DOWNSTREAM_IDLE_TIMEOUT_MS}" \
+  --dry-run
+```
+
+The command must report `result=ok`. It fails closed if either AEON route
+downgrades recovery, the reviewed restart unit changes, `guard_workflows`
+becomes active, Retry-After loses its bound, or the operator timeout cannot
+cover the configured request deadline plus recovery and one replay.
+
+Then copy the wrapper assets:
 
 ```bash
 install -d -m 0700 /home/obj/.config/llm-guard-proxy
@@ -428,13 +455,18 @@ retention_days = 14
 ### Shielded retry runtime budget
 
 `upstream.request_timeout_ms` bounds a single upstream HTTP attempt. It does not
-bound the full shielded retry ladder. `retry.max_attempts` is the **total** cap
-for upstream attempts for one client request, including the initial attempt:
-`max_attempts = 1` sends no retry, and `max_attempts = 2` permits at most one
-additional upstream attempt. For shielded non-stream chat, the primary attempt
-continues to force upstream SSE for inspection. Only a classified forced-SSE
-body failure can use one remaining attempt as a native-JSON fallback; this
-bounded recovery does not disable forced SSE for later non-stream requests.
+bound the full shielded retry ladder. `retry.max_attempts` is the ordinary
+retry-ladder cap for one client request, including the initial attempt:
+`max_attempts = 1` allows no ordinary ladder retry, and `max_attempts = 2`
+permits at most one ordinary additional upstream attempt. Two separate
+pre-commit exceptions can still add physical upstream work without consuming
+that ladder budget: one request-scoped 429 retry for a positive bounded
+`Retry-After`, and one local-recovery replay after a successful pre-commit
+recovery while the response remains byte-silent. For shielded non-stream chat,
+the primary attempt continues to force upstream SSE for inspection. Only a
+classified forced-SSE body failure can use one remaining ordinary ladder
+attempt as a native-JSON fallback; this bounded recovery does not disable
+forced SSE for later non-stream requests.
 
 `retry.request_deadline_ms` is the request-level wall-clock budget shared across
 ordinary shielded generation admission, all shielded attempts (including a

@@ -162,7 +162,7 @@ async fn native_json_fallback_requires_remaining_attempt_budget() {
 }
 
 #[tokio::test]
-async fn native_json_fallback_does_not_follow_request_deadline_recovery() {
+async fn native_json_fallback_does_not_outlive_request_deadline() {
     // Delay past request_deadline_ms so the body failure is reclassified as a deadline
     // abort while still retaining sse_failure_class=body_failure (the F1 regression path).
     let mut upstream =
@@ -191,15 +191,15 @@ async fn native_json_fallback_does_not_follow_request_deadline_recovery() {
     assert_eq!(
         response.status(),
         StatusCode::BAD_GATEWAY,
-        "deadline recovery may replay protected SSE, but must not select native JSON"
+        "an exhausted total deadline must fail closed without any replay"
     );
     let _error_body = response
         .text()
         .await
         .expect("deadline failure response should be readable");
     assert!(
-        recovery_marker.exists(),
-        "the deadline recovery hook must run before the protected replay"
+        !recovery_marker.exists(),
+        "an exhausted total deadline must not start local recovery"
     );
 
     let mut requests = Vec::new();
@@ -209,17 +209,17 @@ async fn native_json_fallback_does_not_follow_request_deadline_recovery() {
     {
         requests.push(request);
     }
-    assert!(
-        requests.len() >= 2,
-        "expected at least first SSE plus readiness/replay; got {}",
-        requests.len()
+    assert_eq!(
+        requests.len(),
+        1,
+        "deadline expiry must not send late requests"
     );
     assert_eq!(requests[0]["stream"], true);
     assert!(
         requests
             .iter()
             .all(|request| request["stream"].as_bool() != Some(false)),
-        "request-deadline recovery must never send a native JSON stream:false request"
+        "deadline expiry must never send a native JSON stream:false request"
     );
 
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
@@ -249,7 +249,7 @@ async fn native_json_fallback_does_not_follow_request_deadline_recovery() {
                     .and_then(serde_json::Value::as_str)
                     != Some("true")
         }),
-        "deadline recovery must not select native JSON wire mode"
+        "deadline expiry must not select native JSON wire mode"
     );
 
     remove_dir_all(&recovery_root);
