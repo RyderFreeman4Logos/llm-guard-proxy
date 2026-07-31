@@ -639,7 +639,8 @@ no_thinking_marker_policy = "force"
 default_injection_schema = "vllm_native"
 
 ## ───────────────────────── Held liveness ───────────────────────────────────
-## The configured mode selects the final response framing. Correctness-first
+## heartbeat.mode is a configured preference only. Request semantics still decide
+## accepted framing: stream uses SSE, non-stream uses buffered JSON. Correctness-first
 ## shielding holds all bytes until an attempt is accepted, so effective
 ## pre-commit liveness is "held" and the emitted heartbeat count is zero.
 ## Operators must configure every downstream idle timeout above the conservative
@@ -648,7 +649,7 @@ default_injection_schema = "vllm_native"
 ## deadline, and the 1,000 ms recovery completion-publication guard.
 
 [heartbeat]
-mode = "sse"                               # Final accepted response uses SSE framing
+mode = "sse"                               # Configured preference; non-stream remains JSON
 interval_secs = 15                         # Configured interval; no pre-commit bytes are emitted
 
 ## ───────────────────────── Cloudflare ──────────────────────────────────────

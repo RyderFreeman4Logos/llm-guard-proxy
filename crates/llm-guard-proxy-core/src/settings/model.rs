@@ -4004,7 +4004,8 @@ impl Default for UpstreamStallConfig {
 /// Downstream heartbeat strategy.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HeartbeatConfig {
-    /// Configured response framing after replay-safe aggregation completes.
+    /// Configured liveness preference. Accepted framing still follows request
+    /// semantics: stream remains SSE and non-stream remains buffered JSON.
     pub mode: HeartbeatMode,
     /// Reserved heartbeat cadence; replay-capable aggregation suppresses emission.
     pub interval_secs: u64,
@@ -4035,12 +4036,12 @@ impl Default for HeartbeatConfig {
 /// remain JSON even when the configured preference is SSE.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HeartbeatMode {
-    /// Emit the accepted result with server-sent-event framing.
+    /// Prefer SSE when request semantics allow streaming responses.
     #[default]
     Sse,
-    /// Emit the accepted result as buffered JSON.
+    /// Prefer buffered JSON labeling for non-stream responses.
     JsonWhitespace,
-    /// Preserve the legacy buffered JSON response.
+    /// Legacy buffered JSON preference with no liveness signaling.
     Disabled,
 }
 
