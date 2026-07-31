@@ -18,15 +18,8 @@ pub(super) async fn complete(
     let mut current = recover_and_replay(context, first).await?;
     let rate_limit_retry_budget = retry_after::RetryBudget::default();
     loop {
-        let SentUpstreamResponse {
-            response,
-            attempt_number,
-            ..
-        } = &current;
-        if response.status() != StatusCode::TOO_MANY_REQUESTS
-            || !context.config.retry.enabled
-            || *attempt_number >= context.config.retry.max_attempts
-        {
+        let response = &current.response;
+        if response.status() != StatusCode::TOO_MANY_REQUESTS || !context.config.retry.enabled {
             return Ok(current);
         }
         let Some(remaining) = context.request_deadline.remaining() else {

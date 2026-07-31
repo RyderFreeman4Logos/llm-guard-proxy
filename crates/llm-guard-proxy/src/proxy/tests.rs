@@ -9187,7 +9187,7 @@ max_attempts = 1
 }
 
 #[tokio::test]
-async fn shielded_retry_exhausted_rate_limit_preserves_429_and_retry_after() {
+async fn shielded_max_attempts_one_exhausted_rate_limit_preserves_429_and_retry_after() {
     let recovery_root = unique_test_dir("shielded-429-no-recovery");
     fs::create_dir_all(&recovery_root).expect("recovery root should be created");
     let marker = recovery_root.join("restart-ran");
@@ -9198,7 +9198,7 @@ async fn shielded_retry_exhausted_rate_limit_preserves_429_and_retry_after() {
 mode = "disabled"
 
 [retry]
-max_attempts = 4
+max_attempts = 1
 max_retry_after_secs = 1
 
 [upstream.local_recovery]
@@ -9344,7 +9344,7 @@ max_retry_after_secs = 1
 }
 
 #[tokio::test]
-async fn generic_rate_limit_exhaustion_preserves_429_and_retry_after() {
+async fn generic_max_attempts_one_rate_limit_exhaustion_preserves_429_and_retry_after() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -9355,7 +9355,7 @@ async fn generic_rate_limit_exhaustion_preserves_429_and_retry_after() {
 enabled = false
 
 [retry]
-max_attempts = 4
+max_attempts = 1
 max_retry_after_secs = 1
 ",
     )
@@ -9385,7 +9385,7 @@ max_retry_after_secs = 1
 }
 
 #[tokio::test]
-async fn generic_rate_limit_retries_valid_delay_then_succeeds() {
+async fn generic_max_attempts_one_rate_limit_retries_valid_delay_then_succeeds() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -9396,7 +9396,7 @@ async fn generic_rate_limit_retries_valid_delay_then_succeeds() {
 enabled = false
 
 [retry]
-max_attempts = 4
+max_attempts = 1
 max_retry_after_secs = 1
 ",
     )
@@ -9434,7 +9434,7 @@ max_retry_after_secs = 1
 }
 
 #[tokio::test]
-async fn shielded_rate_limit_retries_valid_delay_then_succeeds() {
+async fn shielded_max_attempts_one_rate_limit_retries_valid_delay_then_succeeds() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(
         &fake.base_url,
@@ -9445,7 +9445,7 @@ async fn shielded_rate_limit_retries_valid_delay_then_succeeds() {
 mode = "disabled"
 
 [retry]
-max_attempts = 4
+max_attempts = 1
 max_retry_after_secs = 1
 "#,
     )

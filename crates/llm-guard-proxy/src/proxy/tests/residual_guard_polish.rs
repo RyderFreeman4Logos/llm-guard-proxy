@@ -298,7 +298,7 @@ max_per_window = 20
 }
 
 #[tokio::test]
-async fn generic_429_neither_fails_over_nor_restarts() {
+async fn generic_429_max_attempts_one_retries_once_without_failover_or_restart() {
     let recovery_root = unique_test_dir("generic-429-no-recovery");
     fs::create_dir_all(&recovery_root).expect("recovery root should be created");
     let marker = recovery_root.join("restart-ran");
@@ -380,6 +380,7 @@ max_per_window = 20
     );
     response.bytes().await.expect("429 response should drain");
     let _primary_request = recv_non_health_request(&mut primary).await;
+    let _rate_limit_retry = recv_non_health_request(&mut primary).await;
     assert_no_non_health_request(&mut primary).await;
     assert_no_non_health_request(&mut sibling).await;
     assert!(!marker.exists());
@@ -896,24 +897,27 @@ fn spawn_upstream_after_marker(
 
 #[tokio::test]
 async fn generic_deadline_and_caller_scoped_statuses_do_not_restart() {
-    for (case, extra_config, expected_status, expected_retry_after) in [
+    for (case, extra_config, expected_status, expected_retry_after, retries_rate_limit) in [
         (
             "deadline",
             "\n[shielding]\nenabled = false\n",
             StatusCode::BAD_GATEWAY,
             None,
+            false,
         ),
         (
             "bad-request",
             "\n[shielding]\nenabled = false\n",
             StatusCode::BAD_REQUEST,
             None,
+            false,
         ),
         (
             "always-429",
             "\n[shielding]\nenabled = false\n",
             StatusCode::TOO_MANY_REQUESTS,
             Some("1"),
+            true,
         ),
     ] {
         let recovery_root = unique_test_dir(&format!("generic-no-restart-{case}"));
@@ -965,6 +969,9 @@ async fn generic_deadline_and_caller_scoped_statuses_do_not_restart() {
         response.bytes().await.expect("response should drain");
         assert!(!marker.exists(), "case={case} must not restart");
         let _business_request = fake.recv_next().await;
+        if retries_rate_limit {
+            let _rate_limit_retry = fake.recv_next().await;
+        }
         assert!(fake.recv_within(Duration::from_millis(50)).await.is_none());
         remove_dir_all(&recovery_root);
     }

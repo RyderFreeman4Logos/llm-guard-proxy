@@ -6831,7 +6831,7 @@ impl ShieldedRetryPolicy {
         }
     }
 
-    fn allows_retry_after(&self, attempt_number: u32) -> bool {
+    fn allows_ladder(&self, attempt_number: u32) -> bool {
         self.enabled && attempt_number < self.max_attempts
     }
 
@@ -10066,7 +10066,7 @@ fn claim_rate_limit_retry_delay(
     runtime: &ShieldedRetryRuntime,
     info: &ShieldedAttemptInfo,
 ) -> Option<Duration> {
-    if !runtime.retry_policy.allows_retry_after(info.attempt_number)
+    if !runtime.retry_policy.enabled
         || runtime.downstream_drop_signal.is_dropped()
         || runtime.request_deadline.is_exhausted()
     {
@@ -10362,7 +10362,7 @@ fn constraint_repair_for_aggregated_response(
     body: &Bytes,
 ) -> Option<prose_constraints::ConstraintRepair> {
     if runtime.request_deadline.is_exhausted()
-        || !runtime.retry_policy.allows_retry_after(info.attempt_number)
+        || !runtime.retry_policy.allows_ladder(info.attempt_number)
     {
         return None;
     }
@@ -10628,9 +10628,7 @@ fn native_json_fallback_eligible(
             .response_metadata
             .get("request_deadline_exhausted")
             .is_some_and(|value| value == "true")
-        || !runtime
-            .retry_policy
-            .allows_retry_after(failure.attempt_number)
+        || !runtime.retry_policy.allows_ladder(failure.attempt_number)
     {
         return false;
     }
@@ -10787,9 +10785,7 @@ fn should_retry_after_shielded_failure(
     !is_server_shutdown_failure(failure)
         && failure.retry_cause.is_some()
         && !runtime.downstream_drop_signal.is_dropped()
-        && runtime
-            .retry_policy
-            .allows_retry_after(failure.attempt_number)
+        && runtime.retry_policy.allows_ladder(failure.attempt_number)
 }
 
 #[cfg(feature = "upstream-hot-restart")]
