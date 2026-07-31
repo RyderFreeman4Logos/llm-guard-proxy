@@ -455,13 +455,18 @@ retention_days = 14
 ### Shielded retry runtime budget
 
 `upstream.request_timeout_ms` bounds a single upstream HTTP attempt. It does not
-bound the full shielded retry ladder. `retry.max_attempts` is the **total** cap
-for upstream attempts for one client request, including the initial attempt:
-`max_attempts = 1` sends no retry, and `max_attempts = 2` permits at most one
-additional upstream attempt. For shielded non-stream chat, the primary attempt
-continues to force upstream SSE for inspection. Only a classified forced-SSE
-body failure can use one remaining attempt as a native-JSON fallback; this
-bounded recovery does not disable forced SSE for later non-stream requests.
+bound the full shielded retry ladder. `retry.max_attempts` is the ordinary
+retry-ladder cap for one client request, including the initial attempt:
+`max_attempts = 1` allows no ordinary ladder retry, and `max_attempts = 2`
+permits at most one ordinary additional upstream attempt. Two separate
+pre-commit exceptions can still add physical upstream work without consuming
+that ladder budget: one request-scoped 429 retry for a positive bounded
+`Retry-After`, and one local-recovery replay after a successful pre-commit
+recovery while the response remains byte-silent. For shielded non-stream chat,
+the primary attempt continues to force upstream SSE for inspection. Only a
+classified forced-SSE body failure can use one remaining ordinary ladder
+attempt as a native-JSON fallback; this bounded recovery does not disable
+forced SSE for later non-stream requests.
 
 `retry.request_deadline_ms` is the request-level wall-clock budget shared across
 ordinary shielded generation admission, all shielded attempts (including a

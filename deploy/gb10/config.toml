@@ -579,7 +579,7 @@ vector_dim = 256
 
 [retry]
 enabled = true
-max_attempts = 4                           # Max retry attempts per request
+max_attempts = 4                           # Ordinary ladder cap (excludes one-shot 429 + recovery replay)
 request_deadline_ms = 1200000             # Total shielded retry wall-clock budget per request
 max_retry_after_secs = 30                  # Retry 429 only for positive bounded delta-seconds
 anti_loop_hint_enabled = true              # Inject anti-loop hints on retry
