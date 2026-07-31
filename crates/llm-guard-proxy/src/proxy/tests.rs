@@ -14487,7 +14487,11 @@ interval_secs = 1
     assert_eq!(second_json["id"], "chatcmpl-shielded");
     let _second_observed = fake.recv_next().await;
 
-    let connection = Connection::open(&proxy.sqlite_path).expect("sqlite should open");
+    assert_repeated_input_liveness_metadata(&proxy.sqlite_path);
+}
+
+fn assert_repeated_input_liveness_metadata(sqlite_path: &Path) {
+    let connection = Connection::open(sqlite_path).expect("sqlite should open");
     let rows = connection
         .prepare(
             "SELECT input_fingerprint, downstream_mode, request_metadata_json \
@@ -14522,13 +14526,18 @@ interval_secs = 1
         serde_json::from_str(&rows[1].2).expect("second metadata should parse");
     assert_eq!(first_metadata["repeat_input_matched"], "false");
     assert_eq!(first_metadata["downstream_liveness_mode"], "held");
+    assert_eq!(first_metadata["downstream_liveness_configured_mode"], "sse");
     assert_eq!(
-        first_metadata["downstream_liveness_configured_mode"],
+        first_metadata["downstream_liveness_framing_mode"],
         "disabled"
     );
     assert_eq!(second_metadata["repeat_input_matched"], "true");
     assert_eq!(
         second_metadata["downstream_liveness_configured_mode"],
+        "sse"
+    );
+    assert_eq!(
+        second_metadata["downstream_liveness_framing_mode"],
         "json-whitespace"
     );
 }
@@ -20387,13 +20396,11 @@ fn read_last_observability_row(sqlite_path: &Path, table: &str) -> Observability
     }
 }
 
-#[cfg(feature = "guard")]
 fn read_last_request_metadata(sqlite_path: &Path) -> serde_json::Value {
     serde_json::from_str(&read_last_request_metadata_json(sqlite_path))
         .expect("request metadata should be json")
 }
 
-#[cfg(feature = "guard")]
 fn read_last_request_metadata_json(sqlite_path: &Path) -> String {
     let connection = Connection::open(sqlite_path).expect("sqlite should open");
     connection
@@ -21190,6 +21197,35 @@ fn fake_generic_recovery_chat_completion_response(
     state: &FakeUpstreamState,
     body: &Bytes,
 ) -> Option<Response<Body>> {
+    if let Some(response) = fake_shielded_rate_limit_ladder_response(path_and_query, state, body) {
+        return Some(response);
+    }
+    if path_and_query.contains("test=generic-first-body-")
+        || path_and_query.contains("test=generic-post-byte-error")
+    {
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            let response = if path_and_query.contains("first-body-timeout") {
+                parked_stream_response(
+                    "generic-first-body-timeout",
+                    "application/json",
+                    Bytes::new(),
+                )
+            } else if path_and_query.contains("post-byte-error") {
+                failing_body_response(
+                    "generic-post-byte-error",
+                    Some(Bytes::from_static(b"{\"partial\":true}")),
+                )
+            } else {
+                failing_body_response("generic-first-body-reset", None)
+            };
+            return Some(response);
+        }
+        return Some(json_response(
+            "generic-first-body-recovery-success",
+            r#"{"id":"chatcmpl-generic-first-body-recovery","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"recovered"},"finish_reason":"stop"}]}"#
+                .to_owned(),
+        ));
+    }
     if path_and_query.contains("test=generic-429-once-then-success")
         || path_and_query.contains("test=generic-429-then-timeout-then-success")
         || path_and_query.contains("test=shielded-429-once-then-success")
@@ -21256,6 +21292,54 @@ fn fake_generic_recovery_chat_completion_response(
         ));
     }
     None
+}
+
+fn fake_shielded_rate_limit_ladder_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+    body: &Bytes,
+) -> Option<Response<Body>> {
+    if path_and_query.contains("test=shielded-429-then-503-then-success")
+        || path_and_query.contains("test=shielded-429-then-three-503-then-success")
+    {
+        let attempt = next_fake_attempt_count(state, path_and_query);
+        if attempt == 1 {
+            let mut response = upstream_status_json_response(StatusCode::TOO_MANY_REQUESTS);
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("1"));
+            return Some(response);
+        }
+        let transient_failures = if path_and_query.contains("three-503") {
+            3
+        } else {
+            1
+        };
+        if attempt <= transient_failures + 1 {
+            return Some(upstream_status_json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+            ));
+        }
+        return Some(chat_completion_sse_response(body));
+    }
+    None
+}
+
+fn failing_body_response(label: &'static str, first: Option<Bytes>) -> Response<Body> {
+    let stream = stream::iter(first.into_iter().map(Ok)).chain(stream::once(async {
+        sleep(Duration::from_millis(20)).await;
+        Err(std::io::Error::other("deterministic upstream body reset"))
+    }));
+    let mut response = Response::new(Body::from_stream(stream));
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    response.headers_mut().insert(
+        HeaderName::from_static("x-upstream-endpoint"),
+        HeaderValue::from_static(label),
+    );
+    response
 }
 
 fn fake_malformed_chat_completion_response(path_and_query: &str) -> Option<Response<Body>> {

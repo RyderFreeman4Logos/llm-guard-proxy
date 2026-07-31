@@ -202,6 +202,152 @@ async fn generic_transport_timeout_recovers_and_replays_once() {
     assert!(fake.recv_within(Duration::from_millis(50)).await.is_none());
 }
 
+#[derive(Clone, Copy)]
+enum GenericFirstBodyFailure {
+    Timeout,
+    Reset,
+}
+
+impl GenericFirstBodyFailure {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Reset => "reset",
+        }
+    }
+}
+
+#[tokio::test]
+async fn generic_entry_matrix_recovers_first_body_failure_before_commit() {
+    for entry in [
+        GenericEntry::ShieldingDisabled,
+        GenericEntry::UnparseableChat,
+        GenericEntry::ShieldedStreamingDisabled,
+    ] {
+        for failure in [
+            GenericFirstBodyFailure::Timeout,
+            GenericFirstBodyFailure::Reset,
+        ] {
+            let mut fake = FakeUpstream::spawn().await;
+            let config = format!("{}\n[upstream]\nrequest_timeout_ms = 75\n", entry.config());
+            let proxy = ProxyFixture::spawn_with_options(
+                &fake.base_url,
+                true,
+                AppConfig::default().server.max_in_flight_requests,
+                &config,
+            )
+            .await;
+            let response = proxy
+                .client
+                .post(format!(
+                    "{}/v1/chat/completions?test=generic-first-body-{}&entry={}",
+                    proxy.base_url,
+                    failure.name(),
+                    entry.name()
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .body(entry.body())
+                .send()
+                .await
+                .expect("generic first-body recovery request should complete");
+
+            if response.status() != StatusCode::OK {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .expect("failed generic response should be readable");
+                panic!(
+                    "entry={} failure={} returned status={status} body={body}",
+                    entry.name(),
+                    failure.name()
+                );
+            }
+            let body: serde_json::Value = response
+                .json()
+                .await
+                .expect("generic recovery replay should return complete JSON");
+            assert_eq!(body["choices"][0]["message"]["content"], "recovered");
+
+            let first = recv_non_health_request(&mut fake).await;
+            let readiness = recv_non_health_request(&mut fake).await;
+            let replay = recv_non_health_request(&mut fake).await;
+            assert_eq!(readiness.path_and_query, "/v1/chat/completions");
+            assert_eq!(first.path_and_query, replay.path_and_query);
+            assert_eq!(first.body, replay.body);
+            assert_no_non_health_request(&mut fake).await;
+
+            let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+            assert_eq!(attempts.len(), 2);
+            assert_eq!(attempts[0].status, "retried");
+            assert_eq!(attempts[0].retry_reason.as_deref(), Some("local_recovery"));
+            assert_eq!(
+                attempts[0].response_metadata["precommit_body_failure"],
+                "true"
+            );
+            assert_eq!(attempts[1].status, "succeeded");
+        }
+    }
+}
+
+#[tokio::test]
+async fn generic_entry_matrix_never_replays_after_first_nonempty_body_byte() {
+    for entry in [
+        GenericEntry::ShieldingDisabled,
+        GenericEntry::UnparseableChat,
+        GenericEntry::ShieldedStreamingDisabled,
+    ] {
+        let recovery_root = unique_test_dir(&format!("generic-post-byte-{}", entry.name()));
+        fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+        let marker = recovery_root.join("restart-ran");
+        let mut fake = FakeUpstream::spawn().await;
+        let config = entry.config().replace(
+            "restart_command = [\"/bin/true\"]",
+            &format!(
+                "restart_command = [\"/usr/bin/touch\", \"{}\"]",
+                marker.display()
+            ),
+        );
+        let proxy = ProxyFixture::spawn_with_options(
+            &fake.base_url,
+            true,
+            AppConfig::default().server.max_in_flight_requests,
+            &config,
+        )
+        .await;
+        let response = proxy
+            .client
+            .post(format!(
+                "{}/v1/chat/completions?test=generic-post-byte-error&entry={}",
+                proxy.base_url,
+                entry.name()
+            ))
+            .header(CONTENT_TYPE, "application/json")
+            .body(entry.body())
+            .send()
+            .await
+            .expect("generic post-byte response should return headers");
+        if response.status() == StatusCode::OK {
+            let body_error = response
+                .bytes()
+                .await
+                .expect_err("body reset after a committed byte must reach the client");
+            assert!(!body_error.to_string().is_empty());
+        } else {
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            response
+                .bytes()
+                .await
+                .expect("buffered post-byte failure should return a proxy error");
+        }
+
+        let _first = recv_non_health_request(&mut fake).await;
+        assert_no_non_health_request(&mut fake).await;
+        assert!(!marker.exists());
+        remove_dir_all(&recovery_root);
+    }
+}
+
 #[tokio::test]
 async fn generic_sibling_exhaustion_recovers_then_replays_from_primary() {
     let mut primary = FakeUpstream::spawn().await;
@@ -405,7 +551,7 @@ request_timeout_ms = 50
 enabled = false
 
 [retry]
-max_attempts = 4
+max_attempts = 1
 request_deadline_ms = 3000
 max_retry_after_secs = 1
 
@@ -484,6 +630,208 @@ max_per_window = 20
     );
     assert_eq!(attempts[2].status, "succeeded");
     remove_dir_all(&recovery_root);
+}
+
+#[tokio::test]
+async fn shielded_max_attempts_one_preserves_recovery_after_rate_limit_retry() {
+    let recovery_root = unique_test_dir("shielded-429-503-recovery");
+    fs::create_dir_all(&recovery_root).expect("recovery root should be created");
+    let marker = recovery_root.join("restart-ran");
+    let fake = FakeUpstream::spawn().await;
+    let config = format!(
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 1
+request_deadline_ms = 4000
+max_retry_after_secs = 1
+anti_loop_hint_enabled = false
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/touch", "{}"]
+restart_timeout_ms = 500
+readiness_body = {{"model":"test-chat","messages":[],"max_tokens":1}}
+readiness_request_timeout_ms = 500
+readiness_deadline_ms = 1000
+readiness_interval_ms = 10
+max_attempts_per_request = 1
+cooldown_ms = 1
+budget_window_ms = 10000
+max_per_window = 20
+"#,
+        marker.display()
+    );
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &config,
+    )
+    .await;
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=shielded-429-then-503-then-success",
+            proxy.base_url
+        ))
+        .json(&json!({"model":"test-chat","messages":[]}))
+        .send()
+        .await
+        .expect("shielded rate-limit recovery request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response should drain");
+    assert!(marker.exists());
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 3);
+    assert_eq!(attempts[0].http_status, Some(429));
+    assert_eq!(attempts[1].http_status, Some(503));
+    let request_metadata = read_attempt_request_metadata_rows(&proxy.sqlite_path);
+    assert_eq!(
+        request_metadata[1].request_metadata["ordinary_attempt_number"],
+        "1"
+    );
+    assert_eq!(
+        attempts[1].retry_reason.as_deref(),
+        Some("transient_upstream_status")
+    );
+    assert_eq!(
+        attempts[1].response_metadata["local_recovery_status"],
+        "succeeded"
+    );
+    assert_eq!(attempts[2].status, "succeeded");
+    remove_dir_all(&recovery_root);
+}
+
+#[tokio::test]
+async fn shielded_max_attempts_four_rate_limit_does_not_reduce_ordinary_retries() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[heartbeat]
+mode = "disabled"
+
+[retry]
+max_attempts = 4
+request_deadline_ms = 5000
+max_retry_after_secs = 1
+anti_loop_hint_enabled = false
+"#,
+    )
+    .await;
+    let response = proxy
+        .client
+        .post(format!(
+            "{}/v1/chat/completions?test=shielded-429-then-three-503-then-success",
+            proxy.base_url
+        ))
+        .json(&json!({"model":"test-chat","messages":[]}))
+        .send()
+        .await
+        .expect("shielded retry ladder request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response should drain");
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 5);
+    assert_eq!(
+        attempts
+            .iter()
+            .map(|attempt| attempt.attempt_number)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4, 5]
+    );
+    assert_eq!(
+        read_attempt_request_metadata_rows(&proxy.sqlite_path)
+            .iter()
+            .map(|attempt| {
+                attempt.request_metadata["ordinary_attempt_number"]
+                    .as_str()
+                    .expect("ordinary attempt number should be a string")
+            })
+            .collect::<Vec<_>>(),
+        vec!["1", "1", "2", "3", "4"]
+    );
+    assert_eq!(attempts[4].status, "succeeded");
+}
+
+#[tokio::test]
+async fn held_non_stream_liveness_reports_configured_mode_and_json_framing() {
+    for (configured, framing) in [
+        ("sse", "disabled"),
+        ("json-whitespace", "json-whitespace"),
+        ("disabled", "disabled"),
+    ] {
+        let mut fake = FakeUpstream::spawn().await;
+        let proxy = ProxyFixture::spawn_with_options(
+            &fake.base_url,
+            true,
+            AppConfig::default().server.max_in_flight_requests,
+            &format!(
+                r#"
+[heartbeat]
+mode = "{configured}"
+
+[loop_guard]
+enabled = false
+"#
+            ),
+        )
+        .await;
+        let summary = proxy
+            .client
+            .get(format!("{}/config-summary", proxy.base_url))
+            .send()
+            .await
+            .expect("config summary should complete")
+            .text()
+            .await
+            .expect("config summary should be text");
+        assert!(summary.contains(&format!("heartbeat_configured_mode={configured}")));
+
+        let response = proxy
+            .client
+            .post(format!("{}/v1/chat/completions", proxy.base_url))
+            .json(&json!({"model":"test-chat","messages":[]}))
+            .send()
+            .await
+            .expect("held non-stream request should complete");
+        assert_eq!(
+            response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        response.bytes().await.expect("response should drain");
+        let _business = recv_non_health_request(&mut fake).await;
+
+        let request_metadata = read_last_request_metadata(&proxy.sqlite_path);
+        assert_eq!(
+            request_metadata["downstream_liveness_configured_mode"],
+            configured
+        );
+        assert_eq!(
+            request_metadata["downstream_liveness_framing_mode"],
+            framing
+        );
+        let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].response_metadata["downstream_liveness_configured_mode"],
+            configured
+        );
+        assert_eq!(
+            attempts[0].response_metadata["downstream_liveness_framing_mode"],
+            framing
+        );
+    }
 }
 
 #[tokio::test]

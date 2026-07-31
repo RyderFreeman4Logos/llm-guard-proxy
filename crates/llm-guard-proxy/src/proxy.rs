@@ -104,6 +104,7 @@ use buffered_adapter::{
     BufferedResponseAdapter, adapt_openai_request_if_needed,
     rewrite_buffered_adapter_response_from_upstream, sanitize_transformed_request_headers,
 };
+use precommit_recovery::UpstreamResponse;
 use reranker_protocol::{CanonicalRerankerRequest, RenderedEndpointRequest};
 
 #[cfg(all(test, unix))]
@@ -5394,7 +5395,7 @@ async fn forward_generic_endpoint_response(
             {
                 return rewrite_buffered_adapter_response_from_upstream(
                     response_parts,
-                    upstream_response,
+                    upstream_response.into_response(),
                     context.in_flight_permit,
                     adapter,
                     context.model_id.as_deref(),
@@ -5807,7 +5808,7 @@ async fn fetch_models_upstream_group(
     })
 }
 
-fn models_upstream_response(response: EndpointResponse) -> Result<reqwest::Response, ProxyError> {
+fn models_upstream_response(response: EndpointResponse) -> Result<UpstreamResponse, ProxyError> {
     match response {
         EndpointResponse::Upstream(response) => Ok(response),
         EndpointResponse::Rewritten(_) => Err(ProxyError::upstream_body(String::from(
@@ -5931,7 +5932,7 @@ struct ObservedEndpointResponse {
 }
 
 enum EndpointResponse {
-    Upstream(reqwest::Response),
+    Upstream(UpstreamResponse),
     Rewritten(RewrittenEndpointResponse),
 }
 
@@ -5961,6 +5962,13 @@ impl EndpointResponse {
         match self {
             Self::Upstream(response) => response.headers_mut(),
             Self::Rewritten(response) => &mut response.headers,
+        }
+    }
+
+    async fn hold_first_nonempty_body_chunk(&mut self) -> Result<(), ReqwestFailureKind> {
+        match self {
+            Self::Upstream(response) => response.hold_first_nonempty_body_chunk().await,
+            Self::Rewritten(_) => Ok(()),
         }
     }
 }
@@ -6373,10 +6381,10 @@ async fn finalize_endpoint_response(
         headers: headers.clone(),
     });
     if !decode_heterogeneous_reranker || !status.is_success() {
-        return Ok(EndpointResponse::Upstream(response));
+        return Ok(EndpointResponse::Upstream(UpstreamResponse::new(response)));
     }
     let Some(request) = canonical_reranker else {
-        return Ok(EndpointResponse::Upstream(response));
+        return Ok(EndpointResponse::Upstream(UpstreamResponse::new(response)));
     };
     let Some(shutdown) = shutdown else {
         return Err(ProxyError::upstream_body(String::from(
@@ -6752,6 +6760,7 @@ fn plan_shielded_chat(
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ShieldedLivenessSelection {
+    configured_mode: HeartbeatMode,
     mode: ShieldedLivenessMode,
     heartbeat_interval_secs: u64,
     input_fingerprint: Option<String>,
@@ -8516,7 +8525,7 @@ impl ShieldedRetryCause {
 async fn forward_upstream_response(
     dispatch: ResponseDispatch<'_>,
     response_parts: ForwardedResponseParts,
-    upstream_response: reqwest::Response,
+    upstream_response: UpstreamResponse,
     in_flight_permit: InFlightPermit,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
@@ -8530,7 +8539,7 @@ async fn forward_upstream_response(
     ) {
         return forward_buffered_models_response(
             response_parts,
-            upstream_response,
+            upstream_response.into_response(),
             in_flight_permit,
             dispatch.config,
             dispatch.listener,
@@ -9383,6 +9392,16 @@ struct ShieldedRetryRuntime {
 }
 
 impl ShieldedRetryRuntime {
+    fn ordinary_attempt_number(&self, physical_attempt_number: u32) -> u32 {
+        self.rate_limit_retry_budget
+            .ordinary_attempt_number(physical_attempt_number)
+    }
+
+    fn allows_ordinary_retry(&self, physical_attempt_number: u32) -> bool {
+        self.retry_policy
+            .allows_ladder(self.ordinary_attempt_number(physical_attempt_number))
+    }
+
     fn plan(
         &self,
         attempt_number: u32,
@@ -9391,7 +9410,7 @@ impl ShieldedRetryRuntime {
         force_disable_after_salvage_loop: bool,
     ) -> ShieldedAttemptPlan {
         self.retry_policy.attempt_plan(
-            attempt_number,
+            self.ordinary_attempt_number(attempt_number),
             &self.upstream_profile,
             cot_salvage,
             constraint_repair.is_some(),
@@ -10072,9 +10091,11 @@ fn claim_rate_limit_retry_delay(
     {
         return None;
     }
-    runtime
-        .rate_limit_retry_budget
-        .claim_delay(&info.upstream_headers, runtime.retry_policy.max_retry_after)
+    runtime.rate_limit_retry_budget.claim_delay(
+        &info.upstream_headers,
+        runtime.retry_policy.max_retry_after,
+        info.attempt_number,
+    )
 }
 
 async fn wait_for_rate_limit_retry(runtime: &ShieldedRetryRuntime, delay: Duration) -> bool {
@@ -10362,7 +10383,7 @@ fn constraint_repair_for_aggregated_response(
     body: &Bytes,
 ) -> Option<prose_constraints::ConstraintRepair> {
     if runtime.request_deadline.is_exhausted()
-        || !runtime.retry_policy.allows_ladder(info.attempt_number)
+        || !runtime.allows_ordinary_retry(info.attempt_number)
     {
         return None;
     }
@@ -10628,13 +10649,13 @@ fn native_json_fallback_eligible(
             .response_metadata
             .get("request_deadline_exhausted")
             .is_some_and(|value| value == "true")
-        || !runtime.retry_policy.allows_ladder(failure.attempt_number)
+        || !runtime.allows_ordinary_retry(failure.attempt_number)
     {
         return false;
     }
     can_retry
         && runtime.chat_kind == ShieldedChatKind::NonStream
-        && failure.attempt_number == 1
+        && runtime.ordinary_attempt_number(failure.attempt_number) == 1
         && failure.wire_mode == ShieldedUpstreamWireMode::ShieldedSse
         && failure.sse_failure_kind == Some(shielded_chat::AggregationFailureKind::BodyFailure)
 }
@@ -10684,7 +10705,7 @@ fn should_direct_relay_no_thinking_stream(
     retry_cause: Option<ShieldedRetryCause>,
 ) -> bool {
     runtime.chat_kind == ShieldedChatKind::Stream
-        && info.attempt_number > 1
+        && runtime.ordinary_attempt_number(info.attempt_number) > 1
         && matches!(retry_cause, Some(ShieldedRetryCause::LoopDetected))
         && info
             .request_metadata
@@ -10709,7 +10730,7 @@ fn should_direct_relay_first_attempt_force_disable_stream(
     info: &ShieldedAttemptInfo,
 ) -> bool {
     runtime.chat_kind == ShieldedChatKind::Stream
-        && info.attempt_number == 1
+        && runtime.ordinary_attempt_number(info.attempt_number) == 1
         && info
             .request_metadata
             .get("cot_salvage_used")
@@ -10785,7 +10806,7 @@ fn should_retry_after_shielded_failure(
     !is_server_shutdown_failure(failure)
         && failure.retry_cause.is_some()
         && !runtime.downstream_drop_signal.is_dropped()
-        && runtime.retry_policy.allows_ladder(failure.attempt_number)
+        && runtime.allows_ordinary_retry(failure.attempt_number)
 }
 
 #[cfg(feature = "upstream-hot-restart")]
@@ -12339,6 +12360,7 @@ async fn start_shielded_attempt(
             )),
         )));
     };
+    let response = response.into_response();
     let upstream_status = response.status();
     let upstream_headers = response.headers().clone();
     let upstream_mode = upstream_mode_from_headers(&upstream_headers);
@@ -12673,6 +12695,7 @@ fn shielded_attempt_body(
     cot_salvage: Option<&CotSalvageContext>,
     constraint_repair: Option<&prose_constraints::ConstraintRepair>,
 ) -> (Bytes, bool, bool, BTreeMap<String, String>) {
+    let ordinary_attempt_number = runtime.ordinary_attempt_number(attempt_number);
     let prepared_request = match runtime.chat_kind {
         ShieldedChatKind::NonStream => match wire_mode {
             ShieldedUpstreamWireMode::ShieldedSse => shielded_chat::prepare_non_stream_request(
@@ -12708,11 +12731,11 @@ fn shielded_attempt_body(
     };
 
     if let Some(constraint_repair) = constraint_repair {
-        let retry_hint =
-            constraint_repair.retry_hint(attempt_number, runtime.retry_policy.max_attempts);
+        let retry_hint = constraint_repair
+            .retry_hint(ordinary_attempt_number, runtime.retry_policy.max_attempts);
         if let Some(body) = shielded_chat::body_with_anti_loop_retry_hint(
             &prepared_body,
-            attempt_number,
+            ordinary_attempt_number,
             runtime.retry_policy.max_attempts,
             Some(&retry_hint),
         ) {
@@ -12728,7 +12751,7 @@ fn shielded_attempt_body(
     if let Some(cot_salvage) = cot_salvage
         && let Some(body) = shielded_chat::body_with_cot_salvage_retry_hint(
             &prepared_body,
-            attempt_number,
+            ordinary_attempt_number,
             runtime.retry_policy.max_attempts,
             cot_salvage.policy.as_str(),
             &cot_salvage.pre_loop_reasoning,
@@ -12743,13 +12766,13 @@ fn shielded_attempt_body(
         return (body, true, false, thinking_metadata);
     }
 
-    let (prepared_body, anti_loop_hint_applied) = if attempt_number > 1
+    let (prepared_body, anti_loop_hint_applied) = if ordinary_attempt_number > 1
         && runtime.retry_policy.anti_loop_hint_enabled
         && matches!(retry_cause, Some(ShieldedRetryCause::LoopDetected))
     {
         if let Some(body) = shielded_chat::body_with_anti_loop_retry_hint(
             &prepared_body,
-            attempt_number,
+            ordinary_attempt_number,
             runtime.retry_policy.max_attempts,
             attempt_plan.anti_loop_hint.as_deref(),
         ) {
@@ -12834,7 +12857,7 @@ fn shielded_attempt_request_metadata(
     );
     add_retry_attempt_metadata(
         &mut metadata,
-        &runtime.retry_policy,
+        runtime,
         attempt_number,
         retry_cause,
         anti_loop_hint_applied,
@@ -12881,7 +12904,7 @@ fn add_shielded_wire_metadata(
         runtime
             .retry_policy
             .max_attempts
-            .saturating_sub(attempt_number)
+            .saturating_sub(runtime.ordinary_attempt_number(attempt_number))
             .to_string(),
     );
     metadata.insert(
@@ -12892,14 +12915,19 @@ fn add_shielded_wire_metadata(
 
 fn add_retry_attempt_metadata(
     metadata: &mut BTreeMap<String, String>,
-    policy: &ShieldedRetryPolicy,
+    runtime: &ShieldedRetryRuntime,
     attempt_number: u32,
     retry_cause: Option<ShieldedRetryCause>,
     anti_loop_hint_applied: bool,
     attempt_plan: &ShieldedAttemptPlan,
     cot_salvage: Option<&CotSalvageContext>,
 ) {
+    let policy = &runtime.retry_policy;
     metadata.insert(String::from("attempt_number"), attempt_number.to_string());
+    metadata.insert(
+        String::from("ordinary_attempt_number"),
+        runtime.ordinary_attempt_number(attempt_number).to_string(),
+    );
     metadata.insert(
         String::from("attempt_index"),
         attempt_number.saturating_sub(1).to_string(),
@@ -13323,7 +13351,9 @@ fn first_attempt_cot_salvage_context(
     runtime: &ShieldedRetryRuntime,
     failure: &ShieldedAttemptFailure,
 ) -> Option<CotSalvageContext> {
-    if failure.attempt_number != 1 || !runtime.retry_policy.loop_failure_policy.uses_cot_salvage() {
+    if runtime.ordinary_attempt_number(failure.attempt_number) != 1
+        || !runtime.retry_policy.loop_failure_policy.uses_cot_salvage()
+    {
         return None;
     }
     let salvaged_reasoning = pre_loop_reasoning_for_salvage(failure)?;
@@ -15749,6 +15779,7 @@ fn select_shielded_liveness(
     };
 
     ShieldedLivenessSelection {
+        configured_mode: config.heartbeat.mode,
         mode,
         heartbeat_interval_secs: config.heartbeat.interval_secs,
         input_fingerprint,
@@ -16580,7 +16611,7 @@ fn maybe_schedule_paired_comparison_after_primary(
         return;
     }
     let Some(source) = attempts.iter().find(|attempt| {
-        attempt.attempt_number == 1
+        runtime.ordinary_attempt_number(attempt.attempt_number) == 1
             && attempt.status == AttemptStatus::Succeeded
             && attempt_shown_to_downstream(request, attempt)
     }) else {

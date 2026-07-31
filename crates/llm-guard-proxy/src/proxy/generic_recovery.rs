@@ -6,9 +6,9 @@
 use super::{
     AttemptId, AttemptRecord, AttemptStatus, BTreeMap, Duration, FailedAttemptRecordInput,
     GenericForwardContext, LocalRecoveryCause, LocalRecoveryPolicy, ProxyError, RawPayloads,
-    SentUpstreamResponse, StatusCode, TokenUsage, failed_attempt_record, precommit_recovery,
-    prepare_generic_attempt_request, response_metadata, retry_after, send_generic_upstream_attempt,
-    unix_time_millis, upstream_mode_from_headers,
+    ReqwestFailureKind, SentUpstreamResponse, StatusCode, TokenUsage, failed_attempt_record,
+    precommit_recovery, prepare_generic_attempt_request, response_metadata, retry_after,
+    send_generic_upstream_attempt, unix_time_millis, upstream_mode_from_headers,
 };
 
 pub(super) async fn complete(
@@ -20,7 +20,20 @@ pub(super) async fn complete(
     loop {
         let response = &current.response;
         if response.status() != StatusCode::TOO_MANY_REQUESTS || !context.config.retry.enabled {
-            return Ok(current);
+            if context.uri.path() != "/v1/chat/completions"
+                || !response.status().is_success()
+                || context.request_deadline.is_exhausted()
+            {
+                return Ok(current);
+            }
+            match current.response.hold_first_nonempty_body_chunk().await {
+                Ok(()) => return Ok(current),
+                Err(failure) => {
+                    let error = precommit_body_failure(context, current, failure);
+                    current = recover_and_replay(context, Err(error)).await?;
+                    continue;
+                }
+            }
         }
         let Some(remaining) = context.request_deadline.remaining() else {
             return Ok(current);
@@ -28,6 +41,7 @@ pub(super) async fn complete(
         let Some(delay) = rate_limit_retry_budget.claim_delay(
             response.headers(),
             Duration::from_secs(context.config.retry.max_retry_after_secs),
+            current.attempt_number,
         ) else {
             return Ok(current);
         };
@@ -49,6 +63,43 @@ pub(super) async fn complete(
         };
         current = recover_and_replay(context, retried).await?;
     }
+}
+
+fn precommit_body_failure(
+    context: &GenericForwardContext<'_>,
+    mut sent: SentUpstreamResponse,
+    failure: ReqwestFailureKind,
+) -> ProxyError {
+    if let Some(lease) = sent.stuck_watchdog_attempt.take() {
+        lease.end();
+    }
+    let error = ProxyError::UpstreamTransport {
+        failure,
+        observability: None,
+    };
+    let error_reason = error.to_string();
+    let mut attempt_record = failed_attempt_record(FailedAttemptRecordInput {
+        attempt_id: sent.attempt_id,
+        attempt_number: sent.attempt_number,
+        request_id: context.request_id.clone(),
+        started_at_unix_ms: sent.attempt_started_at_unix_ms,
+        finished_at_unix_ms: unix_time_millis(),
+        error_type: error.error_type(),
+        error_reason: &error_reason,
+        request_metadata: sent.attempt_request_metadata,
+        extra_response_metadata: BTreeMap::from([
+            (String::from("precommit_body_failure"), String::from("true")),
+            (
+                String::from("upstream_response_received"),
+                String::from("true"),
+            ),
+        ]),
+    });
+    attempt_record.http_status = Some(sent.response.status().as_u16());
+    attempt_record.upstream_mode = upstream_mode_from_headers(sent.response.headers());
+    error
+        .with_observability(context.request_metadata.clone(), attempt_record)
+        .with_completed_attempt_records(sent.completed_attempt_records)
 }
 
 async fn recover_and_replay(

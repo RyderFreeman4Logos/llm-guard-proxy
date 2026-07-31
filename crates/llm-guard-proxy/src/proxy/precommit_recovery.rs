@@ -4,15 +4,79 @@
 //! downstream byte. It owns the per-request recovery budget and the mandatory
 //! post-await commit/drop rechecks.
 
+use std::pin::Pin;
+
+use axum::{
+    body::Bytes,
+    http::{HeaderMap, StatusCode},
+};
+use futures_util::{Stream, StreamExt};
+
 use super::{
     Arc, AtomicU64, Client, DownstreamCommitSignal, DownstreamDropSignal, Duration,
     LocalRecoveryCause, LocalRecoveryGate, LocalRecoveryPolicy, LocalRecoveryRunOptions, Ordering,
-    RequestDeadline, UpstreamStallRecoveryCoordinator, applied_local_recovery_gate,
-    local_recovery_completed_ready, local_recovery_downstream_commit_observed,
-    local_recovery_metadata, local_recovery_permits_retry,
-    run_local_recovery_for_profile_observing, skipped_local_recovery_gate,
-    unapplied_local_recovery_gate,
+    RequestDeadline, ReqwestFailureKind, UpstreamStallRecoveryCoordinator,
+    applied_local_recovery_gate, local_recovery_completed_ready,
+    local_recovery_downstream_commit_observed, local_recovery_metadata,
+    local_recovery_permits_retry, run_local_recovery_for_profile_observing,
+    skipped_local_recovery_gate, unapplied_local_recovery_gate,
 };
+
+/// Upstream response whose first non-empty body chunk can be held until the
+/// shared pre-commit recovery decision is complete.
+pub(super) struct UpstreamResponse {
+    response: reqwest::Response,
+    held_first_body_chunk: Option<Bytes>,
+}
+
+impl UpstreamResponse {
+    pub(super) fn new(response: reqwest::Response) -> Self {
+        Self {
+            response,
+            held_first_body_chunk: None,
+        }
+    }
+
+    pub(super) fn status(&self) -> StatusCode {
+        self.response.status()
+    }
+
+    pub(super) fn headers(&self) -> &HeaderMap {
+        self.response.headers()
+    }
+
+    pub(super) fn headers_mut(&mut self) -> &mut HeaderMap {
+        self.response.headers_mut()
+    }
+
+    pub(super) async fn hold_first_nonempty_body_chunk(
+        &mut self,
+    ) -> Result<(), ReqwestFailureKind> {
+        loop {
+            match self.response.chunk().await {
+                Ok(Some(chunk)) if chunk.is_empty() => {}
+                Ok(Some(chunk)) => {
+                    self.held_first_body_chunk = Some(chunk);
+                    return Ok(());
+                }
+                Ok(None) => return Ok(()),
+                Err(error) if error.is_timeout() => return Err(ReqwestFailureKind::Timeout),
+                Err(_) => return Err(ReqwestFailureKind::Body),
+            }
+        }
+    }
+
+    pub(super) fn bytes_stream(
+        self,
+    ) -> Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static>> {
+        let held = futures_util::stream::iter(self.held_first_body_chunk.into_iter().map(Ok));
+        Box::pin(held.chain(self.response.bytes_stream()))
+    }
+
+    pub(super) fn into_response(self) -> reqwest::Response {
+        self.response
+    }
+}
 
 pub(super) struct Context<'request> {
     pub(super) policy: &'request LocalRecoveryPolicy,

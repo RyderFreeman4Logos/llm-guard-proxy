@@ -4029,7 +4029,10 @@ impl Default for HeartbeatConfig {
     }
 }
 
-/// Configured downstream framing modes after replay-safe aggregation.
+/// Configured downstream liveness preference.
+///
+/// Request semantics still determine accepted framing: non-stream requests
+/// remain JSON even when the configured preference is SSE.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HeartbeatMode {
     /// Emit the accepted result with server-sent-event framing.

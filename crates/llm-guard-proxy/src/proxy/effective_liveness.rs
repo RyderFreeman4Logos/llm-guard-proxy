@@ -41,6 +41,10 @@ fn metadata(liveness: &ShieldedLivenessSelection) -> BTreeMap<String, String> {
         ),
         (
             String::from("downstream_liveness_configured_mode"),
+            liveness.configured_mode.as_str().to_owned(),
+        ),
+        (
+            String::from("downstream_liveness_framing_mode"),
             liveness.mode.as_str().to_owned(),
         ),
         (

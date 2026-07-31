@@ -2,20 +2,48 @@
 
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU32, Ordering},
 };
 
 use super::{Duration, HeaderMap, HeaderValue, RETRY_AFTER, ShutdownSubscription};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct RetryBudget {
-    consumed: Arc<AtomicBool>,
+    repeated_physical_attempt: Arc<AtomicU32>,
 }
 
 impl RetryBudget {
-    pub(super) fn claim_delay(&self, headers: &HeaderMap, maximum: Duration) -> Option<Duration> {
+    pub(super) fn claim_delay(
+        &self,
+        headers: &HeaderMap,
+        maximum: Duration,
+        physical_attempt_number: u32,
+    ) -> Option<Duration> {
         let delay = bounded_delay(headers, maximum)?;
-        (!self.consumed.swap(true, Ordering::Relaxed)).then_some(delay)
+        let repeated_physical_attempt = physical_attempt_number.saturating_add(1);
+        self.repeated_physical_attempt
+            .compare_exchange(
+                0,
+                repeated_physical_attempt,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+            .then_some(delay)
+    }
+
+    /// Maps a physical telemetry attempt to the ordinary non-429 ladder rung.
+    ///
+    /// The single accepted rate-limit retry repeats the current ordinary rung
+    /// and therefore cannot spend an ordinary retry slot.
+    pub(super) fn ordinary_attempt_number(&self, physical_attempt_number: u32) -> u32 {
+        let repeated_physical_attempt = self.repeated_physical_attempt.load(Ordering::Relaxed);
+        let rate_limit_offset = u32::from(
+            repeated_physical_attempt != 0 && physical_attempt_number >= repeated_physical_attempt,
+        );
+        physical_attempt_number
+            .saturating_sub(rate_limit_offset)
+            .max(1)
     }
 }
 
@@ -96,11 +124,46 @@ mod tests {
         let mut valid = HeaderMap::new();
         valid.insert(RETRY_AFTER, HeaderValue::from_static("1"));
 
-        assert_eq!(budget.claim_delay(&invalid, Duration::from_secs(1)), None);
         assert_eq!(
-            budget.claim_delay(&valid, Duration::from_secs(1)),
+            budget.claim_delay(&invalid, Duration::from_secs(1), 1),
+            None
+        );
+        assert_eq!(
+            budget.claim_delay(&valid, Duration::from_secs(1), 1),
             Some(Duration::from_secs(1))
         );
-        assert_eq!(budget.claim_delay(&valid, Duration::from_secs(1)), None);
+        assert_eq!(budget.claim_delay(&valid, Duration::from_secs(1), 2), None);
+    }
+
+    #[test]
+    fn rate_limit_retry_repeats_the_current_ordinary_attempt() {
+        let budget = RetryBudget::default();
+        assert_eq!(budget.ordinary_attempt_number(1), 1);
+
+        let mut valid = HeaderMap::new();
+        valid.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+        assert_eq!(
+            budget.claim_delay(&valid, Duration::from_secs(1), 1),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(budget.ordinary_attempt_number(2), 1);
+        assert_eq!(budget.ordinary_attempt_number(3), 2);
+        assert_eq!(budget.ordinary_attempt_number(5), 4);
+    }
+
+    #[test]
+    fn delayed_rate_limit_retry_does_not_relabel_prior_ordinary_attempts() {
+        let budget = RetryBudget::default();
+        let mut valid = HeaderMap::new();
+        valid.insert(RETRY_AFTER, HeaderValue::from_static("1"));
+
+        assert_eq!(
+            budget.claim_delay(&valid, Duration::from_secs(1), 2),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(budget.ordinary_attempt_number(1), 1);
+        assert_eq!(budget.ordinary_attempt_number(2), 2);
+        assert_eq!(budget.ordinary_attempt_number(3), 2);
+        assert_eq!(budget.ordinary_attempt_number(4), 3);
     }
 }

@@ -867,10 +867,10 @@ async fn buffered_reranker_adapters_record_one_upstream_sample_and_suppress_rest
 
         let stalled_request = Request::builder()
             .method(Method::POST)
-            .uri("/v1/chat/completions")
+            .uri("/v1/completions")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
-                r#"{"model":"test-chat","messages":[{"role":"user","content":"pending"}],"stream":true}"#,
+                r#"{"model":"test-chat","prompt":"pending","stream":true}"#,
             ))
             .expect("stalled overlapping request should build");
         let stalled_response = proxy_handler(State(proxy.state.clone()), stalled_request).await;
@@ -1026,10 +1026,10 @@ enabled = false
 
     let stalled_request = Request::builder()
         .method(Method::POST)
-        .uri("/v1/chat/completions")
+        .uri("/v1/completions")
         .header(CONTENT_TYPE, "application/json")
         .body(Body::from(
-            r#"{"model":"test-chat","messages":[{"role":"user","content":"pending"}],"stream":true}"#,
+            r#"{"model":"test-chat","prompt":"pending","stream":true}"#,
         ))
         .expect("stalled streaming request should build");
     let _unread_stalled_response = proxy_handler(State(proxy.state.clone()), stalled_request).await;
@@ -1328,11 +1328,9 @@ async fn watchdog_lifecycle_restarts_after_headers_without_body_progress() {
 
     let response = proxy
         .client
-        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .post(format!("{}/v1/completions", proxy.base_url))
         .header(CONTENT_TYPE, "application/json")
-        .body(
-            r#"{"model":"test-chat","messages":[{"role":"user","content":"stream"}],"stream":true}"#,
-        )
+        .body(r#"{"model":"test-chat","prompt":"stream","stream":true}"#)
         .send()
         .await
         .expect("pending SSE request should receive upstream headers");
@@ -2433,6 +2431,7 @@ impl PendingThenNonStreamUpstream {
                 "/v1/chat/completions",
                 post(pending_then_non_stream_handler),
             )
+            .route("/v1/completions", post(pending_then_non_stream_handler))
             .with_state(requests);
         let server = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -2506,7 +2505,9 @@ impl PendingSseUpstream {
         let address = listener
             .local_addr()
             .expect("pending SSE upstream address should resolve");
-        let app = Router::new().route("/v1/chat/completions", post(pending_sse_handler));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(pending_sse_handler))
+            .route("/v1/completions", post(pending_sse_handler));
         let server = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -2527,7 +2528,7 @@ impl Drop for PendingSseUpstream {
 
 async fn pending_and_buffered_reranker_handler(request: Request<Body>) -> Response<Body> {
     match request.uri().path() {
-        "/v1/chat/completions" => {
+        "/v1/chat/completions" | "/v1/completions" => {
             let mut response = Response::new(Body::from_stream(stream::pending::<
                 Result<Bytes, Infallible>,
             >()));
