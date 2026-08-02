@@ -67,7 +67,7 @@ LLM_GUARD_LOCAL_JOBS=4 LLM_GUARD_LOCAL_TEST_THREADS=4 just pre-push
 Run the recovery invariant check with the same executable shipped for `serve`:
 
 ```bash
-./llm-guard-proxy self-test post-await-no-replay
+./target/release/llm-guard-proxy self-test post-await-no-replay
 ```
 
 The explicit subcommand reads no config or credentials, runs no restart command, and
