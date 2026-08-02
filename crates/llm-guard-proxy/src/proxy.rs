@@ -82,6 +82,7 @@ mod deepinfra_rerank_adapter;
 mod effective_liveness;
 mod generic_recovery;
 mod model_metadata;
+mod post_await_self_test;
 mod precommit_recovery;
 mod prose_constraints;
 mod recovery;
@@ -171,6 +172,7 @@ pub(crate) struct ProxyState {
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
     live_registry: Arc<LiveRequestRegistry>,
     persistence_tasks: Arc<PersistenceTasks>,
+    post_await_self_test: Option<post_await_self_test::Context>,
     #[cfg(test)]
     shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
@@ -313,6 +315,7 @@ impl ProxyState {
                     Arc::new(PersistenceTasks::default())
                 }
             },
+            post_await_self_test: None,
             #[cfg(test)]
             shielded_heartbeat_ticks: Arc::new(AtomicU64::new(0)),
         }
@@ -3434,6 +3437,7 @@ async fn forward_openai_request(
                 local_recovery,
                 local_recovery_attempts: Arc::new(AtomicU64::new(0)),
                 downstream_commit_signal: DownstreamCommitSignal::default(),
+                post_await_self_test: state.post_await_self_test.clone(),
                 #[cfg(feature = "upstream-hot-restart")]
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
@@ -8094,6 +8098,7 @@ async fn run_watchdog_recovery(
                 caller_timeout: None,
                 recovery_episode_observer: Some(&recovery_episode_observer),
                 downstream_commit_signal: None,
+                post_await_self_test: None,
             },
         )
         .await
@@ -9388,6 +9393,7 @@ struct ShieldedRetryRuntime {
     local_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     local_recovery_attempts: Arc<AtomicU64>,
     downstream_commit_signal: DownstreamCommitSignal,
+    post_await_self_test: Option<post_await_self_test::Context>,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     shadow_attempts: Arc<InFlightLimiter>,
@@ -9834,6 +9840,7 @@ fn shielded_liveness_stream_response(
         },
         response_model_alias,
         upstream_failure_counters: runtime.upstream_failure_counters.clone(),
+        post_await_self_test: runtime.post_await_self_test.clone(),
     };
     let response_body = ShieldedLivenessBody::new(
         aggregate,
@@ -11261,6 +11268,7 @@ async fn local_recovery_gate(
             downstream_commit_signal: Some(&runtime.downstream_commit_signal),
             downstream_drop_signal: Some(&runtime.downstream_drop_signal),
             request_deadline: runtime.request_deadline,
+            post_await_self_test: runtime.post_await_self_test.as_ref(),
             episode_timeout: runtime.upstream_profile.restart_queue.enabled.then(|| {
                 Duration::from_secs(runtime.upstream_profile.restart_queue.restart_timeout_secs)
             }),
@@ -11375,6 +11383,7 @@ struct LocalRecoveryRunOptions<'a> {
     caller_timeout: Option<Duration>,
     recovery_episode_observer: Option<&'a AtomicU64>,
     downstream_commit_signal: Option<DownstreamCommitSignal>,
+    post_await_self_test: Option<post_await_self_test::Context>,
 }
 
 #[cfg(test)]
@@ -11397,6 +11406,7 @@ async fn run_local_recovery_for_profile(
             caller_timeout: None,
             recovery_episode_observer: None,
             downstream_commit_signal: None,
+            post_await_self_test: None,
         },
     )
     .await
@@ -11463,6 +11473,7 @@ async fn run_local_recovery_for_profile_observing(
         cause,
         task_timeout,
         options.downstream_commit_signal.clone(),
+        options.post_await_self_test.clone(),
     ));
     state.active_local_recovery_task = Some(recovery_task.abort_handle());
     drop(state);
@@ -11618,107 +11629,7 @@ async fn abort_local_recovery_episode(
 }
 
 pub(crate) async fn post_await_no_replay_self_test_report() -> Result<serde_json::Value, String> {
-    let downstream_commit_signal = DownstreamCommitSignal::default();
-    let recovery_signal = downstream_commit_signal.clone();
-    let (await_entered_tx, await_entered_rx) = tokio::sync::oneshot::channel();
-    let (await_release_tx, await_release_rx) = tokio::sync::oneshot::channel();
-    let mut policy = LocalRecoveryPolicy::from_config(&LocalRecoveryConfig::default());
-    policy.readiness_deadline = Duration::from_millis(1);
-    policy.readiness_interval = Duration::from_millis(1);
-
-    let recovery_phase = async move {
-        let mut metadata = BTreeMap::new();
-        if local_recovery_downstream_commit_observed(Some(&recovery_signal), &mut metadata) {
-            return Err("downstream was committed before the recovery await".into());
-        }
-        await_entered_tx
-            .send(())
-            .map_err(|()| String::from("commit phase did not observe the recovery await"))?;
-        await_release_rx
-            .await
-            .map_err(|error| format!("recovery await rendezvous failed: {error}"))?;
-        metadata.insert(
-            String::from("local_recovery_restart_status"),
-            String::from("succeeded"),
-        );
-        Ok::<_, String>(
-            finish_local_recovery_after_restart(
-                Client::new(),
-                String::from("offline-self-test"),
-                &policy,
-                Some(&recovery_signal),
-                metadata,
-            )
-            .await,
-        )
-    };
-    let commit_phase = async {
-        await_entered_rx
-            .await
-            .map_err(|error| format!("recovery await was not observed: {error}"))?;
-        downstream_commit_signal
-            .observe_emitted_bytes(&Bytes::from_static(b": self-test downstream commit\n\n"));
-        await_release_tx
-            .send(())
-            .map_err(|()| String::from("recovery phase left before post-await verification"))?;
-        Ok::<_, String>(())
-    };
-    let (recovery_metadata, commit_result) = tokio::join!(recovery_phase, commit_phase);
-    commit_result?;
-    let recovery_metadata = recovery_metadata?;
-    if !downstream_commit_signal.is_committed() {
-        return Err("recovery await completed without a downstream commit".into());
-    }
-    let readiness_probe_attempted = recovery_metadata
-        .keys()
-        .any(|key| key.starts_with("local_recovery_readiness_"));
-    if readiness_probe_attempted
-        || recovery_metadata
-            .get("local_recovery_replay_skipped_downstream_committed")
-            .map(String::as_str)
-            != Some("true")
-        || recovery_metadata
-            .get("local_recovery_status")
-            .map(String::as_str)
-            != Some("skipped_downstream_committed")
-    {
-        return Err(format!(
-            "post-await downstream commit did not block readiness: {recovery_metadata:?}"
-        ));
-    }
-
-    let replay_gate = precommit_recovery::gate_after_recovery(
-        Some(&downstream_commit_signal),
-        None,
-        RequestDeadline::from_started_at(Instant::now(), Duration::from_secs(1)),
-        BTreeMap::from([(
-            String::from("local_recovery_status"),
-            String::from("succeeded"),
-        )]),
-    );
-    if !replay_gate.applied
-        || replay_gate.permits_retry
-        || replay_gate.permits_replay
-        || replay_gate
-            .metadata
-            .get("local_recovery_replay_skipped_downstream_committed")
-            .map(String::as_str)
-            != Some("true")
-    {
-        return Err(format!(
-            "post-await downstream commit did not block replay: {:?}",
-            replay_gate.metadata
-        ));
-    }
-
-    Ok(serde_json::json!({
-        "downstream_committed_post_await": downstream_commit_signal.is_committed(),
-        "mode": "offline_cli_only",
-        "readiness_probe_attempted": readiness_probe_attempted,
-        "replay_permitted": replay_gate.permits_replay,
-        "self_test": "post-await-no-replay",
-        "status": "passed"
-    }))
+    post_await_self_test::run().await
 }
 
 async fn run_local_recovery_task(
@@ -11728,6 +11639,7 @@ async fn run_local_recovery_task(
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
     downstream_commit_signal: Option<DownstreamCommitSignal>,
+    post_await_self_test: Option<post_await_self_test::Context>,
 ) -> BTreeMap<String, String> {
     let trigger_cause = cause.as_str().to_owned();
     let recovery_trigger_cause = trigger_cause.clone();
@@ -11744,12 +11656,18 @@ async fn run_local_recovery_task(
         ) {
             return metadata;
         }
-        metadata.extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
+        if let Some(self_test) = &post_await_self_test {
+            metadata.extend(self_test.restart_metadata().await);
+        } else {
+            metadata
+                .extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
+        }
         finish_local_recovery_after_restart(
             client,
             base_url,
             &policy,
             downstream_commit_signal.as_ref(),
+            post_await_self_test.as_ref(),
             metadata,
         )
         .await
@@ -11783,9 +11701,13 @@ async fn finish_local_recovery_after_restart(
     base_url: String,
     policy: &LocalRecoveryPolicy,
     downstream_commit_signal: Option<&DownstreamCommitSignal>,
+    post_await_self_test: Option<&post_await_self_test::Context>,
     mut metadata: BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     if local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata) {
+        if let Some(self_test) = post_await_self_test {
+            self_test.mark_post_await_committed();
+        }
         return metadata;
     }
     if metadata
@@ -15233,6 +15155,7 @@ struct ShieldedLivenessBodySettings {
     accepted_response_mode: ShieldedAcceptedResponseMode,
     response_model_alias: Option<String>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
+    post_await_self_test: Option<post_await_self_test::Context>,
 }
 
 struct ShieldedLivenessBody {
@@ -15248,6 +15171,8 @@ struct ShieldedLivenessBody {
     downstream_drop_signal: DownstreamDropSignal,
     downstream_commit_signal: DownstreamCommitSignal,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
+    post_await_self_test: Option<post_await_self_test::Context>,
+    post_await_emit: Option<Pin<Box<oneshot::Receiver<()>>>>,
     bytes_seen: u64,
     terminal_completion: Option<BodyCompletion>,
 }
@@ -15262,6 +15187,11 @@ impl ShieldedLivenessBody {
         downstream_drop_signal: DownstreamDropSignal,
         downstream_commit_signal: DownstreamCommitSignal,
     ) -> Self {
+        let post_await_emit = settings
+            .post_await_self_test
+            .as_ref()
+            .and_then(post_await_self_test::Context::take_emit_receiver)
+            .map(Box::pin);
         Self {
             aggregate,
             direct_stream: None,
@@ -15275,6 +15205,8 @@ impl ShieldedLivenessBody {
             downstream_drop_signal,
             downstream_commit_signal,
             upstream_failure_counters: settings.upstream_failure_counters.clone(),
+            post_await_self_test: settings.post_await_self_test.clone(),
+            post_await_emit,
             bytes_seen: 0,
             terminal_completion: None,
         }
@@ -15496,6 +15428,22 @@ impl Stream for ShieldedLivenessBody {
             Poll::Pending => {}
         }
 
+        if let Some(receiver) = &mut this.post_await_emit {
+            match receiver.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.post_await_emit = None;
+                    let self_test = this.post_await_self_test.clone();
+                    let emitted = this.count_and_emit(heartbeat_chunk(ShieldedLivenessMode::Sse));
+                    if let Some(self_test) = self_test {
+                        self_test.mark_body_emitted();
+                    }
+                    return emitted;
+                }
+                Poll::Ready(Err(_closed)) => this.post_await_emit = None,
+                Poll::Pending => {}
+            }
+        }
+
         // The aggregate owns every replay decision.  Any liveness byte would commit the
         // downstream response before that decision is final, so keep the body silent until
         // it can emit an accepted result, terminal response, or direct-relay content.
@@ -15622,6 +15570,14 @@ fn shielded_chat_stream_response_headers(
         HeaderValue::from_static("no"),
     );
     headers
+}
+
+fn heartbeat_chunk(mode: ShieldedLivenessMode) -> Bytes {
+    match mode {
+        ShieldedLivenessMode::Sse => Bytes::from_static(b": llm-guard-proxy heartbeat\n\n"),
+        ShieldedLivenessMode::JsonWhitespace => Bytes::from_static(b" \n"),
+        ShieldedLivenessMode::Disabled => Bytes::new(),
+    }
 }
 
 fn sse_final_frame(body: &Bytes) -> Bytes {

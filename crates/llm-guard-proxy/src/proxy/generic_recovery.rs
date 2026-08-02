@@ -137,6 +137,7 @@ async fn recover_and_replay(
             attempts: &context.local_recovery_attempts,
             downstream_commit_signal: None,
             downstream_drop_signal: None,
+            post_await_self_test: None,
             request_deadline: context.request_deadline,
             episode_timeout: context.upstream_profile.restart_queue.enabled.then(|| {
                 Duration::from_secs(context.upstream_profile.restart_queue.restart_timeout_secs)

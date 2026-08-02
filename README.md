@@ -70,10 +70,11 @@ Run the recovery invariant check with the same executable shipped for `serve`:
 ./llm-guard-proxy self-test post-await-no-replay
 ```
 
-The explicit subcommand runs without config, listeners, or upstream network access and
-returns passing JSON only after a downstream commit observed across a recovery await
-blocks both the readiness probe and replay. Normal serve options do not expose this
-self-test hook.
+The explicit subcommand reads no config or credentials, runs no restart command, and
+uses only private loopback listeners. Its metadata-only JSON records a control arm
+(business request → readiness probe → successful replay) and a committed arm whose
+real heartbeat crosses the recovery await and blocks both readiness and replay.
+Normal serve options do not expose this self-test hook.
 
 ## GB10 Compatibility Smoke
 

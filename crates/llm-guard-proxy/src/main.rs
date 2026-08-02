@@ -1212,9 +1212,22 @@ mod tests {
             .expect("offline self-test should pass");
 
         assert_eq!(report["status"], "passed");
-        assert_eq!(report["downstream_committed_post_await"], true);
-        assert_eq!(report["readiness_probe_attempted"], false);
-        assert_eq!(report["replay_permitted"], false);
+        assert_eq!(
+            report["control"]["ordered_roles"],
+            serde_json::json!(["business", "recovery_probe", "business"])
+        );
+        assert_eq!(report["control"]["business_count"], 2);
+        assert_eq!(report["control"]["probe_count"], 1);
+        assert_eq!(report["control"]["same_payload"], true);
+        assert_eq!(report["control"]["done_observed"], true);
+        assert_eq!(report["committed"]["business_count"], 1);
+        assert_eq!(report["committed"]["probe_count"], 0);
+        assert_eq!(report["committed"]["client_observed_heartbeat"], true);
+        assert_eq!(report["committed"]["post_await_committed"], true);
+        assert_eq!(report["committed"]["done_observed"], false);
+        assert_eq!(report["committed"]["terminal_error_observed"], true);
+        assert_eq!(report["committed"]["eof_observed"], true);
+        assert_eq!(report["committed"]["cleanup_complete"], true);
     }
 
     #[tokio::test]
