@@ -1218,16 +1218,31 @@ mod tests {
         );
         assert_eq!(report["control"]["business_count"], 2);
         assert_eq!(report["control"]["probe_count"], 1);
+        assert_eq!(report["control"]["request_claims"], 1);
+        assert_eq!(report["control"]["rejected_request_claims"], 0);
+        assert_eq!(report["control"]["guard_business_count"], 2);
+        assert_eq!(report["control"]["guard_probe_count"], 1);
         assert_eq!(report["control"]["same_payload"], true);
         assert_eq!(report["control"]["done_observed"], true);
         assert_eq!(report["committed"]["business_count"], 1);
         assert_eq!(report["committed"]["probe_count"], 0);
+        assert_eq!(report["committed"]["request_claims"], 1);
+        assert_eq!(report["committed"]["rejected_request_claims"], 0);
+        assert_eq!(report["committed"]["guard_business_count"], 1);
+        assert_eq!(report["committed"]["guard_probe_count"], 0);
         assert_eq!(report["committed"]["client_observed_heartbeat"], true);
         assert_eq!(report["committed"]["post_await_committed"], true);
         assert_eq!(report["committed"]["done_observed"], false);
         assert_eq!(report["committed"]["terminal_error_observed"], true);
         assert_eq!(report["committed"]["eof_observed"], true);
         assert_eq!(report["committed"]["cleanup_complete"], true);
+        for unsupported in [
+            "external_network_used",
+            "config_or_credentials_read",
+            "persistence_used",
+        ] {
+            assert!(report.get(unsupported).is_none());
+        }
     }
 
     #[tokio::test]

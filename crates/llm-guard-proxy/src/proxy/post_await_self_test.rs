@@ -44,6 +44,10 @@ pub(super) struct Context {
 
 struct ContextInner {
     arm: Arm,
+    request_claims: AtomicU64,
+    rejected_request_claims: AtomicU64,
+    guard_business_attempts: AtomicU64,
+    guard_probe_dispatches: AtomicU64,
     started: Instant,
     last_stamp_ns: AtomicU64,
     pre_await_gate_ns: AtomicU64,
@@ -74,6 +78,10 @@ impl Context {
         Self {
             inner: Arc::new(ContextInner {
                 arm,
+                request_claims: AtomicU64::new(0),
+                rejected_request_claims: AtomicU64::new(0),
+                guard_business_attempts: AtomicU64::new(0),
+                guard_probe_dispatches: AtomicU64::new(0),
                 started: Instant::now(),
                 last_stamp_ns: AtomicU64::new(0),
                 pre_await_gate_ns: AtomicU64::new(0),
@@ -88,6 +96,47 @@ impl Context {
                 ack_rx: Mutex::new(Some(ack_rx)),
             }),
         }
+    }
+
+    pub(super) fn claim_request(&self) -> Result<Self, String> {
+        if self
+            .inner
+            .request_claims
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return Ok(self.clone());
+        }
+        self.inner
+            .rejected_request_claims
+            .fetch_add(1, Ordering::AcqRel);
+        Err(failure("request_claim_rejected"))
+    }
+
+    pub(super) fn request_claim_counts(&self) -> (u64, u64) {
+        (
+            self.inner.request_claims.load(Ordering::Acquire),
+            self.inner.rejected_request_claims.load(Ordering::Acquire),
+        )
+    }
+
+    pub(super) fn mark_guard_business_attempt(&self) {
+        self.inner
+            .guard_business_attempts
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn mark_guard_probe_dispatch(&self) {
+        self.inner
+            .guard_probe_dispatches
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn guard_attempt_counts(&self) -> (u64, u64) {
+        (
+            self.inner.guard_business_attempts.load(Ordering::Acquire),
+            self.inner.guard_probe_dispatches.load(Ordering::Acquire),
+        )
     }
 
     pub(super) fn mark_pre_await_gate(&self) {
@@ -186,13 +235,44 @@ fn take_channel<T>(slot: &Mutex<Option<T>>) -> Option<T> {
         .take()
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct FakeUpstreamState {
+    arm: Arm,
     business_count: AtomicU64,
     probe_count: AtomicU64,
     ordered_roles: Mutex<Vec<String>>,
-    first_business_body: Mutex<Option<Bytes>>,
+    first_business_payload: Mutex<Option<BusinessPayload>>,
     same_payload: AtomicBool,
+    validation_error: Mutex<Option<String>>,
+}
+
+impl FakeUpstreamState {
+    fn new(arm: Arm) -> Self {
+        Self {
+            arm,
+            business_count: AtomicU64::new(0),
+            probe_count: AtomicU64::new(0),
+            ordered_roles: Mutex::new(Vec::new()),
+            first_business_payload: Mutex::new(None),
+            same_payload: AtomicBool::new(true),
+            validation_error: Mutex::new(None),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct BusinessPayload {
+    model: String,
+    messages: Vec<BusinessMessage>,
+    stream: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct BusinessMessage {
+    role: String,
+    content: String,
 }
 
 #[derive(Debug)]
@@ -235,6 +315,10 @@ struct PhaseReceipt {
 #[serde(deny_unknown_fields)]
 struct ArmReceipt {
     ordered_roles: Vec<String>,
+    request_claims: u64,
+    rejected_request_claims: u64,
+    guard_business_count: u64,
+    guard_probe_count: u64,
     business_count: u64,
     probe_count: u64,
     #[serde(flatten)]
@@ -286,33 +370,24 @@ struct Receipt {
     control: ArmReceipt,
     committed: ArmReceipt,
     same_payload_across_arms: bool,
-    #[serde(flatten)]
-    isolation: IsolationReceipt,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct IsolationReceipt {
-    external_network_used: bool,
-    config_or_credentials_read: bool,
-    persistence_used: bool,
+struct ArmRun {
+    receipt: ArmReceipt,
+    first_payload: BusinessPayload,
 }
 
 pub(super) async fn run() -> Result<serde_json::Value, String> {
     timeout(SELF_TEST_DEADLINE, async {
         let control = run_arm(Arm::Control).await?;
         let committed = run_arm(Arm::Committed).await?;
+        let same_payload_across_arms = control.first_payload == committed.first_payload;
         let receipt = Receipt {
             self_test: String::from("post-await-no-replay"),
             status: String::from("passed"),
-            control,
-            committed,
-            same_payload_across_arms: true,
-            isolation: IsolationReceipt {
-                external_network_used: false,
-                config_or_credentials_read: false,
-                persistence_used: false,
-            },
+            control: control.receipt,
+            committed: committed.receipt,
+            same_payload_across_arms,
         };
         validate_receipt(&receipt)?;
         serde_json::to_value(receipt).map_err(|_| failure("serialize_receipt"))
@@ -321,11 +396,8 @@ pub(super) async fn run() -> Result<serde_json::Value, String> {
     .map_err(|_| failure("deadline_exceeded"))?
 }
 
-async fn run_arm(arm: Arm) -> Result<ArmReceipt, String> {
-    let fake_state = Arc::new(FakeUpstreamState {
-        same_payload: AtomicBool::new(true),
-        ..FakeUpstreamState::default()
-    });
+async fn run_arm(arm: Arm) -> Result<ArmRun, String> {
+    let fake_state = Arc::new(FakeUpstreamState::new(arm));
     let fake_server = spawn_fake_upstream(Arc::clone(&fake_state)).await?;
     let loopback_only = fake_server.addr.ip().is_loopback();
     let context = Context::new(arm);
@@ -341,37 +413,62 @@ async fn run_arm(arm: Arm) -> Result<ArmReceipt, String> {
     let proxy_stopped = proxy_server.stop().await;
     let fake_stopped = fake_server.stop().await;
     let cleanup_complete = proxy_stopped && fake_stopped;
-    let client = client_result?;
+    let client = match client_result {
+        Ok(client) => client,
+        Err(error) => {
+            return Err(fake_state
+                .validation_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .unwrap_or(error));
+        }
+    };
     let ordered_roles = fake_state
         .ordered_roles
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    let first_payload = fake_state
+        .first_business_payload
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .ok_or_else(|| failure("missing_first_business_payload"))?;
 
     let phases = context.phases();
-    Ok(ArmReceipt {
-        ordered_roles,
-        business_count: fake_state.business_count.load(Ordering::Acquire),
-        probe_count: fake_state.probe_count.load(Ordering::Acquire),
-        fault: FaultReceipt {
-            same_payload: fake_state.same_payload.load(Ordering::Acquire),
-            first_chunk_stall: phases.pre_await_gate > 0,
+    let (request_claims, rejected_request_claims) = context.request_claim_counts();
+    let (guard_business_count, guard_probe_count) = context.guard_attempt_counts();
+    Ok(ArmRun {
+        receipt: ArmReceipt {
+            ordered_roles,
+            request_claims,
+            rejected_request_claims,
+            guard_business_count,
+            guard_probe_count,
+            business_count: fake_state.business_count.load(Ordering::Acquire),
+            probe_count: fake_state.probe_count.load(Ordering::Acquire),
+            fault: FaultReceipt {
+                same_payload: fake_state.same_payload.load(Ordering::Acquire),
+                first_chunk_stall: phases.pre_await_gate > 0,
+            },
+            first_byte_wait_ms: client.first_byte_wait_ms,
+            client: ClientEvidence {
+                client_observed_heartbeat: client.outcome == ClientOutcome::CommittedBlocked,
+                done_observed: client.outcome == ClientOutcome::ControlSuccess,
+                terminal_error_observed: client.outcome == ClientOutcome::CommittedBlocked,
+            },
+            completion: CompletionEvidence {
+                eof_observed: true,
+                post_await_committed: phases.post_await_committed_ns > 0,
+            },
+            phases,
+            cleanup: CleanupEvidence {
+                loopback_only,
+                cleanup_complete,
+            },
         },
-        first_byte_wait_ms: client.first_byte_wait_ms,
-        client: ClientEvidence {
-            client_observed_heartbeat: client.outcome == ClientOutcome::CommittedBlocked,
-            done_observed: client.outcome == ClientOutcome::ControlSuccess,
-            terminal_error_observed: client.outcome == ClientOutcome::CommittedBlocked,
-        },
-        completion: CompletionEvidence {
-            eof_observed: true,
-            post_await_committed: phases.post_await_committed_ns > 0,
-        },
-        phases,
-        cleanup: CleanupEvidence {
-            loopback_only,
-            cleanup_complete,
-        },
+        first_payload,
     })
 }
 
@@ -390,6 +487,7 @@ fn build_proxy_state(upstream_addr: SocketAddr, context: Context) -> Result<Prox
     config.retry.max_attempts = 2;
     config.retry.request_deadline_ms = 2_000;
     config.retry.shielded_streaming_enabled = true;
+    config.thinking.enabled = false;
     config.upstream_stall.enabled = true;
     config.upstream_stall.first_chunk_timeout_ms = FIRST_CHUNK_TIMEOUT_MS;
     config.upstream_stall.idle_timeout_ms = 500;
@@ -451,6 +549,7 @@ async fn fake_upstream_handler(
     State(state): State<Arc<FakeUpstreamState>>,
     request: Request<Body>,
 ) -> Response<Body> {
+    let path = request.uri().path().to_owned();
     let is_probe = request
         .headers()
         .get("x-llm-guard-proxy-probe")
@@ -466,13 +565,24 @@ async fn fake_upstream_handler(
         );
     }
 
+    let payload = match parse_business_payload(&path, &body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            *state
+                .validation_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
+            return status_response(StatusCode::BAD_REQUEST);
+        }
+    };
+
     let business_number = state.business_count.fetch_add(1, Ordering::AcqRel) + 1;
     push_role(&state, "business");
     if business_number == 1 {
         *state
-            .first_business_body
+            .first_business_payload
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(body);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(payload);
         return Response::builder()
             .status(StatusCode::OK)
             .header(CONTENT_TYPE, "text/event-stream")
@@ -481,15 +591,35 @@ async fn fake_upstream_handler(
             >()))
             .unwrap_or_else(|_| status_response(StatusCode::INTERNAL_SERVER_ERROR));
     }
+    if state.arm == Arm::Committed {
+        return status_response(StatusCode::INTERNAL_SERVER_ERROR);
+    }
 
     let same_payload = state
-        .first_business_body
+        .first_business_payload
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .as_ref()
-        .is_some_and(|first| first == &body);
+        .is_some_and(|first| first == &payload);
     state.same_payload.store(same_payload, Ordering::Release);
     sse_body(SUCCESS_SSE)
+}
+
+fn parse_business_payload(path: &str, body: &Bytes) -> Result<BusinessPayload, String> {
+    require(path == "/v1/chat/completions", "business_endpoint")?;
+    let payload: BusinessPayload =
+        serde_json::from_slice(body).map_err(|_| failure("business_payload_schema"))?;
+    require(payload.model == "self-test", "business_model")?;
+    require(payload.stream, "business_stream")?;
+    require(
+        payload.messages
+            == [BusinessMessage {
+                role: String::from("user"),
+                content: String::from("transport check"),
+            }],
+        "business_messages",
+    )?;
+    Ok(payload)
 }
 
 fn push_role(state: &FakeUpstreamState, role: &str) {
@@ -608,19 +738,26 @@ fn validate_receipt(receipt: &Receipt) -> Result<(), String> {
     require(
         receipt.same_payload_across_arms,
         "cross_arm_payload_changed",
-    )?;
-    require(
-        !receipt.isolation.external_network_used,
-        "external_network_used",
-    )?;
-    require(
-        !receipt.isolation.config_or_credentials_read,
-        "config_or_credentials_read",
-    )?;
-    require(!receipt.isolation.persistence_used, "persistence_used")
+    )
 }
 
 fn validate_control(receipt: &Receipt) -> Result<(), String> {
+    require(
+        receipt.control.request_claims == 1,
+        "control_request_claims",
+    )?;
+    require(
+        receipt.control.rejected_request_claims == 0,
+        "control_rejected_request_claims",
+    )?;
+    require(
+        receipt.control.guard_business_count == 2,
+        "control_guard_business_count",
+    )?;
+    require(
+        receipt.control.guard_probe_count == 1,
+        "control_guard_probe_count",
+    )?;
     require(
         receipt.control.ordered_roles == ["business", "recovery_probe", "business"],
         "control_role_order",
@@ -630,6 +767,14 @@ fn validate_control(receipt: &Receipt) -> Result<(), String> {
         "control_business_count",
     )?;
     require(receipt.control.probe_count == 1, "control_probe_count")?;
+    require(
+        receipt.control.guard_business_count == receipt.control.business_count,
+        "control_business_count_mismatch",
+    )?;
+    require(
+        receipt.control.guard_probe_count == receipt.control.probe_count,
+        "control_probe_count_mismatch",
+    )?;
     require(
         receipt.control.fault.same_payload,
         "control_payload_changed",
@@ -658,6 +803,22 @@ fn validate_control(receipt: &Receipt) -> Result<(), String> {
 
 fn validate_committed(receipt: &Receipt) -> Result<(), String> {
     require(
+        receipt.committed.request_claims == 1,
+        "committed_request_claims",
+    )?;
+    require(
+        receipt.committed.rejected_request_claims == 0,
+        "committed_rejected_request_claims",
+    )?;
+    require(
+        receipt.committed.guard_business_count == 1,
+        "committed_guard_business_count",
+    )?;
+    require(
+        receipt.committed.guard_probe_count == 0,
+        "committed_guard_probe_count",
+    )?;
+    require(
         receipt.committed.ordered_roles == ["business"],
         "committed_role_order",
     )?;
@@ -666,6 +827,14 @@ fn validate_committed(receipt: &Receipt) -> Result<(), String> {
         "committed_business_count",
     )?;
     require(receipt.committed.probe_count == 0, "committed_probe_count")?;
+    require(
+        receipt.committed.guard_business_count == receipt.committed.business_count,
+        "committed_business_count_mismatch",
+    )?;
+    require(
+        receipt.committed.guard_probe_count == receipt.committed.probe_count,
+        "committed_probe_count_mismatch",
+    )?;
     require(
         receipt.committed.fault.same_payload,
         "committed_payload_state",
@@ -741,6 +910,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_claim_is_single_owner_and_second_claim_is_rejected() {
+        let context = Context::new(Arm::Control);
+
+        assert!(context.claim_request().is_ok());
+        assert_eq!(context.request_claim_counts(), (1, 0));
+        assert!(context.claim_request().is_err());
+        assert_eq!(context.request_claim_counts(), (1, 1));
+    }
+
+    #[test]
+    fn guard_attempt_accounting_is_independent_from_upstream_observation() {
+        let context = Context::new(Arm::Control);
+
+        context.mark_guard_business_attempt();
+        context.mark_guard_business_attempt();
+        context.mark_guard_probe_dispatch();
+
+        assert_eq!(context.guard_attempt_counts(), (2, 1));
+    }
+
+    #[test]
+    fn business_payload_is_structured_and_order_independent() {
+        let expected = parse_business_payload(
+            "/v1/chat/completions",
+            &Bytes::from_static(REQUEST_BODY.as_bytes()),
+        )
+        .expect("canonical payload should pass");
+        let reordered = Bytes::from_static(
+            br#"{"stream":true,"messages":[{"content":"transport check","role":"user"}],"model":"self-test"}"#,
+        );
+        assert_eq!(
+            parse_business_payload("/v1/chat/completions", &reordered)
+                .expect("JSON key order must not matter"),
+            expected
+        );
+
+        for (path, body) in [
+            ("/v1/other", REQUEST_BODY.as_bytes()),
+            ("/v1/chat/completions", br#"{"arbitrary":true}"#),
+            (
+                "/v1/chat/completions",
+                br#"{"model":"self-test","messages":[{"role":"user","content":"wrong"}],"stream":true}"#,
+            ),
+        ] {
+            assert!(parse_business_payload(path, &Bytes::copy_from_slice(body)).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_fake_upstream_rejects_second_business_payload() {
+        let state = Arc::new(FakeUpstreamState::new(Arm::Committed));
+
+        let first = fake_upstream_handler(State(Arc::clone(&state)), business_request()).await;
+        let second = fake_upstream_handler(State(Arc::clone(&state)), business_request()).await;
+
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(second.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(state.business_count.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn receipt_schema_rejects_sensitive_and_unmeasured_fields() {
+        let valid = valid_receipt_value();
+        for unsupported in [
+            "external_network_used",
+            "config_or_credentials_read",
+            "persistence_used",
+        ] {
+            assert!(valid.get(unsupported).is_none());
+        }
+
+        for field in ["prompt", "body", "headers", "diagnostic", "hash"] {
+            let top_level = mutate(&valid, |value| {
+                value
+                    .as_object_mut()
+                    .expect("receipt object")
+                    .insert(String::from(field), serde_json::json!("forbidden"));
+            });
+            assert!(validate_receipt_value(top_level).is_err());
+
+            let nested = mutate(&valid, |value| {
+                value["control"]
+                    .as_object_mut()
+                    .expect("control object")
+                    .insert(String::from(field), serde_json::json!("forbidden"));
+            });
+            assert!(validate_receipt_value(nested).is_err());
+        }
+    }
+
+    #[test]
     fn receipt_validation_rejects_missing_or_self_confirming_evidence() {
         let valid = valid_receipt_value();
         assert!(validate_receipt_value(valid.clone()).is_ok());
@@ -756,6 +1016,15 @@ mod tests {
             value["control"]["probe_count"] = 0.into();
         }));
         mutations.push(mutate(&valid, |value| {
+            value["control"]["rejected_request_claims"] = 1.into();
+        }));
+        mutations.push(mutate(&valid, |value| {
+            value["control"]["guard_business_count"] = 1.into();
+        }));
+        mutations.push(mutate(&valid, |value| {
+            value["control"]["guard_probe_count"] = 0.into();
+        }));
+        mutations.push(mutate(&valid, |value| {
             value["control"]["business_count"] = 1.into();
         }));
         mutations.push(mutate(&valid, |value| {
@@ -769,6 +1038,15 @@ mod tests {
         }));
         mutations.push(mutate(&valid, |value| {
             value["committed"]["probe_count"] = 1.into();
+        }));
+        mutations.push(mutate(&valid, |value| {
+            value["committed"]["request_claims"] = 2.into();
+        }));
+        mutations.push(mutate(&valid, |value| {
+            value["committed"]["guard_business_count"] = 2.into();
+        }));
+        mutations.push(mutate(&valid, |value| {
+            value["committed"]["guard_probe_count"] = 1.into();
         }));
         mutations.push(mutate(&valid, |value| {
             value["committed"]["business_count"] = 2.into();
@@ -800,12 +1078,24 @@ mod tests {
         value
     }
 
+    fn business_request() -> Request<Body> {
+        Request::builder()
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(REQUEST_BODY))
+            .expect("self-test request")
+    }
+
     fn valid_receipt_value() -> serde_json::Value {
         serde_json::json!({
             "self_test": "post-await-no-replay",
             "status": "passed",
             "control": {
                 "ordered_roles": ["business", "recovery_probe", "business"],
+                "request_claims": 1,
+                "rejected_request_claims": 0,
+                "guard_business_count": 2,
+                "guard_probe_count": 1,
                 "business_count": 2,
                 "probe_count": 1,
                 "same_payload": true,
@@ -829,6 +1119,10 @@ mod tests {
             },
             "committed": {
                 "ordered_roles": ["business"],
+                "request_claims": 1,
+                "rejected_request_claims": 0,
+                "guard_business_count": 1,
+                "guard_probe_count": 0,
                 "business_count": 1,
                 "probe_count": 0,
                 "same_payload": true,
@@ -850,10 +1144,7 @@ mod tests {
                 "loopback_only": true,
                 "cleanup_complete": true
             },
-            "same_payload_across_arms": true,
-            "external_network_used": false,
-            "config_or_credentials_read": false,
-            "persistence_used": false
+            "same_payload_across_arms": true
         })
     }
 }

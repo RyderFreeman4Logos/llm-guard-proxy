@@ -3380,6 +3380,12 @@ async fn forward_openai_request(
         Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
     if prepared_request.shielded_chat_plan.intercepted {
         add_retry_request_metadata(&mut request_metadata, &retry_policy);
+        let post_await_self_test = state
+            .post_await_self_test
+            .as_ref()
+            .map(post_await_self_test::Context::claim_request)
+            .transpose()
+            .map_err(ProxyError::request_body)?;
         let request_deadline =
             RequestDeadline::from_started_at(request_started_at, retry_policy.request_deadline);
         let local_recovery_policy =
@@ -3437,7 +3443,7 @@ async fn forward_openai_request(
                 local_recovery,
                 local_recovery_attempts: Arc::new(AtomicU64::new(0)),
                 downstream_commit_signal: DownstreamCommitSignal::default(),
-                post_await_self_test: state.post_await_self_test.clone(),
+                post_await_self_test,
                 #[cfg(feature = "upstream-hot-restart")]
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
@@ -11715,7 +11721,14 @@ async fn finish_local_recovery_after_restart(
         .is_some_and(|status| status == "succeeded")
     {
         metadata.extend(
-            run_local_recovery_readiness(client, base_url, policy, downstream_commit_signal).await,
+            run_local_recovery_readiness(
+                client,
+                base_url,
+                policy,
+                downstream_commit_signal,
+                post_await_self_test,
+            )
+            .await,
         );
     }
     local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata);
@@ -11907,6 +11920,7 @@ async fn run_local_recovery_readiness(
     base_url: String,
     policy: &LocalRecoveryPolicy,
     downstream_commit_signal: Option<&DownstreamCommitSignal>,
+    post_await_self_test: Option<&post_await_self_test::Context>,
 ) -> BTreeMap<String, String> {
     let deadline = Instant::now() + policy.readiness_deadline;
     loop {
@@ -11919,6 +11933,9 @@ async fn run_local_recovery_readiness(
                 String::from("local_recovery_readiness_status"),
                 String::from("timeout"),
             )]);
+        }
+        if let Some(self_test) = post_await_self_test {
+            self_test.mark_guard_probe_dispatch();
         }
         match send_local_recovery_readiness_probe(&client, &base_url, policy).await {
             Ok(true) => {
@@ -12516,6 +12533,9 @@ async fn send_shielded_upstream_attempt(
     retry_body: Bytes,
     upstream_timeout: Duration,
 ) -> Result<SentUpstreamResponse, ProxyError> {
+    if let Some(self_test) = &runtime.post_await_self_test {
+        self_test.mark_guard_business_attempt();
+    }
     let (attempt_id, attempt_number, attempt_started_at_unix_ms) = attempt;
     let request_deadline = Some(runtime.request_deadline.instant());
     send_first_upstream_attempt(UpstreamAttemptContext {
