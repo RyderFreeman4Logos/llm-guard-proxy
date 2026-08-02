@@ -177,12 +177,18 @@ pub(super) async fn gate(
     )
     .await;
     metadata.extend(recovery_metadata);
-    gate_after_recovery(
+    let gate = gate_after_recovery(
         context.downstream_commit_signal,
         context.downstream_drop_signal,
         context.request_deadline,
         metadata,
-    )
+    );
+    if gate.permits_replay
+        && let Some(self_test) = context.post_await_self_test
+    {
+        self_test.mark_control_replay_authorized();
+    }
+    gate
 }
 
 pub(super) fn gate_after_recovery(

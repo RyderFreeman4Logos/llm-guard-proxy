@@ -344,6 +344,20 @@ impl ProxyState {
             .await;
     }
 
+    async fn flush_persistence_checked(&self) -> Result<(), &'static str> {
+        self.flush_persistence().await;
+        if self.persistence_tasks.in_flight.load(Ordering::SeqCst) != 0 {
+            return Err("persistence_cleanup_incomplete");
+        }
+        if self.persistence_tasks.panics.load(Ordering::SeqCst) != 0 {
+            return Err("persistence_cleanup_panicked");
+        }
+        if self.persistence_tasks.dropped_total() != 0 {
+            return Err("persistence_cleanup_dropped");
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn reset_shielded_heartbeat_ticks_for_tests(&self) {
         self.shielded_heartbeat_ticks.store(0, Ordering::SeqCst);
@@ -910,7 +924,6 @@ struct PersistenceTasks {
     idle: Notify,
     dropped: AtomicU64,
     backlog_drop_log: PersistenceBacklogDropLog,
-    #[cfg(test)]
     panics: AtomicUsize,
     #[cfg(test)]
     synchronous_for_tests: bool,
@@ -926,7 +939,6 @@ impl Default for PersistenceTasks {
             idle: Notify::new(),
             dropped: AtomicU64::new(0),
             backlog_drop_log: PersistenceBacklogDropLog::default(),
-            #[cfg(test)]
             panics: AtomicUsize::new(0),
             #[cfg(test)]
             synchronous_for_tests: false,
@@ -994,19 +1006,13 @@ impl PersistenceTasks {
             return;
         }
 
-        #[cfg(test)]
         let tasks = Arc::clone(self);
         // The handle is intentionally detached: after its bounded shutdown wait expires,
         // persistence must not retain a waiter on a stalled blocking SQLite operation.
         let _detached_task = tokio::task::spawn_blocking(move || {
             let _capacity_permit = capacity_permit;
             let _guard = guard;
-            #[cfg(test)]
-            {
-                tasks.run(work);
-            }
-            #[cfg(not(test))]
-            Self::run(work);
+            tasks.run(work);
         });
     }
 
@@ -1014,18 +1020,10 @@ impl PersistenceTasks {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
     fn run(&self, work: impl FnOnce()) {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
             eprintln!("persistence task panicked");
             self.panics.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[cfg(not(test))]
-    fn run(work: impl FnOnce()) {
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
-            eprintln!("persistence task panicked");
         }
     }
 
