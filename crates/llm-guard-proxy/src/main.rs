@@ -1220,16 +1220,24 @@ mod tests {
         assert_eq!(report["control"]["probe_count"], 1);
         assert_eq!(report["control"]["request_claims"], 1);
         assert_eq!(report["control"]["rejected_request_claims"], 0);
-        assert_eq!(report["control"]["guard_business_count"], 2);
-        assert_eq!(report["control"]["guard_probe_count"], 1);
+        assert_eq!(
+            report["control"]["product_roles"],
+            serde_json::json!(["business", "readiness_probe", "recovery_replay"])
+        );
+        assert_eq!(report["control"]["recovery_replay_claims"], 1);
+        assert_eq!(report["control"]["rejected_physical_attempts"], 0);
         assert_eq!(report["control"]["same_payload"], true);
         assert_eq!(report["control"]["done_observed"], true);
         assert_eq!(report["committed"]["business_count"], 1);
         assert_eq!(report["committed"]["probe_count"], 0);
         assert_eq!(report["committed"]["request_claims"], 1);
         assert_eq!(report["committed"]["rejected_request_claims"], 0);
-        assert_eq!(report["committed"]["guard_business_count"], 1);
-        assert_eq!(report["committed"]["guard_probe_count"], 0);
+        assert_eq!(
+            report["committed"]["product_roles"],
+            serde_json::json!(["business"])
+        );
+        assert_eq!(report["committed"]["recovery_replay_claims"], 0);
+        assert_eq!(report["committed"]["rejected_physical_attempts"], 0);
         assert_eq!(report["committed"]["client_observed_heartbeat"], true);
         assert_eq!(report["committed"]["post_await_committed"], true);
         assert_eq!(report["committed"]["done_observed"], false);

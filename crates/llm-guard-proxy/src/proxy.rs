@@ -5388,6 +5388,8 @@ async fn send_generic_upstream_attempt(
         model_id: context.model_id.as_deref(),
         request_deadline,
         stuck_watchdog_request: context.stuck_watchdog_request.as_ref(),
+        post_await_self_test: None,
+        self_test_physical_role: post_await_self_test::PhysicalRole::Other,
     })
     .await
 }
@@ -5716,6 +5718,7 @@ fn models_attempt_request(
     (downstream_headers, metadata)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn fetch_models_upstream_group(
     context: &GenericForwardContext<'_>,
     group: &ModelsUpstreamGroup,
@@ -5756,6 +5759,8 @@ async fn fetch_models_upstream_group(
         model_id: None,
         request_deadline: Some(group.request_deadline),
         stuck_watchdog_request: None,
+        post_await_self_test: None,
+        self_test_physical_role: post_await_self_test::PhysicalRole::Other,
     })
     .await?;
     let SentUpstreamResponse {
@@ -5893,6 +5898,8 @@ struct UpstreamAttemptContext<'request> {
     model_id: Option<&'request str>,
     request_deadline: Option<Instant>,
     stuck_watchdog_request: Option<&'request StuckWatchdogRequest>,
+    post_await_self_test: Option<&'request post_await_self_test::Context>,
+    self_test_physical_role: post_await_self_test::PhysicalRole,
 }
 
 struct SentUpstreamResponse {
@@ -5935,6 +5942,7 @@ struct EndpointFailoverRuntime<'request> {
     decode_heterogeneous_reranker: bool,
     model_id: Option<&'request str>,
     stuck_watchdog_request: Option<&'request StuckWatchdogRequest>,
+    post_await_self_test: Option<&'request post_await_self_test::Context>,
 }
 
 struct EndpointFailoverProgress {
@@ -6003,9 +6011,19 @@ fn render_retry_openai_request(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 async fn send_first_upstream_attempt(
     context: UpstreamAttemptContext<'_>,
 ) -> Result<SentUpstreamResponse, ProxyError> {
+    if let Some(self_test) = context.post_await_self_test {
+        self_test
+            .consume_physical_attempt(
+                &context.attempt_id,
+                context.attempt_number,
+                context.self_test_physical_role,
+            )
+            .map_err(ProxyError::request_body)?;
+    }
     let terminal_endpoint = context
         .failover_retry
         .as_ref()
@@ -6082,6 +6100,7 @@ async fn send_first_upstream_attempt(
                     decode_heterogeneous_reranker: context.decode_heterogeneous_reranker,
                     model_id: context.model_id,
                     stuck_watchdog_request: context.stuck_watchdog_request,
+                    post_await_self_test: context.post_await_self_test,
                 },
                 EndpointFailoverProgress {
                     result,
@@ -6330,6 +6349,19 @@ async fn send_selected_failover_endpoint(
         observed_response: None,
         stuck_watchdog_attempt: None,
     };
+    if let Some(self_test) = runtime.post_await_self_test
+        && let Err(error) = self_test.consume_physical_attempt(
+            &attempt.attempt_id,
+            attempt_number,
+            post_await_self_test::PhysicalRole::Other,
+        )
+    {
+        return CompletedFailoverEndpointSend {
+            result: Err(ProxyError::request_body(error)),
+            attempt,
+            recovery_trial_lease: selected.recovery_trial_lease.take(),
+        };
+    }
     let response = match rendered {
         Ok(rendered) => {
             annotate_physical_endpoint_attempt(
@@ -9416,8 +9448,20 @@ impl ShieldedRetryRuntime {
     }
 
     fn claim_recovery_replay(&self, physical_attempt_number: u32) {
-        self.rate_limit_retry_budget
-            .claim_recovery_replay(physical_attempt_number);
+        let next_attempt_number = physical_attempt_number.saturating_add(1);
+        let accepted = self.post_await_self_test.as_ref().is_none_or(|self_test| {
+            self_test
+                .claim_recovery_replay(
+                    physical_attempt_number,
+                    AttemptId::for_request(&self.request_id, next_attempt_number),
+                    next_attempt_number,
+                )
+                .is_ok()
+        });
+        if accepted {
+            self.rate_limit_retry_budget
+                .claim_recovery_replay(physical_attempt_number);
+        }
     }
 
     fn allows_ordinary_retry(&self, physical_attempt_number: u32) -> bool {
@@ -11470,19 +11514,34 @@ async fn run_local_recovery_for_profile_observing(
         task_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
     ));
     state.runs_in_window = state.runs_in_window.saturating_add(1);
-    let recovery_task = tokio::spawn(run_local_recovery_task(
-        policy.clone(),
-        client,
-        base_url,
-        cause,
-        task_timeout,
-        options.downstream_commit_signal.clone(),
-        options.post_await_self_test.clone(),
-    ));
+    let recovery_policy = policy.clone();
+    let recovery_commit_signal = options.downstream_commit_signal.clone();
+    let recovery_self_test = options.post_await_self_test.clone();
+    let recovery_task = tokio::spawn(async move {
+        run_local_recovery_task(
+            recovery_policy,
+            client,
+            base_url,
+            cause,
+            task_timeout,
+            recovery_commit_signal,
+            recovery_self_test,
+        )
+        .await
+    });
+    if let Some(self_test) = options.post_await_self_test.as_ref() {
+        self_test.register_recovery_abort(recovery_task.abort_handle());
+    }
     state.active_local_recovery_task = Some(recovery_task.abort_handle());
     drop(state);
 
-    spawn_local_recovery_terminalizer(coordinator, recovery_episode_id, recovery_task);
+    let terminalizer =
+        spawn_local_recovery_terminalizer(coordinator, recovery_episode_id, recovery_task);
+    if let Some(self_test) = options.post_await_self_test.as_ref() {
+        self_test.register_owned_producer(terminalizer);
+    } else {
+        drop(terminalizer);
+    }
 
     wait_for_local_recovery_result_with_options(
         policy,
@@ -11581,9 +11640,9 @@ fn spawn_local_recovery_terminalizer(
     coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
     recovery_episode_id: u64,
     recovery_task: tokio::task::JoinHandle<BTreeMap<String, String>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let coordinator = Arc::clone(coordinator);
-    let _terminalizer = tokio::spawn(async move {
+    tokio::spawn(async move {
         let metadata = match recovery_task.await {
             Ok(metadata) => metadata,
             Err(error) => BTreeMap::from([(
@@ -11597,7 +11656,7 @@ fn spawn_local_recovery_terminalizer(
         };
         let _published =
             finish_local_recovery_episode(&coordinator, recovery_episode_id, metadata).await;
-    });
+    })
 }
 
 async fn finish_local_recovery_episode(
@@ -11933,7 +11992,7 @@ async fn run_local_recovery_readiness(
             )]);
         }
         if let Some(self_test) = post_await_self_test {
-            self_test.mark_guard_probe_dispatch();
+            self_test.record_readiness_probe();
         }
         match send_local_recovery_readiness_probe(&client, &base_url, policy).await {
             Ok(true) => {
@@ -12423,6 +12482,18 @@ async fn start_shielded_attempt(
         rendered,
         upstream_body,
         upstream_timeout,
+        if attempt_number == 1 {
+            post_await_self_test::PhysicalRole::Business
+        } else if retry_cause == Some(ShieldedRetryCause::UpstreamStall)
+            && wire_mode == ShieldedUpstreamWireMode::ShieldedSse
+            && salvage.cot_salvage.is_none()
+            && salvage.constraint_repair.is_none()
+            && !salvage.force_disable_after_salvage_loop
+        {
+            post_await_self_test::PhysicalRole::RecoveryReplay
+        } else {
+            post_await_self_test::PhysicalRole::Other
+        },
     )
     .await
     {
@@ -12530,10 +12601,8 @@ async fn send_shielded_upstream_attempt(
     rendered: reranker_protocol::RenderedEndpointRequest,
     retry_body: Bytes,
     upstream_timeout: Duration,
+    self_test_physical_role: post_await_self_test::PhysicalRole,
 ) -> Result<SentUpstreamResponse, ProxyError> {
-    if let Some(self_test) = &runtime.post_await_self_test {
-        self_test.mark_guard_business_attempt();
-    }
     let (attempt_id, attempt_number, attempt_started_at_unix_ms) = attempt;
     let request_deadline = Some(runtime.request_deadline.instant());
     send_first_upstream_attempt(UpstreamAttemptContext {
@@ -12571,6 +12640,8 @@ async fn send_shielded_upstream_attempt(
         model_id: None,
         request_deadline,
         stuck_watchdog_request: runtime.stuck_watchdog_request.as_ref(),
+        post_await_self_test: runtime.post_await_self_test.as_ref(),
+        self_test_physical_role,
     })
     .await
 }

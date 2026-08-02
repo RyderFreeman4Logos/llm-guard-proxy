@@ -1,8 +1,11 @@
 use super::{
-    AppConfig, Body, Bytes, CONTENT_TYPE, ConfigHandle, EvidenceStore, Method, ObservabilityStore,
-    ProxyState, Request, Response, Router, State, StatusCode, TcpListener, build_http_client,
+    AppConfig, AttemptId, Body, Bytes, CONTENT_TYPE, Client, ConfigHandle, EvidenceStore, Method,
+    ObservabilityStore, ProxyState, Request, Response, Router, State, StatusCode, TcpListener,
     router,
 };
+
+#[cfg(test)]
+use super::RequestId;
 
 #[cfg(feature = "guard")]
 use super::BudgetStore;
@@ -36,6 +39,13 @@ pub(super) enum Arm {
     Committed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PhysicalRole {
+    Business,
+    RecoveryReplay,
+    Other,
+}
+
 #[derive(Clone)]
 pub(super) struct Context {
     inner: Arc<ContextInner>,
@@ -45,8 +55,9 @@ struct ContextInner {
     arm: Arm,
     request_claims: AtomicU64,
     rejected_request_claims: AtomicU64,
-    guard_business_attempts: AtomicU64,
-    guard_probe_dispatches: AtomicU64,
+    product_evidence: Mutex<ProductEvidence>,
+    owned_producers: Mutex<Vec<JoinHandle<()>>>,
+    recovery_aborts: Mutex<Vec<tokio::task::AbortHandle>>,
     started: Instant,
     last_stamp_ns: AtomicU64,
     pre_await_gate_ns: AtomicU64,
@@ -80,8 +91,9 @@ impl Context {
                 arm,
                 request_claims: AtomicU64::new(0),
                 rejected_request_claims: AtomicU64::new(0),
-                guard_business_attempts: AtomicU64::new(0),
-                guard_probe_dispatches: AtomicU64::new(0),
+                product_evidence: Mutex::new(ProductEvidence::default()),
+                owned_producers: Mutex::new(Vec::new()),
+                recovery_aborts: Mutex::new(Vec::new()),
                 started: Instant::now(),
                 last_stamp_ns: AtomicU64::new(0),
                 pre_await_gate_ns: AtomicU64::new(0),
@@ -121,22 +133,127 @@ impl Context {
         )
     }
 
-    pub(super) fn mark_guard_business_attempt(&self) {
-        self.inner
-            .guard_business_attempts
-            .fetch_add(1, Ordering::AcqRel);
+    pub(super) fn claim_recovery_replay(
+        &self,
+        failed_attempt_number: u32,
+        next_attempt_id: AttemptId,
+        next_attempt_number: u32,
+    ) -> Result<(), String> {
+        let mut evidence = self.product_evidence();
+        let valid = self.inner.arm == Arm::Control
+            && evidence.pending_recovery_replay.is_none()
+            && evidence.roles == [ProductRole::Business, ProductRole::ReadinessProbe]
+            && evidence.last_physical_attempt_number == Some(failed_attempt_number)
+            && failed_attempt_number
+                .checked_add(1)
+                .is_some_and(|expected| expected == next_attempt_number);
+        if !valid {
+            evidence.rejected_recovery_replay_claims =
+                evidence.rejected_recovery_replay_claims.saturating_add(1);
+            record_product_error(&mut evidence, "recovery_replay_claim_rejected");
+            return Err(failure("recovery_replay_claim_rejected"));
+        }
+        evidence.recovery_replay_claims = evidence.recovery_replay_claims.saturating_add(1);
+        evidence.pending_recovery_replay = Some(RecoveryReplayAuthorization {
+            attempt_id: next_attempt_id,
+            attempt_number: next_attempt_number,
+        });
+        drop(evidence);
+        self.mark(&self.inner.control_replay_authorized_ns);
+        Ok(())
     }
 
-    pub(super) fn mark_guard_probe_dispatch(&self) {
-        self.inner
-            .guard_probe_dispatches
-            .fetch_add(1, Ordering::AcqRel);
+    pub(super) fn consume_physical_attempt(
+        &self,
+        attempt_id: &AttemptId,
+        attempt_number: u32,
+        role: PhysicalRole,
+    ) -> Result<(), String> {
+        let mut evidence = self.product_evidence();
+        if evidence.roles.is_empty()
+            && attempt_number == 1
+            && role == PhysicalRole::Business
+            && evidence.pending_recovery_replay.is_none()
+        {
+            evidence.roles.push(ProductRole::Business);
+            evidence.last_physical_attempt_number = Some(attempt_number);
+            return Ok(());
+        }
+        let matches_authorization =
+            evidence
+                .pending_recovery_replay
+                .as_ref()
+                .is_some_and(|authorization| {
+                    authorization.attempt_id == *attempt_id
+                        && authorization.attempt_number == attempt_number
+                });
+        let monotonic = evidence
+            .last_physical_attempt_number
+            .and_then(|number| number.checked_add(1))
+            == Some(attempt_number);
+        if self.inner.arm == Arm::Control
+            && matches_authorization
+            && role == PhysicalRole::RecoveryReplay
+            && monotonic
+            && evidence.roles == [ProductRole::Business, ProductRole::ReadinessProbe]
+        {
+            evidence.pending_recovery_replay = None;
+            evidence.roles.push(ProductRole::RecoveryReplay);
+            evidence.last_physical_attempt_number = Some(attempt_number);
+            return Ok(());
+        }
+        evidence.rejected_physical_attempts = evidence.rejected_physical_attempts.saturating_add(1);
+        record_product_error(&mut evidence, "physical_attempt_not_authorized");
+        Err(failure("physical_attempt_not_authorized"))
     }
 
-    pub(super) fn guard_attempt_counts(&self) -> (u64, u64) {
-        (
-            self.inner.guard_business_attempts.load(Ordering::Acquire),
-            self.inner.guard_probe_dispatches.load(Ordering::Acquire),
+    pub(super) fn record_readiness_probe(&self) {
+        let mut evidence = self.product_evidence();
+        if self.inner.arm == Arm::Control
+            && evidence.roles == [ProductRole::Business]
+            && evidence.pending_recovery_replay.is_none()
+        {
+            evidence.roles.push(ProductRole::ReadinessProbe);
+            return;
+        }
+        evidence.rejected_readiness_probes = evidence.rejected_readiness_probes.saturating_add(1);
+        record_product_error(&mut evidence, "readiness_probe_not_authorized");
+    }
+
+    pub(super) fn register_owned_producer(&self, task: JoinHandle<()>) {
+        self.inner
+            .owned_producers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(task);
+    }
+
+    pub(super) fn register_recovery_abort(&self, abort: tokio::task::AbortHandle) {
+        self.inner
+            .recovery_aborts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(abort);
+    }
+
+    fn abort_recovery_tasks(&self) {
+        let aborts = self
+            .inner
+            .recovery_aborts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for abort in aborts.iter() {
+            abort.abort();
+        }
+    }
+
+    fn take_owned_producers(&self) -> Vec<JoinHandle<()>> {
+        std::mem::take(
+            &mut *self
+                .inner
+                .owned_producers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         )
     }
 
@@ -195,12 +312,6 @@ impl Context {
         self.mark(&self.inner.post_await_committed_ns);
     }
 
-    pub(super) fn mark_control_replay_authorized(&self) {
-        if self.inner.arm == Arm::Control {
-            self.mark(&self.inner.control_replay_authorized_ns);
-        }
-    }
-
     fn control_replay_authorized(&self) -> bool {
         self.inner
             .control_replay_authorized_ns
@@ -226,6 +337,17 @@ impl Context {
         }
     }
 
+    fn product_snapshot(&self) -> ProductEvidence {
+        self.product_evidence().clone()
+    }
+
+    fn product_evidence(&self) -> std::sync::MutexGuard<'_, ProductEvidence> {
+        self.inner
+            .product_evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn mark(&self, target: &AtomicU64) {
         let elapsed = u64::try_from(self.inner.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let mut previous = self.inner.last_stamp_ns.load(Ordering::Acquire);
@@ -244,6 +366,38 @@ impl Context {
                 Err(current) => previous = current,
             }
         }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProductRole {
+    Business,
+    ReadinessProbe,
+    RecoveryReplay,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoveryReplayAuthorization {
+    attempt_id: AttemptId,
+    attempt_number: u32,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProductEvidence {
+    roles: Vec<ProductRole>,
+    recovery_replay_claims: u64,
+    rejected_recovery_replay_claims: u64,
+    rejected_physical_attempts: u64,
+    rejected_readiness_probes: u64,
+    last_physical_attempt_number: Option<u32>,
+    pending_recovery_replay: Option<RecoveryReplayAuthorization>,
+    validation_error: Option<String>,
+}
+
+fn record_product_error(evidence: &mut ProductEvidence, code: &'static str) {
+    if evidence.validation_error.is_none() {
+        evidence.validation_error = Some(failure(code));
     }
 }
 
@@ -308,25 +462,40 @@ struct BusinessMessage {
 #[derive(Debug)]
 struct LoopbackServer {
     addr: SocketAddr,
+    shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<std::io::Result<()>>>,
 }
 
 impl LoopbackServer {
-    async fn stop(mut self, failure_code: &'static str) -> Result<(), String> {
+    async fn stop(
+        mut self,
+        failure_code: &'static str,
+        cleanup_deadline: Duration,
+    ) -> Result<(), String> {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _sent = shutdown.send(());
+        }
         let Some(task) = self.task.take() else {
             return Ok(());
         };
-        task.abort();
-        match timeout(CLIENT_CHUNK_DEADLINE, task).await {
+        let mut task = task;
+        match timeout(cleanup_deadline, &mut task).await {
             Ok(Ok(Ok(()))) => Ok(()),
-            Ok(Err(error)) if error.is_cancelled() => Ok(()),
-            Ok(Ok(Err(_)) | Err(_)) | Err(_) => Err(failure(failure_code)),
+            Ok(Ok(Err(_)) | Err(_)) => Err(failure(failure_code)),
+            Err(_) => {
+                task.abort();
+                let _joined = task.await;
+                Err(failure(failure_code))
+            }
         }
     }
 }
 
 impl Drop for LoopbackServer {
     fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            let _sent = shutdown.send(());
+        }
         if let Some(task) = &self.task {
             task.abort();
         }
@@ -350,12 +519,15 @@ struct PhaseReceipt {
 #[serde(deny_unknown_fields)]
 struct ArmReceipt {
     ordered_roles: Vec<String>,
+    product_roles: Vec<ProductRole>,
     attempt_count: u64,
     fixture_rejected_count: u64,
     request_claims: u64,
     rejected_request_claims: u64,
-    guard_business_count: u64,
-    guard_probe_count: u64,
+    recovery_replay_claims: u64,
+    rejected_recovery_replay_claims: u64,
+    rejected_physical_attempts: u64,
+    rejected_readiness_probes: u64,
     business_count: u64,
     probe_count: u64,
     #[serde(flatten)]
@@ -415,60 +587,91 @@ struct ArmRun {
 }
 
 pub(super) async fn run() -> Result<serde_json::Value, String> {
-    timeout(SELF_TEST_DEADLINE, async {
-        let control = run_arm(Arm::Control).await?;
-        let committed = run_arm(Arm::Committed).await?;
-        let same_payload_across_arms = control.first_payload == committed.first_payload;
-        let receipt = Receipt {
-            self_test: String::from("post-await-no-replay"),
-            status: String::from("passed"),
-            control: control.receipt,
-            committed: committed.receipt,
-            same_payload_across_arms,
-        };
-        validate_receipt(&receipt)?;
-        serde_json::to_value(receipt).map_err(|_| failure("serialize_receipt"))
-    })
-    .await
-    .map_err(|_| failure("deadline_exceeded"))?
+    let operation_deadline = Instant::now() + SELF_TEST_DEADLINE;
+    let control = run_arm(Arm::Control, operation_deadline).await?;
+    let committed = run_arm(Arm::Committed, operation_deadline).await?;
+    let same_payload_across_arms = control.first_payload == committed.first_payload;
+    let receipt = Receipt {
+        self_test: String::from("post-await-no-replay"),
+        status: String::from("passed"),
+        control: control.receipt,
+        committed: committed.receipt,
+        same_payload_across_arms,
+    };
+    validate_receipt(&receipt)?;
+    serde_json::to_value(receipt).map_err(|_| failure("serialize_receipt"))
 }
 
-async fn run_arm(arm: Arm) -> Result<ArmRun, String> {
-    let fake_state = Arc::new(FakeUpstreamState::new(arm));
-    let fake_server = spawn_fake_upstream(Arc::clone(&fake_state)).await?;
-    let loopback_only = fake_server.addr.ip().is_loopback();
+#[allow(clippy::too_many_lines)]
+async fn run_arm(arm: Arm, operation_deadline: Instant) -> Result<ArmRun, String> {
     let context = Context::new(arm);
-    let mut proxy_state = build_proxy_state(fake_server.addr, context.clone())?;
-    proxy_state.post_await_self_test = Some(context.clone());
-    let cleanup_state = proxy_state.clone();
-    let proxy_server = spawn_proxy(proxy_state).await?;
-    let loopback_only = loopback_only && proxy_server.addr.ip().is_loopback();
-
-    let client_result = run_internal_client(proxy_server.addr, arm, &context).await;
-    cleanup_state.begin_shutdown();
-    let proxy_stop = proxy_server.stop("proxy_cleanup").await;
-    let fake_stop = fake_server.stop("fake_upstream_cleanup").await;
-    let persistence_cleanup = cleanup_state
-        .flush_persistence_checked()
-        .await
-        .map_err(failure);
+    let fake_state = Arc::new(FakeUpstreamState::new(arm));
+    let mut fake_server = Some(spawn_fake_upstream(Arc::clone(&fake_state)).await?);
+    let fake_addr = fake_server
+        .as_ref()
+        .map(|server| server.addr)
+        .ok_or_else(|| failure("missing_fake_upstream"))?;
+    let mut errors = Vec::new();
+    let mut client_result = None;
+    let mut proxy_server = None;
+    let mut cleanup_state = None;
+    let mut loopback_only = fake_addr.ip().is_loopback();
+    match build_proxy_state(fake_addr, context.clone()) {
+        Ok(state) => {
+            cleanup_state = Some(state.clone());
+            match spawn_proxy(state).await {
+                Ok(server) => {
+                    loopback_only &= server.addr.ip().is_loopback();
+                    let proxy_addr = server.addr;
+                    proxy_server = Some(server);
+                    let remaining = operation_deadline.saturating_duration_since(Instant::now());
+                    client_result = Some(
+                        timeout(remaining, run_internal_client(proxy_addr, arm, &context))
+                            .await
+                            .unwrap_or_else(|_| Err(failure("deadline_exceeded"))),
+                    );
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        Err(error) => errors.push(error),
+    }
+    if let Some(state) = &cleanup_state {
+        state.begin_shutdown();
+    }
+    let proxy_stop = match proxy_server.take() {
+        Some(server) => server.stop("proxy_cleanup", CLIENT_CHUNK_DEADLINE).await,
+        None => Ok(()),
+    };
+    let fake_stop = match fake_server.take() {
+        Some(server) => {
+            server
+                .stop("fake_upstream_cleanup", CLIENT_CHUNK_DEADLINE)
+                .await
+        }
+        None => Ok(()),
+    };
+    let producer_cleanup = drain_owned_producers(&context, CLIENT_CHUNK_DEADLINE).await;
+    let persistence_cleanup = match &cleanup_state {
+        Some(state) => state.flush_persistence_checked().await.map_err(failure),
+        None => Ok(()),
+    };
     let evidence = fake_state.snapshot();
+    let product = context.product_snapshot();
     let phases = context.phases();
     let (request_claims, rejected_request_claims) = context.request_claim_counts();
-    let (guard_business_count, guard_probe_count) = context.guard_attempt_counts();
-    let mut errors = Vec::new();
-    let client = collect_result(&mut errors, client_result);
-    collect_result(&mut errors, proxy_stop);
-    collect_result(&mut errors, fake_stop);
-    collect_result(&mut errors, persistence_cleanup);
+    let client = client_result.and_then(|result| collect_result(&mut errors, result));
+    let cleanup_complete = collect_result(&mut errors, proxy_stop).is_some()
+        & collect_result(&mut errors, fake_stop).is_some()
+        & collect_result(&mut errors, producer_cleanup).is_some()
+        & collect_result(&mut errors, persistence_cleanup).is_some();
     collect_final_evidence_errors(
         &mut errors,
         arm,
         &evidence,
+        &product,
         request_claims,
         rejected_request_claims,
-        guard_business_count,
-        guard_probe_count,
     );
     let first_payload = evidence.first_business_payload.clone();
     if !errors.is_empty() {
@@ -479,12 +682,15 @@ async fn run_arm(arm: Arm) -> Result<ArmRun, String> {
     Ok(ArmRun {
         receipt: ArmReceipt {
             ordered_roles: evidence.ordered_roles,
+            product_roles: product.roles,
             attempt_count: evidence.attempt_count,
             fixture_rejected_count: evidence.rejected_count,
             request_claims,
             rejected_request_claims,
-            guard_business_count,
-            guard_probe_count,
+            recovery_replay_claims: product.recovery_replay_claims,
+            rejected_recovery_replay_claims: product.rejected_recovery_replay_claims,
+            rejected_physical_attempts: product.rejected_physical_attempts,
+            rejected_readiness_probes: product.rejected_readiness_probes,
             business_count: evidence.business_count,
             probe_count: evidence.probe_count,
             fault: FaultReceipt {
@@ -504,11 +710,53 @@ async fn run_arm(arm: Arm) -> Result<ArmRun, String> {
             phases,
             cleanup: CleanupEvidence {
                 loopback_only,
-                cleanup_complete: true,
+                cleanup_complete,
             },
         },
         first_payload,
     })
+}
+
+async fn drain_owned_producers(
+    context: &Context,
+    cleanup_deadline: Duration,
+) -> Result<(), String> {
+    let mut tasks = context.take_owned_producers();
+    match timeout(cleanup_deadline, join_owned_producers(&mut tasks)).await {
+        Ok(result) => return result,
+        Err(_) => context.abort_recovery_tasks(),
+    }
+    match timeout(cleanup_deadline, join_owned_producers(&mut tasks)).await {
+        Ok(Ok(())) => Err(failure("producer_cleanup_forced")),
+        Ok(Err(error)) => Err(aggregate_errors(&[
+            failure("producer_cleanup_forced"),
+            error,
+        ])),
+        Err(_) => {
+            for task in &tasks {
+                task.abort();
+            }
+            match timeout(cleanup_deadline, join_owned_producers(&mut tasks)).await {
+                Ok(Ok(())) => Err(failure("producer_cleanup_forced_abort")),
+                Ok(Err(error)) => Err(aggregate_errors(&[
+                    failure("producer_cleanup_forced_abort"),
+                    error,
+                ])),
+                Err(_) => Err(failure("producer_cleanup_after_abort")),
+            }
+        }
+    }
+}
+
+async fn join_owned_producers(tasks: &mut [JoinHandle<()>]) -> Result<(), String> {
+    for task in tasks {
+        match task.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() => return Err(failure("producer_cancelled")),
+            Err(_) => return Err(failure("producer_panicked")),
+        }
+    }
+    Ok(())
 }
 
 fn build_proxy_state(upstream_addr: SocketAddr, context: Context) -> Result<ProxyState, String> {
@@ -550,10 +798,17 @@ fn build_proxy_state(upstream_addr: SocketAddr, context: Context) -> Result<Prox
         evidence_store,
         #[cfg(feature = "guard")]
         budget_store,
-        build_http_client().map_err(|_| failure("build_proxy_client"))?,
+        build_self_test_http_client().map_err(|_| failure("build_proxy_client"))?,
     );
     state.post_await_self_test = Some(context);
     Ok(state)
+}
+
+fn build_self_test_http_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
 }
 
 async fn spawn_fake_upstream(state: Arc<FakeUpstreamState>) -> Result<LoopbackServer, String> {
@@ -566,9 +821,17 @@ async fn spawn_fake_upstream(state: Arc<FakeUpstreamState>) -> Result<LoopbackSe
     let app = Router::new()
         .fallback(fake_upstream_handler)
         .with_state(state);
-    let task = tokio::spawn(axum::serve(listener, app).into_future());
+    let (shutdown, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _stopped = shutdown_rx.await;
+            })
+            .into_future(),
+    );
     Ok(LoopbackServer {
         addr,
+        shutdown: Some(shutdown),
         task: Some(task),
     })
 }
@@ -578,9 +841,17 @@ async fn spawn_proxy(state: ProxyState) -> Result<LoopbackServer, String> {
         .await
         .map_err(|_| failure("bind_proxy"))?;
     let addr = listener.local_addr().map_err(|_| failure("proxy_addr"))?;
-    let task = tokio::spawn(axum::serve(listener, router(state)).into_future());
+    let (shutdown, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(
+        axum::serve(listener, router(state))
+            .with_graceful_shutdown(async move {
+                let _stopped = shutdown_rx.await;
+            })
+            .into_future(),
+    );
     Ok(LoopbackServer {
         addr,
+        shutdown: Some(shutdown),
         task: Some(task),
     })
 }
@@ -784,7 +1055,7 @@ async fn run_internal_client(
     arm: Arm,
     context: &Context,
 ) -> Result<ClientReceipt, String> {
-    let client = build_http_client().map_err(|_| failure("build_internal_client"))?;
+    let client = build_self_test_http_client().map_err(|_| failure("build_internal_client"))?;
     let response = client
         .post(format!("http://{proxy_addr}/v1/chat/completions"))
         .header(CONTENT_TYPE, "application/json")
@@ -878,12 +1149,23 @@ fn validate_control(receipt: &Receipt) -> Result<(), String> {
         "control_rejected_request_claims",
     )?;
     require(
-        receipt.control.guard_business_count == 2,
-        "control_guard_business_count",
+        receipt.control.product_roles
+            == [
+                ProductRole::Business,
+                ProductRole::ReadinessProbe,
+                ProductRole::RecoveryReplay,
+            ],
+        "control_product_roles",
     )?;
     require(
-        receipt.control.guard_probe_count == 1,
-        "control_guard_probe_count",
+        receipt.control.recovery_replay_claims == 1,
+        "control_recovery_replay_claims",
+    )?;
+    require(
+        receipt.control.rejected_recovery_replay_claims == 0
+            && receipt.control.rejected_physical_attempts == 0
+            && receipt.control.rejected_readiness_probes == 0,
+        "control_product_rejections",
     )?;
     require(
         receipt.control.ordered_roles == ["business", "recovery_probe", "business"],
@@ -894,14 +1176,6 @@ fn validate_control(receipt: &Receipt) -> Result<(), String> {
         "control_business_count",
     )?;
     require(receipt.control.probe_count == 1, "control_probe_count")?;
-    require(
-        receipt.control.guard_business_count == receipt.control.business_count,
-        "control_business_count_mismatch",
-    )?;
-    require(
-        receipt.control.guard_probe_count == receipt.control.probe_count,
-        "control_probe_count_mismatch",
-    )?;
     require(
         receipt.control.fault.same_payload,
         "control_payload_changed",
@@ -955,12 +1229,18 @@ fn validate_committed(receipt: &Receipt) -> Result<(), String> {
         "committed_rejected_request_claims",
     )?;
     require(
-        receipt.committed.guard_business_count == 1,
-        "committed_guard_business_count",
+        receipt.committed.product_roles == [ProductRole::Business],
+        "committed_product_roles",
     )?;
     require(
-        receipt.committed.guard_probe_count == 0,
-        "committed_guard_probe_count",
+        receipt.committed.recovery_replay_claims == 0,
+        "committed_recovery_replay_claims",
+    )?;
+    require(
+        receipt.committed.rejected_recovery_replay_claims == 0
+            && receipt.committed.rejected_physical_attempts == 0
+            && receipt.committed.rejected_readiness_probes == 0,
+        "committed_product_rejections",
     )?;
     require(
         receipt.committed.ordered_roles == ["business"],
@@ -971,14 +1251,6 @@ fn validate_committed(receipt: &Receipt) -> Result<(), String> {
         "committed_business_count",
     )?;
     require(receipt.committed.probe_count == 0, "committed_probe_count")?;
-    require(
-        receipt.committed.guard_business_count == receipt.committed.business_count,
-        "committed_business_count_mismatch",
-    )?;
-    require(
-        receipt.committed.guard_probe_count == receipt.committed.probe_count,
-        "committed_probe_count_mismatch",
-    )?;
     require(
         receipt.committed.fault.same_payload,
         "committed_payload_state",
@@ -1046,26 +1318,40 @@ fn collect_final_evidence_errors(
     errors: &mut Vec<String>,
     arm: Arm,
     evidence: &FakeUpstreamEvidence,
+    product: &ProductEvidence,
     request_claims: u64,
     rejected_request_claims: u64,
-    guard_business_count: u64,
-    guard_probe_count: u64,
 ) {
     if let Some(error) = evidence.validation_error.clone() {
         errors.push(error);
     }
-    let (attempt_count, business_count, probe_count, roles, guard_business, guard_probe) = match arm
-    {
-        Arm::Control => (
-            3,
-            2,
-            1,
-            ["business", "recovery_probe", "business"].as_slice(),
-            2,
-            1,
-        ),
-        Arm::Committed => (1, 1, 0, ["business"].as_slice(), 1, 0),
-    };
+    if let Some(error) = product.validation_error.clone() {
+        errors.push(error);
+    }
+    let (attempt_count, business_count, probe_count, roles, product_roles, replay_claims) =
+        match arm {
+            Arm::Control => (
+                3,
+                2,
+                1,
+                ["business", "recovery_probe", "business"].as_slice(),
+                [
+                    ProductRole::Business,
+                    ProductRole::ReadinessProbe,
+                    ProductRole::RecoveryReplay,
+                ]
+                .as_slice(),
+                1,
+            ),
+            Arm::Committed => (
+                1,
+                1,
+                0,
+                ["business"].as_slice(),
+                [ProductRole::Business].as_slice(),
+                0,
+            ),
+        };
     collect_assertion(
         errors,
         evidence.attempt_count == attempt_count,
@@ -1107,15 +1393,31 @@ fn collect_final_evidence_errors(
         rejected_request_claims == 0,
         "request_claim_rejected",
     );
+    collect_assertion(errors, product.roles == product_roles, "product_role_order");
     collect_assertion(
         errors,
-        guard_business_count == guard_business,
-        "guard_business_count",
+        product.recovery_replay_claims == replay_claims,
+        "recovery_replay_claim_count",
     );
     collect_assertion(
         errors,
-        guard_probe_count == guard_probe,
-        "guard_probe_count",
+        product.rejected_recovery_replay_claims == 0,
+        "recovery_replay_claim_rejected",
+    );
+    collect_assertion(
+        errors,
+        product.rejected_physical_attempts == 0,
+        "physical_attempt_rejected",
+    );
+    collect_assertion(
+        errors,
+        product.rejected_readiness_probes == 0,
+        "readiness_probe_rejected",
+    );
+    collect_assertion(
+        errors,
+        product.pending_recovery_replay.is_none(),
+        "unconsumed_recovery_replay",
     );
 }
 
@@ -1162,14 +1464,96 @@ mod tests {
     }
 
     #[test]
-    fn guard_attempt_accounting_is_independent_from_upstream_observation() {
+    fn recovery_replay_authorization_is_typed_single_use_and_attempt_bound() {
         let context = Context::new(Arm::Control);
+        let request_id =
+            RequestId::from_string("req-self-test-role").expect("valid self-test request id");
+        let first = AttemptId::for_request(&request_id, 1);
+        let replay = AttemptId::for_request(&request_id, 2);
 
-        context.mark_guard_business_attempt();
-        context.mark_guard_business_attempt();
-        context.mark_guard_probe_dispatch();
+        context
+            .consume_physical_attempt(&first, 1, PhysicalRole::Business)
+            .expect("first business role");
+        context.record_readiness_probe();
+        context
+            .claim_recovery_replay(1, replay.clone(), 2)
+            .expect("real recovery claim");
+        context
+            .consume_physical_attempt(&replay, 2, PhysicalRole::RecoveryReplay)
+            .expect("claimed replay role");
 
-        assert_eq!(context.guard_attempt_counts(), (2, 1));
+        let evidence = context.product_snapshot();
+        assert_eq!(
+            evidence.roles,
+            [
+                ProductRole::Business,
+                ProductRole::ReadinessProbe,
+                ProductRole::RecoveryReplay,
+            ]
+        );
+        assert_eq!(evidence.recovery_replay_claims, 1);
+        assert!(evidence.pending_recovery_replay.is_none());
+        assert!(
+            context
+                .consume_physical_attempt(&replay, 2, PhysicalRole::RecoveryReplay)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn missing_wrong_or_relabelled_recovery_claim_fails_closed() {
+        for mutation in ["missing", "wrong_attempt", "ordinary_role"] {
+            let context = Context::new(Arm::Control);
+            let request_id = RequestId::from_string(format!("req-{mutation}"))
+                .expect("valid self-test request id");
+            let first = AttemptId::for_request(&request_id, 1);
+            let replay = AttemptId::for_request(&request_id, 2);
+            context
+                .consume_physical_attempt(&first, 1, PhysicalRole::Business)
+                .expect("first business role");
+            context.record_readiness_probe();
+            if mutation != "missing" {
+                context
+                    .claim_recovery_replay(1, replay.clone(), 2)
+                    .expect("recovery claim");
+            }
+            let consumed = match mutation {
+                "wrong_attempt" => context.consume_physical_attempt(
+                    &AttemptId::for_request(&request_id, 3),
+                    3,
+                    PhysicalRole::RecoveryReplay,
+                ),
+                "ordinary_role" => {
+                    context.consume_physical_attempt(&replay, 2, PhysicalRole::Other)
+                }
+                _ => context.consume_physical_attempt(&replay, 2, PhysicalRole::RecoveryReplay),
+            };
+            assert!(consumed.is_err(), "{mutation} must fail closed");
+            assert_eq!(context.product_snapshot().roles.len(), 2);
+        }
+    }
+
+    #[test]
+    fn duplicate_recovery_replay_claim_is_rejected() {
+        let context = Context::new(Arm::Control);
+        let request_id = RequestId::from_string("req-duplicate-claim").expect("valid request id");
+        context
+            .consume_physical_attempt(
+                &AttemptId::for_request(&request_id, 1),
+                1,
+                PhysicalRole::Business,
+            )
+            .expect("first business role");
+        context.record_readiness_probe();
+        let replay = AttemptId::for_request(&request_id, 2);
+        context
+            .claim_recovery_replay(1, replay.clone(), 2)
+            .expect("first claim");
+        assert!(context.claim_recovery_replay(1, replay, 2).is_err());
+        assert_eq!(
+            context.product_snapshot().rejected_recovery_replay_claims,
+            1
+        );
     }
 
     #[test]
@@ -1286,8 +1670,18 @@ mod tests {
             .expect("late invalid request");
         let response = fake_upstream_handler(State(Arc::clone(&state)), rejected).await;
         let evidence = state.snapshot();
+        let product = ProductEvidence {
+            roles: vec![
+                ProductRole::Business,
+                ProductRole::ReadinessProbe,
+                ProductRole::RecoveryReplay,
+            ],
+            recovery_replay_claims: 1,
+            last_physical_attempt_number: Some(2),
+            ..ProductEvidence::default()
+        };
         let mut errors = Vec::new();
-        collect_final_evidence_errors(&mut errors, Arm::Control, &evidence, 1, 0, 2, 1);
+        collect_final_evidence_errors(&mut errors, Arm::Control, &evidence, &product, 1, 0);
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(evidence.attempt_count, 4);
@@ -1324,7 +1718,18 @@ mod tests {
                 Err(failure("control_pre_replay_bytes"))
             );
         }
-        context.mark_control_replay_authorized();
+        let request_id = RequestId::from_string("req-prelude").expect("valid request id");
+        context
+            .consume_physical_attempt(
+                &AttemptId::for_request(&request_id, 1),
+                1,
+                PhysicalRole::Business,
+            )
+            .expect("first business role");
+        context.record_readiness_probe();
+        context
+            .claim_recovery_replay(1, AttemptId::for_request(&request_id, 2), 2)
+            .expect("real recovery replay claim");
         assert!(
             validate_client_chunk_phase(
                 Arm::Control,
@@ -1346,6 +1751,59 @@ mod tests {
             aggregate_errors(&errors),
             "post_await_no_replay_self_test_failed:client_body;post_await_no_replay_self_test_failed:proxy_cleanup"
         );
+    }
+
+    #[tokio::test]
+    async fn early_failure_still_waits_for_owned_producers() {
+        let context = Context::new(Arm::Control);
+        let (release, released) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _released = released.await;
+        });
+        context.register_owned_producer(task);
+        release.send(()).expect("release producer");
+        drain_owned_producers(&context, CLIENT_CHUNK_DEADLINE)
+            .await
+            .expect("producer joined after early failure");
+    }
+
+    #[tokio::test]
+    async fn forced_server_cleanup_cannot_report_success() {
+        let (shutdown, _shutdown_rx) = oneshot::channel();
+        let server = LoopbackServer {
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, 1)),
+            shutdown: Some(shutdown),
+            task: Some(tokio::spawn(std::future::pending::<std::io::Result<()>>())),
+        };
+
+        assert_eq!(
+            server.stop("forced_cleanup", Duration::ZERO).await,
+            Err(failure("forced_cleanup"))
+        );
+        let invalid = mutate(&valid_receipt_value(), |value| {
+            value["control"]["cleanup_complete"] = false.into();
+        });
+        assert!(validate_receipt_value(invalid).is_err());
+    }
+
+    #[tokio::test]
+    async fn forced_producer_cleanup_aborts_drains_and_fails_closed() {
+        let context = Context::new(Arm::Control);
+        let recovery = tokio::spawn(std::future::pending::<()>());
+        context.register_recovery_abort(recovery.abort_handle());
+        context.register_owned_producer(tokio::spawn(async move {
+            let _recovery_result = recovery.await;
+        }));
+
+        assert_eq!(
+            drain_owned_producers(&context, Duration::from_millis(10)).await,
+            Err(failure("producer_cleanup_forced"))
+        );
+    }
+
+    #[test]
+    fn self_test_client_builder_is_private_and_constructible() {
+        build_self_test_http_client().expect("self-test client");
     }
 
     #[tokio::test]
@@ -1420,10 +1878,13 @@ mod tests {
             value["control"]["rejected_request_claims"] = 1.into();
         }));
         mutations.push(mutate(&valid, |value| {
-            value["control"]["guard_business_count"] = 1.into();
+            value["control"]["product_roles"] = serde_json::json!(["business"]);
         }));
         mutations.push(mutate(&valid, |value| {
-            value["control"]["guard_probe_count"] = 0.into();
+            value["control"]["recovery_replay_claims"] = 0.into();
+        }));
+        mutations.push(mutate(&valid, |value| {
+            value["control"]["rejected_physical_attempts"] = 1.into();
         }));
         mutations.push(mutate(&valid, |value| {
             value["control"]["business_count"] = 1.into();
@@ -1450,10 +1911,11 @@ mod tests {
             value["committed"]["request_claims"] = 2.into();
         }));
         mutations.push(mutate(&valid, |value| {
-            value["committed"]["guard_business_count"] = 2.into();
+            value["committed"]["product_roles"] =
+                serde_json::json!(["business", "recovery_replay"]);
         }));
         mutations.push(mutate(&valid, |value| {
-            value["committed"]["guard_probe_count"] = 1.into();
+            value["committed"]["recovery_replay_claims"] = 1.into();
         }));
         mutations.push(mutate(&valid, |value| {
             value["committed"]["business_count"] = 2.into();
@@ -1512,12 +1974,15 @@ mod tests {
             "status": "passed",
             "control": {
                 "ordered_roles": ["business", "recovery_probe", "business"],
+                "product_roles": ["business", "readiness_probe", "recovery_replay"],
                 "attempt_count": 3,
                 "fixture_rejected_count": 0,
                 "request_claims": 1,
                 "rejected_request_claims": 0,
-                "guard_business_count": 2,
-                "guard_probe_count": 1,
+                "recovery_replay_claims": 1,
+                "rejected_recovery_replay_claims": 0,
+                "rejected_physical_attempts": 0,
+                "rejected_readiness_probes": 0,
                 "business_count": 2,
                 "probe_count": 1,
                 "same_payload": true,
@@ -1542,12 +2007,15 @@ mod tests {
             },
             "committed": {
                 "ordered_roles": ["business"],
+                "product_roles": ["business"],
                 "attempt_count": 1,
                 "fixture_rejected_count": 0,
                 "request_claims": 1,
                 "rejected_request_claims": 0,
-                "guard_business_count": 1,
-                "guard_probe_count": 0,
+                "recovery_replay_claims": 0,
+                "rejected_recovery_replay_claims": 0,
+                "rejected_physical_attempts": 0,
+                "rejected_readiness_probes": 0,
                 "business_count": 1,
                 "probe_count": 0,
                 "same_payload": true,
