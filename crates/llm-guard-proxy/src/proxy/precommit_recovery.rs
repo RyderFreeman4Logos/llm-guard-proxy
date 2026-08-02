@@ -4,7 +4,7 @@
 //! downstream byte. It owns the per-request recovery budget and the mandatory
 //! post-await commit/drop rechecks.
 
-use std::pin::Pin;
+use std::{collections::BTreeMap, pin::Pin};
 
 use axum::{
     body::Bytes,
@@ -173,20 +173,30 @@ pub(super) async fn gate(
     )
     .await;
     metadata.extend(recovery_metadata);
+    gate_after_recovery(
+        context.downstream_commit_signal,
+        context.downstream_drop_signal,
+        context.request_deadline,
+        metadata,
+    )
+}
 
-    if context
-        .downstream_drop_signal
-        .is_some_and(DownstreamDropSignal::is_dropped)
-    {
+pub(super) fn gate_after_recovery(
+    downstream_commit_signal: Option<&DownstreamCommitSignal>,
+    downstream_drop_signal: Option<&DownstreamDropSignal>,
+    request_deadline: RequestDeadline,
+    mut metadata: BTreeMap<String, String>,
+) -> LocalRecoveryGate {
+    if downstream_drop_signal.is_some_and(DownstreamDropSignal::is_dropped) {
         return skipped_local_recovery_gate(metadata, "skipped_downstream_dropped", false);
     }
-    if local_recovery_downstream_commit_observed(context.downstream_commit_signal, &mut metadata) {
+    if local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata) {
         return skipped_local_recovery_gate(metadata, "skipped_downstream_committed", false);
     }
 
     let permits_retry = local_recovery_permits_retry(&metadata);
     let permits_replay =
-        local_recovery_completed_ready(&metadata) && !context.request_deadline.is_exhausted();
+        local_recovery_completed_ready(&metadata) && !request_deadline.is_exhausted();
     metadata.insert(
         String::from("local_recovery_permits_retry"),
         permits_retry.to_string(),

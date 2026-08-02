@@ -70,6 +70,20 @@ impl RunOutcome {
 
 async fn run(args: impl IntoIterator<Item = OsString>) -> RunOutcome {
     let args = args.into_iter().collect::<Vec<_>>();
+    if args.get(1).and_then(|arg| arg.to_str()) == Some("self-test") {
+        let result = if args.len() == 3
+            && args.get(2).and_then(|arg| arg.to_str()) == Some("post-await-no-replay")
+        {
+            proxy::post_await_no_replay_self_test_report()
+                .await
+                .map(|report| println!("{report}"))
+        } else {
+            Err(String::from(
+                "usage: llm-guard-proxy self-test post-await-no-replay",
+            ))
+        };
+        return RunOutcome::with_default_timeout(result);
+    }
     if args.get(1).and_then(|arg| arg.to_str()) == Some("evidence") {
         return RunOutcome::with_default_timeout(
             parse_evidence_command(&args[2..]).and_then(run_evidence_command),
@@ -1167,6 +1181,40 @@ mod tests {
         assert!(!rendered.contains("x-api-key"));
         assert!(!rendered.contains("safe=ok"));
         assert!(!rendered.contains("token=sk-test"));
+    }
+
+    #[tokio::test]
+    async fn dispatches_post_await_no_replay_self_test_without_serve_config() {
+        let args = [
+            OsString::from("llm-guard-proxy"),
+            OsString::from("self-test"),
+            OsString::from("post-await-no-replay"),
+        ];
+
+        assert!(super::run(args).await.result.is_ok());
+    }
+
+    #[test]
+    fn serve_options_do_not_expose_post_await_self_test_hook() {
+        let error = parse_proxy_options([
+            OsString::from("llm-guard-proxy"),
+            OsString::from("--post-await-no-replay-self-test"),
+        ])
+        .expect_err("serve options must not expose the self-test");
+
+        assert_eq!(error, "unknown argument: --post-await-no-replay-self-test");
+    }
+
+    #[tokio::test]
+    async fn post_await_no_replay_self_test_proves_probe_and_replay_are_blocked() {
+        let report = super::proxy::post_await_no_replay_self_test_report()
+            .await
+            .expect("offline self-test should pass");
+
+        assert_eq!(report["status"], "passed");
+        assert_eq!(report["downstream_committed_post_await"], true);
+        assert_eq!(report["readiness_probe_attempted"], false);
+        assert_eq!(report["replay_permitted"], false);
     }
 
     #[tokio::test]

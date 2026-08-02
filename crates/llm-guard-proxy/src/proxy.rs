@@ -9458,6 +9458,12 @@ impl DownstreamCommitSignal {
         self.committed.store(true, Ordering::SeqCst);
     }
 
+    fn observe_emitted_bytes(&self, bytes: &Bytes) {
+        if !bytes.is_empty() {
+            self.mark_committed();
+        }
+    }
+
     fn is_committed(&self) -> bool {
         self.committed.load(Ordering::SeqCst)
     }
@@ -11611,6 +11617,110 @@ async fn abort_local_recovery_episode(
     finish_local_recovery_episode(coordinator, recovery_episode_id, metadata).await
 }
 
+pub(crate) async fn post_await_no_replay_self_test_report() -> Result<serde_json::Value, String> {
+    let downstream_commit_signal = DownstreamCommitSignal::default();
+    let recovery_signal = downstream_commit_signal.clone();
+    let (await_entered_tx, await_entered_rx) = tokio::sync::oneshot::channel();
+    let (await_release_tx, await_release_rx) = tokio::sync::oneshot::channel();
+    let mut policy = LocalRecoveryPolicy::from_config(&LocalRecoveryConfig::default());
+    policy.readiness_deadline = Duration::from_millis(1);
+    policy.readiness_interval = Duration::from_millis(1);
+
+    let recovery_phase = async move {
+        let mut metadata = BTreeMap::new();
+        if local_recovery_downstream_commit_observed(Some(&recovery_signal), &mut metadata) {
+            return Err("downstream was committed before the recovery await".into());
+        }
+        await_entered_tx
+            .send(())
+            .map_err(|()| String::from("commit phase did not observe the recovery await"))?;
+        await_release_rx
+            .await
+            .map_err(|error| format!("recovery await rendezvous failed: {error}"))?;
+        metadata.insert(
+            String::from("local_recovery_restart_status"),
+            String::from("succeeded"),
+        );
+        Ok::<_, String>(
+            finish_local_recovery_after_restart(
+                Client::new(),
+                String::from("offline-self-test"),
+                &policy,
+                Some(&recovery_signal),
+                metadata,
+            )
+            .await,
+        )
+    };
+    let commit_phase = async {
+        await_entered_rx
+            .await
+            .map_err(|error| format!("recovery await was not observed: {error}"))?;
+        downstream_commit_signal
+            .observe_emitted_bytes(&Bytes::from_static(b": self-test downstream commit\n\n"));
+        await_release_tx
+            .send(())
+            .map_err(|()| String::from("recovery phase left before post-await verification"))?;
+        Ok::<_, String>(())
+    };
+    let (recovery_metadata, commit_result) = tokio::join!(recovery_phase, commit_phase);
+    commit_result?;
+    let recovery_metadata = recovery_metadata?;
+    if !downstream_commit_signal.is_committed() {
+        return Err("recovery await completed without a downstream commit".into());
+    }
+    let readiness_probe_attempted = recovery_metadata
+        .keys()
+        .any(|key| key.starts_with("local_recovery_readiness_"));
+    if readiness_probe_attempted
+        || recovery_metadata
+            .get("local_recovery_replay_skipped_downstream_committed")
+            .map(String::as_str)
+            != Some("true")
+        || recovery_metadata
+            .get("local_recovery_status")
+            .map(String::as_str)
+            != Some("skipped_downstream_committed")
+    {
+        return Err(format!(
+            "post-await downstream commit did not block readiness: {recovery_metadata:?}"
+        ));
+    }
+
+    let replay_gate = precommit_recovery::gate_after_recovery(
+        Some(&downstream_commit_signal),
+        None,
+        RequestDeadline::from_started_at(Instant::now(), Duration::from_secs(1)),
+        BTreeMap::from([(
+            String::from("local_recovery_status"),
+            String::from("succeeded"),
+        )]),
+    );
+    if !replay_gate.applied
+        || replay_gate.permits_retry
+        || replay_gate.permits_replay
+        || replay_gate
+            .metadata
+            .get("local_recovery_replay_skipped_downstream_committed")
+            .map(String::as_str)
+            != Some("true")
+    {
+        return Err(format!(
+            "post-await downstream commit did not block replay: {:?}",
+            replay_gate.metadata
+        ));
+    }
+
+    Ok(serde_json::json!({
+        "downstream_committed_post_await": downstream_commit_signal.is_committed(),
+        "mode": "offline_cli_only",
+        "readiness_probe_attempted": readiness_probe_attempted,
+        "replay_permitted": replay_gate.permits_replay,
+        "self_test": "post-await-no-replay",
+        "status": "passed"
+    }))
+}
+
 async fn run_local_recovery_task(
     policy: LocalRecoveryPolicy,
     client: Client,
@@ -11635,41 +11745,14 @@ async fn run_local_recovery_task(
             return metadata;
         }
         metadata.extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
-        if local_recovery_downstream_commit_observed(
+        finish_local_recovery_after_restart(
+            client,
+            base_url,
+            &policy,
             downstream_commit_signal.as_ref(),
-            &mut metadata,
-        ) {
-            return metadata;
-        }
-        if metadata
-            .get("local_recovery_restart_status")
-            .is_some_and(|status| status == "succeeded")
-        {
-            metadata.extend(
-                run_local_recovery_readiness(
-                    client,
-                    base_url,
-                    &policy,
-                    downstream_commit_signal.as_ref(),
-                )
-                .await,
-            );
-        }
-        local_recovery_downstream_commit_observed(downstream_commit_signal.as_ref(), &mut metadata);
-        if !metadata.contains_key("local_recovery_status") {
-            let status = match metadata
-                .get("local_recovery_readiness_status")
-                .map(String::as_str)
-            {
-                Some("ready") => "succeeded",
-                Some("timeout") => "readiness_timeout",
-                Some("error") => "readiness_error",
-                Some(_) => "readiness_not_ready",
-                None => "restart_failed",
-            };
-            metadata.insert(String::from("local_recovery_status"), status.to_owned());
-        }
-        metadata
+            metadata,
+        )
+        .await
     };
     match episode_timeout {
         Some(timeout_duration) => match timeout(timeout_duration, recovery).await {
@@ -11693,6 +11776,41 @@ async fn run_local_recovery_task(
         },
         None => recovery.await,
     }
+}
+
+async fn finish_local_recovery_after_restart(
+    client: Client,
+    base_url: String,
+    policy: &LocalRecoveryPolicy,
+    downstream_commit_signal: Option<&DownstreamCommitSignal>,
+    mut metadata: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata) {
+        return metadata;
+    }
+    if metadata
+        .get("local_recovery_restart_status")
+        .is_some_and(|status| status == "succeeded")
+    {
+        metadata.extend(
+            run_local_recovery_readiness(client, base_url, policy, downstream_commit_signal).await,
+        );
+    }
+    local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata);
+    if !metadata.contains_key("local_recovery_status") {
+        let status = match metadata
+            .get("local_recovery_readiness_status")
+            .map(String::as_str)
+        {
+            Some("ready") => "succeeded",
+            Some("timeout") => "readiness_timeout",
+            Some("error") => "readiness_error",
+            Some(_) => "readiness_not_ready",
+            None => "restart_failed",
+        };
+        metadata.insert(String::from("local_recovery_status"), status.to_owned());
+    }
+    metadata
 }
 
 async fn wait_for_local_recovery_result(
@@ -15171,9 +15289,7 @@ impl ShieldedLivenessBody {
     fn count_and_emit(&mut self, bytes: Bytes) -> Poll<Option<Result<Bytes, Infallible>>> {
         let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         self.bytes_seen = self.bytes_seen.saturating_add(chunk_len);
-        if !bytes.is_empty() {
-            self.downstream_commit_signal.mark_committed();
-        }
+        self.downstream_commit_signal.observe_emitted_bytes(&bytes);
         Poll::Ready(Some(Ok(bytes)))
     }
 
