@@ -417,8 +417,16 @@ fn parse_linux_process_state_and_start_time(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LinuxProcessIdentityProbe {
     Current,
+    CurrentZombie,
     ConfirmedGoneOrMismatch,
     Unavailable,
+}
+
+#[cfg(test)]
+impl LinuxProcessIdentityProbe {
+    pub(crate) const fn is_current(self) -> bool {
+        matches!(self, Self::Current | Self::CurrentZombie)
+    }
 }
 
 #[cfg(test)]
@@ -428,6 +436,9 @@ pub(crate) fn probe_linux_process_identity(
 ) -> LinuxProcessIdentityProbe {
     match fs::read_to_string(format!("/proc/{pid}/stat")) {
         Ok(stat) => match parse_linux_process_state_and_start_time(&stat) {
+            Ok(('Z', observed)) if observed == expected_start_time_ticks => {
+                LinuxProcessIdentityProbe::CurrentZombie
+            }
             Ok((_state, observed)) if observed == expected_start_time_ticks => {
                 LinuxProcessIdentityProbe::Current
             }

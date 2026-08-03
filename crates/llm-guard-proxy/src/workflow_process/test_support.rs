@@ -58,7 +58,7 @@ impl TestProcessIdentity {
     }
 
     pub(crate) fn is_current(self) -> bool {
-        self.probe() == IdentityProbe::Current
+        self.probe().is_current()
     }
 
     pub(crate) fn is_live(self) -> bool {
@@ -79,10 +79,10 @@ impl TestProcessIdentity {
         };
         loop {
             match self.probe() {
-                IdentityProbe::Current => {
+                IdentityProbe::Current | IdentityProbe::CurrentZombie => {
                     let target = if process_group { -raw_pid } else { raw_pid };
                     match self.probe() {
-                        IdentityProbe::Current => {
+                        IdentityProbe::Current | IdentityProbe::CurrentZombie => {
                             let _signal = kill(Pid::from_raw(target), Signal::SIGKILL);
                             return;
                         }
@@ -105,7 +105,9 @@ impl TestProcessIdentity {
     pub(crate) fn wait_until_not_live(self, deadline: Instant) -> bool {
         loop {
             match self.probe() {
-                IdentityProbe::ConfirmedGoneOrMismatch => return true,
+                IdentityProbe::CurrentZombie | IdentityProbe::ConfirmedGoneOrMismatch => {
+                    return true;
+                }
                 IdentityProbe::Current | IdentityProbe::Unavailable
                     if Instant::now() < deadline =>
                 {
@@ -170,10 +172,10 @@ impl PublishedProcessCleanup {
 
     pub(crate) fn refresh(&self) -> Option<TestProcessIdentity> {
         if let Some(identity) = self.identity.get() {
-            return (identity.probe() == IdentityProbe::Current).then_some(identity);
+            return identity.probe().is_current().then_some(identity);
         }
         let identity = TestProcessIdentity::read_from(&self.marker_path)?;
-        if identity.probe() != IdentityProbe::Current {
+        if !identity.probe().is_current() {
             return None;
         }
         self.identity.set(Some(identity));
@@ -302,7 +304,7 @@ where
 {
     loop {
         if let Some(identity) = read()
-            && probe(identity) == IdentityProbe::Current
+            && probe(identity).is_current()
         {
             return Some(identity);
         }
@@ -354,6 +356,41 @@ fn validated_marker_wait_retries_absent_stale_and_unavailable_observations() {
     );
 
     assert_eq!(result, Some(identity));
+}
+
+#[test]
+fn exact_zombie_is_not_live_before_owner_reaps_it() {
+    use std::process::Command;
+
+    use nix::{
+        sys::wait::{Id, WaitPidFlag, WaitStatus, waitid},
+        unistd::Pid,
+    };
+
+    let mut command = Command::new("/bin/true");
+    super::configure_process_group(&mut command);
+    let fixture = super::test_raii::TestProcessGroup::spawn(&mut command);
+    let identity = TestProcessIdentity::capture(fixture.identity().pid)
+        .expect("fixture identity should remain observable");
+    let status = waitid(
+        Id::Pid(Pid::from_raw(
+            i32::try_from(identity.pid.get()).expect("fixture PID should fit i32"),
+        )),
+        WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+    )
+    .expect("fixture exit should be observable without reaping");
+
+    assert!(matches!(
+        status,
+        WaitStatus::Exited(_, _) | WaitStatus::Signaled(_, _, _)
+    ));
+    assert!(identity.is_current(), "zombie identity should stay current");
+    assert!(!identity.is_live(), "zombie identity should not be live");
+    assert!(
+        identity.wait_until_not_live(Instant::now()),
+        "an exact zombie must not be classified as live while its owner defers reaping"
+    );
+    fixture.finish_after_signal();
 }
 
 #[test]
