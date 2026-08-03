@@ -82,6 +82,7 @@ mod deepinfra_rerank_adapter;
 mod effective_liveness;
 mod generic_recovery;
 mod model_metadata;
+mod post_await_self_test;
 mod precommit_recovery;
 mod prose_constraints;
 mod recovery;
@@ -171,6 +172,7 @@ pub(crate) struct ProxyState {
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
     live_registry: Arc<LiveRequestRegistry>,
     persistence_tasks: Arc<PersistenceTasks>,
+    post_await_self_test: Option<post_await_self_test::Context>,
     #[cfg(test)]
     shielded_heartbeat_ticks: Arc<AtomicU64>,
 }
@@ -313,6 +315,7 @@ impl ProxyState {
                     Arc::new(PersistenceTasks::default())
                 }
             },
+            post_await_self_test: None,
             #[cfg(test)]
             shielded_heartbeat_ticks: Arc::new(AtomicU64::new(0)),
         }
@@ -339,6 +342,20 @@ impl ProxyState {
         self.persistence_tasks
             .flush(current_shutdown_drain_timeout(&self.config))
             .await;
+    }
+
+    async fn flush_persistence_checked(&self) -> Result<(), &'static str> {
+        self.flush_persistence().await;
+        if self.persistence_tasks.in_flight.load(Ordering::SeqCst) != 0 {
+            return Err("persistence_cleanup_incomplete");
+        }
+        if self.persistence_tasks.panics.load(Ordering::SeqCst) != 0 {
+            return Err("persistence_cleanup_panicked");
+        }
+        if self.persistence_tasks.dropped_total() != 0 {
+            return Err("persistence_cleanup_dropped");
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -907,7 +924,6 @@ struct PersistenceTasks {
     idle: Notify,
     dropped: AtomicU64,
     backlog_drop_log: PersistenceBacklogDropLog,
-    #[cfg(test)]
     panics: AtomicUsize,
     #[cfg(test)]
     synchronous_for_tests: bool,
@@ -923,7 +939,6 @@ impl Default for PersistenceTasks {
             idle: Notify::new(),
             dropped: AtomicU64::new(0),
             backlog_drop_log: PersistenceBacklogDropLog::default(),
-            #[cfg(test)]
             panics: AtomicUsize::new(0),
             #[cfg(test)]
             synchronous_for_tests: false,
@@ -991,19 +1006,13 @@ impl PersistenceTasks {
             return;
         }
 
-        #[cfg(test)]
         let tasks = Arc::clone(self);
         // The handle is intentionally detached: after its bounded shutdown wait expires,
         // persistence must not retain a waiter on a stalled blocking SQLite operation.
         let _detached_task = tokio::task::spawn_blocking(move || {
             let _capacity_permit = capacity_permit;
             let _guard = guard;
-            #[cfg(test)]
-            {
-                tasks.run(work);
-            }
-            #[cfg(not(test))]
-            Self::run(work);
+            tasks.run(work);
         });
     }
 
@@ -1011,18 +1020,10 @@ impl PersistenceTasks {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
     fn run(&self, work: impl FnOnce()) {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
             eprintln!("persistence task panicked");
             self.panics.fetch_add(1, Ordering::SeqCst);
-        }
-    }
-
-    #[cfg(not(test))]
-    fn run(work: impl FnOnce()) {
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
-            eprintln!("persistence task panicked");
         }
     }
 
@@ -3377,6 +3378,12 @@ async fn forward_openai_request(
         Duration::from_millis(prepared_request.upstream_profile.request_timeout_ms);
     if prepared_request.shielded_chat_plan.intercepted {
         add_retry_request_metadata(&mut request_metadata, &retry_policy);
+        let post_await_self_test = state
+            .post_await_self_test
+            .as_ref()
+            .map(post_await_self_test::Context::claim_request)
+            .transpose()
+            .map_err(ProxyError::request_body)?;
         let request_deadline =
             RequestDeadline::from_started_at(request_started_at, retry_policy.request_deadline);
         let local_recovery_policy =
@@ -3434,6 +3441,7 @@ async fn forward_openai_request(
                 local_recovery,
                 local_recovery_attempts: Arc::new(AtomicU64::new(0)),
                 downstream_commit_signal: DownstreamCommitSignal::default(),
+                post_await_self_test,
                 #[cfg(feature = "upstream-hot-restart")]
                 hot_restart_recovery: state.hot_restart_recovery.clone(),
                 shadow_attempts: state.shadow_attempts.clone(),
@@ -5380,6 +5388,8 @@ async fn send_generic_upstream_attempt(
         model_id: context.model_id.as_deref(),
         request_deadline,
         stuck_watchdog_request: context.stuck_watchdog_request.as_ref(),
+        post_await_self_test: None,
+        self_test_physical_role: post_await_self_test::PhysicalRole::Other,
     })
     .await
 }
@@ -5708,6 +5718,7 @@ fn models_attempt_request(
     (downstream_headers, metadata)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn fetch_models_upstream_group(
     context: &GenericForwardContext<'_>,
     group: &ModelsUpstreamGroup,
@@ -5748,6 +5759,8 @@ async fn fetch_models_upstream_group(
         model_id: None,
         request_deadline: Some(group.request_deadline),
         stuck_watchdog_request: None,
+        post_await_self_test: None,
+        self_test_physical_role: post_await_self_test::PhysicalRole::Other,
     })
     .await?;
     let SentUpstreamResponse {
@@ -5885,6 +5898,8 @@ struct UpstreamAttemptContext<'request> {
     model_id: Option<&'request str>,
     request_deadline: Option<Instant>,
     stuck_watchdog_request: Option<&'request StuckWatchdogRequest>,
+    post_await_self_test: Option<&'request post_await_self_test::Context>,
+    self_test_physical_role: post_await_self_test::PhysicalRole,
 }
 
 struct SentUpstreamResponse {
@@ -5927,6 +5942,7 @@ struct EndpointFailoverRuntime<'request> {
     decode_heterogeneous_reranker: bool,
     model_id: Option<&'request str>,
     stuck_watchdog_request: Option<&'request StuckWatchdogRequest>,
+    post_await_self_test: Option<&'request post_await_self_test::Context>,
 }
 
 struct EndpointFailoverProgress {
@@ -5995,9 +6011,19 @@ fn render_retry_openai_request(
     )
 }
 
+#[allow(clippy::too_many_lines)]
 async fn send_first_upstream_attempt(
     context: UpstreamAttemptContext<'_>,
 ) -> Result<SentUpstreamResponse, ProxyError> {
+    if let Some(self_test) = context.post_await_self_test {
+        self_test
+            .consume_physical_attempt(
+                &context.attempt_id,
+                context.attempt_number,
+                context.self_test_physical_role,
+            )
+            .map_err(ProxyError::request_body)?;
+    }
     let terminal_endpoint = context
         .failover_retry
         .as_ref()
@@ -6074,6 +6100,7 @@ async fn send_first_upstream_attempt(
                     decode_heterogeneous_reranker: context.decode_heterogeneous_reranker,
                     model_id: context.model_id,
                     stuck_watchdog_request: context.stuck_watchdog_request,
+                    post_await_self_test: context.post_await_self_test,
                 },
                 EndpointFailoverProgress {
                     result,
@@ -6322,6 +6349,19 @@ async fn send_selected_failover_endpoint(
         observed_response: None,
         stuck_watchdog_attempt: None,
     };
+    if let Some(self_test) = runtime.post_await_self_test
+        && let Err(error) = self_test.consume_physical_attempt(
+            &attempt.attempt_id,
+            attempt_number,
+            post_await_self_test::PhysicalRole::Other,
+        )
+    {
+        return CompletedFailoverEndpointSend {
+            result: Err(ProxyError::request_body(error)),
+            attempt,
+            recovery_trial_lease: selected.recovery_trial_lease.take(),
+        };
+    }
     let response = match rendered {
         Ok(rendered) => {
             annotate_physical_endpoint_attempt(
@@ -8094,6 +8134,7 @@ async fn run_watchdog_recovery(
                 caller_timeout: None,
                 recovery_episode_observer: Some(&recovery_episode_observer),
                 downstream_commit_signal: None,
+                post_await_self_test: None,
             },
         )
         .await
@@ -9388,6 +9429,7 @@ struct ShieldedRetryRuntime {
     local_recovery: Arc<UpstreamStallRecoveryCoordinator>,
     local_recovery_attempts: Arc<AtomicU64>,
     downstream_commit_signal: DownstreamCommitSignal,
+    post_await_self_test: Option<post_await_self_test::Context>,
     #[cfg(feature = "upstream-hot-restart")]
     hot_restart_recovery: Arc<HotRestartCoordinator>,
     shadow_attempts: Arc<InFlightLimiter>,
@@ -9406,8 +9448,20 @@ impl ShieldedRetryRuntime {
     }
 
     fn claim_recovery_replay(&self, physical_attempt_number: u32) {
-        self.rate_limit_retry_budget
-            .claim_recovery_replay(physical_attempt_number);
+        let next_attempt_number = physical_attempt_number.saturating_add(1);
+        let accepted = self.post_await_self_test.as_ref().is_none_or(|self_test| {
+            self_test
+                .claim_recovery_replay(
+                    physical_attempt_number,
+                    AttemptId::for_request(&self.request_id, next_attempt_number),
+                    next_attempt_number,
+                )
+                .is_ok()
+        });
+        if accepted {
+            self.rate_limit_retry_budget
+                .claim_recovery_replay(physical_attempt_number);
+        }
     }
 
     fn allows_ordinary_retry(&self, physical_attempt_number: u32) -> bool {
@@ -9456,6 +9510,12 @@ struct DownstreamCommitSignal {
 impl DownstreamCommitSignal {
     fn mark_committed(&self) {
         self.committed.store(true, Ordering::SeqCst);
+    }
+
+    fn observe_emitted_bytes(&self, bytes: &Bytes) {
+        if !bytes.is_empty() {
+            self.mark_committed();
+        }
     }
 
     fn is_committed(&self) -> bool {
@@ -9828,6 +9888,7 @@ fn shielded_liveness_stream_response(
         },
         response_model_alias,
         upstream_failure_counters: runtime.upstream_failure_counters.clone(),
+        post_await_self_test: runtime.post_await_self_test.clone(),
     };
     let response_body = ShieldedLivenessBody::new(
         aggregate,
@@ -11255,6 +11316,7 @@ async fn local_recovery_gate(
             downstream_commit_signal: Some(&runtime.downstream_commit_signal),
             downstream_drop_signal: Some(&runtime.downstream_drop_signal),
             request_deadline: runtime.request_deadline,
+            post_await_self_test: runtime.post_await_self_test.as_ref(),
             episode_timeout: runtime.upstream_profile.restart_queue.enabled.then(|| {
                 Duration::from_secs(runtime.upstream_profile.restart_queue.restart_timeout_secs)
             }),
@@ -11369,6 +11431,7 @@ struct LocalRecoveryRunOptions<'a> {
     caller_timeout: Option<Duration>,
     recovery_episode_observer: Option<&'a AtomicU64>,
     downstream_commit_signal: Option<DownstreamCommitSignal>,
+    post_await_self_test: Option<post_await_self_test::Context>,
 }
 
 #[cfg(test)]
@@ -11391,6 +11454,7 @@ async fn run_local_recovery_for_profile(
             caller_timeout: None,
             recovery_episode_observer: None,
             downstream_commit_signal: None,
+            post_await_self_test: None,
         },
     )
     .await
@@ -11450,18 +11514,34 @@ async fn run_local_recovery_for_profile_observing(
         task_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
     ));
     state.runs_in_window = state.runs_in_window.saturating_add(1);
-    let recovery_task = tokio::spawn(run_local_recovery_task(
-        policy.clone(),
-        client,
-        base_url,
-        cause,
-        task_timeout,
-        options.downstream_commit_signal.clone(),
-    ));
+    let recovery_policy = policy.clone();
+    let recovery_commit_signal = options.downstream_commit_signal.clone();
+    let recovery_self_test = options.post_await_self_test.clone();
+    let recovery_task = tokio::spawn(async move {
+        run_local_recovery_task(
+            recovery_policy,
+            client,
+            base_url,
+            cause,
+            task_timeout,
+            recovery_commit_signal,
+            recovery_self_test,
+        )
+        .await
+    });
+    if let Some(self_test) = options.post_await_self_test.as_ref() {
+        self_test.register_recovery_abort(recovery_task.abort_handle());
+    }
     state.active_local_recovery_task = Some(recovery_task.abort_handle());
     drop(state);
 
-    spawn_local_recovery_terminalizer(coordinator, recovery_episode_id, recovery_task);
+    let terminalizer =
+        spawn_local_recovery_terminalizer(coordinator, recovery_episode_id, recovery_task);
+    if let Some(self_test) = options.post_await_self_test.as_ref() {
+        self_test.register_owned_producer(terminalizer);
+    } else {
+        drop(terminalizer);
+    }
 
     wait_for_local_recovery_result_with_options(
         policy,
@@ -11560,9 +11640,9 @@ fn spawn_local_recovery_terminalizer(
     coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
     recovery_episode_id: u64,
     recovery_task: tokio::task::JoinHandle<BTreeMap<String, String>>,
-) {
+) -> tokio::task::JoinHandle<()> {
     let coordinator = Arc::clone(coordinator);
-    let _terminalizer = tokio::spawn(async move {
+    tokio::spawn(async move {
         let metadata = match recovery_task.await {
             Ok(metadata) => metadata,
             Err(error) => BTreeMap::from([(
@@ -11576,7 +11656,7 @@ fn spawn_local_recovery_terminalizer(
         };
         let _published =
             finish_local_recovery_episode(&coordinator, recovery_episode_id, metadata).await;
-    });
+    })
 }
 
 async fn finish_local_recovery_episode(
@@ -11611,6 +11691,10 @@ async fn abort_local_recovery_episode(
     finish_local_recovery_episode(coordinator, recovery_episode_id, metadata).await
 }
 
+pub(crate) async fn post_await_no_replay_self_test_report() -> Result<serde_json::Value, String> {
+    post_await_self_test::run().await
+}
+
 async fn run_local_recovery_task(
     policy: LocalRecoveryPolicy,
     client: Client,
@@ -11618,6 +11702,7 @@ async fn run_local_recovery_task(
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
     downstream_commit_signal: Option<DownstreamCommitSignal>,
+    post_await_self_test: Option<post_await_self_test::Context>,
 ) -> BTreeMap<String, String> {
     let trigger_cause = cause.as_str().to_owned();
     let recovery_trigger_cause = trigger_cause.clone();
@@ -11634,42 +11719,21 @@ async fn run_local_recovery_task(
         ) {
             return metadata;
         }
-        metadata.extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
-        if local_recovery_downstream_commit_observed(
+        if let Some(self_test) = &post_await_self_test {
+            metadata.extend(self_test.restart_metadata().await);
+        } else {
+            metadata
+                .extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
+        }
+        finish_local_recovery_after_restart(
+            client,
+            base_url,
+            &policy,
             downstream_commit_signal.as_ref(),
-            &mut metadata,
-        ) {
-            return metadata;
-        }
-        if metadata
-            .get("local_recovery_restart_status")
-            .is_some_and(|status| status == "succeeded")
-        {
-            metadata.extend(
-                run_local_recovery_readiness(
-                    client,
-                    base_url,
-                    &policy,
-                    downstream_commit_signal.as_ref(),
-                )
-                .await,
-            );
-        }
-        local_recovery_downstream_commit_observed(downstream_commit_signal.as_ref(), &mut metadata);
-        if !metadata.contains_key("local_recovery_status") {
-            let status = match metadata
-                .get("local_recovery_readiness_status")
-                .map(String::as_str)
-            {
-                Some("ready") => "succeeded",
-                Some("timeout") => "readiness_timeout",
-                Some("error") => "readiness_error",
-                Some(_) => "readiness_not_ready",
-                None => "restart_failed",
-            };
-            metadata.insert(String::from("local_recovery_status"), status.to_owned());
-        }
-        metadata
+            post_await_self_test.as_ref(),
+            metadata,
+        )
+        .await
     };
     match episode_timeout {
         Some(timeout_duration) => match timeout(timeout_duration, recovery).await {
@@ -11693,6 +11757,52 @@ async fn run_local_recovery_task(
         },
         None => recovery.await,
     }
+}
+
+async fn finish_local_recovery_after_restart(
+    client: Client,
+    base_url: String,
+    policy: &LocalRecoveryPolicy,
+    downstream_commit_signal: Option<&DownstreamCommitSignal>,
+    post_await_self_test: Option<&post_await_self_test::Context>,
+    mut metadata: BTreeMap<String, String>,
+) -> BTreeMap<String, String> {
+    if local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata) {
+        if let Some(self_test) = post_await_self_test {
+            self_test.mark_post_await_committed();
+        }
+        return metadata;
+    }
+    if metadata
+        .get("local_recovery_restart_status")
+        .is_some_and(|status| status == "succeeded")
+    {
+        metadata.extend(
+            run_local_recovery_readiness(
+                client,
+                base_url,
+                policy,
+                downstream_commit_signal,
+                post_await_self_test,
+            )
+            .await,
+        );
+    }
+    local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata);
+    if !metadata.contains_key("local_recovery_status") {
+        let status = match metadata
+            .get("local_recovery_readiness_status")
+            .map(String::as_str)
+        {
+            Some("ready") => "succeeded",
+            Some("timeout") => "readiness_timeout",
+            Some("error") => "readiness_error",
+            Some(_) => "readiness_not_ready",
+            None => "restart_failed",
+        };
+        metadata.insert(String::from("local_recovery_status"), status.to_owned());
+    }
+    metadata
 }
 
 async fn wait_for_local_recovery_result(
@@ -11867,6 +11977,7 @@ async fn run_local_recovery_readiness(
     base_url: String,
     policy: &LocalRecoveryPolicy,
     downstream_commit_signal: Option<&DownstreamCommitSignal>,
+    post_await_self_test: Option<&post_await_self_test::Context>,
 ) -> BTreeMap<String, String> {
     let deadline = Instant::now() + policy.readiness_deadline;
     loop {
@@ -11879,6 +11990,9 @@ async fn run_local_recovery_readiness(
                 String::from("local_recovery_readiness_status"),
                 String::from("timeout"),
             )]);
+        }
+        if let Some(self_test) = post_await_self_test {
+            self_test.record_readiness_probe();
         }
         match send_local_recovery_readiness_probe(&client, &base_url, policy).await {
             Ok(true) => {
@@ -12368,6 +12482,18 @@ async fn start_shielded_attempt(
         rendered,
         upstream_body,
         upstream_timeout,
+        if attempt_number == 1 {
+            post_await_self_test::PhysicalRole::Business
+        } else if retry_cause == Some(ShieldedRetryCause::UpstreamStall)
+            && wire_mode == ShieldedUpstreamWireMode::ShieldedSse
+            && salvage.cot_salvage.is_none()
+            && salvage.constraint_repair.is_none()
+            && !salvage.force_disable_after_salvage_loop
+        {
+            post_await_self_test::PhysicalRole::RecoveryReplay
+        } else {
+            post_await_self_test::PhysicalRole::Other
+        },
     )
     .await
     {
@@ -12475,6 +12601,7 @@ async fn send_shielded_upstream_attempt(
     rendered: reranker_protocol::RenderedEndpointRequest,
     retry_body: Bytes,
     upstream_timeout: Duration,
+    self_test_physical_role: post_await_self_test::PhysicalRole,
 ) -> Result<SentUpstreamResponse, ProxyError> {
     let (attempt_id, attempt_number, attempt_started_at_unix_ms) = attempt;
     let request_deadline = Some(runtime.request_deadline.instant());
@@ -12513,6 +12640,8 @@ async fn send_shielded_upstream_attempt(
         model_id: None,
         request_deadline,
         stuck_watchdog_request: runtime.stuck_watchdog_request.as_ref(),
+        post_await_self_test: runtime.post_await_self_test.as_ref(),
+        self_test_physical_role,
     })
     .await
 }
@@ -15115,6 +15244,7 @@ struct ShieldedLivenessBodySettings {
     accepted_response_mode: ShieldedAcceptedResponseMode,
     response_model_alias: Option<String>,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
+    post_await_self_test: Option<post_await_self_test::Context>,
 }
 
 struct ShieldedLivenessBody {
@@ -15130,6 +15260,8 @@ struct ShieldedLivenessBody {
     downstream_drop_signal: DownstreamDropSignal,
     downstream_commit_signal: DownstreamCommitSignal,
     upstream_failure_counters: Arc<UpstreamFailureCounters>,
+    post_await_self_test: Option<post_await_self_test::Context>,
+    post_await_emit: Option<Pin<Box<oneshot::Receiver<()>>>>,
     bytes_seen: u64,
     terminal_completion: Option<BodyCompletion>,
 }
@@ -15144,6 +15276,11 @@ impl ShieldedLivenessBody {
         downstream_drop_signal: DownstreamDropSignal,
         downstream_commit_signal: DownstreamCommitSignal,
     ) -> Self {
+        let post_await_emit = settings
+            .post_await_self_test
+            .as_ref()
+            .and_then(post_await_self_test::Context::take_emit_receiver)
+            .map(Box::pin);
         Self {
             aggregate,
             direct_stream: None,
@@ -15157,6 +15294,8 @@ impl ShieldedLivenessBody {
             downstream_drop_signal,
             downstream_commit_signal,
             upstream_failure_counters: settings.upstream_failure_counters.clone(),
+            post_await_self_test: settings.post_await_self_test.clone(),
+            post_await_emit,
             bytes_seen: 0,
             terminal_completion: None,
         }
@@ -15171,9 +15310,7 @@ impl ShieldedLivenessBody {
     fn count_and_emit(&mut self, bytes: Bytes) -> Poll<Option<Result<Bytes, Infallible>>> {
         let chunk_len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
         self.bytes_seen = self.bytes_seen.saturating_add(chunk_len);
-        if !bytes.is_empty() {
-            self.downstream_commit_signal.mark_committed();
-        }
+        self.downstream_commit_signal.observe_emitted_bytes(&bytes);
         Poll::Ready(Some(Ok(bytes)))
     }
 
@@ -15380,6 +15517,22 @@ impl Stream for ShieldedLivenessBody {
             Poll::Pending => {}
         }
 
+        if let Some(receiver) = &mut this.post_await_emit {
+            match receiver.as_mut().poll(cx) {
+                Poll::Ready(Ok(())) => {
+                    this.post_await_emit = None;
+                    let self_test = this.post_await_self_test.clone();
+                    let emitted = this.count_and_emit(heartbeat_chunk(ShieldedLivenessMode::Sse));
+                    if let Some(self_test) = self_test {
+                        self_test.mark_body_emitted();
+                    }
+                    return emitted;
+                }
+                Poll::Ready(Err(_closed)) => this.post_await_emit = None,
+                Poll::Pending => {}
+            }
+        }
+
         // The aggregate owns every replay decision.  Any liveness byte would commit the
         // downstream response before that decision is final, so keep the body silent until
         // it can emit an accepted result, terminal response, or direct-relay content.
@@ -15506,6 +15659,14 @@ fn shielded_chat_stream_response_headers(
         HeaderValue::from_static("no"),
     );
     headers
+}
+
+fn heartbeat_chunk(mode: ShieldedLivenessMode) -> Bytes {
+    match mode {
+        ShieldedLivenessMode::Sse => Bytes::from_static(b": llm-guard-proxy heartbeat\n\n"),
+        ShieldedLivenessMode::JsonWhitespace => Bytes::from_static(b" \n"),
+        ShieldedLivenessMode::Disabled => Bytes::new(),
+    }
 }
 
 fn sse_final_frame(body: &Bytes) -> Bytes {

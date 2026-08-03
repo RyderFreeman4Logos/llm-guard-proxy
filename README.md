@@ -62,6 +62,20 @@ with sufficient memory can raise it explicitly without weakening any gate:
 LLM_GUARD_LOCAL_JOBS=4 LLM_GUARD_LOCAL_TEST_THREADS=4 just pre-push
 ```
 
+## Offline Release Self-Test
+
+Run the recovery invariant check with the same executable shipped for `serve`:
+
+```bash
+./target/release/llm-guard-proxy self-test post-await-no-replay
+```
+
+The explicit subcommand reads no config or credentials, runs no restart command, and
+uses only private loopback listeners. Its metadata-only JSON records a control arm
+(business request → readiness probe → successful replay) and a committed arm whose
+real heartbeat crosses the recovery await and blocks both readiness and replay.
+Normal serve options do not expose this self-test hook.
+
 ## GB10 Compatibility Smoke
 
 Run the live GB10 compatibility smoke from this repository with:

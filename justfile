@@ -35,6 +35,9 @@ fmt:
 fmt-check:
     {{_io_prefix}} cargo fmt --all -- --check
 
+build-release:
+    {{_io_prefix}} cargo build --release --all-features -p llm-guard-proxy
+
 contracts:
     python3 -m unittest discover -s tests -p 'test_*.py' -v
 

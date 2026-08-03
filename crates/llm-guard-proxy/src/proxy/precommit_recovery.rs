@@ -4,7 +4,7 @@
 //! downstream byte. It owns the per-request recovery budget and the mandatory
 //! post-await commit/drop rechecks.
 
-use std::pin::Pin;
+use std::{collections::BTreeMap, pin::Pin};
 
 use axum::{
     body::Bytes,
@@ -88,6 +88,7 @@ pub(super) struct Context<'request> {
     pub(super) downstream_commit_signal: Option<&'request DownstreamCommitSignal>,
     pub(super) downstream_drop_signal: Option<&'request DownstreamDropSignal>,
     pub(super) request_deadline: RequestDeadline,
+    pub(super) post_await_self_test: Option<&'request super::post_await_self_test::Context>,
     pub(super) episode_timeout: Option<Duration>,
 }
 
@@ -110,12 +111,11 @@ pub(super) async fn gate(
             | LocalRecoveryCause::UpstreamStall
             | LocalRecoveryCause::StuckWatchdog
     );
+    let recovery_is_configured =
+        context.policy.enabled && !context.policy.restart_command.is_empty();
     if (!can_retry && !allow_without_ladder)
-        || (!context.policy.enabled && context.policy.restart_command.is_empty())
+        || (!recovery_is_configured && context.post_await_self_test.is_none())
     {
-        return unapplied_local_recovery_gate();
-    }
-    if !context.policy.enabled || context.policy.restart_command.is_empty() {
         return unapplied_local_recovery_gate();
     }
 
@@ -157,6 +157,9 @@ pub(super) async fn gate(
         String::from("local_recovery_request_attempts_used"),
         previous_attempts.saturating_add(1).to_string(),
     );
+    if let Some(self_test) = context.post_await_self_test {
+        self_test.mark_pre_await_gate();
+    }
 
     let recovery_metadata = run_local_recovery_for_profile_observing(
         context.policy,
@@ -169,24 +172,35 @@ pub(super) async fn gate(
             caller_timeout: Some(remaining_request_budget),
             recovery_episode_observer: None,
             downstream_commit_signal: context.downstream_commit_signal.cloned(),
+            post_await_self_test: context.post_await_self_test.cloned(),
         },
     )
     .await;
     metadata.extend(recovery_metadata);
+    gate_after_recovery(
+        context.downstream_commit_signal,
+        context.downstream_drop_signal,
+        context.request_deadline,
+        metadata,
+    )
+}
 
-    if context
-        .downstream_drop_signal
-        .is_some_and(DownstreamDropSignal::is_dropped)
-    {
+pub(super) fn gate_after_recovery(
+    downstream_commit_signal: Option<&DownstreamCommitSignal>,
+    downstream_drop_signal: Option<&DownstreamDropSignal>,
+    request_deadline: RequestDeadline,
+    mut metadata: BTreeMap<String, String>,
+) -> LocalRecoveryGate {
+    if downstream_drop_signal.is_some_and(DownstreamDropSignal::is_dropped) {
         return skipped_local_recovery_gate(metadata, "skipped_downstream_dropped", false);
     }
-    if local_recovery_downstream_commit_observed(context.downstream_commit_signal, &mut metadata) {
+    if local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata) {
         return skipped_local_recovery_gate(metadata, "skipped_downstream_committed", false);
     }
 
     let permits_retry = local_recovery_permits_retry(&metadata);
     let permits_replay =
-        local_recovery_completed_ready(&metadata) && !context.request_deadline.is_exhausted();
+        local_recovery_completed_ready(&metadata) && !request_deadline.is_exhausted();
     metadata.insert(
         String::from("local_recovery_permits_retry"),
         permits_retry.to_string(),

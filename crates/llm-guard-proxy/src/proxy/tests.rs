@@ -6361,7 +6361,7 @@ downstream_drop_policy = "detach"
     let response = proxy
         .client
         .post(format!(
-            "{}/v1/chat/completions?test=loop-once-shadow-timeout-then-success&id=drop",
+            "{}/v1/chat/completions?test=loop-once-shadow-timeout-then-slow-success&id=drop",
             proxy.base_url
         ))
         .header(CONTENT_TYPE, "application/json")
@@ -22041,6 +22041,15 @@ fn fake_compat_and_loop_once_chat_completion_response(
     if path_and_query.contains("test=loop-once-shadow-timeout-then-success") {
         if body_contains_retry_hint(body) {
             return Some(chat_completion_sse_response(body));
+        }
+        if next_fake_attempt_count(state, path_and_query) == 1 {
+            return Some(repeated_reasoning_line_sse_response(200));
+        }
+        return Some(stalled_chat_completion_sse_response());
+    }
+    if path_and_query.contains("test=loop-once-shadow-timeout-then-slow-success") {
+        if body_contains_retry_hint(body) {
+            return Some(slow_chat_completion_sse_response(body));
         }
         if next_fake_attempt_count(state, path_and_query) == 1 {
             return Some(repeated_reasoning_line_sse_response(200));

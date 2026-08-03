@@ -1300,6 +1300,7 @@ async fn singleflight_joiner_deadline_expires_without_late_replay_permit() {
             attempts: &attempts,
             downstream_commit_signal: None,
             downstream_drop_signal: None,
+            post_await_self_test: None,
             request_deadline,
             episode_timeout: None,
         },
