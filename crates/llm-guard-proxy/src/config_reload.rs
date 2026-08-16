@@ -335,7 +335,11 @@ fn read_stable_source(
         })?;
     if before != after || after != published {
         if let Some(observed) = observed {
-            *observed = Some(published);
+            *observed = Some(if before.same_identity(&published) {
+                before
+            } else {
+                published
+            });
         }
         return Err(ConfigReloadError::UnstableGeneration {
             path: path.to_path_buf(),
@@ -808,6 +812,76 @@ mod tests {
         let error = manager
             .reload()
             .expect_err("unchanged in-place partial reload must remain rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_identity_change_during_capture_remains_rejected() {
+        let path = unique_test_path("same-identity-change.toml");
+        fs::write(&path, "[heartbeat]\ninterval_secs = 4\n").expect("write initial config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let before = manager.handle().snapshot().expect("initial snapshot");
+        let fifo = path.with_extension("fifo");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should start");
+        assert!(status.success(), "mkfifo should create the capture fixture");
+        fs::rename(&fifo, &path).expect("replace source with fifo");
+
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            let mut open_fifo = OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open fifo after reload reader");
+            open_fifo
+                .write_all(b"[heartbeat]\n")
+                .expect("start source generation");
+            let mode = fs::metadata(&writer_path)
+                .expect("capture source metadata")
+                .permissions()
+                .mode();
+            fs::set_permissions(&writer_path, fs::Permissions::from_mode(mode ^ 0o100))
+                .expect("mutate capture source identity generation");
+            open_fifo
+                .write_all(b"interval_secs = 6\n")
+                .expect("finish mutated source generation");
+        });
+
+        let error = manager
+            .reload()
+            .expect_err("same-identity change during capture must be rejected");
+        writer.join().expect("capture writer should finish");
+        assert!(matches!(
+            error,
+            ConfigReloadError::UnstableGeneration { .. }
+        ));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            let mut open_fifo = OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open fifo after second reload reader");
+            open_fifo
+                .write_all(b"[heartbeat]\ninterval_secs = 6\n")
+                .expect("write unchanged mutated source generation");
+        });
+        let error = manager
+            .reload()
+            .expect_err("unchanged same-identity mutation must remain rejected");
+        writer.join().expect("second capture writer should finish");
         assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
         assert_eq!(
             manager.handle().snapshot().expect("retained snapshot"),
