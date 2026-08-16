@@ -1,12 +1,17 @@
 //! Filesystem-backed configuration loading and polling for the service.
 
 use std::{
-    env, fs, io,
+    env,
+    fs::{self, File, Metadata},
+    io::{self, Read},
     path::{Path, PathBuf},
-    sync::{Arc, RwLock, mpsc},
+    sync::{Arc, Mutex, RwLock, mpsc},
     thread::{self, JoinHandle},
     time::Duration,
 };
+
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 
 use llm_guard_proxy_core::{
     AppConfig, ConfigHandle, ConfigHandleError, ConfigParseError, ReloadOutcome, ValidationError,
@@ -45,6 +50,15 @@ pub enum ConfigReloadError {
         path: PathBuf,
         source: ValidationError,
     },
+    /// A reload source was empty after a config had already been loaded.
+    #[error("empty config generation at {path}")]
+    EmptyGeneration { path: PathBuf },
+    /// A reload modified the previously accepted file in place.
+    #[error("in-place config update rejected at {path}; publish changes by atomic replacement")]
+    InPlaceUpdate { path: PathBuf },
+    /// The source identity or metadata changed while it was being read.
+    #[error("unstable config generation rejected at {path}")]
+    UnstableGeneration { path: PathBuf },
     /// Shared config or reload-health state was poisoned by a panic.
     #[error("config state lock is poisoned")]
     LockPoisoned,
@@ -66,9 +80,10 @@ impl From<ConfigHandleError> for ConfigReloadError {
 #[derive(Clone, Debug)]
 pub struct ConfigManager {
     path: PathBuf,
-    missing_policy: MissingConfigPolicy,
     handle: ConfigHandle,
     last_error: Arc<RwLock<Option<String>>>,
+    source_generation: Arc<Mutex<Option<SourceGeneration>>>,
+    observed_generation: Arc<Mutex<Option<SourceGeneration>>>,
 }
 
 impl ConfigManager {
@@ -88,12 +103,13 @@ impl ConfigManager {
         missing_policy: MissingConfigPolicy,
     ) -> Result<Self, ConfigReloadError> {
         let path = path.into();
-        let config = load_config(&path, missing_policy)?;
+        let (config, source_generation) = load_initial_config(&path, missing_policy)?;
         Ok(Self {
             path,
-            missing_policy,
             handle: ConfigHandle::new(config),
             last_error: Arc::new(RwLock::new(None)),
+            source_generation: Arc::new(Mutex::new(source_generation)),
+            observed_generation: Arc::new(Mutex::new(source_generation)),
         })
     }
 
@@ -125,10 +141,20 @@ impl ConfigManager {
 
     /// Reloads the source and atomically applies its reloadable settings.
     pub(crate) fn reload(&self) -> Result<ReloadOutcome, ConfigReloadError> {
-        let requested = load_config(&self.path, self.missing_policy).inspect_err(|error| {
-            self.set_last_error(Some(error.to_string()));
-        })?;
+        let mut source_generation = self
+            .source_generation
+            .lock()
+            .map_err(|_error| ConfigReloadError::LockPoisoned)?;
+        let mut observed_generation = self
+            .observed_generation
+            .lock()
+            .map_err(|_error| ConfigReloadError::LockPoisoned)?;
+        let (requested, requested_generation) =
+            load_reload_config(&self.path, &mut observed_generation).inspect_err(|error| {
+                self.set_last_error(Some(error.to_string()));
+            })?;
         let outcome = self.handle.apply_reloadable(&requested)?;
+        *source_generation = Some(requested_generation);
         self.set_last_error(None);
         Ok(outcome)
     }
@@ -215,12 +241,12 @@ fn default_config_path_from_home(
     Ok(PathBuf::from(home).join(DEFAULT_CONFIG_RELATIVE_PATH))
 }
 
-fn load_config(
+fn load_initial_config(
     path: &Path,
     missing_policy: MissingConfigPolicy,
-) -> Result<AppConfig, ConfigReloadError> {
-    let contents = match fs::read_to_string(path) {
-        Ok(contents) => contents,
+) -> Result<(AppConfig, Option<SourceGeneration>), ConfigReloadError> {
+    let source = match File::open(path) {
+        Ok(source) => source,
         Err(source)
             if source.kind() == io::ErrorKind::NotFound
                 && missing_policy == MissingConfigPolicy::UseDefaults =>
@@ -228,7 +254,7 @@ fn load_config(
             let mut config = AppConfig::default();
             materialize_evidence_path_defaults(&mut config);
             validate_config(path, &config)?;
-            return Ok(config);
+            return Ok((config, None));
         }
         Err(source) => {
             return Err(ConfigReloadError::Read {
@@ -237,10 +263,102 @@ fn load_config(
             });
         }
     };
+    let (contents, generation) = read_stable_source(path, source, None)?;
+    Ok((
+        parse_config(path, &decode_config_source(path, contents)?)?,
+        Some(generation),
+    ))
+}
 
+fn load_reload_config(
+    path: &Path,
+    previous: &mut Option<SourceGeneration>,
+) -> Result<(AppConfig, SourceGeneration), ConfigReloadError> {
+    let source = File::open(path).map_err(|source| ConfigReloadError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let (contents, generation) = read_stable_source(path, source, Some(previous))?;
+    let in_place_update = previous
+        .as_ref()
+        .is_some_and(|observed| observed.same_identity(&generation) && observed != &generation);
+    if in_place_update {
+        return Err(ConfigReloadError::InPlaceUpdate {
+            path: path.to_path_buf(),
+        });
+    }
+    if previous
+        .as_ref()
+        .is_none_or(|observed| !observed.same_identity(&generation))
+    {
+        *previous = Some(generation);
+    }
+    let contents = decode_config_source(path, contents)?;
+    if contents.trim().is_empty() {
+        return Err(ConfigReloadError::EmptyGeneration {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok((parse_config(path, &contents)?, generation))
+}
+fn read_stable_source(
+    path: &Path,
+    mut source: File,
+    observed: Option<&mut Option<SourceGeneration>>,
+) -> Result<(Vec<u8>, SourceGeneration), ConfigReloadError> {
+    let before = source
+        .metadata()
+        .map(|metadata| SourceGeneration::from(&metadata))
+        .map_err(|source| ConfigReloadError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let mut contents = Vec::new();
+    source
+        .read_to_end(&mut contents)
+        .map_err(|source| ConfigReloadError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let after = source
+        .metadata()
+        .map(|metadata| SourceGeneration::from(&metadata))
+        .map_err(|source| ConfigReloadError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let published = fs::metadata(path)
+        .map(|metadata| SourceGeneration::from(&metadata))
+        .map_err(|source| ConfigReloadError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if before != after || after != published {
+        if let Some(observed) = observed {
+            *observed = Some(if before.same_identity(&published) {
+                before
+            } else {
+                published
+            });
+        }
+        return Err(ConfigReloadError::UnstableGeneration {
+            path: path.to_path_buf(),
+        });
+    }
+    Ok((contents, published))
+}
+
+fn decode_config_source(path: &Path, contents: Vec<u8>) -> Result<String, ConfigReloadError> {
+    String::from_utf8(contents).map_err(|source| ConfigReloadError::Read {
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidData, source),
+    })
+}
+
+fn parse_config(path: &Path, contents: &str) -> Result<AppConfig, ConfigReloadError> {
     let mut defaults = AppConfig::default();
     materialize_evidence_path_defaults(&mut defaults);
-    let config = AppConfig::parse_with_defaults(&contents, defaults).map_err(|source| {
+    let config = AppConfig::parse_with_defaults(contents, defaults).map_err(|source| {
         ConfigReloadError::Parse {
             path: path.to_path_buf(),
             source,
@@ -248,6 +366,68 @@ fn load_config(
     })?;
     validate_config(path, &config)?;
     Ok(config)
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceGeneration {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+#[cfg(unix)]
+impl From<&Metadata> for SourceGeneration {
+    fn from(metadata: &Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl SourceGeneration {
+    fn same_identity(&self, other: &Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+}
+
+#[cfg(not(unix))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SourceGeneration {
+    created: Option<std::time::SystemTime>,
+    modified: Option<std::time::SystemTime>,
+    size: u64,
+}
+
+#[cfg(not(unix))]
+impl From<&Metadata> for SourceGeneration {
+    fn from(metadata: &Metadata) -> Self {
+        Self {
+            created: metadata.created().ok(),
+            modified: metadata.modified().ok(),
+            size: metadata.len(),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl SourceGeneration {
+    fn same_identity(&self, other: &Self) -> bool {
+        self.created == other.created
+    }
 }
 
 fn validate_config(path: &Path, config: &AppConfig) -> Result<(), ConfigReloadError> {
@@ -276,11 +456,13 @@ fn poll_reloads(manager: &ConfigManager, stop_rx: &mpsc::Receiver<()>, interval:
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::{
         ffi::OsString,
-        fs,
+        fs::{self, OpenOptions},
+        io::Write,
         path::{Path, PathBuf},
+        process::Command,
         sync::atomic::{AtomicU64, Ordering},
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
@@ -349,11 +531,10 @@ mod tests {
         .expect("write initial config");
         let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
 
-        fs::write(
+        replace_config_atomically(
             &path,
             "[server]\nport = 19000\nmax_in_flight_requests = 2\n",
-        )
-        .expect("write reload config");
+        );
         let outcome = manager.reload().expect("reload should succeed");
         let snapshot = manager.handle().snapshot().expect("snapshot");
         assert!(outcome.applied);
@@ -362,17 +543,431 @@ mod tests {
         assert_eq!(snapshot.server.max_in_flight_requests, 2);
         assert_eq!(manager.last_error().expect("reload health"), None);
 
-        fs::write(&path, "not toml").expect("write broken reload");
+        replace_config_atomically(&path, "not toml");
         manager.reload().expect_err("broken reload should fail");
         assert!(manager.last_error().expect("reload health").is_some());
         assert_eq!(manager.handle().snapshot().expect("snapshot"), snapshot);
 
-        fs::write(
+        replace_config_atomically(
             &path,
             "[server]\nport = 18009\nmax_in_flight_requests = 3\n",
-        )
-        .expect("write recovered reload");
+        );
         manager.reload().expect("recovered reload should succeed");
+        assert_eq!(manager.last_error().expect("reload health"), None);
+        remove_file(&path);
+    }
+
+    #[test]
+    fn missing_reload_retains_last_good_until_atomic_recovery() {
+        let path = unique_test_path("missing-reload.toml");
+        fs::write(&path, "[heartbeat]\ninterval_secs = 4\n").expect("write initial config");
+        let manager = ConfigManager::from_path_with_policy(&path, MissingConfigPolicy::UseDefaults)
+            .expect("load initial config");
+        let before = manager.handle().snapshot().expect("initial snapshot");
+
+        fs::remove_file(&path).expect("remove config");
+        let error = manager
+            .reload()
+            .expect_err("missing reload must be rejected");
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        assert_eq!(
+            manager.last_error().expect("reload health"),
+            Some(error.to_string())
+        );
+
+        replace_config_atomically(&path, "[heartbeat]\ninterval_secs = 6\n");
+        let outcome = manager.reload().expect("atomic recovery should reload");
+        assert!(outcome.applied);
+        assert_eq!(
+            manager
+                .handle()
+                .snapshot()
+                .expect("recovered snapshot")
+                .heartbeat
+                .interval_secs,
+            6
+        );
+        assert_eq!(manager.last_error().expect("reload health"), None);
+        remove_file(&path);
+    }
+
+    #[test]
+    fn empty_reload_retains_last_good() {
+        let path = unique_test_path("empty-reload.toml");
+        fs::write(&path, "[heartbeat]\ninterval_secs = 4\n").expect("write initial config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let before = manager.handle().snapshot().expect("initial snapshot");
+
+        replace_config_atomically(&path, "");
+        let error = manager.reload().expect_err("empty reload must be rejected");
+        assert!(error.to_string().contains("empty config"));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        assert_eq!(
+            manager.last_error().expect("reload health"),
+            Some(error.to_string())
+        );
+        remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_replacement_in_place_rewrite_retains_last_good_until_atomic_recovery() {
+        let path = unique_test_path("rejected-replacement-rewrite.toml");
+        fs::write(
+            &path,
+            "[shielding]\nenabled = false\n[heartbeat]\ninterval_secs = 4\n",
+        )
+        .expect("write initial config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let before = manager.handle().snapshot().expect("initial snapshot");
+
+        replace_config_atomically(&path, "");
+        let error = manager
+            .reload()
+            .expect_err("empty replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::EmptyGeneration { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        let replacement_inode = fs::metadata(&path).expect("replacement metadata").ino();
+        fs::write(&path, "[heartbeat]\ninterval_secs = 6\n")
+            .expect("rewrite rejected replacement in place");
+        assert_eq!(
+            fs::metadata(&path).expect("rewritten metadata").ino(),
+            replacement_inode
+        );
+        let error = manager
+            .reload()
+            .expect_err("in-place rewrite of rejected replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        let error = manager
+            .reload()
+            .expect_err("unchanged in-place rewrite must remain rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        replace_config_atomically(&path, "not toml");
+        let error = manager
+            .reload()
+            .expect_err("invalid replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::Parse { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        let invalid_replacement_inode = fs::metadata(&path).expect("invalid metadata").ino();
+        fs::write(&path, "[heartbeat]\ninterval_secs = 7\n")
+            .expect("rewrite invalid replacement in place");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("rewritten invalid metadata")
+                .ino(),
+            invalid_replacement_inode
+        );
+        let error = manager
+            .reload()
+            .expect_err("in-place rewrite of invalid replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        let error = manager
+            .reload()
+            .expect_err("unchanged invalid replacement rewrite must remain rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        replace_config_atomically(
+            &path,
+            "[shielding]\nenabled = false\n[heartbeat]\ninterval_secs = 8\n",
+        );
+        let outcome = manager.reload().expect("atomic recovery should reload");
+        assert!(outcome.applied);
+        assert_eq!(
+            manager
+                .handle()
+                .snapshot()
+                .expect("recovered snapshot")
+                .heartbeat
+                .interval_secs,
+            8
+        );
+        assert_eq!(manager.last_error().expect("reload health"), None);
+        remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_invalid_utf8_replacement_rewrite_retains_last_good_until_atomic_recovery() {
+        let path = unique_test_path("rejected-invalid-utf8-rewrite.toml");
+        fs::write(
+            &path,
+            "[shielding]\nenabled = false\n[heartbeat]\ninterval_secs = 4\n",
+        )
+        .expect("write initial config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let before = manager.handle().snapshot().expect("initial snapshot");
+
+        replace_config_atomically(&path, b"\xff");
+        let error = manager
+            .reload()
+            .expect_err("invalid UTF-8 replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::Read { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        let invalid_utf8_replacement_inode =
+            fs::metadata(&path).expect("invalid UTF-8 metadata").ino();
+        fs::write(&path, "[heartbeat]\ninterval_secs = 7\n")
+            .expect("rewrite invalid UTF-8 replacement in place");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("rewritten invalid UTF-8 metadata")
+                .ino(),
+            invalid_utf8_replacement_inode
+        );
+        let error = manager
+            .reload()
+            .expect_err("in-place rewrite of invalid UTF-8 replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        let error = manager
+            .reload()
+            .expect_err("unchanged invalid UTF-8 rewrite must remain rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        replace_config_atomically(
+            &path,
+            "[shielding]\nenabled = false\n[heartbeat]\ninterval_secs = 8\n",
+        );
+        let outcome = manager.reload().expect("atomic recovery should reload");
+        assert!(outcome.applied);
+        assert_eq!(
+            manager
+                .handle()
+                .snapshot()
+                .expect("recovered snapshot")
+                .heartbeat
+                .interval_secs,
+            8
+        );
+        assert_eq!(manager.last_error().expect("reload health"), None);
+        remove_file(&path);
+    }
+
+    #[test]
+    fn in_place_partial_reload_retains_last_good() {
+        let path = unique_test_path("in-place-partial.toml");
+        fs::write(
+            &path,
+            "[shielding]\nenabled = false\n[heartbeat]\ninterval_secs = 4\n",
+        )
+        .expect("write initial config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let before = manager.handle().snapshot().expect("initial snapshot");
+
+        fs::write(&path, "[heartbeat]\ninterval_secs = 6\n")
+            .expect("write syntactically complete partial config");
+        let error = manager
+            .reload()
+            .expect_err("in-place partial reload must be rejected");
+        assert!(error.to_string().contains("in-place config update"));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        assert_eq!(
+            manager.last_error().expect("reload health"),
+            Some(error.to_string())
+        );
+        let error = manager
+            .reload()
+            .expect_err("unchanged in-place partial reload must remain rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn same_identity_change_during_capture_remains_rejected() {
+        let path = unique_test_path("same-identity-change.toml");
+        fs::write(&path, "[heartbeat]\ninterval_secs = 4\n").expect("write initial config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let before = manager.handle().snapshot().expect("initial snapshot");
+        let fifo = path.with_extension("fifo");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should start");
+        assert!(status.success(), "mkfifo should create the capture fixture");
+        fs::rename(&fifo, &path).expect("replace source with fifo");
+
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            let mut open_fifo = OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open fifo after reload reader");
+            open_fifo
+                .write_all(b"[heartbeat]\n")
+                .expect("start source generation");
+            let mode = fs::metadata(&writer_path)
+                .expect("capture source metadata")
+                .permissions()
+                .mode();
+            fs::set_permissions(&writer_path, fs::Permissions::from_mode(mode ^ 0o100))
+                .expect("mutate capture source identity generation");
+            open_fifo
+                .write_all(b"interval_secs = 6\n")
+                .expect("finish mutated source generation");
+        });
+
+        let error = manager
+            .reload()
+            .expect_err("same-identity change during capture must be rejected");
+        writer.join().expect("capture writer should finish");
+        assert!(matches!(
+            error,
+            ConfigReloadError::UnstableGeneration { .. }
+        ));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            let mut open_fifo = OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open fifo after second reload reader");
+            open_fifo
+                .write_all(b"[heartbeat]\ninterval_secs = 6\n")
+                .expect("write unchanged mutated source generation");
+        });
+        let error = manager
+            .reload()
+            .expect_err("unchanged same-identity mutation must remain rejected");
+        writer.join().expect("second capture writer should finish");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identity_change_during_capture_retains_last_good() {
+        let path = unique_test_path("identity-change.toml");
+        fs::write(&path, "[heartbeat]\ninterval_secs = 4\n").expect("write initial config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let before = manager.handle().snapshot().expect("initial snapshot");
+        let fifo = path.with_extension("fifo");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should start");
+        assert!(status.success(), "mkfifo should create the capture fixture");
+        fs::rename(&fifo, &path).expect("replace source with fifo");
+
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || {
+            let mut open_fifo = OpenOptions::new()
+                .write(true)
+                .open(&writer_path)
+                .expect("open fifo after reload reader");
+            replace_config_atomically(&writer_path, "[heartbeat]\ninterval_secs = 8\n");
+            open_fifo
+                .write_all(b"[heartbeat]\ninterval_secs = 6\n")
+                .expect("finish old source generation");
+        });
+
+        let error = manager
+            .reload()
+            .expect_err("identity change during capture must be rejected");
+        writer.join().expect("capture writer should finish");
+        assert!(error.to_string().contains("unstable config generation"));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        assert_eq!(
+            manager.last_error().expect("reload health"),
+            Some(error.to_string())
+        );
+        let replacement_inode = fs::metadata(&path).expect("replacement metadata").ino();
+        fs::write(&path, "[heartbeat]\ninterval_secs = 70\n")
+            .expect("rewrite published replacement in place");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("rewritten replacement metadata")
+                .ino(),
+            replacement_inode
+        );
+        let error = manager
+            .reload()
+            .expect_err("in-place rewrite of published replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        let error = manager
+            .reload()
+            .expect_err("unchanged published replacement rewrite must remain rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        replace_config_atomically(&path, "[heartbeat]\ninterval_secs = 9\n");
+        let outcome = manager.reload().expect("atomic recovery should reload");
+        assert!(outcome.applied);
+        assert_eq!(
+            manager
+                .handle()
+                .snapshot()
+                .expect("recovered snapshot")
+                .heartbeat
+                .interval_secs,
+            9
+        );
         assert_eq!(manager.last_error().expect("reload health"), None);
         remove_file(&path);
     }
@@ -417,15 +1012,15 @@ mod tests {
         fs::create_dir_all(&root).expect("create unsafe evidence parent");
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755))
             .expect("set unsafe evidence permissions");
-        fs::write(
+        replace_config_atomically(
             &path,
             format!(
                 "[heartbeat]\ninterval_secs = 4\n[evidence]\nsqlite_path = \"{}\"\nblob_cache_dir = \"{}\"\n",
                 root.join("evidence.sqlite3").display(),
                 root.join("blobs").display()
-            ),
-        )
-        .expect("write unsafe reload config");
+            )
+            .as_str(),
+        );
 
         manager.reload().expect_err("unsafe reload should fail");
         assert_eq!(manager.handle().snapshot().expect("snapshot"), before);
@@ -584,7 +1179,7 @@ mod tests {
 
     static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn replace_config_atomically(path: &Path, contents: &str) {
+    fn replace_config_atomically(path: &Path, contents: impl AsRef<[u8]>) {
         let replacement = path.with_extension(format!(
             "replacement-{}",
             TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)

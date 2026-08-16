@@ -23197,8 +23197,12 @@ sqlite_path = "{budget_sqlite_path}"
     );
     #[cfg(not(feature = "guard"))]
     let budget_section = String::new();
+    let replacement = options.config_path.with_extension(format!(
+        "replacement-{}",
+        TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     fs::write(
-        options.config_path,
+        &replacement,
         format!(
             r#"
 [server]
@@ -23247,6 +23251,7 @@ blob_cache_dir = "{blob_cache_dir}"
         ),
     )
     .expect("test config should be written");
+    fs::rename(replacement, options.config_path).expect("test config should publish atomically");
 }
 
 fn unique_test_dir(name: &str) -> PathBuf {
