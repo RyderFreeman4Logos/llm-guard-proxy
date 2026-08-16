@@ -12,6 +12,8 @@ use std::{
 
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(test)]
+use std::sync::{Barrier, OnceLock};
 
 use llm_guard_proxy_core::{
     AppConfig, ConfigHandle, ConfigHandleError, ConfigParseError, ReloadOutcome,
@@ -20,6 +22,17 @@ use llm_guard_proxy_core::{
 use llm_guard_proxy_state::{materialize_evidence_path_defaults, preflight_evidence_paths};
 
 const DEFAULT_CONFIG_RELATIVE_PATH: &str = ".config/llm-guard-proxy/config.toml";
+
+#[cfg(test)]
+type SourceCaptureBarrier = (PathBuf, Arc<Barrier>);
+
+#[cfg(test)]
+static SOURCE_CAPTURE_BARRIER: OnceLock<Mutex<Option<SourceCaptureBarrier>>> = OnceLock::new();
+
+#[cfg(test)]
+fn source_capture_barrier() -> &'static Mutex<Option<SourceCaptureBarrier>> {
+    SOURCE_CAPTURE_BARRIER.get_or_init(|| Mutex::new(None))
+}
 
 /// Missing-file behavior for a configuration source.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -397,6 +410,15 @@ fn read_stable_source(
             path: path.to_path_buf(),
             source,
         })?;
+    #[cfg(test)]
+    if let Some((capture_path, barrier)) = source_capture_barrier()
+        .lock()
+        .map_err(|_error| ConfigReloadError::LockPoisoned)?
+        .clone()
+        && capture_path == path
+    {
+        barrier.wait();
+    }
     let mut contents = Vec::new();
     source
         .read_to_end(&mut contents)
@@ -545,7 +567,10 @@ mod tests {
         io::Write,
         path::{Path, PathBuf},
         process::Command,
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicU64, Ordering},
+        },
         thread,
         time::{Duration, SystemTime, UNIX_EPOCH},
     };
@@ -555,7 +580,7 @@ mod tests {
 
     use super::{
         ConfigManager, ConfigReloadError, MissingConfigPolicy, ReloadTerminalState,
-        default_config_path_from_home,
+        default_config_path_from_home, source_capture_barrier,
     };
 
     #[test]
@@ -918,15 +943,18 @@ mod tests {
         assert!(status.success(), "mkfifo should create the capture fixture");
         fs::rename(&fifo, &path).expect("replace source with fifo");
 
+        let capture_barrier = Arc::new(Barrier::new(2));
+        *source_capture_barrier()
+            .lock()
+            .expect("install capture barrier") = Some((path.clone(), Arc::clone(&capture_barrier)));
+
         let writer_path = path.clone();
         let writer = thread::spawn(move || {
             let mut open_fifo = OpenOptions::new()
                 .write(true)
                 .open(&writer_path)
                 .expect("open fifo after reload reader");
-            open_fifo
-                .write_all(b"[heartbeat]\n")
-                .expect("start source generation");
+            capture_barrier.wait();
             let mode = fs::metadata(&writer_path)
                 .expect("capture source metadata")
                 .permissions()
@@ -934,13 +962,15 @@ mod tests {
             fs::set_permissions(&writer_path, fs::Permissions::from_mode(mode ^ 0o100))
                 .expect("mutate capture source identity generation");
             open_fifo
-                .write_all(b"interval_secs = 6\n")
+                .write_all(b"[heartbeat]\ninterval_secs = 6\n")
                 .expect("finish mutated source generation");
         });
 
-        let error = manager
-            .reload()
-            .expect_err("same-identity change during capture must be rejected");
+        let outcome = manager.reload();
+        *source_capture_barrier()
+            .lock()
+            .expect("clear capture barrier") = None;
+        let error = outcome.expect_err("same-identity change during capture must be rejected");
         writer.join().expect("capture writer should finish");
         assert!(matches!(
             error,
