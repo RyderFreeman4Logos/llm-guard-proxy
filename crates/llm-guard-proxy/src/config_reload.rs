@@ -263,7 +263,7 @@ fn load_initial_config(
             });
         }
     };
-    let (contents, generation) = read_stable_source(path, source)?;
+    let (contents, generation) = read_stable_source(path, source, None)?;
     Ok((
         parse_config(path, &decode_config_source(path, contents)?)?,
         Some(generation),
@@ -278,7 +278,7 @@ fn load_reload_config(
         path: path.to_path_buf(),
         source,
     })?;
-    let (contents, generation) = read_stable_source(path, source)?;
+    let (contents, generation) = read_stable_source(path, source, Some(previous))?;
     let in_place_update = previous
         .as_ref()
         .is_some_and(|observed| observed.same_identity(&generation) && observed != &generation);
@@ -300,6 +300,7 @@ fn load_reload_config(
 fn read_stable_source(
     path: &Path,
     mut source: File,
+    observed: Option<&mut Option<SourceGeneration>>,
 ) -> Result<(Vec<u8>, SourceGeneration), ConfigReloadError> {
     let before = source
         .metadata()
@@ -329,6 +330,9 @@ fn read_stable_source(
             source,
         })?;
     if before != after || after != published {
+        if let Some(observed) = observed {
+            *observed = Some(published);
+        }
         return Err(ConfigReloadError::UnstableGeneration {
             path: path.to_path_buf(),
         });
@@ -816,6 +820,37 @@ mod tests {
             manager.last_error().expect("reload health"),
             Some(error.to_string())
         );
+        let replacement_inode = fs::metadata(&path).expect("replacement metadata").ino();
+        fs::write(&path, "[heartbeat]\ninterval_secs = 70\n")
+            .expect("rewrite published replacement in place");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("rewritten replacement metadata")
+                .ino(),
+            replacement_inode
+        );
+        let error = manager
+            .reload()
+            .expect_err("in-place rewrite of published replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        replace_config_atomically(&path, "[heartbeat]\ninterval_secs = 9\n");
+        let outcome = manager.reload().expect("atomic recovery should reload");
+        assert!(outcome.applied);
+        assert_eq!(
+            manager
+                .handle()
+                .snapshot()
+                .expect("recovered snapshot")
+                .heartbeat
+                .interval_secs,
+            9
+        );
+        assert_eq!(manager.last_error().expect("reload health"), None);
         remove_file(&path);
     }
 
