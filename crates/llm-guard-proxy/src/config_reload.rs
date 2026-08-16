@@ -264,7 +264,10 @@ fn load_initial_config(
         }
     };
     let (contents, generation) = read_stable_source(path, source)?;
-    Ok((parse_config(path, &contents)?, Some(generation)))
+    Ok((
+        parse_config(path, &decode_config_source(path, contents)?)?,
+        Some(generation),
+    ))
 }
 
 fn load_reload_config(
@@ -280,6 +283,7 @@ fn load_reload_config(
         .as_ref()
         .is_some_and(|observed| observed.same_identity(&generation) && observed != &generation);
     *previous = Some(generation);
+    let contents = decode_config_source(path, contents)?;
     if contents.trim().is_empty() {
         return Err(ConfigReloadError::EmptyGeneration {
             path: path.to_path_buf(),
@@ -296,7 +300,7 @@ fn load_reload_config(
 fn read_stable_source(
     path: &Path,
     mut source: File,
-) -> Result<(String, SourceGeneration), ConfigReloadError> {
+) -> Result<(Vec<u8>, SourceGeneration), ConfigReloadError> {
     let before = source
         .metadata()
         .map(|metadata| SourceGeneration::from(&metadata))
@@ -304,9 +308,9 @@ fn read_stable_source(
             path: path.to_path_buf(),
             source,
         })?;
-    let mut contents = String::new();
+    let mut contents = Vec::new();
     source
-        .read_to_string(&mut contents)
+        .read_to_end(&mut contents)
         .map_err(|source| ConfigReloadError::Read {
             path: path.to_path_buf(),
             source,
@@ -330,6 +334,13 @@ fn read_stable_source(
         });
     }
     Ok((contents, published))
+}
+
+fn decode_config_source(path: &Path, contents: Vec<u8>) -> Result<String, ConfigReloadError> {
+    String::from_utf8(contents).map_err(|source| ConfigReloadError::Read {
+        path: path.to_path_buf(),
+        source: io::Error::new(io::ErrorKind::InvalidData, source),
+    })
 }
 
 fn parse_config(path: &Path, contents: &str) -> Result<AppConfig, ConfigReloadError> {
@@ -677,6 +688,66 @@ mod tests {
         remove_file(&path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejected_invalid_utf8_replacement_rewrite_retains_last_good_until_atomic_recovery() {
+        let path = unique_test_path("rejected-invalid-utf8-rewrite.toml");
+        fs::write(
+            &path,
+            "[shielding]\nenabled = false\n[heartbeat]\ninterval_secs = 4\n",
+        )
+        .expect("write initial config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let before = manager.handle().snapshot().expect("initial snapshot");
+
+        replace_config_atomically(&path, b"\xff");
+        let error = manager
+            .reload()
+            .expect_err("invalid UTF-8 replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::Read { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        let invalid_utf8_replacement_inode =
+            fs::metadata(&path).expect("invalid UTF-8 metadata").ino();
+        fs::write(&path, "[heartbeat]\ninterval_secs = 7\n")
+            .expect("rewrite invalid UTF-8 replacement in place");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("rewritten invalid UTF-8 metadata")
+                .ino(),
+            invalid_utf8_replacement_inode
+        );
+        let error = manager
+            .reload()
+            .expect_err("in-place rewrite of invalid UTF-8 replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        replace_config_atomically(
+            &path,
+            "[shielding]\nenabled = false\n[heartbeat]\ninterval_secs = 8\n",
+        );
+        let outcome = manager.reload().expect("atomic recovery should reload");
+        assert!(outcome.applied);
+        assert_eq!(
+            manager
+                .handle()
+                .snapshot()
+                .expect("recovered snapshot")
+                .heartbeat
+                .interval_secs,
+            8
+        );
+        assert_eq!(manager.last_error().expect("reload health"), None);
+        remove_file(&path);
+    }
+
     #[test]
     fn in_place_partial_reload_retains_last_good() {
         let path = unique_test_path("in-place-partial.toml");
@@ -955,7 +1026,7 @@ mod tests {
 
     static TEST_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    fn replace_config_atomically(path: &Path, contents: &str) {
+    fn replace_config_atomically(path: &Path, contents: impl AsRef<[u8]>) {
         let replacement = path.with_extension(format!(
             "replacement-{}",
             TEST_FILE_COUNTER.fetch_add(1, Ordering::Relaxed)
