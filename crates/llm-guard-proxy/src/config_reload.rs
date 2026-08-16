@@ -196,7 +196,10 @@ impl ConfigManager {
         let current = self.handle.snapshot()?;
         let (projected, mut outcome) = apply_reloadable(&current, &requested);
         if outcome.rejection.is_none() {
-            outcome.rejection = preflight_evidence_paths(&projected).err();
+            outcome.rejection = projected
+                .validate()
+                .and_then(|()| preflight_evidence_paths(&projected))
+                .err();
         }
         if outcome.rejection.is_none() {
             outcome = self.handle.apply_reloadable(&requested)?;

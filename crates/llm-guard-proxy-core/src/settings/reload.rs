@@ -88,16 +88,6 @@ pub fn apply_reloadable(current: &AppConfig, requested: &AppConfig) -> (AppConfi
     let restart_required_changes = current.restart_required_changes(requested);
     let mut next = current.clone();
     next.apply_reloadable_from(requested);
-    if let Err(rejection) = next.validate() {
-        return (
-            current.clone(),
-            ReloadOutcome {
-                applied: false,
-                restart_required_changes,
-                rejection: Some(rejection),
-            },
-        );
-    }
     let applied = next != *current;
     (
         next,
