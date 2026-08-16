@@ -14,7 +14,8 @@ use std::{
 use std::os::unix::fs::MetadataExt;
 
 use llm_guard_proxy_core::{
-    AppConfig, ConfigHandle, ConfigHandleError, ConfigParseError, ReloadOutcome, ValidationError,
+    AppConfig, ConfigHandle, ConfigHandleError, ConfigParseError, ReloadOutcome,
+    RestartRequiredChange, ValidationError, apply_reloadable,
 };
 use llm_guard_proxy_state::{materialize_evidence_path_defaults, preflight_evidence_paths};
 
@@ -76,12 +77,31 @@ impl From<ConfigHandleError> for ConfigReloadError {
     }
 }
 
+/// Terminal result of one config reload attempt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ReloadTerminalState {
+    Applied,
+    NoChange,
+    RestartPending,
+    Rejected(String),
+}
+
+/// Generation-bound reload result paired with its exact live snapshot.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ReloadStatus {
+    pub(crate) attempt_generation: u64,
+    pub(crate) snapshot_generation: u64,
+    pub(crate) snapshot: AppConfig,
+    pub(crate) terminal: ReloadTerminalState,
+    pub(crate) restart_required_changes: Vec<RestartRequiredChange>,
+}
+
 /// Filesystem-backed config source with reload health tracking.
 #[derive(Clone, Debug)]
 pub struct ConfigManager {
     path: PathBuf,
     handle: ConfigHandle,
-    last_error: Arc<RwLock<Option<String>>>,
+    reload_status: Arc<RwLock<Option<ReloadStatus>>>,
     source_generation: Arc<Mutex<Option<SourceGeneration>>>,
     observed_generation: Arc<Mutex<Option<SourceGeneration>>>,
 }
@@ -107,7 +127,7 @@ impl ConfigManager {
         Ok(Self {
             path,
             handle: ConfigHandle::new(config),
-            last_error: Arc::new(RwLock::new(None)),
+            reload_status: Arc::new(RwLock::new(None)),
             source_generation: Arc::new(Mutex::new(source_generation)),
             observed_generation: Arc::new(Mutex::new(source_generation)),
         })
@@ -132,8 +152,20 @@ impl ConfigManager {
     /// Returns [`ConfigReloadError::LockPoisoned`] when the reload-health lock
     /// was poisoned by a panic.
     pub fn last_error(&self) -> Result<Option<String>, ConfigReloadError> {
+        Ok(self
+            .reload_status()?
+            .and_then(|status| match status.terminal {
+                ReloadTerminalState::Rejected(reason) => Some(reason),
+                ReloadTerminalState::Applied
+                | ReloadTerminalState::NoChange
+                | ReloadTerminalState::RestartPending => None,
+            }))
+    }
+
+    /// Returns the latest reload result and the exact snapshot it describes.
+    pub(crate) fn reload_status(&self) -> Result<Option<ReloadStatus>, ConfigReloadError> {
         let guard = self
-            .last_error
+            .reload_status
             .read()
             .map_err(|_error| ConfigReloadError::LockPoisoned)?;
         Ok(guard.clone())
@@ -150,12 +182,37 @@ impl ConfigManager {
             .lock()
             .map_err(|_error| ConfigReloadError::LockPoisoned)?;
         let (requested, requested_generation) =
-            load_reload_config(&self.path, &mut observed_generation).inspect_err(|error| {
-                self.set_last_error(Some(error.to_string()));
-            })?;
-        let outcome = self.handle.apply_reloadable(&requested)?;
-        *source_generation = Some(requested_generation);
-        self.set_last_error(None);
+            match load_reload_config(&self.path, &mut observed_generation) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    self.record_status(
+                        self.handle.snapshot()?,
+                        ReloadTerminalState::Rejected(error.to_string()),
+                        Vec::new(),
+                    )?;
+                    return Err(error);
+                }
+            };
+        let current = self.handle.snapshot()?;
+        let (projected, mut outcome) = apply_reloadable(&current, &requested);
+        if outcome.rejection.is_none() {
+            outcome.rejection = preflight_evidence_paths(&projected).err();
+        }
+        if outcome.rejection.is_none() {
+            outcome = self.handle.apply_reloadable(&requested)?;
+            *source_generation = Some(requested_generation);
+        }
+        let snapshot = self.handle.snapshot()?;
+        let terminal = if let Some(rejection) = &outcome.rejection {
+            ReloadTerminalState::Rejected(rejection.to_string())
+        } else if outcome.applied {
+            ReloadTerminalState::Applied
+        } else if outcome.restart_required_changes.is_empty() {
+            ReloadTerminalState::NoChange
+        } else {
+            ReloadTerminalState::RestartPending
+        };
+        self.record_status(snapshot, terminal, outcome.restart_required_changes.clone())?;
         Ok(outcome)
     }
 
@@ -182,10 +239,34 @@ impl ConfigManager {
         })
     }
 
-    fn set_last_error(&self, value: Option<String>) {
-        if let Ok(mut guard) = self.last_error.write() {
-            *guard = value;
-        }
+    fn record_status(
+        &self,
+        snapshot: AppConfig,
+        terminal: ReloadTerminalState,
+        restart_required_changes: Vec<RestartRequiredChange>,
+    ) -> Result<(), ConfigReloadError> {
+        let mut guard = self
+            .reload_status
+            .write()
+            .map_err(|_error| ConfigReloadError::LockPoisoned)?;
+        let attempt_generation = guard
+            .as_ref()
+            .map_or(1, |status| status.attempt_generation + 1);
+        let snapshot_generation = if matches!(terminal, ReloadTerminalState::Rejected(_)) {
+            guard
+                .as_ref()
+                .map_or(0, |status| status.snapshot_generation)
+        } else {
+            attempt_generation
+        };
+        *guard = Some(ReloadStatus {
+            attempt_generation,
+            snapshot_generation,
+            snapshot,
+            terminal,
+            restart_required_changes,
+        });
+        Ok(())
     }
 }
 
@@ -445,9 +526,7 @@ fn poll_reloads(manager: &ConfigManager, stop_rx: &mpsc::Receiver<()>, interval:
         match stop_rx.recv_timeout(interval) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(error) = manager.reload() {
-                    manager.set_last_error(Some(error.to_string()));
-                }
+                let _outcome = manager.reload();
             }
         }
     }
@@ -472,7 +551,8 @@ mod tests {
     use llm_guard_proxy_state::materialize_evidence_path_defaults;
 
     use super::{
-        ConfigManager, ConfigReloadError, MissingConfigPolicy, default_config_path_from_home,
+        ConfigManager, ConfigReloadError, MissingConfigPolicy, ReloadTerminalState,
+        default_config_path_from_home,
     };
 
     #[test]
@@ -1045,6 +1125,117 @@ mod tests {
         remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn terminal_reload_status_tracks_generations() {
+        let active_root = unique_test_path("reload-status-active");
+        let candidate_root = unique_test_path("reload-status-candidate");
+        for root in [&active_root, &candidate_root] {
+            fs::create_dir_all(root).expect("create evidence parent");
+            fs::set_permissions(root, fs::Permissions::from_mode(0o700))
+                .expect("secure evidence parent");
+        }
+        let path = unique_test_path("reload-status.toml");
+        let config = |root: &Path, port: u16, interval_secs: u64| {
+            format!(
+                "[server]\nport = {port}\n[heartbeat]\ninterval_secs = {interval_secs}\n[evidence]\nsqlite_path = \"{}\"\nblob_cache_dir = \"{}\"\n",
+                root.join("evidence.sqlite3").display(),
+                root.join("blobs").display()
+            )
+        };
+        let initial = config(&active_root, 18_009, 15);
+        replace_config_atomically(&path, &initial);
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let initial_snapshot = manager.handle().snapshot().expect("initial snapshot");
+
+        replace_config_atomically(&path, "not toml");
+        manager.reload().expect_err("malformed input should fail");
+        let malformed = manager
+            .reload_status()
+            .expect("reload status")
+            .expect("malformed terminal status");
+        assert_eq!(malformed.attempt_generation, 1);
+        assert_eq!(malformed.snapshot_generation, 0);
+        assert_eq!(malformed.snapshot, initial_snapshot);
+        assert!(matches!(
+            malformed.terminal,
+            ReloadTerminalState::Rejected(_)
+        ));
+
+        replace_config_atomically(&path, &initial);
+        manager
+            .reload()
+            .expect("unchanged config should be accepted");
+        let no_change = manager
+            .reload_status()
+            .expect("reload status")
+            .expect("no-change terminal status");
+        assert_eq!(no_change.attempt_generation, 2);
+        assert_eq!(no_change.snapshot_generation, 2);
+        assert_eq!(no_change.snapshot, initial_snapshot);
+        assert_eq!(no_change.terminal, ReloadTerminalState::NoChange);
+
+        fs::set_permissions(&active_root, fs::Permissions::from_mode(0o755))
+            .expect("make projected evidence parent unsafe");
+        replace_config_atomically(&path, config(&candidate_root, 18_009, 15));
+        let outcome = manager
+            .reload()
+            .expect("valid candidate with invalid projection should return an outcome");
+        assert!(!outcome.applied);
+        assert!(outcome.rejection.is_some());
+        let rejected = manager
+            .reload_status()
+            .expect("reload status")
+            .expect("projected-rejection terminal status");
+        assert_eq!(rejected.attempt_generation, 3);
+        assert_eq!(rejected.snapshot_generation, 2);
+        assert_eq!(rejected.snapshot, initial_snapshot);
+        assert!(matches!(
+            rejected.terminal,
+            ReloadTerminalState::Rejected(_)
+        ));
+        assert!(manager.last_error().expect("reload health").is_some());
+        fs::set_permissions(&active_root, fs::Permissions::from_mode(0o700))
+            .expect("restore projected evidence parent");
+
+        replace_config_atomically(&path, config(&active_root, 19_000, 15));
+        manager
+            .reload()
+            .expect("restart-only recovery should be accepted");
+        let restart_pending = manager
+            .reload_status()
+            .expect("reload status")
+            .expect("restart-pending terminal status");
+        assert_eq!(restart_pending.attempt_generation, 4);
+        assert_eq!(restart_pending.snapshot_generation, 4);
+        assert_eq!(restart_pending.snapshot, initial_snapshot);
+        assert_eq!(
+            restart_pending.terminal,
+            ReloadTerminalState::RestartPending
+        );
+        assert_eq!(restart_pending.restart_required_changes.len(), 1);
+        assert_eq!(manager.last_error().expect("reload health"), None);
+
+        replace_config_atomically(&path, config(&active_root, 19_000, 4));
+        manager.reload().expect("coherent reload should apply");
+        let applied = manager
+            .reload_status()
+            .expect("reload status")
+            .expect("applied terminal status");
+        assert_eq!(applied.attempt_generation, 5);
+        assert_eq!(applied.snapshot_generation, 5);
+        assert_eq!(applied.terminal, ReloadTerminalState::Applied);
+        assert_eq!(applied.snapshot.heartbeat.interval_secs, 4);
+        assert_eq!(
+            applied.snapshot,
+            manager.handle().snapshot().expect("current snapshot")
+        );
+
+        remove_file(&path);
+        remove_dir_all(&active_root);
+        remove_dir_all(&candidate_root);
+    }
+
     #[test]
     fn polling_watcher_applies_reloadable_changes() {
         let path = unique_test_path("polling.toml");
@@ -1085,6 +1276,14 @@ mod tests {
             observed_error,
             "polling failure should update reload health"
         );
+        assert!(matches!(
+            manager
+                .reload_status()
+                .expect("reload status")
+                .expect("polling rejection status")
+                .terminal,
+            ReloadTerminalState::Rejected(_)
+        ));
 
         replace_config_atomically(&path, "[heartbeat]\nmode = \"sse\"\ninterval_secs = 3\n");
         let mut recovered = false;
@@ -1101,6 +1300,26 @@ mod tests {
         assert!(
             recovered,
             "successful polling reload should clear health error"
+        );
+
+        replace_config_atomically(
+            &path,
+            "[server]\nport = 19000\n[heartbeat]\nmode = \"sse\"\ninterval_secs = 3\n",
+        );
+        let mut restart_pending = false;
+        for _attempt in 0..50 {
+            if let Some(status) = manager.reload_status().expect("reload status")
+                && status.terminal == ReloadTerminalState::RestartPending
+                && status.restart_required_changes.len() == 1
+            {
+                restart_pending = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            restart_pending,
+            "polling should retain restart-required metadata"
         );
 
         watcher.stop().expect("watcher should stop");

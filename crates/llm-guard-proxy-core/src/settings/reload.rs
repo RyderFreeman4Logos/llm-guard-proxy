@@ -1,6 +1,6 @@
 use std::sync::{Arc, RwLock};
 
-use super::{AppConfig, GuardianConfig, RestartRequiredChange};
+use super::{AppConfig, GuardianConfig, RestartRequiredChange, ValidationError};
 
 /// Failure to access the shared configuration snapshot.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -88,12 +88,23 @@ pub fn apply_reloadable(current: &AppConfig, requested: &AppConfig) -> (AppConfi
     let restart_required_changes = current.restart_required_changes(requested);
     let mut next = current.clone();
     next.apply_reloadable_from(requested);
+    if let Err(rejection) = next.validate() {
+        return (
+            current.clone(),
+            ReloadOutcome {
+                applied: false,
+                restart_required_changes,
+                rejection: Some(rejection),
+            },
+        );
+    }
     let applied = next != *current;
     (
         next,
         ReloadOutcome {
             applied,
             restart_required_changes,
+            rejection: None,
         },
     )
 }
@@ -105,4 +116,6 @@ pub struct ReloadOutcome {
     pub applied: bool,
     /// Restart-required changes detected but not applied.
     pub restart_required_changes: Vec<RestartRequiredChange>,
+    /// Validation failure in the projected live snapshot.
+    pub rejection: Option<ValidationError>,
 }
