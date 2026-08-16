@@ -83,6 +83,7 @@ pub struct ConfigManager {
     handle: ConfigHandle,
     last_error: Arc<RwLock<Option<String>>>,
     source_generation: Arc<Mutex<Option<SourceGeneration>>>,
+    observed_generation: Arc<Mutex<Option<SourceGeneration>>>,
 }
 
 impl ConfigManager {
@@ -108,6 +109,7 @@ impl ConfigManager {
             handle: ConfigHandle::new(config),
             last_error: Arc::new(RwLock::new(None)),
             source_generation: Arc::new(Mutex::new(source_generation)),
+            observed_generation: Arc::new(Mutex::new(source_generation)),
         })
     }
 
@@ -143,8 +145,12 @@ impl ConfigManager {
             .source_generation
             .lock()
             .map_err(|_error| ConfigReloadError::LockPoisoned)?;
+        let mut observed_generation = self
+            .observed_generation
+            .lock()
+            .map_err(|_error| ConfigReloadError::LockPoisoned)?;
         let (requested, requested_generation) =
-            load_reload_config(&self.path, source_generation.as_ref()).inspect_err(|error| {
+            load_reload_config(&self.path, &mut observed_generation).inspect_err(|error| {
                 self.set_last_error(Some(error.to_string()));
             })?;
         let outcome = self.handle.apply_reloadable(&requested)?;
@@ -263,21 +269,23 @@ fn load_initial_config(
 
 fn load_reload_config(
     path: &Path,
-    previous: Option<&SourceGeneration>,
+    previous: &mut Option<SourceGeneration>,
 ) -> Result<(AppConfig, SourceGeneration), ConfigReloadError> {
     let source = File::open(path).map_err(|source| ConfigReloadError::Read {
         path: path.to_path_buf(),
         source,
     })?;
     let (contents, generation) = read_stable_source(path, source)?;
+    let in_place_update = previous
+        .as_ref()
+        .is_some_and(|observed| observed.same_identity(&generation) && observed != &generation);
+    *previous = Some(generation);
     if contents.trim().is_empty() {
         return Err(ConfigReloadError::EmptyGeneration {
             path: path.to_path_buf(),
         });
     }
-    if previous
-        .is_some_and(|accepted| accepted.same_identity(&generation) && accepted != &generation)
-    {
+    if in_place_update {
         return Err(ConfigReloadError::InPlaceUpdate {
             path: path.to_path_buf(),
         });
@@ -425,7 +433,7 @@ fn poll_reloads(manager: &ConfigManager, stop_rx: &mpsc::Receiver<()>, interval:
 #[cfg(test)]
 mod tests {
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::{
         ffi::OsString,
         fs::{self, OpenOptions},
@@ -581,6 +589,91 @@ mod tests {
             manager.last_error().expect("reload health"),
             Some(error.to_string())
         );
+        remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_replacement_in_place_rewrite_retains_last_good_until_atomic_recovery() {
+        let path = unique_test_path("rejected-replacement-rewrite.toml");
+        fs::write(
+            &path,
+            "[shielding]\nenabled = false\n[heartbeat]\ninterval_secs = 4\n",
+        )
+        .expect("write initial config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        let before = manager.handle().snapshot().expect("initial snapshot");
+
+        replace_config_atomically(&path, "");
+        let error = manager
+            .reload()
+            .expect_err("empty replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::EmptyGeneration { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        let replacement_inode = fs::metadata(&path).expect("replacement metadata").ino();
+        fs::write(&path, "[heartbeat]\ninterval_secs = 6\n")
+            .expect("rewrite rejected replacement in place");
+        assert_eq!(
+            fs::metadata(&path).expect("rewritten metadata").ino(),
+            replacement_inode
+        );
+        let error = manager
+            .reload()
+            .expect_err("in-place rewrite of rejected replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        replace_config_atomically(&path, "not toml");
+        let error = manager
+            .reload()
+            .expect_err("invalid replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::Parse { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        let invalid_replacement_inode = fs::metadata(&path).expect("invalid metadata").ino();
+        fs::write(&path, "[heartbeat]\ninterval_secs = 7\n")
+            .expect("rewrite invalid replacement in place");
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("rewritten invalid metadata")
+                .ino(),
+            invalid_replacement_inode
+        );
+        let error = manager
+            .reload()
+            .expect_err("in-place rewrite of invalid replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+
+        replace_config_atomically(
+            &path,
+            "[shielding]\nenabled = false\n[heartbeat]\ninterval_secs = 8\n",
+        );
+        let outcome = manager.reload().expect("atomic recovery should reload");
+        assert!(outcome.applied);
+        assert_eq!(
+            manager
+                .handle()
+                .snapshot()
+                .expect("recovered snapshot")
+                .heartbeat
+                .interval_secs,
+            8
+        );
+        assert_eq!(manager.last_error().expect("reload health"), None);
         remove_file(&path);
     }
 
