@@ -282,21 +282,25 @@ fn load_reload_config(
     let in_place_update = previous
         .as_ref()
         .is_some_and(|observed| observed.same_identity(&generation) && observed != &generation);
-    *previous = Some(generation);
+    if in_place_update {
+        return Err(ConfigReloadError::InPlaceUpdate {
+            path: path.to_path_buf(),
+        });
+    }
+    if previous
+        .as_ref()
+        .is_none_or(|observed| !observed.same_identity(&generation))
+    {
+        *previous = Some(generation);
+    }
     let contents = decode_config_source(path, contents)?;
     if contents.trim().is_empty() {
         return Err(ConfigReloadError::EmptyGeneration {
             path: path.to_path_buf(),
         });
     }
-    if in_place_update {
-        return Err(ConfigReloadError::InPlaceUpdate {
-            path: path.to_path_buf(),
-        });
-    }
     Ok((parse_config(path, &contents)?, generation))
 }
-
 fn read_stable_source(
     path: &Path,
     mut source: File,
@@ -644,6 +648,14 @@ mod tests {
             manager.handle().snapshot().expect("retained snapshot"),
             before
         );
+        let error = manager
+            .reload()
+            .expect_err("unchanged in-place rewrite must remain rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
 
         replace_config_atomically(&path, "not toml");
         let error = manager
@@ -667,6 +679,14 @@ mod tests {
         let error = manager
             .reload()
             .expect_err("in-place rewrite of invalid replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        let error = manager
+            .reload()
+            .expect_err("unchanged invalid replacement rewrite must remain rejected");
         assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
         assert_eq!(
             manager.handle().snapshot().expect("retained snapshot"),
@@ -732,6 +752,14 @@ mod tests {
             manager.handle().snapshot().expect("retained snapshot"),
             before
         );
+        let error = manager
+            .reload()
+            .expect_err("unchanged invalid UTF-8 rewrite must remain rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
 
         replace_config_atomically(
             &path,
@@ -776,6 +804,14 @@ mod tests {
         assert_eq!(
             manager.last_error().expect("reload health"),
             Some(error.to_string())
+        );
+        let error = manager
+            .reload()
+            .expect_err("unchanged in-place partial reload must remain rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
         );
         remove_file(&path);
     }
@@ -832,6 +868,14 @@ mod tests {
         let error = manager
             .reload()
             .expect_err("in-place rewrite of published replacement must be rejected");
+        assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
+        assert_eq!(
+            manager.handle().snapshot().expect("retained snapshot"),
+            before
+        );
+        let error = manager
+            .reload()
+            .expect_err("unchanged published replacement rewrite must remain rejected");
         assert!(matches!(error, ConfigReloadError::InPlaceUpdate { .. }));
         assert_eq!(
             manager.handle().snapshot().expect("retained snapshot"),
