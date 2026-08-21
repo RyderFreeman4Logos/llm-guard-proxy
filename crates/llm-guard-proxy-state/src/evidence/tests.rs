@@ -366,6 +366,46 @@ fn retention_prunes_complete_oldest_groups_and_chunks() {
 }
 
 #[test]
+fn retention_accounting_stays_incremental_as_rows_grow() {
+    let fixture = EvidenceFixture::new("retention-accounting");
+    let manager = fixture.manager(true, false, false, 100, None);
+    let store = EvidenceStore::open(manager);
+    let full_table_count_queries_before = super::store::full_table_count_queries();
+
+    for index in 0..8 {
+        let group_id = format!("group-retention-accounting-{index}");
+        store
+            .record_group(
+                &group_record(&group_id, 1_000 + index),
+                &[attempt_record(
+                    &group_id,
+                    1,
+                    EvidenceAttemptRole::Primary,
+                    EvidenceAttemptStatus::Accepted,
+                    true,
+                )],
+            )
+            .expect("retention accounting write should succeed");
+    }
+    assert_eq!(
+        super::store::full_table_count_queries(),
+        full_table_count_queries_before,
+        "retention writes must not run full-table COUNT(*) queries",
+    );
+
+    let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+    let counts: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT group_count, attempt_count, chunk_count \
+             FROM evidence_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("incremental retention counters should exist");
+    assert_eq!(counts, (8, 8, 0));
+}
+
+#[test]
 fn retention_prunes_expired_raw_artifact_content_without_deleting_metadata() {
     let fixture = EvidenceFixture::new("raw-retention");
     let manager = fixture.manager_with_extra(
