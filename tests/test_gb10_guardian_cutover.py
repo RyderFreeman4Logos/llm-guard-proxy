@@ -30,9 +30,15 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
         integrated_active_hang: bool = False,
         registration_argument: bool = False,
         attestation_state: str = "ready",
+        first_attestation_delay: str = "0",
+        systemctl_timeout: str = "0.1s",
+        readiness_timeout_seconds: str = "1",
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            config = root / "deploy" / "gb10" / "config.toml"
+            config.parent.mkdir(parents=True)
+            config.write_text("unrelated_extra_key = true\n")
             runtime_root = root / "runtime"
             registration_path = runtime_root / "gb10-memory-guardian" / "text-cgroup.v1"
             registration_path.parent.mkdir(parents=True)
@@ -110,6 +116,8 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                 '  *"show --property=MainPID"*"llm-guard-proxy.service"*) '
                 'count="$(cat "${MAIN_PID_QUERY_COUNT}" 2>/dev/null || printf \'0\')"; '
                 'count="$((count + 1))"; printf \'%s\\n\' "${count}" >"${MAIN_PID_QUERY_COUNT}"; '
+                'if (( count == 1 )) && [[ "${FIRST_ATTESTATION_DELAY}" != 0 ]]; '
+                'then sleep "${FIRST_ATTESTATION_DELAY}"; fi; '
                 'case "${ATTESTATION_STATE}" in '
                 'delayed-ready) if (( count >= 2 )); then publish_guardian_fds 4242; fi; '
                 'printf \'4242\\n\' ;; '
@@ -135,6 +143,7 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
             env["INTEGRATED_ACTIVE_STATE"] = integrated_active_state
             env["INTEGRATED_ENABLE_FAILURE"] = "1" if integrated_enable_failure else "0"
             env["INTEGRATED_ACTIVE_HANG"] = "1" if integrated_active_hang else "0"
+            env["FIRST_ATTESTATION_DELAY"] = first_attestation_delay
             env["INTEGRATED_MAIN_PID"] = "0" if attestation_state == "missing-pid" else "4242"
             env["ATTESTATION_STATE"] = attestation_state
             env["MAIN_PID_QUERY_COUNT"] = str(root / "main-pid-query-count")
@@ -143,8 +152,8 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
             env["CGROUP_KILL"] = str(target / "cgroup.kill") if target else ""
             env["LLM_GUARD_CGROUP_ROOT"] = str(cgroup_root)
             env["LLM_GUARD_PROC_ROOT"] = str(proc_root)
-            env["LLM_GUARD_SYSTEMCTL_TIMEOUT"] = "0.1s"
-            env["LLM_GUARD_READINESS_TIMEOUT_SECONDS"] = "1"
+            env["LLM_GUARD_SYSTEMCTL_TIMEOUT"] = systemctl_timeout
+            env["LLM_GUARD_READINESS_TIMEOUT_SECONDS"] = readiness_timeout_seconds
             env["LLM_GUARD_READINESS_POLL_INTERVAL"] = "0.01"
             env["XDG_RUNTIME_DIR"] = str(runtime_root)
             command = [str(CUTOVER)]
@@ -157,6 +166,7 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                     capture_output=True,
                     text=True,
                     env=env,
+                    cwd=root,
                     timeout=2,
                 )
             except subprocess.TimeoutExpired as error:
@@ -234,12 +244,25 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
 
     def test_cutover_restarts_attestation_when_main_pid_changes_during_startup(self) -> None:
         completed, calls = self.run_cutover(
-            self.registration("a" * 64, "a" * 64), attestation_state="pid-changes"
+            self.registration("a" * 64, "a" * 64),
+            attestation_state="pid-changes",
+            readiness_timeout_seconds="2",
         )
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
         main_pid_queries = [call for call in calls if "show --property=MainPID" in call]
         self.assertGreaterEqual(len(main_pid_queries), 4)
+
+    def test_unrelated_config_does_not_break_pid_change_retry(self) -> None:
+        completed, _ = self.run_cutover(
+            self.registration("a" * 64, "a" * 64),
+            attestation_state="pid-changes",
+            first_attestation_delay="0.9",
+            systemctl_timeout="2s",
+            readiness_timeout_seconds="2",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
 
     def test_registration_override_is_rejected_before_any_systemctl_call(self) -> None:
         completed, calls = self.run_cutover(

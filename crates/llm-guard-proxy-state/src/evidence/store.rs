@@ -628,9 +628,9 @@ fn sha256_digest(input: &[u8]) -> [u8; 32] {
     message.extend_from_slice(&bit_len.to_be_bytes());
 
     let mut state = SHA256_INITIAL_STATE;
-    for chunk in message.chunks_exact(64) {
+    for chunk in message.as_chunks::<64>().0 {
         let mut words = [0_u32; 64];
-        for (word, bytes) in words.iter_mut().take(16).zip(chunk.chunks_exact(4)) {
+        for (word, bytes) in words.iter_mut().take(16).zip(chunk.as_chunks::<4>().0) {
             *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
         }
         for index in 16..64 {
