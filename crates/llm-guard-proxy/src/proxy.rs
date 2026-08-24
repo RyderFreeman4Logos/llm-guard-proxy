@@ -9698,7 +9698,7 @@ enum ShieldedBeginOutcome {
     TerminalForward(ShieldedTerminalForward),
 }
 
-struct ShieldedAttemptFailure {
+struct ShieldedAttemptFailureDetails {
     attempt_id: AttemptId,
     request_id: RequestId,
     attempt_number: u32,
@@ -9721,6 +9721,14 @@ struct ShieldedAttemptFailure {
     upstream_body: Bytes,
     final_attempt: Option<FinalAttemptContext>,
     completed_endpoint_attempt_records: Vec<AttemptRecord>,
+}
+
+type ShieldedAttemptFailure = Box<ShieldedAttemptFailureDetails>;
+
+#[cfg(test)]
+#[test]
+fn shielded_attempt_failure_stays_under_clippy_result_large_err_limit() {
+    assert!(std::mem::size_of::<ShieldedAttemptFailure>() <= 128);
 }
 
 #[derive(Clone, Debug)]
@@ -12772,7 +12780,7 @@ fn shielded_start_transport_failure(
             String::from("true"),
         );
     }
-    ShieldedAttemptFailure {
+    Box::new(ShieldedAttemptFailureDetails {
         attempt_id,
         request_id,
         attempt_number,
@@ -12798,7 +12806,7 @@ fn shielded_start_transport_failure(
         upstream_body: input.evidence_upstream_body,
         completed_endpoint_attempt_records,
         final_attempt: None,
-    }
+    })
 }
 
 fn raw_payload_text(bytes: &Bytes) -> Option<String> {
@@ -13316,7 +13324,7 @@ fn aggregation_failure(
     if raw_payloads.input.is_none() {
         raw_payloads.input.clone_from(&info.raw_request_body);
     }
-    ShieldedAttemptFailure {
+    Box::new(ShieldedAttemptFailureDetails {
         attempt_id: info.attempt_id.clone(),
         request_id: info.request_id.clone(),
         attempt_number: info.attempt_number,
@@ -13343,7 +13351,7 @@ fn aggregation_failure(
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
         final_attempt: None,
-    }
+    })
 }
 
 fn constraint_validation_failure(
@@ -13406,7 +13414,7 @@ fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAtte
         String::from("abort_reason"),
         SERVER_SHUTDOWN_ABORT_REASON.to_owned(),
     );
-    ShieldedAttemptFailure {
+    Box::new(ShieldedAttemptFailureDetails {
         attempt_id: info.attempt_id.clone(),
         request_id: info.request_id.clone(),
         attempt_number: info.attempt_number,
@@ -13432,7 +13440,7 @@ fn shutdown_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAtte
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
         final_attempt: None,
-    }
+    })
 }
 
 fn request_deadline_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> ShieldedAttemptFailure {
@@ -13454,7 +13462,7 @@ fn request_deadline_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> Shie
         String::from("request_deadline_exhausted"),
         String::from("true"),
     );
-    ShieldedAttemptFailure {
+    Box::new(ShieldedAttemptFailureDetails {
         attempt_id: info.attempt_id.clone(),
         request_id: info.request_id.clone(),
         attempt_number: info.attempt_number,
@@ -13480,7 +13488,7 @@ fn request_deadline_shielded_attempt_failure(info: &ShieldedAttemptInfo) -> Shie
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
         final_attempt: None,
-    }
+    })
 }
 
 fn mark_request_deadline_attempt_failure(failure: &mut ShieldedAttemptFailure) {
@@ -13639,7 +13647,7 @@ fn status_failure(
         String::from("upstream_response_received"),
         String::from("true"),
     );
-    ShieldedAttemptFailure {
+    Box::new(ShieldedAttemptFailureDetails {
         attempt_id: info.attempt_id.clone(),
         request_id: info.request_id.clone(),
         attempt_number: info.attempt_number,
@@ -13665,7 +13673,7 @@ fn status_failure(
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
         final_attempt: None,
-    }
+    })
 }
 
 fn status_failure_without_retry(
@@ -13683,7 +13691,7 @@ fn status_failure_without_retry(
         String::from("upstream_response_received"),
         String::from("true"),
     );
-    ShieldedAttemptFailure {
+    Box::new(ShieldedAttemptFailureDetails {
         attempt_id: info.attempt_id.clone(),
         request_id: info.request_id.clone(),
         attempt_number: info.attempt_number,
@@ -13709,7 +13717,7 @@ fn status_failure_without_retry(
         upstream_body: info.upstream_body.clone(),
         completed_endpoint_attempt_records: Vec::new(),
         final_attempt: None,
-    }
+    })
 }
 
 fn attempt_failure_record(
