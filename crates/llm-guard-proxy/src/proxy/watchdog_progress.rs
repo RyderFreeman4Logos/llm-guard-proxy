@@ -225,8 +225,7 @@ pub(super) fn non_sse_progress_at_eof(
 
     let progress = u64::from(
         serde_json::from_slice::<Value>(&parser.pending)
-            .ok()
-            .is_some_and(|response| complete_chat_or_completion_response(&response)),
+            .is_ok_and(|response| complete_chat_or_completion_response(&response)),
     );
     parser.pending.clear();
     parser.state = progress_state(progress);
@@ -468,8 +467,7 @@ fn sse_data_has_progress(progress_unit: WatchdogProgressUnit, data: &[u8]) -> bo
     !data.is_empty()
         && data != b"[DONE]"
         && serde_json::from_slice::<Value>(data)
-            .ok()
-            .is_some_and(|event| sse_event_has_progress(progress_unit, &event))
+            .is_ok_and(|event| sse_event_has_progress(progress_unit, &event))
 }
 
 fn sse_event_has_progress(progress_unit: WatchdogProgressUnit, event: &Value) -> bool {
