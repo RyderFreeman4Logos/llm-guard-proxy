@@ -811,6 +811,7 @@ impl AppConfig {
             match_models: Vec::new(),
             upstream_model: None,
             base_url: self.upstream.base_url.clone(),
+            cache_priority_engine: self.upstream.cache_priority_engine,
             endpoints: Vec::new(),
             endpoint_selection: EndpointSelectionMode::PriorityFailover,
             health_probe_interval_ms: 2_000,
@@ -973,6 +974,7 @@ impl AppConfig {
             self.apply_family_defaults();
         }
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
+        self.upstream.cache_priority_engine = requested.upstream.cache_priority_engine;
         self.upstream.metadata = requested.upstream.metadata.clone();
         self.upstream.hot_restart = requested.upstream.hot_restart.clone();
         self.upstream.local_recovery = requested.upstream.local_recovery.clone();
@@ -1080,6 +1082,7 @@ impl AppConfig {
             .zip(requested.upstream_profiles.iter())
         {
             active.request_timeout_ms = requested.request_timeout_ms;
+            active.cache_priority_engine = requested.cache_priority_engine;
             active.endpoint_selection = requested.endpoint_selection;
             active.base_url.clone_from(&requested.base_url);
             active.endpoints.clone_from(&requested.endpoints);
@@ -1577,6 +1580,18 @@ impl Default for ListenerConfig {
     }
 }
 
+/// Engine-specific handling for the `OpenAI` `priority` request field.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CachePriorityEngine {
+    /// Preserve the caller-provided priority value without proxy translation.
+    #[default]
+    Disabled,
+    /// Coerce the priority hint for `SGLang` radix-cache eviction.
+    Sglang,
+    /// Coerce the priority hint for vLLM `OpenAI` scheduling.
+    Vllm,
+}
+
 /// Upstream OpenAI-compatible service settings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UpstreamConfig {
@@ -1584,6 +1599,8 @@ pub struct UpstreamConfig {
     pub base_url: String,
     /// Total upstream request timeout, including streamed response body reads.
     pub request_timeout_ms: u64,
+    /// Engine that accepts the forwarded `OpenAI` `priority` field.
+    pub cache_priority_engine: CachePriorityEngine,
     /// Metadata discovery and model context enrichment policy.
     pub metadata: MetadataConfig,
     /// Hot-restart detection and readiness probe policy.
@@ -1635,6 +1652,7 @@ impl Default for UpstreamConfig {
         Self {
             base_url: String::from("http://gb10:18009/v1"),
             request_timeout_ms: 120_000,
+            cache_priority_engine: CachePriorityEngine::Disabled,
             metadata: MetadataConfig::default(),
             hot_restart: HotRestartConfig::default(),
             local_recovery: LocalRecoveryConfig::default(),
@@ -2170,6 +2188,8 @@ pub struct UpstreamProfileConfig {
     pub upstream_model: Option<String>,
     /// Legacy single base URL for OpenAI-compatible requests.
     pub base_url: String,
+    /// Engine that accepts the forwarded `OpenAI` `priority` field.
+    pub cache_priority_engine: CachePriorityEngine,
     /// Ordered same-model endpoints. Empty preserves the legacy single `base_url` behavior.
     pub endpoints: Vec<UpstreamEndpointConfig>,
     /// Selection order for configured endpoint replicas.
@@ -2456,6 +2476,7 @@ impl Default for UpstreamProfileConfig {
             match_models: Vec::new(),
             upstream_model: None,
             base_url: upstream.base_url,
+            cache_priority_engine: upstream.cache_priority_engine,
             endpoints: Vec::new(),
             endpoint_selection: EndpointSelectionMode::PriorityFailover,
             health_probe_interval_ms: 2_000,

@@ -1860,6 +1860,39 @@ presence_penalty = -0.2
         .expect("param override config should validate");
 }
 
+#[test]
+fn cache_priority_engine_is_per_upstream_and_hot_reloadable() {
+    let current = AppConfig::parse(
+        r#"
+[[upstreams]]
+name = "first-evict"
+base_url = "http://sglang.example/v1"
+match_models = ["test-chat"]
+cache_priority_engine = "sglang"
+"#,
+    )
+    .expect("current cache priority config should parse");
+    let requested = AppConfig::parse(
+        r#"
+[[upstreams]]
+name = "first-evict"
+base_url = "http://sglang.example/v1"
+match_models = ["test-chat"]
+cache_priority_engine = "vllm"
+"#,
+    )
+    .expect("requested cache priority config should parse");
+
+    let (next, outcome) = apply_reloadable(&current, &requested);
+
+    assert!(outcome.applied);
+    assert_eq!(
+        next.upstream_profiles[0].cache_priority_engine,
+        requested.upstream_profiles[0].cache_priority_engine
+    );
+    assert!(RELOADABLE_FIELDS.contains(&"upstreams.cache_priority_engine"));
+}
+
 #[cfg(feature = "param-override")]
 #[test]
 fn parses_fill_if_absent_upstream_profile_defaults() {

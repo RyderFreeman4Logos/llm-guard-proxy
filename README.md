@@ -413,6 +413,17 @@ poll_interval_secs = 1
 # cgroup_root = "/sys/fs/cgroup"
 ```
 
+### First-evict KV priority
+
+Set `cache_priority_engine = "sglang"` on `[upstream]` or a `[[upstreams]]`
+profile to coerce a top-level caller `priority` hint such as `"-1000"` to an
+integer before forwarding it. With SGLang configured for priority radix-cache
+eviction, lower values are evicted first. Set `cache_priority_engine = "vllm"`
+to forward the same OpenAI `priority` field as vLLM scheduling priority only;
+it does not control radix KV eviction. The default is `"disabled"`, which
+leaves the request unchanged, and the setting hot reloads with its upstream
+profile.
+
 The guardian runs inside the proxy and consumes the same hot-reloaded
 configuration snapshot. Invalid edits keep the last-known-good policy. Policy
 changes are prepared while memory is healthy and published as a complete unit;

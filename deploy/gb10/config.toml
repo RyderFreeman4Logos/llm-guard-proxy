@@ -99,6 +99,9 @@ base_url = "http://100.105.4.92:18010/v1"
 # Total request timeout including streaming (30 min).
 request_timeout_ms = 1800000
 
+# Translate a caller first-evict KV-priority hint. Safe default is disabled.
+# cache_priority_engine = "disabled"
+
 [upstream.hot_restart]
 enabled = true
 probe_max_tokens = 1
@@ -184,6 +187,7 @@ match_models = ["aeon-ultimate", "qwen3.6-27b-decensor-by-aeon"]
 request_timeout_ms = 1800000
 max_in_flight_requests = 4
 max_queued_generation_requests = 64
+# cache_priority_engine = "disabled"       # Translate a caller first-evict KV-priority hint. Safe default is disabled.
 
 [upstreams.metadata]
 discovery_enabled = true
@@ -432,6 +436,7 @@ enabled = false
 #| request_timeout_ms = 600000
 #| max_in_flight_requests = 2
 #| max_queued_generation_requests = 8
+#| cache_priority_engine = "disabled"      # Translate a caller first-evict KV-priority hint. Safe default is disabled.
 #| [upstreams.metadata]
 #| discovery_enabled = true
 #| [upstreams.hot_restart]
