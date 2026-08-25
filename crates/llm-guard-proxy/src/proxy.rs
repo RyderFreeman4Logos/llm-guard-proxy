@@ -4347,7 +4347,11 @@ fn insert_param_override_value(
             .and_then(serde_json::Value::as_object)
             .is_some_and(|nested| nested.contains_key(field))
     });
-    if mode == ParamOverrideMode::FillIfAbsent && (object.contains_key(field) || nested_has_field) {
+    if mode == ParamOverrideMode::FillIfAbsent
+        && (object.contains_key(field)
+            || nested_has_field
+            || (field == "reasoning_effort" && shielded_chat::has_no_thinking_markers(object)))
+    {
         return;
     }
     object.insert(field.to_owned(), value.clone());

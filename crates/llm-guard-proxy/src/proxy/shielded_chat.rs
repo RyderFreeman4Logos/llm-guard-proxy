@@ -139,6 +139,12 @@ pub(super) fn has_conflicting_vllm_native_controls(body: &Bytes) -> bool {
     positive_native_budget && detect_no_thinking_markers(&object).detected
 }
 
+/// Returns whether the caller already sent an explicit no-thinking control.
+#[cfg(feature = "param-override")]
+pub(super) fn has_no_thinking_markers(object: &Map<String, Value>) -> bool {
+    detect_no_thinking_markers(object).detected
+}
+
 /// Returns a retry request body with a bounded anti-loop system hint.
 ///
 /// The hint is deterministic and contains only proxy retry metadata; it never
