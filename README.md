@@ -522,6 +522,9 @@ Reloadable fields:
 - `upstream.metadata.context_length_override`
 - `upstream.metadata.max_model_len_override`
 - `upstream.metadata.input_token_safety_margin`
+- `upstream.hot_restart.probe_interval_secs`
+- `upstream.hot_restart.probe_messages`
+- `upstream.hot_restart.probe_chat_template_kwargs`
 
 Restart-required fields:
 
@@ -533,6 +536,17 @@ Restart-required fields:
 - `observability.sqlite_path`
 - `evidence.sqlite_path`
 - `evidence.blob_cache_dir`
+
+Hot-restart readiness uses `upstream.hot_restart.probe_interval_secs` (seconds;
+default `30`) and validates it is positive and no greater than
+`probe_timeout_secs`. The default request is a tagged direct upstream
+`POST /v1/chat/completions` with
+`{"messages":[{"role":"user","content":"1+1="}],"max_tokens":1,"stream":false,"enable_thinking":false}`.
+The probe itself does not enter normal proxy admission, shielding, or retry handling.
+`probe_messages` and `probe_chat_template_kwargs` hot reload with the interval;
+the latter replaces the top-level thinking field for providers that require a
+native form. Use the same keys under `[upstreams.hot_restart]` for a named
+upstream.
 
 The legacy `[server]` listener is always active for backwards-compatible
 single-listener deployments. Additional `[[listeners]]` bind extra downstream

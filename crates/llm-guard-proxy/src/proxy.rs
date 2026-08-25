@@ -11134,11 +11134,8 @@ async fn wait_for_hot_restart_recovery(runtime: &ShieldedRetryRuntime) -> HotRes
         let client = runtime.client.clone();
         let base_url = runtime.upstream_profile.primary_base_url().to_owned();
         let config = runtime.upstream_profile.hot_restart.clone();
-        let model_id = hot_restart_probe_model(runtime);
         let join_handle =
-            tokio::spawn(
-                async move { run_hot_restart_probe(client, base_url, config, model_id).await },
-            );
+            tokio::spawn(async move { run_hot_restart_probe(client, base_url, config).await });
         state.in_progress = Some(HotRestartProbeHandle {
             started_at: Instant::now(),
             join_handle,
@@ -11146,17 +11143,6 @@ async fn wait_for_hot_restart_recovery(runtime: &ShieldedRetryRuntime) -> HotRes
     }
     drop(state);
     wait_for_hot_restart_probe_result(coordinator).await
-}
-
-#[cfg(feature = "upstream-hot-restart")]
-fn hot_restart_probe_model(runtime: &ShieldedRetryRuntime) -> Option<String> {
-    runtime.model_id.clone().or_else(|| {
-        runtime
-            .upstream_profile
-            .match_models
-            .first()
-            .map(ToOwned::to_owned)
-    })
 }
 
 #[cfg(feature = "upstream-hot-restart")]
@@ -11211,7 +11197,6 @@ async fn run_hot_restart_probe(
     client: Client,
     base_url: String,
     config: HotRestartConfig,
-    model_id: Option<String>,
 ) -> HotRestartResult {
     let deadline = Instant::now() + Duration::from_secs(config.probe_timeout_secs);
     let interval = Duration::from_secs(config.probe_interval_secs);
@@ -11219,7 +11204,7 @@ async fn run_hot_restart_probe(
         if Instant::now() >= deadline {
             return HotRestartResult::Timeout;
         }
-        match send_hot_restart_probe(&client, &base_url, &config, model_id.as_deref()).await {
+        match send_hot_restart_probe(&client, &base_url, &config).await {
             Ok(true) => return HotRestartResult::Ready,
             Ok(false) => {}
             Err(error) => {
@@ -11242,11 +11227,10 @@ async fn send_hot_restart_probe(
     client: &Client,
     base_url: &str,
     config: &HotRestartConfig,
-    model_id: Option<&str>,
 ) -> Result<bool, String> {
     let uri = Uri::from_static("/v1/chat/completions");
     let upstream_url = build_upstream_url(base_url, &uri).map_err(|error| error.to_string())?;
-    let body = hot_restart_probe_body(config, model_id);
+    let body = hot_restart_probe_body(config);
     let response = client
         .post(upstream_url)
         .header(
@@ -11272,7 +11256,7 @@ async fn send_hot_restart_probe(
 }
 
 #[cfg(feature = "upstream-hot-restart")]
-fn hot_restart_probe_body(config: &HotRestartConfig, model_id: Option<&str>) -> serde_json::Value {
+fn hot_restart_probe_body(config: &HotRestartConfig) -> serde_json::Value {
     let mut body = serde_json::Map::from_iter([
         (String::from("messages"), config.probe_messages.clone()),
         (
@@ -11281,14 +11265,13 @@ fn hot_restart_probe_body(config: &HotRestartConfig, model_id: Option<&str>) -> 
         ),
         (String::from("stream"), serde_json::Value::Bool(false)),
     ]);
-    if let Some(model_id) = model_id {
-        body.insert(
-            String::from("model"),
-            serde_json::Value::String(model_id.to_owned()),
-        );
-    }
     if let Some(kwargs) = &config.probe_chat_template_kwargs {
         body.insert(String::from("chat_template_kwargs"), kwargs.clone());
+    } else {
+        body.insert(
+            String::from("enable_thinking"),
+            serde_json::Value::Bool(false),
+        );
     }
     serde_json::Value::Object(body)
 }

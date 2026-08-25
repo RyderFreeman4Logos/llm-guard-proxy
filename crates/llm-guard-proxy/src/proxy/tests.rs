@@ -8898,7 +8898,20 @@ max_attempts = 3
         "/v1/chat/completions?test=hot-restart-503-then-success"
     );
     assert_eq!(probe.path_and_query, "/v1/chat/completions");
-    assert!(body_contains_text(&probe.body, "1+1=?"));
+    assert_eq!(
+        probe.headers.get("x-llm-guard-proxy-probe"),
+        Some(&HeaderValue::from_static("hot-restart"))
+    );
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&probe.body)
+            .expect("hot restart probe body should be JSON"),
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "1+1="}],
+            "max_tokens": 1,
+            "stream": false,
+            "enable_thinking": false,
+        })
+    );
     assert_eq!(
         retry.path_and_query,
         "/v1/chat/completions?test=hot-restart-503-then-success"
