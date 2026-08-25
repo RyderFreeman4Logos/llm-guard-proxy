@@ -406,6 +406,191 @@ fn retention_accounting_stays_incremental_as_rows_grow() {
 }
 
 #[test]
+fn repeated_shadow_attempt_preserves_retention_counts_and_groups() {
+    let fixture = EvidenceFixture::new("repeated-shadow-retention");
+    let manager = fixture.manager(true, false, false, 4, Some(2));
+    let store = EvidenceStore::open(manager);
+    let shadow = paired_shadow_attempt("group-shadow-first", "max-thinking");
+
+    store
+        .record_group(
+            &group_record("group-shadow-first", 1_000),
+            std::slice::from_ref(&shadow),
+        )
+        .expect("initial shadow evidence should write");
+    store
+        .record_shadow_attempt(&shadow)
+        .expect("repeated shadow evidence should write");
+    store
+        .record_group(
+            &group_record("group-shadow-second", 2_000),
+            &[attempt_record(
+                "group-shadow-second",
+                1,
+                EvidenceAttemptRole::Primary,
+                EvidenceAttemptStatus::Accepted,
+                true,
+            )],
+        )
+        .expect("second group should write");
+
+    let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM evidence_groups"),
+        2,
+        "replacing a shadow attempt must not prune the oldest complete group",
+    );
+    let counts: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT group_count, attempt_count, chunk_count \
+             FROM evidence_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("retention counters should exist");
+    assert_eq!(counts, (2, 2, 0));
+}
+
+#[test]
+fn populated_v2_upgrade_initializes_retention_counters() {
+    let fixture = EvidenceFixture::new("v2-upgrade");
+    let manager = fixture.manager(true, true, false, 100, None);
+    let store = EvidenceStore::open(manager.clone());
+    let mut attempt = attempt_record(
+        "group-v2-existing",
+        1,
+        EvidenceAttemptRole::Primary,
+        EvidenceAttemptStatus::Accepted,
+        true,
+    );
+    attempt.raw_payloads.input = Some(String::from("persisted chunk"));
+    store
+        .record_group(&group_record("group-v2-existing", 1_000), &[attempt])
+        .expect("seed evidence should write");
+    drop(store);
+
+    let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+    downgrade_schema_to_v2(&connection);
+    drop(connection);
+
+    let upgraded = EvidenceStore::open(manager);
+    upgraded
+        .record_group(
+            &group_record("group-v2-upgraded", 2_000),
+            &[attempt_record(
+                "group-v2-upgraded",
+                1,
+                EvidenceAttemptRole::Primary,
+                EvidenceAttemptStatus::Accepted,
+                true,
+            )],
+        )
+        .expect("populated v2 database should upgrade and write");
+
+    let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+    assert_eq!(schema_version(&connection), 3);
+    let counts: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT group_count, attempt_count, chunk_count \
+             FROM evidence_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("retention counters should exist");
+    assert_eq!(counts, (2, 2, 1));
+}
+
+#[test]
+fn interrupted_v2_upgrade_rolls_back_and_retries() {
+    let fixture = EvidenceFixture::new("v2-upgrade-retry");
+    let manager = fixture.manager(true, false, false, 100, None);
+    let store = EvidenceStore::open(manager.clone());
+    store
+        .record_group(
+            &group_record("group-v2-retry-existing", 1_000),
+            &[attempt_record(
+                "group-v2-retry-existing",
+                1,
+                EvidenceAttemptRole::Primary,
+                EvidenceAttemptStatus::Accepted,
+                true,
+            )],
+        )
+        .expect("seed evidence should write");
+    drop(store);
+
+    let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+    downgrade_schema_to_v2(&connection);
+    connection
+        .execute_batch(
+            "
+CREATE TRIGGER evidence_test_interrupt_v3_upgrade
+BEFORE UPDATE ON evidence_pruning_stats
+BEGIN
+    SELECT RAISE(ABORT, 'simulated v3 upgrade interruption');
+END;
+",
+        )
+        .expect("interruption trigger should install");
+    drop(connection);
+
+    let upgraded = EvidenceStore::open(manager);
+    assert!(
+        upgraded
+            .record_group(
+                &group_record("group-v2-retry-new", 2_000),
+                &[attempt_record(
+                    "group-v2-retry-new",
+                    1,
+                    EvidenceAttemptRole::Primary,
+                    EvidenceAttemptStatus::Accepted,
+                    true,
+                )],
+            )
+            .is_err(),
+        "simulated interruption should stop the upgrade",
+    );
+
+    let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+    assert_eq!(schema_version(&connection), 2);
+    assert!(
+        !table_has_column(&connection, "evidence_pruning_stats", "group_count"),
+        "failed migration must not expose partial v3 columns",
+    );
+    assert_eq!(retention_trigger_count(&connection), 0);
+    connection
+        .execute_batch("DROP TRIGGER evidence_test_interrupt_v3_upgrade;")
+        .expect("interruption trigger should drop");
+    drop(connection);
+
+    upgraded
+        .record_group(
+            &group_record("group-v2-retry-new", 2_000),
+            &[attempt_record(
+                "group-v2-retry-new",
+                1,
+                EvidenceAttemptRole::Primary,
+                EvidenceAttemptStatus::Accepted,
+                true,
+            )],
+        )
+        .expect("rolled-back v2 database should retry cleanly");
+
+    let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+    assert_eq!(schema_version(&connection), 3);
+    assert_eq!(retention_trigger_count(&connection), 6);
+    let counts: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT group_count, attempt_count, chunk_count \
+             FROM evidence_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("retention counters should exist");
+    assert_eq!(counts, (2, 2, 0));
+}
+
+#[test]
 fn retention_prunes_expired_raw_artifact_content_without_deleting_metadata() {
     let fixture = EvidenceFixture::new("raw-retention");
     let manager = fixture.manager_with_extra(
@@ -660,6 +845,50 @@ fn count_rows(connection: &Connection, sql: &str) -> u64 {
         .query_row(sql, [], |row| row.get(0))
         .expect("count query should succeed");
     u64::try_from(count).expect("count should be nonnegative")
+}
+
+fn downgrade_schema_to_v2(connection: &Connection) {
+    connection
+        .execute_batch(
+            "
+DROP TRIGGER IF EXISTS evidence_groups_retention_count_insert;
+DROP TRIGGER IF EXISTS evidence_groups_retention_count_delete;
+DROP TRIGGER IF EXISTS evidence_attempts_retention_count_insert;
+DROP TRIGGER IF EXISTS evidence_attempts_retention_count_delete;
+DROP TRIGGER IF EXISTS evidence_chunks_retention_count_insert;
+DROP TRIGGER IF EXISTS evidence_chunks_retention_count_delete;
+ALTER TABLE evidence_pruning_stats DROP COLUMN group_count;
+ALTER TABLE evidence_pruning_stats DROP COLUMN attempt_count;
+ALTER TABLE evidence_pruning_stats DROP COLUMN chunk_count;
+PRAGMA user_version = 2;
+",
+        )
+        .expect("schema should downgrade to v2");
+}
+
+fn schema_version(connection: &Connection) -> i64 {
+    connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("schema version should read")
+}
+
+fn table_has_column(connection: &Connection, table: &str, column: &str) -> bool {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .expect("table info query should prepare");
+    statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .expect("table info query should execute")
+        .map(|row| row.expect("table info row should decode"))
+        .any(|name| name == column)
+}
+
+fn retention_trigger_count(connection: &Connection) -> u64 {
+    count_rows(
+        connection,
+        "SELECT COUNT(*) FROM sqlite_master \
+         WHERE type = 'trigger' AND name LIKE 'evidence_%_retention_count_%'",
+    )
 }
 
 struct EvidenceFixture {

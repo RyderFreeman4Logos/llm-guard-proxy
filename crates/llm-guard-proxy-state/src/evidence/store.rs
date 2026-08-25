@@ -13,7 +13,7 @@ use std::cell::Cell;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
 use super::{
     error::EvidenceError,
@@ -733,20 +733,20 @@ fn open_connection_if_needed<'connection>(
         let sqlite_path = resolve_sqlite_path(configured_path)?;
         prepare_parent_directory(&sqlite_path)?;
         prepare_sqlite_file(&sqlite_path)?;
-        let connection = open_sqlite_connection(&sqlite_path)?;
+        let mut connection = open_sqlite_connection(&sqlite_path)?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|source| EvidenceError::Sqlite {
                 action: "enable SQLite foreign keys",
                 source,
             })?;
-        migrate(&connection)?;
+        migrate(&mut connection)?;
         *slot = Some(connection);
     }
     slot.as_mut().ok_or(EvidenceError::LockPoisoned)
 }
 
-fn migrate(connection: &Connection) -> Result<(), EvidenceError> {
+fn migrate(connection: &mut Connection) -> Result<(), EvidenceError> {
     let version = read_schema_version(connection)?;
     if version > SCHEMA_VERSION {
         return Err(EvidenceError::UnsupportedSchemaVersion {
@@ -766,8 +766,14 @@ fn migrate(connection: &Connection) -> Result<(), EvidenceError> {
 }
 
 #[allow(clippy::too_many_lines)]
-fn create_schema(connection: &Connection) -> Result<(), EvidenceError> {
-    connection
+fn create_schema(connection: &mut Connection) -> Result<(), EvidenceError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "start SQLite evidence schema transaction",
+            source,
+        })?;
+    transaction
         .execute_batch(
             r"
 CREATE TABLE IF NOT EXISTS evidence_groups (
@@ -885,14 +891,25 @@ INSERT OR IGNORE INTO evidence_pruning_stats (
     chunk_count
 ) VALUES ('global', 0, 0, 0, 0, NULL, 0, 0, 0);
 
-PRAGMA user_version = 3;
 ",
         )
         .map_err(|source| EvidenceError::Sqlite {
             action: "create SQLite evidence schema",
             source,
         })?;
-    create_retention_count_triggers(connection)
+    create_retention_count_triggers(&transaction)?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "set SQLite evidence schema version to v3",
+            source,
+        })?;
+    transaction
+        .commit()
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "commit SQLite evidence schema transaction",
+            source,
+        })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1040,15 +1057,21 @@ PRAGMA foreign_keys = ON;
         })
 }
 
-fn migrate_schema_v3(connection: &Connection) -> Result<(), EvidenceError> {
-    let group_count = read_count(connection, "evidence_groups", "read evidence group count")?;
+fn migrate_schema_v3(connection: &mut Connection) -> Result<(), EvidenceError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "start SQLite evidence v3 migration transaction",
+            source,
+        })?;
+    let group_count = read_count(&transaction, "evidence_groups", "read evidence group count")?;
     let attempt_count = read_count(
-        connection,
+        &transaction,
         "evidence_attempts",
         "read evidence attempt count",
     )?;
-    let chunk_count = read_count(connection, "evidence_chunks", "read evidence chunk count")?;
-    connection
+    let chunk_count = read_count(&transaction, "evidence_chunks", "read evidence chunk count")?;
+    transaction
         .execute_batch(
             r"
 ALTER TABLE evidence_pruning_stats ADD COLUMN group_count INTEGER NOT NULL DEFAULT 0;
@@ -1060,7 +1083,7 @@ ALTER TABLE evidence_pruning_stats ADD COLUMN chunk_count INTEGER NOT NULL DEFAU
             action: "add SQLite evidence retention counters",
             source,
         })?;
-    connection
+    transaction
         .execute(
             "UPDATE evidence_pruning_stats SET group_count = ?1, attempt_count = ?2, chunk_count = ?3 WHERE stats_key = 'global'",
             params![group_count, attempt_count, chunk_count],
@@ -1069,11 +1092,17 @@ ALTER TABLE evidence_pruning_stats ADD COLUMN chunk_count INTEGER NOT NULL DEFAU
             action: "initialize SQLite evidence retention counters",
             source,
         })?;
-    create_retention_count_triggers(connection)?;
-    connection
+    create_retention_count_triggers(&transaction)?;
+    transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|source| EvidenceError::Sqlite {
             action: "set SQLite evidence schema version to v3",
+            source,
+        })?;
+    transaction
+        .commit()
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "commit SQLite evidence v3 migration transaction",
             source,
         })
 }
@@ -1237,7 +1266,7 @@ fn insert_attempt_in_transaction(
     transaction
         .execute(
             r"
-INSERT OR REPLACE INTO evidence_attempts (
+INSERT INTO evidence_attempts (
     attempt_id,
     group_id,
     request_id,
@@ -1269,7 +1298,35 @@ INSERT OR REPLACE INTO evidence_attempts (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
     ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
-)",
+)
+ON CONFLICT(attempt_id) DO UPDATE SET
+    group_id = excluded.group_id,
+    request_id = excluded.request_id,
+    attempt_number = excluded.attempt_number,
+    role = excluded.role,
+    shown_to_downstream = excluded.shown_to_downstream,
+    started_at_unix_ms = excluded.started_at_unix_ms,
+    finished_at_unix_ms = excluded.finished_at_unix_ms,
+    upstream_profile = excluded.upstream_profile,
+    model_id = excluded.model_id,
+    thinking_mode = excluded.thinking_mode,
+    thinking_budget_tokens = excluded.thinking_budget_tokens,
+    thinking_max_tokens = excluded.thinking_max_tokens,
+    detector_features_json = excluded.detector_features_json,
+    status = excluded.status,
+    http_status = excluded.http_status,
+    error_reason = excluded.error_reason,
+    retry_reason = excluded.retry_reason,
+    abort_reason = excluded.abort_reason,
+    shadow_skip_reason = excluded.shadow_skip_reason,
+    request_metadata_json = excluded.request_metadata_json,
+    response_metadata_json = excluded.response_metadata_json,
+    raw_input = excluded.raw_input,
+    raw_output = excluded.raw_output,
+    raw_reasoning = excluded.raw_reasoning,
+    raw_tool_calls = excluded.raw_tool_calls,
+    estimated_bytes = excluded.estimated_bytes
+",
             params![
                 attempt.attempt_id,
                 attempt.group_id,
