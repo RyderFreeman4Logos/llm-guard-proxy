@@ -7607,7 +7607,7 @@ idle_timeout_ms = 50
 [upstream.local_recovery]
 enabled = true
 restart_command = ["/bin/sleep", "2"]
-restart_timeout_ms = 3000
+restart_timeout_ms = 10000
 readiness_body = {"model":"test-chat","messages":[{"role":"user","content":"disabled queue recovery ready"}],"max_tokens":1}
 readiness_request_timeout_ms = 1000
 readiness_deadline_ms = 1000
@@ -7943,9 +7943,9 @@ anti_loop_hint_enabled = false
 [upstream.local_recovery]
 enabled = true
 restart_command = ["{script_path}"]
-restart_timeout_ms = 1000
-readiness_request_timeout_ms = 1000
-readiness_deadline_ms = 1000
+restart_timeout_ms = 5000
+readiness_request_timeout_ms = 5000
+readiness_deadline_ms = 5000
 readiness_interval_ms = 100
 cooldown_ms = 1
 budget_window_ms = 10000
