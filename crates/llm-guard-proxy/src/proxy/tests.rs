@@ -37,6 +37,8 @@ use super::*;
 mod constraint_repair;
 #[path = "tests/cot_salvage_issue_211.rs"]
 mod cot_salvage_issue_211;
+#[path = "tests/first_evict_kv_priority_issue_242.rs"]
+mod first_evict_kv_priority_issue_242;
 #[path = "tests/listener_profile_policy.rs"]
 mod listener_profile_policy;
 #[path = "tests/native_json_fallback_issue_219.rs"]

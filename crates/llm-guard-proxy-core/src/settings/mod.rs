@@ -13,17 +13,17 @@ mod tests;
 
 pub use error::{ConfigParseError, ValidationError};
 pub use model::{
-    AppConfig, CloudflareConfig, ConfigToggle, DefaultInjectionSchema, DownstreamDropPolicy,
-    EmbeddingProvider, EmbeddingQueuePolicy, EndpointSelectionMode, EvidenceConfig,
-    EvidencePairedComparisonConfig, EvidenceShadowConfig, GuardianConfig, GuardianKillAction,
-    HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig, LocalRecoveryConfig,
-    LoopFailurePolicy, LoopGuardConfig, LoopGuardEmbeddingConfig, LoopGuardMode, MetadataConfig,
-    NoThinkingMarkerPolicy, ObservabilityConfig, RestartQueueConfig, RestartRequiredChange,
-    RetentionConfig, RetryConfig, RetryLadderConfig, SelectedUpstreamProfile, ServerConfig,
-    ShadowComparisonAttempt, ShieldingConfig, StuckWatchdogConfig, ThinkingConfig, ThinkingMode,
-    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamEndpointConfig, UpstreamEndpointProtocol,
-    UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig,
-    redact_upstream_base_url, validate_upstream_base_url,
+    AppConfig, CachePriorityEngine, CloudflareConfig, ConfigToggle, DefaultInjectionSchema,
+    DownstreamDropPolicy, EmbeddingProvider, EmbeddingQueuePolicy, EndpointSelectionMode,
+    EvidenceConfig, EvidencePairedComparisonConfig, EvidenceShadowConfig, GuardianConfig,
+    GuardianKillAction, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
+    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, LoopGuardEmbeddingConfig,
+    LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig, RestartQueueConfig,
+    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
+    SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
+    StuckWatchdogConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
+    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 pub use model::{BudgetConfig, GuardWorkflowConfig};
@@ -156,6 +156,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "heartbeat.interval_secs",
     "cloudflare.enabled",
     "upstream.request_timeout_ms",
+    "upstream.cache_priority_engine",
     "upstream.metadata.discovery_enabled",
     "upstream.metadata.enrich_responses",
     "upstream.metadata.refresh_interval_secs",
@@ -196,6 +197,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstream.restart_queue.queue_deadline_secs",
     "upstream.restart_queue.restart_timeout_secs",
     "upstreams.request_timeout_ms",
+    "upstreams.cache_priority_engine",
     "upstreams.health_probe_interval",
     "upstreams.health_probe_timeout",
     "upstreams.health_probe_max_wait",

@@ -39,10 +39,10 @@ use llm_guard_proxy_core::{
     GwpTraceMode, ModelAliasResolver, ProfileCheckResult, ProfileConfig, UnknownKeyPolicy,
 };
 use llm_guard_proxy_core::{
-    AppConfig, ConfigHandle, DefaultInjectionSchema, DownstreamDropPolicy, Health, HeartbeatMode,
-    LICENSE, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig,
-    MetadataConfig, RestartQueueConfig, RetryConfig, RetryLadderConfig, SERVICE_NAME,
-    SelectedUpstreamProfile, ShadowComparisonAttempt, ThinkingConfig, ThinkingMode,
+    AppConfig, CachePriorityEngine, ConfigHandle, DefaultInjectionSchema, DownstreamDropPolicy,
+    Health, HeartbeatMode, LICENSE, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy,
+    LoopGuardConfig, MetadataConfig, RestartQueueConfig, RetryConfig, RetryLadderConfig,
+    SERVICE_NAME, SelectedUpstreamProfile, ShadowComparisonAttempt, ThinkingConfig, ThinkingMode,
     UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
     UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
@@ -4796,6 +4796,34 @@ fn rewrite_request_model_body(body: &Bytes, upstream_model: &str) -> Bytes {
     Bytes::from(value.to_string())
 }
 
+/// Coerces a YAML-string priority hint only for an upstream that opts into an
+/// engine-native `OpenAI` `priority` field. Missing, numeric, and invalid values
+/// retain the original bytes.
+fn coerce_cache_priority_hint(body: &Bytes, profile: &UpstreamProfileConfig) -> Bytes {
+    match profile.cache_priority_engine {
+        CachePriorityEngine::Disabled => return body.clone(),
+        CachePriorityEngine::Sglang | CachePriorityEngine::Vllm => {}
+    }
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    let Some(object) = value.as_object_mut() else {
+        return body.clone();
+    };
+    let Some(priority) = object
+        .get("priority")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<i64>().ok())
+    else {
+        return body.clone();
+    };
+    object.insert(
+        String::from("priority"),
+        serde_json::Value::Number(priority.into()),
+    );
+    Bytes::from(value.to_string())
+}
+
 /// Rewrites the top-level `model` field in a response JSON body back to the
 /// client's original model alias when an upstream model rewrite was applied.
 /// Falls back to the original body for non-JSON or non-object payloads.
@@ -6854,6 +6882,7 @@ fn plan_shielded_chat(
         Some(upstream_model) => rewrite_request_model_body(&upstream_body, upstream_model),
         None => upstream_body,
     };
+    let upstream_body = coerce_cache_priority_hint(&upstream_body, upstream_profile);
     let thinking_metadata = request
         .as_ref()
         .map_or_else(BTreeMap::new, |request| request.thinking_metadata().clone());
@@ -12975,6 +13004,7 @@ fn shielded_attempt_body(
                 &runtime.upstream_profile,
                 &mut thinking_metadata,
             );
+            let body = coerce_cache_priority_hint(&body, &runtime.upstream_profile);
             return (body, false, true, thinking_metadata);
         }
     }
@@ -12994,6 +13024,7 @@ fn shielded_attempt_body(
             &runtime.upstream_profile,
             &mut thinking_metadata,
         );
+        let body = coerce_cache_priority_hint(&body, &runtime.upstream_profile);
         return (body, true, false, thinking_metadata);
     }
 
@@ -13019,6 +13050,7 @@ fn shielded_attempt_body(
         &runtime.upstream_profile,
         &mut thinking_metadata,
     );
+    let prepared_body = coerce_cache_priority_hint(&prepared_body, &runtime.upstream_profile);
     (
         prepared_body,
         anti_loop_hint_applied,
@@ -17155,6 +17187,7 @@ fn shadow_comparison_attempt_plan(
         &runtime.upstream_profile,
         &mut prepared.thinking_metadata,
     );
+    upstream_body = coerce_cache_priority_hint(&upstream_body, &runtime.upstream_profile);
     upstream_body = render_shadow_endpoint_body(runtime, &upstream_body)?;
     let mut request_metadata = source.request_metadata.clone();
     request_metadata.extend(prepared.thinking_metadata);
@@ -17202,6 +17235,7 @@ fn paired_shadow_comparison_attempt_plan(
         &runtime.upstream_profile,
         &mut prepared.thinking_metadata,
     );
+    let upstream_body = coerce_cache_priority_hint(&upstream_body, &runtime.upstream_profile);
     let upstream_body = render_shadow_endpoint_body(runtime, &upstream_body)?;
     let mut request_metadata = source.request_metadata.clone();
     request_metadata.extend(prepared.thinking_metadata);

@@ -12,14 +12,15 @@ use crate::workflow::{WorkflowConfig, WorkflowRuntime};
 #[cfg(feature = "param-override")]
 use super::ParamOverrideConfig;
 use super::{
-    AppConfig, CloudflareConfig, ConfigParseError, ConfigToggle, DefaultInjectionSchema,
-    DownstreamDropPolicy, EndpointSelectionMode, GuardianConfig, GuardianKillAction,
-    HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig, LocalRecoveryConfig,
-    LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy,
-    ObservabilityConfig, RestartQueueConfig, RetentionConfig, RetryConfig, RetryLadderConfig,
-    ServerConfig, ShadowComparisonAttempt, ShieldingConfig, StuckWatchdogConfig, ThinkingConfig,
-    ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig, UpstreamEndpointConfig,
-    UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig, UpstreamStallConfig,
+    AppConfig, CachePriorityEngine, CloudflareConfig, ConfigParseError, ConfigToggle,
+    DefaultInjectionSchema, DownstreamDropPolicy, EndpointSelectionMode, GuardianConfig,
+    GuardianKillAction, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
+    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, LoopGuardMode, MetadataConfig,
+    NoThinkingMarkerPolicy, ObservabilityConfig, RestartQueueConfig, RetentionConfig, RetryConfig,
+    RetryLadderConfig, ServerConfig, ShadowComparisonAttempt, ShieldingConfig, StuckWatchdogConfig,
+    ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
+    UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
+    UpstreamStallConfig,
 };
 #[cfg(feature = "guard")]
 use super::{UnknownKeyPolicy, VirtualKeyConfig};
@@ -1123,6 +1124,9 @@ fn assign_upstream_profile(
             config.match_models = vec![model];
         }
         "base_url" => config.base_url = parse_string(value, line_number)?,
+        "cache_priority_engine" => {
+            config.cache_priority_engine = parse_cache_priority_engine(value, line_number)?;
+        }
         "match_models" => config.match_models = parse_string_array(value, line_number)?,
         "upstream_model" => {
             let model = parse_string(value, line_number)?;
@@ -1219,6 +1223,23 @@ fn parse_endpoint_selection_mode(
             line_number,
             format!(
                 "invalid upstreams.endpoint_selection {other:?}; expected \"priority_failover\" or \"round_robin\""
+            ),
+        )),
+    }
+}
+
+fn parse_cache_priority_engine(
+    value: &str,
+    line_number: usize,
+) -> Result<CachePriorityEngine, ConfigParseError> {
+    match parse_string(value, line_number)?.trim() {
+        "disabled" => Ok(CachePriorityEngine::Disabled),
+        "sglang" => Ok(CachePriorityEngine::Sglang),
+        "vllm" => Ok(CachePriorityEngine::Vllm),
+        other => Err(ConfigParseError::new(
+            line_number,
+            format!(
+                "invalid upstreams.cache_priority_engine {other:?}; expected \"disabled\", \"sglang\", or \"vllm\""
             ),
         )),
     }
@@ -1330,6 +1351,9 @@ fn assign_upstream(
 ) -> Result<(), ConfigParseError> {
     match key {
         "base_url" => config.base_url = parse_string(value, line_number)?,
+        "cache_priority_engine" => {
+            config.cache_priority_engine = parse_cache_priority_engine(value, line_number)?;
+        }
         "request_timeout_ms" => {
             config.request_timeout_ms =
                 parse_u64(value, line_number, "upstream.request_timeout_ms")?;
