@@ -7,10 +7,13 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::cell::Cell;
+
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
 
 use super::{
     error::EvidenceError,
@@ -25,7 +28,7 @@ use llm_guard_proxy_core::{ConfigHandle, EvidenceConfig};
 
 use crate::RawPayloads;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const SHA256_HEX_LEN: usize = 64;
 const SECONDS_PER_DAY: u64 = 86_400;
 const SHA256_INITIAL_STATE: [u32; 8] = [
@@ -108,6 +111,11 @@ const SHA256_ROUND_CONSTANTS: [u32; 64] = [
 const EVIDENCE_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(unix)]
 const EVIDENCE_SQLITE_MODE: u32 = 0o600;
+
+#[cfg(test)]
+thread_local! {
+    static FULL_TABLE_COUNT_QUERIES: Cell<usize> = const { Cell::new(0) };
+}
 
 /// SQLite-backed evidence ledger.
 #[derive(Clone, Debug)]
@@ -725,20 +733,20 @@ fn open_connection_if_needed<'connection>(
         let sqlite_path = resolve_sqlite_path(configured_path)?;
         prepare_parent_directory(&sqlite_path)?;
         prepare_sqlite_file(&sqlite_path)?;
-        let connection = open_sqlite_connection(&sqlite_path)?;
+        let mut connection = open_sqlite_connection(&sqlite_path)?;
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|source| EvidenceError::Sqlite {
                 action: "enable SQLite foreign keys",
                 source,
             })?;
-        migrate(&connection)?;
+        migrate(&mut connection)?;
         *slot = Some(connection);
     }
     slot.as_mut().ok_or(EvidenceError::LockPoisoned)
 }
 
-fn migrate(connection: &Connection) -> Result<(), EvidenceError> {
+fn migrate(connection: &mut Connection) -> Result<(), EvidenceError> {
     let version = read_schema_version(connection)?;
     if version > SCHEMA_VERSION {
         return Err(EvidenceError::UnsupportedSchemaVersion {
@@ -748,14 +756,24 @@ fn migrate(connection: &Connection) -> Result<(), EvidenceError> {
     }
     match version {
         0 => create_schema(connection),
-        1 => migrate_schema_v2(connection),
+        1 => {
+            migrate_schema_v2(connection)?;
+            migrate_schema_v3(connection)
+        }
+        2 => migrate_schema_v3(connection),
         _ => Ok(()),
     }
 }
 
 #[allow(clippy::too_many_lines)]
-fn create_schema(connection: &Connection) -> Result<(), EvidenceError> {
-    connection
+fn create_schema(connection: &mut Connection) -> Result<(), EvidenceError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "start SQLite evidence schema transaction",
+            source,
+        })?;
+    transaction
         .execute_batch(
             r"
 CREATE TABLE IF NOT EXISTS evidence_groups (
@@ -855,7 +873,10 @@ CREATE TABLE IF NOT EXISTS evidence_pruning_stats (
     pruned_groups INTEGER NOT NULL,
     pruned_attempts INTEGER NOT NULL,
     pruned_chunks INTEGER NOT NULL,
-    last_pruned_at_unix_ms INTEGER
+    last_pruned_at_unix_ms INTEGER,
+    group_count INTEGER NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    chunk_count INTEGER NOT NULL
 );
 
 INSERT OR IGNORE INTO evidence_pruning_stats (
@@ -864,14 +885,29 @@ INSERT OR IGNORE INTO evidence_pruning_stats (
     pruned_groups,
     pruned_attempts,
     pruned_chunks,
-    last_pruned_at_unix_ms
-) VALUES ('global', 0, 0, 0, 0, NULL);
+    last_pruned_at_unix_ms,
+    group_count,
+    attempt_count,
+    chunk_count
+) VALUES ('global', 0, 0, 0, 0, NULL, 0, 0, 0);
 
-PRAGMA user_version = 2;
 ",
         )
         .map_err(|source| EvidenceError::Sqlite {
             action: "create SQLite evidence schema",
+            source,
+        })?;
+    create_retention_count_triggers(&transaction)?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "set SQLite evidence schema version to v3",
+            source,
+        })?;
+    transaction
+        .commit()
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "commit SQLite evidence schema transaction",
             source,
         })
 }
@@ -1021,6 +1057,110 @@ PRAGMA foreign_keys = ON;
         })
 }
 
+fn migrate_schema_v3(connection: &mut Connection) -> Result<(), EvidenceError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "start SQLite evidence v3 migration transaction",
+            source,
+        })?;
+    let group_count = read_count(&transaction, "evidence_groups", "read evidence group count")?;
+    let attempt_count = read_count(
+        &transaction,
+        "evidence_attempts",
+        "read evidence attempt count",
+    )?;
+    let chunk_count = read_count(&transaction, "evidence_chunks", "read evidence chunk count")?;
+    transaction
+        .execute_batch(
+            r"
+ALTER TABLE evidence_pruning_stats ADD COLUMN group_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE evidence_pruning_stats ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE evidence_pruning_stats ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0;
+",
+        )
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "add SQLite evidence retention counters",
+            source,
+        })?;
+    transaction
+        .execute(
+            "UPDATE evidence_pruning_stats SET group_count = ?1, attempt_count = ?2, chunk_count = ?3 WHERE stats_key = 'global'",
+            params![group_count, attempt_count, chunk_count],
+        )
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "initialize SQLite evidence retention counters",
+            source,
+        })?;
+    create_retention_count_triggers(&transaction)?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "set SQLite evidence schema version to v3",
+            source,
+        })?;
+    transaction
+        .commit()
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "commit SQLite evidence v3 migration transaction",
+            source,
+        })
+}
+
+fn create_retention_count_triggers(connection: &Connection) -> Result<(), EvidenceError> {
+    connection
+        .execute_batch(
+            r"
+CREATE TRIGGER IF NOT EXISTS evidence_groups_retention_count_insert
+AFTER INSERT ON evidence_groups
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET group_count = group_count + 1
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_groups_retention_count_delete
+AFTER DELETE ON evidence_groups
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET group_count = group_count - 1
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_attempts_retention_count_insert
+AFTER INSERT ON evidence_attempts
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET attempt_count = attempt_count + 1
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_attempts_retention_count_delete
+AFTER DELETE ON evidence_attempts
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET attempt_count = attempt_count - 1
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_chunks_retention_count_insert
+AFTER INSERT ON evidence_chunks
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET chunk_count = chunk_count + 1
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_chunks_retention_count_delete
+AFTER DELETE ON evidence_chunks
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET chunk_count = chunk_count - 1
+    WHERE stats_key = 'global';
+END;
+",
+        )
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "create SQLite evidence retention counter triggers",
+            source,
+        })
+}
+
 fn read_schema_version(connection: &Connection) -> Result<i64, EvidenceError> {
     connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
@@ -1126,7 +1266,7 @@ fn insert_attempt_in_transaction(
     transaction
         .execute(
             r"
-INSERT OR REPLACE INTO evidence_attempts (
+INSERT INTO evidence_attempts (
     attempt_id,
     group_id,
     request_id,
@@ -1158,7 +1298,35 @@ INSERT OR REPLACE INTO evidence_attempts (
     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
     ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27
-)",
+)
+ON CONFLICT(attempt_id) DO UPDATE SET
+    group_id = excluded.group_id,
+    request_id = excluded.request_id,
+    attempt_number = excluded.attempt_number,
+    role = excluded.role,
+    shown_to_downstream = excluded.shown_to_downstream,
+    started_at_unix_ms = excluded.started_at_unix_ms,
+    finished_at_unix_ms = excluded.finished_at_unix_ms,
+    upstream_profile = excluded.upstream_profile,
+    model_id = excluded.model_id,
+    thinking_mode = excluded.thinking_mode,
+    thinking_budget_tokens = excluded.thinking_budget_tokens,
+    thinking_max_tokens = excluded.thinking_max_tokens,
+    detector_features_json = excluded.detector_features_json,
+    status = excluded.status,
+    http_status = excluded.http_status,
+    error_reason = excluded.error_reason,
+    retry_reason = excluded.retry_reason,
+    abort_reason = excluded.abort_reason,
+    shadow_skip_reason = excluded.shadow_skip_reason,
+    request_metadata_json = excluded.request_metadata_json,
+    response_metadata_json = excluded.response_metadata_json,
+    raw_input = excluded.raw_input,
+    raw_output = excluded.raw_output,
+    raw_reasoning = excluded.raw_reasoning,
+    raw_tool_calls = excluded.raw_tool_calls,
+    estimated_bytes = excluded.estimated_bytes
+",
             params![
                 attempt.attempt_id,
                 attempt.group_id,
@@ -1725,13 +1893,19 @@ LIMIT 1
 }
 
 fn read_retention_usage(connection: &Connection) -> Result<EvidenceRetentionUsage, EvidenceError> {
-    let group_count = read_count(connection, "evidence_groups", "read evidence group count")?;
-    let attempt_count = read_count(
-        connection,
-        "evidence_attempts",
-        "read evidence attempt count",
-    )?;
-    let chunk_count = read_count(connection, "evidence_chunks", "read evidence chunk count")?;
+    let (group_count, attempt_count, chunk_count): (i64, i64, i64) = connection
+        .query_row(
+            "SELECT group_count, attempt_count, chunk_count FROM evidence_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "read evidence retention counters",
+            source,
+        })?;
+    let group_count = nonnegative_i64_to_u64(group_count);
+    let attempt_count = nonnegative_i64_to_u64(attempt_count);
+    let chunk_count = nonnegative_i64_to_u64(chunk_count);
     let record_count = group_count
         .saturating_add(attempt_count)
         .saturating_add(chunk_count);
@@ -1750,11 +1924,18 @@ fn read_count(
     table: &'static str,
     action: &'static str,
 ) -> Result<u64, EvidenceError> {
+    #[cfg(test)]
+    FULL_TABLE_COUNT_QUERIES.with(|queries| queries.set(queries.get() + 1));
     let sql = format!("SELECT COUNT(*) FROM {table}");
     let count: i64 = connection
         .query_row(&sql, [], |row| row.get(0))
         .map_err(|source| EvidenceError::Sqlite { action, source })?;
     Ok(nonnegative_i64_to_u64(count))
+}
+
+#[cfg(test)]
+pub(super) fn full_table_count_queries() -> usize {
+    FULL_TABLE_COUNT_QUERIES.with(Cell::get)
 }
 
 fn table_exists(connection: &Connection, table: &str) -> Result<bool, EvidenceError> {
