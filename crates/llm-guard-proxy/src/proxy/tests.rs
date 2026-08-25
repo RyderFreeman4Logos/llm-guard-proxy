@@ -10047,6 +10047,67 @@ top_p = 0.95
 
 #[cfg(feature = "param-override")]
 #[tokio::test]
+async fn fill_if_absent_defaults_preserve_caller_fields_without_native_thinking_budget() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &param_override_profile_config(
+            &fake.base_url,
+            r#"
+mode = "fill_if_absent"
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+max_tokens = 50000
+presence_penalty = 0.0
+repetition_penalty = 1.0
+reasoning_effort = "medium"
+"#,
+        ),
+    )
+    .await;
+
+    let defaulted = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"defaulted"}]}"#,
+    )
+    .await;
+    assert_eq!(defaulted["temperature"], 1.0);
+    assert_eq!(defaulted["top_p"], 0.95);
+    assert_eq!(defaulted["top_k"], 20);
+    assert_eq!(defaulted["min_p"], 0.0);
+    assert_eq!(defaulted["max_tokens"], 50_000);
+    assert_eq!(defaulted["presence_penalty"], 0.0);
+    assert_eq!(defaulted["repetition_penalty"], 1.0);
+    assert_eq!(defaulted["reasoning_effort"], "medium");
+    assert!(defaulted.get("thinking_token_budget").is_none());
+
+    let caller = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"caller"}],"top_p":0.8,"top_k":5,"min_p":0.1,"max_tokens":64,"presence_penalty":0.3,"repetition_penalty":1.2,"reasoning_effort":"low","thinking_token_budget":128,"thinking":{"budget_tokens":64},"parameters":{"temperature":0.4,"max_tokens":32}}"#,
+    )
+    .await;
+    assert!(caller.get("temperature").is_none());
+    assert_eq!(caller["top_p"], 0.8);
+    assert_eq!(caller["top_k"], 5);
+    assert_eq!(caller["min_p"], 0.1);
+    assert_eq!(caller["max_tokens"], 64);
+    assert_eq!(caller["presence_penalty"], 0.3);
+    assert_eq!(caller["repetition_penalty"], 1.2);
+    assert_eq!(caller["reasoning_effort"], "low");
+    assert_eq!(caller["thinking_token_budget"], 128);
+    assert_eq!(caller["thinking"]["budget_tokens"], 64);
+    assert_eq!(caller["parameters"]["temperature"], 0.4);
+    assert_eq!(caller["parameters"]["max_tokens"], 32);
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
 async fn override_disabled_passes_through() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(

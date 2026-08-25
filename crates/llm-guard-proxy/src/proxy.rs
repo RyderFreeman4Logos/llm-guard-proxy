@@ -32,8 +32,6 @@ use bytes::BytesMut;
 use futures_util::{Stream, StreamExt, TryStreamExt};
 #[cfg(feature = "upstream-hot-restart")]
 use llm_guard_proxy_core::HotRestartConfig;
-#[cfg(feature = "param-override")]
-use llm_guard_proxy_core::ParamOverrideConfig;
 #[cfg(feature = "guard")]
 use llm_guard_proxy_core::{
     AliasTarget, BlockReason, DEFAULT_PROFILE_NAME, GWP_PROTOCOL_VERSION, GuardExecutor,
@@ -48,6 +46,8 @@ use llm_guard_proxy_core::{
     UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
     UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
 };
+#[cfg(feature = "param-override")]
+use llm_guard_proxy_core::{ParamOverrideConfig, ParamOverrideMode};
 use llm_guard_proxy_state::{
     AttemptId, AttemptRecord, AttemptStatus, DebugRequestSummary, DownstreamMode,
     EvidenceAttemptRecord, EvidenceAttemptRole, EvidenceAttemptStatus, EvidenceGroupRecord,
@@ -3456,7 +3456,7 @@ async fn forward_openai_request(
         ))
         .await;
     }
-    forward_generic_openai_request(GenericForwardContext {
+    Box::pin(forward_generic_openai_request(GenericForwardContext {
         state,
         config: &config,
         method,
@@ -3492,7 +3492,7 @@ async fn forward_openai_request(
             retry_policy.request_deadline,
         ),
         local_recovery_attempts: AtomicU64::new(0),
-    })
+    }))
     .await
 }
 
@@ -4229,9 +4229,12 @@ fn param_override_has_fields(config: &ParamOverrideConfig) -> bool {
     config.temperature.is_some()
         || config.top_p.is_some()
         || config.top_k.is_some()
+        || config.min_p.is_some()
         || config.max_tokens.is_some()
         || config.frequency_penalty.is_some()
         || config.presence_penalty.is_some()
+        || config.repetition_penalty.is_some()
+        || config.reasoning_effort.is_some()
 }
 
 #[cfg(feature = "param-override")]
@@ -4240,14 +4243,19 @@ fn apply_param_override_object(
     config: &ParamOverrideConfig,
 ) -> shielded_chat::AnswerBudgetDecision {
     insert_param_override_fields(object, config);
-    if let Some(serde_json::Value::Object(parameters)) = object.get_mut("parameters") {
-        insert_param_override_fields(parameters, config);
-    }
     config
         .max_tokens
-        .map_or_else(shielded_chat::AnswerBudgetDecision::default, |max_tokens| {
-            shielded_chat::apply_output_token_cap(object, u64::from(max_tokens))
-        })
+        .map_or_else(
+            shielded_chat::AnswerBudgetDecision::default,
+            |max_tokens| match config.mode {
+                ParamOverrideMode::Override => {
+                    shielded_chat::apply_output_token_cap(object, u64::from(max_tokens))
+                }
+                ParamOverrideMode::FillIfAbsent => {
+                    shielded_chat::apply_output_token_default(object, u64::from(max_tokens))
+                }
+            },
+        )
 }
 
 #[cfg(feature = "param-override")]
@@ -4255,11 +4263,34 @@ fn insert_param_override_fields(
     object: &mut serde_json::Map<String, serde_json::Value>,
     config: &ParamOverrideConfig,
 ) {
-    insert_f64_override(object, "temperature", config.temperature);
-    insert_f64_override(object, "top_p", config.top_p);
-    insert_u32_override(object, "top_k", config.top_k);
-    insert_f64_override(object, "frequency_penalty", config.frequency_penalty);
-    insert_f64_override(object, "presence_penalty", config.presence_penalty);
+    insert_f64_override(object, "temperature", config.temperature, config.mode);
+    insert_f64_override(object, "top_p", config.top_p, config.mode);
+    insert_u32_override(object, "top_k", config.top_k, config.mode);
+    insert_f64_override(object, "min_p", config.min_p, config.mode);
+    insert_f64_override(
+        object,
+        "frequency_penalty",
+        config.frequency_penalty,
+        config.mode,
+    );
+    insert_f64_override(
+        object,
+        "presence_penalty",
+        config.presence_penalty,
+        config.mode,
+    );
+    insert_f64_override(
+        object,
+        "repetition_penalty",
+        config.repetition_penalty,
+        config.mode,
+    );
+    insert_string_override(
+        object,
+        "reasoning_effort",
+        config.reasoning_effort.as_deref(),
+        config.mode,
+    );
 }
 
 #[cfg(feature = "param-override")]
@@ -4267,9 +4298,10 @@ fn insert_f64_override(
     object: &mut serde_json::Map<String, serde_json::Value>,
     field: &'static str,
     value: Option<f64>,
+    mode: ParamOverrideMode,
 ) {
     if let Some(number) = value.and_then(serde_json::Number::from_f64) {
-        object.insert(field.to_owned(), serde_json::Value::Number(number));
+        insert_param_override_value(object, field, serde_json::Value::Number(number), mode);
     }
 }
 
@@ -4278,9 +4310,50 @@ fn insert_u32_override(
     object: &mut serde_json::Map<String, serde_json::Value>,
     field: &'static str,
     value: Option<u32>,
+    mode: ParamOverrideMode,
 ) {
     if let Some(value) = value {
-        object.insert(field.to_owned(), serde_json::Value::Number(value.into()));
+        insert_param_override_value(object, field, serde_json::Value::Number(value.into()), mode);
+    }
+}
+
+#[cfg(feature = "param-override")]
+fn insert_string_override(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+    value: Option<&str>,
+    mode: ParamOverrideMode,
+) {
+    if let Some(value) = value {
+        insert_param_override_value(
+            object,
+            field,
+            serde_json::Value::String(value.to_owned()),
+            mode,
+        );
+    }
+}
+
+#[cfg(feature = "param-override")]
+fn insert_param_override_value(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    field: &'static str,
+    value: serde_json::Value,
+    mode: ParamOverrideMode,
+) {
+    let nested_has_field = object
+        .get("parameters")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|parameters| parameters.contains_key(field));
+    if mode == ParamOverrideMode::FillIfAbsent && (object.contains_key(field) || nested_has_field) {
+        return;
+    }
+    object.insert(field.to_owned(), value.clone());
+    if let Some(parameters) = object
+        .get_mut("parameters")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        parameters.insert(field.to_owned(), value);
     }
 }
 

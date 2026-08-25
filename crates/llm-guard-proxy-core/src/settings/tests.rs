@@ -879,7 +879,7 @@ thinking.default_injection_schema = "canonical"
 
 #[test]
 #[cfg(feature = "param-override")]
-fn gb10_deploy_config_preserves_authoritative_topology_with_native_thinking() {
+fn gb10_deploy_config_preserves_authoritative_topology_with_fill_if_absent_defaults() {
     let config = parse_config_text(GB10_DEPLOY_CONFIG).expect("GB10 deploy config should parse");
     config
         .validate()
@@ -949,11 +949,25 @@ fn gb10_deploy_config_preserves_authoritative_topology_with_native_thinking() {
         ]
     );
     assert_gb10_failover_topology(&config);
-    assert_eq!(
-        config.upstream_profiles[0]
-            .thinking
-            .default_injection_schema,
+    let chat_profile = &config.upstream_profiles[0];
+    assert_eq!(chat_profile.thinking.mode, ThinkingMode::Passthrough);
+    assert!(!chat_profile.thinking.enabled);
+    assert_eq!(chat_profile.thinking.budget_tokens, 32_768);
+    assert_ne!(
+        chat_profile.thinking.default_injection_schema,
         DefaultInjectionSchema::VllmNative
+    );
+    assert_eq!(
+        chat_profile.param_override.mode,
+        super::ParamOverrideMode::FillIfAbsent
+    );
+    assert_eq!(chat_profile.param_override.temperature, Some(1.0));
+    assert_eq!(chat_profile.param_override.min_p, Some(0.0));
+    assert_eq!(chat_profile.param_override.max_tokens, Some(50_000));
+    assert_eq!(chat_profile.param_override.repetition_penalty, Some(1.0));
+    assert_eq!(
+        chat_profile.param_override.reasoning_effort.as_deref(),
+        Some("medium")
     );
     assert_eq!(config.retry.ladder.len(), 4);
     assert!(config
@@ -1035,6 +1049,7 @@ fn gb10_deploy_uncomment_ready_examples_parse() {
     for name in [
         "upstream-stall-recovery",
         "upstream-profile",
+        "fill-if-absent-chat-defaults",
         "heterogeneous-reranker-replicas",
         "generic-openai-reranker-failover",
     ] {
@@ -1822,6 +1837,119 @@ presence_penalty = -0.2
     config
         .validate()
         .expect("param override config should validate");
+}
+
+#[cfg(feature = "param-override")]
+#[test]
+fn parses_fill_if_absent_upstream_profile_defaults() {
+    let config = parse_config_text(
+        r#"
+[[upstreams]]
+name = "qwen-chat"
+base_url = "http://qwen.example/v1"
+match_models = ["qwen-chat"]
+
+[upstreams.param_override]
+mode = "fill_if_absent"
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+max_tokens = 50000
+presence_penalty = 0.0
+repetition_penalty = 1.0
+reasoning_effort = "medium"
+"#,
+    )
+    .expect("fill-if-absent defaults should parse");
+
+    let defaults = &config.upstream_profiles[0].param_override;
+    assert_eq!(defaults.mode, super::ParamOverrideMode::FillIfAbsent);
+    assert_eq!(defaults.temperature, Some(1.0));
+    assert_eq!(defaults.top_p, Some(0.95));
+    assert_eq!(defaults.top_k, Some(20));
+    assert_eq!(defaults.min_p, Some(0.0));
+    assert_eq!(defaults.max_tokens, Some(50_000));
+    assert_eq!(defaults.presence_penalty, Some(0.0));
+    assert_eq!(defaults.repetition_penalty, Some(1.0));
+    assert_eq!(defaults.reasoning_effort.as_deref(), Some("medium"));
+    config.validate().expect("defaults should validate");
+}
+
+#[cfg(feature = "param-override")]
+#[test]
+fn rejects_unknown_fill_if_absent_upstream_profile_default() {
+    let error = parse_config_text(
+        r#"
+[[upstreams]]
+name = "qwen-chat"
+base_url = "http://qwen.example/v1"
+match_models = ["qwen-chat"]
+
+[upstreams.param_override]
+mode = "fill_if_absent"
+unknown_default = 1
+"#,
+    )
+    .expect_err("unknown defaults must remain rejected");
+
+    assert!(error.to_string().contains("unknown_default"));
+}
+
+#[cfg(feature = "param-override")]
+#[test]
+fn hot_reload_updates_fill_if_absent_defaults_without_topology_change() {
+    let current = parse_config_text(
+        r#"
+[[upstreams]]
+name = "qwen-chat"
+base_url = "http://qwen.example/v1"
+match_models = ["qwen-chat"]
+
+[upstreams.param_override]
+mode = "fill_if_absent"
+temperature = 1.0
+"#,
+    )
+    .expect("current defaults should parse");
+    let requested = parse_config_text(
+        r#"
+[[upstreams]]
+name = "qwen-chat"
+base_url = "http://qwen.example/v1"
+match_models = ["qwen-chat"]
+
+[upstreams.param_override]
+mode = "fill_if_absent"
+temperature = 0.8
+reasoning_effort = "high"
+"#,
+    )
+    .expect("requested defaults should parse");
+
+    let (next, outcome) = apply_reloadable(&current, &requested);
+
+    assert!(outcome.applied);
+    assert!(outcome.restart_required_changes.is_empty());
+    assert_eq!(
+        next.upstream_profiles[0].param_override.temperature,
+        Some(0.8)
+    );
+    assert_eq!(
+        next.upstream_profiles[0]
+            .param_override
+            .reasoning_effort
+            .as_deref(),
+        Some("high")
+    );
+    for field in [
+        "upstreams.param_override.mode",
+        "upstreams.param_override.min_p",
+        "upstreams.param_override.repetition_penalty",
+        "upstreams.param_override.reasoning_effort",
+    ] {
+        assert!(RELOADABLE_FIELDS.contains(&field), "missing {field}");
+    }
 }
 
 #[test]

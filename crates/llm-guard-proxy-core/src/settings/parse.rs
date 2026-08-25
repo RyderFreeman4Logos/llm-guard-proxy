@@ -1537,6 +1537,18 @@ fn assign_param_override(
 ) -> Result<(), ConfigParseError> {
     match key {
         "enabled" => config.enabled = parse_bool(value, line_number)?,
+        "mode" => {
+            config.mode = match parse_string(value, line_number)?.trim() {
+                "override" => super::ParamOverrideMode::Override,
+                "fill_if_absent" => super::ParamOverrideMode::FillIfAbsent,
+                _ => {
+                    return Err(ConfigParseError::new(
+                        line_number,
+                        "param_override.mode must be one of: override, fill_if_absent",
+                    ));
+                }
+            };
+        }
         "temperature" => {
             config.temperature = Some(parse_f64(value, line_number, "param_override.temperature")?);
         }
@@ -1545,6 +1557,9 @@ fn assign_param_override(
         }
         "top_k" => {
             config.top_k = Some(parse_u32(value, line_number, "param_override.top_k")?);
+        }
+        "min_p" => {
+            config.min_p = Some(parse_f64(value, line_number, "param_override.min_p")?);
         }
         "max_tokens" => {
             config.max_tokens = Some(parse_u32(value, line_number, "param_override.max_tokens")?);
@@ -1562,6 +1577,16 @@ fn assign_param_override(
                 line_number,
                 "param_override.presence_penalty",
             )?);
+        }
+        "repetition_penalty" => {
+            config.repetition_penalty = Some(parse_f64(
+                value,
+                line_number,
+                "param_override.repetition_penalty",
+            )?);
+        }
+        "reasoning_effort" => {
+            config.reasoning_effort = Some(parse_string(value, line_number)?);
         }
         _ => return unknown_key("upstreams.param_override", key, line_number),
     }

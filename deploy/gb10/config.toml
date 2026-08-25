@@ -215,24 +215,47 @@ budget_window_ms = 900000
 max_per_window = 2
 
 [upstreams.thinking]
-mode = "bounded_thinking"
-enabled = true
+mode = "passthrough"
+enabled = false
 force_disable = false
-max_tokens = 50000                 # Total output cap; caller limits below it remain unchanged
-budget_tokens = 32768
-preserve_answer_budget = true
-tool_request_policy = "apply"
-no_thinking_marker_policy = "respect_no_thinking_markers"
-default_injection_schema = "vllm_native"
+budget_tokens = 32768              # Reference budget for reasoning_effort=medium; passthrough never injects it
 
 [upstreams.param_override]
 enabled = true
-temperature = 0.6
+mode = "fill_if_absent"
+temperature = 1.0
 top_p = 0.95
 top_k = 20
-max_tokens = 50000                 # Supplies the same total cap when thinking policy omits one
-frequency_penalty = 0.0
+min_p = 0.0
+max_tokens = 50000                 # Default total output budget; any caller output limit wins
 presence_penalty = 0.0
+repetition_penalty = 1.0
+reasoning_effort = "medium"
+
+# BEGIN PARSEABLE EXAMPLE: fill-if-absent-chat-defaults
+# Every default is optional; omitted fields pass through unchanged, and explicit
+# caller fields always win. This profile keeps thinking passthrough so the proxy
+# does not inject a backend-specific thinking_token_budget.
+#| [[upstreams]]
+#| name = "example-fill-if-absent-chat"      # Stable profile name
+#| base_url = "http://127.0.0.1:18010/v1"    # OpenAI-compatible chat endpoint
+#| match_models = ["example-chat"]           # Public model aliases routed here
+#| [upstreams.thinking]
+#| mode = "passthrough"                      # Preserve all caller thinking controls
+#| enabled = false                           # Disable default thinking-budget injection
+#| [upstreams.param_override]
+#| enabled = true                         # Safe default is true for configured fields; false disables all rewriting
+#| mode = "fill_if_absent"               # Fill only missing fields; "override" preserves the force-rewrite behavior
+#| temperature = 1.0                      # Default sampling temperature
+#| top_p = 0.95                           # Default nucleus sampling threshold
+#| top_k = 20                             # Default top-k sampling limit
+#| min_p = 0.0                            # Default minimum-token probability threshold
+#| max_tokens = 50000                     # Default total output-token limit
+#| frequency_penalty = 0.0                # Default OpenAI-compatible frequency penalty
+#| presence_penalty = 0.0                 # Default OpenAI-compatible presence penalty
+#| repetition_penalty = 1.0               # Default vLLM repetition penalty
+#| reasoning_effort = "medium"           # Default qualitative reasoning effort; does not inject thinking_token_budget
+# END PARSEABLE EXAMPLE: fill-if-absent-chat-defaults
 
 ## ── upstream_model (optional, same-PR config-doc sync per CLAUDE.md) ─────────
 ## When set, the proxy rewrites the upstream request body and streaming response

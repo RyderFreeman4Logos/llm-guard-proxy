@@ -73,8 +73,6 @@ pub use replay::{
     ReplayRunner, SEVERITY_HARD, SEVERITY_MILD, SEVERITY_NONE, SourceCalibration, SseEvent,
 };
 pub use risk_combiner::{CombinedRisk, DetectorKind, DetectorSignal, RiskCombiner};
-#[cfg(feature = "param-override")]
-pub use settings::ParamOverrideConfig;
 pub use settings::{
     AppConfig, CloudflareConfig, ConfigHandle, ConfigHandleError, ConfigParseError,
     DefaultInjectionSchema, DownstreamDropPolicy, EndpointSelectionMode, EvidenceConfig,
@@ -91,6 +89,8 @@ pub use settings::{
 };
 #[cfg(feature = "guard")]
 pub use settings::{BudgetConfig, UnknownKeyPolicy, VirtualKeyConfig};
+#[cfg(feature = "param-override")]
+pub use settings::{ParamOverrideConfig, ParamOverrideMode};
 #[cfg(feature = "guard")]
 pub use workflow::{GuardWorkflowExecutor, WorkflowConfig, WorkflowRuntime};
 
