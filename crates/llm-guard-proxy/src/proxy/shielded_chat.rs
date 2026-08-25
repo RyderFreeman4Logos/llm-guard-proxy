@@ -1879,12 +1879,14 @@ pub(super) fn apply_output_token_default(
     max_tokens: u64,
 ) -> AnswerBudgetDecision {
     let mut decision = AnswerBudgetDecision::default();
-    let nested_field_present = object
-        .get("parameters")
-        .and_then(Value::as_object)
-        .is_some_and(|parameters| parameters.contains_key("max_tokens"));
+    let parameters = object.get("parameters").and_then(Value::as_object);
+    let nested_field_present = parameters.is_some_and(|parameters| {
+        ANSWER_BUDGET_FIELDS
+            .iter()
+            .any(|field| parameters.contains_key(*field))
+    });
     let mut caller_field_present = nested_field_present;
-    if nested_field_present {
+    if parameters.is_some_and(|parameters| parameters.contains_key("max_tokens")) {
         decision.preserved_fields.push(PARAMETERS_MAX_TOKENS_FIELD);
     }
     for field in ANSWER_BUDGET_FIELDS {

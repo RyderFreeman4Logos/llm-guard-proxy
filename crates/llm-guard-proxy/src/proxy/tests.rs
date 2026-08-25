@@ -10106,6 +10106,24 @@ reasoning_effort = "medium"
     assert_eq!(caller["thinking"]["budget_tokens"], 64);
     assert_eq!(caller["parameters"]["temperature"], 0.4);
     assert_eq!(caller["parameters"]["max_tokens"], 32);
+
+    for (field, body) in [
+        (
+            "max_completion_tokens",
+            br#"{"model":"test-chat","messages":[{"role":"user","content":"parameters-max-completion-tokens"}],"parameters":{"max_completion_tokens":64}}"#
+                .as_slice(),
+        ),
+        (
+            "max_output_tokens",
+            br#"{"model":"test-chat","messages":[{"role":"user","content":"parameters-max-output-tokens"}],"parameters":{"max_output_tokens":64}}"#
+                .as_slice(),
+        ),
+    ] {
+        let caller = post_chat_and_observe_body(&proxy, &mut fake, body).await;
+        assert_eq!(caller["parameters"][field], 64);
+        assert!(caller.get("max_tokens").is_none());
+        assert!(caller["parameters"].get("max_tokens").is_none());
+    }
 }
 
 #[cfg(feature = "param-override")]
