@@ -15196,6 +15196,55 @@ mode = "passthrough"
 }
 
 #[tokio::test]
+async fn context_budget_preflight_rejects_nested_output_limits_before_forwarding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[upstream.metadata]
+context_length_override = 6
+
+[thinking]
+mode = "passthrough"
+"#,
+    )
+    .await;
+
+    for (container, field) in ["parameters", "extra_body"]
+        .into_iter()
+        .flat_map(|container| {
+            ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+                .into_iter()
+                .map(move |field| (container, field))
+        })
+    {
+        let body = format!(
+            r#"{{"model":"test-chat","messages":[{{"role":"user","content":"a b c"}}],"{container}":{{"{field}":3}}}}"#
+        );
+        let response = proxy
+            .client
+            .post(format!("{}/v1/chat/completions", proxy.base_url))
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{container}.{field}"
+        );
+        let error = response_json(response).await;
+        assert_eq!(error["error"]["code"], "context_budget_exceeded");
+    }
+
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
+}
+
+#[tokio::test]
 async fn context_budget_preflight_counts_chat_tool_definitions_before_forwarding() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_options(

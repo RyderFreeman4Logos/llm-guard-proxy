@@ -9036,11 +9036,21 @@ fn estimate_object_fields_tokens(
 }
 
 fn estimate_reserved_output_tokens(value: &serde_json::Value) -> u64 {
-    let output_cap = ["max_tokens", "max_completion_tokens", "max_output_tokens"]
-        .iter()
-        .filter_map(|field| value.get(*field).and_then(serde_json::Value::as_u64))
-        .max()
-        .unwrap_or(0);
+    let output_cap = [
+        &["max_tokens"][..],
+        &["max_completion_tokens"][..],
+        &["max_output_tokens"][..],
+        &["parameters", "max_tokens"][..],
+        &["parameters", "max_completion_tokens"][..],
+        &["parameters", "max_output_tokens"][..],
+        &["extra_body", "max_tokens"][..],
+        &["extra_body", "max_completion_tokens"][..],
+        &["extra_body", "max_output_tokens"][..],
+    ]
+    .iter()
+    .filter_map(|path| numeric_json_path(value, path))
+    .max()
+    .unwrap_or(0);
     output_cap.max(estimate_thinking_budget_tokens(value))
 }
 
