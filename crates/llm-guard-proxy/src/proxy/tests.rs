@@ -68,6 +68,8 @@ mod watchdog_sse_fast_path_residual;
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;
 const TEST_MAX_RECORDS: u64 = 100;
+#[cfg(feature = "param-override")]
+const GB10_DEPLOY_CONFIG: &str = include_str!("../../../../deploy/gb10/config.toml");
 const STREAM_DELAY: Duration = Duration::from_millis(800);
 const STREAM_HEADER_TIMEOUT: Duration = Duration::from_millis(500);
 const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_millis(250);
@@ -23182,6 +23184,69 @@ impl ProxyFixture {
             root,
         }
     }
+
+    #[cfg(feature = "param-override")]
+    async fn spawn_with_gb10_deploy_config(upstream_base_url: &str) -> Self {
+        let root = unique_test_dir("proxy-gb10");
+        fs::create_dir_all(&root).expect("test root should be created");
+        set_owner_only_dir(&root);
+        let storage = root.join("storage");
+        fs::create_dir_all(&storage).expect("storage should be created");
+        set_owner_only_dir(&storage);
+        let config_path = root.join("config.toml");
+        let sqlite_path = storage.join("observability.sqlite3");
+        let evidence_sqlite_path = storage.join("evidence.sqlite3");
+        #[cfg(feature = "guard")]
+        let budget_sqlite_path = storage.join("budget.sqlite3");
+        fs::write(
+            &config_path,
+            gb10_deploy_config_for_test(upstream_base_url, &sqlite_path, &evidence_sqlite_path),
+        )
+        .expect("gb10 deploy config should be written");
+        let manager = ConfigManager::from_explicit_path(&config_path)
+            .expect("gb10 deploy config should load");
+        let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+        let evidence_store = EvidenceStore::open(manager.handle());
+        #[cfg(feature = "guard")]
+        let budget_store = Arc::new(
+            BudgetStore::open(&budget_sqlite_path.display().to_string())
+                .expect("budget store should open"),
+        );
+        let state = ProxyState::new(
+            manager.handle(),
+            manager.path().to_path_buf(),
+            store.clone(),
+            evidence_store,
+            #[cfg(feature = "guard")]
+            budget_store,
+            build_http_client().expect("client should build"),
+        );
+        let app = router(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy should bind");
+        let addr = listener
+            .local_addr()
+            .expect("proxy addr should be available");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("proxy test server failed: {error}");
+            }
+        });
+
+        Self {
+            base_url: format!("http://{addr}"),
+            client: build_http_client().expect("client should build"),
+            manager,
+            state,
+            store,
+            sqlite_path,
+            evidence_sqlite_path,
+            #[cfg(feature = "guard")]
+            budget_sqlite_path,
+            root,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -24176,4 +24241,103 @@ debug_summary_admin_token = "admin-token"
         .await
         .expect("debug live requests request should complete");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[cfg(feature = "param-override")]
+fn gb10_deploy_config_for_test(
+    upstream_base_url: &str,
+    sqlite_path: &Path,
+    evidence_sqlite_path: &Path,
+) -> String {
+    let blob_cache = evidence_sqlite_path
+        .parent()
+        .expect("evidence sqlite path should have parent")
+        .join("evidence-blobs");
+    GB10_DEPLOY_CONFIG
+        .replace("http://100.105.4.92:18010/v1", upstream_base_url)
+        .replace(
+            "/home/obj/.local/state/llm-guard-proxy/observability.sqlite3",
+            &sqlite_path.display().to_string(),
+        )
+        .replace(
+            "/home/obj/.local/state/llm-guard-proxy-evidence/evidence.sqlite3",
+            &evidence_sqlite_path.display().to_string(),
+        )
+        .replace(
+            "/home/obj/.cache/llm-guard-proxy-evidence/blobs",
+            &blob_cache.display().to_string(),
+        )
+        .replace(
+            "[upstream.hot_restart]\nenabled = true",
+            "[upstream.hot_restart]\nenabled = false",
+        )
+        .replace(
+            "[upstreams.hot_restart]\nenabled = true",
+            "[upstreams.hot_restart]\nenabled = false",
+        )
+        .replace("discovery_enabled = true", "discovery_enabled = false")
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn gb10_deploy_chat_path_preserves_caller_fields_without_native_thinking_budget() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+
+    let defaulted = post_chat_and_observe_gb10_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"defaulted"}]}"#,
+        "defaulted",
+    )
+    .await;
+    assert_eq!(defaulted["temperature"], 1.0);
+    assert_eq!(defaulted["top_p"], 0.95);
+    assert_eq!(defaulted["top_k"], 20);
+    assert_eq!(defaulted["min_p"], 0.0);
+    assert_eq!(defaulted["max_tokens"], 50_000);
+    assert_eq!(defaulted["presence_penalty"], 0.0);
+    assert_eq!(defaulted["repetition_penalty"], 1.0);
+    assert_eq!(defaulted["reasoning_effort"], "medium");
+    assert!(defaulted.get("thinking_token_budget").is_none());
+
+    let caller = post_chat_and_observe_gb10_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"caller"}],"max_tokens":64,"reasoning_effort":"low","thinking_token_budget":128,"thinking":{"budget_tokens":64}}"#,
+        "caller",
+    )
+    .await;
+    assert_eq!(caller["max_tokens"], 64);
+    assert_eq!(caller["reasoning_effort"], "low");
+    assert_eq!(caller["thinking_token_budget"], 128);
+    assert_eq!(caller["thinking"]["budget_tokens"], 64);
+}
+
+#[cfg(feature = "param-override")]
+async fn post_chat_and_observe_gb10_body(
+    proxy: &ProxyFixture,
+    fake: &mut FakeUpstream,
+    body: &'static [u8],
+    content: &str,
+) -> serde_json::Value {
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    for _ in 0..8 {
+        let observed = fake.recv_next().await;
+        let value: serde_json::Value =
+            serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+        if value["messages"][0]["content"] == content {
+            return value;
+        }
+    }
+    panic!("gb10 chat path should observe content {content:?}");
 }

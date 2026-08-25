@@ -232,6 +232,30 @@ presence_penalty = 0.0
 repetition_penalty = 1.0
 reasoning_effort = "medium"
 
+# Inherited [[retry.ladder]] injects vllm_native thinking. Keep AEON attempts
+# caller-preserving on first try and retries; do not drop the retry count.
+[[upstreams.retry.ladder]]
+name = "max-thinking"
+thinking_mode = "passthrough"
+enabled = false
+
+[[upstreams.retry.ladder]]
+name = "bounded-thinking-deep"
+thinking_mode = "passthrough"
+enabled = false
+anti_loop_hint = "Previous attempt became repetitive. Do not repeat prior analysis; answer directly."
+
+[[upstreams.retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "passthrough"
+enabled = false
+anti_loop_hint = "Previous attempt became repetitive after a deeper retry. Use only the useful prior work and answer directly."
+
+[[upstreams.retry.ladder]]
+name = "no-thinking"
+thinking_mode = "passthrough"
+enabled = false
+
 # BEGIN PARSEABLE EXAMPLE: fill-if-absent-chat-defaults
 # Every default is optional; omitted fields pass through unchanged, and explicit
 # caller fields always win. This profile keeps thinking passthrough so the proxy
