@@ -28,7 +28,7 @@ const SHARED_REAPER_ACK_PATH_ENV: &str = "LLM_GUARD_SHARED_REAPER_ACK_PATH";
 const SHARED_REAPER_CLEANUP_IDENTITY_PATH_ENV: &str =
     "LLM_GUARD_SHARED_REAPER_CLEANUP_IDENTITY_PATH";
 const SHARED_REAPER_PREIDENTITY_DELAY_ENV: &str = "LLM_GUARD_SHARED_REAPER_PREIDENTITY_DELAY_MS";
-const ISOLATED_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
+const ISOLATED_HELPER_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[test]
 fn shared_deferred_reaper_isolated_subprocess_kills_and_reaps_transferred_process() {

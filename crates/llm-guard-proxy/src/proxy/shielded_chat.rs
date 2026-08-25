@@ -139,6 +139,12 @@ pub(super) fn has_conflicting_vllm_native_controls(body: &Bytes) -> bool {
     positive_native_budget && detect_no_thinking_markers(&object).detected
 }
 
+/// Returns whether the caller already sent an explicit no-thinking control.
+#[cfg(feature = "param-override")]
+pub(super) fn has_no_thinking_markers(object: &Map<String, Value>) -> bool {
+    detect_no_thinking_markers(object).detected
+}
+
 /// Returns a retry request body with a bounded anti-loop system hint.
 ///
 /// The hint is deterministic and contains only proxy retry metadata; it never
@@ -1864,6 +1870,56 @@ pub(super) fn apply_output_token_cap(
     max_tokens: u64,
 ) -> AnswerBudgetDecision {
     apply_output_token_limit(object, max_tokens, true)
+}
+
+/// Inserts a configured output default only when the caller supplied no output field.
+#[cfg(feature = "param-override")]
+pub(super) fn apply_output_token_default(
+    object: &mut Map<String, Value>,
+    max_tokens: u64,
+) -> AnswerBudgetDecision {
+    let mut decision = AnswerBudgetDecision::default();
+    let parameters = object.get("parameters").and_then(Value::as_object);
+    let nested_field_present = parameters.is_some_and(|parameters| {
+        ANSWER_BUDGET_FIELDS
+            .iter()
+            .any(|field| parameters.contains_key(*field))
+    });
+    let mut caller_field_present = nested_field_present;
+    if parameters.is_some_and(|parameters| parameters.contains_key("max_tokens")) {
+        decision.preserved_fields.push(PARAMETERS_MAX_TOKENS_FIELD);
+    }
+    for field in ANSWER_BUDGET_FIELDS {
+        if object.contains_key(*field) {
+            caller_field_present = true;
+            decision.preserved_fields.push(field);
+        }
+        if object
+            .get("extra_body")
+            .and_then(Value::as_object)
+            .is_some_and(|extra_body| extra_body.contains_key(*field))
+        {
+            caller_field_present = true;
+        }
+    }
+    if caller_field_present {
+        return decision;
+    }
+
+    object.insert(
+        String::from("max_tokens"),
+        Value::Number(Number::from(max_tokens)),
+    );
+    decision.adjusted_fields.push("max_tokens");
+    decision.applied = true;
+    if let Some(Value::Object(parameters)) = object.get_mut("parameters") {
+        parameters.insert(
+            String::from("max_tokens"),
+            Value::Number(Number::from(max_tokens)),
+        );
+        decision.adjusted_fields.push(PARAMETERS_MAX_TOKENS_FIELD);
+    }
+    decision
 }
 
 fn apply_output_token_limit(

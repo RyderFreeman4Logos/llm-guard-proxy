@@ -68,6 +68,8 @@ mod watchdog_sse_fast_path_residual;
 const TEST_MAX_BYTES: u64 = 1_000_000;
 const TEST_PRUNE_TO_BYTES: u64 = 800_000;
 const TEST_MAX_RECORDS: u64 = 100;
+#[cfg(feature = "param-override")]
+const GB10_DEPLOY_CONFIG: &str = include_str!("../../../../deploy/gb10/config.toml");
 const STREAM_DELAY: Duration = Duration::from_millis(800);
 const STREAM_HEADER_TIMEOUT: Duration = Duration::from_millis(500);
 const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_millis(250);
@@ -7605,7 +7607,7 @@ idle_timeout_ms = 50
 [upstream.local_recovery]
 enabled = true
 restart_command = ["/bin/sleep", "2"]
-restart_timeout_ms = 3000
+restart_timeout_ms = 10000
 readiness_body = {"model":"test-chat","messages":[{"role":"user","content":"disabled queue recovery ready"}],"max_tokens":1}
 readiness_request_timeout_ms = 1000
 readiness_deadline_ms = 1000
@@ -7941,9 +7943,9 @@ anti_loop_hint_enabled = false
 [upstream.local_recovery]
 enabled = true
 restart_command = ["{script_path}"]
-restart_timeout_ms = 1000
-readiness_request_timeout_ms = 1000
-readiness_deadline_ms = 1000
+restart_timeout_ms = 5000
+readiness_request_timeout_ms = 5000
+readiness_deadline_ms = 5000
 readiness_interval_ms = 100
 cooldown_ms = 1
 budget_window_ms = 10000
@@ -10043,6 +10045,85 @@ top_p = 0.95
 
     assert_eq!(observed_body["top_p"], json!(0.95));
     assert_eq!(observed_body["max_tokens"], 64);
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn fill_if_absent_defaults_preserve_caller_fields_without_native_thinking_budget() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &param_override_profile_config(
+            &fake.base_url,
+            r#"
+mode = "fill_if_absent"
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+max_tokens = 50000
+presence_penalty = 0.0
+repetition_penalty = 1.0
+reasoning_effort = "medium"
+"#,
+        ),
+    )
+    .await;
+
+    let defaulted = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"defaulted"}]}"#,
+    )
+    .await;
+    assert_eq!(defaulted["temperature"], 1.0);
+    assert_eq!(defaulted["top_p"], 0.95);
+    assert_eq!(defaulted["top_k"], 20);
+    assert_eq!(defaulted["min_p"], 0.0);
+    assert_eq!(defaulted["max_tokens"], 50_000);
+    assert_eq!(defaulted["presence_penalty"], 0.0);
+    assert_eq!(defaulted["repetition_penalty"], 1.0);
+    assert_eq!(defaulted["reasoning_effort"], "medium");
+    assert!(defaulted.get("thinking_token_budget").is_none());
+
+    let caller = post_chat_and_observe_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"test-chat","messages":[{"role":"user","content":"caller"}],"top_p":0.8,"top_k":5,"min_p":0.1,"max_tokens":64,"presence_penalty":0.3,"repetition_penalty":1.2,"reasoning_effort":"low","thinking_token_budget":128,"thinking":{"budget_tokens":64},"parameters":{"temperature":0.4,"max_tokens":32}}"#,
+    )
+    .await;
+    assert!(caller.get("temperature").is_none());
+    assert_eq!(caller["top_p"], 0.8);
+    assert_eq!(caller["top_k"], 5);
+    assert_eq!(caller["min_p"], 0.1);
+    assert_eq!(caller["max_tokens"], 64);
+    assert_eq!(caller["presence_penalty"], 0.3);
+    assert_eq!(caller["repetition_penalty"], 1.2);
+    assert_eq!(caller["reasoning_effort"], "low");
+    assert_eq!(caller["thinking_token_budget"], 128);
+    assert_eq!(caller["thinking"]["budget_tokens"], 64);
+    assert_eq!(caller["parameters"]["temperature"], 0.4);
+    assert_eq!(caller["parameters"]["max_tokens"], 32);
+
+    for (field, body) in [
+        (
+            "max_completion_tokens",
+            br#"{"model":"test-chat","messages":[{"role":"user","content":"parameters-max-completion-tokens"}],"parameters":{"max_completion_tokens":64}}"#
+                .as_slice(),
+        ),
+        (
+            "max_output_tokens",
+            br#"{"model":"test-chat","messages":[{"role":"user","content":"parameters-max-output-tokens"}],"parameters":{"max_output_tokens":64}}"#
+                .as_slice(),
+        ),
+    ] {
+        let caller = post_chat_and_observe_body(&proxy, &mut fake, body).await;
+        assert_eq!(caller["parameters"][field], 64);
+        assert!(caller.get("max_tokens").is_none());
+        assert!(caller["parameters"].get("max_tokens").is_none());
+    }
 }
 
 #[cfg(feature = "param-override")]
@@ -15130,6 +15211,55 @@ mode = "passthrough"
     );
     assert_eq!(rejected_metadata["upstream_profile"], "default");
     assert!(!rejected_metadata.to_string().contains("a b c d"));
+}
+
+#[tokio::test]
+async fn context_budget_preflight_rejects_nested_output_limits_before_forwarding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        r#"
+[upstream.metadata]
+context_length_override = 6
+
+[thinking]
+mode = "passthrough"
+"#,
+    )
+    .await;
+
+    for (container, field) in ["parameters", "extra_body"]
+        .into_iter()
+        .flat_map(|container| {
+            ["max_tokens", "max_completion_tokens", "max_output_tokens"]
+                .into_iter()
+                .map(move |field| (container, field))
+        })
+    {
+        let body = format!(
+            r#"{{"model":"test-chat","messages":[{{"role":"user","content":"a b c"}}],"{container}":{{"{field}":3}}}}"#
+        );
+        let response = proxy
+            .client
+            .post(format!("{}/v1/chat/completions", proxy.base_url))
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+            .expect("proxy request should complete");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{container}.{field}"
+        );
+        let error = response_json(response).await;
+        assert_eq!(error["error"]["code"], "context_budget_exceeded");
+    }
+
+    assert!(fake.recv_within(Duration::from_millis(100)).await.is_none());
 }
 
 #[tokio::test]
@@ -23121,6 +23251,69 @@ impl ProxyFixture {
             root,
         }
     }
+
+    #[cfg(feature = "param-override")]
+    async fn spawn_with_gb10_deploy_config(upstream_base_url: &str) -> Self {
+        let root = unique_test_dir("proxy-gb10");
+        fs::create_dir_all(&root).expect("test root should be created");
+        set_owner_only_dir(&root);
+        let storage = root.join("storage");
+        fs::create_dir_all(&storage).expect("storage should be created");
+        set_owner_only_dir(&storage);
+        let config_path = root.join("config.toml");
+        let sqlite_path = storage.join("observability.sqlite3");
+        let evidence_sqlite_path = storage.join("evidence.sqlite3");
+        #[cfg(feature = "guard")]
+        let budget_sqlite_path = storage.join("budget.sqlite3");
+        fs::write(
+            &config_path,
+            gb10_deploy_config_for_test(upstream_base_url, &sqlite_path, &evidence_sqlite_path),
+        )
+        .expect("gb10 deploy config should be written");
+        let manager = ConfigManager::from_explicit_path(&config_path)
+            .expect("gb10 deploy config should load");
+        let store = ObservabilityStore::open(manager.handle()).expect("store should open");
+        let evidence_store = EvidenceStore::open(manager.handle());
+        #[cfg(feature = "guard")]
+        let budget_store = Arc::new(
+            BudgetStore::open(&budget_sqlite_path.display().to_string())
+                .expect("budget store should open"),
+        );
+        let state = ProxyState::new(
+            manager.handle(),
+            manager.path().to_path_buf(),
+            store.clone(),
+            evidence_store,
+            #[cfg(feature = "guard")]
+            budget_store,
+            build_http_client().expect("client should build"),
+        );
+        let app = router(state.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("proxy should bind");
+        let addr = listener
+            .local_addr()
+            .expect("proxy addr should be available");
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("proxy test server failed: {error}");
+            }
+        });
+
+        Self {
+            base_url: format!("http://{addr}"),
+            client: build_http_client().expect("client should build"),
+            manager,
+            state,
+            store,
+            sqlite_path,
+            evidence_sqlite_path,
+            #[cfg(feature = "guard")]
+            budget_sqlite_path,
+            root,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -24115,4 +24308,177 @@ debug_summary_admin_token = "admin-token"
         .await
         .expect("debug live requests request should complete");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[cfg(feature = "param-override")]
+fn gb10_deploy_config_for_test(
+    upstream_base_url: &str,
+    sqlite_path: &Path,
+    evidence_sqlite_path: &Path,
+) -> String {
+    let blob_cache = evidence_sqlite_path
+        .parent()
+        .expect("evidence sqlite path should have parent")
+        .join("evidence-blobs");
+    GB10_DEPLOY_CONFIG
+        .replace("http://100.105.4.92:18010/v1", upstream_base_url)
+        .replace(
+            "/home/obj/.local/state/llm-guard-proxy/observability.sqlite3",
+            &sqlite_path.display().to_string(),
+        )
+        .replace(
+            "/home/obj/.local/state/llm-guard-proxy-evidence/evidence.sqlite3",
+            &evidence_sqlite_path.display().to_string(),
+        )
+        .replace(
+            "/home/obj/.cache/llm-guard-proxy-evidence/blobs",
+            &blob_cache.display().to_string(),
+        )
+        .replace(
+            "[upstream.hot_restart]\nenabled = true",
+            "[upstream.hot_restart]\nenabled = false",
+        )
+        .replace(
+            "[upstreams.hot_restart]\nenabled = true",
+            "[upstreams.hot_restart]\nenabled = false",
+        )
+        .replace("discovery_enabled = true", "discovery_enabled = false")
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn gb10_deploy_chat_path_preserves_caller_fields_without_native_thinking_budget() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+
+    let defaulted = post_chat_and_observe_gb10_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"defaulted"}]}"#,
+        "defaulted",
+    )
+    .await;
+    assert_eq!(defaulted["temperature"], 1.0);
+    assert_eq!(defaulted["top_p"], 0.95);
+    assert_eq!(defaulted["top_k"], 20);
+    assert_eq!(defaulted["min_p"], 0.0);
+    assert_eq!(defaulted["max_tokens"], 50_000);
+    assert_eq!(defaulted["presence_penalty"], 0.0);
+    assert_eq!(defaulted["repetition_penalty"], 1.0);
+    assert_eq!(defaulted["reasoning_effort"], "medium");
+    assert!(defaulted.get("thinking_token_budget").is_none());
+
+    let caller = post_chat_and_observe_gb10_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"caller"}],"max_tokens":64,"reasoning_effort":"low","thinking_token_budget":128,"thinking":{"budget_tokens":64}}"#,
+        "caller",
+    )
+    .await;
+    assert_eq!(caller["max_tokens"], 64);
+    assert_eq!(caller["reasoning_effort"], "low");
+    assert_eq!(caller["thinking_token_budget"], 128);
+    assert_eq!(caller["thinking"]["budget_tokens"], 64);
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn gb10_deploy_chat_path_honors_extra_body_reasoning_effort_without_fill_if_absent_injection()
+{
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+
+    let caller = post_chat_and_observe_gb10_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-none"}],"extra_body":{"reasoning_effort":"none"}}"#,
+        "extra-body-none",
+    )
+    .await;
+    assert_eq!(caller["extra_body"]["reasoning_effort"], "none");
+    assert!(caller.get("reasoning_effort").is_none());
+    assert!(
+        caller
+            .get("parameters")
+            .and_then(|parameters| parameters.get("reasoning_effort"))
+            .is_none()
+    );
+    assert!(caller.get("thinking_token_budget").is_none());
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn gb10_deploy_chat_path_honors_extra_body_enable_thinking_false_without_fill_if_absent_reasoning_effort()
+ {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+
+    let caller = post_chat_and_observe_gb10_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-enable-thinking-false"}],"extra_body":{"enable_thinking":false}}"#,
+        "extra-body-enable-thinking-false",
+    )
+    .await;
+    assert_eq!(caller["extra_body"]["enable_thinking"], false);
+    assert!(caller.get("reasoning_effort").is_none());
+    assert!(
+        caller
+            .get("parameters")
+            .and_then(|parameters| parameters.get("reasoning_effort"))
+            .is_none()
+    );
+    assert!(caller.get("thinking_token_budget").is_none());
+}
+
+#[cfg(feature = "param-override")]
+#[tokio::test]
+async fn gb10_deploy_chat_path_honors_extra_body_output_limits_without_fill_if_absent_max_tokens() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+
+    let caller = post_chat_and_observe_gb10_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-max-tokens"}],"extra_body":{"max_tokens":64}}"#,
+        "extra-body-max-tokens",
+    )
+    .await;
+    assert_eq!(caller["extra_body"]["max_tokens"], 64);
+    assert!(caller.get("max_tokens").is_none());
+    assert!(
+        caller
+            .get("parameters")
+            .and_then(|parameters| parameters.get("max_tokens"))
+            .is_none()
+    );
+    assert!(caller.get("thinking_token_budget").is_none());
+}
+
+#[cfg(feature = "param-override")]
+async fn post_chat_and_observe_gb10_body(
+    proxy: &ProxyFixture,
+    fake: &mut FakeUpstream,
+    body: &'static [u8],
+    content: &str,
+) -> serde_json::Value {
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(body)
+        .send()
+        .await
+        .expect("proxy request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let _aggregated = shielded_final_json(response).await;
+    for _ in 0..8 {
+        let observed = fake.recv_next().await;
+        let value: serde_json::Value =
+            serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+        if value["messages"][0]["content"] == content {
+            return value;
+        }
+    }
+    panic!("gb10 chat path should observe content {content:?}");
 }

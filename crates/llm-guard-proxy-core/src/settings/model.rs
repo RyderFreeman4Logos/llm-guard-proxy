@@ -2561,24 +2561,43 @@ pub struct SelectedUpstreamProfile {
     pub route_reason: UpstreamRouteReason,
 }
 
+/// Rewrite behavior for configured OpenAI-compatible inference parameters.
+#[cfg(feature = "param-override")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ParamOverrideMode {
+    /// Replace configured request fields and cap configured output limits.
+    #[default]
+    Override,
+    /// Insert configured values only when the caller omitted the field.
+    FillIfAbsent,
+}
+
 /// Per-profile OpenAI-compatible inference parameter overrides.
 #[cfg(feature = "param-override")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParamOverrideConfig {
     /// Enables request parameter rewriting for this profile.
     pub enabled: bool,
-    /// Forced `temperature` value.
+    /// Whether configured values replace caller fields or only fill omissions.
+    pub mode: ParamOverrideMode,
+    /// Configured `temperature` value.
     pub temperature: Option<f64>,
-    /// Forced `top_p` value.
+    /// Configured `top_p` value.
     pub top_p: Option<f64>,
-    /// Forced `top_k` value.
+    /// Configured `top_k` value.
     pub top_k: Option<u32>,
+    /// Configured `min_p` value.
+    pub min_p: Option<f64>,
     /// Total output cap and default when the caller omits output-limit fields.
     pub max_tokens: Option<u32>,
-    /// Forced `frequency_penalty` value.
+    /// Configured `frequency_penalty` value.
     pub frequency_penalty: Option<f64>,
-    /// Forced `presence_penalty` value.
+    /// Configured `presence_penalty` value.
     pub presence_penalty: Option<f64>,
+    /// Configured `repetition_penalty` value.
+    pub repetition_penalty: Option<f64>,
+    /// Configured OpenAI-compatible `reasoning_effort` value.
+    pub reasoning_effort: Option<String>,
 }
 
 #[cfg(feature = "param-override")]
@@ -2586,8 +2605,18 @@ impl ParamOverrideConfig {
     fn validate(&self, section: &'static str) -> Result<(), ValidationError> {
         require_optional_finite(self.temperature, section, "temperature")?;
         require_optional_finite(self.top_p, section, "top_p")?;
+        require_optional_finite(self.min_p, section, "min_p")?;
         require_optional_finite(self.frequency_penalty, section, "frequency_penalty")?;
-        require_optional_finite(self.presence_penalty, section, "presence_penalty")
+        require_optional_finite(self.presence_penalty, section, "presence_penalty")?;
+        require_optional_finite(self.repetition_penalty, section, "repetition_penalty")?;
+        if let Some(reasoning_effort) = self.reasoning_effort.as_deref() {
+            require(
+                !reasoning_effort.trim().is_empty() && reasoning_effort == reasoning_effort.trim(),
+                section,
+                "reasoning_effort must be non-empty without surrounding whitespace",
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -2596,12 +2625,16 @@ impl Default for ParamOverrideConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: ParamOverrideMode::Override,
             temperature: None,
             top_p: None,
             top_k: None,
+            min_p: None,
             max_tokens: None,
             frequency_penalty: None,
             presence_penalty: None,
+            repetition_penalty: None,
+            reasoning_effort: None,
         }
     }
 }

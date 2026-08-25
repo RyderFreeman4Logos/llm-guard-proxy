@@ -12,8 +12,6 @@ mod reload;
 mod tests;
 
 pub use error::{ConfigParseError, ValidationError};
-#[cfg(feature = "param-override")]
-pub use model::ParamOverrideConfig;
 pub use model::{
     AppConfig, CloudflareConfig, ConfigToggle, DefaultInjectionSchema, DownstreamDropPolicy,
     EmbeddingProvider, EmbeddingQueuePolicy, EndpointSelectionMode, EvidenceConfig,
@@ -29,6 +27,8 @@ pub use model::{
 };
 #[cfg(feature = "guard")]
 pub use model::{BudgetConfig, GuardWorkflowConfig};
+#[cfg(feature = "param-override")]
+pub use model::{ParamOverrideConfig, ParamOverrideMode};
 #[cfg(feature = "guard")]
 pub use model::{UnknownKeyPolicy, VirtualKeyConfig};
 pub use reload::{ConfigHandle, ConfigHandleError, ReloadOutcome, apply_reloadable};
@@ -250,17 +250,25 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     #[cfg(feature = "param-override")]
     "upstreams.param_override.enabled",
     #[cfg(feature = "param-override")]
+    "upstreams.param_override.mode",
+    #[cfg(feature = "param-override")]
     "upstreams.param_override.temperature",
     #[cfg(feature = "param-override")]
     "upstreams.param_override.top_p",
     #[cfg(feature = "param-override")]
     "upstreams.param_override.top_k",
     #[cfg(feature = "param-override")]
+    "upstreams.param_override.min_p",
+    #[cfg(feature = "param-override")]
     "upstreams.param_override.max_tokens",
     #[cfg(feature = "param-override")]
     "upstreams.param_override.frequency_penalty",
     #[cfg(feature = "param-override")]
     "upstreams.param_override.presence_penalty",
+    #[cfg(feature = "param-override")]
+    "upstreams.param_override.repetition_penalty",
+    #[cfg(feature = "param-override")]
+    "upstreams.param_override.reasoning_effort",
     #[cfg(feature = "guard")]
     "profiles",
     #[cfg(feature = "guard")]
