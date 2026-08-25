@@ -329,6 +329,19 @@ fn assert_default_recovery_watchdog_and_restart_queue_configs(config: &AppConfig
 }
 
 #[test]
+fn default_hot_restart_probe_is_minimal_and_conservative() {
+    let probe = &AppConfig::default().upstream.hot_restart;
+
+    assert_eq!(probe.probe_max_tokens, 1);
+    assert_eq!(probe.probe_interval_secs, 30);
+    assert_eq!(
+        probe.probe_messages,
+        serde_json::json!([{"role": "user", "content": "1+1="}])
+    );
+    assert_eq!(probe.probe_chat_template_kwargs, None);
+}
+
+#[test]
 fn local_recovery_config_defaults_are_safe_and_parse_per_upstream() {
     let config = parse_config_text(
         r#"
@@ -1072,7 +1085,7 @@ fn gb10_deploy_uncomment_ready_examples_parse() {
 fn gb10_deploy_supported_optional_fields_remain_uncomment_ready() {
     let examples = [
         "#| probe_messages = [{\"role\":\"user\",\"content\":\"deployment readiness\"}] # Custom readiness prompt",
-        "#| probe_chat_template_kwargs = {\"enable_thinking\":false}                  # Optional template controls for the probe",
+        "#| probe_chat_template_kwargs = {\"enable_thinking\":false}                  # Provider-native thinking disable (the default is top-level enable_thinking=false)",
         "#| health_chat_probe_enabled = true         # Also probe /v1/chat/completions",
         "#| health_chat_probe_timeout_ms = 15000     # Chat probe timeout, capped at 30s",
     ];
@@ -3960,6 +3973,45 @@ interval_secs = 4
     assert_eq!(snapshot.server.max_in_flight_requests, 2);
     assert_eq!(snapshot.heartbeat.mode, HeartbeatMode::Disabled);
     assert_eq!(snapshot.heartbeat.interval_secs, 4);
+}
+
+#[test]
+fn hot_restart_probe_settings_are_hot_reloadable() {
+    let current = AppConfig::parse(
+        r#"
+[upstream.hot_restart]
+probe_interval_secs = 30
+probe_messages = [{"role":"user","content":"1+1="}]
+"#,
+    )
+    .expect("current hot restart config should parse");
+    let requested = AppConfig::parse(
+        r#"
+[upstream.hot_restart]
+probe_interval_secs = 45
+probe_messages = [{"role":"user","content":"ready"}]
+probe_chat_template_kwargs = {"enable_thinking":false}
+"#,
+    )
+    .expect("requested hot restart config should parse");
+    let handle = ConfigHandle::new(current);
+
+    let outcome = handle
+        .apply_reloadable(&requested)
+        .expect("hot restart probe settings should reload");
+    let snapshot = handle.snapshot().expect("snapshot should succeed");
+
+    assert!(outcome.applied);
+    assert!(outcome.restart_required_changes.is_empty());
+    assert_eq!(snapshot.upstream.hot_restart.probe_interval_secs, 45);
+    assert_eq!(
+        snapshot.upstream.hot_restart.probe_messages,
+        serde_json::json!([{"role":"user","content":"ready"}])
+    );
+    assert_eq!(
+        snapshot.upstream.hot_restart.probe_chat_template_kwargs,
+        Some(serde_json::json!({"enable_thinking":false}))
+    );
 }
 
 #[test]

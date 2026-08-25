@@ -2010,7 +2010,7 @@ pub struct HotRestartConfig {
     pub probe_timeout_secs: u64,
     /// Probe chat messages sent to `/v1/chat/completions`.
     pub probe_messages: serde_json::Value,
-    /// Optional `chat_template_kwargs` attached to readiness probes.
+    /// Optional provider-native thinking controls; unset emits `enable_thinking: false`.
     pub probe_chat_template_kwargs: Option<serde_json::Value>,
 }
 
@@ -2067,10 +2067,10 @@ impl Default for HotRestartConfig {
         Self {
             enabled: true,
             probe_max_tokens: 1,
-            probe_interval_secs: 5,
+            probe_interval_secs: 30,
             probe_timeout_secs: 600,
-            probe_messages: json!([{"role": "user", "content": "1+1=?"}]),
-            probe_chat_template_kwargs: Some(json!({"enable_thinking": false})),
+            probe_messages: json!([{"role": "user", "content": "1+1="}]),
+            probe_chat_template_kwargs: None,
         }
     }
 }

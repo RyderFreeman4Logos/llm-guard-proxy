@@ -102,12 +102,13 @@ request_timeout_ms = 1800000
 [upstream.hot_restart]
 enabled = true
 probe_max_tokens = 1
-probe_interval_secs = 5
+# Conservative readiness cadence. This and the payload fields hot reload.
+probe_interval_secs = 30
 probe_timeout_secs = 600
 
 # BEGIN UNCOMMENT-READY EXAMPLE: hot-restart-chat-probe
 #| probe_messages = [{"role":"user","content":"deployment readiness"}] # Custom readiness prompt
-#| probe_chat_template_kwargs = {"enable_thinking":false}                  # Optional template controls for the probe
+#| probe_chat_template_kwargs = {"enable_thinking":false}                  # Provider-native thinking disable (the default is top-level enable_thinking=false)
 # END UNCOMMENT-READY EXAMPLE: hot-restart-chat-probe
 
 # ── Upstream stall detection ─────────────────────────────────────────────────
@@ -193,7 +194,7 @@ input_token_safety_margin = 512
 [upstreams.hot_restart]
 enabled = true
 probe_max_tokens = 1
-probe_interval_secs = 5
+probe_interval_secs = 30
 probe_timeout_secs = 600
 
 # Named profiles do not inherit [upstream.local_recovery]. Keep the AEON route
