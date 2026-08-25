@@ -24365,6 +24365,30 @@ async fn gb10_deploy_chat_path_honors_extra_body_enable_thinking_false_without_f
 }
 
 #[cfg(feature = "param-override")]
+#[tokio::test]
+async fn gb10_deploy_chat_path_honors_extra_body_output_limits_without_fill_if_absent_max_tokens() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+
+    let caller = post_chat_and_observe_gb10_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-max-tokens"}],"extra_body":{"max_tokens":64}}"#,
+        "extra-body-max-tokens",
+    )
+    .await;
+    assert_eq!(caller["extra_body"]["max_tokens"], 64);
+    assert!(caller.get("max_tokens").is_none());
+    assert!(
+        caller
+            .get("parameters")
+            .and_then(|parameters| parameters.get("max_tokens"))
+            .is_none()
+    );
+    assert!(caller.get("thinking_token_budget").is_none());
+}
+
+#[cfg(feature = "param-override")]
 async fn post_chat_and_observe_gb10_body(
     proxy: &ProxyFixture,
     fake: &mut FakeUpstream,

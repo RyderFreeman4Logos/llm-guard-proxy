@@ -1892,6 +1892,13 @@ pub(super) fn apply_output_token_default(
             caller_field_present = true;
             decision.preserved_fields.push(field);
         }
+        if object
+            .get("extra_body")
+            .and_then(Value::as_object)
+            .is_some_and(|extra_body| extra_body.contains_key(*field))
+        {
+            caller_field_present = true;
+        }
     }
     if caller_field_present {
         return decision;
