@@ -4341,10 +4341,12 @@ fn insert_param_override_value(
     value: serde_json::Value,
     mode: ParamOverrideMode,
 ) {
-    let nested_has_field = object
-        .get("parameters")
-        .and_then(serde_json::Value::as_object)
-        .is_some_and(|parameters| parameters.contains_key(field));
+    let nested_has_field = ["parameters", "extra_body"].into_iter().any(|container| {
+        object
+            .get(container)
+            .and_then(serde_json::Value::as_object)
+            .is_some_and(|nested| nested.contains_key(field))
+    });
     if mode == ParamOverrideMode::FillIfAbsent && (object.contains_key(field) || nested_has_field) {
         return;
     }

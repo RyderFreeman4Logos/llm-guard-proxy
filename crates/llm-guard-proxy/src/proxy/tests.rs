@@ -24315,6 +24315,31 @@ async fn gb10_deploy_chat_path_preserves_caller_fields_without_native_thinking_b
 }
 
 #[cfg(feature = "param-override")]
+#[tokio::test]
+async fn gb10_deploy_chat_path_honors_extra_body_reasoning_effort_without_fill_if_absent_injection()
+{
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+
+    let caller = post_chat_and_observe_gb10_body(
+        &proxy,
+        &mut fake,
+        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-none"}],"extra_body":{"reasoning_effort":"none"}}"#,
+        "extra-body-none",
+    )
+    .await;
+    assert_eq!(caller["extra_body"]["reasoning_effort"], "none");
+    assert!(caller.get("reasoning_effort").is_none());
+    assert!(
+        caller
+            .get("parameters")
+            .and_then(|parameters| parameters.get("reasoning_effort"))
+            .is_none()
+    );
+    assert!(caller.get("thinking_token_budget").is_none());
+}
+
+#[cfg(feature = "param-override")]
 async fn post_chat_and_observe_gb10_body(
     proxy: &ProxyFixture,
     fake: &mut FakeUpstream,
