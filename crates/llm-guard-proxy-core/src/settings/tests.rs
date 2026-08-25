@@ -969,6 +969,14 @@ fn gb10_deploy_config_preserves_authoritative_topology_with_fill_if_absent_defau
         chat_profile.param_override.reasoning_effort.as_deref(),
         Some("medium")
     );
+    let retry_ladder = chat_profile.effective_retry_ladder(&config.retry);
+    assert_eq!(retry_ladder.len(), 4);
+    assert!(retry_ladder.iter().all(|entry| {
+        entry.thinking.mode == ThinkingMode::Passthrough
+            && !entry.thinking.enabled
+            && entry.thinking.default_injection_schema != DefaultInjectionSchema::VllmNative
+            && entry.default_injection_schema != Some(DefaultInjectionSchema::VllmNative)
+    }));
     assert_eq!(config.retry.ladder.len(), 4);
     assert!(config
         .retry
