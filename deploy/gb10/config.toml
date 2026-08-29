@@ -181,7 +181,7 @@ input_token_safety_margin = 512           # Tokens reserved for response
 
 [[forced_model_alias_profiles]]
 alias = "abliterated-qwen-latest-27b-nvfp4-none"
-upstream_model = "aeon-ultimate"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
 temperature = 0.7
@@ -193,7 +193,7 @@ repetition_penalty = 1.0
 
 [[forced_model_alias_profiles]]
 alias = "abliterated-qwen-latest-27b-nvfp4-low"
-upstream_model = "aeon-ultimate"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
 output_cap = 16384
@@ -206,7 +206,7 @@ repetition_penalty = 1
 
 [[forced_model_alias_profiles]]
 alias = "abliterated-qwen-latest-27b-nvfp4-medium"
-upstream_model = "aeon-ultimate"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
 output_cap = 16384

@@ -21736,6 +21736,27 @@ fn fake_loop_twice_then_success_response(
 }
 
 fn fake_fixed_status_chat_completion_response(path_and_query: &str) -> Option<Response<Body>> {
+    if path_and_query.contains("test=terminal-forward-model-json") {
+        let mut response = json_response(
+            "terminal-forward-model-json",
+            r#"{"model":"aeon-ultimate","choices":[]}"#.to_owned(),
+        );
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        return Some(response);
+    }
+    if path_and_query.contains("test=terminal-forward-model-sse") {
+        let body = "data: {\"model\":\"aeon-ultimate\",\"choices\":[]}\n\ndata: [DONE]\n\n";
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response.headers_mut().insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&body.len().to_string()).expect("content length should be valid"),
+        );
+        return Some(response);
+    }
     if path_and_query.contains("test=always-502") {
         return Some(upstream_status_json_response(StatusCode::BAD_GATEWAY));
     }

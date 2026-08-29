@@ -5671,6 +5671,7 @@ async fn send_generic_upstream_attempt(
                 local_forward_uri: context.upstream_uri.clone(),
                 original_downstream_headers: &context.downstream_headers,
                 canonical_reranker: context.canonical_reranker.as_ref(),
+                forced_model_alias_policy: None,
                 transformed_request_headers: context.transformed_request_headers,
                 initial_endpoint: &context.terminal_endpoint,
                 request_deadline,
@@ -5987,6 +5988,7 @@ fn models_failover_retry_context<'request>(
             local_forward_uri: context.upstream_uri.clone(),
             original_downstream_headers: downstream_headers,
             canonical_reranker: None,
+            forced_model_alias_policy: None,
             transformed_request_headers: false,
             initial_endpoint: &group.terminal_endpoint,
             request_deadline: Some(group.request_deadline),
@@ -6170,6 +6172,7 @@ struct UpstreamFailoverRetryContext<'request> {
     local_forward_uri: Uri,
     original_downstream_headers: &'request HeaderMap,
     canonical_reranker: Option<&'request CanonicalRerankerRequest>,
+    forced_model_alias_policy: Option<&'request ForcedModelAliasProfileConfig>,
     transformed_request_headers: bool,
     initial_endpoint: &'request UpstreamEndpointConfig,
     request_deadline: Option<Instant>,
@@ -6630,7 +6633,7 @@ async fn send_selected_failover_endpoint(
     request_metadata: BTreeMap<String, String>,
     mut selected: upstream_failover::SelectedUpstreamEndpoint,
 ) -> CompletedFailoverEndpointSend {
-    let rendered = match runtime.retry.canonical_reranker {
+    let mut rendered = match runtime.retry.canonical_reranker {
         Some(canonical) => reranker_protocol::render(
             &selected.endpoint,
             canonical,
@@ -6638,6 +6641,11 @@ async fn send_selected_failover_endpoint(
         ),
         None => render_retry_openai_request(runtime.retry, &selected.endpoint, runtime.retry_body),
     };
+    if let Ok(rendered) = &mut rendered
+        && let Some(policy) = runtime.retry.forced_model_alias_policy
+    {
+        rendered.body = apply_forced_model_alias_policy(&rendered.body, policy);
+    }
     let attempt_id = AttemptId::for_request(runtime.request_id, attempt_number);
     let started_at_unix_ms = unix_time_millis();
     let mut attempt = PhysicalEndpointAttempt {
@@ -12935,6 +12943,7 @@ async fn send_shielded_upstream_attempt(
                 local_forward_uri: runtime.forward_uri.clone(),
                 original_downstream_headers: &runtime.original_downstream_headers,
                 canonical_reranker: None,
+                forced_model_alias_policy: runtime.forced_model_alias_policy.as_ref(),
                 transformed_request_headers: runtime.transformed_request_headers,
                 initial_endpoint: &runtime.terminal_endpoint,
                 request_deadline,
@@ -14440,10 +14449,19 @@ async fn shielded_retry_terminal_forward_response(
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     let upstream_status = terminal.started.info.upstream_status;
-    let upstream_headers = terminal.started.info.upstream_headers.clone();
+    let mut upstream_headers = terminal.started.info.upstream_headers.clone();
     let request_path = runtime.downstream_uri.path().to_owned();
     let request_id = runtime.request_id.clone();
     let malformed_counter = runtime.malformed_response_counter.clone();
+    let response_model_rewrite =
+        client_response_model_alias(&runtime.upstream_profile, runtime.model_id.as_deref())
+            .and_then(|client_model| {
+                response_model_rewrite_mode(&upstream_headers)
+                    .map(|mode| (mode, client_model.to_owned()))
+            });
+    if response_model_rewrite.is_some() {
+        upstream_headers.remove(CONTENT_LENGTH);
+    }
     let liveness_metadata = effective_liveness::response_metadata(
         &runtime.liveness,
         upstream_headers.get(CONTENT_TYPE).map(header_value),
@@ -14475,11 +14493,15 @@ async fn shielded_retry_terminal_forward_response(
         in_flight_permit,
         runtime.shutdown.subscribe(),
     );
-    let response = downstream_response(
-        upstream_status,
-        &upstream_headers,
-        Body::from_stream(response_body),
-    );
+    let response_body = match response_model_rewrite {
+        Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
+            response_body,
+            mode,
+            client_model,
+        )),
+        None => Body::from_stream(response_body),
+    };
+    let response = downstream_response(upstream_status, &upstream_headers, response_body);
     validate_non_stream_chat_completion_response(
         response,
         &request_path,

@@ -4563,6 +4563,41 @@ repetition_penalty = 1.0
     }
 }
 
+#[cfg(feature = "guard")]
+#[test]
+fn forced_model_alias_collision_with_model_aliases_is_rejected_at_startup() {
+    let config = parse_config_text(
+        r#"
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-none"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_disable"
+output_cap = 16384
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+
+[[model_aliases]]
+id = "abliterated-qwen-latest-27b-nvfp4-none"
+kind = "upstream"
+upstream_profile = "default"
+"#,
+    )
+    .expect("colliding startup config should parse before validation");
+    let error = config
+        .validate()
+        .expect_err("forced aliases must not collide with model aliases at startup");
+    assert_eq!(error.field(), "forced_model_alias_profiles.alias");
+    assert!(
+        error
+            .message()
+            .contains("must not collide with model_aliases.id")
+    );
+}
+
 #[test]
 fn gb10_forced_model_alias_profiles_are_complete() {
     let config = parse_config_text(include_str!("../../../../deploy/gb10/config.toml"))
@@ -4580,6 +4615,7 @@ fn gb10_forced_model_alias_profiles_are_complete() {
         .iter()
         .find(|profile| profile.alias.ends_with("none"))
         .expect("none profile");
+    assert_eq!(none.upstream_model, "abliterated-qwen-latest-27b-nvfp4");
     assert_eq!(none.thinking_mode, Some(ThinkingMode::ForceDisable));
     assert_eq!(none.thinking_budget, None);
     assert_eq!(none.temperature, Some(0.7));
@@ -4595,6 +4631,7 @@ fn gb10_forced_model_alias_profiles_are_complete() {
             .iter()
             .find(|profile| profile.alias.ends_with(suffix))
             .expect("configured thinking profile");
+        assert_eq!(profile.upstream_model, "abliterated-qwen-latest-27b-nvfp4");
         assert_eq!(profile.thinking_mode, Some(ThinkingMode::ForceThinking));
         assert_eq!(profile.thinking_budget, Some(65_536));
         assert_eq!(profile.temperature, Some(1.0));

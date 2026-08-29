@@ -141,6 +141,195 @@ async fn shielded_physical_attempts_preserve_immediate_nonstream_failover_chain(
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn forced_alias_policy_survives_each_endpoint_failover_physical_attempt() {
+    let mut primary = spawn_scripted_primary(PrimaryChatScript::AlwaysUnavailable).await;
+    let mut fallback = FakeUpstream::spawn().await;
+    let config = format!(
+        r#"
+[shielding]
+enabled = true
+
+[upstream.hot_restart]
+enabled = false
+
+[retry]
+enabled = true
+max_attempts = 2
+shielded_streaming_enabled = true
+
+[[upstreams]]
+name = "forced-failover"
+base_url = "{}"
+match_models = ["abliterated-qwen-latest-27b-nvfp4-none", "abliterated-qwen-latest-27b-nvfp4-low", "abliterated-qwen-latest-27b-nvfp4-medium"]
+request_timeout_ms = 1000
+health_probe_interval_ms = 200
+health_probe_timeout_ms = 20
+health_probe_max_wait_ms = 400
+endpoint_selection = "priority_failover"
+
+[[upstreams.endpoints]]
+base_url = "{}"
+priority = "primary"
+protocol = "openai"
+
+[[upstreams.endpoints]]
+base_url = "{}"
+priority = "failover"
+protocol = "openai"
+"#,
+        primary.base_url, primary.base_url, fallback.base_url,
+    );
+    let config = format!(
+        "{config}\n{}",
+        r#"
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-none"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_disable"
+output_cap = 16384
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-low"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_thinking"
+thinking_budget = 65536
+output_cap = 16384
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-medium"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_thinking"
+thinking_budget = 65536
+output_cap = 16384
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+"#,
+    );
+
+    for (alias, stream, thinking, budget, temperature, top_p, presence_penalty) in [
+        (
+            "abliterated-qwen-latest-27b-nvfp4-none",
+            false,
+            false,
+            None,
+            0.7,
+            0.8,
+            1.5,
+        ),
+        (
+            "abliterated-qwen-latest-27b-nvfp4-none",
+            true,
+            false,
+            None,
+            0.7,
+            0.8,
+            1.5,
+        ),
+        (
+            "abliterated-qwen-latest-27b-nvfp4-low",
+            false,
+            true,
+            Some(65536),
+            1.0,
+            0.95,
+            0.0,
+        ),
+        (
+            "abliterated-qwen-latest-27b-nvfp4-low",
+            true,
+            true,
+            Some(65536),
+            1.0,
+            0.95,
+            0.0,
+        ),
+        (
+            "abliterated-qwen-latest-27b-nvfp4-medium",
+            false,
+            true,
+            Some(65536),
+            1.0,
+            0.95,
+            0.0,
+        ),
+        (
+            "abliterated-qwen-latest-27b-nvfp4-medium",
+            true,
+            true,
+            Some(65536),
+            1.0,
+            0.95,
+            0.0,
+        ),
+    ] {
+        let proxy = spawn_failover_proxy(&primary.base_url, &config).await;
+        let response = proxy
+            .client
+            .post(format!("{}/v1/chat/completions", proxy.base_url))
+            .json(&json!({
+                "model": alias, "stream": stream, "messages": [],
+                "temperature": 9, "top_p": 9, "top_k": 9, "min_p": 9,
+                "presence_penalty": 9, "frequency_penalty": 9, "repetition_penalty": 9,
+                "max_completion_tokens": 9,
+                "extra_body": {"temperature": 8, "thinking": {"enabled": false}},
+                "array": [{"frequency_penalty": 8}],
+            }))
+            .send()
+            .await
+            .expect("endpoint failover request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        response.bytes().await.expect("response should drain");
+
+        let first = recv_chat_request(&mut primary).await;
+        let second = recv_chat_request(&mut fallback).await;
+        for request in [first, second] {
+            let body: serde_json::Value = serde_json::from_slice(&request.body)
+                .expect("physical attempt body should be JSON");
+            assert_eq!(body["model"], "aeon-ultimate");
+            assert_eq!(body["temperature"], temperature);
+            assert_eq!(body["top_p"], top_p);
+            assert_eq!(body["top_k"], 20);
+            assert_eq!(body["min_p"], 0.0);
+            assert_eq!(body["presence_penalty"], presence_penalty);
+            assert_eq!(body["repetition_penalty"], 1.0);
+            assert_eq!(body["max_tokens"], 16384);
+            assert_eq!(body["chat_template_kwargs"]["enable_thinking"], thinking);
+            assert_eq!(
+                body.get("thinking_token_budget")
+                    .and_then(serde_json::Value::as_u64),
+                budget
+            );
+            for pointer in [
+                "/frequency_penalty",
+                "/max_completion_tokens",
+                "/extra_body/temperature",
+                "/extra_body/thinking/enabled",
+                "/array/0/frequency_penalty",
+            ] {
+                assert!(body.pointer(pointer).is_none(), "must strip {pointer}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn shielded_physical_attempts_preserve_later_retry_failover_chain() {
     let primary = spawn_scripted_primary(PrimaryChatScript::LoopThenUnavailable).await;
     let fallback = FakeUpstream::spawn().await;
@@ -239,6 +428,19 @@ fn request_model(request: &ObservedRequest) -> String {
         .as_str()
         .expect("forwarded chat body should contain a string model")
         .to_owned()
+}
+
+async fn recv_chat_request(fake: &mut FakeUpstream) -> ObservedRequest {
+    for _ in 0..4 {
+        let request = fake
+            .recv_within(Duration::from_secs(2))
+            .await
+            .expect("endpoint should receive a bounded request sequence");
+        if request.path_and_query != "/v1/models" {
+            return request;
+        }
+    }
+    panic!("endpoint only received health probes, not a chat request");
 }
 
 fn assert_attempt_numbers(attempts: &[AttemptChainRow], expected: &[u32]) {

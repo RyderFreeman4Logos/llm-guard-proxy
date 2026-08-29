@@ -122,7 +122,7 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
         self.assertEqual(len(profiles), 3)
         expected = {
             "abliterated-qwen-latest-27b-nvfp4-none": {
-                "upstream_model": "aeon-ultimate",
+                "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                 "thinking_mode": "force_disable",
                 "output_cap": 16_384,
                 "temperature": 0.7,
@@ -133,7 +133,7 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 "repetition_penalty": 1.0,
             },
             "abliterated-qwen-latest-27b-nvfp4-low": {
-                "upstream_model": "aeon-ultimate",
+                "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                 "thinking_mode": "force_thinking",
                 "thinking_budget": 65_536,
                 "output_cap": 16_384,
@@ -145,7 +145,7 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 "repetition_penalty": 1,
             },
             "abliterated-qwen-latest-27b-nvfp4-medium": {
-                "upstream_model": "aeon-ultimate",
+                "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                 "thinking_mode": "force_thinking",
                 "thinking_budget": 65_536,
                 "output_cap": 16_384,
@@ -165,6 +165,10 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 for profile in profiles
             },
             expected,
+        )
+        self.assertNotIn(
+            "aeon-ultimate",
+            {profile["upstream_model"] for profile in profiles},
         )
         for mutation, alias, field, value in [
             ("absent", None, None, None),

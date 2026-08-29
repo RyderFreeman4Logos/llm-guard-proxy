@@ -524,6 +524,81 @@ upstream_model = "aeon-ultimate"
 }
 
 #[tokio::test]
+async fn upstream_model_rewrites_terminal_forward_json_and_sse_response_models() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &fake.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        &format!(
+            r#"
+[loop_guard]
+mode = "enforce"
+output_repeated_line_threshold = 4
+
+[retry]
+max_attempts = 3
+shielded_streaming_enabled = true
+
+[[upstreams]]
+name = "rewriting-profile"
+base_url = "{}"
+match_models = ["alias-chat"]
+upstream_model = "aeon-ultimate"
+"#,
+            fake.base_url
+        ),
+    )
+    .await;
+
+    for (path, stream) in [
+        ("terminal-forward-model-json", false),
+        ("terminal-forward-model-sse", true),
+    ] {
+        let response = proxy
+            .client
+            .post(format!(
+                "{}/v1/chat/completions?test={path}",
+                proxy.base_url
+            ))
+            .header(CONTENT_TYPE, "application/json")
+            .body(format!(
+                r#"{{"model":"alias-chat","messages":[],"stream":{stream}}}"#
+            ))
+            .send()
+            .await
+            .expect("terminal forward response should complete");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            response.headers().get(CONTENT_LENGTH).is_none(),
+            "model rewrite must remove stale upstream content length"
+        );
+        let body = response
+            .bytes()
+            .await
+            .expect("terminal response should drain");
+        if stream {
+            assert!(
+                openai_sse_json_chunks(std::str::from_utf8(&body).expect("SSE must be UTF-8"))
+                    .iter()
+                    .all(|chunk| chunk["model"] == "alias-chat"),
+                "terminal SSE must restore the requested alias"
+            );
+        } else {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&body).expect("JSON must parse")["model"],
+                "alias-chat",
+                "terminal JSON must restore the requested alias"
+            );
+        }
+        let observed = fake.recv_next().await;
+        let observed_body: serde_json::Value =
+            serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
+        assert_eq!(observed_body["model"], "aeon-ultimate");
+    }
+}
+
+#[tokio::test]
 async fn upstream_model_rewrites_generic_response_model_name() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_extra_config(
