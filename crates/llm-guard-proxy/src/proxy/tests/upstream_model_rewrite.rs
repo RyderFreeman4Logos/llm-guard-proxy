@@ -90,84 +90,20 @@ upstream_model = "aeon-ultimate"
 }
 
 #[test]
-#[allow(clippy::too_many_lines)]
 fn forced_generation_controls_preserve_opaque_nested_extensions() {
-    let mut body = serde_json::json!({
+    let mut body = forced_generation_controls_fixture();
+
+    remove_forced_generation_controls(&mut body);
+
+    assert_forced_generation_controls_removed(&body);
+    assert_opaque_nested_extensions_preserved(&body);
+}
+
+fn forced_generation_controls_fixture() -> serde_json::Value {
+    serde_json::json!({
         "temperature": 9,
         "max_tokens": 9,
-        "extra_body": {
-            "temperature": 8,
-            "max_tokens": 8,
-            "options": [
-                {
-                    "temperature": 7,
-                    "max_tokens": 7,
-                    "vendor_extension": {
-                        "temperature": "keep",
-                        "max_tokens": "keep",
-                        "required": ["temperature"]
-                    }
-                }
-            ],
-            "vendor_extension": {
-                "reasoning_effort": "semantic-value",
-                "max_tokens": 7,
-                "temperature": 0.5,
-                "required": ["max_tokens"]
-            },
-            "vendor_extensions": [
-                {
-                    "reasoning_effort": "semantic-array-value",
-                    "max_tokens": 6,
-                    "temperature": 0.4,
-                    "required": ["temperature"]
-                }
-            ],
-            "messages": [{
-                "content": {"temperature": 0.1, "max_tokens": 3}
-            }],
-            "tools": [{
-                "function": {
-                    "parameters": {
-                        "properties": {"temperature": {"type": "number"}},
-                        "required": ["temperature"],
-                        "max_tokens": 3
-                    }
-                }
-            }],
-            "response_format": {
-                "json_schema": {
-                    "schema": {
-                        "properties": {"max_tokens": {"type": "number"}},
-                        "required": ["max_tokens"],
-                        "temperature": 0.2
-                    }
-                }
-            },
-            "chat_template_kwargs": {
-                "temperature": 8,
-                "options": [{"max_tokens": 7, "vendor": {"temperature": "keep"}}],
-                "vendor_extension": {
-                    "temperature": "keep",
-                    "max_tokens": "keep",
-                    "required": ["max_tokens"]
-                },
-                "vendor_extensions": [{
-                    "temperature": "keep",
-                    "max_tokens": "keep",
-                    "required": ["temperature"]
-                }]
-            },
-            "thinking": {
-                "enabled": true,
-                "budget_tokens": 8,
-                "vendor_extension": {
-                    "thinking": "semantic-value",
-                    "temperature": "keep",
-                    "max_tokens": "keep"
-                }
-            }
-        },
+        "extra_body": opaque_nested_extra_body(),
         "chat_template_kwargs": {
             "enable_thinking": true,
             "options": [{"temperature": 7, "max_tokens": 7, "vendor": {"top_p": "keep"}}],
@@ -193,10 +129,86 @@ fn forced_generation_controls_preserve_opaque_nested_extensions() {
                 "max_tokens": "keep"
             }
         }
-    });
+    })
+}
 
-    remove_forced_generation_controls(&mut body);
+fn opaque_nested_extra_body() -> serde_json::Value {
+    serde_json::json!({
+        "temperature": 8,
+        "max_tokens": 8,
+        "options": [
+            {
+                "temperature": 7,
+                "max_tokens": 7,
+                "vendor_extension": {
+                    "temperature": "keep",
+                    "max_tokens": "keep",
+                    "required": ["temperature"]
+                }
+            }
+        ],
+        "vendor_extension": {
+            "reasoning_effort": "semantic-value",
+            "max_tokens": 7,
+            "temperature": 0.5,
+            "required": ["max_tokens"]
+        },
+        "vendor_extensions": [
+            {
+                "reasoning_effort": "semantic-array-value",
+                "max_tokens": 6,
+                "temperature": 0.4,
+                "required": ["temperature"]
+            }
+        ],
+        "messages": [{
+            "content": {"temperature": 0.1, "max_tokens": 3}
+        }],
+        "tools": [{
+            "function": {
+                "parameters": {
+                    "properties": {"temperature": {"type": "number"}},
+                    "required": ["temperature"],
+                    "max_tokens": 3
+                }
+            }
+        }],
+        "response_format": {
+            "json_schema": {
+                "schema": {
+                    "properties": {"max_tokens": {"type": "number"}},
+                    "required": ["max_tokens"],
+                    "temperature": 0.2
+                }
+            }
+        },
+        "chat_template_kwargs": {
+            "temperature": 8,
+            "options": [{"max_tokens": 7, "vendor": {"temperature": "keep"}}],
+            "vendor_extension": {
+                "temperature": "keep",
+                "max_tokens": "keep",
+                "required": ["max_tokens"]
+            },
+            "vendor_extensions": [{
+                "temperature": "keep",
+                "max_tokens": "keep",
+                "required": ["temperature"]
+            }]
+        },
+        "thinking": {
+            "enabled": true,
+            "budget_tokens": 8,
+            "vendor_extension": {
+                "thinking": "semantic-value",
+                "temperature": "keep",
+                "max_tokens": "keep"
+            }
+        }
+    })
+}
 
+fn assert_forced_generation_controls_removed(body: &serde_json::Value) {
     for pointer in [
         "/temperature",
         "/max_tokens",
@@ -215,6 +227,9 @@ fn forced_generation_controls_preserve_opaque_nested_extensions() {
     ] {
         assert!(body.pointer(pointer).is_none(), "must strip {pointer}");
     }
+}
+
+fn assert_opaque_nested_extensions_preserved(body: &serde_json::Value) {
     for (pointer, expected) in [
         (
             "/extra_body/vendor_extension/temperature",
