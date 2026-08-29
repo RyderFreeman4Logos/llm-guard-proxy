@@ -4515,3 +4515,92 @@ fn _assert_error_types_are_send_sync() {
     assert_send_sync::<ConfigParseError>();
     assert_send_sync::<ValidationError>();
 }
+
+#[test]
+fn forced_model_alias_policy_profiles_parse_validate_and_hot_reload() {
+    let valid = r#"
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-none"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_disable"
+output_cap = 16384
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#;
+    let config = parse_config_text(valid).expect("forced policy should parse");
+    config.validate().expect("forced policy should validate");
+    assert_eq!(config.forced_model_alias_profiles.len(), 1);
+    assert!(RELOADABLE_FIELDS.contains(&"forced_model_alias_profiles"));
+
+    for invalid in [
+        valid.replace(
+            "alias = \"abliterated-qwen-latest-27b-nvfp4-none\"",
+            "alias = \" \"",
+        ),
+        format!("{valid}{valid}"),
+        valid.replace("temperature = 0.7", "temperature = nan"),
+        valid.replace("top_p = 0.8", "top_p = 1.1"),
+        valid.replace("top_k = 20\n", ""),
+        valid.replace(
+            "thinking_mode = \"force_disable\"",
+            "thinking_mode = \"xhigh\"",
+        ),
+    ] {
+        let rejected = match parse_config_text(&invalid) {
+            Ok(config) => config.validate().is_err(),
+            Err(_) => true,
+        };
+        assert!(
+            rejected,
+            "invalid forced policy must be rejected: {invalid}"
+        );
+    }
+}
+
+#[test]
+fn gb10_forced_model_alias_profiles_are_complete() {
+    let config = parse_config_text(include_str!("../../../../deploy/gb10/config.toml"))
+        .expect("GB10 config should parse");
+    config.validate().expect("GB10 config should validate");
+    let profiles = &config.forced_model_alias_profiles;
+    assert_eq!(profiles.len(), 3);
+    assert!(
+        profiles
+            .iter()
+            .all(|profile| !profile.alias.ends_with("xhigh"))
+    );
+
+    let none = profiles
+        .iter()
+        .find(|profile| profile.alias.ends_with("none"))
+        .expect("none profile");
+    assert_eq!(none.thinking_mode, Some(ThinkingMode::ForceDisable));
+    assert_eq!(none.thinking_budget, None);
+    assert_eq!(none.temperature, Some(0.7));
+    assert_eq!(none.top_p, Some(0.8));
+    assert_eq!(none.top_k, Some(20));
+    assert_eq!(none.min_p, Some(0.0));
+    assert_eq!(none.presence_penalty, Some(1.5));
+    assert_eq!(none.repetition_penalty, Some(1.0));
+    assert_eq!(none.output_cap, Some(16_384));
+
+    for suffix in ["low", "medium"] {
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.alias.ends_with(suffix))
+            .expect("configured thinking profile");
+        assert_eq!(profile.thinking_mode, Some(ThinkingMode::ForceThinking));
+        assert_eq!(profile.thinking_budget, Some(65_536));
+        assert_eq!(profile.temperature, Some(1.0));
+        assert_eq!(profile.top_p, Some(0.95));
+        assert_eq!(profile.top_k, Some(20));
+        assert_eq!(profile.min_p, Some(0.0));
+        assert_eq!(profile.presence_penalty, Some(0.0));
+        assert_eq!(profile.repetition_penalty, Some(1.0));
+        assert_eq!(profile.output_cap, Some(16_384));
+    }
+}

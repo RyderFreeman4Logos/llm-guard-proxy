@@ -142,7 +142,7 @@ trigger_on_request_deadline = false
 restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash-n12.service"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
-readiness_body = {"model":"aeon-ultimate","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}
+readiness_body = "{\"model\":\"aeon-ultimate\",\"messages\":[{\"role\":\"user\",\"content\":\"1+1=?\"}],\"chat_template_kwargs\":{\"enable_thinking\":false},\"max_tokens\":1}"
 readiness_request_timeout_ms = 30000
 readiness_deadline_ms = 600000
 readiness_interval_ms = 5000
@@ -175,6 +175,47 @@ refresh_interval_secs = 60                 # Re-discover every 60s
 # context_length_override = 0             # Override detected context length (0 = auto)
 # max_model_len_override = 0              # Override detected max model length
 input_token_safety_margin = 512           # Tokens reserved for response
+
+## ───────────────────────── Forced model aliases ─────────────────────────────
+## Public aliases with immutable, hot-reloadable upstream request policies.
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-none"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_disable"
+output_cap = 16384
+temperature = 0.7
+top_p = 0.80
+top_k = 20
+min_p = 0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-low"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_thinking"
+thinking_budget = 65536
+output_cap = 16384
+temperature = 1
+top_p = 0.95
+top_k = 20
+min_p = 0
+presence_penalty = 0
+repetition_penalty = 1
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-medium"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_thinking"
+thinking_budget = 65536
+output_cap = 16384
+temperature = 1
+top_p = 0.95
+top_k = 20
+min_p = 0
+presence_penalty = 0
+repetition_penalty = 1
 
 ## ───────────────────────── Upstream topology (multi-upstream) ───────────────
 ## Profiles are ordered routes. The first matching model wins; [upstream]
@@ -210,7 +251,7 @@ trigger_on_request_deadline = false
 restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash-n12.service"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
-readiness_body = {"model":"aeon-ultimate","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}
+readiness_body = "{\"model\":\"aeon-ultimate\",\"messages\":[{\"role\":\"user\",\"content\":\"1+1=?\"}],\"chat_template_kwargs\":{\"enable_thinking\":false},\"max_tokens\":1}"
 readiness_request_timeout_ms = 30000
 readiness_deadline_ms = 600000
 readiness_interval_ms = 5000

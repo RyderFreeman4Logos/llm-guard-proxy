@@ -50,6 +50,11 @@ recovery policy relative to the previously installed snapshot:
   targets `vllm-aeon-27b-dflash-n12.service`, and permits one pre-commit
   recovery replay per downstream request. Named profiles do not inherit the
   default route's recovery table.
+- `[[forced_model_alias_profiles]]` carries three hot-reloadable immutable aliases:
+  `abliterated-qwen-latest-27b-nvfp4-none` disables thinking with temperature
+  `0.7`, `top_p 0.80`, presence penalty `1.5`, and a `16384` output cap; `low`
+  and `medium` each force `65536` thinking tokens with `1.0/0.95/20/0/0/1.0`
+  sampler values and the same output cap. No `xhigh` alias is configured.
 
 The guardian values must match the operational source of truth exactly. Do not
 replace current listener routing, per-upstream concurrency, timeouts, evidence

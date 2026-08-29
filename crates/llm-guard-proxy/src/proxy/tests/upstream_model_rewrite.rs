@@ -49,6 +49,148 @@ upstream_model = "aeon-ultimate"
     );
 }
 
+fn assert_forced_model_alias_wire_body(body: &serde_json::Value) {
+    assert_eq!(body["model"], "aeon-ultimate");
+    assert_eq!(body["temperature"], 0.7);
+    assert_eq!(body["top_p"], 0.8);
+    assert_eq!(body["top_k"], 20);
+    assert_eq!(body["min_p"], 0.0);
+    assert_eq!(body["presence_penalty"], 1.5);
+    assert_eq!(body["repetition_penalty"], 1.0);
+    assert_eq!(body["max_tokens"], 16384);
+    assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+    for pointer in [
+        "/reasoning_effort",
+        "/model_reasoning_effort",
+        "/thinking_token_budget",
+        "/thinking_budget",
+        "/enable_thinking",
+        "/max_completion_tokens",
+        "/extra_body/temperature",
+        "/extra_body/max_tokens",
+        "/extra_body/thinking/enabled",
+        "/extra_body/thinking/budget_tokens",
+        "/extra_body/chat_template_kwargs/enable_thinking",
+        "/extra_body/chat_template_kwargs/thinking_budget",
+        "/arbitrary/reasoning_effort",
+        "/arbitrary/max_output_tokens",
+        "/arbitrary/children/0/min_p",
+        "/arbitrary/children/0/output_tokens",
+    ] {
+        assert!(body.pointer(pointer).is_none(), "must strip {pointer}");
+    }
+}
+
+async fn assert_ordinary_model_is_unchanged(proxy: &ProxyFixture, fake: &mut FakeUpstream) {
+    let ordinary = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(
+            r#"{"model":"ordinary-model","messages":[],"stream":true,"temperature":0.42,"top_p":0.73,"top_k":7,"min_p":0.12,"presence_penalty":0.3,"repetition_penalty":1.2}"#,
+        )
+        .send()
+        .await
+        .expect("ordinary request should complete");
+    assert_eq!(ordinary.status(), StatusCode::OK);
+    let observed = fake.recv_next().await;
+    let body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("JSON upstream body");
+    assert_eq!(body["model"], "ordinary-model");
+    assert_eq!(body["temperature"], 0.42);
+    assert_eq!(body["top_p"], 0.73);
+    assert_eq!(body["top_k"], 7);
+    assert_eq!(body["min_p"], 0.12);
+    assert_eq!(body["presence_penalty"], 0.3);
+    assert_eq!(body["repetition_penalty"], 1.2);
+}
+
+#[tokio::test]
+async fn forced_model_alias_policy_rewrites_streaming_and_non_streaming_requests() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-none"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_disable"
+output_cap = 16384
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#,
+    )
+    .await;
+    for stream in [false, true] {
+        let response = proxy
+            .client
+            .post(format!("{}/v1/chat/completions", proxy.base_url))
+            .header(CONTENT_TYPE, "application/json")
+            .body(format!(
+                r#"{{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[{{"role":"user","content":"ping"}}],"stream":{stream},"reasoning_effort":"high","model_reasoning_effort":"high","thinking_token_budget":999,"thinking_budget":999,"enable_thinking":false,"temperature":9,"top_p":9,"top_k":9,"min_p":9,"presence_penalty":9,"repetition_penalty":9,"max_completion_tokens":9,"extra_body":{{"temperature":8,"max_tokens":8,"thinking":{{"enabled":true,"budget_tokens":8}},"chat_template_kwargs":{{"enable_thinking":true,"thinking_budget":8}}}},"arbitrary":{{"reasoning_effort":"high","max_output_tokens":8,"children":[{{"min_p":8,"output_tokens":8}}]}}}}"#
+            ))
+            .send()
+            .await
+            .expect("forced policy request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        let observed = fake.recv_next().await;
+        let body: serde_json::Value =
+            serde_json::from_slice(&observed.body).expect("JSON upstream body");
+        assert_forced_model_alias_wire_body(&body);
+    }
+    assert_ordinary_model_is_unchanged(&proxy, &mut fake).await;
+
+    let replacement = proxy.root.join("config.next");
+    let changed = std::fs::read_to_string(proxy.root.join("config.toml"))
+        .expect("read fixture config")
+        .replace("temperature = 0.7", "temperature = 0.3");
+    std::fs::write(&replacement, changed).expect("write changed generation");
+    std::fs::rename(&replacement, proxy.root.join("config.toml"))
+        .expect("publish changed generation");
+    proxy.manager.reload().expect("hot reload should apply");
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[],"stream":false}"#)
+        .send()
+        .await
+        .expect("reloaded request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let observed = fake.recv_next().await;
+    let body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("JSON upstream body");
+    assert_eq!(body["temperature"], 0.3);
+    std::fs::write(
+        &replacement,
+        "[[forced_model_alias_profiles]]\nalias = \"\"\n",
+    )
+    .expect("write invalid generation");
+    std::fs::rename(&replacement, proxy.root.join("config.toml"))
+        .expect("publish invalid generation");
+    proxy
+        .manager
+        .reload()
+        .expect_err("invalid reload must fail");
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[],"stream":false}"#)
+        .send()
+        .await
+        .expect("last-good request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let observed = fake.recv_next().await;
+    let body: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("JSON upstream body");
+    assert_eq!(body["temperature"], 0.3);
+}
+
 #[tokio::test]
 async fn upstream_model_rewrites_shielded_streaming_response_model_name() {
     let mut fake = FakeUpstream::spawn().await;

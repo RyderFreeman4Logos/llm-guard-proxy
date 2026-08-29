@@ -33,8 +33,9 @@ def load_config(path: Path) -> dict[str, JsonValue]:
             key, separator, raw_body = line.partition("=")
             if not separator:
                 raise ValueError("readiness_body assignment is malformed")
-            json.loads(raw_body.strip())
-            line = f"{key}= {json.dumps(raw_body.strip())}"
+            if not raw_body.lstrip().startswith('"'):
+                json.loads(raw_body.strip())
+                line = f"{key}= {json.dumps(raw_body.strip())}"
         normalized_lines.append(line)
     config = tomllib.loads("\n".join(normalized_lines))
     routes = [_table(config, "upstream")]

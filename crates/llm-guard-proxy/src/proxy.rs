@@ -40,11 +40,12 @@ use llm_guard_proxy_core::{
 };
 use llm_guard_proxy_core::{
     AppConfig, CachePriorityEngine, ConfigHandle, DefaultInjectionSchema, DownstreamDropPolicy,
-    Health, HeartbeatMode, LICENSE, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy,
-    LoopGuardConfig, MetadataConfig, RestartQueueConfig, RetryConfig, RetryLadderConfig,
-    SERVICE_NAME, SelectedUpstreamProfile, ShadowComparisonAttempt, ThinkingConfig, ThinkingMode,
-    UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    ForcedModelAliasProfileConfig, Health, HeartbeatMode, LICENSE, ListenerConfig,
+    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, MetadataConfig, RestartQueueConfig,
+    RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile, ShadowComparisonAttempt,
+    ThinkingConfig, ThinkingMode, UpstreamEndpointConfig, UpstreamEndpointProtocol,
+    UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "param-override")]
 use llm_guard_proxy_core::{ParamOverrideConfig, ParamOverrideMode};
@@ -3855,9 +3856,10 @@ fn prepare_openai_forward_request(
     let adapted_body = adapted_request.adapted_body;
     let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
     let reqwest_method = upstream_method(method)?;
-    let body = adapted_body;
+    let (forced_model_alias_policy, body) =
+        forced_model_alias_policy_body(config, model_id.as_deref(), &adapted_body);
     validate_vllm_native_request_controls(config, &upstream_profile, method, &forward_uri, &body)?;
-    let shielded_chat_plan = plan_shielded_chat(
+    let mut shielded_chat_plan = plan_shielded_chat(
         state,
         config,
         &upstream_profile,
@@ -3866,11 +3868,13 @@ fn prepare_openai_forward_request(
         &body,
     );
     #[cfg(feature = "param-override")]
-    let shielded_chat_plan = {
-        let mut plan = shielded_chat_plan;
-        apply_param_override_to_shielded_plan(method, &forward_uri, &mut plan, &upstream_profile)?;
-        plan
-    };
+    apply_param_override_to_shielded_plan(
+        method,
+        &forward_uri,
+        &mut shielded_chat_plan,
+        &upstream_profile,
+    )?;
+    apply_forced_model_alias_policy_to_plan(forced_model_alias_policy, &mut shielded_chat_plan);
     add_shielded_request_metadata(
         request_metadata,
         shielded_chat_plan.intercepted,
@@ -3910,6 +3914,40 @@ fn prepare_openai_forward_request(
         upstream_deadline: None,
         endpoint_retry_order,
     })
+}
+
+fn forced_model_alias_policy<'config>(
+    config: &'config AppConfig,
+    model_id: Option<&str>,
+) -> Option<&'config ForcedModelAliasProfileConfig> {
+    config
+        .forced_model_alias_profiles
+        .iter()
+        .find(|policy| Some(policy.alias.as_str()) == model_id)
+}
+
+fn forced_model_alias_policy_body<'config>(
+    config: &'config AppConfig,
+    model_id: Option<&str>,
+    body: &Bytes,
+) -> (Option<&'config ForcedModelAliasProfileConfig>, Bytes) {
+    let policy = forced_model_alias_policy(config, model_id);
+    let body = policy.map_or_else(
+        || body.clone(),
+        |policy| apply_forced_model_alias_policy(body, policy),
+    );
+    (policy, body)
+}
+
+fn apply_forced_model_alias_policy_to_plan(
+    policy: Option<&ForcedModelAliasProfileConfig>,
+    plan: &mut ShieldedChatPlan,
+) {
+    let Some(policy) = policy else {
+        return;
+    };
+    plan.upstream_body = apply_forced_model_alias_policy(&plan.upstream_body, policy);
+    plan.downstream_body = apply_forced_model_alias_policy(&plan.downstream_body, policy);
 }
 
 fn initial_endpoint_retry_state(
@@ -4794,6 +4832,139 @@ fn rewrite_request_model_body(body: &Bytes, upstream_model: &str) -> Bytes {
         serde_json::Value::String(upstream_model.to_owned()),
     );
     Bytes::from(value.to_string())
+}
+
+fn apply_forced_model_alias_policy(body: &Bytes, policy: &ForcedModelAliasProfileConfig) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    if !value.is_object() {
+        return body.clone();
+    }
+    let (
+        Some(thinking_mode),
+        Some(output_cap),
+        Some(temperature),
+        Some(top_p),
+        Some(top_k),
+        Some(min_p),
+        Some(presence_penalty),
+        Some(repetition_penalty),
+    ) = (
+        policy.thinking_mode,
+        policy.output_cap,
+        policy.temperature,
+        policy.top_p,
+        policy.top_k,
+        policy.min_p,
+        policy.presence_penalty,
+        policy.repetition_penalty,
+    )
+    else {
+        return body.clone();
+    };
+    let Some(temperature) = serde_json::Number::from_f64(temperature) else {
+        return body.clone();
+    };
+    let Some(top_p) = serde_json::Number::from_f64(top_p) else {
+        return body.clone();
+    };
+    let Some(min_p) = serde_json::Number::from_f64(min_p) else {
+        return body.clone();
+    };
+    let Some(presence_penalty) = serde_json::Number::from_f64(presence_penalty) else {
+        return body.clone();
+    };
+    let Some(repetition_penalty) = serde_json::Number::from_f64(repetition_penalty) else {
+        return body.clone();
+    };
+    remove_forced_generation_controls(&mut value, None);
+    let Some(object) = value.as_object_mut() else {
+        return body.clone();
+    };
+    object.insert(
+        String::from("model"),
+        serde_json::Value::String(policy.upstream_model.clone()),
+    );
+    object.insert(
+        String::from("temperature"),
+        serde_json::Value::Number(temperature),
+    );
+    object.insert(String::from("top_p"), serde_json::Value::Number(top_p));
+    object.insert(
+        String::from("top_k"),
+        serde_json::Value::Number(top_k.into()),
+    );
+    object.insert(String::from("min_p"), serde_json::Value::Number(min_p));
+    object.insert(
+        String::from("presence_penalty"),
+        serde_json::Value::Number(presence_penalty),
+    );
+    object.insert(
+        String::from("repetition_penalty"),
+        serde_json::Value::Number(repetition_penalty),
+    );
+    object.insert(
+        String::from("max_tokens"),
+        serde_json::Value::Number(output_cap.into()),
+    );
+    let template = object
+        .entry(String::from("chat_template_kwargs"))
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !template.is_object() {
+        *template = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(template) = template.as_object_mut() {
+        template.insert(
+            String::from("enable_thinking"),
+            serde_json::Value::Bool(thinking_mode == ThinkingMode::ForceThinking),
+        );
+    }
+    if let Some(budget) = policy.thinking_budget {
+        object.insert(
+            String::from("thinking_token_budget"),
+            serde_json::Value::Number(budget.into()),
+        );
+    }
+    Bytes::from(value.to_string())
+}
+
+fn remove_forced_generation_controls(value: &mut serde_json::Value, parent: Option<&str>) {
+    let serde_json::Value::Object(object) = value else {
+        if let serde_json::Value::Array(values) = value {
+            for value in values {
+                remove_forced_generation_controls(value, parent);
+            }
+        }
+        return;
+    };
+    for field in [
+        "reasoning_effort",
+        "model_reasoning_effort",
+        "thinking_token_budget",
+        "thinking_budget",
+        "budget_tokens",
+        "enable_thinking",
+        "llm_guard_proxy_disable_thinking",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "repetition_penalty",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "output_tokens",
+    ] {
+        object.remove(field);
+    }
+    if parent == Some("thinking") {
+        object.remove("enabled");
+    }
+    for (key, value) in object {
+        remove_forced_generation_controls(value, Some(key));
+    }
 }
 
 /// Coerces a YAML-string priority hint only for an upstream that opts into an

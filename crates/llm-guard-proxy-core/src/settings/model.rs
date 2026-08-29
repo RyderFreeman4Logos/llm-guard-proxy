@@ -56,6 +56,8 @@ pub struct AppConfig {
     pub upstream: UpstreamConfig,
     /// Additional named upstream profiles matched by request model.
     pub upstream_profiles: Vec<UpstreamProfileConfig>,
+    /// Immutable request policies selected by public model aliases.
+    pub forced_model_alias_profiles: Vec<ForcedModelAliasProfileConfig>,
     /// Virtual model aliases exposed to clients.
     #[cfg(feature = "guard")]
     pub model_aliases: Vec<ModelAliasConfig>,
@@ -308,6 +310,7 @@ impl AppConfig {
         self.server.validate()?;
         self.upstream.validate()?;
         self.validate_upstream_profiles()?;
+        self.validate_forced_model_alias_profiles()?;
         #[cfg(feature = "guard")]
         {
             self.validate_model_aliases()?;
@@ -368,6 +371,19 @@ impl AppConfig {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_forced_model_alias_profiles(&self) -> Result<(), ValidationError> {
+        let mut aliases = HashSet::new();
+        for profile in &self.forced_model_alias_profiles {
+            profile.validate()?;
+            require(
+                aliases.insert(profile.alias.clone()),
+                "forced_model_alias_profiles.alias",
+                "must be unique",
+            )?;
+        }
         Ok(())
     }
 
@@ -956,6 +972,8 @@ impl AppConfig {
         self.heartbeat = requested.heartbeat.clone();
         self.cloudflare = requested.cloudflare.clone();
         self.guardian.clone_from(&requested.guardian);
+        self.forced_model_alias_profiles
+            .clone_from(&requested.forced_model_alias_profiles);
         #[cfg(feature = "guard")]
         {
             self.profiles.clone_from(&requested.profiles);
@@ -2658,6 +2676,140 @@ impl Default for ParamOverrideConfig {
             reasoning_effort: None,
         }
     }
+}
+
+/// Immutable sampling and thinking policy selected by one public model alias.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ForcedModelAliasProfileConfig {
+    /// Client-visible alias that selects this policy.
+    pub alias: String,
+    /// Canonical model name sent upstream.
+    pub upstream_model: String,
+    /// Force-disable or force-thinking policy.
+    pub thinking_mode: Option<ThinkingMode>,
+    /// Required only for `force_thinking`.
+    pub thinking_budget: Option<u32>,
+    /// Forced output token cap.
+    pub output_cap: Option<u32>,
+    /// Forced sampler and penalty settings.
+    pub temperature: Option<f64>,
+    pub top_p: Option<f64>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f64>,
+    pub presence_penalty: Option<f64>,
+    pub repetition_penalty: Option<f64>,
+}
+
+impl ForcedModelAliasProfileConfig {
+    fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            !self.alias.trim().is_empty(),
+            "forced_model_alias_profiles.alias",
+            "must not be empty",
+        )?;
+        require(
+            self.alias == self.alias.trim(),
+            "forced_model_alias_profiles.alias",
+            "must not have leading or trailing whitespace",
+        )?;
+        require(
+            !self.upstream_model.trim().is_empty(),
+            "forced_model_alias_profiles.upstream_model",
+            "must not be empty",
+        )?;
+        require(
+            self.upstream_model == self.upstream_model.trim(),
+            "forced_model_alias_profiles.upstream_model",
+            "must not have leading or trailing whitespace",
+        )?;
+        let output_cap = self.output_cap.ok_or_else(|| {
+            ValidationError::new(
+                "forced_model_alias_profiles.output_cap",
+                "is required and must be greater than zero",
+            )
+        })?;
+        require(
+            output_cap > 0,
+            "forced_model_alias_profiles.output_cap",
+            "must be greater than zero",
+        )?;
+        validate_forced_model_alias_number(
+            self.temperature,
+            "forced_model_alias_profiles.temperature",
+            0.0,
+            2.0,
+        )?;
+        validate_forced_model_alias_number(
+            self.top_p,
+            "forced_model_alias_profiles.top_p",
+            0.0,
+            1.0,
+        )?;
+        let top_k = self.top_k.ok_or_else(|| {
+            ValidationError::new(
+                "forced_model_alias_profiles.top_k",
+                "is required and must be greater than zero",
+            )
+        })?;
+        require(
+            top_k > 0,
+            "forced_model_alias_profiles.top_k",
+            "must be greater than zero",
+        )?;
+        validate_forced_model_alias_number(
+            self.min_p,
+            "forced_model_alias_profiles.min_p",
+            0.0,
+            1.0,
+        )?;
+        validate_forced_model_alias_number(
+            self.presence_penalty,
+            "forced_model_alias_profiles.presence_penalty",
+            -2.0,
+            2.0,
+        )?;
+        validate_forced_model_alias_number(
+            self.repetition_penalty,
+            "forced_model_alias_profiles.repetition_penalty",
+            f64::MIN_POSITIVE,
+            2.0,
+        )?;
+        match self.thinking_mode.ok_or_else(|| {
+            ValidationError::new(
+                "forced_model_alias_profiles.thinking_mode",
+                "is required and must be force_disable or force_thinking",
+            )
+        })? {
+            ThinkingMode::ForceDisable => require(
+                self.thinking_budget.is_none(),
+                "forced_model_alias_profiles.thinking_budget",
+                "must be omitted when thinking is disabled",
+            ),
+            ThinkingMode::ForceThinking => require(
+                self.thinking_budget.is_some_and(|budget| budget > 0),
+                "forced_model_alias_profiles.thinking_budget",
+                "must be greater than zero when thinking is enabled",
+            ),
+            _ => Err(ValidationError::new(
+                "forced_model_alias_profiles.thinking_mode",
+                "must be force_disable or force_thinking",
+            )),
+        }
+    }
+}
+
+fn validate_forced_model_alias_number(
+    value: Option<f64>,
+    field: &'static str,
+    minimum: f64,
+    maximum: f64,
+) -> Result<(), ValidationError> {
+    let value = value.ok_or_else(|| ValidationError::new(field, "is required"))?;
+    require(
+        value.is_finite() && (minimum..=maximum).contains(&value),
+        field,
+        "must be finite and within the supported range",
+    )
 }
 
 /// Bounded route reason stored in observability metadata.
