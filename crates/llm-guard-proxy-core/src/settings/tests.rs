@@ -1073,6 +1073,7 @@ fn gb10_deploy_uncomment_ready_examples_parse() {
         "fill-if-absent-chat-defaults",
         "heterogeneous-reranker-replicas",
         "generic-openai-reranker-failover",
+        "forced-model-alias-profile",
     ] {
         assert_deploy_example_parses(name);
     }

@@ -105,7 +105,8 @@ def _recovery_errors(label: str, recovery: dict[str, JsonValue]) -> list[str]:
         errors.append(f"{label}.local_recovery.trigger_on_request_deadline must be false")
     if recovery.get("restart_command") != AEON_RESTART_COMMAND:
         errors.append(f"{label}.local_recovery.restart_command is not the reviewed AEON unit")
-    if recovery.get("max_attempts_per_request") != 1:
+    attempts = _positive_int(recovery, "max_attempts_per_request")
+    if attempts != 1:
         errors.append(f"{label}.local_recovery.max_attempts_per_request must equal 1")
     for field in (
         "restart_timeout_ms",
@@ -126,6 +127,23 @@ def _recovery_errors(label: str, recovery: dict[str, JsonValue]) -> list[str]:
 
 def _forced_alias_profile_errors(config: dict[str, JsonValue]) -> list[str]:
     profiles = config.get("forced_model_alias_profiles")
+    if isinstance(profiles, list):
+        numeric_fields = (
+            "thinking_budget",
+            "output_cap",
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "presence_penalty",
+            "repetition_penalty",
+        )
+        if any(
+            isinstance(profile, dict)
+            and any(isinstance(profile.get(field), bool) for field in numeric_fields)
+            for profile in profiles
+        ):
+            return ["forced_model_alias_profiles numeric fields must not be boolean"]
     expected = [
         {"alias": alias, **settings}
         for alias, settings in FORCED_ALIAS_PROFILES.items()

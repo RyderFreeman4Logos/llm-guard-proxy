@@ -3338,7 +3338,7 @@ async fn forward_openai_request(
             rendered.body = apply_forced_model_alias_policy_for_endpoint(
                 &rendered.body,
                 policy,
-                is_chat_completions_request(&method, &prepared_request.forward_uri),
+                endpoint_capability(&method, &prepared_request.forward_uri),
             );
         }
         prepared_request.forward_uri = rendered.uri;
@@ -3963,7 +3963,7 @@ fn forced_model_alias_policy_body(
             apply_forced_model_alias_policy_for_endpoint(
                 body,
                 policy,
-                is_chat_completions_request(method, uri),
+                endpoint_capability(method, uri),
             )
         },
     );
@@ -4007,7 +4007,7 @@ fn prepare_forced_alias_shielded_plan(
     apply_forced_model_alias_policy_to_plan(
         policy.as_ref(),
         &mut shielded_chat_plan,
-        is_chat_completions_request(method, forward_uri),
+        endpoint_capability(method, forward_uri),
     );
     Ok((policy, body, shielded_chat_plan))
 }
@@ -4015,18 +4015,18 @@ fn prepare_forced_alias_shielded_plan(
 fn apply_forced_model_alias_policy_for_endpoint(
     body: &Bytes,
     policy: &ForcedModelAliasProfileConfig,
-    applies_to_generation: bool,
+    capability: EndpointCapability,
 ) -> Bytes {
-    if applies_to_generation {
-        apply_forced_model_alias_policy(body, policy)
-    } else {
-        rewrite_request_model_body(body, &policy.upstream_model)
+    match capability {
+        EndpointCapability::Generation => apply_forced_model_alias_policy(body, policy),
+        EndpointCapability::ModelOnly => rewrite_request_model_body(body, &policy.upstream_model),
     }
 }
 
 fn add_forced_alias_wire_metadata(
     metadata: &mut BTreeMap<String, String>,
     policy: Option<&ForcedModelAliasProfileConfig>,
+    capability: EndpointCapability,
     body: &Bytes,
 ) {
     let Some(policy) = policy else {
@@ -4044,40 +4044,45 @@ fn add_forced_alias_wire_metadata(
             .unwrap_or_default()
             .to_owned(),
     );
+    let thinking_enabled = object
+        .get("chat_template_kwargs")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|template| template.get("enable_thinking"))
+        .and_then(serde_json::Value::as_bool);
     metadata.insert(
         String::from("forced_thinking_mode"),
-        policy
-            .thinking_mode
-            .map_or_else(String::new, |mode| mode.as_str().to_owned()),
+        match (capability, thinking_enabled) {
+            (EndpointCapability::Generation, Some(true)) => String::from("force_thinking"),
+            (EndpointCapability::Generation, Some(false)) => String::from("force_disable"),
+            _ => String::new(),
+        },
     );
+    let thinking_budget = object
+        .get("thinking_token_budget")
+        .and_then(serde_json::Value::as_u64);
     metadata.insert(
         String::from("forced_thinking_budget"),
-        object
-            .get("thinking_token_budget")
-            .and_then(serde_json::Value::as_u64)
-            .map_or_else(|| String::from("none"), |value| value.to_string()),
+        thinking_budget.map_or_else(|| String::from("none"), |value| value.to_string()),
     );
+    let total_cap = object.get("max_tokens").and_then(serde_json::Value::as_u64);
     metadata.insert(
         String::from("forced_answer_headroom"),
-        policy
-            .output_cap
+        total_cap
+            .and_then(|total| total.checked_sub(thinking_budget.unwrap_or(0)))
             .map_or_else(String::new, |value| value.to_string()),
     );
     metadata.insert(
         String::from("forced_wire_total_cap"),
-        object
-            .get("max_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .map_or_else(|| String::from("none"), |value| value.to_string()),
+        total_cap.map_or_else(|| String::from("none"), |value| value.to_string()),
     );
 }
 
 fn apply_forced_model_alias_policy_to_plan(
     policy: Option<&ForcedModelAliasProfileConfig>,
     plan: &mut ShieldedChatPlan,
-    applies_to_generation: bool,
+    capability: EndpointCapability,
 ) {
-    let Some(policy) = policy.filter(|_| applies_to_generation) else {
+    let Some(policy) = policy.filter(|_| capability == EndpointCapability::Generation) else {
         return;
     };
     plan.upstream_body = apply_forced_model_alias_policy(&plan.upstream_body, policy);
@@ -4297,6 +4302,25 @@ fn profile_block_reason_message(reason: &BlockReason) -> String {
             format!("daily request limit exceeded: limit={limit}")
         }
         BlockReason::KindMismatch => String::from("profile kind mismatch"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EndpointCapability {
+    Generation,
+    ModelOnly,
+}
+
+fn endpoint_capability(method: &Method, uri: &Uri) -> EndpointCapability {
+    if method == Method::POST
+        && matches!(
+            uri.path(),
+            "/v1/chat/completions" | "/chat/completions" | "/v1/completions"
+        )
+    {
+        EndpointCapability::Generation
+    } else {
+        EndpointCapability::ModelOnly
     }
 }
 
@@ -5097,6 +5121,23 @@ fn remove_forced_generation_controls(value: &mut serde_json::Value) {
 }
 
 fn remove_provider_generation_controls(value: &mut serde_json::Value, parent: Option<&str>) {
+    if matches!(
+        parent,
+        Some(
+            "messages"
+                | "content"
+                | "tools"
+                | "functions"
+                | "function"
+                | "parameters"
+                | "response_format"
+                | "json_schema"
+                | "schema"
+                | "properties"
+        )
+    ) {
+        return;
+    }
     match value {
         serde_json::Value::Array(values) => {
             for value in values {
@@ -5640,6 +5681,7 @@ fn prepare_generic_attempt_request(
     add_forced_alias_wire_metadata(
         &mut metadata,
         context.forced_model_alias_policy.as_ref(),
+        endpoint_capability(&context.method, &context.uri),
         &context.upstream_body,
     );
     (override_headers, metadata)
@@ -5827,6 +5869,7 @@ async fn send_generic_upstream_attempt(
             UpstreamFailoverRetryContext {
                 registry: context.state.upstream_health.as_ref(),
                 profile: &context.upstream_profile,
+                method: context.reqwest_method.clone(),
                 local_forward_uri: context.upstream_uri.clone(),
                 original_downstream_headers: &context.downstream_headers,
                 canonical_reranker: context.canonical_reranker.as_ref(),
@@ -6144,6 +6187,7 @@ fn models_failover_retry_context<'request>(
         .then_some(UpstreamFailoverRetryContext {
             registry: context.state.upstream_health.as_ref(),
             profile: &group.profile,
+            method: context.reqwest_method.clone(),
             local_forward_uri: context.upstream_uri.clone(),
             original_downstream_headers: downstream_headers,
             canonical_reranker: None,
@@ -6328,6 +6372,7 @@ fn upstream_body_error_with_observability(
 struct UpstreamFailoverRetryContext<'request> {
     registry: &'request UpstreamHealthRegistry,
     profile: &'request UpstreamProfileConfig,
+    method: reqwest::Method,
     local_forward_uri: Uri,
     original_downstream_headers: &'request HeaderMap,
     canonical_reranker: Option<&'request CanonicalRerankerRequest>,
@@ -6476,7 +6521,7 @@ fn render_retry_openai_request(
         rendered.body = apply_forced_model_alias_policy_for_endpoint(
             &rendered.body,
             policy,
-            is_chat_completion_path(retry.local_forward_uri.path()),
+            endpoint_capability(&retry.method, &retry.local_forward_uri),
         );
     }
     Ok(rendered)
@@ -6800,7 +6845,7 @@ async fn send_selected_failover_endpoint(
     request_metadata: BTreeMap<String, String>,
     mut selected: upstream_failover::SelectedUpstreamEndpoint,
 ) -> CompletedFailoverEndpointSend {
-    let mut rendered = match runtime.retry.canonical_reranker {
+    let rendered = match runtime.retry.canonical_reranker {
         Some(canonical) => reranker_protocol::render(
             &selected.endpoint,
             canonical,
@@ -6808,11 +6853,6 @@ async fn send_selected_failover_endpoint(
         ),
         None => render_retry_openai_request(runtime.retry, &selected.endpoint, runtime.retry_body),
     };
-    if let Ok(rendered) = &mut rendered
-        && let Some(policy) = runtime.retry.forced_model_alias_policy
-    {
-        rendered.body = apply_forced_model_alias_policy(&rendered.body, policy);
-    }
     let attempt_id = AttemptId::for_request(runtime.request_id, attempt_number);
     let started_at_unix_ms = unix_time_millis();
     let mut attempt = PhysicalEndpointAttempt {
@@ -6840,6 +6880,12 @@ async fn send_selected_failover_endpoint(
     }
     let response = match rendered {
         Ok(rendered) => {
+            add_forced_alias_wire_metadata(
+                &mut attempt.request_metadata,
+                runtime.retry.forced_model_alias_policy,
+                endpoint_capability(&runtime.retry_method, &runtime.retry.local_forward_uri),
+                &rendered.body,
+            );
             annotate_physical_endpoint_attempt(
                 &mut attempt.request_metadata,
                 attempt.endpoint.as_ref(),
@@ -12939,6 +12985,7 @@ async fn start_shielded_attempt(
     add_forced_alias_wire_metadata(
         &mut request_metadata,
         runtime.forced_model_alias_policy.as_ref(),
+        endpoint_capability(&runtime.method, &runtime.forward_uri),
         &rendered.body,
     );
     let raw_request_body = raw_payload_text(&rendered.body);
@@ -13112,6 +13159,7 @@ async fn send_shielded_upstream_attempt(
             UpstreamFailoverRetryContext {
                 registry: runtime.upstream_health.as_ref(),
                 profile: &runtime.upstream_profile,
+                method: runtime.method.clone(),
                 local_forward_uri: runtime.forward_uri.clone(),
                 original_downstream_headers: &runtime.original_downstream_headers,
                 canonical_reranker: None,

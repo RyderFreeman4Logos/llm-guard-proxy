@@ -170,6 +170,41 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
             "aeon-ultimate",
             {profile["upstream_model"] for profile in profiles},
         )
+        for alias, field in [
+            ("abliterated-qwen-latest-27b-nvfp4-low", "thinking_budget"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "output_cap"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "temperature"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "top_p"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "top_k"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "min_p"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "presence_penalty"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "repetition_penalty"),
+        ]:
+            with self.subTest(boolean_numeric_field=field):
+                candidate = copy.deepcopy(self.config)
+                profile = next(
+                    profile
+                    for profile in candidate["forced_model_alias_profiles"]
+                    if profile["alias"] == alias
+                )
+                profile[field] = bool(profile[field])
+                errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
+                self.assertTrue(errors)
+        for route in ("upstream", "aeon-chat"):
+            with self.subTest(boolean_recovery_route=route):
+                candidate = copy.deepcopy(self.config)
+                recovery = (
+                    candidate["upstream"]["local_recovery"]
+                    if route == "upstream"
+                    else next(
+                        profile
+                        for profile in candidate["upstreams"]
+                        if profile["name"] == route
+                    )["local_recovery"]
+                )
+                recovery["max_attempts_per_request"] = True
+                errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
+                self.assertTrue(errors)
         for mutation, alias, field, value in [
             ("absent", None, None, None),
             ("extra", None, None, None),

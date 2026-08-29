@@ -178,6 +178,21 @@ input_token_safety_margin = 512           # Tokens reserved for response
 
 ## ───────────────────────── Forced model aliases ─────────────────────────────
 ## Public aliases with immutable, hot-reloadable upstream request policies.
+# Safe default: omit this whole table unless an operator needs a reviewed alias.
+# BEGIN PARSEABLE EXAMPLE: forced-model-alias-profile
+#| [[forced_model_alias_profiles]]
+#| alias = "example-public-alias"              # Public client-visible alias; safe default is no alias table.
+#| upstream_model = "example-upstream-model"   # Canonical upstream model; safe default is no rewrite.
+#| thinking_mode = "force_disable"             # Force thinking mode; safe default is caller-controlled thinking.
+#| # thinking_budget = 65536                    # Required only for force_thinking; safe default is omitted.
+#| output_cap = 16384                           # Reserve answer tokens; safe default is no forced cap.
+#| temperature = 1.0                            # Sampling temperature; safe default is caller-controlled.
+#| top_p = 0.95                                 # Nucleus sampling; safe default is caller-controlled.
+#| top_k = 20                                   # Top-k sampling; safe default is caller-controlled.
+#| min_p = 0.0                                  # Minimum probability; safe default is caller-controlled.
+#| presence_penalty = 0.0                       # Presence penalty; safe default is caller-controlled.
+#| repetition_penalty = 1.0                     # Repetition penalty; safe default is caller-controlled.
+# END PARSEABLE EXAMPLE: forced-model-alias-profile
 
 [[forced_model_alias_profiles]]
 alias = "abliterated-qwen-latest-27b-nvfp4-none"
