@@ -5172,47 +5172,35 @@ fn remove_forced_generation_controls(value: &mut serde_json::Value) {
     };
     remove_forced_generation_control_fields(object);
     if let Some(extra_body) = object.get_mut("extra_body") {
-        remove_provider_generation_controls(extra_body, None);
+        remove_provider_generation_controls(extra_body, "extra_body");
     }
     if let Some(template) = object.get_mut("chat_template_kwargs") {
-        remove_provider_generation_controls(template, Some("chat_template_kwargs"));
+        remove_provider_generation_controls(template, "chat_template_kwargs");
     }
     if let Some(thinking) = object.get_mut("thinking") {
-        remove_provider_generation_controls(thinking, Some("thinking"));
+        remove_provider_generation_controls(thinking, "thinking");
     }
 }
 
-fn remove_provider_generation_controls(value: &mut serde_json::Value, parent: Option<&str>) {
-    if matches!(
-        parent,
-        Some(
-            "messages"
-                | "content"
-                | "tools"
-                | "functions"
-                | "function"
-                | "parameters"
-                | "response_format"
-                | "json_schema"
-                | "schema"
-                | "properties"
-        )
-    ) {
-        return;
-    }
+fn remove_provider_generation_controls(value: &mut serde_json::Value, container: &str) {
     match value {
         serde_json::Value::Array(values) => {
             for value in values {
-                remove_provider_generation_controls(value, parent);
+                remove_provider_generation_controls(value, container);
             }
         }
         serde_json::Value::Object(object) => {
             remove_forced_generation_control_fields(object);
-            if parent == Some("thinking") {
+            if container == "thinking" {
                 object.remove("enabled");
             }
             for (key, value) in object {
-                remove_provider_generation_controls(value, Some(key));
+                if matches!(
+                    key.as_str(),
+                    "extra_body" | "chat_template_kwargs" | "thinking" | "options"
+                ) {
+                    remove_provider_generation_controls(value, key);
+                }
             }
         }
         _ => {}

@@ -89,6 +89,210 @@ upstream_model = "aeon-ultimate"
     );
 }
 
+#[test]
+#[allow(clippy::too_many_lines)]
+fn forced_generation_controls_preserve_opaque_nested_extensions() {
+    let mut body = serde_json::json!({
+        "temperature": 9,
+        "max_tokens": 9,
+        "extra_body": {
+            "temperature": 8,
+            "max_tokens": 8,
+            "options": [
+                {
+                    "temperature": 7,
+                    "max_tokens": 7,
+                    "vendor_extension": {
+                        "temperature": "keep",
+                        "max_tokens": "keep",
+                        "required": ["temperature"]
+                    }
+                }
+            ],
+            "vendor_extension": {
+                "reasoning_effort": "semantic-value",
+                "max_tokens": 7,
+                "temperature": 0.5,
+                "required": ["max_tokens"]
+            },
+            "vendor_extensions": [
+                {
+                    "reasoning_effort": "semantic-array-value",
+                    "max_tokens": 6,
+                    "temperature": 0.4,
+                    "required": ["temperature"]
+                }
+            ],
+            "messages": [{
+                "content": {"temperature": 0.1, "max_tokens": 3}
+            }],
+            "tools": [{
+                "function": {
+                    "parameters": {
+                        "properties": {"temperature": {"type": "number"}},
+                        "required": ["temperature"],
+                        "max_tokens": 3
+                    }
+                }
+            }],
+            "response_format": {
+                "json_schema": {
+                    "schema": {
+                        "properties": {"max_tokens": {"type": "number"}},
+                        "required": ["max_tokens"],
+                        "temperature": 0.2
+                    }
+                }
+            },
+            "chat_template_kwargs": {
+                "temperature": 8,
+                "options": [{"max_tokens": 7, "vendor": {"temperature": "keep"}}],
+                "vendor_extension": {
+                    "temperature": "keep",
+                    "max_tokens": "keep",
+                    "required": ["max_tokens"]
+                },
+                "vendor_extensions": [{
+                    "temperature": "keep",
+                    "max_tokens": "keep",
+                    "required": ["temperature"]
+                }]
+            },
+            "thinking": {
+                "enabled": true,
+                "budget_tokens": 8,
+                "vendor_extension": {
+                    "thinking": "semantic-value",
+                    "temperature": "keep",
+                    "max_tokens": "keep"
+                }
+            }
+        },
+        "chat_template_kwargs": {
+            "enable_thinking": true,
+            "options": [{"temperature": 7, "max_tokens": 7, "vendor": {"top_p": "keep"}}],
+            "vendor_extension": {
+                "reasoning_effort": "keep",
+                "temperature": "keep",
+                "max_tokens": "keep",
+                "required": ["temperature"]
+            },
+            "vendor_extensions": [{
+                "reasoning_effort": "keep",
+                "temperature": "keep",
+                "max_tokens": "keep",
+                "required": ["max_tokens"]
+            }]
+        },
+        "thinking": {
+            "enabled": true,
+            "budget_tokens": 8,
+            "vendor_extension": {
+                "reasoning_effort": "keep",
+                "temperature": "keep",
+                "max_tokens": "keep"
+            }
+        }
+    });
+
+    remove_forced_generation_controls(&mut body);
+
+    for pointer in [
+        "/temperature",
+        "/max_tokens",
+        "/extra_body/temperature",
+        "/extra_body/max_tokens",
+        "/extra_body/options/0/temperature",
+        "/extra_body/options/0/max_tokens",
+        "/extra_body/chat_template_kwargs/temperature",
+        "/extra_body/chat_template_kwargs/options/0/max_tokens",
+        "/extra_body/thinking/enabled",
+        "/extra_body/thinking/budget_tokens",
+        "/chat_template_kwargs/enable_thinking",
+        "/chat_template_kwargs/options/0/temperature",
+        "/thinking/enabled",
+        "/thinking/budget_tokens",
+    ] {
+        assert!(body.pointer(pointer).is_none(), "must strip {pointer}");
+    }
+    for (pointer, expected) in [
+        (
+            "/extra_body/vendor_extension/temperature",
+            serde_json::json!(0.5),
+        ),
+        (
+            "/extra_body/vendor_extension/max_tokens",
+            serde_json::json!(7),
+        ),
+        (
+            "/extra_body/vendor_extension/required/0",
+            serde_json::json!("max_tokens"),
+        ),
+        (
+            "/extra_body/vendor_extensions/0/temperature",
+            serde_json::json!(0.4),
+        ),
+        (
+            "/extra_body/vendor_extensions/0/max_tokens",
+            serde_json::json!(6),
+        ),
+        (
+            "/extra_body/chat_template_kwargs/vendor_extension/temperature",
+            serde_json::json!("keep"),
+        ),
+        (
+            "/extra_body/chat_template_kwargs/options/0/vendor/temperature",
+            serde_json::json!("keep"),
+        ),
+        (
+            "/extra_body/chat_template_kwargs/vendor_extensions/0/required/0",
+            serde_json::json!("temperature"),
+        ),
+        (
+            "/extra_body/thinking/vendor_extension/thinking",
+            serde_json::json!("semantic-value"),
+        ),
+        (
+            "/chat_template_kwargs/vendor_extension/reasoning_effort",
+            serde_json::json!("keep"),
+        ),
+        (
+            "/chat_template_kwargs/vendor_extensions/0/max_tokens",
+            serde_json::json!("keep"),
+        ),
+        (
+            "/thinking/vendor_extension/reasoning_effort",
+            serde_json::json!("keep"),
+        ),
+        (
+            "/extra_body/messages/0/content/temperature",
+            serde_json::json!(0.1),
+        ),
+        (
+            "/extra_body/tools/0/function/parameters/properties/temperature/type",
+            serde_json::json!("number"),
+        ),
+        (
+            "/extra_body/tools/0/function/parameters/required/0",
+            serde_json::json!("temperature"),
+        ),
+        (
+            "/extra_body/response_format/json_schema/schema/properties/max_tokens/type",
+            serde_json::json!("number"),
+        ),
+        (
+            "/extra_body/response_format/json_schema/schema/required/0",
+            serde_json::json!("max_tokens"),
+        ),
+    ] {
+        assert_eq!(
+            body.pointer(pointer),
+            Some(&expected),
+            "must preserve {pointer}"
+        );
+    }
+}
+
 fn assert_forced_model_alias_wire_body(body: &serde_json::Value) {
     assert_eq!(body["model"], "aeon-ultimate");
     assert_eq!(body["temperature"], 0.7);
