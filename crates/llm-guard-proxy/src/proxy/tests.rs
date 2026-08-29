@@ -8027,6 +8027,21 @@ fn write_singleflight_restart_script(recovery_root: &Path) -> (PathBuf, PathBuf)
     (script_path, count_path)
 }
 
+async fn wait_for_upstream_stall_recovery_to_start(
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+) {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if coordinator.state.lock().await.running {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovery leader should publish running state");
+}
+
 async fn assert_singleflight_upstream_requests(fake: &mut FakeUpstream) {
     let mut observed = Vec::new();
     for _ in 0..5 {
@@ -8061,7 +8076,7 @@ async fn upstream_stall_recovery_is_single_flight_and_budget_limited() {
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![String::from("/bin/sleep"), String::from("0.2")],
         recovery_timeout: Duration::from_secs(2),
-        recovery_cooldown: Duration::from_millis(1),
+        recovery_cooldown: Duration::ZERO,
         recovery_budget_window: Duration::from_secs(60),
         recovery_max_per_window: 1,
     };
@@ -8072,7 +8087,7 @@ async fn upstream_stall_recovery_is_single_flight_and_budget_limited() {
         let policy = policy.clone();
         async move { run_upstream_stall_recovery(&policy, &coordinator).await }
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_upstream_stall_recovery_to_start(&coordinator).await;
     let joined = run_upstream_stall_recovery(&policy, &coordinator).await;
     let first = first_recovery
         .await
@@ -8082,7 +8097,6 @@ async fn upstream_stall_recovery_is_single_flight_and_budget_limited() {
     assert_eq!(joined["upstream_stall_recovery_status"], "joined_inflight");
     assert_eq!(joined["upstream_stall_recovery_joined_status"], "succeeded");
 
-    tokio::time::sleep(Duration::from_millis(5)).await;
     let budget_limited = run_upstream_stall_recovery(&policy, &coordinator).await;
     assert_eq!(
         budget_limited["upstream_stall_recovery_status"],
@@ -8099,7 +8113,7 @@ async fn upstream_stall_recovery_joiners_do_not_hang_after_leader_cancellation()
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![String::from("/bin/sleep"), String::from("0.2")],
         recovery_timeout: Duration::from_secs(2),
-        recovery_cooldown: Duration::from_millis(1),
+        recovery_cooldown: Duration::ZERO,
         recovery_budget_window: Duration::from_secs(60),
         recovery_max_per_window: 2,
     };
@@ -8110,7 +8124,7 @@ async fn upstream_stall_recovery_joiners_do_not_hang_after_leader_cancellation()
         let policy = policy.clone();
         async move { run_upstream_stall_recovery(&policy, &coordinator).await }
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_upstream_stall_recovery_to_start(&coordinator).await;
     leader.abort();
     assert!(
         leader
@@ -8120,11 +8134,11 @@ async fn upstream_stall_recovery_joiners_do_not_hang_after_leader_cancellation()
     );
 
     let joined = timeout(
-        Duration::from_millis(500),
+        recovery_join_timeout(policy.recovery_timeout),
         run_upstream_stall_recovery(&policy, &coordinator),
     )
     .await
-    .expect("later stall recovery should not wait forever after leader cancellation");
+    .expect("later stall recovery should complete within its bounded join grace");
 
     assert_eq!(joined["upstream_stall_recovery_status"], "joined_inflight");
     assert_eq!(joined["upstream_stall_recovery_joined_status"], "succeeded");
@@ -8222,9 +8236,6 @@ async fn upstream_stall_recovery_public_path_returns_term_resistant_leader_clean
     let leader = read_pid_file_after_ready(&leader_pid_path, &ready_path).await;
     let metadata = recovery.await.expect("public recovery task should join");
 
-    // The legacy early public return leaves the background cleanup running.
-    // Let that bounded cleanup finish before asserting so this RED test cannot leak its leader.
-    sleep(Duration::from_millis(1_250)).await;
     assert_process_reaped(leader).await;
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
@@ -8261,7 +8272,7 @@ async fn upstream_stall_recovery_command_wiring_times_out_and_cleans_process_gro
     };
 
     let metadata = timeout(
-        Duration::from_secs(2),
+        recovery_join_timeout(policy.recovery_timeout),
         run_upstream_stall_recovery_command(&policy),
     )
     .await
