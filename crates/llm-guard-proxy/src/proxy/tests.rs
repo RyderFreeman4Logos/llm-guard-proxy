@@ -19047,6 +19047,9 @@ async fn shutdown_cancels_pre_response_upstream_work() {
     shutdown_tx
         .send(())
         .expect("shutdown signal should be delivered");
+    timeout(STREAM_COMPLETION_TIMEOUT, proxy.state.wait_for_shutdown())
+        .await
+        .expect("shutdown gate should begin draining before joining the request task");
     let response_result = timeout(STREAM_COMPLETION_TIMEOUT, request)
         .await
         .expect("pre-response request should complete after shutdown")
@@ -19187,17 +19190,22 @@ interval_secs = 1
         downstreams.push(response.bytes_stream());
     }
 
-    for downstream in &mut downstreams {
-        assert!(
-            timeout(Duration::from_millis(100), downstream.next())
-                .await
-                .is_err()
+    for index in 0..4 {
+        let observed = timeout(STREAM_HEADER_TIMEOUT, upstream.recv_request())
+            .await
+            .expect("each downstream storm request should reach the cancellable upstream");
+        assert_eq!(
+            observed.path_and_query,
+            format!("/v1/chat/completions?test=connection-storm-{index}")
         );
     }
 
     shutdown_tx
         .send(())
         .expect("shutdown signal should be delivered");
+    timeout(STREAM_COMPLETION_TIMEOUT, proxy.state.wait_for_shutdown())
+        .await
+        .expect("shutdown gate should begin draining before the drain budget starts");
     let shutdown_started = tokio::time::Instant::now();
     timeout(STREAM_COMPLETION_TIMEOUT, server)
         .await
