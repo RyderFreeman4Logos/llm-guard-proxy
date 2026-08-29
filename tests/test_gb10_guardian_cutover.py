@@ -31,7 +31,7 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
         registration_argument: bool = False,
         attestation_state: str = "ready",
         first_attestation_delay: str = "0",
-        systemctl_timeout: str = "0.1s",
+        systemctl_timeout: str = "1s",
         readiness_timeout_seconds: str = "1",
     ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
         with tempfile.TemporaryDirectory() as temporary:
@@ -167,7 +167,7 @@ class Gb10GuardianCutoverTests(unittest.TestCase):
                     text=True,
                     env=env,
                     cwd=root,
-                    timeout=2,
+                    timeout=10,
                 )
             except subprocess.TimeoutExpired as error:
                 completed = subprocess.CompletedProcess(

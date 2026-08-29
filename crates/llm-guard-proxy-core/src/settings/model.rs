@@ -383,6 +383,15 @@ impl AppConfig {
                 "forced_model_alias_profiles.alias",
                 "must be unique",
             )?;
+            #[cfg(feature = "guard")]
+            require(
+                !self
+                    .model_aliases
+                    .iter()
+                    .any(|alias| alias.id == profile.alias),
+                "forced_model_alias_profiles.alias",
+                "must not collide with model_aliases.id",
+            )?;
         }
         Ok(())
     }

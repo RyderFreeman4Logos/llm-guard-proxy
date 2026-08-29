@@ -2,6 +2,46 @@
 
 use super::*;
 
+const FORCED_MODEL_ALIAS_PROFILES_CONFIG: &str = r#"
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-none"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_disable"
+output_cap = 16384
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-low"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_thinking"
+thinking_budget = 65536
+output_cap = 16384
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-nvfp4-medium"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_thinking"
+thinking_budget = 65536
+output_cap = 16384
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+"#;
+
 #[tokio::test]
 async fn upstream_model_rewrites_request_and_response_model_names() {
     let mut fake = FakeUpstream::spawn().await;
@@ -65,6 +105,7 @@ fn assert_forced_model_alias_wire_body(body: &serde_json::Value) {
         "/thinking_token_budget",
         "/thinking_budget",
         "/enable_thinking",
+        "/frequency_penalty",
         "/max_completion_tokens",
         "/extra_body/temperature",
         "/extra_body/max_tokens",
@@ -76,8 +117,77 @@ fn assert_forced_model_alias_wire_body(body: &serde_json::Value) {
         "/arbitrary/max_output_tokens",
         "/arbitrary/children/0/min_p",
         "/arbitrary/children/0/output_tokens",
+        "/arbitrary/frequency_penalty",
+        "/arbitrary/children/0/frequency_penalty",
+        "/arbitrary/children/1/0/frequency_penalty",
     ] {
         assert!(body.pointer(pointer).is_none(), "must strip {pointer}");
+    }
+}
+
+async fn assert_forced_response_model(response: reqwest::Response, stream: bool, alias: &str) {
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_body = response
+        .bytes()
+        .await
+        .expect("forced response should drain");
+    if stream {
+        let body = std::str::from_utf8(&response_body).expect("forced SSE should be UTF-8");
+        assert!(
+            openai_sse_json_chunks(body)
+                .iter()
+                .filter_map(|chunk| chunk.get("model"))
+                .all(|model| model == alias),
+            "forced SSE response must restore the requested public alias"
+        );
+    } else {
+        let body: serde_json::Value =
+            serde_json::from_slice(&response_body).expect("forced JSON response");
+        assert_eq!(body["model"], alias);
+    }
+}
+
+async fn assert_forced_retry_attempts(
+    fake: &mut FakeUpstream,
+    thinking: bool,
+    budget: Option<u64>,
+    temperature: f64,
+    top_p: f64,
+    presence_penalty: f64,
+) {
+    let mut attempts = Vec::new();
+    while attempts.len() < 4 {
+        let observed = fake.recv_next().await;
+        if observed
+            .path_and_query
+            .contains("test=shielded-429-then-two-503-then-success")
+        {
+            attempts.push(observed);
+        }
+    }
+    for (attempt, observed) in attempts.into_iter().enumerate() {
+        let body: serde_json::Value =
+            serde_json::from_slice(&observed.body).expect("attempt body should be JSON");
+        assert_eq!(
+            body["model"],
+            "aeon-ultimate",
+            "forced alias must survive physical attempt {}",
+            attempt + 1
+        );
+        assert_eq!(body["temperature"], temperature);
+        assert_eq!(body["top_p"], top_p);
+        assert_eq!(body["top_k"], 20);
+        assert_eq!(body["min_p"], 0.0);
+        assert_eq!(body["presence_penalty"], presence_penalty);
+        assert_eq!(body["repetition_penalty"], 1.0);
+        assert_eq!(body["max_tokens"], 16384);
+        assert_eq!(body["frequency_penalty"], serde_json::Value::Null);
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], thinking);
+        assert_eq!(
+            body.get("thinking_token_budget")
+                .and_then(serde_json::Value::as_u64),
+            budget
+        );
     }
 }
 
@@ -131,12 +241,13 @@ repetition_penalty = 1.0
             .post(format!("{}/v1/chat/completions", proxy.base_url))
             .header(CONTENT_TYPE, "application/json")
             .body(format!(
-                r#"{{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[{{"role":"user","content":"ping"}}],"stream":{stream},"reasoning_effort":"high","model_reasoning_effort":"high","thinking_token_budget":999,"thinking_budget":999,"enable_thinking":false,"temperature":9,"top_p":9,"top_k":9,"min_p":9,"presence_penalty":9,"repetition_penalty":9,"max_completion_tokens":9,"extra_body":{{"temperature":8,"max_tokens":8,"thinking":{{"enabled":true,"budget_tokens":8}},"chat_template_kwargs":{{"enable_thinking":true,"thinking_budget":8}}}},"arbitrary":{{"reasoning_effort":"high","max_output_tokens":8,"children":[{{"min_p":8,"output_tokens":8}}]}}}}"#
+                r#"{{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[{{"role":"user","content":"ping"}}],"stream":{stream},"reasoning_effort":"high","model_reasoning_effort":"high","thinking_token_budget":999,"thinking_budget":999,"enable_thinking":false,"temperature":9,"top_p":9,"top_k":9,"min_p":9,"presence_penalty":9,"frequency_penalty":9,"repetition_penalty":9,"max_completion_tokens":9,"extra_body":{{"temperature":8,"max_tokens":8,"frequency_penalty":8,"thinking":{{"enabled":true,"budget_tokens":8}},"chat_template_kwargs":{{"enable_thinking":true,"thinking_budget":8}}}},"arbitrary":{{"reasoning_effort":"high","max_output_tokens":8,"frequency_penalty":8,"children":[{{"min_p":8,"output_tokens":8,"frequency_penalty":8}},[{{"frequency_penalty":8}}]]}}}}"#
             ))
             .send()
             .await
             .expect("forced policy request should complete");
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_forced_response_model(response, stream, "abliterated-qwen-latest-27b-nvfp4-none")
+            .await;
         let observed = fake.recv_next().await;
         let body: serde_json::Value =
             serde_json::from_slice(&observed.body).expect("JSON upstream body");
@@ -148,7 +259,7 @@ repetition_penalty = 1.0
     let changed = std::fs::read_to_string(proxy.root.join("config.toml"))
         .expect("read fixture config")
         .replace("temperature = 0.7", "temperature = 0.3");
-    std::fs::write(&replacement, changed).expect("write changed generation");
+    std::fs::write(&replacement, &changed).expect("write changed generation");
     std::fs::rename(&replacement, proxy.root.join("config.toml"))
         .expect("publish changed generation");
     proxy.manager.reload().expect("hot reload should apply");
@@ -167,9 +278,11 @@ repetition_penalty = 1.0
     assert_eq!(body["temperature"], 0.3);
     std::fs::write(
         &replacement,
-        "[[forced_model_alias_profiles]]\nalias = \"\"\n",
+        format!(
+            "{changed}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-nvfp4-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
+        ),
     )
-    .expect("write invalid generation");
+    .expect("write colliding generation");
     std::fs::rename(&replacement, proxy.root.join("config.toml"))
         .expect("publish invalid generation");
     proxy
@@ -189,6 +302,92 @@ repetition_penalty = 1.0
     let body: serde_json::Value =
         serde_json::from_slice(&observed.body).expect("JSON upstream body");
     assert_eq!(body["temperature"], 0.3);
+}
+
+#[tokio::test]
+async fn forced_model_alias_policy_survives_every_shielded_retry_attempt() {
+    let mut fake = FakeUpstream::spawn().await;
+    let config = format!(
+        r#"
+[retry]
+max_attempts = 4
+max_retry_after_secs = 1
+shielded_streaming_enabled = true
+
+[[retry.ladder]]
+name = "high"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 32768
+
+[[retry.ladder]]
+name = "medium"
+thinking_mode = "force_thinking"
+max_tokens = 50000
+thinking_token_budget = 8192
+
+[[retry.ladder]]
+name = "off"
+thinking_mode = "force_disable"
+max_tokens = 50000
+
+{FORCED_MODEL_ALIAS_PROFILES_CONFIG}"#
+    );
+    let proxy = ProxyFixture::spawn_with_extra_config(&fake.base_url, &config).await;
+
+    for (alias, thinking, budget, temperature, top_p, presence_penalty) in [
+        (
+            "abliterated-qwen-latest-27b-nvfp4-none",
+            false,
+            None,
+            0.7,
+            0.8,
+            1.5,
+        ),
+        (
+            "abliterated-qwen-latest-27b-nvfp4-low",
+            true,
+            Some(65536),
+            1.0,
+            0.95,
+            0.0,
+        ),
+        (
+            "abliterated-qwen-latest-27b-nvfp4-medium",
+            true,
+            Some(65536),
+            1.0,
+            0.95,
+            0.0,
+        ),
+    ] {
+        for stream in [false, true] {
+            let response = proxy
+                .client
+                .post(format!(
+                    "{}/v1/chat/completions?test=shielded-429-then-two-503-then-success&alias={alias}-{stream}",
+                    proxy.base_url
+                ))
+                .header(CONTENT_TYPE, "application/json")
+                .body(format!(
+                    r#"{{"model":"{alias}","messages":[],"stream":{stream},"temperature":9,"top_p":9,"top_k":9,"min_p":9,"presence_penalty":9,"frequency_penalty":9,"repetition_penalty":9}}"#
+                ))
+                .send()
+                .await
+                .expect("shielded ladder request should complete");
+            assert_forced_response_model(response, stream, alias).await;
+
+            assert_forced_retry_attempts(
+                &mut fake,
+                thinking,
+                budget,
+                temperature,
+                top_p,
+                presence_penalty,
+            )
+            .await;
+        }
+    }
 }
 
 #[tokio::test]

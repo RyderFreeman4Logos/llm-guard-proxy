@@ -4541,7 +4541,9 @@ repetition_penalty = 1.0
             "alias = \"abliterated-qwen-latest-27b-nvfp4-none\"",
             "alias = \" \"",
         ),
-        format!("{valid}{valid}"),
+        format!(
+            "{valid}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-nvfp4-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
+        ),
         valid.replace("temperature = 0.7", "temperature = nan"),
         valid.replace("top_p = 0.8", "top_p = 1.1"),
         valid.replace("top_k = 20\n", ""),

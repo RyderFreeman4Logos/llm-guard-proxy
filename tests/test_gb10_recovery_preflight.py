@@ -117,6 +117,83 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
         )
         errors, _ = self.preflight.validate_snapshot(candidate, expected)
         self.assertTrue(any("strictly greater" in error for error in errors))
+    def test_forced_alias_profiles_are_exact_and_immutable(self) -> None:
+        profiles = self.config["forced_model_alias_profiles"]
+        self.assertEqual(len(profiles), 3)
+        expected = {
+            "abliterated-qwen-latest-27b-nvfp4-none": {
+                "upstream_model": "aeon-ultimate",
+                "thinking_mode": "force_disable",
+                "output_cap": 16_384,
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 20,
+                "min_p": 0,
+                "presence_penalty": 1.5,
+                "repetition_penalty": 1.0,
+            },
+            "abliterated-qwen-latest-27b-nvfp4-low": {
+                "upstream_model": "aeon-ultimate",
+                "thinking_mode": "force_thinking",
+                "thinking_budget": 65_536,
+                "output_cap": 16_384,
+                "temperature": 1,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0,
+                "presence_penalty": 0,
+                "repetition_penalty": 1,
+            },
+            "abliterated-qwen-latest-27b-nvfp4-medium": {
+                "upstream_model": "aeon-ultimate",
+                "thinking_mode": "force_thinking",
+                "thinking_budget": 65_536,
+                "output_cap": 16_384,
+                "temperature": 1,
+                "top_p": 0.95,
+                "top_k": 20,
+                "min_p": 0,
+                "presence_penalty": 0,
+                "repetition_penalty": 1,
+            },
+        }
+        self.assertEqual(
+            {
+                profile["alias"]: {
+                    key: value for key, value in profile.items() if key != "alias"
+                }
+                for profile in profiles
+            },
+            expected,
+        )
+        for mutation, alias, field, value in [
+            ("absent", None, None, None),
+            ("extra", None, None, None),
+            ("upstream", "abliterated-qwen-latest-27b-nvfp4-none", "upstream_model", "wrong"),
+            ("thinking mode", "abliterated-qwen-latest-27b-nvfp4-none", "thinking_mode", "force_thinking"),
+            ("thinking budget", "abliterated-qwen-latest-27b-nvfp4-low", "thinking_budget", 1),
+            ("output", "abliterated-qwen-latest-27b-nvfp4-none", "output_cap", 1),
+            ("temperature", "abliterated-qwen-latest-27b-nvfp4-none", "temperature", 1),
+            ("top_p", "abliterated-qwen-latest-27b-nvfp4-none", "top_p", 1),
+            ("top_k", "abliterated-qwen-latest-27b-nvfp4-none", "top_k", 1),
+            ("min_p", "abliterated-qwen-latest-27b-nvfp4-none", "min_p", 1),
+            ("presence_penalty", "abliterated-qwen-latest-27b-nvfp4-none", "presence_penalty", 0),
+            ("repetition_penalty", "abliterated-qwen-latest-27b-nvfp4-none", "repetition_penalty", 0.5),
+        ]:
+            with self.subTest(mutation=mutation):
+                candidate = copy.deepcopy(self.config)
+                candidate_profiles = candidate["forced_model_alias_profiles"]
+                if mutation == "absent":
+                    candidate.pop("forced_model_alias_profiles")
+                elif mutation == "extra":
+                    extra = copy.deepcopy(candidate_profiles[0])
+                    extra["alias"] = "abliterated-qwen-latest-27b-nvfp4-xhigh"
+                    candidate_profiles.append(extra)
+                else:
+                    profile = next(profile for profile in candidate_profiles if profile["alias"] == alias)
+                    profile[field] = value
+                errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
+                self.assertTrue(errors)
 
 
 if __name__ == "__main__":

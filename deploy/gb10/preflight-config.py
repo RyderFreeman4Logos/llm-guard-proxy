@@ -22,6 +22,43 @@ AEON_RESTART_COMMAND = [
     "vllm-aeon-27b-dflash-n12.service",
 ]
 RECOVERY_COMPLETION_GUARD_MS = 1_000
+FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
+    "abliterated-qwen-latest-27b-nvfp4-none": {
+        "upstream_model": "aeon-ultimate",
+        "thinking_mode": "force_disable",
+        "output_cap": 16_384,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+    },
+    "abliterated-qwen-latest-27b-nvfp4-low": {
+        "upstream_model": "aeon-ultimate",
+        "thinking_mode": "force_thinking",
+        "thinking_budget": 65_536,
+        "output_cap": 16_384,
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 0,
+        "repetition_penalty": 1,
+    },
+    "abliterated-qwen-latest-27b-nvfp4-medium": {
+        "upstream_model": "aeon-ultimate",
+        "thinking_mode": "force_thinking",
+        "thinking_budget": 65_536,
+        "output_cap": 16_384,
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 0,
+        "repetition_penalty": 1,
+    },
+}
 
 
 def load_config(path: Path) -> dict[str, JsonValue]:
@@ -87,6 +124,19 @@ def _recovery_errors(label: str, recovery: dict[str, JsonValue]) -> list[str]:
     return errors
 
 
+def _forced_alias_profile_errors(config: dict[str, JsonValue]) -> list[str]:
+    profiles = config.get("forced_model_alias_profiles")
+    expected = [
+        {"alias": alias, **settings}
+        for alias, settings in FORCED_ALIAS_PROFILES.items()
+    ]
+    return (
+        []
+        if profiles == expected
+        else ["forced_model_alias_profiles must exactly match the reviewed aliases"]
+    )
+
+
 def minimum_downstream_idle_timeout_ms(config: dict[str, JsonValue]) -> int | None:
     """Return the strict byte-silent bound including recovery handoff and replay."""
     retry = _table(config, "retry")
@@ -121,6 +171,7 @@ def validate_snapshot(
     config: dict[str, JsonValue], downstream_idle_timeout_ms: int
 ) -> tuple[list[str], int | None]:
     errors: list[str] = []
+    errors.extend(_forced_alias_profile_errors(config))
     if "guard_workflows" in config:
         errors.append("guard_workflows must remain inactive in the reviewed snapshot")
 

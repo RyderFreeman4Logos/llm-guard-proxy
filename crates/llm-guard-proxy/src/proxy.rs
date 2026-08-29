@@ -3310,7 +3310,7 @@ async fn forward_openai_request(
             .endpoint_retry_order
             .clone_from(&selected.selection_order);
         prepared_request.upstream_deadline = Some(upstream_deadline);
-        let rendered = match prepared_request.canonical_reranker.as_ref() {
+        let mut rendered = match prepared_request.canonical_reranker.as_ref() {
             Some(canonical) => {
                 reranker_protocol::render(&selected.endpoint, canonical, &downstream_headers)
             }
@@ -3334,6 +3334,9 @@ async fn forward_openai_request(
             }),
         }
         .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+        if let Some(policy) = &prepared_request.forced_model_alias_policy {
+            rendered.body = apply_forced_model_alias_policy(&rendered.body, policy);
+        }
         prepared_request.forward_uri = rendered.uri;
         prepared_request.upstream_url = rendered.url;
         prepared_request.shielded_chat_plan.upstream_body = rendered.body;
@@ -3419,6 +3422,7 @@ async fn forward_openai_request(
                 request_id: request_id.clone(),
                 started_at_unix_ms,
                 model_id: prepared_request.model_id,
+                forced_model_alias_policy: prepared_request.forced_model_alias_policy,
                 stuck_watchdog_request,
                 request_metadata,
                 listener: state.listener.clone(),
@@ -3757,6 +3761,7 @@ async fn read_body_with_adapter_limit(
 
 struct PreparedOpenAiRequest {
     model_id: Option<String>,
+    forced_model_alias_policy: Option<ForcedModelAliasProfileConfig>,
     #[cfg(feature = "guard")]
     caller_profile_name: String,
     #[cfg(feature = "guard")]
@@ -3828,7 +3833,7 @@ fn prepare_openai_forward_request(
         adapt_openai_request_if_needed(method, uri, downstream_headers, body, request_metadata)?;
     let selected_profile =
         select_profile_for_request(config, &state.listener, method, uri, model_id.as_deref())?;
-    let upstream_profile = selected_profile.profile;
+    let mut upstream_profile = selected_profile.profile;
     let route_reason = selected_profile.route_reason;
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
     let canonical_reranker = reranker_protocol::capture_request(
@@ -3839,25 +3844,19 @@ fn prepare_openai_forward_request(
         &adapted_request.adapted_body,
     );
     let transformed_request_headers = adapted_request.response_adapter.is_some();
-    let response_adapter = if upstream_profile
-        .endpoints
-        .iter()
-        .any(|endpoint| endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank)
-        && let Some(canonical) = canonical_reranker.as_ref()
-    {
-        Some(BufferedResponseAdapter::HeterogeneousReranker {
-            request: canonical.clone(),
-            terminal_protocol: UpstreamEndpointProtocol::OpenAi,
-        })
-    } else {
-        adapted_request.response_adapter
-    };
+    let response_adapter =
+        deepinfra_reranker_response_adapter(&upstream_profile, canonical_reranker.as_ref())
+            .or(adapted_request.response_adapter);
     let forward_uri = adapted_request.forward_uri;
     let adapted_body = adapted_request.adapted_body;
     let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
     let reqwest_method = upstream_method(method)?;
-    let (forced_model_alias_policy, body) =
-        forced_model_alias_policy_body(config, model_id.as_deref(), &adapted_body);
+    let (policy, body) = forced_model_alias_policy_body(
+        config,
+        model_id.as_deref(),
+        &adapted_body,
+        &mut upstream_profile,
+    );
     validate_vllm_native_request_controls(config, &upstream_profile, method, &forward_uri, &body)?;
     let mut shielded_chat_plan = plan_shielded_chat(
         state,
@@ -3874,7 +3873,7 @@ fn prepare_openai_forward_request(
         &mut shielded_chat_plan,
         &upstream_profile,
     )?;
-    apply_forced_model_alias_policy_to_plan(forced_model_alias_policy, &mut shielded_chat_plan);
+    apply_forced_model_alias_policy_to_plan(policy.as_ref(), &mut shielded_chat_plan);
     add_shielded_request_metadata(
         request_metadata,
         shielded_chat_plan.intercepted,
@@ -3889,10 +3888,10 @@ fn prepare_openai_forward_request(
         &shielded_chat_plan.upstream_body,
         &upstream_profile,
     )?);
-
     let (terminal_endpoint, endpoint_retry_order) = initial_endpoint_retry_state(&upstream_profile);
     Ok(PreparedOpenAiRequest {
         model_id,
+        forced_model_alias_policy: policy,
         #[cfg(feature = "guard")]
         caller_profile_name: caller_profile.name.clone(),
         #[cfg(feature = "guard")]
@@ -3916,6 +3915,25 @@ fn prepare_openai_forward_request(
     })
 }
 
+fn deepinfra_reranker_response_adapter(
+    upstream_profile: &UpstreamProfileConfig,
+    canonical_reranker: Option<&reranker_protocol::CanonicalRerankerRequest>,
+) -> Option<BufferedResponseAdapter> {
+    match canonical_reranker {
+        Some(canonical)
+            if upstream_profile.endpoints.iter().any(|endpoint| {
+                endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+            }) =>
+        {
+            Some(BufferedResponseAdapter::HeterogeneousReranker {
+                request: canonical.clone(),
+                terminal_protocol: UpstreamEndpointProtocol::OpenAi,
+            })
+        }
+        None | Some(_) => None,
+    }
+}
+
 fn forced_model_alias_policy<'config>(
     config: &'config AppConfig,
     model_id: Option<&str>,
@@ -3926,13 +3944,17 @@ fn forced_model_alias_policy<'config>(
         .find(|policy| Some(policy.alias.as_str()) == model_id)
 }
 
-fn forced_model_alias_policy_body<'config>(
-    config: &'config AppConfig,
+fn forced_model_alias_policy_body(
+    config: &AppConfig,
     model_id: Option<&str>,
     body: &Bytes,
-) -> (Option<&'config ForcedModelAliasProfileConfig>, Bytes) {
-    let policy = forced_model_alias_policy(config, model_id);
-    let body = policy.map_or_else(
+    upstream_profile: &mut UpstreamProfileConfig,
+) -> (Option<ForcedModelAliasProfileConfig>, Bytes) {
+    let policy = forced_model_alias_policy(config, model_id).cloned();
+    if let Some(policy) = &policy {
+        upstream_profile.upstream_model = Some(policy.upstream_model.clone());
+    }
+    let body = policy.as_ref().map_or_else(
         || body.clone(),
         |policy| apply_forced_model_alias_policy(body, policy),
     );
@@ -4951,6 +4973,7 @@ fn remove_forced_generation_controls(value: &mut serde_json::Value, parent: Opti
         "top_k",
         "min_p",
         "presence_penalty",
+        "frequency_penalty",
         "repetition_penalty",
         "max_tokens",
         "max_completion_tokens",
@@ -9695,6 +9718,7 @@ struct ShieldedRetryRuntime {
     request_id: RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
+    forced_model_alias_policy: Option<ForcedModelAliasProfileConfig>,
     stuck_watchdog_request: Option<StuckWatchdogRequest>,
     request_metadata: BTreeMap<String, String>,
     listener: ListenerConfig,
@@ -12820,13 +12844,17 @@ fn render_shielded_endpoint_body(
     runtime: &ShieldedRetryRuntime,
     body: &Bytes,
 ) -> Result<reranker_protocol::RenderedEndpointRequest, ProxyError> {
-    reranker_protocol::render_openai_endpoint(
+    let mut rendered = reranker_protocol::render_openai_endpoint(
         &runtime.terminal_endpoint,
         runtime.forward_uri.clone(),
         body,
         &runtime.original_downstream_headers,
         runtime.transformed_request_headers,
-    )
+    )?;
+    if let Some(policy) = &runtime.forced_model_alias_policy {
+        rendered.body = apply_forced_model_alias_policy(&rendered.body, policy);
+    }
+    Ok(rendered)
 }
 
 fn shielded_retry_endpoint(
@@ -17454,7 +17482,12 @@ fn render_shadow_endpoint_body(runtime: &ShieldedRetryRuntime, body: &Bytes) -> 
         runtime.transformed_request_headers,
     )
     .ok()
-    .map(|rendered| rendered.body)
+    .map(|mut rendered| {
+        if let Some(policy) = &runtime.forced_model_alias_policy {
+            rendered.body = apply_forced_model_alias_policy(&rendered.body, policy);
+        }
+        rendered.body
+    })
 }
 
 fn prepared_shadow_body(
