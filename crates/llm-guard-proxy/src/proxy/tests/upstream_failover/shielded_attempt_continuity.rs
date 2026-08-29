@@ -221,6 +221,58 @@ async fn forced_alias_policy_survives_each_endpoint_failover_physical_attempt() 
 }
 
 #[tokio::test]
+async fn canonical_reranker_failover_reapplies_forced_alias_policy_and_metadata() {
+    let mut primary = spawn_scripted_primary(PrimaryChatScript::AlwaysUnavailable).await;
+    let mut fallback = FakeUpstream::spawn().await;
+    let config = forced_alias_failover_config(&primary.base_url, &fallback.base_url);
+    let proxy = spawn_observed_failover_proxy(&primary.base_url, &config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/rerank", proxy.base_url))
+        .json(&json!({
+            "model": "abliterated-qwen-latest-27b-nvfp4-low",
+            "query": "forced canonical reranker failover",
+            "documents": ["document"],
+        }))
+        .send()
+        .await
+        .expect("canonical reranker request should fail over");
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .bytes()
+        .await
+        .expect("reranker response should drain");
+
+    for request in [
+        recv_chat_request(&mut primary).await,
+        recv_chat_request(&mut fallback).await,
+    ] {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("reranker attempt body should be JSON");
+        assert_eq!(body["model"], "aeon-ultimate");
+    }
+
+    let metadata = read_attempt_request_metadata_rows(&proxy.sqlite_path);
+    assert_eq!(metadata.len(), 2);
+    for attempt in metadata {
+        let metadata = attempt.request_metadata;
+        assert_eq!(
+            metadata["forced_alias"],
+            "abliterated-qwen-latest-27b-nvfp4-low"
+        );
+        assert_eq!(metadata["forced_upstream_model"], "aeon-ultimate");
+        assert_eq!(metadata["forced_thinking_mode"], "");
+        assert_eq!(metadata["forced_thinking_budget"], "none");
+        assert_eq!(metadata["forced_answer_headroom"], "");
+        assert_eq!(metadata["forced_wire_total_cap"], "unset");
+        assert_eq!(metadata["attempt_thinking_mode"], "");
+        assert_eq!(metadata["attempt_thinking_budget_tokens"], "none");
+        assert_eq!(metadata["attempt_thinking_max_tokens"], "unset");
+    }
+}
+
+#[tokio::test]
 async fn shielded_physical_attempts_preserve_later_retry_failover_chain() {
     let primary = spawn_scripted_primary(PrimaryChatScript::LoopThenUnavailable).await;
     let fallback = FakeUpstream::spawn().await;

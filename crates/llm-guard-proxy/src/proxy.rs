@@ -4095,32 +4095,48 @@ fn add_forced_alias_wire_metadata(
         .and_then(serde_json::Value::as_object)
         .and_then(|template| template.get("enable_thinking"))
         .and_then(serde_json::Value::as_bool);
-    metadata.insert(
-        String::from("forced_thinking_mode"),
-        match (capability, thinking_enabled) {
-            (EndpointCapability::Generation, Some(true)) => String::from("force_thinking"),
-            (EndpointCapability::Generation, Some(false)) => String::from("force_disable"),
-            _ => String::new(),
-        },
-    );
+    let thinking_mode = match (capability, thinking_enabled) {
+        (EndpointCapability::Generation, Some(true)) => String::from("force_thinking"),
+        (EndpointCapability::Generation, Some(false)) => String::from("force_disable"),
+        _ => String::new(),
+    };
+    metadata.insert(String::from("forced_thinking_mode"), thinking_mode.clone());
+    metadata.insert(String::from("attempt_thinking_mode"), thinking_mode);
     let thinking_budget = object
         .get("thinking_token_budget")
         .and_then(serde_json::Value::as_u64);
+    let thinking_budget =
+        thinking_budget.map_or_else(|| String::from("none"), |value| value.to_string());
     metadata.insert(
         String::from("forced_thinking_budget"),
-        thinking_budget.map_or_else(|| String::from("none"), |value| value.to_string()),
+        thinking_budget.clone(),
     );
+    metadata.insert(
+        String::from("attempt_thinking_budget_tokens"),
+        thinking_budget.clone(),
+    );
+    metadata.insert(String::from("thinking_budget"), thinking_budget);
     let total_cap = object.get("max_tokens").and_then(serde_json::Value::as_u64);
+    let total_cap = total_cap.map_or_else(|| String::from("unset"), |value| value.to_string());
     metadata.insert(
         String::from("forced_answer_headroom"),
-        total_cap
-            .and_then(|total| total.checked_sub(thinking_budget.unwrap_or(0)))
+        object
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|total| {
+                object
+                    .get("thinking_token_budget")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(Some(total), |budget| total.checked_sub(budget))
+            })
             .map_or_else(String::new, |value| value.to_string()),
     );
+    metadata.insert(String::from("forced_wire_total_cap"), total_cap.clone());
     metadata.insert(
-        String::from("forced_wire_total_cap"),
-        total_cap.map_or_else(|| String::from("none"), |value| value.to_string()),
+        String::from("attempt_thinking_max_tokens"),
+        total_cap.clone(),
     );
+    metadata.insert(String::from("max_tokens"), total_cap);
 }
 
 fn apply_forced_model_alias_policy_to_plan(
@@ -5724,12 +5740,6 @@ fn prepare_generic_attempt_request(
             context.upstream_url.query().is_some().to_string(),
         );
     }
-    add_forced_alias_wire_metadata(
-        &mut metadata,
-        context.forced_model_alias_policy.as_ref(),
-        endpoint_capability(&context.method, &context.uri),
-        &context.upstream_body,
-    );
     (override_headers, metadata)
 }
 
@@ -5886,6 +5896,12 @@ async fn send_generic_upstream_attempt(
         context.thinking_policy_applied,
         &context.liveness,
         &context.thinking_metadata,
+    );
+    add_forced_alias_wire_metadata(
+        &mut attempt_request_metadata,
+        context.forced_model_alias_policy.as_ref(),
+        endpoint_capability(&context.method, &context.uri),
+        &context.upstream_body,
     );
     copy_endpoint_selection_metadata(&context.request_metadata, &mut attempt_request_metadata);
     let request_deadline = if attempt_number == 1 {
@@ -6898,7 +6914,17 @@ async fn send_selected_failover_endpoint(
             runtime.retry.original_downstream_headers,
         ),
         None => render_retry_openai_request(runtime.retry, &selected.endpoint, runtime.retry_body),
-    };
+    }
+    .map(|mut rendered| {
+        if let Some(policy) = runtime.retry.forced_model_alias_policy {
+            rendered.body = apply_forced_model_alias_policy_for_endpoint(
+                &rendered.body,
+                policy,
+                endpoint_capability(&runtime.retry_method, &runtime.retry.local_forward_uri),
+            );
+        }
+        rendered
+    });
     let attempt_id = AttemptId::for_request(runtime.request_id, attempt_number);
     let started_at_unix_ms = unix_time_millis();
     let mut attempt = PhysicalEndpointAttempt {
@@ -17696,6 +17722,12 @@ fn shadow_comparison_attempt_plan(
             .max_tokens
             .map_or_else(|| String::from("unset"), |value| value.to_string()),
     );
+    add_forced_alias_wire_metadata(
+        &mut request_metadata,
+        runtime.forced_model_alias_policy.as_ref(),
+        endpoint_capability(&runtime.method, &runtime.forward_uri),
+        &upstream_body,
+    );
     Some(ShadowAttemptPlan {
         upstream_body,
         request_metadata,
@@ -17748,6 +17780,12 @@ fn paired_shadow_comparison_attempt_plan(
         thinking
             .max_tokens
             .map_or_else(|| String::from("unset"), |value| value.to_string()),
+    );
+    add_forced_alias_wire_metadata(
+        &mut request_metadata,
+        runtime.forced_model_alias_policy.as_ref(),
+        endpoint_capability(&runtime.method, &runtime.forward_uri),
+        &upstream_body,
     );
     Some(ShadowAttemptPlan {
         upstream_body,

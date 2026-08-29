@@ -2702,10 +2702,15 @@ pub struct ForcedModelAliasProfileConfig {
     pub output_cap: Option<u32>,
     /// Forced sampler and penalty settings.
     pub temperature: Option<f64>,
+    /// Nucleus-sampling probability mass; use `0.95` for a conservative default.
     pub top_p: Option<f64>,
+    /// Maximum candidate tokens considered per sample; use `20` for a conservative default.
     pub top_k: Option<u32>,
+    /// Minimum token probability threshold; use `0.0` to disable this filter.
     pub min_p: Option<f64>,
+    /// Penalizes tokens already present in the response; use `0.0` to disable it.
     pub presence_penalty: Option<f64>,
+    /// Penalizes repeated tokens; use `1.0` for the model default.
     pub repetition_penalty: Option<f64>,
 }
 
