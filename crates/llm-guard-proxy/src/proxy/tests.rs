@@ -23224,6 +23224,14 @@ impl ProxyFixture {
                 eprintln!("proxy test server failed: {error}");
             }
         });
+        let ready = timeout(
+            STREAM_COMPLETION_TIMEOUT,
+            reqwest::get(format!("http://{addr}/metrics")),
+        )
+        .await
+        .expect("proxy readiness request should not time out")
+        .expect("proxy readiness request should complete");
+        assert_eq!(ready.status(), StatusCode::OK);
 
         Self {
             base_url: format!("http://{addr}"),
@@ -23287,6 +23295,14 @@ impl ProxyFixture {
                 eprintln!("proxy test server failed: {error}");
             }
         });
+        let ready = timeout(
+            STREAM_COMPLETION_TIMEOUT,
+            reqwest::get(format!("http://{addr}/metrics")),
+        )
+        .await
+        .expect("proxy readiness request should not time out")
+        .expect("proxy readiness request should complete");
+        assert_eq!(ready.status(), StatusCode::OK);
 
         Self {
             base_url: format!("http://{addr}"),
