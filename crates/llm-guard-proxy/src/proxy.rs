@@ -3335,7 +3335,11 @@ async fn forward_openai_request(
         }
         .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
         if let Some(policy) = &prepared_request.forced_model_alias_policy {
-            rendered.body = apply_forced_model_alias_policy(&rendered.body, policy);
+            rendered.body = apply_forced_model_alias_policy_for_endpoint(
+                &rendered.body,
+                policy,
+                is_chat_completions_request(&method, &prepared_request.forward_uri),
+            );
         }
         prepared_request.forward_uri = rendered.uri;
         prepared_request.upstream_url = rendered.url;
@@ -3478,6 +3482,7 @@ async fn forward_openai_request(
         liveness: prepared_request.shielded_chat_plan.liveness,
         thinking_policy_applied: prepared_request.shielded_chat_plan.thinking_policy_applied,
         thinking_metadata: prepared_request.shielded_chat_plan.thinking_metadata,
+        forced_model_alias_policy: prepared_request.forced_model_alias_policy,
         request_id,
         started_at_unix_ms,
         model_id: prepared_request.model_id,
@@ -3833,8 +3838,8 @@ fn prepare_openai_forward_request(
         adapt_openai_request_if_needed(method, uri, downstream_headers, body, request_metadata)?;
     let selected_profile =
         select_profile_for_request(config, &state.listener, method, uri, model_id.as_deref())?;
-    let mut upstream_profile = selected_profile.profile;
-    let route_reason = selected_profile.route_reason;
+    let (mut upstream_profile, route_reason) =
+        (selected_profile.profile, selected_profile.route_reason);
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
     let canonical_reranker = reranker_protocol::capture_request(
         method,
@@ -3844,36 +3849,23 @@ fn prepare_openai_forward_request(
         &adapted_request.adapted_body,
     );
     let transformed_request_headers = adapted_request.response_adapter.is_some();
-    let response_adapter =
-        deepinfra_reranker_response_adapter(&upstream_profile, canonical_reranker.as_ref())
-            .or(adapted_request.response_adapter);
-    let forward_uri = adapted_request.forward_uri;
-    let adapted_body = adapted_request.adapted_body;
+    let response_adapter = response_adapter_for_request(
+        &upstream_profile,
+        canonical_reranker.as_ref(),
+        adapted_request.response_adapter,
+    );
+    let (forward_uri, adapted_body) = (adapted_request.forward_uri, adapted_request.adapted_body);
     let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
     let reqwest_method = upstream_method(method)?;
-    let (policy, body) = forced_model_alias_policy_body(
-        config,
-        model_id.as_deref(),
-        &adapted_body,
-        &mut upstream_profile,
-    );
-    validate_vllm_native_request_controls(config, &upstream_profile, method, &forward_uri, &body)?;
-    let mut shielded_chat_plan = plan_shielded_chat(
+    let (policy, body, shielded_chat_plan) = prepare_forced_alias_shielded_plan(
         state,
         config,
-        &upstream_profile,
+        &mut upstream_profile,
+        model_id.as_deref(),
         method,
         &forward_uri,
-        &body,
-    );
-    #[cfg(feature = "param-override")]
-    apply_param_override_to_shielded_plan(
-        method,
-        &forward_uri,
-        &mut shielded_chat_plan,
-        &upstream_profile,
+        &adapted_body,
     )?;
-    apply_forced_model_alias_policy_to_plan(policy.as_ref(), &mut shielded_chat_plan);
     add_shielded_request_metadata(
         request_metadata,
         shielded_chat_plan.intercepted,
@@ -3915,6 +3907,15 @@ fn prepare_openai_forward_request(
     })
 }
 
+fn response_adapter_for_request(
+    upstream_profile: &UpstreamProfileConfig,
+    canonical_reranker: Option<&reranker_protocol::CanonicalRerankerRequest>,
+    adapted_response_adapter: Option<BufferedResponseAdapter>,
+) -> Option<BufferedResponseAdapter> {
+    deepinfra_reranker_response_adapter(upstream_profile, canonical_reranker)
+        .or(adapted_response_adapter)
+}
+
 fn deepinfra_reranker_response_adapter(
     upstream_profile: &UpstreamProfileConfig,
     canonical_reranker: Option<&reranker_protocol::CanonicalRerankerRequest>,
@@ -3947,6 +3948,8 @@ fn forced_model_alias_policy<'config>(
 fn forced_model_alias_policy_body(
     config: &AppConfig,
     model_id: Option<&str>,
+    method: &Method,
+    uri: &Uri,
     body: &Bytes,
     upstream_profile: &mut UpstreamProfileConfig,
 ) -> (Option<ForcedModelAliasProfileConfig>, Bytes) {
@@ -3956,16 +3959,125 @@ fn forced_model_alias_policy_body(
     }
     let body = policy.as_ref().map_or_else(
         || body.clone(),
-        |policy| apply_forced_model_alias_policy(body, policy),
+        |policy| {
+            apply_forced_model_alias_policy_for_endpoint(
+                body,
+                policy,
+                is_chat_completions_request(method, uri),
+            )
+        },
     );
     (policy, body)
+}
+
+fn prepare_forced_alias_shielded_plan(
+    state: &ProxyState,
+    config: &AppConfig,
+    upstream_profile: &mut UpstreamProfileConfig,
+    model_id: Option<&str>,
+    method: &Method,
+    forward_uri: &Uri,
+    adapted_body: &Bytes,
+) -> Result<
+    (
+        Option<ForcedModelAliasProfileConfig>,
+        Bytes,
+        ShieldedChatPlan,
+    ),
+    ProxyError,
+> {
+    let (policy, body) = forced_model_alias_policy_body(
+        config,
+        model_id,
+        method,
+        forward_uri,
+        adapted_body,
+        upstream_profile,
+    );
+    validate_vllm_native_request_controls(config, upstream_profile, method, forward_uri, &body)?;
+    let mut shielded_chat_plan =
+        plan_shielded_chat(state, config, upstream_profile, method, forward_uri, &body);
+    #[cfg(feature = "param-override")]
+    apply_param_override_to_shielded_plan(
+        method,
+        forward_uri,
+        &mut shielded_chat_plan,
+        upstream_profile,
+    )?;
+    apply_forced_model_alias_policy_to_plan(
+        policy.as_ref(),
+        &mut shielded_chat_plan,
+        is_chat_completions_request(method, forward_uri),
+    );
+    Ok((policy, body, shielded_chat_plan))
+}
+
+fn apply_forced_model_alias_policy_for_endpoint(
+    body: &Bytes,
+    policy: &ForcedModelAliasProfileConfig,
+    applies_to_generation: bool,
+) -> Bytes {
+    if applies_to_generation {
+        apply_forced_model_alias_policy(body, policy)
+    } else {
+        rewrite_request_model_body(body, &policy.upstream_model)
+    }
+}
+
+fn add_forced_alias_wire_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    policy: Option<&ForcedModelAliasProfileConfig>,
+    body: &Bytes,
+) {
+    let Some(policy) = policy else {
+        return;
+    };
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(body) else {
+        return;
+    };
+    metadata.insert(String::from("forced_alias"), policy.alias.clone());
+    metadata.insert(
+        String::from("forced_upstream_model"),
+        object
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    );
+    metadata.insert(
+        String::from("forced_thinking_mode"),
+        policy
+            .thinking_mode
+            .map_or_else(String::new, |mode| mode.as_str().to_owned()),
+    );
+    metadata.insert(
+        String::from("forced_thinking_budget"),
+        object
+            .get("thinking_token_budget")
+            .and_then(serde_json::Value::as_u64)
+            .map_or_else(|| String::from("none"), |value| value.to_string()),
+    );
+    metadata.insert(
+        String::from("forced_answer_headroom"),
+        policy
+            .output_cap
+            .map_or_else(String::new, |value| value.to_string()),
+    );
+    metadata.insert(
+        String::from("forced_wire_total_cap"),
+        object
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .map_or_else(|| String::from("none"), |value| value.to_string()),
+    );
 }
 
 fn apply_forced_model_alias_policy_to_plan(
     policy: Option<&ForcedModelAliasProfileConfig>,
     plan: &mut ShieldedChatPlan,
+    applies_to_generation: bool,
 ) {
-    let Some(policy) = policy else {
+    let Some(policy) = policy.filter(|_| applies_to_generation) else {
         return;
     };
     plan.upstream_body = apply_forced_model_alias_policy(&plan.upstream_body, policy);
@@ -4856,6 +4968,20 @@ fn rewrite_request_model_body(body: &Bytes, upstream_model: &str) -> Bytes {
     Bytes::from(value.to_string())
 }
 
+fn forced_generation_total_cap(
+    policy: &ForcedModelAliasProfileConfig,
+    thinking_mode: ThinkingMode,
+    output_cap: u32,
+) -> Option<u32> {
+    match thinking_mode {
+        ThinkingMode::ForceThinking => policy
+            .thinking_budget
+            .and_then(|budget| budget.checked_add(output_cap)),
+        ThinkingMode::ForceDisable => Some(output_cap),
+        ThinkingMode::Passthrough | ThinkingMode::BoundedThinking => None,
+    }
+}
+
 fn apply_forced_model_alias_policy(body: &Bytes, policy: &ForcedModelAliasProfileConfig) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.clone();
@@ -4900,7 +5026,10 @@ fn apply_forced_model_alias_policy(body: &Bytes, policy: &ForcedModelAliasProfil
     let Some(repetition_penalty) = serde_json::Number::from_f64(repetition_penalty) else {
         return body.clone();
     };
-    remove_forced_generation_controls(&mut value, None);
+    let Some(total_cap) = forced_generation_total_cap(policy, thinking_mode, output_cap) else {
+        return body.clone();
+    };
+    remove_forced_generation_controls(&mut value);
     let Some(object) = value.as_object_mut() else {
         return body.clone();
     };
@@ -4928,7 +5057,7 @@ fn apply_forced_model_alias_policy(body: &Bytes, policy: &ForcedModelAliasProfil
     );
     object.insert(
         String::from("max_tokens"),
-        serde_json::Value::Number(output_cap.into()),
+        serde_json::Value::Number(total_cap.into()),
     );
     let template = object
         .entry(String::from("chat_template_kwargs"))
@@ -4951,15 +5080,45 @@ fn apply_forced_model_alias_policy(body: &Bytes, policy: &ForcedModelAliasProfil
     Bytes::from(value.to_string())
 }
 
-fn remove_forced_generation_controls(value: &mut serde_json::Value, parent: Option<&str>) {
+fn remove_forced_generation_controls(value: &mut serde_json::Value) {
     let serde_json::Value::Object(object) = value else {
-        if let serde_json::Value::Array(values) = value {
-            for value in values {
-                remove_forced_generation_controls(value, parent);
-            }
-        }
         return;
     };
+    remove_forced_generation_control_fields(object);
+    if let Some(extra_body) = object.get_mut("extra_body") {
+        remove_provider_generation_controls(extra_body, None);
+    }
+    if let Some(template) = object.get_mut("chat_template_kwargs") {
+        remove_provider_generation_controls(template, Some("chat_template_kwargs"));
+    }
+    if let Some(thinking) = object.get_mut("thinking") {
+        remove_provider_generation_controls(thinking, Some("thinking"));
+    }
+}
+
+fn remove_provider_generation_controls(value: &mut serde_json::Value, parent: Option<&str>) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remove_provider_generation_controls(value, parent);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            remove_forced_generation_control_fields(object);
+            if parent == Some("thinking") {
+                object.remove("enabled");
+            }
+            for (key, value) in object {
+                remove_provider_generation_controls(value, Some(key));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remove_forced_generation_control_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+) {
     for field in [
         "reasoning_effort",
         "model_reasoning_effort",
@@ -4981,12 +5140,6 @@ fn remove_forced_generation_controls(value: &mut serde_json::Value, parent: Opti
         "output_tokens",
     ] {
         object.remove(field);
-    }
-    if parent == Some("thinking") {
-        object.remove("enabled");
-    }
-    for (key, value) in object {
-        remove_forced_generation_controls(value, Some(key));
     }
 }
 
@@ -5440,6 +5593,7 @@ struct GenericForwardContext<'request> {
     liveness: ShieldedLivenessSelection,
     thinking_policy_applied: bool,
     thinking_metadata: BTreeMap<String, String>,
+    forced_model_alias_policy: Option<ForcedModelAliasProfileConfig>,
     request_id: &'request RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
@@ -5483,6 +5637,11 @@ fn prepare_generic_attempt_request(
             context.upstream_url.query().is_some().to_string(),
         );
     }
+    add_forced_alias_wire_metadata(
+        &mut metadata,
+        context.forced_model_alias_policy.as_ref(),
+        &context.upstream_body,
+    );
     (override_headers, metadata)
 }
 
@@ -5671,7 +5830,7 @@ async fn send_generic_upstream_attempt(
                 local_forward_uri: context.upstream_uri.clone(),
                 original_downstream_headers: &context.downstream_headers,
                 canonical_reranker: context.canonical_reranker.as_ref(),
-                forced_model_alias_policy: None,
+                forced_model_alias_policy: context.forced_model_alias_policy.as_ref(),
                 transformed_request_headers: context.transformed_request_headers,
                 initial_endpoint: &context.terminal_endpoint,
                 request_deadline,
@@ -6306,13 +6465,21 @@ fn render_retry_openai_request(
     endpoint: &UpstreamEndpointConfig,
     body: &Bytes,
 ) -> Result<RenderedEndpointRequest, ProxyError> {
-    reranker_protocol::render_openai_endpoint(
+    let mut rendered = reranker_protocol::render_openai_endpoint(
         endpoint,
         retry.local_forward_uri.clone(),
         body,
         retry.original_downstream_headers,
         retry.transformed_request_headers,
-    )
+    )?;
+    if let Some(policy) = retry.forced_model_alias_policy {
+        rendered.body = apply_forced_model_alias_policy_for_endpoint(
+            &rendered.body,
+            policy,
+            is_chat_completion_path(retry.local_forward_uri.path()),
+        );
+    }
+    Ok(rendered)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -12744,7 +12911,7 @@ async fn start_shielded_attempt(
         salvage.cot_salvage,
         salvage.constraint_repair,
     );
-    let request_metadata = shielded_attempt_request_metadata(
+    let mut request_metadata = shielded_attempt_request_metadata(
         runtime,
         attempt_number,
         retry_cause,
@@ -12769,6 +12936,11 @@ async fn start_shielded_attempt(
             error,
         })
     })?;
+    add_forced_alias_wire_metadata(
+        &mut request_metadata,
+        runtime.forced_model_alias_policy.as_ref(),
+        &rendered.body,
+    );
     let raw_request_body = raw_payload_text(&rendered.body);
     let evidence_upstream_body = rendered.body.clone();
     let upstream_timeout = shielded_attempt_upstream_timeout(runtime);

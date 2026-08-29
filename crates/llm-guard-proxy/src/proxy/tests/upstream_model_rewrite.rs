@@ -113,16 +113,16 @@ fn assert_forced_model_alias_wire_body(body: &serde_json::Value) {
         "/extra_body/thinking/budget_tokens",
         "/extra_body/chat_template_kwargs/enable_thinking",
         "/extra_body/chat_template_kwargs/thinking_budget",
-        "/arbitrary/reasoning_effort",
-        "/arbitrary/max_output_tokens",
-        "/arbitrary/children/0/min_p",
-        "/arbitrary/children/0/output_tokens",
-        "/arbitrary/frequency_penalty",
-        "/arbitrary/children/0/frequency_penalty",
-        "/arbitrary/children/1/0/frequency_penalty",
     ] {
         assert!(body.pointer(pointer).is_none(), "must strip {pointer}");
     }
+    assert_eq!(body["arbitrary"]["reasoning_effort"], "high");
+    assert_eq!(body["arbitrary"]["max_output_tokens"], 8);
+    assert_eq!(body["arbitrary"]["children"][0]["min_p"], 8);
+    assert_eq!(body["arbitrary"]["children"][0]["output_tokens"], 8);
+    assert_eq!(body["arbitrary"]["frequency_penalty"], 8);
+    assert_eq!(body["arbitrary"]["children"][0]["frequency_penalty"], 8);
+    assert_eq!(body["arbitrary"]["children"][1][0]["frequency_penalty"], 8);
 }
 
 async fn assert_forced_response_model(response: reqwest::Response, stream: bool, alias: &str) {
@@ -180,7 +180,7 @@ async fn assert_forced_retry_attempts(
         assert_eq!(body["min_p"], 0.0);
         assert_eq!(body["presence_penalty"], presence_penalty);
         assert_eq!(body["repetition_penalty"], 1.0);
-        assert_eq!(body["max_tokens"], 16384);
+        assert_eq!(body["max_tokens"], if thinking { 81920 } else { 16384 });
         assert_eq!(body["frequency_penalty"], serde_json::Value::Null);
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], thinking);
         assert_eq!(

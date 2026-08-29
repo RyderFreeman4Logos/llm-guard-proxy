@@ -2698,7 +2698,7 @@ pub struct ForcedModelAliasProfileConfig {
     pub thinking_mode: Option<ThinkingMode>,
     /// Required only for `force_thinking`.
     pub thinking_budget: Option<u32>,
-    /// Forced output token cap.
+    /// Visible-answer headroom used to derive the forced total generation cap.
     pub output_cap: Option<u32>,
     /// Forced sampler and penalty settings.
     pub temperature: Option<f64>,
@@ -2794,17 +2794,37 @@ impl ForcedModelAliasProfileConfig {
                 "forced_model_alias_profiles.thinking_budget",
                 "must be omitted when thinking is disabled",
             ),
-            ThinkingMode::ForceThinking => require(
-                self.thinking_budget.is_some_and(|budget| budget > 0),
-                "forced_model_alias_profiles.thinking_budget",
-                "must be greater than zero when thinking is enabled",
-            ),
+            ThinkingMode::ForceThinking => {
+                validate_forced_model_alias_thinking_budget(self.thinking_budget, output_cap)
+            }
             _ => Err(ValidationError::new(
                 "forced_model_alias_profiles.thinking_mode",
                 "must be force_disable or force_thinking",
             )),
         }
     }
+}
+
+fn validate_forced_model_alias_thinking_budget(
+    thinking_budget: Option<u32>,
+    output_cap: u32,
+) -> Result<(), ValidationError> {
+    let budget = thinking_budget.ok_or_else(|| {
+        ValidationError::new(
+            "forced_model_alias_profiles.thinking_budget",
+            "must be greater than zero when thinking is enabled",
+        )
+    })?;
+    require(
+        budget > 0,
+        "forced_model_alias_profiles.thinking_budget",
+        "must be greater than zero when thinking is enabled",
+    )?;
+    require(
+        budget.checked_add(output_cap).is_some(),
+        "forced_model_alias_profiles",
+        "thinking_budget plus output_cap must fit the supported total generation cap",
+    )
 }
 
 fn validate_forced_model_alias_number(
