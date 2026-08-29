@@ -20777,6 +20777,10 @@ impl FakeUpstream {
     ) -> Self {
         let (sender, receiver) = mpsc::channel(10);
         let app = Router::new()
+            .route(
+                "/__fake_upstream_ready",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
             .fallback(fake_upstream_handler)
             .with_state(FakeUpstreamState {
                 sender,
@@ -20801,6 +20805,14 @@ impl FakeUpstream {
                 eprintln!("fake upstream server failed: {error}");
             }
         });
+        let ready = timeout(
+            STREAM_COMPLETION_TIMEOUT,
+            reqwest::get(format!("http://{addr}/__fake_upstream_ready")),
+        )
+        .await
+        .expect("fake upstream readiness request should not time out")
+        .expect("fake upstream readiness request should complete");
+        assert_eq!(ready.status(), StatusCode::NO_CONTENT);
 
         Self {
             base_url: format!("http://{addr}/v1"),
