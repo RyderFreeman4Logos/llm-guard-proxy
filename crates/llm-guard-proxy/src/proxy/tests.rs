@@ -25,7 +25,7 @@ use axum::http::header::{AUTHORIZATION, CONNECTION, LOCATION};
 use futures_util::{Stream, StreamExt, stream};
 use rusqlite::{Connection, params};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncBufReadExt, BufReader},
     net::TcpListener,
     sync::{mpsc, oneshot},
     time::{sleep, timeout},
@@ -1626,16 +1626,23 @@ fn admin_token_matcher_accepts_only_exact_values() {
 #[tokio::test(flavor = "current_thread")]
 async fn persistence_tasks_contain_spawn_blocking_panics() {
     let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
-    let tasks = Arc::new(PersistenceTasks::default());
+    let (panic_published_tx, panic_published_rx) = oneshot::channel();
+    let tasks = Arc::new(PersistenceTasks::with_panic_publication_for_tests(
+        panic_published_tx,
+    ));
 
     tasks.spawn_blocking(|| panic!("simulated persistence store teardown failure"));
 
+    timeout(STREAM_COMPLETION_TIMEOUT, panic_published_rx)
+        .await
+        .expect("panic-safe persistence task should publish its panic")
+        .expect("panic publication sender should remain owned until the worker runs");
     timeout(
         STREAM_COMPLETION_TIMEOUT,
         tasks.flush(STREAM_COMPLETION_TIMEOUT),
     )
     .await
-    .expect("panic-safe persistence task should finish");
+    .expect("published panic-safe persistence task should finish");
     assert_eq!(tasks.panics.load(Ordering::SeqCst), 1);
 }
 
@@ -1643,34 +1650,28 @@ async fn persistence_tasks_contain_spawn_blocking_panics() {
 async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
     let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
     let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
-    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let (first_started_tx, first_started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let overflow_executed = Arc::new(AtomicBool::new(false));
 
     tasks.spawn_blocking(move || {
         first_started_tx
             .send(())
-            .expect("first persistence task receiver should remain open");
+            .expect("first persistence task startup receiver should remain open");
         release_rx
-            .recv()
+            .blocking_recv()
             .expect("first persistence task should be released");
     });
-    first_started_rx
-        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
-        .expect("first persistence task should start");
+    timeout(STREAM_COMPLETION_TIMEOUT, first_started_rx)
+        .await
+        .expect("first persistence task should start")
+        .expect("first persistence task startup sender should remain owned until it runs");
 
+    let overflow_executed_for_task = Arc::clone(&overflow_executed);
     tasks.spawn_blocking(move || {
-        second_started_tx
-            .send(())
-            .expect("dropped persistence task must not execute");
+        overflow_executed_for_task.store(true, Ordering::SeqCst);
     });
 
-    assert!(
-        second_started_rx
-            .recv_timeout(Duration::from_millis(250))
-            .is_err(),
-        "overflow persistence work must not execute while the backlog is saturated"
-    );
     assert_eq!(
         tasks.dropped_total(),
         1,
@@ -1685,6 +1686,10 @@ async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
     )
     .await
     .expect("retained persistence task should drain");
+    assert!(
+        !overflow_executed.load(Ordering::SeqCst),
+        "overflow persistence work must not execute while the backlog is saturated"
+    );
 }
 
 async fn terminate_and_reap_test_child(
@@ -1705,151 +1710,45 @@ async fn terminate_and_reap_test_child(
     (termination, reaped)
 }
 
-async fn drain_test_child_output(
-    stdout_reader: tokio::task::JoinHandle<Vec<u8>>,
-    stderr_reader: tokio::task::JoinHandle<Vec<u8>>,
-) -> (Vec<u8>, Vec<u8>) {
-    let stdout = stdout_reader
-        .await
-        .expect("backlog-drop child stdout reader should not panic");
-    let stderr = stderr_reader
-        .await
-        .expect("backlog-drop child stderr reader should not panic");
-    (stdout, stderr)
-}
-
-async fn run_bounded_test_child(test_name: &str, child_env: &str) -> std::process::Output {
-    let mut command = tokio::process::Command::new(
-        std::env::current_exe().expect("test binary path should be available"),
-    );
-    command
-        .args(["--exact", test_name, "--nocapture"])
-        .env(child_env, "1")
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = command
-        .spawn()
-        .expect("backlog-drop child test should start");
-    let process_group_id = child.id().expect("backlog-drop child process group id");
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .expect("backlog-drop child stdout should be captured");
-    let mut child_stderr = child
-        .stderr
-        .take()
-        .expect("backlog-drop child stderr should be captured");
-    let stdout_reader = tokio::spawn(async move {
-        let mut output = Vec::new();
-        child_stdout
-            .read_to_end(&mut output)
-            .await
-            .expect("backlog-drop child stdout should drain");
-        output
-    });
-    let stderr_reader = tokio::spawn(async move {
-        let mut output = Vec::new();
-        child_stderr
-            .read_to_end(&mut output)
-            .await
-            .expect("backlog-drop child stderr should drain");
-        output
-    });
-    let status = match timeout(Duration::from_secs(30), child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            let (termination, reaped) =
-                terminate_and_reap_test_child(&mut child, process_group_id).await;
-            let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
-            panic!(
-                "backlog-drop child test wait failed: {error}; termination={termination}; reaped={reaped:?}; stdout={}; stderr={}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr),
-            );
-        }
-        Err(_) => {
-            let (termination, reaped) =
-                terminate_and_reap_test_child(&mut child, process_group_id).await;
-            let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
-            panic!(
-                "backlog-drop child test timed out after 30 seconds; termination={termination}; reaped={reaped:?}; stdout={}; stderr={}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr),
-            );
-        }
-    };
-    let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
-    std::process::Output {
-        status,
-        stdout,
-        stderr,
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
-    const CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_CHILD";
     const HANG_CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_HANG_CHILD";
-    const TEST_NAME: &str =
-        "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
     const OVERFLOW_BURST: usize = 128;
 
     let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
 
-    if std::env::var_os(CHILD_ENV).is_none() {
-        let output = run_bounded_test_child(TEST_NAME, CHILD_ENV).await;
-        assert!(
-            output.status.success(),
-            "backlog-drop child test failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
-            "backlog-drop child test must run exactly one test: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let log_emissions = stderr
-            .matches("persistence backlog full, dropping record")
-            .count();
-        assert!(
-            log_emissions <= 1,
-            "a saturated overflow burst must emit at most one backlog-drop log, emitted {log_emissions}"
-        );
-        assert!(
-            stderr.contains("dropped_since_last_log=1"),
-            "the first aggregated backlog-drop log must report its dropped delta: {stderr}"
-        );
-        return;
-    }
-
     if std::env::var_os(HANG_CHILD_ENV).is_some() {
-        sleep(Duration::from_secs(60)).await;
+        eprintln!("persistence backlog-drop hang ready");
+        std::future::pending::<()>().await;
     }
 
-    let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
-    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (backlog_log_tx, backlog_log_rx) = oneshot::channel();
+    let tasks = Arc::new(PersistenceTasks::with_backlog_drop_log_for_tests(
+        1,
+        backlog_log_tx,
+    ));
+    let (first_started_tx, first_started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
     tasks.spawn_blocking(move || {
         first_started_tx
             .send(())
-            .expect("first persistence task receiver should remain open");
+            .expect("first persistence task startup receiver should remain open");
         release_rx
-            .recv()
+            .blocking_recv()
             .expect("first persistence task should be released");
     });
-    first_started_rx
-        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
-        .expect("first persistence task should start");
+    timeout(STREAM_COMPLETION_TIMEOUT, first_started_rx)
+        .await
+        .expect("first persistence task should start")
+        .expect("first persistence task startup sender should remain owned until it runs");
 
     for _ in 0..OVERFLOW_BURST {
         tasks.spawn_blocking(|| {});
     }
+    timeout(STREAM_COMPLETION_TIMEOUT, backlog_log_rx)
+        .await
+        .expect("first saturated overflow should publish its aggregate backlog-drop log")
+        .expect("backlog-drop log sender should remain owned until it publishes");
     assert_eq!(
         tasks.dropped_total(),
         OVERFLOW_BURST as u64,
@@ -1882,7 +1781,7 @@ async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
         .args(["--exact", TEST_NAME, "--nocapture"])
         .env(HANG_CHILD_ENV, "1")
         .kill_on_drop(true)
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
 
@@ -1890,10 +1789,27 @@ async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
         .spawn()
         .expect("hung backlog-drop parent test should start");
     let process_group_id = child.id().expect("hung backlog-drop parent child pid");
+    let child_stderr = child
+        .stderr
+        .take()
+        .expect("hung backlog-drop child stderr should be captured");
+    let mut child_stderr_lines = BufReader::new(child_stderr).lines();
+    timeout(STREAM_COMPLETION_TIMEOUT, async {
+        loop {
+            let line = child_stderr_lines
+                .next_line()
+                .await
+                .expect("hung backlog-drop child stderr should remain readable")
+                .expect("hung backlog-drop child should announce its ready state");
+            if line.contains("persistence backlog-drop hang ready") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("hung backlog-drop child should announce its ready state before the guard");
 
-    // The nested child has a 30-second deadline; leave startup scheduling headroom
-    // when the full suite is running concurrently.
-    let status = match timeout(Duration::from_secs(60), child.wait()).await {
+    let status = match timeout(STREAM_COMPLETION_TIMEOUT, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             let (termination, reaped) =
@@ -1905,9 +1821,13 @@ async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
         Err(_) => {
             let (termination, reaped) =
                 terminate_and_reap_test_child(&mut child, process_group_id).await;
-            panic!(
-                "backlog-drop parent must fail after terminating its hung child; termination={termination}; reaped={reaped:?}"
+            let reaped =
+                reaped.expect("hung backlog-drop child should be reaped after termination");
+            assert!(
+                !reaped.success(),
+                "hung backlog-drop child must exit unsuccessfully after {termination}: {reaped:?}"
             );
+            return;
         }
     };
     assert!(

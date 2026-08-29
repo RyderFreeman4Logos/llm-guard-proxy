@@ -930,6 +930,10 @@ struct PersistenceTasks {
     synchronous_for_tests: bool,
     #[cfg(test)]
     flush_wait_hook: Option<PersistenceFlushWaitHook>,
+    #[cfg(test)]
+    panic_published: Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    backlog_drop_log_published: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Default for PersistenceTasks {
@@ -945,6 +949,10 @@ impl Default for PersistenceTasks {
             synchronous_for_tests: false,
             #[cfg(test)]
             flush_wait_hook: None,
+            #[cfg(test)]
+            panic_published: Mutex::new(None),
+            #[cfg(test)]
+            backlog_drop_log_published: Mutex::new(None),
         }
     }
 }
@@ -962,6 +970,26 @@ impl PersistenceTasks {
     fn with_capacity_for_tests(capacity: usize) -> Self {
         Self {
             capacity: Arc::new(Semaphore::new(capacity)),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_panic_publication_for_tests(panic_published: oneshot::Sender<()>) -> Self {
+        Self {
+            panic_published: Mutex::new(Some(panic_published)),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backlog_drop_log_for_tests(
+        capacity: usize,
+        backlog_drop_log_published: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            capacity: Arc::new(Semaphore::new(capacity)),
+            backlog_drop_log_published: Mutex::new(Some(backlog_drop_log_published)),
             ..Self::default()
         }
     }
@@ -995,6 +1023,15 @@ impl PersistenceTasks {
                 eprintln!(
                     "persistence backlog full, dropping record dropped_total={dropped_total} dropped_since_last_log={dropped_since_last_log} capacity={MAX_PERSISTENCE_TASKS}"
                 );
+                #[cfg(test)]
+                if let Some(backlog_drop_log_published) = self
+                    .backlog_drop_log_published
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ignored_if_test_stops_waiting = backlog_drop_log_published.send(());
+                }
             }
             return;
         };
@@ -1025,6 +1062,15 @@ impl PersistenceTasks {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
             eprintln!("persistence task panicked");
             self.panics.fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            if let Some(panic_published) = self
+                .panic_published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ignored_if_test_stops_waiting = panic_published.send(());
+            }
         }
     }
 
