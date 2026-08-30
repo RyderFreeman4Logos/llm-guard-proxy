@@ -9617,7 +9617,9 @@ async fn forward_upstream_response(
     let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
     let body_transformed = response_model_rewrite.is_some();
-    let known_content_length = known_content_length(&upstream_headers, body_transformed);
+    let downstream_headers = downstream_response_headers(&upstream_headers, body_transformed, None);
+    let known_content_length =
+        response_lifecycle_content_length(dispatch.method, upstream_status, &downstream_headers);
     let response_body = ObservedUpstreamBody::new(
         upstream_stream,
         observer,
@@ -9625,15 +9627,9 @@ async fn forward_upstream_response(
         shutdown,
         known_content_length,
     );
-    let (response_body, body_transformed) =
+    let (response_body, _) =
         forwarded_response_body(&mut upstream_headers, response_body, response_model_rewrite);
-    let response = downstream_response(
-        upstream_status,
-        &upstream_headers,
-        response_body,
-        body_transformed,
-        None,
-    );
+    let response = response_with_headers(upstream_status, downstream_headers, response_body);
     Ok(validate_non_stream_chat_completion_response(
         response,
         &request_path,
@@ -15220,7 +15216,12 @@ async fn shielded_retry_terminal_forward_response(
         },
     );
     let body_transformed = response_model_rewrite.is_some();
-    let known_content_length = known_content_length(&upstream_headers, body_transformed);
+    let downstream_headers = downstream_response_headers(&upstream_headers, body_transformed, None);
+    let known_content_length = response_lifecycle_content_length(
+        &runtime.downstream_method,
+        upstream_status,
+        &downstream_headers,
+    );
     let response_body = ObservedUpstreamBody::new(
         terminal.started.response.bytes_stream(),
         observer,
@@ -15236,13 +15237,7 @@ async fn shielded_retry_terminal_forward_response(
         )),
         None => Body::from_stream(response_body),
     };
-    let response = downstream_response(
-        upstream_status,
-        &upstream_headers,
-        response_body,
-        body_transformed,
-        None,
-    );
+    let response = response_with_headers(upstream_status, downstream_headers, response_body);
     validate_non_stream_chat_completion_response(
         response,
         &request_path,
@@ -15293,7 +15288,12 @@ async fn shielded_retry_direct_relay_response(
         },
     );
     let body_transformed = response_model_rewrite.is_some();
-    let known_content_length = known_content_length(&upstream_headers, body_transformed);
+    let downstream_headers = downstream_response_headers(&upstream_headers, body_transformed, None);
+    let known_content_length = response_lifecycle_content_length(
+        &runtime.downstream_method,
+        upstream_status,
+        &downstream_headers,
+    );
     let response_body = ObservedUpstreamBody::new_with_deadline(
         outcome.started.response.bytes_stream(),
         observer,
@@ -15311,13 +15311,7 @@ async fn shielded_retry_direct_relay_response(
         )),
         None => Body::from_stream(response_body),
     };
-    let response = downstream_response(
-        upstream_status,
-        &upstream_headers,
-        response_body,
-        body_transformed,
-        None,
-    );
+    let response = response_with_headers(upstream_status, downstream_headers, response_body);
     validate_non_stream_chat_completion_response(
         response,
         &request_path,
@@ -16709,6 +16703,15 @@ fn downstream_response(
     body_transformed: bool,
     body_len: Option<usize>,
 ) -> Response<Body> {
+    let headers = downstream_response_headers(upstream_headers, body_transformed, body_len);
+    response_with_headers(status, headers, body)
+}
+
+fn downstream_response_headers(
+    upstream_headers: &HeaderMap,
+    body_transformed: bool,
+    body_len: Option<usize>,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
     copy_response_headers(upstream_headers, &mut headers, body_transformed);
     if let Some(body_len) = body_len
@@ -16716,14 +16719,41 @@ fn downstream_response(
     {
         headers.insert(CONTENT_LENGTH, content_length);
     }
-    response_with_headers(status, headers, body)
+    headers
 }
 
-fn known_content_length(headers: &HeaderMap, body_transformed: bool) -> Option<u64> {
-    if body_transformed {
+fn response_lifecycle_content_length(
+    method: &Method,
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+) -> Option<u64> {
+    if method == Method::HEAD
+        || method == Method::CONNECT && status.is_success()
+        || status.is_informational()
+        || status == reqwest::StatusCode::NO_CONTENT
+        || status == reqwest::StatusCode::NOT_MODIFIED
+    {
         return None;
     }
-    headers.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()
+    unique_content_length(headers)
+}
+
+fn unique_content_length(headers: &HeaderMap) -> Option<u64> {
+    let mut length = None;
+    for header in &headers.get_all(CONTENT_LENGTH) {
+        let header = header.to_str().ok()?;
+        for value in header.split(',').map(str::trim) {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            let parsed = value.parse().ok()?;
+            if length.is_some_and(|current| current != parsed) {
+                return None;
+            }
+            length = Some(parsed);
+        }
+    }
+    length
 }
 
 fn content_length_mismatch(expected: u64, observed: u64) -> BodyCompletion {

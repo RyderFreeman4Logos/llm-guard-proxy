@@ -47,6 +47,8 @@ mod native_json_fallback_issue_219;
 mod quality_first_timeouts_issue_222;
 #[path = "tests/residual_guard_polish.rs"]
 mod residual_guard_polish;
+#[path = "tests/response_framing_lifecycle.rs"]
+mod response_framing_lifecycle;
 #[path = "tests/response_representation_state.rs"]
 mod response_representation_state;
 #[path = "tests/shielded_endpoint_rendering.rs"]
@@ -2095,6 +2097,94 @@ async fn get_models_forwards_method_path_query_and_headers() {
             .is_some_and(|value| value != "downstream.example"),
         "proxy must let the upstream client set Host instead of forwarding the downstream Host"
     );
+}
+
+#[tokio::test]
+async fn head_models_content_length_metadata_does_not_fail_lifecycle_completion() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let request = Request::builder()
+        .method(Method::HEAD)
+        .uri("/v1/models?test=head-content-length")
+        .body(Body::empty())
+        .expect("HEAD request should be valid");
+
+    let response = proxy_handler(State(proxy.state.clone()), request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_LENGTH),
+        Some(&HeaderValue::from_static("3"))
+    );
+    assert!(
+        to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+            .await
+            .expect("HEAD response body should complete")
+            .is_empty(),
+        "HEAD metadata Content-Length must not require emitted bytes"
+    );
+    let observed = fake.recv().await;
+    assert_eq!(observed.method, Method::HEAD);
+    assert_eq!(
+        proxy
+            .store
+            .retention_usage()
+            .expect("usage should be readable")
+            .record_count,
+        2,
+        "request and attempt cleanup records must terminalize"
+    );
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "succeeded");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(request_row.error_reason, None);
+    assert_eq!(request_row.abort_reason, None);
+    assert_eq!(request_row.response_metadata["http_status_success"], "true");
+    assert_eq!(attempt_row.status, "succeeded");
+    assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(attempt_row.error_reason, None);
+    assert_eq!(attempt_row.abort_reason, None);
+    assert_eq!(attempt_row.response_metadata["http_status_success"], "true");
+}
+
+#[test]
+fn response_lifecycle_content_length_requires_one_valid_final_value() {
+    let headers = |values: &[&str]| {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(value).expect("test Content-Length should be a header value"),
+            );
+        }
+        headers
+    };
+    let authority =
+        |status, headers| response_lifecycle_content_length(&Method::GET, status, &headers);
+
+    assert_eq!(authority(StatusCode::OK, headers(&["3"])), Some(3));
+    assert_eq!(authority(StatusCode::OK, headers(&["0"])), Some(0));
+    assert_eq!(authority(StatusCode::OK, headers(&["3", "3"])), Some(3));
+    assert_eq!(authority(StatusCode::OK, headers(&["3, 3"])), Some(3));
+    assert_eq!(authority(StatusCode::OK, headers(&["3", "4"])), None);
+    assert_eq!(authority(StatusCode::OK, headers(&["3, 4"])), None);
+    assert_eq!(authority(StatusCode::OK, headers(&["3", "invalid"])), None);
+    assert_eq!(
+        authority(StatusCode::OK, headers(&["18446744073709551616"])),
+        None
+    );
+    assert_eq!(
+        authority(StatusCode::NOT_MODIFIED, headers(&["invalid"])),
+        None,
+        "304 Content-Length is metadata, not emitted-body authority"
+    );
+
+    let mut upstream_headers = headers(&["3"]);
+    upstream_headers.insert(CONNECTION, HeaderValue::from_static("content-length"));
+    let final_headers = downstream_response_headers(&upstream_headers, false, None);
+    assert!(final_headers.get(CONTENT_LENGTH).is_none());
+    assert_eq!(authority(StatusCode::OK, final_headers), None);
 }
 
 #[tokio::test]
@@ -21047,6 +21137,7 @@ async fn fake_upstream_handler(
     let observed = observe_request(request).await;
     let path_and_query = observed.path_and_query.clone();
     let body = observed.body.clone();
+    let is_head = observed.method == Method::HEAD;
     let is_hot_restart_probe = observed
         .headers
         .get("x-llm-guard-proxy-probe")
@@ -21064,12 +21155,11 @@ async fn fake_upstream_handler(
         .send(observed)
         .await
         .expect("fake upstream observation should send");
-    if endpoint == "/v1/models"
-        && path_and_query.contains("test=distinct-multi-upstream-models")
-        && state.models_body.is_some()
-        && let Some(models_delay) = state.models_delay
+    maybe_delay_fake_models(&endpoint, &path_and_query, &state).await;
+    if let Some(response) =
+        fake_head_models_content_length_response(is_head, &endpoint, &path_and_query)
     {
-        sleep(models_delay).await;
+        return response;
     }
 
     if is_sse_stream {
@@ -21145,6 +21235,33 @@ async fn fake_upstream_handler(
         );
     }
     response
+}
+
+async fn maybe_delay_fake_models(endpoint: &str, path_and_query: &str, state: &FakeUpstreamState) {
+    if endpoint == "/v1/models"
+        && path_and_query.contains("test=distinct-multi-upstream-models")
+        && state.models_body.is_some()
+        && let Some(models_delay) = state.models_delay
+    {
+        sleep(models_delay).await;
+    }
+}
+
+fn fake_head_models_content_length_response(
+    is_head: bool,
+    endpoint: &str,
+    path_and_query: &str,
+) -> Option<Response<Body>> {
+    if !is_head || endpoint != "/v1/models" || !path_and_query.contains("test=head-content-length")
+    {
+        return None;
+    }
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_LENGTH, HeaderValue::from_static("3"));
+    Some(response)
 }
 
 async fn observe_request(request: Request<Body>) -> ObservedRequest {
