@@ -178,6 +178,52 @@ repetition_penalty = 1.0
 }
 
 #[tokio::test]
+async fn forced_alias_is_rejected_on_responses_before_forwarding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy =
+        ProxyFixture::spawn_with_extra_config(&fake.base_url, FORCED_MODEL_ALIAS_PROFILES_CONFIG)
+            .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"abliterated-qwen-latest-27b-none","input":"ping"}"#,
+            ))
+            .expect("responses request should build"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("rejection body should be readable");
+    assert!(
+        std::str::from_utf8(&body)
+            .expect("rejection body should be UTF-8")
+            .contains("forced model aliases are not supported on /v1/responses")
+    );
+    assert_no_upstream_request(&mut fake).await;
+
+    let ordinary = proxy_handler(
+        State(proxy.state.clone()),
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/responses")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"model":"ordinary-model","input":"ping"}"#))
+            .expect("ordinary responses request should build"),
+    )
+    .await;
+
+    assert_eq!(ordinary.status(), StatusCode::NOT_FOUND);
+    assert_eq!(fake.recv_next().await.path_and_query, "/v1/responses");
+}
+
+#[tokio::test]
 async fn guard_listener_lists_forced_aliases_before_reserved_model_filtering() {
     let models = r#"{"object":"list","data":[{"id":"abliterated-qwen-latest-27b-nvfp4","object":"model"},{"id":"aeon","object":"model"},{"id":"aeon-ultimate","object":"model"},{"id":"unrelated-model","object":"model"},{"id":"pooling-model","object":"model"}]}"#;
     let fake = FakeUpstream::spawn_with_models_body(models).await;

@@ -3888,6 +3888,18 @@ fn prepare_openai_forward_request(
     {
         return Err(ProxyError::reserved_ingress_model_id());
     }
+    if method == Method::POST
+        && uri.path() == "/v1/responses"
+        && forced_model_alias_policy(config, model_id.as_deref()).is_some()
+    {
+        return Err(ProxyError::ContextBudgetExceeded {
+            message: String::from("forced model aliases are not supported on /v1/responses"),
+            param: "model",
+            code: "unsupported_forced_model_alias_responses",
+            request_metadata: None,
+            attempts: Vec::new(),
+        });
+    }
     #[cfg(feature = "guard")]
     enforce_caller_profile_policy(&caller_profile, model_id.as_deref())?;
     #[cfg(feature = "guard")]
