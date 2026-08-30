@@ -226,6 +226,129 @@ async fn guard_listener_lists_forced_aliases_before_reserved_model_filtering() {
 }
 
 #[tokio::test]
+async fn models_enrichment_does_not_republish_reserved_legacy_aliases() {
+    let models = r#"{"object":"list","data":[{"id":"reserved-canonical","object":"model"},{"id":"unrelated-model","object":"model"}]}"#;
+    let fake = FakeUpstream::spawn_with_models_body(models).await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[upstream]
+reserved_ingress_model_ids = ["reserved-canonical"]
+
+[upstream.metadata]
+discovery_enabled = true
+enrich_responses = true
+
+[[model_aliases]]
+id = "reserved-canonical"
+kind = "upstream"
+upstream_profile = "default"
+
+[[model_aliases]]
+id = "unrelated-alias"
+kind = "upstream"
+upstream_profile = "default"
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(ListenerConfig {
+            name: String::from("default"),
+            bind_host: String::from("127.0.0.1"),
+            port: 18000,
+            allowed_upstreams: None,
+            upstream_profile: None,
+        })),
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models?test=distinct-multi-upstream-models")
+            .body(Body::empty())
+            .expect("models request should build"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models response should be readable");
+    let models: serde_json::Value = serde_json::from_slice(&body).expect("models response JSON");
+    let model_ids = models["data"]
+        .as_array()
+        .expect("models response data")
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(model_ids, vec!["unrelated-model", "unrelated-alias"]);
+}
+
+#[tokio::test]
+async fn grouped_models_enrichment_does_not_republish_reserved_legacy_aliases() {
+    let models = r#"{"object":"list","data":[{"id":"reserved-canonical","object":"model"},{"id":"unrelated-model","object":"model"}]}"#;
+    let mut default_fake = FakeUpstream::spawn_with_models_body(models).await;
+    let mut grouped_fake = FakeUpstream::spawn_with_models_body(models).await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &default_fake.base_url,
+        &format!(
+            r#"
+[upstream]
+reserved_ingress_model_ids = ["reserved-canonical"]
+
+[upstream.metadata]
+discovery_enabled = true
+enrich_responses = true
+
+[[upstreams]]
+name = "grouped"
+base_url = "{}"
+match_models = ["unrelated-model"]
+
+[[model_aliases]]
+id = "reserved-canonical"
+kind = "upstream"
+upstream_profile = "default"
+
+[[model_aliases]]
+id = "unrelated-alias"
+kind = "upstream"
+upstream_profile = "default"
+"#,
+            grouped_fake.base_url
+        ),
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(ListenerConfig {
+            name: String::from("guard"),
+            bind_host: String::from("127.0.0.1"),
+            port: 18009,
+            allowed_upstreams: None,
+            upstream_profile: None,
+        })),
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models?test=distinct-multi-upstream-models")
+            .body(Body::empty())
+            .expect("grouped models request should build"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("grouped models response should be readable");
+    let models: serde_json::Value = serde_json::from_slice(&body).expect("models response JSON");
+    let model_ids = models["data"]
+        .as_array()
+        .expect("models response data")
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(model_ids, vec!["unrelated-model", "unrelated-alias"]);
+    let _ = default_fake.recv_next().await;
+    let _ = grouped_fake.recv_next().await;
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn guard_listener_hot_reload_updates_reserved_identity_with_alias_generation() {
     let mut fake = FakeUpstream::spawn().await;

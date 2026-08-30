@@ -28,12 +28,20 @@ pub(super) fn enrich_models_body(
     #[cfg(not(feature = "guard"))]
     let alias_changed = false;
     let mut changed = alias_changed;
-    for model in models {
+    for model in models.iter_mut() {
         if let Some(record) = model.as_object_mut() {
             let metadata = metadata_for_model_record(config, selected_metadata, record);
             changed |= enrich_model_record(metadata, record);
         }
     }
+    let model_count = models.len();
+    models.retain(|model| {
+        model
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|model_id| !config.upstream.is_reserved_ingress_model_id(model_id))
+    });
+    changed |= model_count != models.len();
 
     if !changed {
         return body;
