@@ -4599,6 +4599,47 @@ upstream_profile = "default"
     );
 }
 
+#[cfg(feature = "guard")]
+#[test]
+fn forced_model_alias_canonical_target_collision_with_model_alias_is_rejected() {
+    let config = parse_config_text(
+        r#"
+[[upstreams]]
+name = "canonical-route"
+base_url = "http://canonical.example/v1"
+match_models = ["canonical-target"]
+
+[[forced_model_alias_profiles]]
+alias = "forced-public-alias"
+upstream_model = "canonical-target"
+thinking_mode = "force_disable"
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+
+[[model_aliases]]
+id = "canonical-target"
+kind = "upstream"
+upstream_profile = "default"
+"#,
+    )
+    .expect("colliding canonical target config should parse before validation");
+
+    let error = config
+        .validate()
+        .expect_err("forced canonical targets must not collide with model aliases");
+    assert_eq!(error.field(), "forced_model_alias_profiles.upstream_model");
+    assert!(
+        error
+            .message()
+            .contains("must not collide with model_aliases.id")
+    );
+}
+
 #[test]
 fn gb10_forced_model_alias_profiles_are_complete() {
     let config = parse_config_text(include_str!("../../../../deploy/gb10/config.toml"))

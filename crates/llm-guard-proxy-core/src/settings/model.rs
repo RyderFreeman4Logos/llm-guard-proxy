@@ -392,6 +392,15 @@ impl AppConfig {
                 "forced_model_alias_profiles.alias",
                 "must not collide with model_aliases.id",
             )?;
+            #[cfg(feature = "guard")]
+            require(
+                !self
+                    .model_aliases
+                    .iter()
+                    .any(|alias| alias.id == profile.upstream_model),
+                "forced_model_alias_profiles.upstream_model",
+                "must not collide with model_aliases.id",
+            )?;
         }
         Ok(())
     }
