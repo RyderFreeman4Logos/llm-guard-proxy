@@ -16,7 +16,7 @@ use super::{
     ForwardedResponseParts, InFlightPermit, ObservedBufferedBody, ProxyError,
     deepinfra_rerank_adapter, downstream_mode_from_headers, downstream_response,
     forwarded_request_headers, read_upstream_body_bytes_until_shutdown, reranker_protocol,
-    score_adapter,
+    rewrite_json_response_model_body, score_adapter,
 };
 
 #[derive(Clone, Debug)]
@@ -291,6 +291,7 @@ pub(super) async fn rewrite_buffered_adapter_response_from_upstream(
     in_flight_permit: InFlightPermit,
     adapter: BufferedResponseAdapter,
     model_id: Option<&str>,
+    public_model_alias: Option<&str>,
 ) -> Result<Response<Body>, ProxyError> {
     let upstream_status = response_parts.upstream_status;
     let body = match read_upstream_body_bytes_until_shutdown(
@@ -311,7 +312,7 @@ pub(super) async fn rewrite_buffered_adapter_response_from_upstream(
         }
     };
     let upstream_body_bytes = body.len();
-    let (body, response_headers) = if upstream_status.is_success() {
+    let (mut body, response_headers) = if upstream_status.is_success() {
         match adapter.rewrite(&body, model_id) {
             Ok(rewritten_body) => {
                 // Buffered reranker results arrive complete at upstream EOF. Record
@@ -354,6 +355,13 @@ pub(super) async fn rewrite_buffered_adapter_response_from_upstream(
             transformed_error_response_headers(&response_parts.upstream_headers),
         )
     };
+    if matches!(
+        adapter,
+        BufferedResponseAdapter::HeterogeneousReranker { .. }
+    ) && let Some(alias) = public_model_alias
+    {
+        body = rewrite_json_response_model_body(&body, &response_headers, alias);
+    }
     let stream_cancel = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer_with(
         downstream_mode_from_headers(&response_headers),

@@ -6,6 +6,7 @@ use tokio::{
 };
 
 mod credential_boundary;
+mod forced_alias_regressions;
 mod models_attempt_preservation;
 mod response_and_recovery;
 mod shielded_attempt_continuity;

@@ -448,6 +448,7 @@ async fn buffered_adapter_ends_watchdog_lease_before_constructing_unread_downstr
         InFlightPermit { limiter: None },
         BufferedResponseAdapter::ScoreFromRerank(None),
         Some("qwen3-reranker-8b"),
+        None,
     )
     .await
     .expect("buffered adapter should rewrite the complete reranker response");

@@ -3385,6 +3385,7 @@ async fn forward_openai_request(
                 &rendered.body,
                 policy,
                 endpoint_capability(&method, &prepared_request.forward_uri),
+                selected.endpoint.protocol,
             );
         }
         prepared_request.forward_uri = rendered.uri;
@@ -4010,6 +4011,7 @@ fn forced_model_alias_policy_body(
                 body,
                 policy,
                 endpoint_capability(method, uri),
+                UpstreamEndpointProtocol::OpenAi,
             )
         },
     );
@@ -4062,7 +4064,11 @@ fn apply_forced_model_alias_policy_for_endpoint(
     body: &Bytes,
     policy: &ForcedModelAliasProfileConfig,
     capability: EndpointCapability,
+    protocol: UpstreamEndpointProtocol,
 ) -> Bytes {
+    if protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
+        return body.clone();
+    }
     match capability {
         EndpointCapability::Generation => apply_forced_model_alias_policy(body, policy),
         EndpointCapability::ModelOnly => rewrite_request_model_body(body, &policy.upstream_model),
@@ -4084,11 +4090,7 @@ fn add_forced_alias_wire_metadata(
     metadata.insert(String::from("forced_alias"), policy.alias.clone());
     metadata.insert(
         String::from("forced_upstream_model"),
-        object
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        policy.upstream_model.clone(),
     );
     let thinking_enabled = object
         .get("chat_template_kwargs")
@@ -5279,6 +5281,18 @@ fn rewrite_response_model_body(body: &Bytes, client_model: &str) -> Bytes {
     Bytes::from(value.to_string())
 }
 
+pub(super) fn rewrite_json_response_model_body(
+    body: &Bytes,
+    headers: &HeaderMap,
+    client_model: &str,
+) -> Bytes {
+    if response_model_rewrite_mode(headers) == Some(ResponseModelRewriteMode::Json) {
+        rewrite_response_model_body(body, client_model)
+    } else {
+        body.clone()
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ResponseModelRewriteMode {
     Json,
@@ -5954,12 +5968,20 @@ async fn forward_generic_endpoint_response(
     upstream_response: EndpointResponse,
     terminal_endpoint_protocol: UpstreamEndpointProtocol,
 ) -> Result<Response<Body>, ProxyError> {
+    let public_model_alias =
+        client_response_model_alias(&context.upstream_profile, context.model_id.as_deref())
+            .map(str::to_owned);
     match upstream_response {
-        EndpointResponse::Rewritten(rewritten) => Ok(forward_rewritten_endpoint_response(
-            response_parts,
-            context.in_flight_permit,
-            rewritten,
-        )),
+        EndpointResponse::Rewritten(mut rewritten) => {
+            if let Some(alias) = public_model_alias.as_deref() {
+                rewritten.body = rewrite_response_model_body(&rewritten.body, alias);
+            }
+            Ok(forward_rewritten_endpoint_response(
+                response_parts,
+                context.in_flight_permit,
+                rewritten,
+            ))
+        }
         EndpointResponse::Upstream(upstream_response) => {
             if let Some(adapter) = context
                 .response_adapter
@@ -5971,6 +5993,7 @@ async fn forward_generic_endpoint_response(
                     context.in_flight_permit,
                     adapter,
                     context.model_id.as_deref(),
+                    public_model_alias.as_deref(),
                 )
                 .await;
             }
@@ -6572,6 +6595,7 @@ fn render_retry_openai_request(
             &rendered.body,
             policy,
             endpoint_capability(&retry.method, &retry.local_forward_uri),
+            endpoint.protocol,
         );
     }
     Ok(rendered)
@@ -6909,16 +6933,16 @@ async fn send_selected_failover_endpoint(
                 &rendered.body,
                 policy,
                 endpoint_capability(&runtime.retry_method, &runtime.retry.local_forward_uri),
+                selected.endpoint.protocol,
             );
         }
         rendered
     });
     let attempt_id = AttemptId::for_request(runtime.request_id, attempt_number);
-    let started_at_unix_ms = unix_time_millis();
     let mut attempt = PhysicalEndpointAttempt {
         attempt_id,
         attempt_number,
-        started_at_unix_ms,
+        started_at_unix_ms: unix_time_millis(),
         request_metadata,
         endpoint: Some(selected.endpoint.clone()),
         protocol: selected.endpoint.protocol,
