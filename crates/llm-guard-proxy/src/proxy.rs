@@ -5619,7 +5619,14 @@ fn select_allowed_upstream_profile(
     if let Some(selected) = select_profile_from_model_alias(config, listener, routed_model)? {
         return Ok(selected);
     }
-    let selected = config.select_upstream_profile(routed_model);
+    let mut selected = config.select_upstream_profile(routed_model);
+    if selected.route_reason != UpstreamRouteReason::MatchedModel && routed_model != model {
+        #[cfg(feature = "guard")]
+        if let Some(alias_selected) = select_profile_from_model_alias(config, listener, model)? {
+            return Ok(alias_selected);
+        }
+        selected = config.select_upstream_profile(model);
+    }
     if listener.allows_upstream(&selected.profile.name) {
         return Ok(selected);
     }
