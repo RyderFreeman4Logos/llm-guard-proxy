@@ -274,6 +274,8 @@ pub(super) fn sanitize_transformed_request_headers(headers: &HeaderMap) -> Heade
         "digest",
         "content-digest",
         "repr-digest",
+        "signature",
+        "signature-input",
         "etag",
         "if-match",
         "if-none-match",

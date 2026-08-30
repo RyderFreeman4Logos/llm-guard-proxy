@@ -3454,9 +3454,13 @@ async fn forward_openai_request(
                 upstream_url: prepared_request.upstream_url,
                 downstream_method: method,
                 downstream_uri: uri,
-                upstream_headers: prepared_request
-                    .upstream_headers
-                    .unwrap_or_else(|| downstream_headers.clone()),
+                upstream_headers: prepared_request.upstream_headers.unwrap_or_else(|| {
+                    if prepared_request.transformed_request_headers {
+                        sanitize_transformed_request_headers(&downstream_headers)
+                    } else {
+                        downstream_headers.clone()
+                    }
+                }),
                 original_downstream_headers: downstream_headers,
                 upstream_body: prepared_request.shielded_chat_plan.upstream_body,
                 downstream_body: prepared_request.shielded_chat_plan.downstream_body,
@@ -3916,30 +3920,24 @@ fn prepare_openai_forward_request(
     let (mut upstream_profile, route_reason) =
         (selected_profile.profile, selected_profile.route_reason);
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
-    let canonical_reranker = reranker_protocol::capture_request(
-        method,
-        uri,
-        body,
-        &adapted_request.forward_uri,
-        &adapted_request.adapted_body,
-    );
+    let canonical_reranker = canonical_reranker_request(method, uri, body, &adapted_request);
     let transformed_request_headers = adapted_request.response_adapter.is_some();
+    let (policy, body, shielded_chat_plan, forward_uri, forced_alias_transformed) =
+        prepare_forced_alias_request(
+            state,
+            config,
+            &mut upstream_profile,
+            model_id.as_deref(),
+            method,
+            &adapted_request.forward_uri,
+            &adapted_request.adapted_body,
+        )?;
     let response_adapter = response_adapter_for_request(
         &upstream_profile,
         canonical_reranker.as_ref(),
         adapted_request.response_adapter,
     );
-    let (forward_uri, adapted_body) = (adapted_request.forward_uri, adapted_request.adapted_body);
-    let (policy, body, shielded_chat_plan) = prepare_forced_alias_shielded_plan(
-        state,
-        config,
-        &mut upstream_profile,
-        model_id.as_deref(),
-        method,
-        &forward_uri,
-        &adapted_body,
-    )?;
-    let forward_uri = forced_model_detail_uri(forward_uri, policy.as_ref())?;
+    let transformed_request_headers = transformed_request_headers || forced_alias_transformed;
     add_shielded_request_metadata(
         request_metadata,
         shielded_chat_plan.intercepted,
@@ -3979,6 +3977,64 @@ fn prepare_openai_forward_request(
         upstream_deadline: None,
         endpoint_retry_order,
     })
+}
+
+fn canonical_reranker_request(
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    adapted: &buffered_adapter::AdaptedOpenAiRequest,
+) -> Option<CanonicalRerankerRequest> {
+    reranker_protocol::capture_request(
+        method,
+        uri,
+        body,
+        &adapted.forward_uri,
+        &adapted.adapted_body,
+    )
+}
+
+fn prepare_forced_alias_request(
+    state: &ProxyState,
+    config: &AppConfig,
+    upstream_profile: &mut UpstreamProfileConfig,
+    model_id: Option<&str>,
+    method: &Method,
+    uri: &Uri,
+    adapted_body: &Bytes,
+) -> Result<
+    (
+        Option<ForcedModelAliasProfileConfig>,
+        Bytes,
+        ShieldedChatPlan,
+        Uri,
+        bool,
+    ),
+    ProxyError,
+> {
+    let (policy, body, shielded_chat_plan) = prepare_forced_alias_shielded_plan(
+        state,
+        config,
+        upstream_profile,
+        model_id,
+        method,
+        uri,
+        adapted_body,
+    )?;
+    let forward_uri = forced_model_detail_uri(uri.clone(), policy.as_ref())?;
+    let transformed =
+        forced_alias_request_transformed(policy.as_ref(), adapted_body, &body, uri, &forward_uri);
+    Ok((policy, body, shielded_chat_plan, forward_uri, transformed))
+}
+
+fn forced_alias_request_transformed(
+    policy: Option<&ForcedModelAliasProfileConfig>,
+    original_body: &Bytes,
+    body: &Bytes,
+    original_uri: &Uri,
+    uri: &Uri,
+) -> bool {
+    policy.is_some() && (body != original_body || uri != original_uri)
 }
 
 fn response_adapter_for_request(

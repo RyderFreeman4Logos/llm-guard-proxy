@@ -572,6 +572,126 @@ repetition_penalty = 1.0
 }
 
 #[tokio::test]
+async fn forced_alias_rewrites_sanitize_bound_headers_but_preserve_origin_authentication() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[[forced_model_alias_profiles]]
+alias = "public-forced-alias"
+upstream_model = "canonical-target"
+thinking_mode = "force_disable"
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#,
+    )
+    .await;
+
+    let ordinary = proxy_handler(
+        State(proxy.state.clone()),
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models/ordinary-model")
+            .header(AUTHORIZATION, "Bearer preserved")
+            .header("Signature", "sig-ordinary")
+            .header("Digest", "sha-256=ordinary")
+            .body(Body::empty())
+            .expect("ordinary model detail request should build"),
+    )
+    .await;
+    assert_eq!(ordinary.status(), StatusCode::NOT_FOUND);
+    let ordinary = fake.recv_next().await;
+    assert_eq!(
+        ordinary.headers.get(AUTHORIZATION).unwrap(),
+        "Bearer preserved"
+    );
+    assert_eq!(ordinary.headers.get("signature").unwrap(), "sig-ordinary");
+    assert_eq!(ordinary.headers.get("digest").unwrap(), "sha-256=ordinary");
+
+    let forced_chat = proxy_handler(
+        State(proxy.state.clone()),
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .header(AUTHORIZATION, "Bearer preserved")
+            .header("Signature", "sig-forced")
+            .header("Signature-Input", "sig-forced-input")
+            .header("Digest", "sha-256=forced")
+            .header("Content-Digest", "sha-256=:forced:")
+            .header("Content-MD5", "forced")
+            .header("ETag", "forced")
+            .header("If-Match", "forced")
+            .header("If-None-Match", "forced")
+            .body(Body::from(
+                r#"{"model":"public-forced-alias","messages":[],"stream":false}"#,
+            ))
+            .expect("forced chat request should build"),
+    )
+    .await;
+    assert_eq!(forced_chat.status(), StatusCode::OK);
+    let forced_chat = fake.recv_next().await;
+    assert_eq!(
+        forced_chat.headers.get(AUTHORIZATION).unwrap(),
+        "Bearer preserved"
+    );
+    assert_rewritten_request_headers(&forced_chat.headers);
+    assert_eq!(
+        forced_chat.headers.get(CONTENT_LENGTH).unwrap(),
+        forced_chat.body.len().to_string().as_str(),
+        "rewritten body length must be recomputed"
+    );
+
+    let forced_detail = proxy_handler(
+        State(proxy.state.clone()),
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models/public-forced-alias?include=details")
+            .header(AUTHORIZATION, "Bearer preserved")
+            .header("Signature", "sig-detail")
+            .header("Digest", "sha-256=detail")
+            .body(Body::empty())
+            .expect("forced model detail request should build"),
+    )
+    .await;
+    assert_eq!(forced_detail.status(), StatusCode::NOT_FOUND);
+    let forced_detail = fake.recv_next().await;
+    assert_eq!(
+        forced_detail.path_and_query,
+        "/v1/models/canonical-target?include=details"
+    );
+    assert_eq!(
+        forced_detail.headers.get(AUTHORIZATION).unwrap(),
+        "Bearer preserved"
+    );
+    assert!(forced_detail.headers.get("signature").is_none());
+    assert!(forced_detail.headers.get("digest").is_none());
+}
+
+fn assert_rewritten_request_headers(headers: &HeaderMap) {
+    for header in [
+        "signature",
+        "signature-input",
+        "digest",
+        "content-digest",
+        "content-md5",
+        "etag",
+        "if-match",
+        "if-none-match",
+    ] {
+        assert!(
+            headers.get(header).is_none(),
+            "rewritten body must not retain {header}"
+        );
+    }
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn guard_listener_hot_reload_updates_reserved_identity_with_alias_generation() {
     let mut fake = FakeUpstream::spawn().await;
