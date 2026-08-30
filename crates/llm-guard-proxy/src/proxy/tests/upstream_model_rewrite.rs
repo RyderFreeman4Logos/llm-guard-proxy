@@ -395,7 +395,7 @@ upstream_profile = "default"
 }
 
 #[tokio::test]
-async fn model_detail_rejects_reserved_ids_before_forwarding() {
+async fn model_detail_strictly_decodes_reserved_ids_before_forwarding() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_extra_config(
         &fake.base_url,
@@ -413,36 +413,58 @@ reserved_ingress_model_ids = ["reserved-canonical"]
         upstream_profile: None,
     };
 
-    let response = proxy_handler(
-        State(proxy.state.for_listener(listener.clone())),
-        Request::builder()
-            .method(Method::GET)
-            .uri("/v1/models/reserved-canonical")
-            .body(Body::empty())
-            .expect("reserved model detail request should build"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
-        .await
-        .expect("reserved model detail error should be readable");
-    assert!(String::from_utf8_lossy(&body).contains("reserved"));
-    assert_no_upstream_request(&mut fake).await;
+    for path in [
+        "/v1/models/reserved-canonical",
+        "/v1/models/reserved%2Dcanonical",
+    ] {
+        let response = proxy_handler(
+            State(proxy.state.for_listener(listener.clone())),
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .expect("reserved model detail request should build"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+            .await
+            .expect("reserved model detail error should be readable");
+        assert!(String::from_utf8_lossy(&body).contains("reserved"));
+        assert_no_upstream_request(&mut fake).await;
+    }
 
-    let response = proxy_handler(
-        State(proxy.state.for_listener(listener)),
-        Request::builder()
-            .method(Method::GET)
-            .uri("/v1/models/ordinary-model")
-            .body(Body::empty())
-            .expect("ordinary model detail request should build"),
-    )
-    .await;
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        fake.recv_next().await.path_and_query,
-        "/v1/models/ordinary-model"
-    );
+    for path in [
+        "/v1/models/malformed%ZZ",
+        "/v1/models/ordinary%2Fmodel",
+        "/v1/models/ordinary%5Cmodel",
+    ] {
+        let response = proxy_handler(
+            State(proxy.state.for_listener(listener.clone())),
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .expect("invalid model detail request should build"),
+        )
+        .await;
+        assert!(response.status().is_client_error(), "{path}");
+        assert_no_upstream_request(&mut fake).await;
+    }
+
+    for path in ["/v1/models/ordinary-model", "/v1/models/ordinary%2Dmodel"] {
+        let response = proxy_handler(
+            State(proxy.state.for_listener(listener.clone())),
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .expect("ordinary model detail request should build"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(fake.recv_next().await.path_and_query, path);
+    }
 }
 
 #[tokio::test]

@@ -16919,18 +16919,45 @@ fn header_value(value: &HeaderValue) -> String {
         .map_or_else(|_error| HEADER_VALUE_NOT_UTF8.to_owned(), str::to_owned)
 }
 
-fn model_detail_id_from_path<'a>(method: &Method, uri: &'a Uri) -> Option<&'a str> {
+fn model_detail_id_from_path(method: &Method, uri: &Uri) -> Option<String> {
     if method != Method::GET {
         return None;
     }
     uri.path()
         .strip_prefix("/v1/models/")
         .filter(|model| !model.is_empty() && !model.contains('/'))
+        .and_then(|model| strict_percent_decode_model_detail_id(model).ok())
+}
+
+fn strict_percent_decode_model_detail_id(segment: &str) -> Result<String, OpenAiPathError> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        let byte = if bytes[index] == b'%' {
+            let Some((decoded_byte, next_index)) = percent_encoded_byte(bytes, index) else {
+                return Err(OpenAiPathError::InvalidModelDetailId);
+            };
+            index = next_index;
+            decoded_byte
+        } else {
+            let byte = bytes[index];
+            index += 1;
+            byte
+        };
+        if matches!(byte, b'/' | b'\\') {
+            return Err(OpenAiPathError::InvalidModelDetailId);
+        }
+        decoded.push(byte);
+    }
+
+    String::from_utf8(decoded).map_err(|_error| OpenAiPathError::InvalidModelDetailId)
 }
 
 fn extract_model_id(method: &Method, uri: &Uri, body: &Bytes) -> Option<String> {
     if let Some(model) = model_detail_id_from_path(method, uri) {
-        return Some(model.to_owned());
+        return Some(model);
     }
     if let Some(model) = deepinfra_rerank_adapter::model_id_from_path(method, uri) {
         return Some(model.to_owned());
@@ -17067,6 +17094,12 @@ fn validate_openai_path(path: &str) -> Result<(), OpenAiPathError> {
 
     if path.split('/').any(path_segment_decodes_to_dot_segment) {
         return Err(OpenAiPathError::DotSegment);
+    }
+    if let Some(model) = path
+        .strip_prefix("/v1/models/")
+        .filter(|model| !model.is_empty() && !model.contains('/'))
+    {
+        strict_percent_decode_model_detail_id(model)?;
     }
 
     Ok(())
@@ -19233,20 +19266,22 @@ enum OpenAiPathError {
     OutsideOpenAiScope,
     #[error("OpenAI-compatible request path contains a raw or percent-encoded dot segment")]
     DotSegment,
+    #[error("model detail ID must be valid percent-encoded UTF-8 without path separators")]
+    InvalidModelDetailId,
 }
 
 impl OpenAiPathError {
     const fn status(self) -> StatusCode {
         match self {
             Self::OutsideOpenAiScope => StatusCode::NOT_FOUND,
-            Self::DotSegment => StatusCode::BAD_REQUEST,
+            Self::DotSegment | Self::InvalidModelDetailId => StatusCode::BAD_REQUEST,
         }
     }
 
     const fn error_type(self) -> &'static str {
         match self {
             Self::OutsideOpenAiScope => "not_found",
-            Self::DotSegment => "invalid_request_path",
+            Self::DotSegment | Self::InvalidModelDetailId => "invalid_request_path",
         }
     }
 }
