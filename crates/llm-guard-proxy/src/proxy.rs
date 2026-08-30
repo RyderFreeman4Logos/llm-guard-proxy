@@ -10010,7 +10010,7 @@ fn filter_models_body_for_listener(
                 return filter_reserved(body);
             };
             return filter_reserved(model_metadata::filter_models_body_by_id(body, |model_id| {
-                profile.match_models.is_empty() || profile.matches_model(model_id)
+                listener_forced_profile_matches_model(config, listener, &profile, model_id)
             }));
         }
         if listener.allowed_upstreams.is_none() {
@@ -10026,7 +10026,7 @@ fn filter_models_body_for_listener(
             return body;
         };
         model_metadata::filter_models_body_by_id(body, |model_id| {
-            profile.match_models.is_empty() || profile.matches_model(model_id)
+            listener_forced_profile_matches_model(config, listener, &profile, model_id)
         })
     } else if listener.allowed_upstreams.is_none() {
         body
@@ -10036,6 +10036,20 @@ fn filter_models_body_for_listener(
         })
     };
     filter_reserved(body)
+}
+
+fn listener_forced_profile_matches_model(
+    config: &AppConfig,
+    listener: &ListenerConfig,
+    profile: &UpstreamProfileConfig,
+    model_id: &str,
+) -> bool {
+    profile.match_models.is_empty()
+        || profile.matches_model(model_id)
+        || forced_model_alias_policy(config, Some(model_id)).is_some_and(|policy| {
+            select_allowed_upstream_profile(config, listener, Some(policy.upstream_model.as_str()))
+                .is_ok_and(|selected| selected.profile.name == profile.name)
+        })
 }
 
 fn model_discovery_request_headers(headers: &HeaderMap) -> HeaderMap {
