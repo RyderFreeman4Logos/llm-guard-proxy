@@ -159,3 +159,46 @@ fn watchdog_sse_event_framing_makes_oversized_incomplete_events_sticky_unobserva
         "oversized event degradation must stay sticky for the physical attempt"
     );
 }
+
+#[test]
+fn sse_frame_end_accepts_line_endings_at_every_byte_split_and_picks_earliest_frame() {
+    let cases = [
+        ("lf", b"data: {\"model\":\"alias\"}\n\n".as_slice()),
+        ("crlf", b"data: {\"model\":\"alias\"}\r\n\r\n".as_slice()),
+        ("cr", b"data: {\"model\":\"alias\"}\r\r".as_slice()),
+        ("mixed", b"data: {\"model\":\"alias\"}\r\n\n".as_slice()),
+    ];
+    for (name, event) in cases {
+        for split in 0..=event.len() {
+            let mut buffer = BytesMut::new();
+            buffer.extend_from_slice(&event[..split]);
+            let expected = if split == event.len() {
+                Some(event.len())
+            } else if name == "crlf" && split + 1 == event.len() {
+                Some(split)
+            } else {
+                None
+            };
+            assert_eq!(
+                sse_frame_end(&buffer),
+                expected,
+                "{name} frame must remain incomplete until all bytes arrive at split {split}"
+            );
+            buffer.extend_from_slice(&event[split..]);
+            assert_eq!(
+                sse_frame_end(&buffer),
+                Some(event.len()),
+                "{name} frame must complete after split {split}"
+            );
+        }
+    }
+
+    let mut mixed = BytesMut::from(&b"data: first\r\n\ndata: second\r\rtrailing"[..]);
+    let first_end = sse_frame_end(&mixed).expect("the first mixed frame must complete");
+    assert_eq!(&mixed.split_to(first_end)[..], b"data: first\r\n\n");
+    assert_eq!(
+        sse_frame_end(&mixed),
+        Some(b"data: second\r\r".len()),
+        "the scanner must choose the earliest complete frame"
+    );
+}

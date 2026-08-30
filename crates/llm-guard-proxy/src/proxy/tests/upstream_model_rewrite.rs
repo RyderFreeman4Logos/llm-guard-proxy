@@ -1859,6 +1859,10 @@ async fn upstream_model_rewrite_sse_buffer_overflows_with_controlled_error() {
         "stream must surface a controlled FrameOverflow error when the SSE \
          frame exceeds the byte cap without a delimiter"
     );
+    assert!(
+        body.buffered.is_empty(),
+        "overflow must clear the retained buffer after the later oversized chunk"
+    );
 }
 
 #[tokio::test]
@@ -1887,6 +1891,73 @@ async fn upstream_model_rewrite_sse_buffer_releases_after_overflow() {
     assert!(
         count <= 2,
         "overflowed stream must terminate quickly, got {count} items"
+    );
+    assert!(
+        body.buffered.is_empty(),
+        "first oversized chunk must fail before retaining bytes beyond the cap"
+    );
+}
+
+#[tokio::test]
+async fn upstream_model_rewrite_sse_accepts_exact_cap_frame() {
+    let cap = SSE_REWRITE_FRAME_BYTE_LIMIT;
+    let mut exact = vec![b'x'; cap - 2];
+    exact.extend_from_slice(b"\n\n");
+    let input = futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(exact))]);
+    let mut body = ResponseModelRewriteBody::new(
+        input,
+        ResponseModelRewriteMode::OpenAiSse,
+        String::from("alias-chat"),
+    );
+
+    let frame = body
+        .next()
+        .await
+        .expect("exact-cap frame must produce one body item")
+        .expect("exact-cap frame must not overflow");
+    assert_eq!(frame.len(), cap);
+    assert!(
+        body.next().await.is_none(),
+        "exact-cap stream must reach EOF"
+    );
+}
+
+#[tokio::test]
+async fn upstream_model_rewrite_sse_processes_multiple_bounded_frames_in_one_large_chunk() {
+    let cap = SSE_REWRITE_FRAME_BYTE_LIMIT;
+    let payload_len = cap / 2 + 100 - b"data: ".len() - 2;
+    let mut input = Vec::with_capacity((payload_len + b"data: ".len() + 2) * 2);
+    for byte in *b"ab" {
+        input.extend_from_slice(b"data: ");
+        input.extend(std::iter::repeat_n(byte, payload_len));
+        input.extend_from_slice(b"\n\n");
+    }
+    assert!(
+        input.len() > cap,
+        "the transport chunk must exceed the frame cap"
+    );
+    let input = futures_util::stream::iter(vec![Ok::<Bytes, std::io::Error>(Bytes::from(input))]);
+    let mut body = ResponseModelRewriteBody::new(
+        input,
+        ResponseModelRewriteMode::OpenAiSse,
+        String::from("alias-chat"),
+    );
+
+    let first = body
+        .next()
+        .await
+        .expect("first bounded frame must be emitted")
+        .expect("first bounded frame must not overflow");
+    assert_eq!(first.len(), payload_len + b"data: ".len() + 2);
+    let second = body
+        .next()
+        .await
+        .expect("second bounded frame must be emitted")
+        .expect("second bounded frame must not overflow");
+    assert_eq!(second.len(), first.len());
+    assert!(
+        body.next().await.is_none(),
+        "large chunk stream must reach EOF"
     );
 }
 

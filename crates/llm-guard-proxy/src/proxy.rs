@@ -5464,6 +5464,7 @@ struct ResponseModelRewriteBody<S> {
     mode: ResponseModelRewriteMode,
     client_model: String,
     buffered: BytesMut,
+    pending: Option<Bytes>,
     completed: bool,
 }
 
@@ -5474,6 +5475,7 @@ impl<S> ResponseModelRewriteBody<S> {
             mode,
             client_model,
             buffered: BytesMut::new(),
+            pending: None,
             completed: false,
         }
     }
@@ -5500,16 +5502,29 @@ where
             .0)));
         }
 
-        match this.stream.as_mut().poll_next(cx) {
+        let next = match this.pending.take() {
+            Some(bytes) => Poll::Ready(Some(Ok(bytes))),
+            None => this.stream.as_mut().poll_next(cx),
+        };
+        match next {
             Poll::Ready(Some(Ok(bytes))) => {
-                this.buffered.extend_from_slice(&bytes);
                 if matches!(this.mode, ResponseModelRewriteMode::OpenAiSse) {
-                    if this.buffered.len() > SSE_REWRITE_FRAME_BYTE_LIMIT {
+                    let remaining = SSE_REWRITE_FRAME_BYTE_LIMIT
+                        .checked_sub(this.buffered.len())
+                        .expect("SSE rewrite buffer must stay within its byte limit");
+                    let accepted_len = bytes.len().min(remaining);
+                    if bytes.len() > remaining
+                        && sse_frame_end_parts(&this.buffered, &bytes[..accepted_len]).is_none()
+                    {
                         this.completed = true;
                         this.buffered.clear();
                         return Poll::Ready(Some(Err(ResponseModelRewriteError::FrameOverflow {
                             limit: SSE_REWRITE_FRAME_BYTE_LIMIT,
                         })));
+                    }
+                    this.buffered.extend_from_slice(&bytes[..accepted_len]);
+                    if accepted_len < bytes.len() {
+                        this.pending = Some(bytes.slice(accepted_len..));
                     }
                     if let Some(frame) = take_sse_frame(&mut this.buffered) {
                         return Poll::Ready(Some(Ok(rewrite_sse_response_model_body(
@@ -5518,6 +5533,8 @@ where
                         )
                         .0)));
                     }
+                } else {
+                    this.buffered.extend_from_slice(&bytes);
                 }
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -5584,16 +5601,54 @@ fn take_sse_frame(buffer: &mut BytesMut) -> Option<Bytes> {
 }
 
 fn sse_frame_end(buffer: &[u8]) -> Option<usize> {
-    buffer
-        .windows(2)
-        .position(|bytes| bytes == b"\n\n")
-        .map(|index| index + 2)
-        .or_else(|| {
-            buffer
-                .windows(4)
-                .position(|bytes| bytes == b"\r\n\r\n")
-                .map(|index| index + 4)
-        })
+    sse_frame_end_chunks(std::iter::once(buffer))
+}
+
+fn sse_frame_end_parts(first: &[u8], second: &[u8]) -> Option<usize> {
+    sse_frame_end_chunks([first, second])
+}
+
+fn sse_frame_end_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Option<usize> {
+    let mut line_start = 0;
+    let mut offset = 0;
+    let mut pending_cr = None;
+    for chunk in chunks {
+        for (index, &byte) in chunk.iter().enumerate() {
+            let position = offset + index;
+            if let Some(cr_start) = pending_cr {
+                if byte == b'\n' {
+                    let end = position + 1;
+                    if line_start == cr_start {
+                        return Some(end);
+                    }
+                    line_start = end;
+                    pending_cr = None;
+                    continue;
+                }
+                let end = cr_start + 1;
+                if line_start == cr_start {
+                    return Some(end);
+                }
+                line_start = end;
+                pending_cr = None;
+            }
+            match byte {
+                b'\r' => pending_cr = Some(position),
+                b'\n' => {
+                    let end = position + 1;
+                    if line_start == position {
+                        return Some(end);
+                    }
+                    line_start = end;
+                }
+                _ => {}
+            }
+        }
+        offset += chunk.len();
+    }
+    pending_cr
+        .filter(|&cr_start| line_start == cr_start)
+        .map(|cr_start| cr_start + 1)
 }
 
 fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> (Bytes, bool) {
@@ -5601,7 +5656,7 @@ fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> (Bytes, 
         return (body.clone(), false);
     };
     let mut rewritten = String::with_capacity(body_text.len());
-    for line in body_text.split_inclusive('\n') {
+    let rewrite_line = |line: &str, rewritten: &mut String| {
         let (line, line_ending) = line
             .strip_suffix('\n')
             .map_or((line, ""), |line| (line, "\n"));
@@ -5612,7 +5667,7 @@ fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> (Bytes, 
             rewritten.push_str(line);
             rewritten.push_str(carriage_return);
             rewritten.push_str(line_ending);
-            continue;
+            return;
         };
         let whitespace_length = data.len().saturating_sub(data.trim_start().len());
         let (whitespace, payload) = data.split_at(whitespace_length);
@@ -5623,6 +5678,30 @@ fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> (Bytes, 
         rewritten.push_str(std::str::from_utf8(&payload).expect("JSON response rewrite is UTF-8"));
         rewritten.push_str(carriage_return);
         rewritten.push_str(line_ending);
+    };
+    let body_bytes = body_text.as_bytes();
+    let mut line_start = 0;
+    let mut offset = 0;
+    while offset < body_bytes.len() {
+        let line_end = match body_bytes[offset] {
+            b'\n' => Some(offset + 1),
+            b'\r' => Some(if body_bytes.get(offset + 1) == Some(&b'\n') {
+                offset + 2
+            } else {
+                offset + 1
+            }),
+            _ => None,
+        };
+        let Some(line_end) = line_end else {
+            offset += 1;
+            continue;
+        };
+        rewrite_line(&body_text[line_start..line_end], &mut rewritten);
+        line_start = line_end;
+        offset = line_end;
+    }
+    if line_start < body_text.len() {
+        rewrite_line(&body_text[line_start..], &mut rewritten);
     }
     let rewritten = Bytes::from(rewritten);
     let transformed = rewritten != *body;
@@ -16825,7 +16904,7 @@ fn should_skip_response_header(
     connection_tokens: &HashSet<HeaderName>,
     body_transformed: bool,
 ) -> bool {
-    name == CONTENT_LENGTH
+    (body_transformed && name == CONTENT_LENGTH)
         || is_hop_by_hop_header(name)
         || connection_tokens.contains(name)
         || (body_transformed && is_body_bound_response_header(name))

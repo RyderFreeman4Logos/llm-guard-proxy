@@ -13,7 +13,20 @@ use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use super::*;
 
-const BODY_BOUND_HEADERS: [&str; 4] = ["etag", "digest", "signature", "signature-input"];
+const BODY_BOUND_HEADERS: [&str; 12] = [
+    "content-encoding",
+    "content-md5",
+    "digest",
+    "content-digest",
+    "repr-digest",
+    "etag",
+    "signature",
+    "signature-input",
+    "if-match",
+    "if-none-match",
+    "if-modified-since",
+    "if-unmodified-since",
+];
 #[cfg(feature = "guard")]
 const FORCED_ALIAS_CONFIG: &str = r#"
 [[forced_model_alias_profiles]]
@@ -123,6 +136,7 @@ impl Drop for DelayedAliasSseUpstream {
 
 #[cfg(feature = "guard")]
 async fn delayed_alias_sse_handler(State(state): State<DelayedAliasSseState>) -> Response {
+    let content_length = state.first.len().saturating_add(state.second.len());
     let first_sent = state
         .first_sent
         .lock()
@@ -185,6 +199,10 @@ async fn delayed_alias_sse_handler(State(state): State<DelayedAliasSseState>) ->
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
     add_stale_body_bound_response_headers(&mut response);
+    response.headers_mut().insert(
+        CONTENT_LENGTH,
+        HeaderValue::from_str(&content_length.to_string()).expect("test content length is valid"),
+    );
     response
 }
 
@@ -235,7 +253,7 @@ async fn shielded_non_alias_aggregation_sanitizes_body_bound_headers() {
 #[tokio::test]
 async fn alias_sse_rewrite_forwards_first_frame_before_upstream_eof() {
     let mut upstream = DelayedAliasSseUpstream::spawn(
-        b"data: {\"model\":\"canonical-target\"}\r\n\r\n",
+        b"data: {\"model\":\"canonical-target\"}\r\r",
         b"data: {\"model\":\"canonical-target\",\"done\":true}\n\n",
     )
     .await;
@@ -268,6 +286,14 @@ async fn alias_sse_rewrite_forwards_first_frame_before_upstream_eof() {
             "rewritten SSE must not retain {header}"
         );
     }
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE),
+        Some(&HeaderValue::from_static("text/event-stream"))
+    );
+    assert!(
+        response.headers().get(CONTENT_LENGTH).is_none(),
+        "rewritten SSE must strip stale Content-Length"
+    );
 
     let mut body = response.bytes_stream();
     let first = timeout(STREAM_FIRST_CHUNK_TIMEOUT, body.next())
@@ -277,7 +303,7 @@ async fn alias_sse_rewrite_forwards_first_frame_before_upstream_eof() {
         .expect("rewritten first SSE frame must be readable");
     assert_eq!(
         first.as_ref(),
-        b"data: {\"model\":\"public-forced-alias\"}\r\n\r\n"
+        b"data: {\"model\":\"public-forced-alias\"}\r\r"
     );
     upstream.assert_second_frame_is_blocked();
 
@@ -327,6 +353,11 @@ async fn opaque_alias_sse_forwards_first_frame_before_upstream_eof_without_heade
     assert_eq!(
         response.headers().get("x-safe-custom"),
         Some(&HeaderValue::from_static("preserve-me"))
+    );
+    assert_eq!(
+        response.headers().get(CONTENT_LENGTH),
+        Some(&HeaderValue::from_static("30")),
+        "opaque streaming bytes must preserve the valid upstream Content-Length"
     );
     for header in BODY_BOUND_HEADERS {
         assert!(
@@ -486,10 +517,19 @@ enrich_responses = true
                 .get(header)
                 .and_then(|value| value.to_str().ok()),
             Some(match header {
-                "etag" => "\"stale-etag\"",
+                "content-encoding" => "identity",
+                "content-md5" => "stale-md5",
                 "digest" => "sha-256=stale",
+                "content-digest" => "sha-256=:stale:",
+                "repr-digest" => "sha-256=:stale-repr:",
+                "etag" => "\"stale-etag\"",
                 "signature" => "stale-signature",
                 "signature-input" => "stale-signature-input",
+                "if-match" => "\"stale-match\"",
+                "if-none-match" => "\"stale-none-match\"",
+                "if-modified-since" | "if-unmodified-since" => {
+                    "Wed, 21 Oct 2015 07:28:00 GMT"
+                }
                 _ => unreachable!(),
             }),
             "no-op models response must preserve {header}"

@@ -21398,10 +21398,18 @@ fn forced_alias_non_utf8_sse_response() -> Response<Body> {
 
 fn add_stale_body_bound_response_headers(response: &mut Response<Body>) {
     for (name, value) in [
-        ("etag", "\"stale-etag\""),
+        ("content-encoding", "identity"),
+        ("content-md5", "stale-md5"),
         ("digest", "sha-256=stale"),
+        ("content-digest", "sha-256=:stale:"),
+        ("repr-digest", "sha-256=:stale-repr:"),
+        ("etag", "\"stale-etag\""),
         ("signature", "stale-signature"),
         ("signature-input", "stale-signature-input"),
+        ("if-match", "\"stale-match\""),
+        ("if-none-match", "\"stale-none-match\""),
+        ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
     ] {
         response.headers_mut().insert(
             HeaderName::from_static(name),
