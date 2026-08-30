@@ -140,6 +140,7 @@ fn forced_alias_reload_config_with_extra(
         match_model,
         forced_upstream_model,
         "http://current-legacy.example/v1",
+        None,
         extra,
     )
 }
@@ -148,12 +149,17 @@ fn forced_alias_reload_config_with_routing(
     match_model: &str,
     forced_upstream_model: &str,
     legacy_upstream_base_url: &str,
+    reserved_model: Option<&str>,
     extra: &str,
 ) -> AppConfig {
+    let reserved_model = reserved_model.map_or(String::new(), |model| {
+        format!("reserved_ingress_model_ids = [\"{model}\"]\n")
+    });
     let config = AppConfig::parse(&format!(
         r#"
 [upstream]
 base_url = "{legacy_upstream_base_url}"
+{reserved_model}
 
 [[upstreams]]
 name = "forced-target"
@@ -196,6 +202,7 @@ fn forced_aliases_follow_retained_routing_topology_generation() {
                 "current-canonical",
                 "requested-canonical",
                 "http://requested-legacy.example/v1",
+                None,
                 "",
             ),
             Some("upstream.base_url"),
@@ -246,4 +253,41 @@ fn forced_aliases_follow_retained_routing_topology_generation() {
             "{name}: expected restart-required routing field"
         );
     }
+}
+
+#[test]
+fn forced_alias_and_reserved_ids_follow_retained_routing_generation() {
+    let current = forced_alias_reload_config_with_routing(
+        "current-canonical",
+        "current-canonical",
+        "http://current-legacy.example/v1",
+        Some("current-canonical"),
+        "",
+    );
+    let requested = forced_alias_reload_config_with_routing(
+        "current-canonical",
+        "requested-canonical",
+        "http://current-legacy.example/v1",
+        Some("requested-canonical"),
+        "\n[[listeners]]\nname = \"routing-listener\"\nbind_host = \"127.0.0.1\"\nport = 18010\nallowed_upstreams = [\"default\"]\n",
+    );
+
+    let (next, outcome) = apply_reloadable(&current, &requested);
+
+    assert_eq!(
+        outcome
+            .restart_required_changes
+            .iter()
+            .map(|change| change.field)
+            .collect::<Vec<_>>(),
+        vec!["listeners.topology"]
+    );
+    assert_eq!(
+        next.forced_model_alias_profiles,
+        current.forced_model_alias_profiles
+    );
+    assert_eq!(
+        next.upstream.reserved_ingress_model_ids,
+        current.upstream.reserved_ingress_model_ids
+    );
 }

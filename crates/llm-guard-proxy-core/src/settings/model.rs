@@ -1008,9 +1008,6 @@ impl AppConfig {
             self.apply_family_defaults();
         }
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
-        self.upstream
-            .reserved_ingress_model_ids
-            .clone_from(&requested.upstream.reserved_ingress_model_ids);
         self.upstream.cache_priority_engine = requested.upstream.cache_priority_engine;
         self.upstream.metadata = requested.upstream.metadata.clone();
         self.upstream.hot_restart = requested.upstream.hot_restart.clone();
@@ -1018,6 +1015,9 @@ impl AppConfig {
         self.upstream.stuck_watchdog = requested.upstream.stuck_watchdog.clone();
         self.upstream.restart_queue = requested.upstream.restart_queue.clone();
         if self.routing_topology_matches(requested) {
+            self.upstream
+                .reserved_ingress_model_ids
+                .clone_from(&requested.upstream.reserved_ingress_model_ids);
             self.forced_model_alias_profiles
                 .clone_from(&requested.forced_model_alias_profiles);
         }
