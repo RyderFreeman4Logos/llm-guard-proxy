@@ -5601,11 +5601,13 @@ fn select_allowed_upstream_profile(
             route_reason: UpstreamRouteReason::ListenerForced,
         });
     }
+    let routed_model = forced_model_alias_policy(config, model)
+        .map_or(model, |policy| Some(policy.upstream_model.as_str()));
     #[cfg(feature = "guard")]
-    if let Some(selected) = select_profile_from_model_alias(config, listener, model)? {
+    if let Some(selected) = select_profile_from_model_alias(config, listener, routed_model)? {
         return Ok(selected);
     }
-    let selected = config.select_upstream_profile(model);
+    let selected = config.select_upstream_profile(routed_model);
     if listener.allows_upstream(&selected.profile.name) {
         return Ok(selected);
     }
