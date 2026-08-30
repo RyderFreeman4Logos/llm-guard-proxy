@@ -9616,8 +9616,15 @@ async fn forward_upstream_response(
     };
     let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
-    let response_body =
-        ObservedUpstreamBody::new(upstream_stream, observer, in_flight_permit, shutdown);
+    let body_transformed = response_model_rewrite.is_some();
+    let known_content_length = known_content_length(&upstream_headers, body_transformed);
+    let response_body = ObservedUpstreamBody::new(
+        upstream_stream,
+        observer,
+        in_flight_permit,
+        shutdown,
+        known_content_length,
+    );
     let (response_body, body_transformed) =
         forwarded_response_body(&mut upstream_headers, response_body, response_model_rewrite);
     let response = downstream_response(
@@ -15212,13 +15219,15 @@ async fn shielded_retry_terminal_forward_response(
             stuck_watchdog_attempt: terminal.started.stuck_watchdog_attempt,
         },
     );
+    let body_transformed = response_model_rewrite.is_some();
+    let known_content_length = known_content_length(&upstream_headers, body_transformed);
     let response_body = ObservedUpstreamBody::new(
         terminal.started.response.bytes_stream(),
         observer,
         in_flight_permit,
         runtime.shutdown.subscribe(),
+        known_content_length,
     );
-    let body_transformed = response_model_rewrite.is_some();
     let response_body = match response_model_rewrite {
         Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
             response_body,
@@ -15283,6 +15292,8 @@ async fn shielded_retry_direct_relay_response(
             stuck_watchdog_attempt: outcome.started.stuck_watchdog_attempt,
         },
     );
+    let body_transformed = response_model_rewrite.is_some();
+    let known_content_length = known_content_length(&upstream_headers, body_transformed);
     let response_body = ObservedUpstreamBody::new_with_deadline(
         outcome.started.response.bytes_stream(),
         observer,
@@ -15290,8 +15301,8 @@ async fn shielded_retry_direct_relay_response(
         BodyCompletion::Succeeded,
         runtime.shutdown.subscribe(),
         Some(outcome.request_deadline),
+        known_content_length,
     );
-    let body_transformed = response_model_rewrite.is_some();
     let response_body = match response_model_rewrite {
         Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
             response_body,
@@ -16091,6 +16102,7 @@ struct ObservedUpstreamBody {
     body_buffer: BytesMut,
     terminal_completion: BodyCompletion,
     deadline: Option<Pin<Box<Sleep>>>,
+    known_content_length: Option<u64>,
 }
 
 impl ObservedUpstreamBody {
@@ -16099,6 +16111,7 @@ impl ObservedUpstreamBody {
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
         shutdown: ShutdownSubscription,
+        known_content_length: Option<u64>,
     ) -> Self {
         Self::new_with_completion(
             stream,
@@ -16107,6 +16120,7 @@ impl ObservedUpstreamBody {
             BodyCompletion::Succeeded,
             shutdown,
             None,
+            known_content_length,
         )
     }
 
@@ -16117,6 +16131,7 @@ impl ObservedUpstreamBody {
         terminal_completion: BodyCompletion,
         shutdown: ShutdownSubscription,
         deadline: Option<RequestDeadline>,
+        known_content_length: Option<u64>,
     ) -> Self {
         Self::new_with_completion(
             stream,
@@ -16125,6 +16140,7 @@ impl ObservedUpstreamBody {
             terminal_completion,
             shutdown,
             deadline,
+            known_content_length,
         )
     }
 
@@ -16135,6 +16151,7 @@ impl ObservedUpstreamBody {
         terminal_completion: BodyCompletion,
         shutdown: ShutdownSubscription,
         deadline: Option<RequestDeadline>,
+        known_content_length: Option<u64>,
     ) -> Self {
         let progress = observer.stuck_watchdog_progress_request();
         let relayed = observe_upstream_body_independently(stream, progress);
@@ -16150,6 +16167,7 @@ impl ObservedUpstreamBody {
                 .map(|deadline| deadline.remaining().unwrap_or(Duration::ZERO))
                 .map(tokio::time::sleep)
                 .map(Box::pin),
+            known_content_length,
         }
     }
 
@@ -16188,6 +16206,12 @@ impl Stream for ObservedUpstreamBody {
                     let take = remaining.min(bytes.len());
                     this.body_buffer.extend_from_slice(&bytes[..take]);
                 }
+                if let Some(expected) = this.known_content_length
+                    && this.bytes_seen > expected
+                {
+                    let completion = content_length_mismatch(expected, this.bytes_seen);
+                    this.record_once(&completion);
+                }
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(error))) => {
@@ -16197,8 +16221,14 @@ impl Stream for ObservedUpstreamBody {
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
-                let completion =
-                    std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded);
+                let completion = match this.known_content_length {
+                    Some(expected) if this.bytes_seen != expected => {
+                        content_length_mismatch(expected, this.bytes_seen)
+                    }
+                    _ => {
+                        std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded)
+                    }
+                };
                 this.record_once(&completion);
                 Poll::Ready(None)
             }
@@ -16209,7 +16239,16 @@ impl Stream for ObservedUpstreamBody {
 
 impl Drop for ObservedUpstreamBody {
     fn drop(&mut self) {
-        self.record_once(&BodyCompletion::DownstreamDropped);
+        let completion = if matches!(self.terminal_completion, BodyCompletion::Succeeded)
+            && self
+                .known_content_length
+                .is_some_and(|expected| self.bytes_seen == expected)
+        {
+            BodyCompletion::Succeeded
+        } else {
+            BodyCompletion::DownstreamDropped
+        };
+        self.record_once(&completion);
     }
 }
 
@@ -16678,6 +16717,19 @@ fn downstream_response(
         headers.insert(CONTENT_LENGTH, content_length);
     }
     response_with_headers(status, headers, body)
+}
+
+fn known_content_length(headers: &HeaderMap, body_transformed: bool) -> Option<u64> {
+    if body_transformed {
+        return None;
+    }
+    headers.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()
+}
+
+fn content_length_mismatch(expected: u64, observed: u64) -> BodyCompletion {
+    BodyCompletion::UpstreamStreamError(format!(
+        "content_length_mismatch: expected {expected} bytes, observed {observed}"
+    ))
 }
 
 /// Adds the stable observability identifier at the single terminal proxy boundary.

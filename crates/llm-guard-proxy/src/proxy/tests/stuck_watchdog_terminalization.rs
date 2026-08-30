@@ -367,6 +367,7 @@ async fn terminal_json_progress_has_one_owner_when_downstream_drop_races_staged_
         response_parts.into_observer(),
         InFlightPermit { limiter: None },
         proxy.state.shutdown.subscribe(),
+        None,
     );
     let delivered = timeout(Duration::from_secs(1), downstream.next())
         .await
