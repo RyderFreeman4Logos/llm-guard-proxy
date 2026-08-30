@@ -24353,11 +24353,12 @@ fn gb10_deploy_config_for_test(
 async fn gb10_deploy_chat_path_preserves_caller_fields_without_native_thinking_budget() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+    assert_gb10_reserved_aeon_ultimate_rejected(&proxy, &mut fake).await;
 
     let defaulted = post_chat_and_observe_gb10_body(
         &proxy,
         &mut fake,
-        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"defaulted"}]}"#,
+        br#"{"model":"qwen3.6-27b-decensor-by-aeon","messages":[{"role":"user","content":"defaulted"}]}"#,
         "defaulted",
     )
     .await;
@@ -24374,7 +24375,7 @@ async fn gb10_deploy_chat_path_preserves_caller_fields_without_native_thinking_b
     let caller = post_chat_and_observe_gb10_body(
         &proxy,
         &mut fake,
-        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"caller"}],"max_tokens":64,"reasoning_effort":"low","thinking_token_budget":128,"thinking":{"budget_tokens":64}}"#,
+        br#"{"model":"qwen3.6-27b-decensor-by-aeon","messages":[{"role":"user","content":"caller"}],"max_tokens":64,"reasoning_effort":"low","thinking_token_budget":128,"thinking":{"budget_tokens":64}}"#,
         "caller",
     )
     .await;
@@ -24390,11 +24391,12 @@ async fn gb10_deploy_chat_path_honors_extra_body_reasoning_effort_without_fill_i
 {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+    assert_gb10_reserved_aeon_ultimate_rejected(&proxy, &mut fake).await;
 
     let caller = post_chat_and_observe_gb10_body(
         &proxy,
         &mut fake,
-        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-none"}],"extra_body":{"reasoning_effort":"none"}}"#,
+        br#"{"model":"qwen3.6-27b-decensor-by-aeon","messages":[{"role":"user","content":"extra-body-none"}],"extra_body":{"reasoning_effort":"none"}}"#,
         "extra-body-none",
     )
     .await;
@@ -24415,11 +24417,12 @@ async fn gb10_deploy_chat_path_honors_extra_body_enable_thinking_false_without_f
  {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+    assert_gb10_reserved_aeon_ultimate_rejected(&proxy, &mut fake).await;
 
     let caller = post_chat_and_observe_gb10_body(
         &proxy,
         &mut fake,
-        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-enable-thinking-false"}],"extra_body":{"enable_thinking":false}}"#,
+        br#"{"model":"qwen3.6-27b-decensor-by-aeon","messages":[{"role":"user","content":"extra-body-enable-thinking-false"}],"extra_body":{"enable_thinking":false}}"#,
         "extra-body-enable-thinking-false",
     )
     .await;
@@ -24439,11 +24442,12 @@ async fn gb10_deploy_chat_path_honors_extra_body_enable_thinking_false_without_f
 async fn gb10_deploy_chat_path_honors_extra_body_output_limits_without_fill_if_absent_max_tokens() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+    assert_gb10_reserved_aeon_ultimate_rejected(&proxy, &mut fake).await;
 
     let caller = post_chat_and_observe_gb10_body(
         &proxy,
         &mut fake,
-        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-max-tokens"}],"extra_body":{"max_tokens":64}}"#,
+        br#"{"model":"qwen3.6-27b-decensor-by-aeon","messages":[{"role":"user","content":"extra-body-max-tokens"}],"extra_body":{"max_tokens":64}}"#,
         "extra-body-max-tokens",
     )
     .await;
@@ -24456,6 +24460,30 @@ async fn gb10_deploy_chat_path_honors_extra_body_output_limits_without_fill_if_a
             .is_none()
     );
     assert!(caller.get("thinking_token_budget").is_none());
+}
+
+#[cfg(feature = "param-override")]
+async fn assert_gb10_reserved_aeon_ultimate_rejected(
+    proxy: &ProxyFixture,
+    fake: &mut FakeUpstream,
+) {
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"reserved"}]}"#)
+        .send()
+        .await
+        .expect("reserved proxy request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("reserved rejection body should be readable")
+            .contains("reserved")
+    );
+    assert_no_upstream_request(fake).await;
 }
 
 #[cfg(feature = "param-override")]

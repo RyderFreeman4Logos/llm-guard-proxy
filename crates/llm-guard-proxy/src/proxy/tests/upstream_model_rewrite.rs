@@ -3,6 +3,9 @@
 use super::*;
 
 const FORCED_MODEL_ALIAS_PROFILES_CONFIG: &str = r#"
+[upstream]
+reserved_ingress_model_ids = ["abliterated-qwen-latest-27b-nvfp4", "aeon", "aeon-ultimate"]
+
 [[forced_model_alias_profiles]]
 alias = "abliterated-qwen-latest-27b-none"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
@@ -56,41 +59,43 @@ async fn guard_listener_rejects_reserved_forced_alias_upstream_model_before_forw
         upstream_profile: None,
     });
 
-    for (path, body) in [
-        (
-            "/v1/chat/completions",
-            r#"{"model":"abliterated-qwen-latest-27b-nvfp4","messages":[]}"#,
-        ),
-        (
-            "/v1/completions",
-            r#"{"model":"abliterated-qwen-latest-27b-nvfp4","prompt":"ping"}"#,
-        ),
-        (
-            "/v1/embeddings",
-            r#"{"model":"abliterated-qwen-latest-27b-nvfp4","input":"ping"}"#,
-        ),
-    ] {
-        let response = proxy_handler(
-            State(guard_state.clone()),
-            Request::builder()
-                .method(Method::POST)
-                .uri(path)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(body))
-                .expect("reserved-model request should build"),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
-        let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
-            .await
-            .expect("rejection body should be readable");
-        assert!(
-            std::str::from_utf8(&body)
-                .expect("rejection body should be UTF-8")
-                .contains("reserved for a forced alias"),
-            "{path} must return the deterministic reservation error"
-        );
-        assert_no_upstream_request(&mut fake).await;
+    for model in ["abliterated-qwen-latest-27b-nvfp4", "aeon", "aeon-ultimate"] {
+        for (path, body) in [
+            (
+                "/v1/chat/completions",
+                format!(r#"{{"model":"{model}","messages":[]}}"#),
+            ),
+            (
+                "/v1/completions",
+                format!(r#"{{"model":"{model}","prompt":"ping"}}"#),
+            ),
+            (
+                "/v1/embeddings",
+                format!(r#"{{"model":"{model}","input":"ping"}}"#),
+            ),
+        ] {
+            let response = proxy_handler(
+                State(guard_state.clone()),
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .expect("reserved-model request should build"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model} {path}");
+            let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+                .await
+                .expect("rejection body should be readable");
+            assert!(
+                std::str::from_utf8(&body)
+                    .expect("rejection body should be UTF-8")
+                    .contains("reserved"),
+                "{model} {path} must return the deterministic reservation error"
+            );
+            assert_no_upstream_request(&mut fake).await;
+        }
     }
 
     let retired_alias = format!("{}-none", "abliterated-qwen-latest-27b-nvfp4");
@@ -118,7 +123,7 @@ async fn guard_listener_rejects_reserved_forced_alias_upstream_model_before_forw
 
 #[tokio::test]
 async fn guard_listener_hides_reserved_forced_alias_upstream_model_from_models() {
-    let models = r#"{"object":"list","data":[{"id":"abliterated-qwen-latest-27b-nvfp4","object":"model"},{"id":"unrelated-model","object":"model"}]}"#;
+    let models = r#"{"object":"list","data":[{"id":"abliterated-qwen-latest-27b-nvfp4","object":"model"},{"id":"aeon","object":"model"},{"id":"aeon-ultimate","object":"model"},{"id":"unrelated-model","object":"model"}]}"#;
     let fake = FakeUpstream::spawn_with_models_body(models).await;
     let proxy =
         ProxyFixture::spawn_with_extra_config(&fake.base_url, FORCED_MODEL_ALIAS_PROFILES_CONFIG)
@@ -152,6 +157,8 @@ async fn guard_listener_hides_reserved_forced_alias_upstream_model_from_models()
         .filter_map(|model| model["id"].as_str())
         .collect::<Vec<_>>();
     assert!(!model_ids.contains(&"abliterated-qwen-latest-27b-nvfp4"));
+    assert!(!model_ids.contains(&"aeon"));
+    assert!(!model_ids.contains(&"aeon-ultimate"));
     assert!(
         model_ids.contains(&"unrelated-model"),
         "unrelated model must remain visible; got {model_ids:?}"

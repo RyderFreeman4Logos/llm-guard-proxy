@@ -99,6 +99,10 @@ base_url = "http://100.105.4.92:18010/v1"
 # Total request timeout including streaming (30 min).
 request_timeout_ms = 1800000
 
+# Internal upstream identities are never accepted at ingress or exposed by
+# model discovery; the three public aliases below remain client-visible.
+reserved_ingress_model_ids = ["abliterated-qwen-latest-27b-nvfp4", "aeon", "aeon-ultimate"]
+
 # Translate a caller first-evict KV-priority hint. Safe default is disabled.
 # cache_priority_engine = "disabled"
 

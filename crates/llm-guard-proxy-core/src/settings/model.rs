@@ -1001,6 +1001,9 @@ impl AppConfig {
             self.apply_family_defaults();
         }
         self.upstream.request_timeout_ms = requested.upstream.request_timeout_ms;
+        self.upstream
+            .reserved_ingress_model_ids
+            .clone_from(&requested.upstream.reserved_ingress_model_ids);
         self.upstream.cache_priority_engine = requested.upstream.cache_priority_engine;
         self.upstream.metadata = requested.upstream.metadata.clone();
         self.upstream.hot_restart = requested.upstream.hot_restart.clone();
@@ -1626,6 +1629,8 @@ pub struct UpstreamConfig {
     pub base_url: String,
     /// Total upstream request timeout, including streamed response body reads.
     pub request_timeout_ms: u64,
+    /// Model IDs that are never admitted at ingress or exposed by model listing.
+    pub reserved_ingress_model_ids: Vec<String>,
     /// Engine that accepts the forwarded `OpenAI` `priority` field.
     pub cache_priority_engine: CachePriorityEngine,
     /// Metadata discovery and model context enrichment policy.
@@ -1648,6 +1653,31 @@ impl UpstreamConfig {
             "upstream.request_timeout_ms",
             "must be greater than zero",
         )?;
+        let mut reserved_ids = HashSet::new();
+        for model_id in &self.reserved_ingress_model_ids {
+            require(
+                !model_id.is_empty() && model_id == model_id.trim(),
+                "upstream.reserved_ingress_model_ids",
+                "must contain non-empty trimmed model identifiers",
+            )?;
+            require(
+                model_id.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+                "upstream.reserved_ingress_model_ids",
+                "model identifiers must be at most 256 bytes",
+            )?;
+            require(
+                model_id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
+                }),
+                "upstream.reserved_ingress_model_ids",
+                "model identifiers must contain only ASCII letters, digits, '/', '-', '_', or '.'",
+            )?;
+            require(
+                reserved_ids.insert(model_id),
+                "upstream.reserved_ingress_model_ids",
+                "must not contain duplicate model identifiers",
+            )?;
+        }
         self.metadata.validate()?;
         self.hot_restart.validate(HotRestartValidationFields {
             max_tokens: "upstream.hot_restart.probe_max_tokens",
@@ -1672,6 +1702,14 @@ impl UpstreamConfig {
     pub fn redacted_base_url(&self) -> String {
         redact_upstream_base_url(&self.base_url)
     }
+
+    /// Returns true when an ingress model ID is explicitly reserved.
+    #[must_use]
+    pub fn is_reserved_ingress_model_id(&self, model_id: &str) -> bool {
+        self.reserved_ingress_model_ids
+            .iter()
+            .any(|reserved| reserved == model_id)
+    }
 }
 
 impl Default for UpstreamConfig {
@@ -1679,6 +1717,7 @@ impl Default for UpstreamConfig {
         Self {
             base_url: String::from("http://gb10:18009/v1"),
             request_timeout_ms: 120_000,
+            reserved_ingress_model_ids: Vec::new(),
             cache_priority_engine: CachePriorityEngine::Disabled,
             metadata: MetadataConfig::default(),
             hot_restart: HotRestartConfig::default(),

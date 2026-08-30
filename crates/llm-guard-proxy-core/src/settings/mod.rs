@@ -158,6 +158,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "cloudflare.enabled",
     "upstream.request_timeout_ms",
     "upstream.cache_priority_engine",
+    "upstream.reserved_ingress_model_ids",
     "upstream.metadata.discovery_enabled",
     "upstream.metadata.enrich_responses",
     "upstream.metadata.refresh_interval_secs",

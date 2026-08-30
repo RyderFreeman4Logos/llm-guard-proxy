@@ -1446,6 +1446,9 @@ fn assign_upstream(
             config.request_timeout_ms =
                 parse_u64(value, line_number, "upstream.request_timeout_ms")?;
         }
+        "reserved_ingress_model_ids" => {
+            config.reserved_ingress_model_ids = parse_string_array(value, line_number)?;
+        }
         _ => return unknown_key("upstream", key, line_number),
     }
     Ok(())
