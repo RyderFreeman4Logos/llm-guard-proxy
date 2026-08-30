@@ -349,6 +349,57 @@ upstream_profile = "default"
 }
 
 #[tokio::test]
+async fn model_detail_rejects_reserved_ids_before_forwarding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[upstream]
+reserved_ingress_model_ids = ["reserved-canonical"]
+"#,
+    )
+    .await;
+    let listener = ListenerConfig {
+        name: String::from("default"),
+        bind_host: String::from("127.0.0.1"),
+        port: 18000,
+        allowed_upstreams: None,
+        upstream_profile: None,
+    };
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener.clone())),
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models/reserved-canonical")
+            .body(Body::empty())
+            .expect("reserved model detail request should build"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("reserved model detail error should be readable");
+    assert!(String::from_utf8_lossy(&body).contains("reserved"));
+    assert_no_upstream_request(&mut fake).await;
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models/ordinary-model")
+            .body(Body::empty())
+            .expect("ordinary model detail request should build"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        fake.recv_next().await.path_and_query,
+        "/v1/models/ordinary-model"
+    );
+}
+
+#[tokio::test]
 #[allow(clippy::too_many_lines)]
 async fn guard_listener_hot_reload_updates_reserved_identity_with_alias_generation() {
     let mut fake = FakeUpstream::spawn().await;

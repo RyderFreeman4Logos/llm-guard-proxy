@@ -16900,7 +16900,19 @@ fn header_value(value: &HeaderValue) -> String {
         .map_or_else(|_error| HEADER_VALUE_NOT_UTF8.to_owned(), str::to_owned)
 }
 
+fn model_detail_id_from_path<'a>(method: &Method, uri: &'a Uri) -> Option<&'a str> {
+    if method != Method::GET {
+        return None;
+    }
+    uri.path()
+        .strip_prefix("/v1/models/")
+        .filter(|model| !model.is_empty() && !model.contains('/'))
+}
+
 fn extract_model_id(method: &Method, uri: &Uri, body: &Bytes) -> Option<String> {
+    if let Some(model) = model_detail_id_from_path(method, uri) {
+        return Some(model.to_owned());
+    }
     if let Some(model) = deepinfra_rerank_adapter::model_id_from_path(method, uri) {
         return Some(model.to_owned());
     }
