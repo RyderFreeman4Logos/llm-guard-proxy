@@ -21222,7 +21222,6 @@ fn fake_upstream_endpoint_response(
     {
         return response;
     }
-
     if endpoint == "/v1/embeddings" && path_and_query.contains("test=token-usage") {
         return json_response(
             "embeddings-token-usage",
@@ -21256,6 +21255,9 @@ fn fake_upstream_endpoint_response(
             "chat-completions",
             r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
         ),
+        "/v1/completions" if path_and_query.contains("test=forced-response-integrity-headers") => {
+            return forced_alias_integrity_response();
+        }
         "/v1/completions" => (
             "completions",
             r#"{"id":"cmpl-test","object":"text_completion"}"#,
@@ -21278,6 +21280,33 @@ fn forced_model_detail_response() -> Response<Body> {
         "forced-model-detail",
         String::from(r#"{"id":"canonical-target","object":"model"}"#),
     )
+}
+
+fn forced_alias_integrity_response() -> Response<Body> {
+    let mut response = json_response(
+        "forced-alias-integrity",
+        String::from(r#"{"model":"canonical-target","choices":[]}"#),
+    );
+    for (name, value) in [
+        ("content-encoding", "identity"),
+        ("content-md5", "stale-md5"),
+        ("digest", "sha-256=stale"),
+        ("content-digest", "sha-256=:stale:"),
+        ("repr-digest", "sha-256=:stale-repr:"),
+        ("etag", "\"stale-etag\""),
+        ("signature", "stale-signature"),
+        ("signature-input", "stale-signature-input"),
+        ("if-match", "\"stale-match\""),
+        ("if-none-match", "\"stale-none-match\""),
+        ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+    ] {
+        response.headers_mut().insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    response
 }
 
 fn fake_response_status(label: &str) -> StatusCode {

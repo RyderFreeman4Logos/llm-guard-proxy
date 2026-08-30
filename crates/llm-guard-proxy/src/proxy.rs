@@ -6221,12 +6221,15 @@ fn forward_rewritten_endpoint_response(
         BTreeMap::new(),
         RawPayloads::default(),
     );
+    let body_len = rewritten.body.len();
     let response_body =
         ObservedBufferedBody::new(rewritten.body, observer, in_flight_permit, shutdown);
     downstream_response(
         rewritten.status,
         &response_headers,
         Body::from_stream(response_body),
+        true,
+        Some(body_len),
     )
 }
 
@@ -6316,6 +6319,7 @@ async fn forward_merged_models_response(
     );
     let body =
         model_metadata::enrich_models_body(context.config, metadata_config, merged_body.body);
+    let body_len = body.len();
     let response_parts = ForwardedResponseParts {
         config: context.state.config.clone(),
         store: context.state.store.clone(),
@@ -6350,6 +6354,8 @@ async fn forward_merged_models_response(
         upstream_status,
         &upstream_headers,
         Body::from_stream(response_body),
+        true,
+        Some(body_len),
     ))
 }
 
@@ -9314,6 +9320,7 @@ impl ShieldedRetryCause {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn forward_upstream_response(
     dispatch: ResponseDispatch<'_>,
     response_parts: ForwardedResponseParts,
@@ -9371,12 +9378,15 @@ async fn forward_upstream_response(
             }
             let shutdown = response_parts.shutdown_subscription();
             let observer = response_parts.into_observer();
+            let body_len = body.len();
             let response_body =
                 ObservedBufferedBody::new(body, observer, in_flight_permit, shutdown);
             let response = downstream_response(
                 upstream_status,
                 &upstream_headers,
                 Body::from_stream(response_body),
+                true,
+                Some(body_len),
             );
             return Ok(validate_non_stream_chat_completion_response(
                 response,
@@ -9386,8 +9396,7 @@ async fn forward_upstream_response(
             )
             .await);
         }
-        Some(rewrite) => Some(rewrite),
-        None => None,
+        rewrite => rewrite,
     };
     if response_model_rewrite.is_some() {
         upstream_headers.remove(CONTENT_LENGTH);
@@ -9400,6 +9409,7 @@ async fn forward_upstream_response(
         in_flight_permit,
         shutdown,
     );
+    let body_transformed = response_model_rewrite.is_some();
     let response_body = match response_model_rewrite {
         Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
             response_body,
@@ -9408,7 +9418,13 @@ async fn forward_upstream_response(
         )),
         None => Body::from_stream(response_body),
     };
-    let response = downstream_response(upstream_status, &upstream_headers, response_body);
+    let response = downstream_response(
+        upstream_status,
+        &upstream_headers,
+        response_body,
+        body_transformed,
+        None,
+    );
     Ok(validate_non_stream_chat_completion_response(
         response,
         &request_path,
@@ -10056,6 +10072,7 @@ async fn forward_buffered_models_response(
     response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
     let body = prepare_models_body(config, listener, upstream_profile, body);
     let body = model_metadata::enrich_models_body(config, metadata_config, body);
+    let body_len = body.len();
     let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
     let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit, shutdown);
@@ -10064,6 +10081,8 @@ async fn forward_buffered_models_response(
         upstream_status,
         &upstream_headers,
         Body::from_stream(response_body),
+        true,
+        Some(body_len),
     ))
 }
 
@@ -14807,6 +14826,8 @@ fn shielded_retry_success_response(
     mut outcome: ShieldedAcceptedOutcome,
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
+    let body_transformed =
+        runtime.upstream_profile.upstream_model.is_some() && runtime.model_id.is_some();
     if runtime.upstream_profile.upstream_model.is_some()
         && let Some(client_model) = runtime.model_id.as_deref()
     {
@@ -14826,7 +14847,8 @@ fn shielded_retry_success_response(
         return malformed_choices_error_response(&runtime.request_id);
     }
     let upstream_content_type = upstream_headers.get(CONTENT_TYPE).map(header_value);
-    let response_headers = shielded_chat_response_headers(&upstream_headers, body_len);
+    let response_headers =
+        shielded_chat_response_headers(&upstream_headers, body_len, body_transformed);
     let mut extra_metadata = outcome.response_metadata.clone();
     extra_metadata.extend(effective_liveness::response_metadata(
         &runtime.liveness,
@@ -14988,6 +15010,7 @@ async fn shielded_retry_terminal_forward_response(
         in_flight_permit,
         runtime.shutdown.subscribe(),
     );
+    let body_transformed = response_model_rewrite.is_some();
     let response_body = match response_model_rewrite {
         Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
             response_body,
@@ -14996,7 +15019,13 @@ async fn shielded_retry_terminal_forward_response(
         )),
         None => Body::from_stream(response_body),
     };
-    let response = downstream_response(upstream_status, &upstream_headers, response_body);
+    let response = downstream_response(
+        upstream_status,
+        &upstream_headers,
+        response_body,
+        body_transformed,
+        None,
+    );
     validate_non_stream_chat_completion_response(
         response,
         &request_path,
@@ -15054,6 +15083,7 @@ async fn shielded_retry_direct_relay_response(
         runtime.shutdown.subscribe(),
         Some(outcome.request_deadline),
     );
+    let body_transformed = response_model_rewrite.is_some();
     let response_body = match response_model_rewrite {
         Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
             response_body,
@@ -15062,7 +15092,13 @@ async fn shielded_retry_direct_relay_response(
         )),
         None => Body::from_stream(response_body),
     };
-    let response = downstream_response(upstream_status, &upstream_headers, response_body);
+    let response = downstream_response(
+        upstream_status,
+        &upstream_headers,
+        response_body,
+        body_transformed,
+        None,
+    );
     validate_non_stream_chat_completion_response(
         response,
         &request_path,
@@ -16423,9 +16459,16 @@ fn downstream_response(
     status: reqwest::StatusCode,
     upstream_headers: &HeaderMap,
     body: Body,
+    body_transformed: bool,
+    body_len: Option<usize>,
 ) -> Response<Body> {
     let mut headers = HeaderMap::new();
-    copy_response_headers(upstream_headers, &mut headers);
+    copy_response_headers(upstream_headers, &mut headers, body_transformed);
+    if let Some(body_len) = body_len
+        && let Ok(content_length) = HeaderValue::from_str(&body_len.to_string())
+    {
+        headers.insert(CONTENT_LENGTH, content_length);
+    }
     response_with_headers(status, headers, body)
 }
 
@@ -16457,9 +16500,13 @@ fn response_with_headers(
     response
 }
 
-fn shielded_chat_response_headers(upstream_headers: &HeaderMap, body_len: usize) -> HeaderMap {
+fn shielded_chat_response_headers(
+    upstream_headers: &HeaderMap,
+    body_len: usize,
+    body_transformed: bool,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    copy_response_headers(upstream_headers, &mut headers);
+    copy_response_headers(upstream_headers, &mut headers, body_transformed);
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Ok(content_length) = HeaderValue::from_str(&body_len.to_string()) {
         headers.insert(CONTENT_LENGTH, content_length);
@@ -16472,7 +16519,7 @@ fn shielded_chat_stream_response_headers(
     mode: ShieldedLivenessMode,
 ) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    copy_response_headers(upstream_headers, &mut headers);
+    copy_response_headers(upstream_headers, &mut headers, true);
     let content_type = match mode {
         ShieldedLivenessMode::Sse => "text/event-stream",
         ShieldedLivenessMode::JsonWhitespace | ShieldedLivenessMode::Disabled => "application/json",
@@ -16626,10 +16673,10 @@ fn forwarded_request_headers(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
-fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
+fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap, body_transformed: bool) {
     let connection_tokens = connection_header_tokens(source);
     for (name, value) in source {
-        if should_skip_response_header(name, &connection_tokens) {
+        if should_skip_response_header(name, &connection_tokens, body_transformed) {
             continue;
         }
         target.append(name.clone(), value.clone());
@@ -16644,8 +16691,33 @@ fn should_skip_request_header(name: &HeaderName, connection_tokens: &HashSet<Hea
         || connection_tokens.contains(name)
 }
 
-fn should_skip_response_header(name: &HeaderName, connection_tokens: &HashSet<HeaderName>) -> bool {
-    name == CONTENT_LENGTH || is_hop_by_hop_header(name) || connection_tokens.contains(name)
+fn should_skip_response_header(
+    name: &HeaderName,
+    connection_tokens: &HashSet<HeaderName>,
+    body_transformed: bool,
+) -> bool {
+    name == CONTENT_LENGTH
+        || is_hop_by_hop_header(name)
+        || connection_tokens.contains(name)
+        || (body_transformed && is_body_bound_response_header(name))
+}
+
+fn is_body_bound_response_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "content-encoding"
+            | "content-md5"
+            | "digest"
+            | "content-digest"
+            | "repr-digest"
+            | "etag"
+            | "signature"
+            | "signature-input"
+            | "if-match"
+            | "if-none-match"
+            | "if-modified-since"
+            | "if-unmodified-since"
+    )
 }
 
 fn is_hop_by_hop_header(name: &HeaderName) -> bool {

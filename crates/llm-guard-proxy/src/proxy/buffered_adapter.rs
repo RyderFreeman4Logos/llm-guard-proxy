@@ -364,6 +364,7 @@ pub(super) async fn rewrite_buffered_adapter_response_from_upstream(
     {
         body = rewrite_json_response_model_body(&body, &response_headers, alias);
     }
+    let body_len = body.len();
     let stream_cancel = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer_with(
         downstream_mode_from_headers(&response_headers),
@@ -380,6 +381,8 @@ pub(super) async fn rewrite_buffered_adapter_response_from_upstream(
         upstream_status,
         &response_headers,
         Body::from_stream(response_body),
+        true,
+        Some(body_len),
     ))
 }
 

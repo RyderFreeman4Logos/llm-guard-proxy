@@ -677,6 +677,77 @@ repetition_penalty = 1.0
 }
 
 #[tokio::test]
+async fn forced_alias_body_rewrite_drops_stale_response_representation_headers() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[[forced_model_alias_profiles]]
+alias = "public-forced-alias"
+upstream_model = "canonical-target"
+thinking_mode = "force_disable"
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/completions?test=forced-response-integrity-headers")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"model":"public-forced-alias","prompt":"ping"}"#,
+            ))
+            .expect("forced completion request should build"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-upstream-endpoint").unwrap(),
+        "forced-alias-integrity"
+    );
+    for header in [
+        "content-encoding",
+        "content-md5",
+        "digest",
+        "content-digest",
+        "repr-digest",
+        "etag",
+        "signature",
+        "signature-input",
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+    ] {
+        assert!(
+            response.headers().get(header).is_none(),
+            "rewritten response must not retain {header}"
+        );
+    }
+    let content_length = response.headers().get(CONTENT_LENGTH).cloned();
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("forced chat response should be readable");
+    let body_json: serde_json::Value =
+        serde_json::from_slice(&body).expect("forced chat response should be JSON");
+    assert_eq!(body_json["model"], "public-forced-alias");
+    assert_eq!(
+        content_length.as_ref().unwrap(),
+        body.len().to_string().as_str(),
+        "rewritten response length must be recomputed"
+    );
+}
+
+#[tokio::test]
 async fn forced_alias_rewrites_sanitize_bound_headers_but_preserve_origin_authentication() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_extra_config(
