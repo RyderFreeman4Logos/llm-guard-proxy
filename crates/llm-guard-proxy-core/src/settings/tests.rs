@@ -4521,8 +4521,8 @@ fn _assert_error_types_are_send_sync() {
 fn forced_model_alias_policy_profiles_parse_validate_and_hot_reload() {
     let valid = r#"
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-none"
-upstream_model = "aeon-ultimate"
+alias = "abliterated-qwen-latest-27b-none"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
 temperature = 0.7
@@ -4539,11 +4539,11 @@ repetition_penalty = 1.0
 
     for invalid in [
         valid.replace(
-            "alias = \"abliterated-qwen-latest-27b-nvfp4-none\"",
+            "alias = \"abliterated-qwen-latest-27b-none\"",
             "alias = \" \"",
         ),
         format!(
-            "{valid}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-nvfp4-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
+            "{valid}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
         ),
         valid.replace("temperature = 0.7", "temperature = nan"),
         valid.replace("top_p = 0.8", "top_p = 1.1"),
@@ -4570,8 +4570,8 @@ fn forced_model_alias_collision_with_model_aliases_is_rejected_at_startup() {
     let config = parse_config_text(
         r#"
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-none"
-upstream_model = "aeon-ultimate"
+alias = "abliterated-qwen-latest-27b-none"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
 temperature = 0.7
@@ -4582,7 +4582,7 @@ presence_penalty = 1.5
 repetition_penalty = 1.0
 
 [[model_aliases]]
-id = "abliterated-qwen-latest-27b-nvfp4-none"
+id = "abliterated-qwen-latest-27b-none"
 kind = "upstream"
 upstream_profile = "default"
 "#,

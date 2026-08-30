@@ -23,7 +23,7 @@ AEON_RESTART_COMMAND = [
 ]
 RECOVERY_COMPLETION_GUARD_MS = 1_000
 FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
-    "abliterated-qwen-latest-27b-nvfp4-none": {
+    "abliterated-qwen-latest-27b-none": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_disable",
         "output_cap": 16_384,
@@ -34,7 +34,7 @@ FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
         "presence_penalty": 1.5,
         "repetition_penalty": 1.0,
     },
-    "abliterated-qwen-latest-27b-nvfp4-low": {
+    "abliterated-qwen-latest-27b-low": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_thinking",
         "thinking_budget": 65_536,
@@ -46,7 +46,7 @@ FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
         "presence_penalty": 0,
         "repetition_penalty": 1,
     },
-    "abliterated-qwen-latest-27b-nvfp4-medium": {
+    "abliterated-qwen-latest-27b-medium": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_thinking",
         "thinking_budget": 65_536,

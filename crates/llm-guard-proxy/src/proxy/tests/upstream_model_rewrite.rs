@@ -4,8 +4,8 @@ use super::*;
 
 const FORCED_MODEL_ALIAS_PROFILES_CONFIG: &str = r#"
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-none"
-upstream_model = "aeon-ultimate"
+alias = "abliterated-qwen-latest-27b-none"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
 temperature = 0.7
@@ -16,8 +16,8 @@ presence_penalty = 1.5
 repetition_penalty = 1.0
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-low"
-upstream_model = "aeon-ultimate"
+alias = "abliterated-qwen-latest-27b-low"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
 output_cap = 16384
@@ -29,8 +29,8 @@ presence_penalty = 0.0
 repetition_penalty = 1.0
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-medium"
-upstream_model = "aeon-ultimate"
+alias = "abliterated-qwen-latest-27b-medium"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
 output_cap = 16384
@@ -41,6 +41,234 @@ min_p = 0.0
 presence_penalty = 0.0
 repetition_penalty = 1.0
 "#;
+
+#[tokio::test]
+async fn guard_listener_rejects_reserved_forced_alias_upstream_model_before_forwarding() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy =
+        ProxyFixture::spawn_with_extra_config(&fake.base_url, FORCED_MODEL_ALIAS_PROFILES_CONFIG)
+            .await;
+    let guard_state = proxy.state.for_listener(ListenerConfig {
+        name: String::from("guard"),
+        bind_host: String::from("127.0.0.1"),
+        port: 18009,
+        allowed_upstreams: None,
+        upstream_profile: None,
+    });
+
+    for (path, body) in [
+        (
+            "/v1/chat/completions",
+            r#"{"model":"abliterated-qwen-latest-27b-nvfp4","messages":[]}"#,
+        ),
+        (
+            "/v1/completions",
+            r#"{"model":"abliterated-qwen-latest-27b-nvfp4","prompt":"ping"}"#,
+        ),
+        (
+            "/v1/embeddings",
+            r#"{"model":"abliterated-qwen-latest-27b-nvfp4","input":"ping"}"#,
+        ),
+    ] {
+        let response = proxy_handler(
+            State(guard_state.clone()),
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body))
+                .expect("reserved-model request should build"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+            .await
+            .expect("rejection body should be readable");
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("rejection body should be UTF-8")
+                .contains("reserved for a forced alias"),
+            "{path} must return the deterministic reservation error"
+        );
+        assert_no_upstream_request(&mut fake).await;
+    }
+
+    let retired_alias = format!("{}-none", "abliterated-qwen-latest-27b-nvfp4");
+    let response = proxy_handler(
+        State(guard_state),
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"model":"{retired_alias}","messages":[]}}"#
+            )))
+            .expect("retired alias request should build"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let observed = fake.recv_next().await;
+    let observed: serde_json::Value =
+        serde_json::from_slice(&observed.body).expect("retired alias request should be JSON");
+    assert_eq!(
+        observed["model"], retired_alias,
+        "retired spelling must not activate the forced canonical rewrite"
+    );
+}
+
+#[tokio::test]
+async fn guard_listener_hides_reserved_forced_alias_upstream_model_from_models() {
+    let models = r#"{"object":"list","data":[{"id":"abliterated-qwen-latest-27b-nvfp4","object":"model"},{"id":"unrelated-model","object":"model"}]}"#;
+    let fake = FakeUpstream::spawn_with_models_body(models).await;
+    let proxy =
+        ProxyFixture::spawn_with_extra_config(&fake.base_url, FORCED_MODEL_ALIAS_PROFILES_CONFIG)
+            .await;
+    let guard_state = proxy.state.for_listener(ListenerConfig {
+        name: String::from("guard"),
+        bind_host: String::from("127.0.0.1"),
+        port: 18009,
+        allowed_upstreams: None,
+        upstream_profile: None,
+    });
+
+    let response = proxy_handler(
+        State(guard_state),
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models?test=distinct-multi-upstream-models")
+            .body(Body::empty())
+            .expect("models request should build"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models response should be readable");
+    let models: serde_json::Value = serde_json::from_slice(&body).expect("models response JSON");
+    let model_ids = models["data"]
+        .as_array()
+        .expect("models response data")
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect::<Vec<_>>();
+    assert!(!model_ids.contains(&"abliterated-qwen-latest-27b-nvfp4"));
+    assert!(
+        model_ids.contains(&"unrelated-model"),
+        "unrelated model must remain visible; got {model_ids:?}"
+    );
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)]
+async fn guard_listener_hot_reload_updates_reserved_identity_with_alias_generation() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy =
+        ProxyFixture::spawn_with_extra_config(&fake.base_url, FORCED_MODEL_ALIAS_PROFILES_CONFIG)
+            .await;
+    let guard_state = proxy.state.for_listener(ListenerConfig {
+        name: String::from("guard"),
+        bind_host: String::from("127.0.0.1"),
+        port: 18009,
+        allowed_upstreams: None,
+        upstream_profile: None,
+    });
+    let reserved = |model| {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(format!(
+                r#"{{"model":"{model}","messages":[]}}"#
+            )))
+            .expect("reservation request should build")
+    };
+
+    let response = proxy_handler(
+        State(guard_state.clone()),
+        reserved("abliterated-qwen-latest-27b-nvfp4"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_no_upstream_request(&mut fake).await;
+
+    let replacement = proxy.root.join("config.next");
+    let changed = std::fs::read_to_string(proxy.root.join("config.toml"))
+        .expect("read fixture config")
+        .replace(
+            "abliterated-qwen-latest-27b-none",
+            "abliterated-qwen-latest-27b-none-reloaded",
+        )
+        .replace(
+            "abliterated-qwen-latest-27b-low",
+            "abliterated-qwen-latest-27b-low-reloaded",
+        )
+        .replace(
+            "abliterated-qwen-latest-27b-medium",
+            "abliterated-qwen-latest-27b-medium-reloaded",
+        )
+        .replace(
+            "abliterated-qwen-latest-27b-nvfp4",
+            "test-reloaded-canonical",
+        );
+    std::fs::write(&replacement, &changed).expect("write changed generation");
+    std::fs::rename(&replacement, proxy.root.join("config.toml"))
+        .expect("publish changed generation");
+    proxy
+        .manager
+        .reload()
+        .expect("reload should apply atomically");
+
+    let response = proxy_handler(
+        State(guard_state.clone()),
+        reserved("abliterated-qwen-latest-27b-nvfp4"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let old_canonical = fake.recv_next().await;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&old_canonical.body)
+            .expect("old canonical request should be JSON")["model"],
+        "abliterated-qwen-latest-27b-nvfp4"
+    );
+
+    let response = proxy_handler(
+        State(guard_state.clone()),
+        reserved("test-reloaded-canonical"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_no_upstream_request(&mut fake).await;
+
+    let response = proxy_handler(
+        State(guard_state.clone()),
+        reserved("abliterated-qwen-latest-27b-none-reloaded"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let rewritten = fake.recv_next().await;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&rewritten.body)
+            .expect("reloaded alias request should be JSON")["model"],
+        "test-reloaded-canonical"
+    );
+
+    std::fs::write(
+        &replacement,
+        format!(
+            "{changed}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-none-reloaded\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
+        ),
+    )
+    .expect("write invalid generation");
+    std::fs::rename(&replacement, proxy.root.join("config.toml"))
+        .expect("publish invalid generation");
+    proxy
+        .manager
+        .reload()
+        .expect_err("invalid reload must retain the complete last-good generation");
+    let response = proxy_handler(State(guard_state), reserved("test-reloaded-canonical")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_no_upstream_request(&mut fake).await;
+}
 
 #[tokio::test]
 async fn upstream_model_rewrites_request_and_response_model_names() {
@@ -309,7 +537,7 @@ fn assert_opaque_nested_extensions_preserved(body: &serde_json::Value) {
 }
 
 fn assert_forced_model_alias_wire_body(body: &serde_json::Value) {
-    assert_eq!(body["model"], "aeon-ultimate");
+    assert_eq!(body["model"], "abliterated-qwen-latest-27b-nvfp4");
     assert_eq!(body["temperature"], 0.7);
     assert_eq!(body["top_p"], 0.8);
     assert_eq!(body["top_k"], 20);
@@ -389,7 +617,7 @@ async fn assert_forced_retry_attempts(
             serde_json::from_slice(&observed.body).expect("attempt body should be JSON");
         assert_eq!(
             body["model"],
-            "aeon-ultimate",
+            "abliterated-qwen-latest-27b-nvfp4",
             "forced alias must survive physical attempt {}",
             attempt + 1
         );
@@ -441,8 +669,8 @@ async fn forced_model_alias_policy_rewrites_streaming_and_non_streaming_requests
         &fake.base_url,
         r#"
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-none"
-upstream_model = "aeon-ultimate"
+alias = "abliterated-qwen-latest-27b-none"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
 temperature = 0.7
@@ -460,13 +688,12 @@ repetition_penalty = 1.0
             .post(format!("{}/v1/chat/completions", proxy.base_url))
             .header(CONTENT_TYPE, "application/json")
             .body(format!(
-                r#"{{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[{{"role":"user","content":"ping"}}],"stream":{stream},"reasoning_effort":"high","model_reasoning_effort":"high","thinking_token_budget":999,"thinking_budget":999,"enable_thinking":false,"temperature":9,"top_p":9,"top_k":9,"min_p":9,"presence_penalty":9,"frequency_penalty":9,"repetition_penalty":9,"max_completion_tokens":9,"extra_body":{{"temperature":8,"max_tokens":8,"frequency_penalty":8,"thinking":{{"enabled":true,"budget_tokens":8}},"chat_template_kwargs":{{"enable_thinking":true,"thinking_budget":8}}}},"arbitrary":{{"reasoning_effort":"high","max_output_tokens":8,"frequency_penalty":8,"children":[{{"min_p":8,"output_tokens":8,"frequency_penalty":8}},[{{"frequency_penalty":8}}]]}}}}"#
+                r#"{{"model":"abliterated-qwen-latest-27b-none","messages":[{{"role":"user","content":"ping"}}],"stream":{stream},"reasoning_effort":"high","model_reasoning_effort":"high","thinking_token_budget":999,"thinking_budget":999,"enable_thinking":false,"temperature":9,"top_p":9,"top_k":9,"min_p":9,"presence_penalty":9,"frequency_penalty":9,"repetition_penalty":9,"max_completion_tokens":9,"extra_body":{{"temperature":8,"max_tokens":8,"frequency_penalty":8,"thinking":{{"enabled":true,"budget_tokens":8}},"chat_template_kwargs":{{"enable_thinking":true,"thinking_budget":8}}}},"arbitrary":{{"reasoning_effort":"high","max_output_tokens":8,"frequency_penalty":8,"children":[{{"min_p":8,"output_tokens":8,"frequency_penalty":8}},[{{"frequency_penalty":8}}]]}}}}"#
             ))
             .send()
             .await
             .expect("forced policy request should complete");
-        assert_forced_response_model(response, stream, "abliterated-qwen-latest-27b-nvfp4-none")
-            .await;
+        assert_forced_response_model(response, stream, "abliterated-qwen-latest-27b-none").await;
         let observed = fake.recv_next().await;
         let body: serde_json::Value =
             serde_json::from_slice(&observed.body).expect("JSON upstream body");
@@ -486,7 +713,7 @@ repetition_penalty = 1.0
         .client
         .post(format!("{}/v1/chat/completions", proxy.base_url))
         .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[],"stream":false}"#)
+        .body(r#"{"model":"abliterated-qwen-latest-27b-none","messages":[],"stream":false}"#)
         .send()
         .await
         .expect("reloaded request should complete");
@@ -498,7 +725,7 @@ repetition_penalty = 1.0
     std::fs::write(
         &replacement,
         format!(
-            "{changed}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-nvfp4-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
+            "{changed}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
         ),
     )
     .expect("write colliding generation");
@@ -512,7 +739,7 @@ repetition_penalty = 1.0
         .client
         .post(format!("{}/v1/chat/completions", proxy.base_url))
         .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[],"stream":false}"#)
+        .body(r#"{"model":"abliterated-qwen-latest-27b-none","messages":[],"stream":false}"#)
         .send()
         .await
         .expect("last-good request should complete");
@@ -556,7 +783,7 @@ max_tokens = 50000
 
     for (alias, thinking, budget, temperature, top_p, presence_penalty) in [
         (
-            "abliterated-qwen-latest-27b-nvfp4-none",
+            "abliterated-qwen-latest-27b-none",
             false,
             None,
             0.7,
@@ -564,7 +791,7 @@ max_tokens = 50000
             1.5,
         ),
         (
-            "abliterated-qwen-latest-27b-nvfp4-low",
+            "abliterated-qwen-latest-27b-low",
             true,
             Some(65536),
             1.0,
@@ -572,7 +799,7 @@ max_tokens = 50000
             0.0,
         ),
         (
-            "abliterated-qwen-latest-27b-nvfp4-medium",
+            "abliterated-qwen-latest-27b-medium",
             true,
             Some(65536),
             1.0,

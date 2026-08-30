@@ -125,6 +125,7 @@ const IN_FLIGHT_CAPACITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100)
 const ADMISSION_RETRY_AFTER_SECS: u32 = 1;
 const TOKEN_USAGE_BODY_CAP: usize = 64 * 1024;
 const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
+const GUARD_PUBLIC_LISTENER_PORT: u16 = 18_009;
 const PAIRED_SAMPLE_DENOMINATOR: u64 = 1_000_000;
 const SERVER_SHUTDOWN_ABORT_REASON: &str = "server_shutdown";
 const PROXY_SHUTTING_DOWN_ERROR_TYPE: &str = "proxy_shutting_down";
@@ -3875,6 +3876,11 @@ fn prepare_openai_forward_request(
     #[cfg(feature = "guard")]
     add_caller_profile_metadata(request_metadata, &caller_profile);
     let model_id = extract_model_id(method, uri, body);
+    if model_id.as_deref().is_some_and(|model| {
+        is_reserved_forced_alias_upstream_model(config, &state.listener, model)
+    }) {
+        return Err(ProxyError::reserved_forced_alias_upstream_model());
+    }
     #[cfg(feature = "guard")]
     enforce_caller_profile_policy(&caller_profile, model_id.as_deref())?;
     #[cfg(feature = "guard")]
@@ -3990,6 +3996,21 @@ fn forced_model_alias_policy<'config>(
         .forced_model_alias_profiles
         .iter()
         .find(|policy| Some(policy.alias.as_str()) == model_id)
+}
+
+/// A forced alias's upstream model is private on the public Guard listener.
+/// The reservation is derived from the request's immutable config snapshot so
+/// reloads cannot expose a new canonical identity before its alias is active.
+fn is_reserved_forced_alias_upstream_model(
+    config: &AppConfig,
+    listener: &ListenerConfig,
+    model: &str,
+) -> bool {
+    listener.port == GUARD_PUBLIC_LISTENER_PORT
+        && config
+            .forced_model_alias_profiles
+            .iter()
+            .any(|policy| policy.upstream_model == model)
 }
 
 fn forced_model_alias_policy_body(
@@ -9951,19 +9972,39 @@ fn filter_models_body_for_listener(
     listener: &ListenerConfig,
     body: Bytes,
 ) -> Bytes {
-    if let Some(profile_name) = listener.upstream_profile.as_deref() {
+    if listener.port != GUARD_PUBLIC_LISTENER_PORT {
+        if let Some(profile_name) = listener.upstream_profile.as_deref() {
+            let Some(profile) = config.upstream_profile_by_name(profile_name) else {
+                return body;
+            };
+            return model_metadata::filter_models_body_by_id(body, |model_id| {
+                profile.match_models.is_empty() || profile.matches_model(model_id)
+            });
+        }
+        if listener.allowed_upstreams.is_none() {
+            return body;
+        }
+        return model_metadata::filter_models_body_by_id(body, |model_id| {
+            select_allowed_upstream_profile(config, listener, Some(model_id)).is_ok()
+        });
+    }
+
+    let body = if let Some(profile_name) = listener.upstream_profile.as_deref() {
         let Some(profile) = config.upstream_profile_by_name(profile_name) else {
             return body;
         };
-        return model_metadata::filter_models_body_by_id(body, |model_id| {
+        model_metadata::filter_models_body_by_id(body, |model_id| {
             profile.match_models.is_empty() || profile.matches_model(model_id)
-        });
-    }
-    if listener.allowed_upstreams.is_none() {
-        return body;
-    }
+        })
+    } else if listener.allowed_upstreams.is_none() {
+        body
+    } else {
+        model_metadata::filter_models_body_by_id(body, |model_id| {
+            select_allowed_upstream_profile(config, listener, Some(model_id)).is_ok()
+        })
+    };
     model_metadata::filter_models_body_by_id(body, |model_id| {
-        select_allowed_upstream_profile(config, listener, Some(model_id)).is_ok()
+        !is_reserved_forced_alias_upstream_model(config, listener, model_id)
     })
 }
 
@@ -18681,6 +18722,19 @@ impl ProxyError {
             param: estimate.param,
             code: "context_budget_exceeded",
             request_metadata: Some(estimate.metadata("rejected")),
+            attempts: Vec::new(),
+        }
+    }
+
+    fn reserved_forced_alias_upstream_model() -> Self {
+        Self::ContextBudgetExceeded {
+            message: String::from("requested model is reserved for a forced alias"),
+            param: "model",
+            code: "reserved_forced_alias_upstream_model",
+            request_metadata: Some(BTreeMap::from([(
+                String::from("model_reservation"),
+                String::from("forced_alias_upstream"),
+            )])),
             attempts: Vec::new(),
         }
     }

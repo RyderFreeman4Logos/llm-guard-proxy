@@ -148,7 +148,7 @@ async fn forced_alias_policy_survives_each_endpoint_failover_physical_attempt() 
 
     for (alias, stream, thinking, budget, temperature, top_p, presence_penalty) in [
         (
-            "abliterated-qwen-latest-27b-nvfp4-none",
+            "abliterated-qwen-latest-27b-none",
             false,
             false,
             None,
@@ -157,7 +157,7 @@ async fn forced_alias_policy_survives_each_endpoint_failover_physical_attempt() 
             1.5,
         ),
         (
-            "abliterated-qwen-latest-27b-nvfp4-none",
+            "abliterated-qwen-latest-27b-none",
             true,
             false,
             None,
@@ -166,7 +166,7 @@ async fn forced_alias_policy_survives_each_endpoint_failover_physical_attempt() 
             1.5,
         ),
         (
-            "abliterated-qwen-latest-27b-nvfp4-low",
+            "abliterated-qwen-latest-27b-low",
             false,
             true,
             Some(65536),
@@ -175,7 +175,7 @@ async fn forced_alias_policy_survives_each_endpoint_failover_physical_attempt() 
             0.0,
         ),
         (
-            "abliterated-qwen-latest-27b-nvfp4-low",
+            "abliterated-qwen-latest-27b-low",
             true,
             true,
             Some(65536),
@@ -184,7 +184,7 @@ async fn forced_alias_policy_survives_each_endpoint_failover_physical_attempt() 
             0.0,
         ),
         (
-            "abliterated-qwen-latest-27b-nvfp4-medium",
+            "abliterated-qwen-latest-27b-medium",
             false,
             true,
             Some(65536),
@@ -193,7 +193,7 @@ async fn forced_alias_policy_survives_each_endpoint_failover_physical_attempt() 
             0.0,
         ),
         (
-            "abliterated-qwen-latest-27b-nvfp4-medium",
+            "abliterated-qwen-latest-27b-medium",
             true,
             true,
             Some(65536),
@@ -231,7 +231,7 @@ async fn canonical_reranker_failover_reapplies_forced_alias_policy_and_metadata(
         .client
         .post(format!("{}/v1/rerank", proxy.base_url))
         .json(&json!({
-            "model": "abliterated-qwen-latest-27b-nvfp4-low",
+            "model": "abliterated-qwen-latest-27b-low",
             "query": "forced canonical reranker failover",
             "documents": ["document"],
         }))
@@ -250,18 +250,18 @@ async fn canonical_reranker_failover_reapplies_forced_alias_policy_and_metadata(
     ] {
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("reranker attempt body should be JSON");
-        assert_eq!(body["model"], "aeon-ultimate");
+        assert_eq!(body["model"], "abliterated-qwen-latest-27b-nvfp4");
     }
 
     let metadata = read_attempt_request_metadata_rows(&proxy.sqlite_path);
     assert_eq!(metadata.len(), 2);
     for attempt in metadata {
         let metadata = attempt.request_metadata;
+        assert_eq!(metadata["forced_alias"], "abliterated-qwen-latest-27b-low");
         assert_eq!(
-            metadata["forced_alias"],
-            "abliterated-qwen-latest-27b-nvfp4-low"
+            metadata["forced_upstream_model"],
+            "abliterated-qwen-latest-27b-nvfp4"
         );
-        assert_eq!(metadata["forced_upstream_model"], "aeon-ultimate");
         assert_eq!(metadata["forced_thinking_mode"], "");
         assert_eq!(metadata["forced_thinking_budget"], "none");
         assert_eq!(metadata["forced_answer_headroom"], "");
@@ -400,7 +400,7 @@ async fn assert_forced_alias_failover_attempts(
     ] {
         let body: serde_json::Value =
             serde_json::from_slice(&request.body).expect("physical attempt body should be JSON");
-        assert_eq!(body["model"], "aeon-ultimate");
+        assert_eq!(body["model"], "abliterated-qwen-latest-27b-nvfp4");
         assert_eq!(body["temperature"], temperature);
         assert_eq!(body["top_p"], top_p);
         assert_eq!(body["top_k"], 20);
@@ -440,7 +440,7 @@ shielded_streaming_enabled = true
 [[upstreams]]
 name = "forced-failover"
 base_url = "{primary_base_url}"
-match_models = ["abliterated-qwen-latest-27b-nvfp4-none", "abliterated-qwen-latest-27b-nvfp4-low", "abliterated-qwen-latest-27b-nvfp4-medium"]
+match_models = ["abliterated-qwen-latest-27b-none", "abliterated-qwen-latest-27b-low", "abliterated-qwen-latest-27b-medium"]
 request_timeout_ms = 1000
 health_probe_interval_ms = 200
 health_probe_timeout_ms = 20
@@ -461,8 +461,8 @@ protocol = "openai"
 
 const FORCED_ALIAS_PROFILES: &str = r#"
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-none"
-upstream_model = "aeon-ultimate"
+alias = "abliterated-qwen-latest-27b-none"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
 temperature = 0.7
@@ -472,8 +472,8 @@ min_p = 0.0
 presence_penalty = 1.5
 repetition_penalty = 1.0
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-low"
-upstream_model = "aeon-ultimate"
+alias = "abliterated-qwen-latest-27b-low"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
 output_cap = 16384
@@ -484,8 +484,8 @@ min_p = 0.0
 presence_penalty = 0.0
 repetition_penalty = 1.0
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-medium"
-upstream_model = "aeon-ultimate"
+alias = "abliterated-qwen-latest-27b-medium"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
 output_cap = 16384
