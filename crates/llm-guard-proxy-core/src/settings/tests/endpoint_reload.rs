@@ -126,3 +126,60 @@ protocol = "openai"
 
     assert_endpoint_reload_applied(&current, &requested);
 }
+
+fn forced_alias_reload_config(match_model: &str, forced_upstream_model: &str) -> AppConfig {
+    let config = AppConfig::parse(&format!(
+        r#"
+[[upstreams]]
+name = "forced-target"
+base_url = "http://profile.example/v1"
+match_models = ["{match_model}"]
+
+[[forced_model_alias_profiles]]
+alias = "forced-public-alias"
+upstream_model = "{forced_upstream_model}"
+thinking_mode = "force_disable"
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#
+    ))
+    .expect("forced alias reload fixture should parse");
+    config
+        .validate()
+        .expect("forced alias reload fixture should validate");
+    config
+}
+
+#[test]
+fn forced_aliases_follow_retained_upstream_routing_generation() {
+    let current = forced_alias_reload_config("current-canonical", "current-canonical");
+    let requested = forced_alias_reload_config("requested-canonical", "requested-canonical");
+
+    let (next, outcome) = apply_reloadable(&current, &requested);
+
+    assert!(
+        outcome
+            .restart_required_changes
+            .iter()
+            .any(|change| change.field == "upstreams.topology")
+    );
+    assert_eq!(next.upstream_profiles, current.upstream_profiles);
+    assert_eq!(
+        next.forced_model_alias_profiles, current.forced_model_alias_profiles,
+        "forced aliases must stay in the routing generation retained for restart"
+    );
+
+    let alias_only_requested =
+        forced_alias_reload_config("current-canonical", "reloaded-canonical");
+    let (next, outcome) = apply_reloadable(&current, &alias_only_requested);
+    assert!(outcome.applied);
+    assert_eq!(
+        next.forced_model_alias_profiles, alias_only_requested.forced_model_alias_profiles,
+        "forced-alias-only reloads remain live when routing topology is unchanged"
+    );
+}

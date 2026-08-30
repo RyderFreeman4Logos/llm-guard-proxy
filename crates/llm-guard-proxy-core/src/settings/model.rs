@@ -981,8 +981,6 @@ impl AppConfig {
         self.heartbeat = requested.heartbeat.clone();
         self.cloudflare = requested.cloudflare.clone();
         self.guardian.clone_from(&requested.guardian);
-        self.forced_model_alias_profiles
-            .clone_from(&requested.forced_model_alias_profiles);
         #[cfg(feature = "guard")]
         {
             self.profiles.clone_from(&requested.profiles);
@@ -1011,6 +1009,8 @@ impl AppConfig {
         self.upstream.stuck_watchdog = requested.upstream.stuck_watchdog.clone();
         self.upstream.restart_queue = requested.upstream.restart_queue.clone();
         if self.upstream_profiles_topology_matches(requested) {
+            self.forced_model_alias_profiles
+                .clone_from(&requested.forced_model_alias_profiles);
             self.apply_reloadable_upstream_profile_fields(requested);
         }
     }
