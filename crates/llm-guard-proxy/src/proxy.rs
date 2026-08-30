@@ -5362,11 +5362,11 @@ fn coerce_cache_priority_hint(body: &Bytes, profile: &UpstreamProfileConfig) -> 
 /// Rewrites the top-level `model` field in a response JSON body back to the
 /// client's original model alias when an upstream model rewrite was applied.
 /// Falls back to the original body for non-JSON or non-object payloads.
-fn rewrite_response_model_body(body: &Bytes, client_model: &str) -> Bytes {
+fn rewrite_response_model_body(body: &Bytes, client_model: &str) -> (Bytes, bool) {
     rewrite_response_model_body_with_field(body, client_model, "model", false)
 }
 
-fn rewrite_response_model_detail_body(body: &Bytes, client_model: &str) -> Bytes {
+fn rewrite_response_model_detail_body(body: &Bytes, client_model: &str) -> (Bytes, bool) {
     rewrite_response_model_body_with_field(body, client_model, "id", true)
 }
 
@@ -5374,7 +5374,7 @@ fn rewrite_response_body_for_request(
     body: &Bytes,
     client_model: &str,
     request_path: &str,
-) -> Bytes {
+) -> (Bytes, bool) {
     if model_detail_id_from_path(request_path)
         .ok()
         .flatten()
@@ -5391,12 +5391,12 @@ fn rewrite_response_model_body_with_field(
     client_model: &str,
     field: &str,
     remove_model: bool,
-) -> Bytes {
+) -> (Bytes, bool) {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return body.clone();
+        return (body.clone(), false);
     };
     let Some(object) = value.as_object_mut() else {
-        return body.clone();
+        return (body.clone(), false);
     };
     object.insert(
         String::from(field),
@@ -5405,18 +5405,20 @@ fn rewrite_response_model_body_with_field(
     if remove_model {
         object.remove("model");
     }
-    Bytes::from(value.to_string())
+    let rewritten = Bytes::from(value.to_string());
+    let transformed = rewritten != *body;
+    (rewritten, transformed)
 }
 
 pub(super) fn rewrite_json_response_model_body(
     body: &Bytes,
     headers: &HeaderMap,
     client_model: &str,
-) -> Bytes {
+) -> (Bytes, bool) {
     if response_model_rewrite_mode(headers) == Some(ResponseModelRewriteMode::Json) {
         rewrite_response_model_body(body, client_model)
     } else {
-        body.clone()
+        (body.clone(), false)
     }
 }
 
@@ -5494,7 +5496,8 @@ where
             return Poll::Ready(Some(Ok(rewrite_sse_response_model_body(
                 &frame,
                 &this.client_model,
-            ))));
+            )
+            .0)));
         }
 
         match this.stream.as_mut().poll_next(cx) {
@@ -5512,7 +5515,8 @@ where
                         return Poll::Ready(Some(Ok(rewrite_sse_response_model_body(
                             &frame,
                             &this.client_model,
-                        ))));
+                        )
+                        .0)));
                     }
                 }
                 cx.waker().wake_by_ref();
@@ -5530,10 +5534,10 @@ where
                 let body = this.buffered.split().freeze();
                 let body = match this.mode {
                     ResponseModelRewriteMode::Json => {
-                        rewrite_response_model_body(&body, &this.client_model)
+                        rewrite_response_model_body(&body, &this.client_model).0
                     }
                     ResponseModelRewriteMode::OpenAiSse => {
-                        rewrite_sse_response_model_body(&body, &this.client_model)
+                        rewrite_sse_response_model_body(&body, &this.client_model).0
                     }
                 };
                 Poll::Ready(Some(Ok(body)))
@@ -5588,12 +5592,12 @@ fn take_sse_frame(buffer: &mut BytesMut) -> Option<Bytes> {
     Some(buffer.split_to(end).freeze())
 }
 
-fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> Bytes {
-    let Ok(body) = std::str::from_utf8(body) else {
-        return body.clone();
+fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> (Bytes, bool) {
+    let Ok(body_text) = std::str::from_utf8(body) else {
+        return (body.clone(), false);
     };
-    let mut rewritten = String::with_capacity(body.len());
-    for line in body.split_inclusive('\n') {
+    let mut rewritten = String::with_capacity(body_text.len());
+    for line in body_text.split_inclusive('\n') {
         let (line, line_ending) = line
             .strip_suffix('\n')
             .map_or((line, ""), |line| (line, "\n"));
@@ -5609,14 +5613,16 @@ fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> Bytes {
         let whitespace_length = data.len().saturating_sub(data.trim_start().len());
         let (whitespace, payload) = data.split_at(whitespace_length);
         let payload = Bytes::copy_from_slice(payload.as_bytes());
-        let payload = rewrite_response_model_body(&payload, client_model);
+        let (payload, _payload_transformed) = rewrite_response_model_body(&payload, client_model);
         rewritten.push_str("data:");
         rewritten.push_str(whitespace);
         rewritten.push_str(std::str::from_utf8(&payload).expect("JSON response rewrite is UTF-8"));
         rewritten.push_str(carriage_return);
         rewritten.push_str(line_ending);
     }
-    Bytes::from(rewritten)
+    let rewritten = Bytes::from(rewritten);
+    let transformed = rewritten != *body;
+    (rewritten, transformed)
 }
 
 #[cfg(feature = "guard")]
@@ -6110,7 +6116,7 @@ async fn forward_generic_endpoint_response(
     match upstream_response {
         EndpointResponse::Rewritten(mut rewritten) => {
             if let Some(alias) = public_model_alias.as_deref() {
-                rewritten.body = rewrite_response_model_body(&rewritten.body, alias);
+                rewritten.body = rewrite_response_model_body(&rewritten.body, alias).0;
             }
             Ok(forward_rewritten_endpoint_response(
                 response_parts,
@@ -9321,23 +9327,7 @@ impl ShieldedRetryCause {
     }
 }
 
-fn forwarded_response_body(
-    upstream_headers: &mut HeaderMap,
-    response_body: ObservedUpstreamBody,
-    response_model_rewrite: Option<(ResponseModelRewriteMode, String)>,
-) -> (Body, bool) {
-    if response_model_rewrite.is_some() {
-        upstream_headers.remove(CONTENT_LENGTH);
-    }
-    let body_transformed = response_model_rewrite.is_some();
-    let response_body = match response_model_rewrite {
-        Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
-            response_body,
-            mode,
-            client_model,
-        )),
-        None => Body::from_stream(response_body),
-    };
+fn forwarded_response_body(response_body: Body, body_transformed: bool) -> (Body, bool) {
     (response_body, body_transformed)
 }
 
@@ -9378,46 +9368,49 @@ async fn forward_upstream_response(
     .and_then(|client_model| {
         response_model_rewrite_mode(&upstream_headers).map(|mode| (mode, client_model.to_owned()))
     });
-    let response_model_rewrite = match response_model_rewrite {
-        Some((ResponseModelRewriteMode::Json, client_model)) => {
-            let body = match read_upstream_body_bytes_until_shutdown(
-                upstream_response.bytes_stream(),
-                response_parts.shutdown_subscription(),
-            )
-            .await
-            {
-                Ok(body) => body,
-                Err(error) => return Err(response_parts.into_body_read_error(error)),
-            };
-            response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
-            let body = rewrite_response_body_for_request(&body, &client_model, &request_path);
-            if let Ok(content_length) = HeaderValue::from_str(&body.len().to_string()) {
-                upstream_headers.insert(CONTENT_LENGTH, content_length);
-            } else {
-                upstream_headers.remove(CONTENT_LENGTH);
+    if let Some((mode, client_model)) = response_model_rewrite {
+        let body = match read_upstream_body_bytes_until_shutdown(
+            upstream_response.bytes_stream(),
+            response_parts.shutdown_subscription(),
+        )
+        .await
+        {
+            Ok(body) => body,
+            Err(error) => return Err(response_parts.into_body_read_error(error)),
+        };
+        response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
+        let (body, body_transformed) = match mode {
+            ResponseModelRewriteMode::Json => {
+                rewrite_response_body_for_request(&body, &client_model, &request_path)
             }
-            let shutdown = response_parts.shutdown_subscription();
-            let observer = response_parts.into_observer();
-            let body_len = body.len();
-            let response_body =
-                ObservedBufferedBody::new(body, observer, in_flight_permit, shutdown);
-            let response = downstream_response(
-                upstream_status,
-                &upstream_headers,
-                Body::from_stream(response_body),
-                true,
-                Some(body_len),
-            );
-            return Ok(validate_non_stream_chat_completion_response(
-                response,
-                &request_path,
-                &request_id,
-                dispatch.malformed_response_counter,
-            )
-            .await);
-        }
-        rewrite => rewrite,
-    };
+            ResponseModelRewriteMode::OpenAiSse => {
+                rewrite_sse_response_model_body(&body, &client_model)
+            }
+        };
+        let content_length =
+            HeaderValue::from_str(&body.len().to_string()).expect("body length should be valid");
+        upstream_headers.insert(CONTENT_LENGTH, content_length);
+        let shutdown = response_parts.shutdown_subscription();
+        let observer = response_parts.into_observer();
+        let body_len = body.len();
+        let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit, shutdown);
+        let (response_body, body_transformed) =
+            forwarded_response_body(Body::from_stream(response_body), body_transformed);
+        let response = downstream_response(
+            upstream_status,
+            &upstream_headers,
+            response_body,
+            body_transformed,
+            Some(body_len),
+        );
+        return Ok(validate_non_stream_chat_completion_response(
+            response,
+            &request_path,
+            &request_id,
+            dispatch.malformed_response_counter,
+        )
+        .await);
+    }
     let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
     let response_body = ObservedUpstreamBody::new(
@@ -9427,7 +9420,7 @@ async fn forward_upstream_response(
         shutdown,
     );
     let (response_body, body_transformed) =
-        forwarded_response_body(&mut upstream_headers, response_body, response_model_rewrite);
+        forwarded_response_body(Body::from_stream(response_body), false);
     let response = downstream_response(
         upstream_status,
         &upstream_headers,
@@ -14847,7 +14840,7 @@ fn shielded_retry_success_response(
     if runtime.upstream_profile.upstream_model.is_some()
         && let Some(client_model) = runtime.model_id.as_deref()
     {
-        outcome.body = rewrite_response_model_body(&outcome.body, client_model);
+        outcome.body = rewrite_response_model_body(&outcome.body, client_model).0;
     }
     let body_len = outcome.body.len();
     let upstream_headers = outcome.final_attempt.upstream_headers.clone();
@@ -16210,9 +16203,9 @@ impl ShieldedLivenessBody {
         if self.accepted_response_mode == ShieldedAcceptedResponseMode::OpenAiSse
             || self.mode == ShieldedLivenessMode::Sse
         {
-            rewrite_sse_response_model_body(&body, client_model)
+            rewrite_sse_response_model_body(&body, client_model).0
         } else {
-            rewrite_response_model_body(&body, client_model)
+            rewrite_response_model_body(&body, client_model).0
         }
     }
 

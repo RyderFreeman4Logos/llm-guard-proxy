@@ -45,6 +45,85 @@ async fn shielded_non_alias_aggregation_sanitizes_body_bound_headers() {
     let _observed = fake.recv_next().await;
 }
 
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn alias_response_noop_preserves_body_bound_headers_and_bytes() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[[forced_model_alias_profiles]]
+alias = "public-forced-alias"
+upstream_model = "canonical-target"
+thinking_mode = "force_disable"
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#,
+    )
+    .await;
+
+    let cases = [
+        (
+            "malformed-json",
+            r#"{"model":"public-forced-alias","prompt":"ping"}"#,
+            "application/json",
+            b"{malformed-json".as_slice(),
+        ),
+        (
+            "non-object-json",
+            r#"{"model":"public-forced-alias","prompt":"ping"}"#,
+            "application/json",
+            b"[\"unchanged\"]".as_slice(),
+        ),
+        (
+            "non-utf8-sse",
+            r#"{"model":"public-forced-alias","messages":[],"stream":true}"#,
+            "text/event-stream",
+            b"data: \xFF\n\n".as_slice(),
+        ),
+    ];
+    for (case, request_body, content_type, expected_body) in cases {
+        let response = proxy
+            .client
+            .post(format!(
+                "{}/v1/completions?test=forced-response-noop-{case}",
+                proxy.base_url
+            ))
+            .header(CONTENT_TYPE, content_type)
+            .body(request_body)
+            .send()
+            .await
+            .expect("no-op alias response should complete");
+
+        assert_eq!(response.status(), StatusCode::OK, "case={case}");
+        assert_eq!(
+            response.headers().get("x-safe-custom"),
+            Some(&HeaderValue::from_static("preserve-me")),
+            "case={case}"
+        );
+        for header in BODY_BOUND_HEADERS {
+            assert!(
+                response.headers().get(header).is_some(),
+                "no-op alias response must preserve {header}; case={case}"
+            );
+        }
+        assert_eq!(
+            response
+                .bytes()
+                .await
+                .expect("body should be readable")
+                .as_ref(),
+            expected_body,
+            "case={case}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn buffered_models_noop_preserves_body_bound_headers_but_changed_body_does_not() {
     let mut fake = FakeUpstream::spawn().await;

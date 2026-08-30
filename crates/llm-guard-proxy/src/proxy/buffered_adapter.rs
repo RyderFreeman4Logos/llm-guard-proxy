@@ -362,7 +362,7 @@ pub(super) async fn rewrite_buffered_adapter_response_from_upstream(
         BufferedResponseAdapter::HeterogeneousReranker { .. }
     ) && let Some(alias) = public_model_alias
     {
-        body = rewrite_json_response_model_body(&body, &response_headers, alias);
+        body = rewrite_json_response_model_body(&body, &response_headers, alias).0;
     }
     let body_len = body.len();
     let stream_cancel = response_parts.shutdown_subscription();

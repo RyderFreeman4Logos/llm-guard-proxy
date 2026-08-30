@@ -21302,6 +21302,19 @@ fn fake_upstream_endpoint_response(
             "chat-completions",
             r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
         ),
+        "/v1/completions" if path_and_query.contains("test=forced-response-noop-non-utf8-sse") => {
+            return forced_alias_non_utf8_sse_response();
+        }
+        "/v1/completions"
+            if path_and_query.contains("test=forced-response-noop-malformed-json") =>
+        {
+            return forced_alias_malformed_json_response();
+        }
+        "/v1/completions"
+            if path_and_query.contains("test=forced-response-noop-non-object-json") =>
+        {
+            return forced_alias_non_object_json_response();
+        }
         "/v1/completions" if path_and_query.contains("test=forced-response-integrity-headers") => {
             return forced_alias_integrity_response();
         }
@@ -21353,6 +21366,33 @@ fn forced_alias_integrity_response() -> Response<Body> {
             HeaderValue::from_static(value),
         );
     }
+    response
+}
+
+fn forced_alias_malformed_json_response() -> Response<Body> {
+    let mut response = Response::new(Body::from(Bytes::from_static(b"{malformed-json")));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    add_stale_body_bound_response_headers(&mut response);
+    response
+}
+
+fn forced_alias_non_object_json_response() -> Response<Body> {
+    let mut response = Response::new(Body::from(Bytes::from_static(b"[\"unchanged\"]")));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    add_stale_body_bound_response_headers(&mut response);
+    response
+}
+
+fn forced_alias_non_utf8_sse_response() -> Response<Body> {
+    let mut response = Response::new(Body::from(Bytes::from_static(b"data: \xFF\n\n")));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    add_stale_body_bound_response_headers(&mut response);
     response
 }
 
