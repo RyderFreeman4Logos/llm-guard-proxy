@@ -21168,6 +21168,9 @@ fn fake_upstream_endpoint_response(
     state: &FakeUpstreamState,
     body: &Bytes,
 ) -> Response<Body> {
+    if endpoint.starts_with("/v1/models/") && path_and_query.contains("test=forced-model-detail") {
+        return forced_model_detail_response();
+    }
     if endpoint == "/v1/models" {
         if path_and_query.contains("test=model-metadata-chunked") {
             return chunked_json_response(
@@ -21264,14 +21267,25 @@ fn fake_upstream_endpoint_response(
         "/v1/rerank" => return fake_rerank_response(path_and_query, body),
         _ => ("unknown", r#"{"error":"unsupported"}"#),
     };
-    let status = if label == "unknown" {
-        StatusCode::NOT_FOUND
-    } else {
-        StatusCode::OK
-    };
+    let status = fake_response_status(label);
     let mut response = json_response(label, body.to_owned());
     *response.status_mut() = status;
     response
+}
+
+fn forced_model_detail_response() -> Response<Body> {
+    json_response(
+        "forced-model-detail",
+        String::from(r#"{"id":"canonical-target","object":"model"}"#),
+    )
+}
+
+fn fake_response_status(label: &str) -> StatusCode {
+    if label == "unknown" {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::OK
+    }
 }
 
 fn fake_chat_completion_response(

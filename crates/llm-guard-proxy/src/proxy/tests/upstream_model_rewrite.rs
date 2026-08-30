@@ -630,6 +630,53 @@ repetition_penalty = 1.0
 }
 
 #[tokio::test]
+async fn forced_model_detail_success_restores_public_id_without_injecting_model() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[[forced_model_alias_profiles]]
+alias = "public-forced-alias"
+upstream_model = "canonical-target"
+thinking_mode = "force_disable"
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.clone()),
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models/public-forced-alias?test=forced-model-detail")
+            .body(Body::empty())
+            .expect("forced model detail request should build"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let observed = fake.recv_next().await;
+    assert_eq!(
+        observed.path_and_query,
+        "/v1/models/canonical-target?test=forced-model-detail"
+    );
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("forced model detail response should be readable");
+    let detail: serde_json::Value =
+        serde_json::from_slice(&body).expect("forced model detail response should be JSON");
+    assert_eq!(detail["id"], "public-forced-alias");
+    assert_eq!(detail["object"], "model");
+    assert!(detail.get("model").is_none());
+}
+
+#[tokio::test]
 async fn forced_alias_rewrites_sanitize_bound_headers_but_preserve_origin_authentication() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_extra_config(

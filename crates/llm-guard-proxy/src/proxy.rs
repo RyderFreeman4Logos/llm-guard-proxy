@@ -5363,6 +5363,35 @@ fn coerce_cache_priority_hint(body: &Bytes, profile: &UpstreamProfileConfig) -> 
 /// client's original model alias when an upstream model rewrite was applied.
 /// Falls back to the original body for non-JSON or non-object payloads.
 fn rewrite_response_model_body(body: &Bytes, client_model: &str) -> Bytes {
+    rewrite_response_model_body_with_field(body, client_model, "model", false)
+}
+
+fn rewrite_response_model_detail_body(body: &Bytes, client_model: &str) -> Bytes {
+    rewrite_response_model_body_with_field(body, client_model, "id", true)
+}
+
+fn rewrite_response_body_for_request(
+    body: &Bytes,
+    client_model: &str,
+    request_path: &str,
+) -> Bytes {
+    if model_detail_id_from_path(request_path)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        rewrite_response_model_detail_body(body, client_model)
+    } else {
+        rewrite_response_model_body(body, client_model)
+    }
+}
+
+fn rewrite_response_model_body_with_field(
+    body: &Bytes,
+    client_model: &str,
+    field: &str,
+    remove_model: bool,
+) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.clone();
     };
@@ -5370,9 +5399,12 @@ fn rewrite_response_model_body(body: &Bytes, client_model: &str) -> Bytes {
         return body.clone();
     };
     object.insert(
-        String::from("model"),
+        String::from(field),
         serde_json::Value::String(client_model.to_owned()),
     );
+    if remove_model {
+        object.remove("model");
+    }
     Bytes::from(value.to_string())
 }
 
@@ -9331,7 +9363,7 @@ async fn forward_upstream_response(
                 Err(error) => return Err(response_parts.into_body_read_error(error)),
             };
             response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
-            let body = rewrite_response_model_body(&body, &client_model);
+            let body = rewrite_response_body_for_request(&body, &client_model, &request_path);
             if let Ok(content_length) = HeaderValue::from_str(&body.len().to_string()) {
                 upstream_headers.insert(CONTENT_LENGTH, content_length);
             } else {
