@@ -272,6 +272,64 @@ async fn guard_listener_lists_forced_aliases_before_reserved_model_filtering() {
 }
 
 #[tokio::test]
+async fn models_buffering_covers_forced_aliases_and_reserved_filtering_without_enrichment() {
+    let models = r#"{"object":"list","data":[{"id":"canonical-model","object":"model"},{"id":"unrelated-model","object":"model"}]}"#;
+    let fake = FakeUpstream::spawn_with_models_body(models).await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &fake.base_url,
+        r#"
+[upstream]
+reserved_ingress_model_ids = ["canonical-model"]
+
+[upstream.metadata]
+discovery_enabled = false
+enrich_responses = false
+
+[[forced_model_alias_profiles]]
+alias = "public-canonical-model"
+upstream_model = "canonical-model"
+thinking_mode = "force_disable"
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#,
+    )
+    .await;
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(ListenerConfig {
+            name: String::from("guard"),
+            bind_host: String::from("127.0.0.1"),
+            port: 18009,
+            allowed_upstreams: None,
+            upstream_profile: None,
+        })),
+        empty_get_request("/v1/models?test=distinct-multi-upstream-models"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+        .await
+        .expect("models response should be readable");
+    let models: serde_json::Value = serde_json::from_slice(&body).expect("models response JSON");
+    let model_ids = models["data"]
+        .as_array()
+        .expect("models response data")
+        .iter()
+        .filter_map(|model| model["id"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        model_ids,
+        vec!["unrelated-model", "public-canonical-model"],
+        "forced aliases must be synthesized while reserved canonical IDs stay hidden"
+    );
+}
+
+#[tokio::test]
 async fn listener_forced_profiles_list_routable_forced_aliases_after_enrichment() {
     let models = r#"{"object":"list","data":[{"id":"canonical-target","object":"model"},{"id":"unrelated-model","object":"model"}]}"#;
     let mut fake = FakeUpstream::spawn_with_models_body(models).await;

@@ -9296,6 +9296,7 @@ async fn forward_upstream_response(
         dispatch.metadata_config,
         dispatch.listener,
         dispatch.upstream_profile,
+        dispatch.config,
     ) {
         return forward_buffered_models_response(
             response_parts,
@@ -9453,11 +9454,14 @@ fn should_buffer_models_response(
     metadata: &MetadataConfig,
     listener: &ListenerConfig,
     upstream_profile: &UpstreamProfileConfig,
+    config: &AppConfig,
 ) -> bool {
     method == Method::GET
         && uri.path() == "/v1/models"
         && (listener.allowed_upstreams.is_some()
             || !upstream_profile.match_models.is_empty()
+            || !config.forced_model_alias_profiles.is_empty()
+            || !config.upstream.reserved_ingress_model_ids.is_empty()
             || should_enrich_models_response(method, uri, metadata))
 }
 
