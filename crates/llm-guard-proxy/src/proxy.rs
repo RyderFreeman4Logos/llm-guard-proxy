@@ -6281,7 +6281,7 @@ async fn forward_merged_models_response(
                 .extend(group.match_model_alias_profiles);
             let body = filtered_bodies[index].clone();
             filtered_bodies[index] =
-                prepare_models_body_for_group(&context, &selected_groups[index], body);
+                prepare_models_body_for_group(&context, &selected_groups[index], body).0;
             continue;
         }
         let fetch = match fetch_models_upstream_group(
@@ -6317,8 +6317,9 @@ async fn forward_merged_models_response(
         response_headers,
         response_mode,
     );
-    let body =
+    let (body, enriched) =
         model_metadata::enrich_models_body(context.config, metadata_config, merged_body.body);
+    let body_transformed = merged_body.has_valid_model_list || enriched;
     let body_len = body.len();
     let response_parts = ForwardedResponseParts {
         config: context.state.config.clone(),
@@ -6354,7 +6355,7 @@ async fn forward_merged_models_response(
         upstream_status,
         &upstream_headers,
         Body::from_stream(response_body),
-        true,
+        body_transformed,
         Some(body_len),
     ))
 }
@@ -6518,7 +6519,7 @@ async fn fetch_models_upstream_group(
         }
     };
     let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
-    let body = prepare_models_body_for_group(context, group, body);
+    let body = prepare_models_body_for_group(context, group, body).0;
     let attempt_record = final_attempt_record(
         FinalAttemptContext {
             attempt_id,
@@ -9320,7 +9321,26 @@ impl ShieldedRetryCause {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+fn forwarded_response_body(
+    upstream_headers: &mut HeaderMap,
+    response_body: ObservedUpstreamBody,
+    response_model_rewrite: Option<(ResponseModelRewriteMode, String)>,
+) -> (Body, bool) {
+    if response_model_rewrite.is_some() {
+        upstream_headers.remove(CONTENT_LENGTH);
+    }
+    let body_transformed = response_model_rewrite.is_some();
+    let response_body = match response_model_rewrite {
+        Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
+            response_body,
+            mode,
+            client_model,
+        )),
+        None => Body::from_stream(response_body),
+    };
+    (response_body, body_transformed)
+}
+
 async fn forward_upstream_response(
     dispatch: ResponseDispatch<'_>,
     response_parts: ForwardedResponseParts,
@@ -9398,9 +9418,6 @@ async fn forward_upstream_response(
         }
         rewrite => rewrite,
     };
-    if response_model_rewrite.is_some() {
-        upstream_headers.remove(CONTENT_LENGTH);
-    }
     let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
     let response_body = ObservedUpstreamBody::new(
@@ -9409,15 +9426,8 @@ async fn forward_upstream_response(
         in_flight_permit,
         shutdown,
     );
-    let body_transformed = response_model_rewrite.is_some();
-    let response_body = match response_model_rewrite {
-        Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
-            response_body,
-            mode,
-            client_model,
-        )),
-        None => Body::from_stream(response_body),
-    };
+    let (response_body, body_transformed) =
+        forwarded_response_body(&mut upstream_headers, response_body, response_model_rewrite);
     let response = downstream_response(
         upstream_status,
         &upstream_headers,
@@ -10070,8 +10080,9 @@ async fn forward_buffered_models_response(
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
     response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
-    let body = prepare_models_body(config, listener, upstream_profile, body);
-    let body = model_metadata::enrich_models_body(config, metadata_config, body);
+    let (body, prepared) = prepare_models_body(config, listener, upstream_profile, body);
+    let (body, enriched) = model_metadata::enrich_models_body(config, metadata_config, body);
+    let body_transformed = prepared || enriched;
     let body_len = body.len();
     let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
@@ -10081,7 +10092,7 @@ async fn forward_buffered_models_response(
         upstream_status,
         &upstream_headers,
         Body::from_stream(response_body),
-        true,
+        body_transformed,
         Some(body_len),
     ))
 }
@@ -10090,14 +10101,17 @@ fn prepare_models_body_for_group(
     context: &GenericForwardContext<'_>,
     group: &ModelsUpstreamGroup,
     body: Bytes,
-) -> Bytes {
-    let body = model_metadata::append_match_model_aliases(&group.match_model_alias_profiles, body);
-    let body = model_metadata::append_forced_model_aliases(
+) -> (Bytes, bool) {
+    let (body, match_aliases) =
+        model_metadata::append_match_model_aliases(&group.match_model_alias_profiles, body);
+    let (body, forced_aliases) = model_metadata::append_forced_model_aliases(
         &group.match_model_alias_profiles,
         &context.config.forced_model_alias_profiles,
         body,
     );
-    filter_models_body_for_listener(context.config, &context.state.listener, body)
+    let (body, filtered) =
+        filter_models_body_for_listener(context.config, &context.state.listener, body);
+    (body, match_aliases || forced_aliases || filtered)
 }
 
 fn prepare_models_body(
@@ -10105,41 +10119,44 @@ fn prepare_models_body(
     listener: &ListenerConfig,
     profile: &UpstreamProfileConfig,
     body: Bytes,
-) -> Bytes {
-    let body = model_metadata::append_match_model_aliases(std::slice::from_ref(profile), body);
-    let body = model_metadata::append_forced_model_aliases(
+) -> (Bytes, bool) {
+    let (body, match_aliases) =
+        model_metadata::append_match_model_aliases(std::slice::from_ref(profile), body);
+    let (body, forced_aliases) = model_metadata::append_forced_model_aliases(
         std::slice::from_ref(profile),
         &config.forced_model_alias_profiles,
         body,
     );
-    filter_models_body_for_listener(config, listener, body)
+    let (body, filtered) = filter_models_body_for_listener(config, listener, body);
+    (body, match_aliases || forced_aliases || filtered)
 }
 
 fn filter_models_body_for_listener(
     config: &AppConfig,
     listener: &ListenerConfig,
     body: Bytes,
-) -> Bytes {
-    let filter_reserved = |body| {
+) -> (Bytes, bool) {
+    let filter_reserved = |(body, transformed): (Bytes, bool)| {
         if config.upstream.reserved_ingress_model_ids.is_empty() {
-            body
+            (body, transformed)
         } else {
-            model_metadata::filter_models_body_by_id(body, |model_id| {
+            let (body, filtered) = model_metadata::filter_models_body_by_id(body, |model_id| {
                 !config.upstream.is_reserved_ingress_model_id(model_id)
-            })
+            });
+            (body, transformed || filtered)
         }
     };
     if listener.port != GUARD_PUBLIC_LISTENER_PORT {
         if let Some(profile_name) = listener.upstream_profile.as_deref() {
             let Some(profile) = config.upstream_profile_by_name(profile_name) else {
-                return filter_reserved(body);
+                return filter_reserved((body, false));
             };
             return filter_reserved(model_metadata::filter_models_body_by_id(body, |model_id| {
                 listener_forced_profile_matches_model(config, listener, &profile, model_id)
             }));
         }
         if listener.allowed_upstreams.is_none() {
-            return filter_reserved(body);
+            return filter_reserved((body, false));
         }
         return filter_reserved(model_metadata::filter_models_body_by_id(body, |model_id| {
             select_allowed_upstream_profile(config, listener, Some(model_id)).is_ok()
@@ -10148,13 +10165,13 @@ fn filter_models_body_for_listener(
 
     let body = if let Some(profile_name) = listener.upstream_profile.as_deref() {
         let Some(profile) = config.upstream_profile_by_name(profile_name) else {
-            return body;
+            return (body, false);
         };
         model_metadata::filter_models_body_by_id(body, |model_id| {
             listener_forced_profile_matches_model(config, listener, &profile, model_id)
         })
     } else if listener.allowed_upstreams.is_none() {
-        body
+        (body, false)
     } else {
         model_metadata::filter_models_body_by_id(body, |model_id| {
             select_allowed_upstream_profile(config, listener, Some(model_id)).is_ok()
@@ -14826,8 +14843,7 @@ fn shielded_retry_success_response(
     mut outcome: ShieldedAcceptedOutcome,
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
-    let body_transformed =
-        runtime.upstream_profile.upstream_model.is_some() && runtime.model_id.is_some();
+    let body_transformed = true;
     if runtime.upstream_profile.upstream_model.is_some()
         && let Some(client_model) = runtime.model_id.as_deref()
     {

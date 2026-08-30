@@ -14,13 +14,13 @@ pub(super) fn enrich_models_body(
     config: &AppConfig,
     selected_metadata: &MetadataConfig,
     body: Bytes,
-) -> Bytes {
+) -> (Bytes, bool) {
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
-        return body;
+        return (body, false);
     };
 
     let Some(models) = value.get_mut("data").and_then(Value::as_array_mut) else {
-        return body;
+        return (body, false);
     };
 
     #[cfg(feature = "guard")]
@@ -44,10 +44,10 @@ pub(super) fn enrich_models_body(
     changed |= model_count != models.len();
 
     if !changed {
-        return body;
+        return (body, false);
     }
 
-    serde_json::to_vec(&value).map_or(body, Bytes::from)
+    serde_json::to_vec(&value).map_or((body, false), |body| (Bytes::from(body), true))
 }
 
 /// Keeps only model records whose `id` is accepted by `allow_model_id`.
@@ -57,40 +57,47 @@ pub(super) fn enrich_models_body(
 pub(super) fn filter_models_body_by_id(
     body: Bytes,
     mut allow_model_id: impl FnMut(&str) -> bool,
-) -> Bytes {
+) -> (Bytes, bool) {
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
-        return body;
+        return (body, false);
     };
     let Some(models) = value.get_mut("data").and_then(Value::as_array_mut) else {
-        return body;
+        return (body, false);
     };
+    let model_count = models.len();
     models.retain(|model| {
         model
             .get("id")
             .and_then(Value::as_str)
             .is_some_and(&mut allow_model_id)
     });
-    serde_json::to_vec(&value).map_or(body, Bytes::from)
+    if model_count == models.len() {
+        return (body, false);
+    }
+    serde_json::to_vec(&value).map_or((body, false), |body| (Bytes::from(body), true))
 }
 
 /// Injects each missing `match_models` alias with metadata from its configured upstream model.
 ///
 /// This runs before listener filtering so aliases selected by the listener remain discoverable.
-pub(super) fn append_match_model_aliases(profiles: &[UpstreamProfileConfig], body: Bytes) -> Bytes {
+pub(super) fn append_match_model_aliases(
+    profiles: &[UpstreamProfileConfig],
+    body: Bytes,
+) -> (Bytes, bool) {
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
-        return body;
+        return (body, false);
     };
     let Some(models) = value.get_mut("data").and_then(Value::as_array_mut) else {
-        return body;
+        return (body, false);
     };
     let mut changed = false;
     for profile in profiles {
         changed |= append_match_model_alias_records(profile, models);
     }
     if !changed {
-        return body;
+        return (body, false);
     }
-    serde_json::to_vec(&value).map_or(body, Bytes::from)
+    serde_json::to_vec(&value).map_or((body, false), |body| (Bytes::from(body), true))
 }
 
 fn append_match_model_alias_records(
@@ -125,15 +132,15 @@ pub(super) fn append_forced_model_aliases(
     profiles: &[UpstreamProfileConfig],
     forced_aliases: &[ForcedModelAliasProfileConfig],
     body: Bytes,
-) -> Bytes {
+) -> (Bytes, bool) {
     if profiles.is_empty() {
-        return body;
+        return (body, false);
     }
     let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
-        return body;
+        return (body, false);
     };
     let Some(models) = value.get_mut("data").and_then(Value::as_array_mut) else {
-        return body;
+        return (body, false);
     };
     let mut seen = models
         .iter()
@@ -168,9 +175,9 @@ pub(super) fn append_forced_model_aliases(
         }
     }
     if !changed {
-        return body;
+        return (body, false);
     }
-    serde_json::to_vec(&value).map_or(body, Bytes::from)
+    serde_json::to_vec(&value).map_or((body, false), |body| (Bytes::from(body), true))
 }
 
 fn match_model_alias_template<'models>(

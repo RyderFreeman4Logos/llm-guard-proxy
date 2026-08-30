@@ -47,6 +47,8 @@ mod native_json_fallback_issue_219;
 mod quality_first_timeouts_issue_222;
 #[path = "tests/residual_guard_polish.rs"]
 mod residual_guard_polish;
+#[path = "tests/response_representation_state.rs"]
+mod response_representation_state;
 #[path = "tests/shielded_endpoint_rendering.rs"]
 mod shielded_endpoint_rendering;
 #[cfg(unix)]
@@ -21162,6 +21164,88 @@ async fn observe_request(request: Request<Body>) -> ObservedRequest {
     }
 }
 
+fn fake_models_endpoint_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+) -> Option<Response<Body>> {
+    if path_and_query.contains("test=models-noop-integrity-headers") {
+        let mut response = json_response(
+            "models-noop-integrity",
+            String::from(
+                r#"{"object":"list","data":[{"id":"stable-model","object":"model","max_model_len":256000,"context_length":256000,"max_context_length":256000,"owned_by":"vllm"}]}"#,
+            ),
+        );
+        add_stale_body_bound_response_headers(&mut response);
+        return Some(response);
+    }
+    if path_and_query.contains("test=models-changed-integrity-headers") {
+        let mut response = json_response(
+            "models-changed-integrity",
+            String::from(
+                r#"{"object":"list","data":[{"id":"changed-model","object":"model","max_model_len":256000,"owned_by":"vllm"}]}"#,
+            ),
+        );
+        add_stale_body_bound_response_headers(&mut response);
+        return Some(response);
+    }
+    if path_and_query.contains("test=model-metadata-chunked") {
+        return Some(chunked_json_response(
+            "models",
+            MODEL_METADATA_CHUNKED_FIRST,
+            MODEL_METADATA_CHUNKED_SECOND,
+        ));
+    }
+    if path_and_query.contains("test=model-metadata-large") {
+        return Some(json_response("models", large_model_metadata_body()));
+    }
+    if path_and_query.contains("test=model-metadata-changing") {
+        let max_model_len = state
+            .changing_model_len
+            .fetch_add(128_000, Ordering::SeqCst);
+        return Some(json_response("models", model_metadata_body(max_model_len)));
+    }
+    if path_and_query.contains("test=model-metadata-no-context") {
+        return Some(json_response(
+            "models",
+            MODEL_METADATA_NO_CONTEXT_BODY.to_owned(),
+        ));
+    }
+    if path_and_query.contains("test=model-metadata-context-length") {
+        return Some(json_response(
+            "models",
+            MODEL_METADATA_CONTEXT_LENGTH_BODY.to_owned(),
+        ));
+    }
+    if path_and_query.contains("test=model-metadata-max-context-length") {
+        return Some(json_response(
+            "models",
+            MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY.to_owned(),
+        ));
+    }
+    if path_and_query.contains("test=multi-listener-models") {
+        return Some(json_response(
+            "models",
+            MULTI_LISTENER_MODEL_METADATA_BODY.to_owned(),
+        ));
+    }
+    if path_and_query.contains("test=distinct-multi-upstream-models")
+        && let Some(models_body) = state.models_body
+    {
+        let mut response = json_response(state.models_label, models_body.to_owned());
+        *response.status_mut() = state.models_status;
+        if state.models_status == StatusCode::TOO_MANY_REQUESTS {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("11"));
+        }
+        return Some(response);
+    }
+    if path_and_query.contains("test=model-metadata") {
+        return Some(json_response("models", MODEL_METADATA_BODY.to_owned()));
+    }
+    None
+}
+
 fn fake_upstream_endpoint_response(
     endpoint: &str,
     path_and_query: &str,
@@ -21171,55 +21255,18 @@ fn fake_upstream_endpoint_response(
     if endpoint.starts_with("/v1/models/") && path_and_query.contains("test=forced-model-detail") {
         return forced_model_detail_response();
     }
-    if endpoint == "/v1/models" {
-        if path_and_query.contains("test=model-metadata-chunked") {
-            return chunked_json_response(
-                "models",
-                MODEL_METADATA_CHUNKED_FIRST,
-                MODEL_METADATA_CHUNKED_SECOND,
-            );
-        }
-        if path_and_query.contains("test=model-metadata-large") {
-            return json_response("models", large_model_metadata_body());
-        }
-        if path_and_query.contains("test=model-metadata-changing") {
-            let max_model_len = state
-                .changing_model_len
-                .fetch_add(128_000, Ordering::SeqCst);
-            return json_response("models", model_metadata_body(max_model_len));
-        }
-        if path_and_query.contains("test=model-metadata-no-context") {
-            return json_response("models", MODEL_METADATA_NO_CONTEXT_BODY.to_owned());
-        }
-        if path_and_query.contains("test=model-metadata-context-length") {
-            return json_response("models", MODEL_METADATA_CONTEXT_LENGTH_BODY.to_owned());
-        }
-        if path_and_query.contains("test=model-metadata-max-context-length") {
-            return json_response("models", MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY.to_owned());
-        }
-        if path_and_query.contains("test=multi-listener-models") {
-            return json_response("models", MULTI_LISTENER_MODEL_METADATA_BODY.to_owned());
-        }
-        if path_and_query.contains("test=distinct-multi-upstream-models")
-            && let Some(models_body) = state.models_body
-        {
-            let mut response = json_response(state.models_label, models_body.to_owned());
-            *response.status_mut() = state.models_status;
-            if state.models_status == StatusCode::TOO_MANY_REQUESTS {
-                response
-                    .headers_mut()
-                    .insert(RETRY_AFTER, HeaderValue::from_static("11"));
-            }
-            return response;
-        }
-        if path_and_query.contains("test=model-metadata") {
-            return json_response("models", MODEL_METADATA_BODY.to_owned());
-        }
+    if endpoint == "/v1/models"
+        && let Some(response) = fake_models_endpoint_response(path_and_query, state)
+    {
+        return response;
     }
 
     if endpoint == "/v1/chat/completions"
-        && let Some(response) = fake_chat_completion_response(path_and_query, state, body)
+        && let Some(mut response) = fake_chat_completion_response(path_and_query, state, body)
     {
+        if path_and_query.contains("test=shielded-aggregate-integrity-headers") {
+            add_stale_body_bound_response_headers(&mut response);
+        }
         return response;
     }
     if endpoint == "/v1/embeddings" && path_and_query.contains("test=token-usage") {
@@ -21307,6 +21354,24 @@ fn forced_alias_integrity_response() -> Response<Body> {
         );
     }
     response
+}
+
+fn add_stale_body_bound_response_headers(response: &mut Response<Body>) {
+    for (name, value) in [
+        ("etag", "\"stale-etag\""),
+        ("digest", "sha-256=stale"),
+        ("signature", "stale-signature"),
+        ("signature-input", "stale-signature-input"),
+    ] {
+        response.headers_mut().insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    response.headers_mut().insert(
+        HeaderName::from_static("x-safe-custom"),
+        HeaderValue::from_static("preserve-me"),
+    );
 }
 
 fn fake_response_status(label: &str) -> StatusCode {
