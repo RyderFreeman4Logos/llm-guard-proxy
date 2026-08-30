@@ -3655,7 +3655,10 @@ async fn admit_generation_after_body(
         request.uri,
         request.request_started_at,
     );
-    let model_id_for_admission = extract_model_id(request.method, request.uri, &body);
+    let model_id_for_admission =
+        extract_model_id(request.method, request.uri, &body).map_err(|error| {
+            ProxyError::from(error).with_request_metadata(body_read_request_metadata.clone())
+        })?;
     if let Some(model_id) = model_id_for_admission.as_deref()
         && config.upstream.is_reserved_ingress_model_id(model_id)
     {
@@ -3881,7 +3884,7 @@ fn prepare_openai_forward_request(
     let caller_profile = resolve_caller_profile(config, downstream_headers)?;
     #[cfg(feature = "guard")]
     add_caller_profile_metadata(request_metadata, &caller_profile);
-    let model_id = extract_model_id(method, uri, body);
+    let model_id = extract_model_id(method, uri, body)?;
     if model_id
         .as_deref()
         .is_some_and(|model| config.upstream.is_reserved_ingress_model_id(model))
@@ -3927,8 +3930,6 @@ fn prepare_openai_forward_request(
         adapted_request.response_adapter,
     );
     let (forward_uri, adapted_body) = (adapted_request.forward_uri, adapted_request.adapted_body);
-    let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
-    let reqwest_method = upstream_method(method)?;
     let (policy, body, shielded_chat_plan) = prepare_forced_alias_shielded_plan(
         state,
         config,
@@ -3938,6 +3939,7 @@ fn prepare_openai_forward_request(
         &forward_uri,
         &adapted_body,
     )?;
+    let forward_uri = forced_model_detail_uri(forward_uri, policy.as_ref())?;
     add_shielded_request_metadata(
         request_metadata,
         shielded_chat_plan.intercepted,
@@ -3962,11 +3964,11 @@ fn prepare_openai_forward_request(
         caller_profile: caller_profile.config,
         #[cfg(feature = "guard")]
         workflow_alias,
+        upstream_url: build_upstream_url(&upstream_profile.base_url, &forward_uri)?,
         upstream_profile,
         route_reason,
         forward_uri,
-        upstream_url,
-        reqwest_method,
+        reqwest_method: upstream_method(method)?,
         shielded_chat_plan,
         response_adapter,
         canonical_reranker,
@@ -4015,6 +4017,18 @@ fn forced_model_alias_policy<'config>(
         .forced_model_alias_profiles
         .iter()
         .find(|policy| Some(policy.alias.as_str()) == model_id)
+}
+
+fn forced_model_detail_uri(
+    forward_uri: Uri,
+    policy: Option<&ForcedModelAliasProfileConfig>,
+) -> Result<Uri, OpenAiPathError> {
+    if let Some(policy) = policy
+        && model_detail_id_from_path(forward_uri.path())?.is_some()
+    {
+        return rewrite_model_detail_uri(&forward_uri, &policy.upstream_model);
+    }
+    Ok(forward_uri)
 }
 
 fn forced_model_alias_policy_body(
@@ -16933,14 +16947,40 @@ fn header_value(value: &HeaderValue) -> String {
         .map_or_else(|_error| HEADER_VALUE_NOT_UTF8.to_owned(), str::to_owned)
 }
 
-fn model_detail_id_from_path(method: &Method, uri: &Uri) -> Option<String> {
-    if method != Method::GET {
-        return None;
+fn model_detail_id_from_path(path: &str) -> Result<Option<String>, OpenAiPathError> {
+    let Some(segment) = path.strip_prefix("/v1/models/") else {
+        return Ok(None);
+    };
+    if segment.is_empty() || segment.contains('/') {
+        return Err(OpenAiPathError::InvalidModelDetailId);
     }
-    uri.path()
-        .strip_prefix("/v1/models/")
-        .filter(|model| !model.is_empty() && !model.contains('/'))
-        .and_then(|model| strict_percent_decode_model_detail_id(model).ok())
+    strict_percent_decode_model_detail_id(segment).map(Some)
+}
+
+fn rewrite_model_detail_uri(uri: &Uri, model_id: &str) -> Result<Uri, OpenAiPathError> {
+    let mut path_and_query = format!("/v1/models/{}", percent_encode_model_detail_id(model_id));
+    if let Some(query) = uri.query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    path_and_query
+        .parse()
+        .map_err(|_error| OpenAiPathError::InvalidModelDetailId)
+}
+
+fn percent_encode_model_detail_id(model_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(model_id.len());
+    for byte in model_id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    encoded
 }
 
 fn strict_percent_decode_model_detail_id(segment: &str) -> Result<String, OpenAiPathError> {
@@ -16969,24 +17009,28 @@ fn strict_percent_decode_model_detail_id(segment: &str) -> Result<String, OpenAi
     String::from_utf8(decoded).map_err(|_error| OpenAiPathError::InvalidModelDetailId)
 }
 
-fn extract_model_id(method: &Method, uri: &Uri, body: &Bytes) -> Option<String> {
-    if let Some(model) = model_detail_id_from_path(method, uri) {
-        return Some(model);
+fn extract_model_id(
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+) -> Result<Option<String>, OpenAiPathError> {
+    if let Some(model) = model_detail_id_from_path(uri.path())? {
+        return Ok(Some(model));
     }
     if let Some(model) = deepinfra_rerank_adapter::model_id_from_path(method, uri) {
-        return Some(model.to_owned());
+        return Ok(Some(model.to_owned()));
     }
     if score_adapter::is_score_request(method, uri) {
-        return score_adapter::model_id_from_score_body(body);
+        return Ok(score_adapter::model_id_from_score_body(body));
     }
-    serde_json::from_slice::<serde_json::Value>(body)
+    Ok(serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
             value
                 .get("model")
                 .and_then(|model| model.as_str())
                 .map(str::to_owned)
-        })
+        }))
 }
 
 fn downstream_mode_from_headers(headers: &HeaderMap) -> DownstreamMode {
@@ -17109,12 +17153,7 @@ fn validate_openai_path(path: &str) -> Result<(), OpenAiPathError> {
     if path.split('/').any(path_segment_decodes_to_dot_segment) {
         return Err(OpenAiPathError::DotSegment);
     }
-    if let Some(model) = path
-        .strip_prefix("/v1/models/")
-        .filter(|model| !model.is_empty() && !model.contains('/'))
-    {
-        strict_percent_decode_model_detail_id(model)?;
-    }
+    model_detail_id_from_path(path)?;
 
     Ok(())
 }

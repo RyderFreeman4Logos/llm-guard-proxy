@@ -468,13 +468,26 @@ upstream_profile = "default"
 }
 
 #[tokio::test]
-async fn model_detail_strictly_decodes_reserved_ids_before_forwarding() {
+async fn model_detail_uri_authority_rejects_invalid_or_reserved_paths_and_rewrites_forced_aliases()
+{
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_extra_config(
         &fake.base_url,
         r#"
 [upstream]
 reserved_ingress_model_ids = ["reserved-canonical"]
+
+[[forced_model_alias_profiles]]
+alias = "public-forced-alias"
+upstream_model = "canonical target"
+thinking_mode = "force_disable"
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
 "#,
     )
     .await;
@@ -486,14 +499,14 @@ reserved_ingress_model_ids = ["reserved-canonical"]
         upstream_profile: None,
     };
 
-    for path in [
-        "/v1/models/reserved-canonical",
-        "/v1/models/reserved%2Dcanonical",
+    for (method, path) in [
+        (Method::GET, "/v1/models/reserved-canonical"),
+        (Method::DELETE, "/v1/models/reserved%2Dcanonical"),
     ] {
         let response = proxy_handler(
             State(proxy.state.for_listener(listener.clone())),
             Request::builder()
-                .method(Method::GET)
+                .method(method)
                 .uri(path)
                 .body(Body::empty())
                 .expect("reserved model detail request should build"),
@@ -511,6 +524,8 @@ reserved_ingress_model_ids = ["reserved-canonical"]
         "/v1/models/malformed%ZZ",
         "/v1/models/ordinary%2Fmodel",
         "/v1/models/ordinary%5Cmodel",
+        "/v1/models/ordinary-model/",
+        "/v1/models/ordinary-model/extra",
     ] {
         let response = proxy_handler(
             State(proxy.state.for_listener(listener.clone())),
@@ -538,6 +553,22 @@ reserved_ingress_model_ids = ["reserved-canonical"]
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         assert_eq!(fake.recv_next().await.path_and_query, path);
     }
+
+    let response = proxy_handler(
+        State(proxy.state.for_listener(listener)),
+        Request::builder()
+            .method(Method::GET)
+            .uri("/v1/models/public-forced-alias?include=details")
+            .body(Body::empty())
+            .expect("forced alias model detail request should build"),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        fake.recv_next().await.path_and_query,
+        "/v1/models/canonical%20target?include=details",
+        "forced model detail aliases must forward only the canonical percent-encoded ID"
+    );
 }
 
 #[tokio::test]

@@ -1317,7 +1317,9 @@ fn score_model_extraction_uses_raw_fallback_before_policy_and_routing() {
         "9".repeat(1_000)
     ));
     assert_eq!(
-        extract_model_id(&Method::POST, &Uri::from_static("/v1/score"), &body).as_deref(),
+        extract_model_id(&Method::POST, &Uri::from_static("/v1/score"), &body)
+            .expect("score path should parse")
+            .as_deref(),
         Some("forbidden-model")
     );
 }
