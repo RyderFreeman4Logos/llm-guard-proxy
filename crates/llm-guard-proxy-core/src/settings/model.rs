@@ -1008,9 +1008,11 @@ impl AppConfig {
         self.upstream.local_recovery = requested.upstream.local_recovery.clone();
         self.upstream.stuck_watchdog = requested.upstream.stuck_watchdog.clone();
         self.upstream.restart_queue = requested.upstream.restart_queue.clone();
-        if self.upstream_profiles_topology_matches(requested) {
+        if self.routing_topology_matches(requested) {
             self.forced_model_alias_profiles
                 .clone_from(&requested.forced_model_alias_profiles);
+        }
+        if self.upstream_profiles_topology_matches(requested) {
             self.apply_reloadable_upstream_profile_fields(requested);
         }
     }
@@ -1088,6 +1090,20 @@ impl AppConfig {
 
     fn upstream_profiles_topology_matches(&self, requested: &Self) -> bool {
         self.upstream_profile_topology() == requested.upstream_profile_topology()
+    }
+
+    fn routing_topology_matches(&self, requested: &Self) -> bool {
+        #[cfg(feature = "guard")]
+        let model_alias_topology_matches =
+            self.model_alias_topology() == requested.model_alias_topology();
+        #[cfg(not(feature = "guard"))]
+        let model_alias_topology_matches = true;
+        self.server.bind_host == requested.server.bind_host
+            && self.server.port == requested.server.port
+            && self.listener_topology() == requested.listener_topology()
+            && self.upstream.base_url == requested.upstream.base_url
+            && self.upstream_profiles_topology_matches(requested)
+            && model_alias_topology_matches
     }
 
     fn upstream_profile_topology(&self) -> Vec<UpstreamProfileTopology> {

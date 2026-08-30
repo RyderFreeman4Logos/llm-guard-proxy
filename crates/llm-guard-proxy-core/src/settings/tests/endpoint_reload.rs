@@ -128,8 +128,33 @@ protocol = "openai"
 }
 
 fn forced_alias_reload_config(match_model: &str, forced_upstream_model: &str) -> AppConfig {
+    forced_alias_reload_config_with_extra(match_model, forced_upstream_model, "")
+}
+
+fn forced_alias_reload_config_with_extra(
+    match_model: &str,
+    forced_upstream_model: &str,
+    extra: &str,
+) -> AppConfig {
+    forced_alias_reload_config_with_routing(
+        match_model,
+        forced_upstream_model,
+        "http://current-legacy.example/v1",
+        extra,
+    )
+}
+
+fn forced_alias_reload_config_with_routing(
+    match_model: &str,
+    forced_upstream_model: &str,
+    legacy_upstream_base_url: &str,
+    extra: &str,
+) -> AppConfig {
     let config = AppConfig::parse(&format!(
         r#"
+[upstream]
+base_url = "{legacy_upstream_base_url}"
+
 [[upstreams]]
 name = "forced-target"
 base_url = "http://profile.example/v1"
@@ -146,6 +171,7 @@ top_k = 20
 min_p = 0.0
 presence_penalty = 1.5
 repetition_penalty = 1.0
+{extra}
 "#
     ))
     .expect("forced alias reload fixture should parse");
@@ -156,30 +182,68 @@ repetition_penalty = 1.0
 }
 
 #[test]
-fn forced_aliases_follow_retained_upstream_routing_generation() {
+fn forced_aliases_follow_retained_routing_topology_generation() {
     let current = forced_alias_reload_config("current-canonical", "current-canonical");
-    let requested = forced_alias_reload_config("requested-canonical", "requested-canonical");
+    let cases = [
+        (
+            "named upstream profile",
+            forced_alias_reload_config("requested-canonical", "requested-canonical"),
+            Some("upstreams.topology"),
+        ),
+        (
+            "legacy upstream",
+            forced_alias_reload_config_with_routing(
+                "current-canonical",
+                "requested-canonical",
+                "http://requested-legacy.example/v1",
+                "",
+            ),
+            Some("upstream.base_url"),
+        ),
+        (
+            "listener policy",
+            forced_alias_reload_config_with_extra(
+                "current-canonical",
+                "requested-canonical",
+                "\n[[listeners]]\nname = \"routing-listener\"\nbind_host = \"127.0.0.1\"\nport = 18010\nallowed_upstreams = [\"default\"]\n",
+            ),
+            Some("listeners.topology"),
+        ),
+        (
+            "public model aliases",
+            forced_alias_reload_config_with_extra(
+                "current-canonical",
+                "requested-canonical",
+                "\n[[model_aliases]]\nid = \"public-routing-alias\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n",
+            ),
+            Some("model_aliases.topology"),
+        ),
+        (
+            "alias only",
+            forced_alias_reload_config("current-canonical", "reloaded-canonical"),
+            None,
+        ),
+    ];
 
-    let (next, outcome) = apply_reloadable(&current, &requested);
-
-    assert!(
-        outcome
-            .restart_required_changes
-            .iter()
-            .any(|change| change.field == "upstreams.topology")
-    );
-    assert_eq!(next.upstream_profiles, current.upstream_profiles);
-    assert_eq!(
-        next.forced_model_alias_profiles, current.forced_model_alias_profiles,
-        "forced aliases must stay in the routing generation retained for restart"
-    );
-
-    let alias_only_requested =
-        forced_alias_reload_config("current-canonical", "reloaded-canonical");
-    let (next, outcome) = apply_reloadable(&current, &alias_only_requested);
-    assert!(outcome.applied);
-    assert_eq!(
-        next.forced_model_alias_profiles, alias_only_requested.forced_model_alias_profiles,
-        "forced-alias-only reloads remain live when routing topology is unchanged"
-    );
+    for (name, requested, restart_field) in cases {
+        requested
+            .validate()
+            .expect("requested routing fixture should validate");
+        let (next, outcome) = apply_reloadable(&current, &requested);
+        assert_eq!(
+            &next.forced_model_alias_profiles,
+            restart_field.map_or(&requested.forced_model_alias_profiles, |_| {
+                &current.forced_model_alias_profiles
+            }),
+            "{name}: forced aliases must stay in the retained routing generation"
+        );
+        assert_eq!(
+            outcome
+                .restart_required_changes
+                .iter()
+                .any(|change| Some(change.field) == restart_field),
+            restart_field.is_some(),
+            "{name}: expected restart-required routing field"
+        );
+    }
 }
