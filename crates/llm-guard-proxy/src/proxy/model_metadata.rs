@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 
 use axum::body::Bytes;
-use llm_guard_proxy_core::{AppConfig, MetadataConfig, UpstreamProfileConfig};
+use llm_guard_proxy_core::{
+    AppConfig, ForcedModelAliasProfileConfig, MetadataConfig, UpstreamProfileConfig,
+};
 use serde_json::{Map, Number, Value};
 
 /// Enriches OpenAI-compatible model list responses with normalized context metadata.
@@ -107,14 +109,62 @@ fn append_match_model_alias_records(
     changed
 }
 
-/// Selects the template model record for alias synthesis.
+/// Injects each missing forced model alias from its exact upstream model.
 ///
-/// When `upstream_model` is configured (`Some(id)`), only an exact match is
-/// accepted — if the configured target is missing from the upstream `/v1/models`
-/// response, no aliases are synthesized to avoid copying unrelated metadata.
-/// When `upstream_model` is absent (`None`), the first record with an `id` is
-/// used as a best-effort fallback, preserving prior behavior for configurations
-/// that only specify `match_models`.
+/// This runs before listener filtering so reserved canonical IDs can remain hidden while their
+/// public aliases stay discoverable.
+pub(super) fn append_forced_model_aliases(
+    profiles: &[UpstreamProfileConfig],
+    forced_aliases: &[ForcedModelAliasProfileConfig],
+    body: Bytes,
+) -> Bytes {
+    if profiles.is_empty() {
+        return body;
+    }
+    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
+        return body;
+    };
+    let Some(models) = value.get_mut("data").and_then(Value::as_array_mut) else {
+        return body;
+    };
+    let mut seen = models
+        .iter()
+        .filter_map(|model| model.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect::<HashSet<_>>();
+    let mut changed = false;
+    for forced_alias in forced_aliases {
+        if seen.contains(&forced_alias.alias) {
+            continue;
+        }
+        let Some(template) = models
+            .iter()
+            .find(|model| {
+                model.get("id").and_then(Value::as_str)
+                    == Some(forced_alias.upstream_model.as_str())
+            })
+            .cloned()
+        else {
+            continue;
+        };
+        let profile = profiles
+            .iter()
+            .find(|profile| {
+                profile.upstream_model.as_deref() == Some(forced_alias.upstream_model.as_str())
+                    || profile.matches_model(&forced_alias.upstream_model)
+            })
+            .unwrap_or_else(|| &profiles[0]);
+        if let Some(record) = match_model_alias_record(profile, &forced_alias.alias, &template) {
+            seen.insert(forced_alias.alias.clone());
+            models.push(record);
+            changed = true;
+        }
+    }
+    if !changed {
+        return body;
+    }
+    serde_json::to_vec(&value).map_or(body, Bytes::from)
+}
+
 fn match_model_alias_template<'models>(
     profile: &UpstreamProfileConfig,
     models: &'models [Value],

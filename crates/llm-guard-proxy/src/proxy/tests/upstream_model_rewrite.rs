@@ -122,8 +122,8 @@ async fn guard_listener_rejects_reserved_forced_alias_upstream_model_before_forw
 }
 
 #[tokio::test]
-async fn guard_listener_hides_reserved_forced_alias_upstream_model_from_models() {
-    let models = r#"{"object":"list","data":[{"id":"abliterated-qwen-latest-27b-nvfp4","object":"model"},{"id":"aeon","object":"model"},{"id":"aeon-ultimate","object":"model"},{"id":"unrelated-model","object":"model"}]}"#;
+async fn guard_listener_lists_forced_aliases_before_reserved_model_filtering() {
+    let models = r#"{"object":"list","data":[{"id":"abliterated-qwen-latest-27b-nvfp4","object":"model"},{"id":"aeon","object":"model"},{"id":"aeon-ultimate","object":"model"},{"id":"unrelated-model","object":"model"},{"id":"pooling-model","object":"model"}]}"#;
     let fake = FakeUpstream::spawn_with_models_body(models).await;
     let proxy =
         ProxyFixture::spawn_with_extra_config(&fake.base_url, FORCED_MODEL_ALIAS_PROFILES_CONFIG)
@@ -156,12 +156,16 @@ async fn guard_listener_hides_reserved_forced_alias_upstream_model_from_models()
         .iter()
         .filter_map(|model| model["id"].as_str())
         .collect::<Vec<_>>();
-    assert!(!model_ids.contains(&"abliterated-qwen-latest-27b-nvfp4"));
-    assert!(!model_ids.contains(&"aeon"));
-    assert!(!model_ids.contains(&"aeon-ultimate"));
-    assert!(
-        model_ids.contains(&"unrelated-model"),
-        "unrelated model must remain visible; got {model_ids:?}"
+    assert_eq!(
+        model_ids,
+        vec![
+            "unrelated-model",
+            "pooling-model",
+            "abliterated-qwen-latest-27b-none",
+            "abliterated-qwen-latest-27b-low",
+            "abliterated-qwen-latest-27b-medium",
+        ],
+        "forced aliases must be materialized before reserved model filtering"
     );
 }
 

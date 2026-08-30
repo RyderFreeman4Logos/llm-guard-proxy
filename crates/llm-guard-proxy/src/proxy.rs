@@ -9946,6 +9946,11 @@ fn prepare_models_body_for_group(
     body: Bytes,
 ) -> Bytes {
     let body = model_metadata::append_match_model_aliases(&group.match_model_alias_profiles, body);
+    let body = model_metadata::append_forced_model_aliases(
+        &group.match_model_alias_profiles,
+        &context.config.forced_model_alias_profiles,
+        body,
+    );
     filter_models_body_for_listener(context.config, &context.state.listener, body)
 }
 
@@ -9956,6 +9961,11 @@ fn prepare_models_body(
     body: Bytes,
 ) -> Bytes {
     let body = model_metadata::append_match_model_aliases(std::slice::from_ref(profile), body);
+    let body = model_metadata::append_forced_model_aliases(
+        std::slice::from_ref(profile),
+        &config.forced_model_alias_profiles,
+        body,
+    );
     filter_models_body_for_listener(config, listener, body)
 }
 
