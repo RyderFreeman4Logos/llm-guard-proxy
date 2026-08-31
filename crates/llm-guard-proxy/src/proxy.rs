@@ -11630,6 +11630,16 @@ async fn run_shielded_attempts(
             );
         }
 
+        if should_direct_relay_loop_guard_disabled_stream(&runtime, &started.info) {
+            return ShieldedRunOutcome::DirectRelay(
+                direct_relay_loop_guard_disabled_stream_outcome(
+                    started,
+                    &attempt_records,
+                    runtime.request_deadline,
+                ),
+            );
+        }
+
         if should_direct_relay_no_thinking_stream(&runtime, &started.info, retry_cause) {
             return ShieldedRunOutcome::DirectRelay(direct_relay_no_thinking_stream_outcome(
                 started,
@@ -11830,6 +11840,19 @@ fn direct_relay_first_attempt_force_disable_stream_outcome(
     }
 }
 
+fn direct_relay_loop_guard_disabled_stream_outcome(
+    started: ShieldedStartedAttempt,
+    attempt_records: &[AttemptRecord],
+    request_deadline: RequestDeadline,
+) -> ShieldedDirectRelayOutcome {
+    ShieldedDirectRelayOutcome {
+        started,
+        prior_attempt_records: attempt_records.to_vec(),
+        response_metadata: loop_guard_disabled_direct_relay_metadata(),
+        request_deadline,
+    }
+}
+
 fn should_direct_relay_no_thinking_stream(
     runtime: &ShieldedRetryRuntime,
     info: &ShieldedAttemptInfo,
@@ -11872,6 +11895,18 @@ fn should_direct_relay_first_attempt_force_disable_stream(
             .is_some_and(|mode| mode == ThinkingMode::ForceDisable.as_str())
 }
 
+fn should_direct_relay_loop_guard_disabled_stream(
+    runtime: &ShieldedRetryRuntime,
+    info: &ShieldedAttemptInfo,
+) -> bool {
+    runtime.chat_kind == ShieldedChatKind::Stream
+        && runtime.loop_context.is_disabled()
+        && info
+            .request_metadata
+            .get("cot_salvage_used")
+            .is_none_or(|used| used != "true")
+}
+
 fn no_thinking_direct_relay_metadata() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -11902,6 +11937,23 @@ fn first_attempt_force_disable_direct_relay_metadata() -> BTreeMap<String, Strin
         (
             String::from("shielded_loop_inspection_skipped"),
             String::from("first_attempt_force_disable_direct_streaming_relay"),
+        ),
+    ])
+}
+
+fn loop_guard_disabled_direct_relay_metadata() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            String::from("shielded_direct_streaming_relay"),
+            String::from("true"),
+        ),
+        (
+            String::from("shielded_direct_streaming_relay_deadline_bound"),
+            String::from("true"),
+        ),
+        (
+            String::from("shielded_loop_inspection_skipped"),
+            String::from("loop_guard_disabled_direct_streaming_relay"),
         ),
     ])
 }

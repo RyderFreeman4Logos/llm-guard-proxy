@@ -43,6 +43,29 @@ repetition_penalty = 1.0
 "#;
 
 #[cfg(feature = "guard")]
+const FORCED_THINKING_ALIAS_LOOP_GUARD_OFF_CONFIG: &str = r#"
+[loop_guard]
+mode = "disabled"
+
+[retry]
+max_attempts = 3
+shielded_streaming_enabled = true
+
+[[forced_model_alias_profiles]]
+alias = "public-forced-thinking-alias"
+upstream_model = "canonical-target"
+thinking_mode = "force_thinking"
+thinking_budget = 16
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#;
+
+#[cfg(feature = "guard")]
 #[derive(Clone)]
 struct DelayedAliasSseState {
     first: Bytes,
@@ -324,6 +347,59 @@ async fn alias_sse_rewrite_forwards_first_frame_before_upstream_eof() {
             .expect("SSE body must reach EOF after the released terminal frame")
             .is_none()
     );
+}
+
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn loop_guard_off_shielded_thinking_chat_relays_first_frame_before_upstream_eof() {
+    let mut upstream = DelayedAliasSseUpstream::spawn(
+        b"data: {\"model\":\"canonical-target\"}\r\r",
+        b"data: {\"model\":\"canonical-target\",\"done\":true}\n\n",
+    )
+    .await;
+    let proxy = ProxyFixture::spawn_with_extra_config(
+        &upstream.base_url,
+        FORCED_THINKING_ALIAS_LOOP_GUARD_OFF_CONFIG,
+    )
+    .await;
+    let client = proxy.client.clone();
+    let request = tokio::spawn(async move {
+        client
+            .post(format!("{}/v1/chat/completions", proxy.base_url))
+            .header(CONTENT_TYPE, "application/json")
+            .body(
+                r#"{"model":"public-forced-thinking-alias","messages":[{"role":"user","content":"ping"}],"stream":true}"#,
+            )
+            .send()
+            .await
+    });
+
+    upstream.first_frame_sent().await;
+    let response = timeout(STREAM_HEADER_TIMEOUT, request)
+        .await
+        .expect("downstream headers must not wait for upstream EOF")
+        .expect("downstream request task must not panic")
+        .expect("shielded chat response should complete its headers");
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut body = response.bytes_stream();
+    let first = timeout(STREAM_FIRST_CHUNK_TIMEOUT, body.next())
+        .await
+        .expect("loop-guard-off shielded chat must relay before upstream EOF")
+        .expect("shielded chat body must contain the first frame")
+        .expect("shielded chat first frame must be readable");
+    assert_eq!(
+        first.as_ref(),
+        b"data: {\"model\":\"public-forced-thinking-alias\"}\r\r"
+    );
+    upstream.assert_second_frame_is_blocked();
+
+    upstream.release();
+    upstream.second_frame_started().await;
+    let _second = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
+        .await
+        .expect("released terminal frame must reach the client")
+        .expect("shielded chat body must contain the terminal frame")
+        .expect("shielded chat terminal frame must be readable");
 }
 
 #[cfg(feature = "guard")]

@@ -202,6 +202,10 @@ impl LoopInspectionContext {
         }
     }
 
+    pub(in crate::proxy) fn is_disabled(&self) -> bool {
+        self.config.effective_mode().is_disabled()
+    }
+
     pub(super) fn detector(&self) -> Option<LoopDetector> {
         let mode = self.config.effective_mode();
         (!mode.is_disabled()).then(|| LoopDetector {
