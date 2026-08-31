@@ -5523,8 +5523,9 @@ where
                         .expect("SSE rewrite buffer must stay within its byte limit");
                     let accepted_len = bytes.len().min(remaining);
                     let start = this.buffered.len();
+                    this.buffered.extend_from_slice(&bytes[..accepted_len]);
                     let mut scanner = this.sse_scanner.clone();
-                    let frame_end = scanner.scan_appended(&bytes[..accepted_len], start);
+                    let frame_end = scanner.scan_appended(&this.buffered, start);
                     if bytes.len() > remaining && frame_end.is_none() {
                         this.completed = true;
                         this.buffered.clear();
@@ -5532,7 +5533,6 @@ where
                             limit: SSE_REWRITE_FRAME_BYTE_LIMIT,
                         })));
                     }
-                    this.buffered.extend_from_slice(&bytes[..accepted_len]);
                     this.sse_scanner = scanner;
                     if accepted_len < bytes.len() {
                         this.pending = Some(bytes.slice(accepted_len..));

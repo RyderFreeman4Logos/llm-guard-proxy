@@ -1846,6 +1846,43 @@ match_models = ["alias-chat"]
 }
 
 #[tokio::test]
+async fn upstream_model_rewrite_sse_emits_fragmented_tool_call_frame_promptly() {
+    let input = [
+        Ok::<Bytes, std::io::Error>(Bytes::from_static(
+            br#"data: {"choices":[{"delta":{"content":"prompt","tool_calls":[{"function":{"arguments":"{}","name":"lookup"},"index":0}]}}],"model":"aeon-ultimate"}"#,
+        )),
+        Ok(Bytes::from_static(b"\n")),
+        Ok(Bytes::from_static(b"\n")),
+    ];
+    let input = stream::iter(input).chain(stream::pending());
+    let mut body = ResponseModelRewriteBody::new(
+        input,
+        ResponseModelRewriteMode::OpenAiSse,
+        String::from("alias-chat"),
+    );
+
+    let frame = timeout(Duration::from_secs(1), body.next())
+        .await
+        .expect("complete fragmented SSE frame must be emitted promptly")
+        .expect("fragmented SSE stream must emit a frame")
+        .expect("fragmented SSE frame must not overflow");
+    let expected = [
+        br#"data: {"choices":[{"delta":{"content":"prompt","tool_calls":[{"function":{"arguments":"{}","name":"lookup"},"index":0}]}}],"model":"alias-chat"}"#.as_slice(),
+        b"\n\n".as_slice(),
+    ]
+    .concat();
+    assert_eq!(
+        frame.as_ref(),
+        expected.as_slice(),
+        "fragmented tool-call SSE framing and client alias must be preserved"
+    );
+    assert!(
+        body.buffered.is_empty(),
+        "emitted frame must leave no buffered prefix"
+    );
+}
+
+#[tokio::test]
 async fn upstream_model_rewrite_sse_buffer_overflows_with_controlled_error() {
     // Feed the rewriter a stream of bytes that exceeds the frame cap without
     // any SSE delimiter. The body must terminate with a controlled error
