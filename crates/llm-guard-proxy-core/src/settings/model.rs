@@ -1728,12 +1728,14 @@ impl UpstreamConfig {
         redact_upstream_base_url(&self.base_url)
     }
 
-    /// Returns true when an ingress model ID is explicitly reserved.
+    /// Returns true when an ingress model ID is reserved for internal use.
     #[must_use]
     pub fn is_reserved_ingress_model_id(&self, model_id: &str) -> bool {
-        self.reserved_ingress_model_ids
-            .iter()
-            .any(|reserved| reserved == model_id)
+        model_id.starts_with("__listener_forced_")
+            || self
+                .reserved_ingress_model_ids
+                .iter()
+                .any(|reserved| reserved == model_id)
     }
 }
 

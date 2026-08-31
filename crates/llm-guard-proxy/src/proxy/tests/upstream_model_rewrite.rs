@@ -59,7 +59,14 @@ async fn guard_listener_rejects_reserved_forced_alias_upstream_model_before_forw
         upstream_profile: None,
     });
 
-    for model in ["abliterated-qwen-latest-27b-nvfp4", "aeon", "aeon-ultimate"] {
+    for model in [
+        "abliterated-qwen-latest-27b-nvfp4",
+        "aeon",
+        "aeon-ultimate",
+        "__listener_forced_aeon_guard_max__",
+        "__listener_forced_aeon_legacy_bounded__",
+        "__listener_forced_aeon_raw_max__",
+    ] {
         for (path, body) in [
             (
                 "/v1/chat/completions",
@@ -225,7 +232,7 @@ async fn forced_alias_is_rejected_on_responses_before_forwarding() {
 
 #[tokio::test]
 async fn guard_listener_lists_forced_aliases_before_reserved_model_filtering() {
-    let models = r#"{"object":"list","data":[{"id":"abliterated-qwen-latest-27b-nvfp4","object":"model"},{"id":"aeon","object":"model"},{"id":"aeon-ultimate","object":"model"},{"id":"unrelated-model","object":"model"},{"id":"pooling-model","object":"model"}]}"#;
+    let models = r#"{"object":"list","data":[{"id":"abliterated-qwen-latest-27b-nvfp4","object":"model"},{"id":"aeon","object":"model"},{"id":"aeon-ultimate","object":"model"},{"id":"__listener_forced_aeon_guard_max__","object":"model"},{"id":"__listener_forced_aeon_legacy_bounded__","object":"model"},{"id":"__listener_forced_aeon_raw_max__","object":"model"},{"id":"unrelated-model","object":"model"},{"id":"pooling-model","object":"model"}]}"#;
     let fake = FakeUpstream::spawn_with_models_body(models).await;
     let proxy =
         ProxyFixture::spawn_with_extra_config(&fake.base_url, FORCED_MODEL_ALIAS_PROFILES_CONFIG)
@@ -560,6 +567,12 @@ repetition_penalty = 1.0
     for (method, path) in [
         (Method::GET, "/v1/models/reserved-canonical"),
         (Method::DELETE, "/v1/models/reserved%2Dcanonical"),
+        (Method::GET, "/v1/models/__listener_forced_aeon_guard_max__"),
+        (
+            Method::GET,
+            "/v1/models/__listener_forced_aeon_legacy_bounded__",
+        ),
+        (Method::GET, "/v1/models/__listener_forced_aeon_raw_max__"),
     ] {
         let response = proxy_handler(
             State(proxy.state.for_listener(listener.clone())),

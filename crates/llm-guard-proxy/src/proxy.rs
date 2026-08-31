@@ -10388,14 +10388,10 @@ fn filter_models_body_for_listener(
     body: Bytes,
 ) -> (Bytes, bool) {
     let filter_reserved = |(body, transformed): (Bytes, bool)| {
-        if config.upstream.reserved_ingress_model_ids.is_empty() {
-            (body, transformed)
-        } else {
-            let (body, filtered) = model_metadata::filter_models_body_by_id(body, |model_id| {
-                !config.upstream.is_reserved_ingress_model_id(model_id)
-            });
-            (body, transformed || filtered)
-        }
+        let (body, filtered) = model_metadata::filter_models_body_by_id(body, |model_id| {
+            !config.upstream.is_reserved_ingress_model_id(model_id)
+        });
+        (body, transformed || filtered)
     };
     if listener.port != GUARD_PUBLIC_LISTENER_PORT {
         if let Some(profile_name) = listener.upstream_profile.as_deref() {
