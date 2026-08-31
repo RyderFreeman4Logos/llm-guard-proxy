@@ -13,13 +13,14 @@ use tokio::{net::TcpListener, sync::oneshot, task::JoinHandle};
 
 use super::*;
 
-const BODY_BOUND_HEADERS: [&str; 12] = [
+const BODY_BOUND_HEADERS: [&str; 13] = [
     "content-encoding",
     "content-md5",
     "digest",
     "content-digest",
     "repr-digest",
     "etag",
+    "last-modified",
     "signature",
     "signature-input",
     "if-match",
@@ -492,6 +493,30 @@ async fn alias_response_noop_preserves_body_bound_headers_and_bytes() {
             "text/event-stream",
             b"data: \xFF\n\n".as_slice(),
         ),
+        (
+            "empty-sse",
+            r#"{"model":"public-forced-alias","messages":[],"stream":true}"#,
+            "text/event-stream",
+            b"".as_slice(),
+        ),
+        (
+            "comment-sse",
+            r#"{"model":"public-forced-alias","messages":[],"stream":true}"#,
+            "text/event-stream",
+            b": keepalive\n\n".as_slice(),
+        ),
+        (
+            "done-sse",
+            r#"{"model":"public-forced-alias","messages":[],"stream":true}"#,
+            "text/event-stream",
+            b"data: [DONE]\n\n".as_slice(),
+        ),
+        (
+            "same-model-sse",
+            r#"{"model":"public-forced-alias","messages":[],"stream":true}"#,
+            "text/event-stream",
+            b"data: {\"model\":\"public-forced-alias\"}\n\n".as_slice(),
+        ),
     ];
     for (case, request_body, content_type, expected_body) in cases {
         let response = proxy
@@ -603,7 +628,7 @@ enrich_responses = true
                 "signature-input" => "stale-signature-input",
                 "if-match" => "\"stale-match\"",
                 "if-none-match" => "\"stale-none-match\"",
-                "if-modified-since" | "if-unmodified-since" => {
+                "if-modified-since" | "if-unmodified-since" | "last-modified" => {
                     "Wed, 21 Oct 2015 07:28:00 GMT"
                 }
                 _ => unreachable!(),

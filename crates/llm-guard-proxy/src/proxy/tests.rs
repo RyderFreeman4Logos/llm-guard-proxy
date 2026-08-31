@@ -21501,7 +21501,21 @@ fn fake_upstream_endpoint_response(
             r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
         ),
         "/v1/completions" if path_and_query.contains("test=forced-response-noop-non-utf8-sse") => {
-            return forced_alias_non_utf8_sse_response();
+            return forced_alias_sse_response(b"data: \xFF\n\n");
+        }
+        "/v1/completions" if path_and_query.contains("test=forced-response-noop-empty-sse") => {
+            return forced_alias_sse_response(b"");
+        }
+        "/v1/completions" if path_and_query.contains("test=forced-response-noop-comment-sse") => {
+            return forced_alias_sse_response(b": keepalive\n\n");
+        }
+        "/v1/completions" if path_and_query.contains("test=forced-response-noop-done-sse") => {
+            return forced_alias_sse_response(b"data: [DONE]\n\n");
+        }
+        "/v1/completions"
+            if path_and_query.contains("test=forced-response-noop-same-model-sse") =>
+        {
+            return forced_alias_sse_response(b"data: {\"model\":\"public-forced-alias\"}\n\n");
         }
         "/v1/completions"
             if path_and_query.contains("test=forced-response-noop-malformed-json") =>
@@ -21552,6 +21566,7 @@ fn forced_alias_integrity_response() -> Response<Body> {
         ("content-digest", "sha-256=:stale:"),
         ("repr-digest", "sha-256=:stale-repr:"),
         ("etag", "\"stale-etag\""),
+        ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
         ("signature", "stale-signature"),
         ("signature-input", "stale-signature-input"),
         ("if-match", "\"stale-match\""),
@@ -21585,8 +21600,8 @@ fn forced_alias_non_object_json_response() -> Response<Body> {
     response
 }
 
-fn forced_alias_non_utf8_sse_response() -> Response<Body> {
-    let mut response = Response::new(Body::from(Bytes::from_static(b"data: \xFF\n\n")));
+fn forced_alias_sse_response(body: &'static [u8]) -> Response<Body> {
+    let mut response = Response::new(Body::from(Bytes::from_static(body)));
     response
         .headers_mut()
         .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
@@ -21602,6 +21617,7 @@ fn add_stale_body_bound_response_headers(response: &mut Response<Body>) {
         ("content-digest", "sha-256=:stale:"),
         ("repr-digest", "sha-256=:stale-repr:"),
         ("etag", "\"stale-etag\""),
+        ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
         ("signature", "stale-signature"),
         ("signature-input", "stale-signature-input"),
         ("if-match", "\"stale-match\""),

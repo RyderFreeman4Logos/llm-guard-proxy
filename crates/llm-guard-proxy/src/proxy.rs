@@ -5659,11 +5659,22 @@ impl SseFrameScanner {
         self.frame_end
     }
 
+    fn advance_after_frame(&mut self) -> usize {
+        let frame_end = self
+            .frame_end
+            .take()
+            .expect("completed SSE frame must have an end offset");
+        self.line_start = frame_end;
+        self.pending_cr = None;
+        frame_end
+    }
+
     fn take_frame(&mut self, buffer: &mut BytesMut) -> Option<Bytes> {
-        let frame_end = self.frame_end.take()?;
+        let frame_end = self.frame_end?;
         let frame = buffer.split_to(frame_end).freeze();
         self.line_start = 0;
         self.pending_cr = None;
+        self.frame_end = None;
         self.scan_appended(buffer, 0);
         Some(frame)
     }
@@ -9451,17 +9462,29 @@ fn replay_prefetched_upstream_body(
 async fn preclassify_sse_response_body(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
     mut shutdown: ShutdownSubscription,
+    client_model: &str,
 ) -> Result<(UpstreamBodyStream, bool), ProxyError> {
     let mut stream: UpstreamBodyStream = Box::pin(stream);
     let mut prefetched = BytesMut::new();
     let mut scanner = SseFrameScanner::default();
     loop {
         if let Some(frame_end) = scanner.frame_end {
-            let can_rewrite = std::str::from_utf8(&prefetched[..frame_end]).is_ok();
-            return Ok((
-                replay_prefetched_upstream_body(prefetched.freeze(), stream),
-                can_rewrite,
-            ));
+            let frame = Bytes::copy_from_slice(&prefetched[..frame_end]);
+            if std::str::from_utf8(&frame).is_err() {
+                return Ok((
+                    replay_prefetched_upstream_body(prefetched.freeze(), stream),
+                    false,
+                ));
+            }
+            if rewrite_sse_response_model_body(&frame, client_model).1 {
+                return Ok((
+                    replay_prefetched_upstream_body(prefetched.freeze(), stream),
+                    true,
+                ));
+            }
+            let frame_end = scanner.advance_after_frame();
+            scanner.scan_appended(&prefetched, frame_end);
+            continue;
         }
         let next = tokio::select! {
             biased;
@@ -9477,7 +9500,9 @@ async fn preclassify_sse_response_body(
                 let frame_end = scanner.scan_appended(&prefetched, start);
                 if bytes.len() > remaining {
                     if let Some(frame_end) = frame_end {
-                        let can_rewrite = std::str::from_utf8(&prefetched[..frame_end]).is_ok();
+                        let frame = Bytes::copy_from_slice(&prefetched[..frame_end]);
+                        let can_rewrite = std::str::from_utf8(&frame).is_ok()
+                            && rewrite_sse_response_model_body(&frame, client_model).1;
                         let suffix = bytes.slice(remaining..);
                         let tail =
                             Box::pin(futures_util::stream::iter(Some(Ok(suffix))).chain(stream));
@@ -9500,10 +9525,9 @@ async fn preclassify_sse_response_body(
                 ));
             }
             None => {
-                let can_rewrite = std::str::from_utf8(&prefetched).is_ok();
                 return Ok((
                     replay_prefetched_upstream_body(prefetched.freeze(), stream),
-                    can_rewrite,
+                    false,
                 ));
             }
         }
@@ -9629,6 +9653,7 @@ async fn forward_upstream_response(
             let (stream, can_rewrite) = match preclassify_sse_response_body(
                 upstream_response.bytes_stream(),
                 response_parts.shutdown_subscription(),
+                &client_model,
             )
             .await
             {
@@ -17084,6 +17109,7 @@ fn is_body_bound_response_header(name: &HeaderName) -> bool {
             | "content-digest"
             | "repr-digest"
             | "etag"
+            | "last-modified"
             | "signature"
             | "signature-input"
             | "if-match"

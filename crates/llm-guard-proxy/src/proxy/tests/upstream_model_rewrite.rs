@@ -721,6 +721,7 @@ repetition_penalty = 1.0
         "content-digest",
         "repr-digest",
         "etag",
+        "last-modified",
         "signature",
         "signature-input",
         "if-match",
