@@ -1961,6 +1961,27 @@ async fn upstream_model_rewrite_sse_processes_multiple_bounded_frames_in_one_lar
     );
 }
 
+#[test]
+fn incremental_sse_scanner_inspects_fragmented_unterminated_growth_once() {
+    let chunks = [1_usize, 3, 17, 257, 4_096];
+    let mut scanner = SseFrameScanner::default();
+    let mut buffered = BytesMut::new();
+    for chunk_len in chunks {
+        let start = buffered.len();
+        buffered.extend(std::iter::repeat_n(b'x', chunk_len));
+        assert_eq!(
+            scanner.scan_appended(&buffered, start),
+            None,
+            "unterminated byte growth must not yield a frame"
+        );
+    }
+    assert_eq!(
+        scanner.inspected_bytes,
+        buffered.len(),
+        "fragmented unterminated input must inspect each byte once rather than rescanning its prefix"
+    );
+}
+
 #[tokio::test]
 async fn configured_upstream_model_missing_from_models_list_does_not_synthesize_alias() {
     // upstream_model = "aeon-ultimate" but the upstream /v1/models response

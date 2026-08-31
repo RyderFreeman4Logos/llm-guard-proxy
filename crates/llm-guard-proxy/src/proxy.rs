@@ -5464,6 +5464,7 @@ struct ResponseModelRewriteBody<S> {
     mode: ResponseModelRewriteMode,
     client_model: String,
     buffered: BytesMut,
+    sse_scanner: SseFrameScanner,
     pending: Option<Bytes>,
     completed: bool,
 }
@@ -5475,6 +5476,7 @@ impl<S> ResponseModelRewriteBody<S> {
             mode,
             client_model,
             buffered: BytesMut::new(),
+            sse_scanner: SseFrameScanner::default(),
             pending: None,
             completed: false,
         }
@@ -5493,7 +5495,7 @@ where
             return Poll::Ready(None);
         }
         if matches!(this.mode, ResponseModelRewriteMode::OpenAiSse)
-            && let Some(frame) = take_sse_frame(&mut this.buffered)
+            && let Some(frame) = take_sse_frame(&mut this.buffered, &mut this.sse_scanner)
         {
             return Poll::Ready(Some(Ok(rewrite_sse_response_model_body(
                 &frame,
@@ -5513,9 +5515,10 @@ where
                         .checked_sub(this.buffered.len())
                         .expect("SSE rewrite buffer must stay within its byte limit");
                     let accepted_len = bytes.len().min(remaining);
-                    if bytes.len() > remaining
-                        && sse_frame_end_parts(&this.buffered, &bytes[..accepted_len]).is_none()
-                    {
+                    let start = this.buffered.len();
+                    let mut scanner = this.sse_scanner.clone();
+                    let frame_end = scanner.scan_appended(&bytes[..accepted_len], start);
+                    if bytes.len() > remaining && frame_end.is_none() {
                         this.completed = true;
                         this.buffered.clear();
                         return Poll::Ready(Some(Err(ResponseModelRewriteError::FrameOverflow {
@@ -5523,10 +5526,11 @@ where
                         })));
                     }
                     this.buffered.extend_from_slice(&bytes[..accepted_len]);
+                    this.sse_scanner = scanner;
                     if accepted_len < bytes.len() {
                         this.pending = Some(bytes.slice(accepted_len..));
                     }
-                    if let Some(frame) = take_sse_frame(&mut this.buffered) {
+                    if let Some(frame) = take_sse_frame(&mut this.buffered, &mut this.sse_scanner) {
                         return Poll::Ready(Some(Ok(rewrite_sse_response_model_body(
                             &frame,
                             &this.client_model,
@@ -5595,60 +5599,84 @@ impl<E: std::error::Error + 'static> std::error::Error for ResponseModelRewriteE
     }
 }
 
-fn take_sse_frame(buffer: &mut BytesMut) -> Option<Bytes> {
-    let end = sse_frame_end(buffer)?;
-    Some(buffer.split_to(end).freeze())
+#[derive(Clone, Default)]
+struct SseFrameScanner {
+    line_start: usize,
+    pending_cr: Option<usize>,
+    frame_end: Option<usize>,
+    #[cfg(test)]
+    inspected_bytes: usize,
 }
 
-fn sse_frame_end(buffer: &[u8]) -> Option<usize> {
-    sse_frame_end_chunks(std::iter::once(buffer))
-}
-
-fn sse_frame_end_parts(first: &[u8], second: &[u8]) -> Option<usize> {
-    sse_frame_end_chunks([first, second])
-}
-
-fn sse_frame_end_chunks<'a>(chunks: impl IntoIterator<Item = &'a [u8]>) -> Option<usize> {
-    let mut line_start = 0;
-    let mut offset = 0;
-    let mut pending_cr = None;
-    for chunk in chunks {
-        for (index, &byte) in chunk.iter().enumerate() {
-            let position = offset + index;
-            if let Some(cr_start) = pending_cr {
+impl SseFrameScanner {
+    fn scan_appended(&mut self, bytes: &[u8], start: usize) -> Option<usize> {
+        if let Some(frame_end) = self.frame_end {
+            return Some(frame_end);
+        }
+        for (position, &byte) in bytes.iter().enumerate().skip(start) {
+            #[cfg(test)]
+            {
+                self.inspected_bytes = self.inspected_bytes.saturating_add(1);
+            }
+            if let Some(cr_start) = self.pending_cr {
                 if byte == b'\n' {
                     let end = position + 1;
-                    if line_start == cr_start {
-                        return Some(end);
+                    if self.line_start == cr_start {
+                        self.frame_end = Some(end);
+                        return self.frame_end;
                     }
-                    line_start = end;
-                    pending_cr = None;
+                    self.line_start = end;
+                    self.pending_cr = None;
                     continue;
                 }
                 let end = cr_start + 1;
-                if line_start == cr_start {
-                    return Some(end);
+                if self.line_start == cr_start {
+                    self.frame_end = Some(end);
+                    return self.frame_end;
                 }
-                line_start = end;
-                pending_cr = None;
+                self.line_start = end;
+                self.pending_cr = None;
             }
             match byte {
-                b'\r' => pending_cr = Some(position),
+                b'\r' => self.pending_cr = Some(position),
                 b'\n' => {
                     let end = position + 1;
-                    if line_start == position {
-                        return Some(end);
+                    if self.line_start == position {
+                        self.frame_end = Some(end);
+                        return self.frame_end;
                     }
-                    line_start = end;
+                    self.line_start = end;
                 }
                 _ => {}
             }
         }
-        offset += chunk.len();
+        if self
+            .pending_cr
+            .is_some_and(|cr_start| self.line_start == cr_start)
+        {
+            self.frame_end = self.pending_cr.map(|cr_start| cr_start + 1);
+        }
+        self.frame_end
     }
-    pending_cr
-        .filter(|&cr_start| line_start == cr_start)
-        .map(|cr_start| cr_start + 1)
+
+    fn take_frame(&mut self, buffer: &mut BytesMut) -> Option<Bytes> {
+        let frame_end = self.frame_end.take()?;
+        let frame = buffer.split_to(frame_end).freeze();
+        self.line_start = 0;
+        self.pending_cr = None;
+        self.scan_appended(buffer, 0);
+        Some(frame)
+    }
+}
+
+fn take_sse_frame(buffer: &mut BytesMut, scanner: &mut SseFrameScanner) -> Option<Bytes> {
+    scanner.take_frame(buffer)
+}
+
+#[cfg(test)]
+fn sse_frame_end(buffer: &[u8]) -> Option<usize> {
+    let mut scanner = SseFrameScanner::default();
+    scanner.scan_appended(buffer, 0)
 }
 
 fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> (Bytes, bool) {
@@ -9426,8 +9454,9 @@ async fn preclassify_sse_response_body(
 ) -> Result<(UpstreamBodyStream, bool), ProxyError> {
     let mut stream: UpstreamBodyStream = Box::pin(stream);
     let mut prefetched = BytesMut::new();
+    let mut scanner = SseFrameScanner::default();
     loop {
-        if let Some(frame_end) = sse_frame_end(&prefetched) {
+        if let Some(frame_end) = scanner.frame_end {
             let can_rewrite = std::str::from_utf8(&prefetched[..frame_end]).is_ok();
             return Ok((
                 replay_prefetched_upstream_body(prefetched.freeze(), stream),
@@ -9442,9 +9471,12 @@ async fn preclassify_sse_response_body(
         match next {
             Some(Ok(bytes)) => {
                 let remaining = SSE_REWRITE_FRAME_BYTE_LIMIT.saturating_sub(prefetched.len());
+                let accepted_len = bytes.len().min(remaining);
+                let start = prefetched.len();
+                prefetched.extend_from_slice(&bytes[..accepted_len]);
+                let frame_end = scanner.scan_appended(&prefetched, start);
                 if bytes.len() > remaining {
-                    prefetched.extend_from_slice(&bytes[..remaining]);
-                    if let Some(frame_end) = sse_frame_end(&prefetched) {
+                    if let Some(frame_end) = frame_end {
                         let can_rewrite = std::str::from_utf8(&prefetched[..frame_end]).is_ok();
                         let suffix = bytes.slice(remaining..);
                         let tail =
@@ -9458,7 +9490,6 @@ async fn preclassify_sse_response_body(
                         "upstream SSE frame exceeded {SSE_REWRITE_FRAME_BYTE_LIMIT} byte limit"
                     )));
                 }
-                prefetched.extend_from_slice(&bytes);
             }
             Some(Err(error)) => {
                 let prefix = prefetched.freeze();
