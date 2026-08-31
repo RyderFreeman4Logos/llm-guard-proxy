@@ -99,7 +99,7 @@ shielded_streaming_enabled = true
 
 #[tokio::test]
 async fn shielded_chat_retries_a_503_on_the_configured_failover_endpoint() {
-    let primary_base_url = spawn_shielded_503_upstream().await;
+    let (primary_base_url, _primary_server) = spawn_shielded_503_upstream().await;
     let mut fallback = FakeUpstream::spawn().await;
     let extra_config =
         shielded_openai_failover_profile_config(&primary_base_url, &fallback.base_url);
@@ -1113,7 +1113,7 @@ async fn closed_upstream_base_url() -> String {
     format!("http://{addr}/v1")
 }
 
-async fn spawn_shielded_503_upstream() -> String {
+async fn spawn_shielded_503_upstream() -> (String, TestServer) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("shielded primary should bind");
@@ -1133,12 +1133,12 @@ async fn spawn_shielded_503_upstream() -> String {
             .body(Body::empty())
             .expect("503 response should build")
     });
-    tokio::spawn(async move {
+    let server = TestServer::new(tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             eprintln!("shielded 503 upstream server failed: {error}");
         }
-    });
-    format!("http://{addr}/v1")
+    }));
+    (format!("http://{addr}/v1"), server)
 }
 
 fn shielded_openai_failover_profile_config(
@@ -1431,13 +1431,14 @@ fn spawn_fake_upstream_on_listener(listener: TcpListener) -> FakeUpstream {
     let addr = listener
         .local_addr()
         .expect("recovering upstream address should be available");
-    tokio::spawn(async move {
+    let server = TestServer::new(tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             eprintln!("recovering upstream server failed: {error}");
         }
-    });
+    }));
     FakeUpstream {
         base_url: format!("http://{addr}/v1"),
         receiver,
+        _server: server,
     }
 }

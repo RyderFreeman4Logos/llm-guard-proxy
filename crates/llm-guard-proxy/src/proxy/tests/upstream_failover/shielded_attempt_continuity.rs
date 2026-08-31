@@ -561,14 +561,15 @@ async fn spawn_scripted_primary(script: PrimaryChatScript) -> FakeUpstream {
     let addr = listener
         .local_addr()
         .expect("scripted shielded primary address should be available");
-    tokio::spawn(async move {
+    let server = TestServer::new(tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             eprintln!("scripted shielded primary failed: {error}");
         }
-    });
+    }));
     FakeUpstream {
         base_url: format!("http://{addr}/v1"),
         receiver,
+        _server: server,
     }
 }
 

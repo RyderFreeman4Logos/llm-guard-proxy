@@ -19041,6 +19041,7 @@ async fn shutdown_cancels_pre_response_upstream_work() {
         })
         .await
     });
+    assert_proxy_test_server_ready(addr).await;
 
     let request = tokio::spawn({
         let client = proxy.client.clone();
@@ -20654,9 +20655,55 @@ struct ObservedRequest {
     body: Bytes,
 }
 
+struct TestServer {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestServer {
+    fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        Self { task }
+    }
+
+    fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.task.abort_handle()
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn test_server_drop_aborts_owned_task() {
+    let server = TestServer::new(tokio::spawn(std::future::pending()));
+    let abort = server.abort_handle();
+
+    drop(server);
+    tokio::task::yield_now().await;
+
+    assert!(
+        abort.is_finished(),
+        "dropping a fixture must stop its server"
+    );
+}
+
+async fn assert_proxy_test_server_ready(addr: std::net::SocketAddr) {
+    let ready = timeout(
+        STREAM_COMPLETION_TIMEOUT,
+        reqwest::get(format!("http://{addr}/metrics")),
+    )
+    .await
+    .expect("test proxy readiness should be bounded")
+    .expect("test proxy should become ready");
+    assert_eq!(ready.status(), StatusCode::OK);
+}
+
 struct FakeUpstream {
     base_url: String,
     receiver: mpsc::Receiver<ObservedRequest>,
+    _server: TestServer,
 }
 
 #[derive(Debug)]
@@ -20668,6 +20715,7 @@ struct CancellableUpstream {
     base_url: String,
     receiver: mpsc::Receiver<ObservedRequest>,
     drop_receiver: mpsc::Receiver<UpstreamDropEvent>,
+    _server: TestServer,
 }
 
 #[derive(Clone)]
@@ -20694,16 +20742,17 @@ impl CancellableUpstream {
         let addr = listener
             .local_addr()
             .expect("cancellable upstream address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("cancellable upstream server failed: {error}");
             }
-        });
+        }));
 
         Self {
             base_url: format!("http://{addr}/v1"),
             receiver,
             drop_receiver,
+            _server: server,
         }
     }
 
@@ -20892,11 +20941,11 @@ impl FakeUpstream {
         let addr = listener
             .local_addr()
             .expect("fake upstream address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("fake upstream server failed: {error}");
             }
-        });
+        }));
         let ready = timeout(
             STREAM_COMPLETION_TIMEOUT,
             reqwest::get(format!("http://{addr}/__fake_upstream_ready")),
@@ -20909,6 +20958,7 @@ impl FakeUpstream {
         Self {
             base_url: format!("http://{addr}/v1"),
             receiver,
+            _server: server,
         }
     }
 
@@ -20931,6 +20981,7 @@ impl FakeUpstream {
 struct RedirectingUpstream {
     base_url: String,
     receiver: mpsc::Receiver<ObservedRequest>,
+    _server: TestServer,
 }
 
 impl RedirectingUpstream {
@@ -20949,15 +21000,16 @@ impl RedirectingUpstream {
         let addr = listener
             .local_addr()
             .expect("redirecting upstream address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("redirecting upstream server failed: {error}");
             }
-        });
+        }));
 
         Self {
             base_url: format!("http://{addr}/v1"),
             receiver,
+            _server: server,
         }
     }
 
@@ -20979,6 +21031,7 @@ struct RedirectingUpstreamState {
 struct RedirectTarget {
     capture_url: String,
     receiver: mpsc::Receiver<ObservedRequest>,
+    _server: TestServer,
 }
 
 impl RedirectTarget {
@@ -20993,15 +21046,16 @@ impl RedirectTarget {
         let addr = listener
             .local_addr()
             .expect("redirect target address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("redirect target server failed: {error}");
             }
-        });
+        }));
 
         Self {
             capture_url: format!("http://{addr}/v1/redirect-target"),
             receiver,
+            _server: server,
         }
     }
 
@@ -21012,6 +21066,7 @@ impl RedirectTarget {
 
 struct BrokenUpstream {
     base_url: String,
+    _server: TestServer,
 }
 
 impl BrokenUpstream {
@@ -21022,7 +21077,7 @@ impl BrokenUpstream {
         let addr = listener
             .local_addr()
             .expect("broken upstream address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((_stream, _addr)) => {}
@@ -21032,10 +21087,11 @@ impl BrokenUpstream {
                     }
                 }
             }
-        });
+        }));
 
         Self {
             base_url: format!("http://{addr}/v1"),
+            _server: server,
         }
     }
 }
@@ -23300,6 +23356,7 @@ struct ProxyFixture {
     #[cfg(feature = "guard")]
     budget_sqlite_path: PathBuf,
     root: PathBuf,
+    server: TestServer,
 }
 
 impl ProxyFixture {
@@ -23492,19 +23549,12 @@ impl ProxyFixture {
         let addr = listener
             .local_addr()
             .expect("proxy addr should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("proxy test server failed: {error}");
             }
-        });
-        let ready = timeout(
-            STREAM_COMPLETION_TIMEOUT,
-            reqwest::get(format!("http://{addr}/metrics")),
-        )
-        .await
-        .expect("proxy readiness request should not time out")
-        .expect("proxy readiness request should complete");
-        assert_eq!(ready.status(), StatusCode::OK);
+        }));
+        assert_proxy_test_server_ready(addr).await;
 
         Self {
             base_url: format!("http://{addr}"),
@@ -23517,6 +23567,7 @@ impl ProxyFixture {
             #[cfg(feature = "guard")]
             budget_sqlite_path,
             root,
+            server,
         }
     }
 
@@ -23563,19 +23614,12 @@ impl ProxyFixture {
         let addr = listener
             .local_addr()
             .expect("proxy addr should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("proxy test server failed: {error}");
             }
-        });
-        let ready = timeout(
-            STREAM_COMPLETION_TIMEOUT,
-            reqwest::get(format!("http://{addr}/metrics")),
-        )
-        .await
-        .expect("proxy readiness request should not time out")
-        .expect("proxy readiness request should complete");
-        assert_eq!(ready.status(), StatusCode::OK);
+        }));
+        assert_proxy_test_server_ready(addr).await;
 
         Self {
             base_url: format!("http://{addr}"),
@@ -23588,6 +23632,7 @@ impl ProxyFixture {
             #[cfg(feature = "guard")]
             budget_sqlite_path,
             root,
+            server,
         }
     }
 }
@@ -23606,6 +23651,7 @@ struct ProxyFixtureSpawnOptions<'a> {
 
 impl Drop for ProxyFixture {
     fn drop(&mut self) {
+        self.server.task.abort();
         remove_dir_all(&self.root);
     }
 }
