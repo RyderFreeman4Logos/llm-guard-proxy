@@ -56,6 +56,8 @@ pub struct AppConfig {
     pub upstream: UpstreamConfig,
     /// Additional named upstream profiles matched by request model.
     pub upstream_profiles: Vec<UpstreamProfileConfig>,
+    /// Immutable request policies selected by public model aliases.
+    pub forced_model_alias_profiles: Vec<ForcedModelAliasProfileConfig>,
     /// Virtual model aliases exposed to clients.
     #[cfg(feature = "guard")]
     pub model_aliases: Vec<ModelAliasConfig>,
@@ -308,6 +310,7 @@ impl AppConfig {
         self.server.validate()?;
         self.upstream.validate()?;
         self.validate_upstream_profiles()?;
+        self.validate_forced_model_alias_profiles()?;
         #[cfg(feature = "guard")]
         {
             self.validate_model_aliases()?;
@@ -368,6 +371,37 @@ impl AppConfig {
             }
         }
 
+        Ok(())
+    }
+
+    fn validate_forced_model_alias_profiles(&self) -> Result<(), ValidationError> {
+        let mut aliases = HashSet::new();
+        for profile in &self.forced_model_alias_profiles {
+            profile.validate()?;
+            require(
+                aliases.insert(profile.alias.clone()),
+                "forced_model_alias_profiles.alias",
+                "must be unique",
+            )?;
+            #[cfg(feature = "guard")]
+            require(
+                !self
+                    .model_aliases
+                    .iter()
+                    .any(|alias| alias.id == profile.alias),
+                "forced_model_alias_profiles.alias",
+                "must not collide with model_aliases.id",
+            )?;
+            #[cfg(feature = "guard")]
+            require(
+                !self
+                    .model_aliases
+                    .iter()
+                    .any(|alias| alias.id == profile.upstream_model),
+                "forced_model_alias_profiles.upstream_model",
+                "must not collide with model_aliases.id",
+            )?;
+        }
         Ok(())
     }
 
@@ -980,6 +1014,13 @@ impl AppConfig {
         self.upstream.local_recovery = requested.upstream.local_recovery.clone();
         self.upstream.stuck_watchdog = requested.upstream.stuck_watchdog.clone();
         self.upstream.restart_queue = requested.upstream.restart_queue.clone();
+        if self.routing_topology_matches(requested) {
+            self.upstream
+                .reserved_ingress_model_ids
+                .clone_from(&requested.upstream.reserved_ingress_model_ids);
+            self.forced_model_alias_profiles
+                .clone_from(&requested.forced_model_alias_profiles);
+        }
         if self.upstream_profiles_topology_matches(requested) {
             self.apply_reloadable_upstream_profile_fields(requested);
         }
@@ -1058,6 +1099,20 @@ impl AppConfig {
 
     fn upstream_profiles_topology_matches(&self, requested: &Self) -> bool {
         self.upstream_profile_topology() == requested.upstream_profile_topology()
+    }
+
+    fn routing_topology_matches(&self, requested: &Self) -> bool {
+        #[cfg(feature = "guard")]
+        let model_alias_topology_matches =
+            self.model_alias_topology() == requested.model_alias_topology();
+        #[cfg(not(feature = "guard"))]
+        let model_alias_topology_matches = true;
+        self.server.bind_host == requested.server.bind_host
+            && self.server.port == requested.server.port
+            && self.listener_topology() == requested.listener_topology()
+            && self.upstream.base_url == requested.upstream.base_url
+            && self.upstream_profiles_topology_matches(requested)
+            && model_alias_topology_matches
     }
 
     fn upstream_profile_topology(&self) -> Vec<UpstreamProfileTopology> {
@@ -1599,6 +1654,8 @@ pub struct UpstreamConfig {
     pub base_url: String,
     /// Total upstream request timeout, including streamed response body reads.
     pub request_timeout_ms: u64,
+    /// Model IDs that are never admitted at ingress or exposed by model listing.
+    pub reserved_ingress_model_ids: Vec<String>,
     /// Engine that accepts the forwarded `OpenAI` `priority` field.
     pub cache_priority_engine: CachePriorityEngine,
     /// Metadata discovery and model context enrichment policy.
@@ -1621,6 +1678,31 @@ impl UpstreamConfig {
             "upstream.request_timeout_ms",
             "must be greater than zero",
         )?;
+        let mut reserved_ids = HashSet::new();
+        for model_id in &self.reserved_ingress_model_ids {
+            require(
+                !model_id.is_empty() && model_id == model_id.trim(),
+                "upstream.reserved_ingress_model_ids",
+                "must contain non-empty trimmed model identifiers",
+            )?;
+            require(
+                model_id.len() <= MAX_UPSTREAM_MODEL_ALIAS_BYTES,
+                "upstream.reserved_ingress_model_ids",
+                "model identifiers must be at most 256 bytes",
+            )?;
+            require(
+                model_id.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.')
+                }),
+                "upstream.reserved_ingress_model_ids",
+                "model identifiers must contain only ASCII letters, digits, '/', '-', '_', or '.'",
+            )?;
+            require(
+                reserved_ids.insert(model_id),
+                "upstream.reserved_ingress_model_ids",
+                "must not contain duplicate model identifiers",
+            )?;
+        }
         self.metadata.validate()?;
         self.hot_restart.validate(HotRestartValidationFields {
             max_tokens: "upstream.hot_restart.probe_max_tokens",
@@ -1645,6 +1727,16 @@ impl UpstreamConfig {
     pub fn redacted_base_url(&self) -> String {
         redact_upstream_base_url(&self.base_url)
     }
+
+    /// Returns true when an ingress model ID is reserved for internal use.
+    #[must_use]
+    pub fn is_reserved_ingress_model_id(&self, model_id: &str) -> bool {
+        model_id.starts_with("__listener_forced_")
+            || self
+                .reserved_ingress_model_ids
+                .iter()
+                .any(|reserved| reserved == model_id)
+    }
 }
 
 impl Default for UpstreamConfig {
@@ -1652,6 +1744,7 @@ impl Default for UpstreamConfig {
         Self {
             base_url: String::from("http://gb10:18009/v1"),
             request_timeout_ms: 120_000,
+            reserved_ingress_model_ids: Vec::new(),
             cache_priority_engine: CachePriorityEngine::Disabled,
             metadata: MetadataConfig::default(),
             hot_restart: HotRestartConfig::default(),
@@ -2658,6 +2751,165 @@ impl Default for ParamOverrideConfig {
             reasoning_effort: None,
         }
     }
+}
+
+/// Immutable sampling and thinking policy selected by one public model alias.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ForcedModelAliasProfileConfig {
+    /// Client-visible alias that selects this policy.
+    pub alias: String,
+    /// Canonical model name sent upstream.
+    pub upstream_model: String,
+    /// Force-disable or force-thinking policy.
+    pub thinking_mode: Option<ThinkingMode>,
+    /// Required only for `force_thinking`.
+    pub thinking_budget: Option<u32>,
+    /// Visible-answer headroom used to derive the forced total generation cap.
+    pub output_cap: Option<u32>,
+    /// Forced sampler and penalty settings.
+    pub temperature: Option<f64>,
+    /// Nucleus-sampling probability mass; use `0.95` for a conservative default.
+    pub top_p: Option<f64>,
+    /// Maximum candidate tokens considered per sample; use `20` for a conservative default.
+    pub top_k: Option<u32>,
+    /// Minimum token probability threshold; use `0.0` to disable this filter.
+    pub min_p: Option<f64>,
+    /// Penalizes tokens already present in the response; use `0.0` to disable it.
+    pub presence_penalty: Option<f64>,
+    /// Penalizes repeated tokens; use `1.0` for the model default.
+    pub repetition_penalty: Option<f64>,
+}
+
+impl ForcedModelAliasProfileConfig {
+    fn validate(&self) -> Result<(), ValidationError> {
+        require(
+            !self.alias.trim().is_empty(),
+            "forced_model_alias_profiles.alias",
+            "must not be empty",
+        )?;
+        require(
+            self.alias == self.alias.trim(),
+            "forced_model_alias_profiles.alias",
+            "must not have leading or trailing whitespace",
+        )?;
+        require(
+            !self.upstream_model.trim().is_empty(),
+            "forced_model_alias_profiles.upstream_model",
+            "must not be empty",
+        )?;
+        require(
+            self.upstream_model == self.upstream_model.trim(),
+            "forced_model_alias_profiles.upstream_model",
+            "must not have leading or trailing whitespace",
+        )?;
+        let output_cap = self.output_cap.ok_or_else(|| {
+            ValidationError::new(
+                "forced_model_alias_profiles.output_cap",
+                "is required and must be greater than zero",
+            )
+        })?;
+        require(
+            output_cap > 0,
+            "forced_model_alias_profiles.output_cap",
+            "must be greater than zero",
+        )?;
+        validate_forced_model_alias_number(
+            self.temperature,
+            "forced_model_alias_profiles.temperature",
+            0.0,
+            2.0,
+        )?;
+        validate_forced_model_alias_number(
+            self.top_p,
+            "forced_model_alias_profiles.top_p",
+            0.0,
+            1.0,
+        )?;
+        let top_k = self.top_k.ok_or_else(|| {
+            ValidationError::new(
+                "forced_model_alias_profiles.top_k",
+                "is required and must be greater than zero",
+            )
+        })?;
+        require(
+            top_k > 0,
+            "forced_model_alias_profiles.top_k",
+            "must be greater than zero",
+        )?;
+        validate_forced_model_alias_number(
+            self.min_p,
+            "forced_model_alias_profiles.min_p",
+            0.0,
+            1.0,
+        )?;
+        validate_forced_model_alias_number(
+            self.presence_penalty,
+            "forced_model_alias_profiles.presence_penalty",
+            -2.0,
+            2.0,
+        )?;
+        validate_forced_model_alias_number(
+            self.repetition_penalty,
+            "forced_model_alias_profiles.repetition_penalty",
+            f64::MIN_POSITIVE,
+            2.0,
+        )?;
+        match self.thinking_mode.ok_or_else(|| {
+            ValidationError::new(
+                "forced_model_alias_profiles.thinking_mode",
+                "is required and must be force_disable or force_thinking",
+            )
+        })? {
+            ThinkingMode::ForceDisable => require(
+                self.thinking_budget.is_none(),
+                "forced_model_alias_profiles.thinking_budget",
+                "must be omitted when thinking is disabled",
+            ),
+            ThinkingMode::ForceThinking => {
+                validate_forced_model_alias_thinking_budget(self.thinking_budget, output_cap)
+            }
+            _ => Err(ValidationError::new(
+                "forced_model_alias_profiles.thinking_mode",
+                "must be force_disable or force_thinking",
+            )),
+        }
+    }
+}
+
+fn validate_forced_model_alias_thinking_budget(
+    thinking_budget: Option<u32>,
+    output_cap: u32,
+) -> Result<(), ValidationError> {
+    let budget = thinking_budget.ok_or_else(|| {
+        ValidationError::new(
+            "forced_model_alias_profiles.thinking_budget",
+            "must be greater than zero when thinking is enabled",
+        )
+    })?;
+    require(
+        budget > 0,
+        "forced_model_alias_profiles.thinking_budget",
+        "must be greater than zero when thinking is enabled",
+    )?;
+    require(
+        budget.checked_add(output_cap).is_some(),
+        "forced_model_alias_profiles",
+        "thinking_budget plus output_cap must fit the supported total generation cap",
+    )
+}
+
+fn validate_forced_model_alias_number(
+    value: Option<f64>,
+    field: &'static str,
+    minimum: f64,
+    maximum: f64,
+) -> Result<(), ValidationError> {
+    let value = value.ok_or_else(|| ValidationError::new(field, "is required"))?;
+    require(
+        value.is_finite() && (minimum..=maximum).contains(&value),
+        field,
+        "must be finite and within the supported range",
+    )
 }
 
 /// Bounded route reason stored in observability metadata.

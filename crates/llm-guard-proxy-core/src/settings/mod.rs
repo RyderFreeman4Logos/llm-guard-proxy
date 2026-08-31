@@ -15,15 +15,16 @@ pub use error::{ConfigParseError, ValidationError};
 pub use model::{
     AppConfig, CachePriorityEngine, CloudflareConfig, ConfigToggle, DefaultInjectionSchema,
     DownstreamDropPolicy, EmbeddingProvider, EmbeddingQueuePolicy, EndpointSelectionMode,
-    EvidenceConfig, EvidencePairedComparisonConfig, EvidenceShadowConfig, GuardianConfig,
-    GuardianKillAction, HeartbeatConfig, HeartbeatMode, HotRestartConfig, ListenerConfig,
-    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, LoopGuardEmbeddingConfig,
-    LoopGuardMode, MetadataConfig, NoThinkingMarkerPolicy, ObservabilityConfig, RestartQueueConfig,
-    RestartRequiredChange, RetentionConfig, RetryConfig, RetryLadderConfig,
-    SelectedUpstreamProfile, ServerConfig, ShadowComparisonAttempt, ShieldingConfig,
-    StuckWatchdogConfig, ThinkingConfig, ThinkingMode, ToolRequestThinkingPolicy, UpstreamConfig,
-    UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    EvidenceConfig, EvidencePairedComparisonConfig, EvidenceShadowConfig,
+    ForcedModelAliasProfileConfig, GuardianConfig, GuardianKillAction, HeartbeatConfig,
+    HeartbeatMode, HotRestartConfig, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy,
+    LoopGuardConfig, LoopGuardEmbeddingConfig, LoopGuardMode, MetadataConfig,
+    NoThinkingMarkerPolicy, ObservabilityConfig, RestartQueueConfig, RestartRequiredChange,
+    RetentionConfig, RetryConfig, RetryLadderConfig, SelectedUpstreamProfile, ServerConfig,
+    ShadowComparisonAttempt, ShieldingConfig, StuckWatchdogConfig, ThinkingConfig, ThinkingMode,
+    ToolRequestThinkingPolicy, UpstreamConfig, UpstreamEndpointConfig, UpstreamEndpointProtocol,
+    UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "guard")]
 pub use model::{BudgetConfig, GuardWorkflowConfig};
@@ -157,6 +158,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "cloudflare.enabled",
     "upstream.request_timeout_ms",
     "upstream.cache_priority_engine",
+    "upstream.reserved_ingress_model_ids",
     "upstream.metadata.discovery_enabled",
     "upstream.metadata.enrich_responses",
     "upstream.metadata.refresh_interval_secs",
@@ -249,6 +251,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstreams.thinking.apply_to_tool_requests",
     "upstreams.loop_guard",
     "upstreams.retry.ladder",
+    "forced_model_alias_profiles",
     #[cfg(feature = "param-override")]
     "upstreams.param_override.enabled",
     #[cfg(feature = "param-override")]

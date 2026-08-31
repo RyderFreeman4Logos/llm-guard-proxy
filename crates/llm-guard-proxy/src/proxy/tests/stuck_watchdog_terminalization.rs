@@ -367,6 +367,7 @@ async fn terminal_json_progress_has_one_owner_when_downstream_drop_races_staged_
         response_parts.into_observer(),
         InFlightPermit { limiter: None },
         proxy.state.shutdown.subscribe(),
+        None,
     );
     let delivered = timeout(Duration::from_secs(1), downstream.next())
         .await
@@ -448,6 +449,7 @@ async fn buffered_adapter_ends_watchdog_lease_before_constructing_unread_downstr
         InFlightPermit { limiter: None },
         BufferedResponseAdapter::ScoreFromRerank(None),
         Some("qwen3-reranker-8b"),
+        None,
     )
     .await
     .expect("buffered adapter should rewrite the complete reranker response");

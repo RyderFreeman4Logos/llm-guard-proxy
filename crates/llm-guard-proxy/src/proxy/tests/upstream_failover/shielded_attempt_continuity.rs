@@ -141,6 +141,138 @@ async fn shielded_physical_attempts_preserve_immediate_nonstream_failover_chain(
 }
 
 #[tokio::test]
+async fn forced_alias_policy_survives_each_endpoint_failover_physical_attempt() {
+    let mut primary = spawn_scripted_primary(PrimaryChatScript::AlwaysUnavailable).await;
+    let mut fallback = FakeUpstream::spawn().await;
+    let config = forced_alias_failover_config(&primary.base_url, &fallback.base_url);
+
+    for (alias, stream, thinking, budget, temperature, top_p, presence_penalty) in [
+        (
+            "abliterated-qwen-latest-27b-none",
+            false,
+            false,
+            None,
+            0.7,
+            0.8,
+            1.5,
+        ),
+        (
+            "abliterated-qwen-latest-27b-none",
+            true,
+            false,
+            None,
+            0.7,
+            0.8,
+            1.5,
+        ),
+        (
+            "abliterated-qwen-latest-27b-low",
+            false,
+            true,
+            Some(65536),
+            1.0,
+            0.95,
+            0.0,
+        ),
+        (
+            "abliterated-qwen-latest-27b-low",
+            true,
+            true,
+            Some(65536),
+            1.0,
+            0.95,
+            0.0,
+        ),
+        (
+            "abliterated-qwen-latest-27b-medium",
+            false,
+            true,
+            Some(65536),
+            1.0,
+            0.95,
+            0.0,
+        ),
+        (
+            "abliterated-qwen-latest-27b-medium",
+            true,
+            true,
+            Some(65536),
+            1.0,
+            0.95,
+            0.0,
+        ),
+    ] {
+        assert_forced_alias_failover_attempts(
+            &mut primary,
+            &mut fallback,
+            &config,
+            (
+                alias,
+                stream,
+                thinking,
+                budget,
+                temperature,
+                top_p,
+                presence_penalty,
+            ),
+        )
+        .await;
+    }
+}
+
+#[tokio::test]
+async fn canonical_reranker_failover_reapplies_forced_alias_policy_and_metadata() {
+    let mut primary = spawn_scripted_primary(PrimaryChatScript::AlwaysUnavailable).await;
+    let mut fallback = FakeUpstream::spawn().await;
+    let config = forced_alias_failover_config(&primary.base_url, &fallback.base_url);
+    let proxy = spawn_observed_failover_proxy(&primary.base_url, &config).await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/rerank", proxy.base_url))
+        .json(&json!({
+            "model": "abliterated-qwen-latest-27b-low",
+            "query": "forced canonical reranker failover",
+            "documents": ["document"],
+        }))
+        .send()
+        .await
+        .expect("canonical reranker request should fail over");
+    assert_eq!(response.status(), StatusCode::OK);
+    response
+        .bytes()
+        .await
+        .expect("reranker response should drain");
+
+    for request in [
+        recv_chat_request(&mut primary).await,
+        recv_chat_request(&mut fallback).await,
+    ] {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("reranker attempt body should be JSON");
+        assert_eq!(body["model"], "abliterated-qwen-latest-27b-nvfp4");
+    }
+
+    let metadata = read_attempt_request_metadata_rows(&proxy.sqlite_path);
+    assert_eq!(metadata.len(), 2);
+    for attempt in metadata {
+        let metadata = attempt.request_metadata;
+        assert_eq!(metadata["forced_alias"], "abliterated-qwen-latest-27b-low");
+        assert_eq!(
+            metadata["forced_upstream_model"],
+            "abliterated-qwen-latest-27b-nvfp4"
+        );
+        assert_eq!(metadata["forced_thinking_mode"], "");
+        assert_eq!(metadata["forced_thinking_budget"], "none");
+        assert_eq!(metadata["forced_answer_headroom"], "");
+        assert_eq!(metadata["forced_wire_total_cap"], "unset");
+        assert_eq!(metadata["attempt_thinking_mode"], "");
+        assert_eq!(metadata["attempt_thinking_budget_tokens"], "none");
+        assert_eq!(metadata["attempt_thinking_max_tokens"], "unset");
+    }
+}
+
+#[tokio::test]
 async fn shielded_physical_attempts_preserve_later_retry_failover_chain() {
     let primary = spawn_scripted_primary(PrimaryChatScript::LoopThenUnavailable).await;
     let fallback = FakeUpstream::spawn().await;
@@ -232,6 +364,139 @@ async fn shielded_retry_stays_on_the_successful_failover_endpoint() {
     );
 }
 
+async fn assert_forced_alias_failover_attempts(
+    primary: &mut FakeUpstream,
+    fallback: &mut FakeUpstream,
+    config: &str,
+    (alias, stream, thinking, budget, temperature, top_p, presence_penalty): (
+        &str,
+        bool,
+        bool,
+        Option<u64>,
+        f64,
+        f64,
+        f64,
+    ),
+) {
+    let proxy = spawn_failover_proxy(&primary.base_url, config).await;
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .json(&json!({
+            "model": alias, "stream": stream, "messages": [], "temperature": 9, "top_p": 9,
+            "top_k": 9, "min_p": 9, "presence_penalty": 9, "frequency_penalty": 9,
+            "repetition_penalty": 9, "max_completion_tokens": 9,
+            "extra_body": {"temperature": 8, "thinking": {"enabled": false}},
+            "array": [{"frequency_penalty": 8}],
+        }))
+        .send()
+        .await
+        .expect("endpoint failover request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    response.bytes().await.expect("response should drain");
+    for request in [
+        recv_chat_request(primary).await,
+        recv_chat_request(fallback).await,
+    ] {
+        let body: serde_json::Value =
+            serde_json::from_slice(&request.body).expect("physical attempt body should be JSON");
+        assert_eq!(body["model"], "abliterated-qwen-latest-27b-nvfp4");
+        assert_eq!(body["temperature"], temperature);
+        assert_eq!(body["top_p"], top_p);
+        assert_eq!(body["top_k"], 20);
+        assert_eq!(body["min_p"], 0.0);
+        assert_eq!(body["presence_penalty"], presence_penalty);
+        assert_eq!(body["repetition_penalty"], 1.0);
+        assert_eq!(body["max_tokens"], if thinking { 81920 } else { 16384 });
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], thinking);
+        assert_eq!(
+            body.get("thinking_token_budget")
+                .and_then(serde_json::Value::as_u64),
+            budget
+        );
+        for pointer in [
+            "/frequency_penalty",
+            "/max_completion_tokens",
+            "/extra_body/temperature",
+            "/extra_body/thinking/enabled",
+        ] {
+            assert!(body.pointer(pointer).is_none(), "must strip {pointer}");
+        }
+        assert_eq!(body["array"][0]["frequency_penalty"], 8);
+    }
+}
+
+fn forced_alias_failover_config(primary_base_url: &str, fallback_base_url: &str) -> String {
+    format!(
+        r#"
+[shielding]
+enabled = true
+[upstream.hot_restart]
+enabled = false
+[retry]
+enabled = true
+max_attempts = 2
+shielded_streaming_enabled = true
+[[upstreams]]
+name = "forced-failover"
+base_url = "{primary_base_url}"
+match_models = ["abliterated-qwen-latest-27b-none", "abliterated-qwen-latest-27b-low", "abliterated-qwen-latest-27b-medium"]
+request_timeout_ms = 1000
+health_probe_interval_ms = 200
+health_probe_timeout_ms = 20
+health_probe_max_wait_ms = 400
+endpoint_selection = "priority_failover"
+[[upstreams.endpoints]]
+base_url = "{primary_base_url}"
+priority = "primary"
+protocol = "openai"
+[[upstreams.endpoints]]
+base_url = "{fallback_base_url}"
+priority = "failover"
+protocol = "openai"
+{FORCED_ALIAS_PROFILES}
+"#
+    )
+}
+
+const FORCED_ALIAS_PROFILES: &str = r#"
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-none"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
+thinking_mode = "force_disable"
+output_cap = 16384
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-low"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
+thinking_mode = "force_thinking"
+thinking_budget = 65536
+output_cap = 16384
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-medium"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
+thinking_mode = "force_thinking"
+thinking_budget = 65536
+output_cap = 16384
+temperature = 1.0
+top_p = 0.95
+top_k = 20
+min_p = 0.0
+presence_penalty = 0.0
+repetition_penalty = 1.0
+"#;
+
 fn request_model(request: &ObservedRequest) -> String {
     let value: serde_json::Value =
         serde_json::from_slice(&request.body).expect("forwarded chat body should be JSON");
@@ -239,6 +504,19 @@ fn request_model(request: &ObservedRequest) -> String {
         .as_str()
         .expect("forwarded chat body should contain a string model")
         .to_owned()
+}
+
+async fn recv_chat_request(fake: &mut FakeUpstream) -> ObservedRequest {
+    for _ in 0..4 {
+        let request = fake
+            .recv_within(Duration::from_secs(2))
+            .await
+            .expect("endpoint should receive a bounded request sequence");
+        if request.path_and_query != "/v1/models" {
+            return request;
+        }
+    }
+    panic!("endpoint only received health probes, not a chat request");
 }
 
 fn assert_attempt_numbers(attempts: &[AttemptChainRow], expected: &[u32]) {
@@ -283,14 +561,15 @@ async fn spawn_scripted_primary(script: PrimaryChatScript) -> FakeUpstream {
     let addr = listener
         .local_addr()
         .expect("scripted shielded primary address should be available");
-    tokio::spawn(async move {
+    let server = TestServer::new(tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app).await {
             eprintln!("scripted shielded primary failed: {error}");
         }
-    });
+    }));
     FakeUpstream {
         base_url: format!("http://{addr}/v1"),
         receiver,
+        _server: server,
     }
 }
 

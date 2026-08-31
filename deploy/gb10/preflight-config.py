@@ -22,6 +22,43 @@ AEON_RESTART_COMMAND = [
     "vllm-aeon-27b-dflash-n12.service",
 ]
 RECOVERY_COMPLETION_GUARD_MS = 1_000
+FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
+    "abliterated-qwen-latest-27b-none": {
+        "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
+        "thinking_mode": "force_disable",
+        "output_cap": 16_384,
+        "temperature": 0.7,
+        "top_p": 0.8,
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 1.5,
+        "repetition_penalty": 1.0,
+    },
+    "abliterated-qwen-latest-27b-low": {
+        "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
+        "thinking_mode": "force_thinking",
+        "thinking_budget": 65_536,
+        "output_cap": 16_384,
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 0,
+        "repetition_penalty": 1,
+    },
+    "abliterated-qwen-latest-27b-medium": {
+        "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
+        "thinking_mode": "force_thinking",
+        "thinking_budget": 65_536,
+        "output_cap": 16_384,
+        "temperature": 1,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0,
+        "presence_penalty": 0,
+        "repetition_penalty": 1,
+    },
+}
 
 
 def load_config(path: Path) -> dict[str, JsonValue]:
@@ -33,8 +70,9 @@ def load_config(path: Path) -> dict[str, JsonValue]:
             key, separator, raw_body = line.partition("=")
             if not separator:
                 raise ValueError("readiness_body assignment is malformed")
-            json.loads(raw_body.strip())
-            line = f"{key}= {json.dumps(raw_body.strip())}"
+            if not raw_body.lstrip().startswith('"'):
+                json.loads(raw_body.strip())
+                line = f"{key}= {json.dumps(raw_body.strip())}"
         normalized_lines.append(line)
     config = tomllib.loads("\n".join(normalized_lines))
     routes = [_table(config, "upstream")]
@@ -67,7 +105,8 @@ def _recovery_errors(label: str, recovery: dict[str, JsonValue]) -> list[str]:
         errors.append(f"{label}.local_recovery.trigger_on_request_deadline must be false")
     if recovery.get("restart_command") != AEON_RESTART_COMMAND:
         errors.append(f"{label}.local_recovery.restart_command is not the reviewed AEON unit")
-    if recovery.get("max_attempts_per_request") != 1:
+    attempts = _positive_int(recovery, "max_attempts_per_request")
+    if attempts != 1:
         errors.append(f"{label}.local_recovery.max_attempts_per_request must equal 1")
     for field in (
         "restart_timeout_ms",
@@ -84,6 +123,36 @@ def _recovery_errors(label: str, recovery: dict[str, JsonValue]) -> list[str]:
     if not isinstance(readiness_body, dict) or readiness_body.get("model") != "aeon-ultimate":
         errors.append(f"{label}.local_recovery.readiness_body must probe aeon-ultimate")
     return errors
+
+
+def _forced_alias_profile_errors(config: dict[str, JsonValue]) -> list[str]:
+    profiles = config.get("forced_model_alias_profiles")
+    if isinstance(profiles, list):
+        numeric_fields = (
+            "thinking_budget",
+            "output_cap",
+            "temperature",
+            "top_p",
+            "top_k",
+            "min_p",
+            "presence_penalty",
+            "repetition_penalty",
+        )
+        if any(
+            isinstance(profile, dict)
+            and any(isinstance(profile.get(field), bool) for field in numeric_fields)
+            for profile in profiles
+        ):
+            return ["forced_model_alias_profiles numeric fields must not be boolean"]
+    expected = [
+        {"alias": alias, **settings}
+        for alias, settings in FORCED_ALIAS_PROFILES.items()
+    ]
+    return (
+        []
+        if profiles == expected
+        else ["forced_model_alias_profiles must exactly match the reviewed aliases"]
+    )
 
 
 def minimum_downstream_idle_timeout_ms(config: dict[str, JsonValue]) -> int | None:
@@ -120,6 +189,7 @@ def validate_snapshot(
     config: dict[str, JsonValue], downstream_idle_timeout_ms: int
 ) -> tuple[list[str], int | None]:
     errors: list[str] = []
+    errors.extend(_forced_alias_profile_errors(config))
     if "guard_workflows" in config:
         errors.append("guard_workflows must remain inactive in the reviewed snapshot")
 

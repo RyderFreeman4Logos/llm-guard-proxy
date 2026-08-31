@@ -40,11 +40,12 @@ use llm_guard_proxy_core::{
 };
 use llm_guard_proxy_core::{
     AppConfig, CachePriorityEngine, ConfigHandle, DefaultInjectionSchema, DownstreamDropPolicy,
-    Health, HeartbeatMode, LICENSE, ListenerConfig, LocalRecoveryConfig, LoopFailurePolicy,
-    LoopGuardConfig, MetadataConfig, RestartQueueConfig, RetryConfig, RetryLadderConfig,
-    SERVICE_NAME, SelectedUpstreamProfile, ShadowComparisonAttempt, ThinkingConfig, ThinkingMode,
-    UpstreamEndpointConfig, UpstreamEndpointProtocol, UpstreamPriority, UpstreamProfileConfig,
-    UpstreamRouteReason, UpstreamStallConfig, redact_upstream_base_url, validate_upstream_base_url,
+    ForcedModelAliasProfileConfig, Health, HeartbeatMode, LICENSE, ListenerConfig,
+    LocalRecoveryConfig, LoopFailurePolicy, LoopGuardConfig, MetadataConfig, RestartQueueConfig,
+    RetryConfig, RetryLadderConfig, SERVICE_NAME, SelectedUpstreamProfile, ShadowComparisonAttempt,
+    ThinkingConfig, ThinkingMode, UpstreamEndpointConfig, UpstreamEndpointProtocol,
+    UpstreamPriority, UpstreamProfileConfig, UpstreamRouteReason, UpstreamStallConfig,
+    redact_upstream_base_url, validate_upstream_base_url,
 };
 #[cfg(feature = "param-override")]
 use llm_guard_proxy_core::{ParamOverrideConfig, ParamOverrideMode};
@@ -124,6 +125,7 @@ const IN_FLIGHT_CAPACITY_RECHECK_INTERVAL: Duration = Duration::from_millis(100)
 const ADMISSION_RETRY_AFTER_SECS: u32 = 1;
 const TOKEN_USAGE_BODY_CAP: usize = 64 * 1024;
 const MAX_DENIED_MODEL_ID_BYTES: usize = 128;
+const GUARD_PUBLIC_LISTENER_PORT: u16 = 18_009;
 const PAIRED_SAMPLE_DENOMINATOR: u64 = 1_000_000;
 const SERVER_SHUTDOWN_ABORT_REASON: &str = "server_shutdown";
 const PROXY_SHUTTING_DOWN_ERROR_TYPE: &str = "proxy_shutting_down";
@@ -929,6 +931,10 @@ struct PersistenceTasks {
     synchronous_for_tests: bool,
     #[cfg(test)]
     flush_wait_hook: Option<PersistenceFlushWaitHook>,
+    #[cfg(test)]
+    panic_published: Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    backlog_drop_log_published: Mutex<Option<oneshot::Sender<()>>>,
 }
 
 impl Default for PersistenceTasks {
@@ -944,6 +950,10 @@ impl Default for PersistenceTasks {
             synchronous_for_tests: false,
             #[cfg(test)]
             flush_wait_hook: None,
+            #[cfg(test)]
+            panic_published: Mutex::new(None),
+            #[cfg(test)]
+            backlog_drop_log_published: Mutex::new(None),
         }
     }
 }
@@ -961,6 +971,26 @@ impl PersistenceTasks {
     fn with_capacity_for_tests(capacity: usize) -> Self {
         Self {
             capacity: Arc::new(Semaphore::new(capacity)),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_panic_publication_for_tests(panic_published: oneshot::Sender<()>) -> Self {
+        Self {
+            panic_published: Mutex::new(Some(panic_published)),
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn with_backlog_drop_log_for_tests(
+        capacity: usize,
+        backlog_drop_log_published: oneshot::Sender<()>,
+    ) -> Self {
+        Self {
+            capacity: Arc::new(Semaphore::new(capacity)),
+            backlog_drop_log_published: Mutex::new(Some(backlog_drop_log_published)),
             ..Self::default()
         }
     }
@@ -994,6 +1024,15 @@ impl PersistenceTasks {
                 eprintln!(
                     "persistence backlog full, dropping record dropped_total={dropped_total} dropped_since_last_log={dropped_since_last_log} capacity={MAX_PERSISTENCE_TASKS}"
                 );
+                #[cfg(test)]
+                if let Some(backlog_drop_log_published) = self
+                    .backlog_drop_log_published
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ignored_if_test_stops_waiting = backlog_drop_log_published.send(());
+                }
             }
             return;
         };
@@ -1009,6 +1048,13 @@ impl PersistenceTasks {
         let tasks = Arc::clone(self);
         // The handle is intentionally detached: after its bounded shutdown wait expires,
         // persistence must not retain a waiter on a stalled blocking SQLite operation.
+        #[cfg(test)]
+        let _detached_task = std::thread::spawn(move || {
+            let _capacity_permit = capacity_permit;
+            let _guard = guard;
+            tasks.run(work);
+        });
+        #[cfg(not(test))]
         let _detached_task = tokio::task::spawn_blocking(move || {
             let _capacity_permit = capacity_permit;
             let _guard = guard;
@@ -1024,6 +1070,15 @@ impl PersistenceTasks {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
             eprintln!("persistence task panicked");
             self.panics.fetch_add(1, Ordering::SeqCst);
+            #[cfg(test)]
+            if let Some(panic_published) = self
+                .panic_published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ignored_if_test_stops_waiting = panic_published.send(());
+            }
         }
     }
 
@@ -3309,7 +3364,7 @@ async fn forward_openai_request(
             .endpoint_retry_order
             .clone_from(&selected.selection_order);
         prepared_request.upstream_deadline = Some(upstream_deadline);
-        let rendered = match prepared_request.canonical_reranker.as_ref() {
+        let mut rendered = match prepared_request.canonical_reranker.as_ref() {
             Some(canonical) => {
                 reranker_protocol::render(&selected.endpoint, canonical, &downstream_headers)
             }
@@ -3333,6 +3388,14 @@ async fn forward_openai_request(
             }),
         }
         .map_err(|error| error.with_request_metadata(request_metadata.clone()))?;
+        if let Some(policy) = &prepared_request.forced_model_alias_policy {
+            rendered.body = apply_forced_model_alias_policy_for_endpoint(
+                &rendered.body,
+                policy,
+                endpoint_capability(&method, &prepared_request.forward_uri),
+                selected.endpoint.protocol,
+            );
+        }
         prepared_request.forward_uri = rendered.uri;
         prepared_request.upstream_url = rendered.url;
         prepared_request.shielded_chat_plan.upstream_body = rendered.body;
@@ -3398,9 +3461,13 @@ async fn forward_openai_request(
                 upstream_url: prepared_request.upstream_url,
                 downstream_method: method,
                 downstream_uri: uri,
-                upstream_headers: prepared_request
-                    .upstream_headers
-                    .unwrap_or_else(|| downstream_headers.clone()),
+                upstream_headers: prepared_request.upstream_headers.unwrap_or_else(|| {
+                    if prepared_request.transformed_request_headers {
+                        sanitize_transformed_request_headers(&downstream_headers)
+                    } else {
+                        downstream_headers.clone()
+                    }
+                }),
                 original_downstream_headers: downstream_headers,
                 upstream_body: prepared_request.shielded_chat_plan.upstream_body,
                 downstream_body: prepared_request.shielded_chat_plan.downstream_body,
@@ -3418,6 +3485,7 @@ async fn forward_openai_request(
                 request_id: request_id.clone(),
                 started_at_unix_ms,
                 model_id: prepared_request.model_id,
+                forced_model_alias_policy: prepared_request.forced_model_alias_policy,
                 stuck_watchdog_request,
                 request_metadata,
                 listener: state.listener.clone(),
@@ -3473,6 +3541,7 @@ async fn forward_openai_request(
         liveness: prepared_request.shielded_chat_plan.liveness,
         thinking_policy_applied: prepared_request.shielded_chat_plan.thinking_policy_applied,
         thinking_metadata: prepared_request.shielded_chat_plan.thinking_metadata,
+        forced_model_alias_policy: prepared_request.forced_model_alias_policy,
         request_id,
         started_at_unix_ms,
         model_id: prepared_request.model_id,
@@ -3597,7 +3666,16 @@ async fn admit_generation_after_body(
         request.uri,
         request.request_started_at,
     );
-    let model_id_for_admission = extract_model_id(request.method, request.uri, &body);
+    let model_id_for_admission =
+        extract_model_id(request.method, request.uri, &body).map_err(|error| {
+            ProxyError::from(error).with_request_metadata(body_read_request_metadata.clone())
+        })?;
+    if let Some(model_id) = model_id_for_admission.as_deref()
+        && config.upstream.is_reserved_ingress_model_id(model_id)
+    {
+        return Err(ProxyError::reserved_ingress_model_id()
+            .with_request_metadata(body_read_request_metadata));
+    }
     let selected_profile = select_allowed_upstream_profile(
         &config,
         &state.listener,
@@ -3756,6 +3834,7 @@ async fn read_body_with_adapter_limit(
 
 struct PreparedOpenAiRequest {
     model_id: Option<String>,
+    forced_model_alias_policy: Option<ForcedModelAliasProfileConfig>,
     #[cfg(feature = "guard")]
     caller_profile_name: String,
     #[cfg(feature = "guard")]
@@ -3816,7 +3895,25 @@ fn prepare_openai_forward_request(
     let caller_profile = resolve_caller_profile(config, downstream_headers)?;
     #[cfg(feature = "guard")]
     add_caller_profile_metadata(request_metadata, &caller_profile);
-    let model_id = extract_model_id(method, uri, body);
+    let model_id = extract_model_id(method, uri, body)?;
+    if model_id
+        .as_deref()
+        .is_some_and(|model| config.upstream.is_reserved_ingress_model_id(model))
+    {
+        return Err(ProxyError::reserved_ingress_model_id());
+    }
+    if method == Method::POST
+        && uri.path() == "/v1/responses"
+        && forced_model_alias_policy(config, model_id.as_deref()).is_some()
+    {
+        return Err(ProxyError::ContextBudgetExceeded {
+            message: String::from("forced model aliases are not supported on /v1/responses"),
+            param: "model",
+            code: "unsupported_forced_model_alias_responses",
+            request_metadata: None,
+            attempts: Vec::new(),
+        });
+    }
     #[cfg(feature = "guard")]
     enforce_caller_profile_policy(&caller_profile, model_id.as_deref())?;
     #[cfg(feature = "guard")]
@@ -3827,50 +3924,27 @@ fn prepare_openai_forward_request(
         adapt_openai_request_if_needed(method, uri, downstream_headers, body, request_metadata)?;
     let selected_profile =
         select_profile_for_request(config, &state.listener, method, uri, model_id.as_deref())?;
-    let upstream_profile = selected_profile.profile;
-    let route_reason = selected_profile.route_reason;
+    let (mut upstream_profile, route_reason) =
+        (selected_profile.profile, selected_profile.route_reason);
     add_upstream_profile_metadata(request_metadata, &upstream_profile, route_reason);
-    let canonical_reranker = reranker_protocol::capture_request(
-        method,
-        uri,
-        body,
-        &adapted_request.forward_uri,
-        &adapted_request.adapted_body,
-    );
+    let canonical_reranker = canonical_reranker_request(method, uri, body, &adapted_request);
     let transformed_request_headers = adapted_request.response_adapter.is_some();
-    let response_adapter = if upstream_profile
-        .endpoints
-        .iter()
-        .any(|endpoint| endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank)
-        && let Some(canonical) = canonical_reranker.as_ref()
-    {
-        Some(BufferedResponseAdapter::HeterogeneousReranker {
-            request: canonical.clone(),
-            terminal_protocol: UpstreamEndpointProtocol::OpenAi,
-        })
-    } else {
-        adapted_request.response_adapter
-    };
-    let forward_uri = adapted_request.forward_uri;
-    let adapted_body = adapted_request.adapted_body;
-    let upstream_url = build_upstream_url(&upstream_profile.base_url, &forward_uri)?;
-    let reqwest_method = upstream_method(method)?;
-    let body = adapted_body;
-    validate_vllm_native_request_controls(config, &upstream_profile, method, &forward_uri, &body)?;
-    let shielded_chat_plan = plan_shielded_chat(
-        state,
-        config,
+    let (policy, body, shielded_chat_plan, forward_uri, forced_alias_transformed) =
+        prepare_forced_alias_request(
+            state,
+            config,
+            &mut upstream_profile,
+            model_id.as_deref(),
+            method,
+            &adapted_request.forward_uri,
+            &adapted_request.adapted_body,
+        )?;
+    let response_adapter = response_adapter_for_request(
         &upstream_profile,
-        method,
-        &forward_uri,
-        &body,
+        canonical_reranker.as_ref(),
+        adapted_request.response_adapter,
     );
-    #[cfg(feature = "param-override")]
-    let shielded_chat_plan = {
-        let mut plan = shielded_chat_plan;
-        apply_param_override_to_shielded_plan(method, &forward_uri, &mut plan, &upstream_profile)?;
-        plan
-    };
+    let transformed_request_headers = transformed_request_headers || forced_alias_transformed;
     add_shielded_request_metadata(
         request_metadata,
         shielded_chat_plan.intercepted,
@@ -3885,21 +3959,21 @@ fn prepare_openai_forward_request(
         &shielded_chat_plan.upstream_body,
         &upstream_profile,
     )?);
-
     let (terminal_endpoint, endpoint_retry_order) = initial_endpoint_retry_state(&upstream_profile);
     Ok(PreparedOpenAiRequest {
         model_id,
+        forced_model_alias_policy: policy,
         #[cfg(feature = "guard")]
         caller_profile_name: caller_profile.name.clone(),
         #[cfg(feature = "guard")]
         caller_profile: caller_profile.config,
         #[cfg(feature = "guard")]
         workflow_alias,
+        upstream_url: build_upstream_url(&upstream_profile.base_url, &forward_uri)?,
         upstream_profile,
         route_reason,
         forward_uri,
-        upstream_url,
-        reqwest_method,
+        reqwest_method: upstream_method(method)?,
         shielded_chat_plan,
         response_adapter,
         canonical_reranker,
@@ -3910,6 +3984,275 @@ fn prepare_openai_forward_request(
         upstream_deadline: None,
         endpoint_retry_order,
     })
+}
+
+fn canonical_reranker_request(
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    adapted: &buffered_adapter::AdaptedOpenAiRequest,
+) -> Option<CanonicalRerankerRequest> {
+    reranker_protocol::capture_request(
+        method,
+        uri,
+        body,
+        &adapted.forward_uri,
+        &adapted.adapted_body,
+    )
+}
+
+fn prepare_forced_alias_request(
+    state: &ProxyState,
+    config: &AppConfig,
+    upstream_profile: &mut UpstreamProfileConfig,
+    model_id: Option<&str>,
+    method: &Method,
+    uri: &Uri,
+    adapted_body: &Bytes,
+) -> Result<
+    (
+        Option<ForcedModelAliasProfileConfig>,
+        Bytes,
+        ShieldedChatPlan,
+        Uri,
+        bool,
+    ),
+    ProxyError,
+> {
+    let (policy, body, shielded_chat_plan) = prepare_forced_alias_shielded_plan(
+        state,
+        config,
+        upstream_profile,
+        model_id,
+        method,
+        uri,
+        adapted_body,
+    )?;
+    let forward_uri = forced_model_detail_uri(uri.clone(), policy.as_ref())?;
+    let transformed =
+        forced_alias_request_transformed(policy.as_ref(), adapted_body, &body, uri, &forward_uri);
+    Ok((policy, body, shielded_chat_plan, forward_uri, transformed))
+}
+
+fn forced_alias_request_transformed(
+    policy: Option<&ForcedModelAliasProfileConfig>,
+    original_body: &Bytes,
+    body: &Bytes,
+    original_uri: &Uri,
+    uri: &Uri,
+) -> bool {
+    policy.is_some() && (body != original_body || uri != original_uri)
+}
+
+fn response_adapter_for_request(
+    upstream_profile: &UpstreamProfileConfig,
+    canonical_reranker: Option<&reranker_protocol::CanonicalRerankerRequest>,
+    adapted_response_adapter: Option<BufferedResponseAdapter>,
+) -> Option<BufferedResponseAdapter> {
+    deepinfra_reranker_response_adapter(upstream_profile, canonical_reranker)
+        .or(adapted_response_adapter)
+}
+
+fn deepinfra_reranker_response_adapter(
+    upstream_profile: &UpstreamProfileConfig,
+    canonical_reranker: Option<&reranker_protocol::CanonicalRerankerRequest>,
+) -> Option<BufferedResponseAdapter> {
+    match canonical_reranker {
+        Some(canonical)
+            if upstream_profile.endpoints.iter().any(|endpoint| {
+                endpoint.protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank
+            }) =>
+        {
+            Some(BufferedResponseAdapter::HeterogeneousReranker {
+                request: canonical.clone(),
+                terminal_protocol: UpstreamEndpointProtocol::OpenAi,
+            })
+        }
+        None | Some(_) => None,
+    }
+}
+
+fn forced_model_alias_policy<'config>(
+    config: &'config AppConfig,
+    model_id: Option<&str>,
+) -> Option<&'config ForcedModelAliasProfileConfig> {
+    config
+        .forced_model_alias_profiles
+        .iter()
+        .find(|policy| Some(policy.alias.as_str()) == model_id)
+}
+
+fn forced_model_detail_uri(
+    forward_uri: Uri,
+    policy: Option<&ForcedModelAliasProfileConfig>,
+) -> Result<Uri, OpenAiPathError> {
+    if let Some(policy) = policy
+        && model_detail_id_from_path(forward_uri.path())?.is_some()
+    {
+        return rewrite_model_detail_uri(&forward_uri, &policy.upstream_model);
+    }
+    Ok(forward_uri)
+}
+
+fn forced_model_alias_policy_body(
+    config: &AppConfig,
+    model_id: Option<&str>,
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+    upstream_profile: &mut UpstreamProfileConfig,
+) -> (Option<ForcedModelAliasProfileConfig>, Bytes) {
+    let policy = forced_model_alias_policy(config, model_id).cloned();
+    if let Some(policy) = &policy {
+        upstream_profile.upstream_model = Some(policy.upstream_model.clone());
+    }
+    let body = policy.as_ref().map_or_else(
+        || body.clone(),
+        |policy| {
+            apply_forced_model_alias_policy_for_endpoint(
+                body,
+                policy,
+                endpoint_capability(method, uri),
+                UpstreamEndpointProtocol::OpenAi,
+            )
+        },
+    );
+    (policy, body)
+}
+
+fn prepare_forced_alias_shielded_plan(
+    state: &ProxyState,
+    config: &AppConfig,
+    upstream_profile: &mut UpstreamProfileConfig,
+    model_id: Option<&str>,
+    method: &Method,
+    forward_uri: &Uri,
+    adapted_body: &Bytes,
+) -> Result<
+    (
+        Option<ForcedModelAliasProfileConfig>,
+        Bytes,
+        ShieldedChatPlan,
+    ),
+    ProxyError,
+> {
+    let (policy, body) = forced_model_alias_policy_body(
+        config,
+        model_id,
+        method,
+        forward_uri,
+        adapted_body,
+        upstream_profile,
+    );
+    validate_vllm_native_request_controls(config, upstream_profile, method, forward_uri, &body)?;
+    let mut shielded_chat_plan =
+        plan_shielded_chat(state, config, upstream_profile, method, forward_uri, &body);
+    #[cfg(feature = "param-override")]
+    apply_param_override_to_shielded_plan(
+        method,
+        forward_uri,
+        &mut shielded_chat_plan,
+        upstream_profile,
+    )?;
+    apply_forced_model_alias_policy_to_plan(
+        policy.as_ref(),
+        &mut shielded_chat_plan,
+        endpoint_capability(method, forward_uri),
+    );
+    Ok((policy, body, shielded_chat_plan))
+}
+
+fn apply_forced_model_alias_policy_for_endpoint(
+    body: &Bytes,
+    policy: &ForcedModelAliasProfileConfig,
+    capability: EndpointCapability,
+    protocol: UpstreamEndpointProtocol,
+) -> Bytes {
+    if protocol == UpstreamEndpointProtocol::DeepInfraQwen3Rerank {
+        return body.clone();
+    }
+    match capability {
+        EndpointCapability::Generation => apply_forced_model_alias_policy(body, policy),
+        EndpointCapability::ModelOnly => rewrite_request_model_body(body, &policy.upstream_model),
+    }
+}
+
+fn add_forced_alias_wire_metadata(
+    metadata: &mut BTreeMap<String, String>,
+    policy: Option<&ForcedModelAliasProfileConfig>,
+    capability: EndpointCapability,
+    body: &Bytes,
+) {
+    let Some(policy) = policy else {
+        return;
+    };
+    let Ok(serde_json::Value::Object(object)) = serde_json::from_slice(body) else {
+        return;
+    };
+    metadata.insert(String::from("forced_alias"), policy.alias.clone());
+    metadata.insert(
+        String::from("forced_upstream_model"),
+        policy.upstream_model.clone(),
+    );
+    let thinking_enabled = object
+        .get("chat_template_kwargs")
+        .and_then(serde_json::Value::as_object)
+        .and_then(|template| template.get("enable_thinking"))
+        .and_then(serde_json::Value::as_bool);
+    let thinking_mode = match (capability, thinking_enabled) {
+        (EndpointCapability::Generation, Some(true)) => String::from("force_thinking"),
+        (EndpointCapability::Generation, Some(false)) => String::from("force_disable"),
+        _ => String::new(),
+    };
+    metadata.insert(String::from("forced_thinking_mode"), thinking_mode.clone());
+    metadata.insert(String::from("attempt_thinking_mode"), thinking_mode);
+    let thinking_budget = object
+        .get("thinking_token_budget")
+        .and_then(serde_json::Value::as_u64);
+    let thinking_budget =
+        thinking_budget.map_or_else(|| String::from("none"), |value| value.to_string());
+    metadata.insert(
+        String::from("forced_thinking_budget"),
+        thinking_budget.clone(),
+    );
+    metadata.insert(
+        String::from("attempt_thinking_budget_tokens"),
+        thinking_budget.clone(),
+    );
+    metadata.insert(String::from("thinking_budget"), thinking_budget);
+    let total_cap = object.get("max_tokens").and_then(serde_json::Value::as_u64);
+    let total_cap = total_cap.map_or_else(|| String::from("unset"), |value| value.to_string());
+    metadata.insert(
+        String::from("forced_answer_headroom"),
+        object
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|total| {
+                object
+                    .get("thinking_token_budget")
+                    .and_then(serde_json::Value::as_u64)
+                    .map_or(Some(total), |budget| total.checked_sub(budget))
+            })
+            .map_or_else(String::new, |value| value.to_string()),
+    );
+    metadata.insert(String::from("forced_wire_total_cap"), total_cap.clone());
+    metadata.insert(
+        String::from("attempt_thinking_max_tokens"),
+        total_cap.clone(),
+    );
+    metadata.insert(String::from("max_tokens"), total_cap);
+}
+
+fn apply_forced_model_alias_policy_to_plan(
+    policy: Option<&ForcedModelAliasProfileConfig>,
+    plan: &mut ShieldedChatPlan,
+    capability: EndpointCapability,
+) {
+    let Some(policy) = policy.filter(|_| capability == EndpointCapability::Generation) else {
+        return;
+    };
+    plan.upstream_body = apply_forced_model_alias_policy(&plan.upstream_body, policy);
+    plan.downstream_body = apply_forced_model_alias_policy(&plan.downstream_body, policy);
 }
 
 fn initial_endpoint_retry_state(
@@ -4125,6 +4468,25 @@ fn profile_block_reason_message(reason: &BlockReason) -> String {
             format!("daily request limit exceeded: limit={limit}")
         }
         BlockReason::KindMismatch => String::from("profile kind mismatch"),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EndpointCapability {
+    Generation,
+    ModelOnly,
+}
+
+fn endpoint_capability(method: &Method, uri: &Uri) -> EndpointCapability {
+    if method == Method::POST
+        && matches!(
+            uri.path(),
+            "/v1/chat/completions" | "/chat/completions" | "/v1/completions"
+        )
+    {
+        EndpointCapability::Generation
+    } else {
+        EndpointCapability::ModelOnly
     }
 }
 
@@ -4796,6 +5158,186 @@ fn rewrite_request_model_body(body: &Bytes, upstream_model: &str) -> Bytes {
     Bytes::from(value.to_string())
 }
 
+fn forced_generation_total_cap(
+    policy: &ForcedModelAliasProfileConfig,
+    thinking_mode: ThinkingMode,
+    output_cap: u32,
+) -> Option<u32> {
+    match thinking_mode {
+        ThinkingMode::ForceThinking => policy
+            .thinking_budget
+            .and_then(|budget| budget.checked_add(output_cap)),
+        ThinkingMode::ForceDisable => Some(output_cap),
+        ThinkingMode::Passthrough | ThinkingMode::BoundedThinking => None,
+    }
+}
+
+fn apply_forced_model_alias_policy(body: &Bytes, policy: &ForcedModelAliasProfileConfig) -> Bytes {
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return body.clone();
+    };
+    if !value.is_object() {
+        return body.clone();
+    }
+    let (
+        Some(thinking_mode),
+        Some(output_cap),
+        Some(temperature),
+        Some(top_p),
+        Some(top_k),
+        Some(min_p),
+        Some(presence_penalty),
+        Some(repetition_penalty),
+    ) = (
+        policy.thinking_mode,
+        policy.output_cap,
+        policy.temperature,
+        policy.top_p,
+        policy.top_k,
+        policy.min_p,
+        policy.presence_penalty,
+        policy.repetition_penalty,
+    )
+    else {
+        return body.clone();
+    };
+    let Some(temperature) = serde_json::Number::from_f64(temperature) else {
+        return body.clone();
+    };
+    let Some(top_p) = serde_json::Number::from_f64(top_p) else {
+        return body.clone();
+    };
+    let Some(min_p) = serde_json::Number::from_f64(min_p) else {
+        return body.clone();
+    };
+    let Some(presence_penalty) = serde_json::Number::from_f64(presence_penalty) else {
+        return body.clone();
+    };
+    let Some(repetition_penalty) = serde_json::Number::from_f64(repetition_penalty) else {
+        return body.clone();
+    };
+    let Some(total_cap) = forced_generation_total_cap(policy, thinking_mode, output_cap) else {
+        return body.clone();
+    };
+    remove_forced_generation_controls(&mut value);
+    let Some(object) = value.as_object_mut() else {
+        return body.clone();
+    };
+    object.insert(
+        String::from("model"),
+        serde_json::Value::String(policy.upstream_model.clone()),
+    );
+    object.insert(
+        String::from("temperature"),
+        serde_json::Value::Number(temperature),
+    );
+    object.insert(String::from("top_p"), serde_json::Value::Number(top_p));
+    object.insert(
+        String::from("top_k"),
+        serde_json::Value::Number(top_k.into()),
+    );
+    object.insert(String::from("min_p"), serde_json::Value::Number(min_p));
+    object.insert(
+        String::from("presence_penalty"),
+        serde_json::Value::Number(presence_penalty),
+    );
+    object.insert(
+        String::from("repetition_penalty"),
+        serde_json::Value::Number(repetition_penalty),
+    );
+    object.insert(
+        String::from("max_tokens"),
+        serde_json::Value::Number(total_cap.into()),
+    );
+    let template = object
+        .entry(String::from("chat_template_kwargs"))
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if !template.is_object() {
+        *template = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(template) = template.as_object_mut() {
+        template.insert(
+            String::from("enable_thinking"),
+            serde_json::Value::Bool(thinking_mode == ThinkingMode::ForceThinking),
+        );
+    }
+    if let Some(budget) = policy.thinking_budget {
+        object.insert(
+            String::from("thinking_token_budget"),
+            serde_json::Value::Number(budget.into()),
+        );
+    }
+    Bytes::from(value.to_string())
+}
+
+fn remove_forced_generation_controls(value: &mut serde_json::Value) {
+    let serde_json::Value::Object(object) = value else {
+        return;
+    };
+    remove_forced_generation_control_fields(object);
+    if let Some(extra_body) = object.get_mut("extra_body") {
+        remove_provider_generation_controls(extra_body, "extra_body");
+    }
+    if let Some(template) = object.get_mut("chat_template_kwargs") {
+        remove_provider_generation_controls(template, "chat_template_kwargs");
+    }
+    if let Some(thinking) = object.get_mut("thinking") {
+        remove_provider_generation_controls(thinking, "thinking");
+    }
+}
+
+fn remove_provider_generation_controls(value: &mut serde_json::Value, container: &str) {
+    match value {
+        serde_json::Value::Array(values) => {
+            for value in values {
+                remove_provider_generation_controls(value, container);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            remove_forced_generation_control_fields(object);
+            if container == "thinking" {
+                object.remove("enabled");
+            }
+            for (key, value) in object {
+                if matches!(
+                    key.as_str(),
+                    "extra_body" | "chat_template_kwargs" | "thinking" | "options"
+                ) {
+                    remove_provider_generation_controls(value, key);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn remove_forced_generation_control_fields(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    for field in [
+        "reasoning_effort",
+        "model_reasoning_effort",
+        "thinking_token_budget",
+        "thinking_budget",
+        "budget_tokens",
+        "enable_thinking",
+        "llm_guard_proxy_disable_thinking",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "presence_penalty",
+        "frequency_penalty",
+        "repetition_penalty",
+        "max_tokens",
+        "max_completion_tokens",
+        "max_output_tokens",
+        "output_tokens",
+    ] {
+        object.remove(field);
+    }
+}
+
 /// Coerces a YAML-string priority hint only for an upstream that opts into an
 /// engine-native `OpenAI` `priority` field. Missing, numeric, and invalid values
 /// retain the original bytes.
@@ -4827,18 +5369,64 @@ fn coerce_cache_priority_hint(body: &Bytes, profile: &UpstreamProfileConfig) -> 
 /// Rewrites the top-level `model` field in a response JSON body back to the
 /// client's original model alias when an upstream model rewrite was applied.
 /// Falls back to the original body for non-JSON or non-object payloads.
-fn rewrite_response_model_body(body: &Bytes, client_model: &str) -> Bytes {
+fn rewrite_response_model_body(body: &Bytes, client_model: &str) -> (Bytes, bool) {
+    rewrite_response_model_body_with_field(body, client_model, "model", false)
+}
+
+fn rewrite_response_model_detail_body(body: &Bytes, client_model: &str) -> (Bytes, bool) {
+    rewrite_response_model_body_with_field(body, client_model, "id", true)
+}
+
+fn rewrite_response_body_for_request(
+    body: &Bytes,
+    client_model: &str,
+    request_path: &str,
+) -> (Bytes, bool) {
+    if model_detail_id_from_path(request_path)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        rewrite_response_model_detail_body(body, client_model)
+    } else {
+        rewrite_response_model_body(body, client_model)
+    }
+}
+
+fn rewrite_response_model_body_with_field(
+    body: &Bytes,
+    client_model: &str,
+    field: &str,
+    remove_model: bool,
+) -> (Bytes, bool) {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
-        return body.clone();
+        return (body.clone(), false);
     };
     let Some(object) = value.as_object_mut() else {
-        return body.clone();
+        return (body.clone(), false);
     };
     object.insert(
-        String::from("model"),
+        String::from(field),
         serde_json::Value::String(client_model.to_owned()),
     );
-    Bytes::from(value.to_string())
+    if remove_model {
+        object.remove("model");
+    }
+    let rewritten = Bytes::from(value.to_string());
+    let transformed = rewritten != *body;
+    (rewritten, transformed)
+}
+
+pub(super) fn rewrite_json_response_model_body(
+    body: &Bytes,
+    headers: &HeaderMap,
+    client_model: &str,
+) -> (Bytes, bool) {
+    if response_model_rewrite_mode(headers) == Some(ResponseModelRewriteMode::Json) {
+        rewrite_response_model_body(body, client_model)
+    } else {
+        (body.clone(), false)
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -4883,6 +5471,8 @@ struct ResponseModelRewriteBody<S> {
     mode: ResponseModelRewriteMode,
     client_model: String,
     buffered: BytesMut,
+    sse_scanner: SseFrameScanner,
+    pending: Option<Bytes>,
     completed: bool,
 }
 
@@ -4893,6 +5483,8 @@ impl<S> ResponseModelRewriteBody<S> {
             mode,
             client_model,
             buffered: BytesMut::new(),
+            sse_scanner: SseFrameScanner::default(),
+            pending: None,
             completed: false,
         }
     }
@@ -4910,31 +5502,50 @@ where
             return Poll::Ready(None);
         }
         if matches!(this.mode, ResponseModelRewriteMode::OpenAiSse)
-            && let Some(frame) = take_sse_frame(&mut this.buffered)
+            && let Some(frame) = take_sse_frame(&mut this.buffered, &mut this.sse_scanner)
         {
             return Poll::Ready(Some(Ok(rewrite_sse_response_model_body(
                 &frame,
                 &this.client_model,
-            ))));
+            )
+            .0)));
         }
 
-        match this.stream.as_mut().poll_next(cx) {
+        let next = match this.pending.take() {
+            Some(bytes) => Poll::Ready(Some(Ok(bytes))),
+            None => this.stream.as_mut().poll_next(cx),
+        };
+        match next {
             Poll::Ready(Some(Ok(bytes))) => {
-                this.buffered.extend_from_slice(&bytes);
                 if matches!(this.mode, ResponseModelRewriteMode::OpenAiSse) {
-                    if this.buffered.len() > SSE_REWRITE_FRAME_BYTE_LIMIT {
+                    let remaining = SSE_REWRITE_FRAME_BYTE_LIMIT
+                        .checked_sub(this.buffered.len())
+                        .expect("SSE rewrite buffer must stay within its byte limit");
+                    let accepted_len = bytes.len().min(remaining);
+                    let start = this.buffered.len();
+                    this.buffered.extend_from_slice(&bytes[..accepted_len]);
+                    let mut scanner = this.sse_scanner.clone();
+                    let frame_end = scanner.scan_appended(&this.buffered, start);
+                    if bytes.len() > remaining && frame_end.is_none() {
                         this.completed = true;
                         this.buffered.clear();
                         return Poll::Ready(Some(Err(ResponseModelRewriteError::FrameOverflow {
                             limit: SSE_REWRITE_FRAME_BYTE_LIMIT,
                         })));
                     }
-                    if let Some(frame) = take_sse_frame(&mut this.buffered) {
+                    this.sse_scanner = scanner;
+                    if accepted_len < bytes.len() {
+                        this.pending = Some(bytes.slice(accepted_len..));
+                    }
+                    if let Some(frame) = take_sse_frame(&mut this.buffered, &mut this.sse_scanner) {
                         return Poll::Ready(Some(Ok(rewrite_sse_response_model_body(
                             &frame,
                             &this.client_model,
-                        ))));
+                        )
+                        .0)));
                     }
+                } else {
+                    this.buffered.extend_from_slice(&bytes);
                 }
                 cx.waker().wake_by_ref();
                 Poll::Pending
@@ -4951,10 +5562,10 @@ where
                 let body = this.buffered.split().freeze();
                 let body = match this.mode {
                     ResponseModelRewriteMode::Json => {
-                        rewrite_response_model_body(&body, &this.client_model)
+                        rewrite_response_model_body(&body, &this.client_model).0
                     }
                     ResponseModelRewriteMode::OpenAiSse => {
-                        rewrite_sse_response_model_body(&body, &this.client_model)
+                        rewrite_sse_response_model_body(&body, &this.client_model).0
                     }
                 };
                 Poll::Ready(Some(Ok(body)))
@@ -4995,26 +5606,103 @@ impl<E: std::error::Error + 'static> std::error::Error for ResponseModelRewriteE
     }
 }
 
-fn take_sse_frame(buffer: &mut BytesMut) -> Option<Bytes> {
-    let end = buffer
-        .windows(2)
-        .position(|bytes| bytes == b"\n\n")
-        .map(|index| index + 2)
-        .or_else(|| {
-            buffer
-                .windows(4)
-                .position(|bytes| bytes == b"\r\n\r\n")
-                .map(|index| index + 4)
-        })?;
-    Some(buffer.split_to(end).freeze())
+#[derive(Clone, Default)]
+struct SseFrameScanner {
+    line_start: usize,
+    pending_cr: Option<usize>,
+    frame_end: Option<usize>,
+    #[cfg(test)]
+    inspected_bytes: usize,
 }
 
-fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> Bytes {
-    let Ok(body) = std::str::from_utf8(body) else {
-        return body.clone();
+impl SseFrameScanner {
+    fn scan_appended(&mut self, bytes: &[u8], start: usize) -> Option<usize> {
+        if let Some(frame_end) = self.frame_end {
+            return Some(frame_end);
+        }
+        for (position, &byte) in bytes.iter().enumerate().skip(start) {
+            #[cfg(test)]
+            {
+                self.inspected_bytes = self.inspected_bytes.saturating_add(1);
+            }
+            if let Some(cr_start) = self.pending_cr {
+                if byte == b'\n' {
+                    let end = position + 1;
+                    if self.line_start == cr_start {
+                        self.frame_end = Some(end);
+                        return self.frame_end;
+                    }
+                    self.line_start = end;
+                    self.pending_cr = None;
+                    continue;
+                }
+                let end = cr_start + 1;
+                if self.line_start == cr_start {
+                    self.frame_end = Some(end);
+                    return self.frame_end;
+                }
+                self.line_start = end;
+                self.pending_cr = None;
+            }
+            match byte {
+                b'\r' => self.pending_cr = Some(position),
+                b'\n' => {
+                    let end = position + 1;
+                    if self.line_start == position {
+                        self.frame_end = Some(end);
+                        return self.frame_end;
+                    }
+                    self.line_start = end;
+                }
+                _ => {}
+            }
+        }
+        if self
+            .pending_cr
+            .is_some_and(|cr_start| self.line_start == cr_start)
+        {
+            self.frame_end = self.pending_cr.map(|cr_start| cr_start + 1);
+        }
+        self.frame_end
+    }
+
+    fn advance_after_frame(&mut self) -> usize {
+        let frame_end = self
+            .frame_end
+            .take()
+            .expect("completed SSE frame must have an end offset");
+        self.line_start = frame_end;
+        self.pending_cr = None;
+        frame_end
+    }
+
+    fn take_frame(&mut self, buffer: &mut BytesMut) -> Option<Bytes> {
+        let frame_end = self.frame_end?;
+        let frame = buffer.split_to(frame_end).freeze();
+        self.line_start = 0;
+        self.pending_cr = None;
+        self.frame_end = None;
+        self.scan_appended(buffer, 0);
+        Some(frame)
+    }
+}
+
+fn take_sse_frame(buffer: &mut BytesMut, scanner: &mut SseFrameScanner) -> Option<Bytes> {
+    scanner.take_frame(buffer)
+}
+
+#[cfg(test)]
+fn sse_frame_end(buffer: &[u8]) -> Option<usize> {
+    let mut scanner = SseFrameScanner::default();
+    scanner.scan_appended(buffer, 0)
+}
+
+fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> (Bytes, bool) {
+    let Ok(body_text) = std::str::from_utf8(body) else {
+        return (body.clone(), false);
     };
-    let mut rewritten = String::with_capacity(body.len());
-    for line in body.split_inclusive('\n') {
+    let mut rewritten = String::with_capacity(body_text.len());
+    let rewrite_line = |line: &str, rewritten: &mut String| {
         let (line, line_ending) = line
             .strip_suffix('\n')
             .map_or((line, ""), |line| (line, "\n"));
@@ -5025,19 +5713,45 @@ fn rewrite_sse_response_model_body(body: &Bytes, client_model: &str) -> Bytes {
             rewritten.push_str(line);
             rewritten.push_str(carriage_return);
             rewritten.push_str(line_ending);
-            continue;
+            return;
         };
         let whitespace_length = data.len().saturating_sub(data.trim_start().len());
         let (whitespace, payload) = data.split_at(whitespace_length);
         let payload = Bytes::copy_from_slice(payload.as_bytes());
-        let payload = rewrite_response_model_body(&payload, client_model);
+        let (payload, _payload_transformed) = rewrite_response_model_body(&payload, client_model);
         rewritten.push_str("data:");
         rewritten.push_str(whitespace);
         rewritten.push_str(std::str::from_utf8(&payload).expect("JSON response rewrite is UTF-8"));
         rewritten.push_str(carriage_return);
         rewritten.push_str(line_ending);
+    };
+    let body_bytes = body_text.as_bytes();
+    let mut line_start = 0;
+    let mut offset = 0;
+    while offset < body_bytes.len() {
+        let line_end = match body_bytes[offset] {
+            b'\n' => Some(offset + 1),
+            b'\r' => Some(if body_bytes.get(offset + 1) == Some(&b'\n') {
+                offset + 2
+            } else {
+                offset + 1
+            }),
+            _ => None,
+        };
+        let Some(line_end) = line_end else {
+            offset += 1;
+            continue;
+        };
+        rewrite_line(&body_text[line_start..line_end], &mut rewritten);
+        line_start = line_end;
+        offset = line_end;
     }
-    Bytes::from(rewritten)
+    if line_start < body_text.len() {
+        rewrite_line(&body_text[line_start..], &mut rewritten);
+    }
+    let rewritten = Bytes::from(rewritten);
+    let transformed = rewritten != *body;
+    (rewritten, transformed)
 }
 
 #[cfg(feature = "guard")]
@@ -5136,11 +5850,20 @@ fn select_allowed_upstream_profile(
             route_reason: UpstreamRouteReason::ListenerForced,
         });
     }
+    let routed_model = forced_model_alias_policy(config, model)
+        .map_or(model, |policy| Some(policy.upstream_model.as_str()));
     #[cfg(feature = "guard")]
-    if let Some(selected) = select_profile_from_model_alias(config, listener, model)? {
+    if let Some(selected) = select_profile_from_model_alias(config, listener, routed_model)? {
         return Ok(selected);
     }
-    let selected = config.select_upstream_profile(model);
+    let mut selected = config.select_upstream_profile(routed_model);
+    if selected.route_reason != UpstreamRouteReason::MatchedModel && routed_model != model {
+        #[cfg(feature = "guard")]
+        if let Some(alias_selected) = select_profile_from_model_alias(config, listener, model)? {
+            return Ok(alias_selected);
+        }
+        selected = config.select_upstream_profile(model);
+    }
     if listener.allows_upstream(&selected.profile.name) {
         return Ok(selected);
     }
@@ -5246,6 +5969,7 @@ struct GenericForwardContext<'request> {
     liveness: ShieldedLivenessSelection,
     thinking_policy_applied: bool,
     thinking_metadata: BTreeMap<String, String>,
+    forced_model_alias_policy: Option<ForcedModelAliasProfileConfig>,
     request_id: &'request RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
@@ -5446,6 +6170,12 @@ async fn send_generic_upstream_attempt(
         &context.liveness,
         &context.thinking_metadata,
     );
+    add_forced_alias_wire_metadata(
+        &mut attempt_request_metadata,
+        context.forced_model_alias_policy.as_ref(),
+        endpoint_capability(&context.method, &context.uri),
+        &context.upstream_body,
+    );
     copy_endpoint_selection_metadata(&context.request_metadata, &mut attempt_request_metadata);
     let request_deadline = if attempt_number == 1 {
         context.upstream_deadline
@@ -5474,9 +6204,11 @@ async fn send_generic_upstream_attempt(
             UpstreamFailoverRetryContext {
                 registry: context.state.upstream_health.as_ref(),
                 profile: &context.upstream_profile,
+                method: context.reqwest_method.clone(),
                 local_forward_uri: context.upstream_uri.clone(),
                 original_downstream_headers: &context.downstream_headers,
                 canonical_reranker: context.canonical_reranker.as_ref(),
+                forced_model_alias_policy: context.forced_model_alias_policy.as_ref(),
                 transformed_request_headers: context.transformed_request_headers,
                 initial_endpoint: &context.terminal_endpoint,
                 request_deadline,
@@ -5507,12 +6239,20 @@ async fn forward_generic_endpoint_response(
     upstream_response: EndpointResponse,
     terminal_endpoint_protocol: UpstreamEndpointProtocol,
 ) -> Result<Response<Body>, ProxyError> {
+    let public_model_alias =
+        client_response_model_alias(&context.upstream_profile, context.model_id.as_deref())
+            .map(str::to_owned);
     match upstream_response {
-        EndpointResponse::Rewritten(rewritten) => Ok(forward_rewritten_endpoint_response(
-            response_parts,
-            context.in_flight_permit,
-            rewritten,
-        )),
+        EndpointResponse::Rewritten(mut rewritten) => {
+            if let Some(alias) = public_model_alias.as_deref() {
+                rewritten.body = rewrite_response_model_body(&rewritten.body, alias).0;
+            }
+            Ok(forward_rewritten_endpoint_response(
+                response_parts,
+                context.in_flight_permit,
+                rewritten,
+            ))
+        }
         EndpointResponse::Upstream(upstream_response) => {
             if let Some(adapter) = context
                 .response_adapter
@@ -5524,6 +6264,7 @@ async fn forward_generic_endpoint_response(
                     context.in_flight_permit,
                     adapter,
                     context.model_id.as_deref(),
+                    public_model_alias.as_deref(),
                 )
                 .await;
             }
@@ -5615,12 +6356,15 @@ fn forward_rewritten_endpoint_response(
         BTreeMap::new(),
         RawPayloads::default(),
     );
+    let body_len = rewritten.body.len();
     let response_body =
         ObservedBufferedBody::new(rewritten.body, observer, in_flight_permit, shutdown);
     downstream_response(
         rewritten.status,
         &response_headers,
         Body::from_stream(response_body),
+        true,
+        Some(body_len),
     )
 }
 
@@ -5672,7 +6416,7 @@ async fn forward_merged_models_response(
                 .extend(group.match_model_alias_profiles);
             let body = filtered_bodies[index].clone();
             filtered_bodies[index] =
-                prepare_models_body_for_group(&context, &selected_groups[index], body);
+                prepare_models_body_for_group(&context, &selected_groups[index], body).0;
             continue;
         }
         let fetch = match fetch_models_upstream_group(
@@ -5708,8 +6452,10 @@ async fn forward_merged_models_response(
         response_headers,
         response_mode,
     );
-    let body =
+    let (body, enriched) =
         model_metadata::enrich_models_body(context.config, metadata_config, merged_body.body);
+    let body_transformed = merged_body.has_valid_model_list || enriched;
+    let body_len = body.len();
     let response_parts = ForwardedResponseParts {
         config: context.state.config.clone(),
         store: context.state.store.clone(),
@@ -5744,6 +6490,8 @@ async fn forward_merged_models_response(
         upstream_status,
         &upstream_headers,
         Body::from_stream(response_body),
+        body_transformed,
+        Some(body_len),
     ))
 }
 
@@ -5790,9 +6538,11 @@ fn models_failover_retry_context<'request>(
         .then_some(UpstreamFailoverRetryContext {
             registry: context.state.upstream_health.as_ref(),
             profile: &group.profile,
+            method: context.reqwest_method.clone(),
             local_forward_uri: context.upstream_uri.clone(),
             original_downstream_headers: downstream_headers,
             canonical_reranker: None,
+            forced_model_alias_policy: None,
             transformed_request_headers: false,
             initial_endpoint: &group.terminal_endpoint,
             request_deadline: Some(group.request_deadline),
@@ -5904,7 +6654,7 @@ async fn fetch_models_upstream_group(
         }
     };
     let body_len = u64::try_from(body.len()).unwrap_or(u64::MAX);
-    let body = prepare_models_body_for_group(context, group, body);
+    let body = prepare_models_body_for_group(context, group, body).0;
     let attempt_record = final_attempt_record(
         FinalAttemptContext {
             attempt_id,
@@ -5973,9 +6723,11 @@ fn upstream_body_error_with_observability(
 struct UpstreamFailoverRetryContext<'request> {
     registry: &'request UpstreamHealthRegistry,
     profile: &'request UpstreamProfileConfig,
+    method: reqwest::Method,
     local_forward_uri: Uri,
     original_downstream_headers: &'request HeaderMap,
     canonical_reranker: Option<&'request CanonicalRerankerRequest>,
+    forced_model_alias_policy: Option<&'request ForcedModelAliasProfileConfig>,
     transformed_request_headers: bool,
     initial_endpoint: &'request UpstreamEndpointConfig,
     request_deadline: Option<Instant>,
@@ -6109,13 +6861,22 @@ fn render_retry_openai_request(
     endpoint: &UpstreamEndpointConfig,
     body: &Bytes,
 ) -> Result<RenderedEndpointRequest, ProxyError> {
-    reranker_protocol::render_openai_endpoint(
+    let mut rendered = reranker_protocol::render_openai_endpoint(
         endpoint,
         retry.local_forward_uri.clone(),
         body,
         retry.original_downstream_headers,
         retry.transformed_request_headers,
-    )
+    )?;
+    if let Some(policy) = retry.forced_model_alias_policy {
+        rendered.body = apply_forced_model_alias_policy_for_endpoint(
+            &rendered.body,
+            policy,
+            endpoint_capability(&retry.method, &retry.local_forward_uri),
+            endpoint.protocol,
+        );
+    }
+    Ok(rendered)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -6443,13 +7204,23 @@ async fn send_selected_failover_endpoint(
             runtime.retry.original_downstream_headers,
         ),
         None => render_retry_openai_request(runtime.retry, &selected.endpoint, runtime.retry_body),
-    };
+    }
+    .map(|mut rendered| {
+        if let Some(policy) = runtime.retry.forced_model_alias_policy {
+            rendered.body = apply_forced_model_alias_policy_for_endpoint(
+                &rendered.body,
+                policy,
+                endpoint_capability(&runtime.retry_method, &runtime.retry.local_forward_uri),
+                selected.endpoint.protocol,
+            );
+        }
+        rendered
+    });
     let attempt_id = AttemptId::for_request(runtime.request_id, attempt_number);
-    let started_at_unix_ms = unix_time_millis();
     let mut attempt = PhysicalEndpointAttempt {
         attempt_id,
         attempt_number,
-        started_at_unix_ms,
+        started_at_unix_ms: unix_time_millis(),
         request_metadata,
         endpoint: Some(selected.endpoint.clone()),
         protocol: selected.endpoint.protocol,
@@ -6471,6 +7242,12 @@ async fn send_selected_failover_endpoint(
     }
     let response = match rendered {
         Ok(rendered) => {
+            add_forced_alias_wire_metadata(
+                &mut attempt.request_metadata,
+                runtime.retry.forced_model_alias_policy,
+                endpoint_capability(&runtime.retry_method, &runtime.retry.local_forward_uri),
+                &rendered.body,
+            );
             annotate_physical_endpoint_attempt(
                 &mut attempt.request_metadata,
                 attempt.endpoint.as_ref(),
@@ -8679,6 +9456,157 @@ impl ShieldedRetryCause {
     }
 }
 
+type UpstreamBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
+
+fn replay_prefetched_upstream_body(
+    prefix: Bytes,
+    stream: UpstreamBodyStream,
+) -> UpstreamBodyStream {
+    let prefix = (!prefix.is_empty()).then_some(Ok(prefix));
+    Box::pin(futures_util::stream::iter(prefix).chain(stream))
+}
+
+async fn preclassify_sse_response_body(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+    mut shutdown: ShutdownSubscription,
+    client_model: &str,
+) -> Result<(UpstreamBodyStream, bool), ProxyError> {
+    let mut stream: UpstreamBodyStream = Box::pin(stream);
+    let mut prefetched = BytesMut::new();
+    let mut scanner = SseFrameScanner::default();
+    loop {
+        if let Some(frame_end) = scanner.frame_end {
+            let frame = Bytes::copy_from_slice(&prefetched[..frame_end]);
+            if std::str::from_utf8(&frame).is_err() {
+                return Ok((
+                    replay_prefetched_upstream_body(prefetched.freeze(), stream),
+                    false,
+                ));
+            }
+            if rewrite_sse_response_model_body(&frame, client_model).1 {
+                return Ok((
+                    replay_prefetched_upstream_body(prefetched.freeze(), stream),
+                    true,
+                ));
+            }
+            let frame_end = scanner.advance_after_frame();
+            scanner.scan_appended(&prefetched, frame_end);
+            continue;
+        }
+        let next = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Err(ProxyError::server_shutdown()),
+            next = stream.next() => next,
+        };
+        match next {
+            Some(Ok(bytes)) => {
+                let remaining = SSE_REWRITE_FRAME_BYTE_LIMIT.saturating_sub(prefetched.len());
+                let accepted_len = bytes.len().min(remaining);
+                let start = prefetched.len();
+                prefetched.extend_from_slice(&bytes[..accepted_len]);
+                let frame_end = scanner.scan_appended(&prefetched, start);
+                if bytes.len() > remaining {
+                    if let Some(frame_end) = frame_end {
+                        let frame = Bytes::copy_from_slice(&prefetched[..frame_end]);
+                        let can_rewrite = std::str::from_utf8(&frame).is_ok()
+                            && rewrite_sse_response_model_body(&frame, client_model).1;
+                        let suffix = bytes.slice(remaining..);
+                        let tail =
+                            Box::pin(futures_util::stream::iter(Some(Ok(suffix))).chain(stream));
+                        return Ok((
+                            replay_prefetched_upstream_body(prefetched.freeze(), tail),
+                            can_rewrite,
+                        ));
+                    }
+                    return Err(ProxyError::upstream_body(format!(
+                        "upstream SSE frame exceeded {SSE_REWRITE_FRAME_BYTE_LIMIT} byte limit"
+                    )));
+                }
+            }
+            Some(Err(error)) => {
+                let prefix = prefetched.freeze();
+                let terminal = futures_util::stream::once(async move { Err(error) });
+                return Ok((
+                    replay_prefetched_upstream_body(prefix, Box::pin(terminal)),
+                    false,
+                ));
+            }
+            None => {
+                return Ok((
+                    replay_prefetched_upstream_body(prefetched.freeze(), stream),
+                    false,
+                ));
+            }
+        }
+    }
+}
+
+fn forwarded_response_body(
+    upstream_headers: &mut HeaderMap,
+    response_body: ObservedUpstreamBody,
+    response_model_rewrite: Option<(ResponseModelRewriteMode, String)>,
+) -> (Body, bool) {
+    if response_model_rewrite.is_some() {
+        upstream_headers.remove(CONTENT_LENGTH);
+    }
+    let body_transformed = response_model_rewrite.is_some();
+    let response_body = match response_model_rewrite {
+        Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
+            response_body,
+            mode,
+            client_model,
+        )),
+        None => Body::from_stream(response_body),
+    };
+    (response_body, body_transformed)
+}
+
+async fn forward_json_alias_response(
+    dispatch: ResponseDispatch<'_>,
+    response_parts: ForwardedResponseParts,
+    upstream_response: UpstreamResponse,
+    in_flight_permit: InFlightPermit,
+    mut upstream_headers: HeaderMap,
+    client_model: &str,
+) -> Result<Response<Body>, ProxyError> {
+    let upstream_status = response_parts.upstream_status;
+    let request_id = response_parts.request_id.clone();
+    let request_path = dispatch.uri.path();
+    let body = match read_upstream_body_bytes_until_shutdown(
+        upstream_response.bytes_stream(),
+        response_parts.shutdown_subscription(),
+    )
+    .await
+    {
+        Ok(body) => body,
+        Err(error) => return Err(response_parts.into_body_read_error(error)),
+    };
+    response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
+    let (body, body_transformed) =
+        rewrite_response_body_for_request(&body, client_model, request_path);
+    let content_length =
+        HeaderValue::from_str(&body.len().to_string()).expect("body length should be valid");
+    upstream_headers.insert(CONTENT_LENGTH, content_length);
+    let shutdown = response_parts.shutdown_subscription();
+    let observer = response_parts.into_observer();
+    let body_len = body.len();
+    let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit, shutdown);
+    let response = downstream_response(
+        upstream_status,
+        &upstream_headers,
+        Body::from_stream(response_body),
+        body_transformed,
+        Some(body_len),
+    );
+    Ok(validate_non_stream_chat_completion_response(
+        response,
+        request_path,
+        &request_id,
+        dispatch.malformed_response_counter,
+    )
+    .await)
+}
+
 async fn forward_upstream_response(
     dispatch: ResponseDispatch<'_>,
     response_parts: ForwardedResponseParts,
@@ -8693,6 +9621,7 @@ async fn forward_upstream_response(
         dispatch.metadata_config,
         dispatch.listener,
         dispatch.upstream_profile,
+        dispatch.config,
     ) {
         return forward_buffered_models_response(
             response_parts,
@@ -8715,64 +9644,55 @@ async fn forward_upstream_response(
     .and_then(|client_model| {
         response_model_rewrite_mode(&upstream_headers).map(|mode| (mode, client_model.to_owned()))
     });
-    let response_model_rewrite = match response_model_rewrite {
-        Some((ResponseModelRewriteMode::Json, client_model)) => {
-            let body = match read_upstream_body_bytes_until_shutdown(
+    if let Some((ResponseModelRewriteMode::Json, client_model)) = &response_model_rewrite {
+        return forward_json_alias_response(
+            dispatch,
+            response_parts,
+            upstream_response,
+            in_flight_permit,
+            upstream_headers,
+            client_model,
+        )
+        .await;
+    }
+    let (upstream_stream, response_model_rewrite) = match response_model_rewrite {
+        Some((ResponseModelRewriteMode::OpenAiSse, client_model)) => {
+            let (stream, can_rewrite) = match preclassify_sse_response_body(
                 upstream_response.bytes_stream(),
                 response_parts.shutdown_subscription(),
+                &client_model,
             )
             .await
             {
-                Ok(body) => body,
+                Ok(classified) => classified,
                 Err(error) => return Err(response_parts.into_body_read_error(error)),
             };
-            response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
-            let body = rewrite_response_model_body(&body, &client_model);
-            if let Ok(content_length) = HeaderValue::from_str(&body.len().to_string()) {
-                upstream_headers.insert(CONTENT_LENGTH, content_length);
-            } else {
-                upstream_headers.remove(CONTENT_LENGTH);
-            }
-            let shutdown = response_parts.shutdown_subscription();
-            let observer = response_parts.into_observer();
-            let response_body =
-                ObservedBufferedBody::new(body, observer, in_flight_permit, shutdown);
-            let response = downstream_response(
-                upstream_status,
-                &upstream_headers,
-                Body::from_stream(response_body),
-            );
-            return Ok(validate_non_stream_chat_completion_response(
-                response,
-                &request_path,
-                &request_id,
-                dispatch.malformed_response_counter,
-            )
-            .await);
+            let rewrite =
+                can_rewrite.then_some((ResponseModelRewriteMode::OpenAiSse, client_model));
+            (stream, rewrite)
         }
-        Some(rewrite) => Some(rewrite),
-        None => None,
+        None => (
+            Box::pin(upstream_response.bytes_stream()) as UpstreamBodyStream,
+            None,
+        ),
+        Some((ResponseModelRewriteMode::Json, _)) => unreachable!("JSON aliases return above"),
     };
-    if response_model_rewrite.is_some() {
-        upstream_headers.remove(CONTENT_LENGTH);
-    }
     let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
+    let body_transformed = response_model_rewrite.is_some();
+    let downstream_headers = downstream_response_headers(&upstream_headers, body_transformed, None);
+    let known_content_length =
+        response_lifecycle_content_length(dispatch.method, upstream_status, &downstream_headers);
     let response_body = ObservedUpstreamBody::new(
-        upstream_response.bytes_stream(),
+        upstream_stream,
         observer,
         in_flight_permit,
         shutdown,
+        known_content_length,
     );
-    let response_body = match response_model_rewrite {
-        Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
-            response_body,
-            mode,
-            client_model,
-        )),
-        None => Body::from_stream(response_body),
-    };
-    let response = downstream_response(upstream_status, &upstream_headers, response_body);
+    let (response_body, _) =
+        forwarded_response_body(&mut upstream_headers, response_body, response_model_rewrite);
+    let response = response_with_headers(upstream_status, downstream_headers, response_body);
     Ok(validate_non_stream_chat_completion_response(
         response,
         &request_path,
@@ -8850,11 +9770,14 @@ fn should_buffer_models_response(
     metadata: &MetadataConfig,
     listener: &ListenerConfig,
     upstream_profile: &UpstreamProfileConfig,
+    config: &AppConfig,
 ) -> bool {
     method == Method::GET
         && uri.path() == "/v1/models"
         && (listener.allowed_upstreams.is_some()
             || !upstream_profile.match_models.is_empty()
+            || !config.forced_model_alias_profiles.is_empty()
+            || !config.upstream.reserved_ingress_model_ids.is_empty()
             || should_enrich_models_response(method, uri, metadata))
 }
 
@@ -9415,8 +10338,10 @@ async fn forward_buffered_models_response(
         Err(error) => return Err(response_parts.into_body_read_error(error)),
     };
     response_parts.end_stuck_watchdog_attempt_at_upstream_terminal();
-    let body = prepare_models_body(config, listener, upstream_profile, body);
-    let body = model_metadata::enrich_models_body(config, metadata_config, body);
+    let (body, prepared) = prepare_models_body(config, listener, upstream_profile, body);
+    let (body, enriched) = model_metadata::enrich_models_body(config, metadata_config, body);
+    let body_transformed = prepared || enriched;
+    let body_len = body.len();
     let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
     let response_body = ObservedBufferedBody::new(body, observer, in_flight_permit, shutdown);
@@ -9425,6 +10350,8 @@ async fn forward_buffered_models_response(
         upstream_status,
         &upstream_headers,
         Body::from_stream(response_body),
+        body_transformed,
+        Some(body_len),
     ))
 }
 
@@ -9432,9 +10359,17 @@ fn prepare_models_body_for_group(
     context: &GenericForwardContext<'_>,
     group: &ModelsUpstreamGroup,
     body: Bytes,
-) -> Bytes {
-    let body = model_metadata::append_match_model_aliases(&group.match_model_alias_profiles, body);
-    filter_models_body_for_listener(context.config, &context.state.listener, body)
+) -> (Bytes, bool) {
+    let (body, match_aliases) =
+        model_metadata::append_match_model_aliases(&group.match_model_alias_profiles, body);
+    let (body, forced_aliases) = model_metadata::append_forced_model_aliases(
+        &group.match_model_alias_profiles,
+        &context.config.forced_model_alias_profiles,
+        body,
+    );
+    let (body, filtered) =
+        filter_models_body_for_listener(context.config, &context.state.listener, body);
+    (body, match_aliases || forced_aliases || filtered)
 }
 
 fn prepare_models_body(
@@ -9442,30 +10377,75 @@ fn prepare_models_body(
     listener: &ListenerConfig,
     profile: &UpstreamProfileConfig,
     body: Bytes,
-) -> Bytes {
-    let body = model_metadata::append_match_model_aliases(std::slice::from_ref(profile), body);
-    filter_models_body_for_listener(config, listener, body)
+) -> (Bytes, bool) {
+    let (body, match_aliases) =
+        model_metadata::append_match_model_aliases(std::slice::from_ref(profile), body);
+    let (body, forced_aliases) = model_metadata::append_forced_model_aliases(
+        std::slice::from_ref(profile),
+        &config.forced_model_alias_profiles,
+        body,
+    );
+    let (body, filtered) = filter_models_body_for_listener(config, listener, body);
+    (body, match_aliases || forced_aliases || filtered)
 }
 
 fn filter_models_body_for_listener(
     config: &AppConfig,
     listener: &ListenerConfig,
     body: Bytes,
-) -> Bytes {
-    if let Some(profile_name) = listener.upstream_profile.as_deref() {
-        let Some(profile) = config.upstream_profile_by_name(profile_name) else {
-            return body;
-        };
-        return model_metadata::filter_models_body_by_id(body, |model_id| {
-            profile.match_models.is_empty() || profile.matches_model(model_id)
+) -> (Bytes, bool) {
+    let filter_reserved = |(body, transformed): (Bytes, bool)| {
+        let (body, filtered) = model_metadata::filter_models_body_by_id(body, |model_id| {
+            !config.upstream.is_reserved_ingress_model_id(model_id)
         });
+        (body, transformed || filtered)
+    };
+    if listener.port != GUARD_PUBLIC_LISTENER_PORT {
+        if let Some(profile_name) = listener.upstream_profile.as_deref() {
+            let Some(profile) = config.upstream_profile_by_name(profile_name) else {
+                return filter_reserved((body, false));
+            };
+            return filter_reserved(model_metadata::filter_models_body_by_id(body, |model_id| {
+                listener_forced_profile_matches_model(config, listener, &profile, model_id)
+            }));
+        }
+        if listener.allowed_upstreams.is_none() {
+            return filter_reserved((body, false));
+        }
+        return filter_reserved(model_metadata::filter_models_body_by_id(body, |model_id| {
+            select_allowed_upstream_profile(config, listener, Some(model_id)).is_ok()
+        }));
     }
-    if listener.allowed_upstreams.is_none() {
-        return body;
-    }
-    model_metadata::filter_models_body_by_id(body, |model_id| {
-        select_allowed_upstream_profile(config, listener, Some(model_id)).is_ok()
-    })
+
+    let body = if let Some(profile_name) = listener.upstream_profile.as_deref() {
+        let Some(profile) = config.upstream_profile_by_name(profile_name) else {
+            return (body, false);
+        };
+        model_metadata::filter_models_body_by_id(body, |model_id| {
+            listener_forced_profile_matches_model(config, listener, &profile, model_id)
+        })
+    } else if listener.allowed_upstreams.is_none() {
+        (body, false)
+    } else {
+        model_metadata::filter_models_body_by_id(body, |model_id| {
+            select_allowed_upstream_profile(config, listener, Some(model_id)).is_ok()
+        })
+    };
+    filter_reserved(body)
+}
+
+fn listener_forced_profile_matches_model(
+    config: &AppConfig,
+    listener: &ListenerConfig,
+    profile: &UpstreamProfileConfig,
+    model_id: &str,
+) -> bool {
+    profile.match_models.is_empty()
+        || profile.matches_model(model_id)
+        || forced_model_alias_policy(config, Some(model_id)).is_some_and(|policy| {
+            select_allowed_upstream_profile(config, listener, Some(policy.upstream_model.as_str()))
+                .is_ok_and(|selected| selected.profile.name == profile.name)
+        })
 }
 
 fn model_discovery_request_headers(headers: &HeaderMap) -> HeaderMap {
@@ -9524,6 +10504,7 @@ struct ShieldedRetryRuntime {
     request_id: RequestId,
     started_at_unix_ms: u64,
     model_id: Option<String>,
+    forced_model_alias_policy: Option<ForcedModelAliasProfileConfig>,
     stuck_watchdog_request: Option<StuckWatchdogRequest>,
     request_metadata: BTreeMap<String, String>,
     listener: ListenerConfig,
@@ -10708,6 +11689,16 @@ async fn run_shielded_attempts(
             );
         }
 
+        if should_direct_relay_loop_guard_disabled_stream(&runtime, &started.info) {
+            return ShieldedRunOutcome::DirectRelay(
+                direct_relay_loop_guard_disabled_stream_outcome(
+                    started,
+                    &attempt_records,
+                    runtime.request_deadline,
+                ),
+            );
+        }
+
         if should_direct_relay_no_thinking_stream(&runtime, &started.info, retry_cause) {
             return ShieldedRunOutcome::DirectRelay(direct_relay_no_thinking_stream_outcome(
                 started,
@@ -10908,6 +11899,19 @@ fn direct_relay_first_attempt_force_disable_stream_outcome(
     }
 }
 
+fn direct_relay_loop_guard_disabled_stream_outcome(
+    started: ShieldedStartedAttempt,
+    attempt_records: &[AttemptRecord],
+    request_deadline: RequestDeadline,
+) -> ShieldedDirectRelayOutcome {
+    ShieldedDirectRelayOutcome {
+        started,
+        prior_attempt_records: attempt_records.to_vec(),
+        response_metadata: loop_guard_disabled_direct_relay_metadata(),
+        request_deadline,
+    }
+}
+
 fn should_direct_relay_no_thinking_stream(
     runtime: &ShieldedRetryRuntime,
     info: &ShieldedAttemptInfo,
@@ -10950,6 +11954,18 @@ fn should_direct_relay_first_attempt_force_disable_stream(
             .is_some_and(|mode| mode == ThinkingMode::ForceDisable.as_str())
 }
 
+fn should_direct_relay_loop_guard_disabled_stream(
+    runtime: &ShieldedRetryRuntime,
+    info: &ShieldedAttemptInfo,
+) -> bool {
+    runtime.chat_kind == ShieldedChatKind::Stream
+        && runtime.loop_context.is_disabled()
+        && info
+            .request_metadata
+            .get("cot_salvage_used")
+            .is_none_or(|used| used != "true")
+}
+
 fn no_thinking_direct_relay_metadata() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -10980,6 +11996,23 @@ fn first_attempt_force_disable_direct_relay_metadata() -> BTreeMap<String, Strin
         (
             String::from("shielded_loop_inspection_skipped"),
             String::from("first_attempt_force_disable_direct_streaming_relay"),
+        ),
+    ])
+}
+
+fn loop_guard_disabled_direct_relay_metadata() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            String::from("shielded_direct_streaming_relay"),
+            String::from("true"),
+        ),
+        (
+            String::from("shielded_direct_streaming_relay_deadline_bound"),
+            String::from("true"),
+        ),
+        (
+            String::from("shielded_loop_inspection_skipped"),
+            String::from("loop_guard_disabled_direct_streaming_relay"),
         ),
     ])
 }
@@ -12541,7 +13574,7 @@ async fn start_shielded_attempt(
         salvage.cot_salvage,
         salvage.constraint_repair,
     );
-    let request_metadata = shielded_attempt_request_metadata(
+    let mut request_metadata = shielded_attempt_request_metadata(
         runtime,
         attempt_number,
         retry_cause,
@@ -12566,6 +13599,12 @@ async fn start_shielded_attempt(
             error,
         })
     })?;
+    add_forced_alias_wire_metadata(
+        &mut request_metadata,
+        runtime.forced_model_alias_policy.as_ref(),
+        endpoint_capability(&runtime.method, &runtime.forward_uri),
+        &rendered.body,
+    );
     let raw_request_body = raw_payload_text(&rendered.body);
     let evidence_upstream_body = rendered.body.clone();
     let upstream_timeout = shielded_attempt_upstream_timeout(runtime);
@@ -12649,13 +13688,17 @@ fn render_shielded_endpoint_body(
     runtime: &ShieldedRetryRuntime,
     body: &Bytes,
 ) -> Result<reranker_protocol::RenderedEndpointRequest, ProxyError> {
-    reranker_protocol::render_openai_endpoint(
+    let mut rendered = reranker_protocol::render_openai_endpoint(
         &runtime.terminal_endpoint,
         runtime.forward_uri.clone(),
         body,
         &runtime.original_downstream_headers,
         runtime.transformed_request_headers,
-    )
+    )?;
+    if let Some(policy) = &runtime.forced_model_alias_policy {
+        rendered.body = apply_forced_model_alias_policy(&rendered.body, policy);
+    }
+    Ok(rendered)
 }
 
 fn shielded_retry_endpoint(
@@ -12733,9 +13776,11 @@ async fn send_shielded_upstream_attempt(
             UpstreamFailoverRetryContext {
                 registry: runtime.upstream_health.as_ref(),
                 profile: &runtime.upstream_profile,
+                method: runtime.method.clone(),
                 local_forward_uri: runtime.forward_uri.clone(),
                 original_downstream_headers: &runtime.original_downstream_headers,
                 canonical_reranker: None,
+                forced_model_alias_policy: runtime.forced_model_alias_policy.as_ref(),
                 transformed_request_headers: runtime.transformed_request_headers,
                 initial_endpoint: &runtime.terminal_endpoint,
                 request_deadline,
@@ -14104,10 +15149,11 @@ fn shielded_retry_success_response(
     mut outcome: ShieldedAcceptedOutcome,
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
+    let body_transformed = true;
     if runtime.upstream_profile.upstream_model.is_some()
         && let Some(client_model) = runtime.model_id.as_deref()
     {
-        outcome.body = rewrite_response_model_body(&outcome.body, client_model);
+        outcome.body = rewrite_response_model_body(&outcome.body, client_model).0;
     }
     let body_len = outcome.body.len();
     let upstream_headers = outcome.final_attempt.upstream_headers.clone();
@@ -14123,7 +15169,8 @@ fn shielded_retry_success_response(
         return malformed_choices_error_response(&runtime.request_id);
     }
     let upstream_content_type = upstream_headers.get(CONTENT_TYPE).map(header_value);
-    let response_headers = shielded_chat_response_headers(&upstream_headers, body_len);
+    let response_headers =
+        shielded_chat_response_headers(&upstream_headers, body_len, body_transformed);
     let mut extra_metadata = outcome.response_metadata.clone();
     extra_metadata.extend(effective_liveness::response_metadata(
         &runtime.liveness,
@@ -14241,10 +15288,19 @@ async fn shielded_retry_terminal_forward_response(
     in_flight_permit: InFlightPermit,
 ) -> Response<Body> {
     let upstream_status = terminal.started.info.upstream_status;
-    let upstream_headers = terminal.started.info.upstream_headers.clone();
+    let mut upstream_headers = terminal.started.info.upstream_headers.clone();
     let request_path = runtime.downstream_uri.path().to_owned();
     let request_id = runtime.request_id.clone();
     let malformed_counter = runtime.malformed_response_counter.clone();
+    let response_model_rewrite =
+        client_response_model_alias(&runtime.upstream_profile, runtime.model_id.as_deref())
+            .and_then(|client_model| {
+                response_model_rewrite_mode(&upstream_headers)
+                    .map(|mode| (mode, client_model.to_owned()))
+            });
+    if response_model_rewrite.is_some() {
+        upstream_headers.remove(CONTENT_LENGTH);
+    }
     let liveness_metadata = effective_liveness::response_metadata(
         &runtime.liveness,
         upstream_headers.get(CONTENT_TYPE).map(header_value),
@@ -14270,17 +15326,29 @@ async fn shielded_retry_terminal_forward_response(
             stuck_watchdog_attempt: terminal.started.stuck_watchdog_attempt,
         },
     );
+    let body_transformed = response_model_rewrite.is_some();
+    let downstream_headers = downstream_response_headers(&upstream_headers, body_transformed, None);
+    let known_content_length = response_lifecycle_content_length(
+        &runtime.downstream_method,
+        upstream_status,
+        &downstream_headers,
+    );
     let response_body = ObservedUpstreamBody::new(
         terminal.started.response.bytes_stream(),
         observer,
         in_flight_permit,
         runtime.shutdown.subscribe(),
+        known_content_length,
     );
-    let response = downstream_response(
-        upstream_status,
-        &upstream_headers,
-        Body::from_stream(response_body),
-    );
+    let response_body = match response_model_rewrite {
+        Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
+            response_body,
+            mode,
+            client_model,
+        )),
+        None => Body::from_stream(response_body),
+    };
+    let response = response_with_headers(upstream_status, downstream_headers, response_body);
     validate_non_stream_chat_completion_response(
         response,
         &request_path,
@@ -14330,6 +15398,13 @@ async fn shielded_retry_direct_relay_response(
             stuck_watchdog_attempt: outcome.started.stuck_watchdog_attempt,
         },
     );
+    let body_transformed = response_model_rewrite.is_some();
+    let downstream_headers = downstream_response_headers(&upstream_headers, body_transformed, None);
+    let known_content_length = response_lifecycle_content_length(
+        &runtime.downstream_method,
+        upstream_status,
+        &downstream_headers,
+    );
     let response_body = ObservedUpstreamBody::new_with_deadline(
         outcome.started.response.bytes_stream(),
         observer,
@@ -14337,6 +15412,7 @@ async fn shielded_retry_direct_relay_response(
         BodyCompletion::Succeeded,
         runtime.shutdown.subscribe(),
         Some(outcome.request_deadline),
+        known_content_length,
     );
     let response_body = match response_model_rewrite {
         Some((mode, client_model)) => Body::from_stream(ResponseModelRewriteBody::new(
@@ -14346,7 +15422,7 @@ async fn shielded_retry_direct_relay_response(
         )),
         None => Body::from_stream(response_body),
     };
-    let response = downstream_response(upstream_status, &upstream_headers, response_body);
+    let response = response_with_headers(upstream_status, downstream_headers, response_body);
     validate_non_stream_chat_completion_response(
         response,
         &request_path,
@@ -15131,6 +16207,7 @@ struct ObservedUpstreamBody {
     body_buffer: BytesMut,
     terminal_completion: BodyCompletion,
     deadline: Option<Pin<Box<Sleep>>>,
+    known_content_length: Option<u64>,
 }
 
 impl ObservedUpstreamBody {
@@ -15139,6 +16216,7 @@ impl ObservedUpstreamBody {
         observer: ForwardedBodyObserver,
         in_flight_permit: InFlightPermit,
         shutdown: ShutdownSubscription,
+        known_content_length: Option<u64>,
     ) -> Self {
         Self::new_with_completion(
             stream,
@@ -15147,6 +16225,7 @@ impl ObservedUpstreamBody {
             BodyCompletion::Succeeded,
             shutdown,
             None,
+            known_content_length,
         )
     }
 
@@ -15157,6 +16236,7 @@ impl ObservedUpstreamBody {
         terminal_completion: BodyCompletion,
         shutdown: ShutdownSubscription,
         deadline: Option<RequestDeadline>,
+        known_content_length: Option<u64>,
     ) -> Self {
         Self::new_with_completion(
             stream,
@@ -15165,6 +16245,7 @@ impl ObservedUpstreamBody {
             terminal_completion,
             shutdown,
             deadline,
+            known_content_length,
         )
     }
 
@@ -15175,6 +16256,7 @@ impl ObservedUpstreamBody {
         terminal_completion: BodyCompletion,
         shutdown: ShutdownSubscription,
         deadline: Option<RequestDeadline>,
+        known_content_length: Option<u64>,
     ) -> Self {
         let progress = observer.stuck_watchdog_progress_request();
         let relayed = observe_upstream_body_independently(stream, progress);
@@ -15190,6 +16272,7 @@ impl ObservedUpstreamBody {
                 .map(|deadline| deadline.remaining().unwrap_or(Duration::ZERO))
                 .map(tokio::time::sleep)
                 .map(Box::pin),
+            known_content_length,
         }
     }
 
@@ -15228,6 +16311,12 @@ impl Stream for ObservedUpstreamBody {
                     let take = remaining.min(bytes.len());
                     this.body_buffer.extend_from_slice(&bytes[..take]);
                 }
+                if let Some(expected) = this.known_content_length
+                    && this.bytes_seen > expected
+                {
+                    let completion = content_length_mismatch(expected, this.bytes_seen);
+                    this.record_once(&completion);
+                }
                 Poll::Ready(Some(Ok(bytes)))
             }
             Poll::Ready(Some(Err(error))) => {
@@ -15237,8 +16326,14 @@ impl Stream for ObservedUpstreamBody {
                 Poll::Ready(Some(Err(error)))
             }
             Poll::Ready(None) => {
-                let completion =
-                    std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded);
+                let completion = match this.known_content_length {
+                    Some(expected) if this.bytes_seen != expected => {
+                        content_length_mismatch(expected, this.bytes_seen)
+                    }
+                    _ => {
+                        std::mem::replace(&mut this.terminal_completion, BodyCompletion::Succeeded)
+                    }
+                };
                 this.record_once(&completion);
                 Poll::Ready(None)
             }
@@ -15249,7 +16344,16 @@ impl Stream for ObservedUpstreamBody {
 
 impl Drop for ObservedUpstreamBody {
     fn drop(&mut self) {
-        self.record_once(&BodyCompletion::DownstreamDropped);
+        let completion = if matches!(self.terminal_completion, BodyCompletion::Succeeded)
+            && self
+                .known_content_length
+                .is_some_and(|expected| self.bytes_seen == expected)
+        {
+            BodyCompletion::Succeeded
+        } else {
+            BodyCompletion::DownstreamDropped
+        };
+        self.record_once(&completion);
     }
 }
 
@@ -15442,9 +16546,9 @@ impl ShieldedLivenessBody {
         if self.accepted_response_mode == ShieldedAcceptedResponseMode::OpenAiSse
             || self.mode == ShieldedLivenessMode::Sse
         {
-            rewrite_sse_response_model_body(&body, client_model)
+            rewrite_sse_response_model_body(&body, client_model).0
         } else {
-            rewrite_response_model_body(&body, client_model)
+            rewrite_response_model_body(&body, client_model).0
         }
     }
 
@@ -15707,10 +16811,66 @@ fn downstream_response(
     status: reqwest::StatusCode,
     upstream_headers: &HeaderMap,
     body: Body,
+    body_transformed: bool,
+    body_len: Option<usize>,
 ) -> Response<Body> {
-    let mut headers = HeaderMap::new();
-    copy_response_headers(upstream_headers, &mut headers);
+    let headers = downstream_response_headers(upstream_headers, body_transformed, body_len);
     response_with_headers(status, headers, body)
+}
+
+fn downstream_response_headers(
+    upstream_headers: &HeaderMap,
+    body_transformed: bool,
+    body_len: Option<usize>,
+) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    copy_response_headers(upstream_headers, &mut headers, body_transformed);
+    if let Some(body_len) = body_len
+        && let Ok(content_length) = HeaderValue::from_str(&body_len.to_string())
+    {
+        headers.insert(CONTENT_LENGTH, content_length);
+    }
+    headers
+}
+
+fn response_lifecycle_content_length(
+    method: &Method,
+    status: reqwest::StatusCode,
+    headers: &HeaderMap,
+) -> Option<u64> {
+    if method == Method::HEAD
+        || method == Method::CONNECT && status.is_success()
+        || status.is_informational()
+        || status == reqwest::StatusCode::NO_CONTENT
+        || status == reqwest::StatusCode::NOT_MODIFIED
+    {
+        return None;
+    }
+    unique_content_length(headers)
+}
+
+fn unique_content_length(headers: &HeaderMap) -> Option<u64> {
+    let mut length = None;
+    for header in &headers.get_all(CONTENT_LENGTH) {
+        let header = header.to_str().ok()?;
+        for value in header.split(',').map(str::trim) {
+            if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            let parsed = value.parse().ok()?;
+            if length.is_some_and(|current| current != parsed) {
+                return None;
+            }
+            length = Some(parsed);
+        }
+    }
+    length
+}
+
+fn content_length_mismatch(expected: u64, observed: u64) -> BodyCompletion {
+    BodyCompletion::UpstreamStreamError(format!(
+        "content_length_mismatch: expected {expected} bytes, observed {observed}"
+    ))
 }
 
 /// Adds the stable observability identifier at the single terminal proxy boundary.
@@ -15741,9 +16901,13 @@ fn response_with_headers(
     response
 }
 
-fn shielded_chat_response_headers(upstream_headers: &HeaderMap, body_len: usize) -> HeaderMap {
+fn shielded_chat_response_headers(
+    upstream_headers: &HeaderMap,
+    body_len: usize,
+    body_transformed: bool,
+) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    copy_response_headers(upstream_headers, &mut headers);
+    copy_response_headers(upstream_headers, &mut headers, body_transformed);
     headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
     if let Ok(content_length) = HeaderValue::from_str(&body_len.to_string()) {
         headers.insert(CONTENT_LENGTH, content_length);
@@ -15756,7 +16920,7 @@ fn shielded_chat_stream_response_headers(
     mode: ShieldedLivenessMode,
 ) -> HeaderMap {
     let mut headers = HeaderMap::new();
-    copy_response_headers(upstream_headers, &mut headers);
+    copy_response_headers(upstream_headers, &mut headers, true);
     let content_type = match mode {
         ShieldedLivenessMode::Sse => "text/event-stream",
         ShieldedLivenessMode::JsonWhitespace | ShieldedLivenessMode::Disabled => "application/json",
@@ -15910,10 +17074,10 @@ fn forwarded_request_headers(headers: &HeaderMap) -> HeaderMap {
     forwarded
 }
 
-fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap) {
+fn copy_response_headers(source: &HeaderMap, target: &mut HeaderMap, body_transformed: bool) {
     let connection_tokens = connection_header_tokens(source);
     for (name, value) in source {
-        if should_skip_response_header(name, &connection_tokens) {
+        if should_skip_response_header(name, &connection_tokens, body_transformed) {
             continue;
         }
         target.append(name.clone(), value.clone());
@@ -15928,8 +17092,34 @@ fn should_skip_request_header(name: &HeaderName, connection_tokens: &HashSet<Hea
         || connection_tokens.contains(name)
 }
 
-fn should_skip_response_header(name: &HeaderName, connection_tokens: &HashSet<HeaderName>) -> bool {
-    name == CONTENT_LENGTH || is_hop_by_hop_header(name) || connection_tokens.contains(name)
+fn should_skip_response_header(
+    name: &HeaderName,
+    connection_tokens: &HashSet<HeaderName>,
+    body_transformed: bool,
+) -> bool {
+    (body_transformed && name == CONTENT_LENGTH)
+        || is_hop_by_hop_header(name)
+        || connection_tokens.contains(name)
+        || (body_transformed && is_body_bound_response_header(name))
+}
+
+fn is_body_bound_response_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "content-encoding"
+            | "content-md5"
+            | "digest"
+            | "content-digest"
+            | "repr-digest"
+            | "etag"
+            | "last-modified"
+            | "signature"
+            | "signature-input"
+            | "if-match"
+            | "if-none-match"
+            | "if-modified-since"
+            | "if-unmodified-since"
+    )
 }
 
 fn is_hop_by_hop_header(name: &HeaderName) -> bool {
@@ -16323,21 +17513,90 @@ fn header_value(value: &HeaderValue) -> String {
         .map_or_else(|_error| HEADER_VALUE_NOT_UTF8.to_owned(), str::to_owned)
 }
 
-fn extract_model_id(method: &Method, uri: &Uri, body: &Bytes) -> Option<String> {
+fn model_detail_id_from_path(path: &str) -> Result<Option<String>, OpenAiPathError> {
+    let Some(segment) = path.strip_prefix("/v1/models/") else {
+        return Ok(None);
+    };
+    if segment.is_empty() || segment.contains('/') {
+        return Err(OpenAiPathError::InvalidModelDetailId);
+    }
+    strict_percent_decode_model_detail_id(segment).map(Some)
+}
+
+fn rewrite_model_detail_uri(uri: &Uri, model_id: &str) -> Result<Uri, OpenAiPathError> {
+    let mut path_and_query = format!("/v1/models/{}", percent_encode_model_detail_id(model_id));
+    if let Some(query) = uri.query() {
+        path_and_query.push('?');
+        path_and_query.push_str(query);
+    }
+    path_and_query
+        .parse()
+        .map_err(|_error| OpenAiPathError::InvalidModelDetailId)
+}
+
+fn percent_encode_model_detail_id(model_id: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(model_id.len());
+    for byte in model_id.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0F)]));
+        }
+    }
+    encoded
+}
+
+fn strict_percent_decode_model_detail_id(segment: &str) -> Result<String, OpenAiPathError> {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0_usize;
+
+    while index < bytes.len() {
+        let byte = if bytes[index] == b'%' {
+            let Some((decoded_byte, next_index)) = percent_encoded_byte(bytes, index) else {
+                return Err(OpenAiPathError::InvalidModelDetailId);
+            };
+            index = next_index;
+            decoded_byte
+        } else {
+            let byte = bytes[index];
+            index += 1;
+            byte
+        };
+        if matches!(byte, b'/' | b'\\') {
+            return Err(OpenAiPathError::InvalidModelDetailId);
+        }
+        decoded.push(byte);
+    }
+
+    String::from_utf8(decoded).map_err(|_error| OpenAiPathError::InvalidModelDetailId)
+}
+
+fn extract_model_id(
+    method: &Method,
+    uri: &Uri,
+    body: &Bytes,
+) -> Result<Option<String>, OpenAiPathError> {
+    if let Some(model) = model_detail_id_from_path(uri.path())? {
+        return Ok(Some(model));
+    }
     if let Some(model) = deepinfra_rerank_adapter::model_id_from_path(method, uri) {
-        return Some(model.to_owned());
+        return Ok(Some(model.to_owned()));
     }
     if score_adapter::is_score_request(method, uri) {
-        return score_adapter::model_id_from_score_body(body);
+        return Ok(score_adapter::model_id_from_score_body(body));
     }
-    serde_json::from_slice::<serde_json::Value>(body)
+    Ok(serde_json::from_slice::<serde_json::Value>(body)
         .ok()
         .and_then(|value| {
             value
                 .get("model")
                 .and_then(|model| model.as_str())
                 .map(str::to_owned)
-        })
+        }))
 }
 
 fn downstream_mode_from_headers(headers: &HeaderMap) -> DownstreamMode {
@@ -16460,6 +17719,7 @@ fn validate_openai_path(path: &str) -> Result<(), OpenAiPathError> {
     if path.split('/').any(path_segment_decodes_to_dot_segment) {
         return Err(OpenAiPathError::DotSegment);
     }
+    model_detail_id_from_path(path)?;
 
     Ok(())
 }
@@ -17209,6 +18469,12 @@ fn shadow_comparison_attempt_plan(
             .max_tokens
             .map_or_else(|| String::from("unset"), |value| value.to_string()),
     );
+    add_forced_alias_wire_metadata(
+        &mut request_metadata,
+        runtime.forced_model_alias_policy.as_ref(),
+        endpoint_capability(&runtime.method, &runtime.forward_uri),
+        &upstream_body,
+    );
     Some(ShadowAttemptPlan {
         upstream_body,
         request_metadata,
@@ -17262,6 +18528,12 @@ fn paired_shadow_comparison_attempt_plan(
             .max_tokens
             .map_or_else(|| String::from("unset"), |value| value.to_string()),
     );
+    add_forced_alias_wire_metadata(
+        &mut request_metadata,
+        runtime.forced_model_alias_policy.as_ref(),
+        endpoint_capability(&runtime.method, &runtime.forward_uri),
+        &upstream_body,
+    );
     Some(ShadowAttemptPlan {
         upstream_body,
         request_metadata,
@@ -17283,7 +18555,12 @@ fn render_shadow_endpoint_body(runtime: &ShieldedRetryRuntime, body: &Bytes) -> 
         runtime.transformed_request_headers,
     )
     .ok()
-    .map(|rendered| rendered.body)
+    .map(|mut rendered| {
+        if let Some(policy) = &runtime.forced_model_alias_policy {
+            rendered.body = apply_forced_model_alias_policy(&rendered.body, policy);
+        }
+        rendered.body
+    })
 }
 
 fn prepared_shadow_body(
@@ -18143,6 +19420,19 @@ impl ProxyError {
         }
     }
 
+    fn reserved_ingress_model_id() -> Self {
+        Self::ContextBudgetExceeded {
+            message: String::from("requested model is reserved for internal ingress"),
+            param: "model",
+            code: "reserved_ingress_model_id",
+            request_metadata: Some(BTreeMap::from([(
+                String::from("model_reservation"),
+                String::from("reserved_ingress_model_id"),
+            )])),
+            attempts: Vec::new(),
+        }
+    }
+
     fn status(&self) -> StatusCode {
         match self {
             Self::RequestBody { .. } => StatusCode::PAYLOAD_TOO_LARGE,
@@ -18595,20 +19885,22 @@ enum OpenAiPathError {
     OutsideOpenAiScope,
     #[error("OpenAI-compatible request path contains a raw or percent-encoded dot segment")]
     DotSegment,
+    #[error("model detail ID must be valid percent-encoded UTF-8 without path separators")]
+    InvalidModelDetailId,
 }
 
 impl OpenAiPathError {
     const fn status(self) -> StatusCode {
         match self {
             Self::OutsideOpenAiScope => StatusCode::NOT_FOUND,
-            Self::DotSegment => StatusCode::BAD_REQUEST,
+            Self::DotSegment | Self::InvalidModelDetailId => StatusCode::BAD_REQUEST,
         }
     }
 
     const fn error_type(self) -> &'static str {
         match self {
             Self::OutsideOpenAiScope => "not_found",
-            Self::DotSegment => "invalid_request_path",
+            Self::DotSegment | Self::InvalidModelDetailId => "invalid_request_path",
         }
     }
 }

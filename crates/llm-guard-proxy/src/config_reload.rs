@@ -665,6 +665,62 @@ mod tests {
         remove_file(&path);
     }
 
+    #[cfg(feature = "guard")]
+    #[test]
+    fn malformed_collision_reload_retains_last_good_snapshot_and_generation() {
+        let path = unique_test_path("forced-alias-collision.toml");
+        let valid = r#"
+[heartbeat]
+interval_secs = 4
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-none"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
+thinking_mode = "force_disable"
+output_cap = 16384
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#;
+        fs::write(&path, valid).expect("write initial config");
+        let manager = ConfigManager::from_explicit_path(&path).expect("load initial config");
+        replace_config_atomically(
+            &path,
+            valid.replace("interval_secs = 4", "interval_secs = 5"),
+        );
+        manager.reload().expect("valid generation should apply");
+        let before = manager
+            .reload_status()
+            .expect("reload status")
+            .expect("status");
+
+        replace_config_atomically(
+            &path,
+            format!(
+                "{}\n[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n",
+                valid.replace("interval_secs = 4", "interval_secs = 6")
+            ),
+        );
+        let error = manager.reload().expect_err("colliding reload must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("must not collide with model_aliases.id")
+        );
+        let after = manager
+            .reload_status()
+            .expect("reload status")
+            .expect("status");
+        assert_eq!(after.attempt_generation, before.attempt_generation + 1);
+        assert_eq!(after.snapshot_generation, before.snapshot_generation);
+        assert_eq!(after.snapshot, before.snapshot);
+        assert!(matches!(after.terminal, ReloadTerminalState::Rejected(_)));
+        remove_file(&path);
+    }
+
     #[test]
     fn missing_reload_retains_last_good_until_atomic_recovery() {
         let path = unique_test_path("missing-reload.toml");

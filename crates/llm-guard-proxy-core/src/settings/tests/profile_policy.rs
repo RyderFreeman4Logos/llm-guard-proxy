@@ -72,3 +72,22 @@ name = " "
     .expect_err("profile retry ladder should reject a blank name");
     assert_eq!(retry_ladder_error.field(), "upstreams.retry.ladder.name");
 }
+
+#[test]
+fn reserved_ingress_model_ids_are_explicitly_configured() {
+    let config = parse_config_text(
+        r#"
+[upstream]
+reserved_ingress_model_ids = ["abliterated-qwen-latest-27b-nvfp4", "aeon", "aeon-ultimate"]
+"#,
+    )
+    .expect("reserved ingress model IDs should be an explicit upstream setting");
+    config
+        .validate()
+        .expect("reserved ingress model IDs should validate");
+    assert_eq!(
+        config.upstream.reserved_ingress_model_ids,
+        ["abliterated-qwen-latest-27b-nvfp4", "aeon", "aeon-ultimate"]
+    );
+    assert!(RELOADABLE_FIELDS.contains(&"upstream.reserved_ingress_model_ids"));
+}

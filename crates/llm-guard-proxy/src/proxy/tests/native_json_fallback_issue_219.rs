@@ -488,6 +488,7 @@ fn assert_no_native_fallback(attempts: &[AttemptChainRow]) {
 struct NativeJsonFallbackUpstream {
     base_url: String,
     receiver: mpsc::Receiver<serde_json::Value>,
+    _server: TestServer,
 }
 
 #[derive(Clone)]
@@ -515,14 +516,15 @@ impl NativeJsonFallbackUpstream {
         let address = listener
             .local_addr()
             .expect("native JSON fallback upstream address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("native JSON fallback upstream server failed: {error}");
             }
-        });
+        }));
         Self {
             base_url: format!("http://{address}/v1"),
             receiver,
+            _server: server,
         }
     }
 

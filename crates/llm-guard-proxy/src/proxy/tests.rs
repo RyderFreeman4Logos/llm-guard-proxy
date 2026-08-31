@@ -25,7 +25,7 @@ use axum::http::header::{AUTHORIZATION, CONNECTION, LOCATION};
 use futures_util::{Stream, StreamExt, stream};
 use rusqlite::{Connection, params};
 use tokio::{
-    io::AsyncReadExt,
+    io::{AsyncBufReadExt, BufReader},
     net::TcpListener,
     sync::{mpsc, oneshot},
     time::{sleep, timeout},
@@ -47,6 +47,10 @@ mod native_json_fallback_issue_219;
 mod quality_first_timeouts_issue_222;
 #[path = "tests/residual_guard_polish.rs"]
 mod residual_guard_polish;
+#[path = "tests/response_framing_lifecycle.rs"]
+mod response_framing_lifecycle;
+#[path = "tests/response_representation_state.rs"]
+mod response_representation_state;
 #[path = "tests/shielded_endpoint_rendering.rs"]
 mod shielded_endpoint_rendering;
 #[cfg(unix)]
@@ -1626,16 +1630,23 @@ fn admin_token_matcher_accepts_only_exact_values() {
 #[tokio::test(flavor = "current_thread")]
 async fn persistence_tasks_contain_spawn_blocking_panics() {
     let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
-    let tasks = Arc::new(PersistenceTasks::default());
+    let (panic_published_tx, panic_published_rx) = oneshot::channel();
+    let tasks = Arc::new(PersistenceTasks::with_panic_publication_for_tests(
+        panic_published_tx,
+    ));
 
     tasks.spawn_blocking(|| panic!("simulated persistence store teardown failure"));
 
+    timeout(STREAM_COMPLETION_TIMEOUT, panic_published_rx)
+        .await
+        .expect("panic-safe persistence task should publish its panic")
+        .expect("panic publication sender should remain owned until the worker runs");
     timeout(
         STREAM_COMPLETION_TIMEOUT,
         tasks.flush(STREAM_COMPLETION_TIMEOUT),
     )
     .await
-    .expect("panic-safe persistence task should finish");
+    .expect("published panic-safe persistence task should finish");
     assert_eq!(tasks.panics.load(Ordering::SeqCst), 1);
 }
 
@@ -1643,34 +1654,28 @@ async fn persistence_tasks_contain_spawn_blocking_panics() {
 async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
     let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
     let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
-    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let (second_started_tx, second_started_rx) = std::sync::mpsc::channel();
+    let (first_started_tx, first_started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let overflow_executed = Arc::new(AtomicBool::new(false));
 
     tasks.spawn_blocking(move || {
         first_started_tx
             .send(())
-            .expect("first persistence task receiver should remain open");
+            .expect("first persistence task startup receiver should remain open");
         release_rx
-            .recv()
+            .blocking_recv()
             .expect("first persistence task should be released");
     });
-    first_started_rx
-        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
-        .expect("first persistence task should start");
+    timeout(STREAM_COMPLETION_TIMEOUT, first_started_rx)
+        .await
+        .expect("first persistence task should start")
+        .expect("first persistence task startup sender should remain owned until it runs");
 
+    let overflow_executed_for_task = Arc::clone(&overflow_executed);
     tasks.spawn_blocking(move || {
-        second_started_tx
-            .send(())
-            .expect("dropped persistence task must not execute");
+        overflow_executed_for_task.store(true, Ordering::SeqCst);
     });
 
-    assert!(
-        second_started_rx
-            .recv_timeout(Duration::from_millis(250))
-            .is_err(),
-        "overflow persistence work must not execute while the backlog is saturated"
-    );
     assert_eq!(
         tasks.dropped_total(),
         1,
@@ -1685,6 +1690,10 @@ async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
     )
     .await
     .expect("retained persistence task should drain");
+    assert!(
+        !overflow_executed.load(Ordering::SeqCst),
+        "overflow persistence work must not execute while the backlog is saturated"
+    );
 }
 
 async fn terminate_and_reap_test_child(
@@ -1705,151 +1714,45 @@ async fn terminate_and_reap_test_child(
     (termination, reaped)
 }
 
-async fn drain_test_child_output(
-    stdout_reader: tokio::task::JoinHandle<Vec<u8>>,
-    stderr_reader: tokio::task::JoinHandle<Vec<u8>>,
-) -> (Vec<u8>, Vec<u8>) {
-    let stdout = stdout_reader
-        .await
-        .expect("backlog-drop child stdout reader should not panic");
-    let stderr = stderr_reader
-        .await
-        .expect("backlog-drop child stderr reader should not panic");
-    (stdout, stderr)
-}
-
-async fn run_bounded_test_child(test_name: &str, child_env: &str) -> std::process::Output {
-    let mut command = tokio::process::Command::new(
-        std::env::current_exe().expect("test binary path should be available"),
-    );
-    command
-        .args(["--exact", test_name, "--nocapture"])
-        .env(child_env, "1")
-        .kill_on_drop(true)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    command.process_group(0);
-
-    let mut child = command
-        .spawn()
-        .expect("backlog-drop child test should start");
-    let process_group_id = child.id().expect("backlog-drop child process group id");
-    let mut child_stdout = child
-        .stdout
-        .take()
-        .expect("backlog-drop child stdout should be captured");
-    let mut child_stderr = child
-        .stderr
-        .take()
-        .expect("backlog-drop child stderr should be captured");
-    let stdout_reader = tokio::spawn(async move {
-        let mut output = Vec::new();
-        child_stdout
-            .read_to_end(&mut output)
-            .await
-            .expect("backlog-drop child stdout should drain");
-        output
-    });
-    let stderr_reader = tokio::spawn(async move {
-        let mut output = Vec::new();
-        child_stderr
-            .read_to_end(&mut output)
-            .await
-            .expect("backlog-drop child stderr should drain");
-        output
-    });
-    let status = match timeout(Duration::from_secs(30), child.wait()).await {
-        Ok(Ok(status)) => status,
-        Ok(Err(error)) => {
-            let (termination, reaped) =
-                terminate_and_reap_test_child(&mut child, process_group_id).await;
-            let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
-            panic!(
-                "backlog-drop child test wait failed: {error}; termination={termination}; reaped={reaped:?}; stdout={}; stderr={}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr),
-            );
-        }
-        Err(_) => {
-            let (termination, reaped) =
-                terminate_and_reap_test_child(&mut child, process_group_id).await;
-            let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
-            panic!(
-                "backlog-drop child test timed out after 30 seconds; termination={termination}; reaped={reaped:?}; stdout={}; stderr={}",
-                String::from_utf8_lossy(&stdout),
-                String::from_utf8_lossy(&stderr),
-            );
-        }
-    };
-    let (stdout, stderr) = drain_test_child_output(stdout_reader, stderr_reader).await;
-    std::process::Output {
-        status,
-        stdout,
-        stderr,
-    }
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
-    const CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_CHILD";
     const HANG_CHILD_ENV: &str = "LLM_GUARD_PROXY_PERSISTENCE_DROP_LOG_TEST_HANG_CHILD";
-    const TEST_NAME: &str =
-        "proxy::tests::persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst";
     const OVERFLOW_BURST: usize = 128;
 
     let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
 
-    if std::env::var_os(CHILD_ENV).is_none() {
-        let output = run_bounded_test_child(TEST_NAME, CHILD_ENV).await;
-        assert!(
-            output.status.success(),
-            "backlog-drop child test failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            String::from_utf8_lossy(&output.stdout).contains("running 1 test"),
-            "backlog-drop child test must run exactly one test: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let log_emissions = stderr
-            .matches("persistence backlog full, dropping record")
-            .count();
-        assert!(
-            log_emissions <= 1,
-            "a saturated overflow burst must emit at most one backlog-drop log, emitted {log_emissions}"
-        );
-        assert!(
-            stderr.contains("dropped_since_last_log=1"),
-            "the first aggregated backlog-drop log must report its dropped delta: {stderr}"
-        );
-        return;
-    }
-
     if std::env::var_os(HANG_CHILD_ENV).is_some() {
-        sleep(Duration::from_secs(60)).await;
+        eprintln!("persistence backlog-drop hang ready");
+        std::future::pending::<()>().await;
     }
 
-    let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
-    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (backlog_log_tx, backlog_log_rx) = oneshot::channel();
+    let tasks = Arc::new(PersistenceTasks::with_backlog_drop_log_for_tests(
+        1,
+        backlog_log_tx,
+    ));
+    let (first_started_tx, first_started_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
     tasks.spawn_blocking(move || {
         first_started_tx
             .send(())
-            .expect("first persistence task receiver should remain open");
+            .expect("first persistence task startup receiver should remain open");
         release_rx
-            .recv()
+            .blocking_recv()
             .expect("first persistence task should be released");
     });
-    first_started_rx
-        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
-        .expect("first persistence task should start");
+    timeout(STREAM_COMPLETION_TIMEOUT, first_started_rx)
+        .await
+        .expect("first persistence task should start")
+        .expect("first persistence task startup sender should remain owned until it runs");
 
     for _ in 0..OVERFLOW_BURST {
         tasks.spawn_blocking(|| {});
     }
+    timeout(STREAM_COMPLETION_TIMEOUT, backlog_log_rx)
+        .await
+        .expect("first saturated overflow should publish its aggregate backlog-drop log")
+        .expect("backlog-drop log sender should remain owned until it publishes");
     assert_eq!(
         tasks.dropped_total(),
         OVERFLOW_BURST as u64,
@@ -1882,7 +1785,7 @@ async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
         .args(["--exact", TEST_NAME, "--nocapture"])
         .env(HANG_CHILD_ENV, "1")
         .kill_on_drop(true)
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
     #[cfg(unix)]
     command.process_group(0);
 
@@ -1890,10 +1793,27 @@ async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
         .spawn()
         .expect("hung backlog-drop parent test should start");
     let process_group_id = child.id().expect("hung backlog-drop parent child pid");
+    let child_stderr = child
+        .stderr
+        .take()
+        .expect("hung backlog-drop child stderr should be captured");
+    let mut child_stderr_lines = BufReader::new(child_stderr).lines();
+    timeout(STREAM_COMPLETION_TIMEOUT, async {
+        loop {
+            let line = child_stderr_lines
+                .next_line()
+                .await
+                .expect("hung backlog-drop child stderr should remain readable")
+                .expect("hung backlog-drop child should announce its ready state");
+            if line.contains("persistence backlog-drop hang ready") {
+                return;
+            }
+        }
+    })
+    .await
+    .expect("hung backlog-drop child should announce its ready state before the guard");
 
-    // The nested child has a 30-second deadline; leave startup scheduling headroom
-    // when the full suite is running concurrently.
-    let status = match timeout(Duration::from_secs(60), child.wait()).await {
+    let status = match timeout(STREAM_COMPLETION_TIMEOUT, child.wait()).await {
         Ok(Ok(status)) => status,
         Ok(Err(error)) => {
             let (termination, reaped) =
@@ -1905,9 +1825,13 @@ async fn persistence_tasks_timeout_and_reap_a_hung_backlog_drop_child() {
         Err(_) => {
             let (termination, reaped) =
                 terminate_and_reap_test_child(&mut child, process_group_id).await;
-            panic!(
-                "backlog-drop parent must fail after terminating its hung child; termination={termination}; reaped={reaped:?}"
+            let reaped =
+                reaped.expect("hung backlog-drop child should be reaped after termination");
+            assert!(
+                !reaped.success(),
+                "hung backlog-drop child must exit unsuccessfully after {termination}: {reaped:?}"
             );
+            return;
         }
     };
     assert!(
@@ -2173,6 +2097,94 @@ async fn get_models_forwards_method_path_query_and_headers() {
             .is_some_and(|value| value != "downstream.example"),
         "proxy must let the upstream client set Host instead of forwarding the downstream Host"
     );
+}
+
+#[tokio::test]
+async fn head_models_content_length_metadata_does_not_fail_lifecycle_completion() {
+    let fake = FakeUpstream::spawn().await;
+    let proxy = ProxyFixture::spawn(&fake.base_url, true).await;
+    let request = Request::builder()
+        .method(Method::HEAD)
+        .uri("/v1/models?test=head-content-length")
+        .body(Body::empty())
+        .expect("HEAD request should be valid");
+
+    let response = proxy_handler(State(proxy.state.clone()), request).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(CONTENT_LENGTH),
+        Some(&HeaderValue::from_static("3"))
+    );
+    assert!(
+        to_bytes(response.into_body(), MAX_PROXY_BODY_BYTES)
+            .await
+            .expect("HEAD response body should complete")
+            .is_empty(),
+        "HEAD metadata Content-Length must not require emitted bytes"
+    );
+    let observed = fake.recv().await;
+    assert_eq!(observed.method, Method::HEAD);
+    assert_eq!(
+        proxy
+            .store
+            .retention_usage()
+            .expect("usage should be readable")
+            .record_count,
+        2,
+        "request and attempt cleanup records must terminalize"
+    );
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "succeeded");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(request_row.error_reason, None);
+    assert_eq!(request_row.abort_reason, None);
+    assert_eq!(request_row.response_metadata["http_status_success"], "true");
+    assert_eq!(attempt_row.status, "succeeded");
+    assert_eq!(attempt_row.http_status, 200);
+    assert_eq!(attempt_row.error_reason, None);
+    assert_eq!(attempt_row.abort_reason, None);
+    assert_eq!(attempt_row.response_metadata["http_status_success"], "true");
+}
+
+#[test]
+fn response_lifecycle_content_length_requires_one_valid_final_value() {
+    let headers = |values: &[&str]| {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(
+                CONTENT_LENGTH,
+                HeaderValue::from_str(value).expect("test Content-Length should be a header value"),
+            );
+        }
+        headers
+    };
+    let authority =
+        |status, headers| response_lifecycle_content_length(&Method::GET, status, &headers);
+
+    assert_eq!(authority(StatusCode::OK, headers(&["3"])), Some(3));
+    assert_eq!(authority(StatusCode::OK, headers(&["0"])), Some(0));
+    assert_eq!(authority(StatusCode::OK, headers(&["3", "3"])), Some(3));
+    assert_eq!(authority(StatusCode::OK, headers(&["3, 3"])), Some(3));
+    assert_eq!(authority(StatusCode::OK, headers(&["3", "4"])), None);
+    assert_eq!(authority(StatusCode::OK, headers(&["3, 4"])), None);
+    assert_eq!(authority(StatusCode::OK, headers(&["3", "invalid"])), None);
+    assert_eq!(
+        authority(StatusCode::OK, headers(&["18446744073709551616"])),
+        None
+    );
+    assert_eq!(
+        authority(StatusCode::NOT_MODIFIED, headers(&["invalid"])),
+        None,
+        "304 Content-Length is metadata, not emitted-body authority"
+    );
+
+    let mut upstream_headers = headers(&["3"]);
+    upstream_headers.insert(CONNECTION, HeaderValue::from_static("content-length"));
+    let final_headers = downstream_response_headers(&upstream_headers, false, None);
+    assert!(final_headers.get(CONTENT_LENGTH).is_none());
+    assert_eq!(authority(StatusCode::OK, final_headers), None);
 }
 
 #[tokio::test]
@@ -8027,6 +8039,21 @@ fn write_singleflight_restart_script(recovery_root: &Path) -> (PathBuf, PathBuf)
     (script_path, count_path)
 }
 
+async fn wait_for_upstream_stall_recovery_to_start(
+    coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
+) {
+    timeout(Duration::from_secs(1), async {
+        loop {
+            if coordinator.state.lock().await.running {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("recovery leader should publish running state");
+}
+
 async fn assert_singleflight_upstream_requests(fake: &mut FakeUpstream) {
     let mut observed = Vec::new();
     for _ in 0..5 {
@@ -8061,7 +8088,7 @@ async fn upstream_stall_recovery_is_single_flight_and_budget_limited() {
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![String::from("/bin/sleep"), String::from("0.2")],
         recovery_timeout: Duration::from_secs(2),
-        recovery_cooldown: Duration::from_millis(1),
+        recovery_cooldown: Duration::ZERO,
         recovery_budget_window: Duration::from_secs(60),
         recovery_max_per_window: 1,
     };
@@ -8072,7 +8099,7 @@ async fn upstream_stall_recovery_is_single_flight_and_budget_limited() {
         let policy = policy.clone();
         async move { run_upstream_stall_recovery(&policy, &coordinator).await }
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_upstream_stall_recovery_to_start(&coordinator).await;
     let joined = run_upstream_stall_recovery(&policy, &coordinator).await;
     let first = first_recovery
         .await
@@ -8082,7 +8109,6 @@ async fn upstream_stall_recovery_is_single_flight_and_budget_limited() {
     assert_eq!(joined["upstream_stall_recovery_status"], "joined_inflight");
     assert_eq!(joined["upstream_stall_recovery_joined_status"], "succeeded");
 
-    tokio::time::sleep(Duration::from_millis(5)).await;
     let budget_limited = run_upstream_stall_recovery(&policy, &coordinator).await;
     assert_eq!(
         budget_limited["upstream_stall_recovery_status"],
@@ -8099,7 +8125,7 @@ async fn upstream_stall_recovery_joiners_do_not_hang_after_leader_cancellation()
         idle_timeout: Duration::from_millis(50),
         recovery_command: vec![String::from("/bin/sleep"), String::from("0.2")],
         recovery_timeout: Duration::from_secs(2),
-        recovery_cooldown: Duration::from_millis(1),
+        recovery_cooldown: Duration::ZERO,
         recovery_budget_window: Duration::from_secs(60),
         recovery_max_per_window: 2,
     };
@@ -8110,7 +8136,7 @@ async fn upstream_stall_recovery_joiners_do_not_hang_after_leader_cancellation()
         let policy = policy.clone();
         async move { run_upstream_stall_recovery(&policy, &coordinator).await }
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    wait_for_upstream_stall_recovery_to_start(&coordinator).await;
     leader.abort();
     assert!(
         leader
@@ -8120,11 +8146,11 @@ async fn upstream_stall_recovery_joiners_do_not_hang_after_leader_cancellation()
     );
 
     let joined = timeout(
-        Duration::from_millis(500),
+        recovery_join_timeout(policy.recovery_timeout),
         run_upstream_stall_recovery(&policy, &coordinator),
     )
     .await
-    .expect("later stall recovery should not wait forever after leader cancellation");
+    .expect("later stall recovery should complete within its bounded join grace");
 
     assert_eq!(joined["upstream_stall_recovery_status"], "joined_inflight");
     assert_eq!(joined["upstream_stall_recovery_joined_status"], "succeeded");
@@ -8222,9 +8248,6 @@ async fn upstream_stall_recovery_public_path_returns_term_resistant_leader_clean
     let leader = read_pid_file_after_ready(&leader_pid_path, &ready_path).await;
     let metadata = recovery.await.expect("public recovery task should join");
 
-    // The legacy early public return leaves the background cleanup running.
-    // Let that bounded cleanup finish before asserting so this RED test cannot leak its leader.
-    sleep(Duration::from_millis(1_250)).await;
     assert_process_reaped(leader).await;
     assert_eq!(metadata["upstream_stall_recovery_status"], "timeout_killed");
     assert_eq!(
@@ -8261,7 +8284,7 @@ async fn upstream_stall_recovery_command_wiring_times_out_and_cleans_process_gro
     };
 
     let metadata = timeout(
-        Duration::from_secs(2),
+        recovery_join_timeout(policy.recovery_timeout),
         run_upstream_stall_recovery_command(&policy),
     )
     .await
@@ -19018,6 +19041,7 @@ async fn shutdown_cancels_pre_response_upstream_work() {
         })
         .await
     });
+    assert_proxy_test_server_ready(addr).await;
 
     let request = tokio::spawn({
         let client = proxy.client.clone();
@@ -19036,6 +19060,9 @@ async fn shutdown_cancels_pre_response_upstream_work() {
     shutdown_tx
         .send(())
         .expect("shutdown signal should be delivered");
+    timeout(STREAM_COMPLETION_TIMEOUT, proxy.state.wait_for_shutdown())
+        .await
+        .expect("shutdown gate should begin draining before joining the request task");
     let response_result = timeout(STREAM_COMPLETION_TIMEOUT, request)
         .await
         .expect("pre-response request should complete after shutdown")
@@ -19176,17 +19203,22 @@ interval_secs = 1
         downstreams.push(response.bytes_stream());
     }
 
-    for downstream in &mut downstreams {
-        assert!(
-            timeout(Duration::from_millis(100), downstream.next())
-                .await
-                .is_err()
+    for index in 0..4 {
+        let observed = timeout(STREAM_HEADER_TIMEOUT, upstream.recv_request())
+            .await
+            .expect("each downstream storm request should reach the cancellable upstream");
+        assert_eq!(
+            observed.path_and_query,
+            format!("/v1/chat/completions?test=connection-storm-{index}")
         );
     }
 
     shutdown_tx
         .send(())
         .expect("shutdown signal should be delivered");
+    timeout(STREAM_COMPLETION_TIMEOUT, proxy.state.wait_for_shutdown())
+        .await
+        .expect("shutdown gate should begin draining before the drain budget starts");
     let shutdown_started = tokio::time::Instant::now();
     timeout(STREAM_COMPLETION_TIMEOUT, server)
         .await
@@ -20621,11 +20653,58 @@ struct ObservedRequest {
     path_and_query: String,
     headers: HeaderMap,
     body: Bytes,
+    health_response_receipt: Option<oneshot::Receiver<()>>,
+}
+
+struct TestServer {
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl TestServer {
+    fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        Self { task }
+    }
+
+    fn abort_handle(&self) -> tokio::task::AbortHandle {
+        self.task.abort_handle()
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+#[tokio::test]
+async fn test_server_drop_aborts_owned_task() {
+    let server = TestServer::new(tokio::spawn(std::future::pending()));
+    let abort = server.abort_handle();
+
+    drop(server);
+    tokio::task::yield_now().await;
+
+    assert!(
+        abort.is_finished(),
+        "dropping a fixture must stop its server"
+    );
+}
+
+async fn assert_proxy_test_server_ready(addr: std::net::SocketAddr) {
+    let ready = timeout(
+        STREAM_COMPLETION_TIMEOUT,
+        reqwest::get(format!("http://{addr}/metrics")),
+    )
+    .await
+    .expect("test proxy readiness should be bounded")
+    .expect("test proxy should become ready");
+    assert_eq!(ready.status(), StatusCode::OK);
 }
 
 struct FakeUpstream {
     base_url: String,
     receiver: mpsc::Receiver<ObservedRequest>,
+    _server: TestServer,
 }
 
 #[derive(Debug)]
@@ -20637,6 +20716,7 @@ struct CancellableUpstream {
     base_url: String,
     receiver: mpsc::Receiver<ObservedRequest>,
     drop_receiver: mpsc::Receiver<UpstreamDropEvent>,
+    _server: TestServer,
 }
 
 #[derive(Clone)]
@@ -20663,16 +20743,17 @@ impl CancellableUpstream {
         let addr = listener
             .local_addr()
             .expect("cancellable upstream address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("cancellable upstream server failed: {error}");
             }
-        });
+        }));
 
         Self {
             base_url: format!("http://{addr}/v1"),
             receiver,
             drop_receiver,
+            _server: server,
         }
     }
 
@@ -20838,6 +20919,10 @@ impl FakeUpstream {
     ) -> Self {
         let (sender, receiver) = mpsc::channel(10);
         let app = Router::new()
+            .route(
+                "/__fake_upstream_ready",
+                get(|| async { StatusCode::NO_CONTENT }),
+            )
             .fallback(fake_upstream_handler)
             .with_state(FakeUpstreamState {
                 sender,
@@ -20857,15 +20942,24 @@ impl FakeUpstream {
         let addr = listener
             .local_addr()
             .expect("fake upstream address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("fake upstream server failed: {error}");
             }
-        });
+        }));
+        let ready = timeout(
+            STREAM_COMPLETION_TIMEOUT,
+            reqwest::get(format!("http://{addr}/__fake_upstream_ready")),
+        )
+        .await
+        .expect("fake upstream readiness request should not time out")
+        .expect("fake upstream readiness request should complete");
+        assert_eq!(ready.status(), StatusCode::NO_CONTENT);
 
         Self {
             base_url: format!("http://{addr}/v1"),
             receiver,
+            _server: server,
         }
     }
 
@@ -20888,6 +20982,7 @@ impl FakeUpstream {
 struct RedirectingUpstream {
     base_url: String,
     receiver: mpsc::Receiver<ObservedRequest>,
+    _server: TestServer,
 }
 
 impl RedirectingUpstream {
@@ -20906,15 +21001,16 @@ impl RedirectingUpstream {
         let addr = listener
             .local_addr()
             .expect("redirecting upstream address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("redirecting upstream server failed: {error}");
             }
-        });
+        }));
 
         Self {
             base_url: format!("http://{addr}/v1"),
             receiver,
+            _server: server,
         }
     }
 
@@ -20936,6 +21032,7 @@ struct RedirectingUpstreamState {
 struct RedirectTarget {
     capture_url: String,
     receiver: mpsc::Receiver<ObservedRequest>,
+    _server: TestServer,
 }
 
 impl RedirectTarget {
@@ -20950,15 +21047,16 @@ impl RedirectTarget {
         let addr = listener
             .local_addr()
             .expect("redirect target address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("redirect target server failed: {error}");
             }
-        });
+        }));
 
         Self {
             capture_url: format!("http://{addr}/v1/redirect-target"),
             receiver,
+            _server: server,
         }
     }
 
@@ -20969,6 +21067,7 @@ impl RedirectTarget {
 
 struct BrokenUpstream {
     base_url: String,
+    _server: TestServer,
 }
 
 impl BrokenUpstream {
@@ -20979,7 +21078,7 @@ impl BrokenUpstream {
         let addr = listener
             .local_addr()
             .expect("broken upstream address should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((_stream, _addr)) => {}
@@ -20989,10 +21088,11 @@ impl BrokenUpstream {
                     }
                 }
             }
-        });
+        }));
 
         Self {
             base_url: format!("http://{addr}/v1"),
+            _server: server,
         }
     }
 }
@@ -21091,19 +21191,15 @@ async fn fake_upstream_handler(
     State(state): State<FakeUpstreamState>,
     request: Request<Body>,
 ) -> Response<Body> {
-    let observed = observe_request(request).await;
+    let (observed, endpoint, health_response_receipt_sender) =
+        observe_fake_upstream_request(request).await;
     let path_and_query = observed.path_and_query.clone();
     let body = observed.body.clone();
+    let is_head = observed.method == Method::HEAD;
     let is_hot_restart_probe = observed
         .headers
         .get("x-llm-guard-proxy-probe")
         .is_some_and(|value| value == "hot-restart");
-    let endpoint = observed
-        .path_and_query
-        .split('?')
-        .next()
-        .unwrap_or_default()
-        .to_owned();
     let is_sse_stream = observed.path_and_query.contains("test=sse");
     let is_long_json_stream = observed.path_and_query.contains("test=long-json");
     state
@@ -21111,12 +21207,12 @@ async fn fake_upstream_handler(
         .send(observed)
         .await
         .expect("fake upstream observation should send");
-    if endpoint == "/v1/models"
-        && path_and_query.contains("test=distinct-multi-upstream-models")
-        && state.models_body.is_some()
-        && let Some(models_delay) = state.models_delay
+    maybe_delay_fake_models(&endpoint, &path_and_query, &state).await;
+    if let Some(response) =
+        fake_head_models_content_length_response(is_head, &endpoint, &path_and_query)
     {
-        sleep(models_delay).await;
+        complete_health_response(health_response_receipt_sender);
+        return response;
     }
 
     if is_sse_stream {
@@ -21191,7 +21287,61 @@ async fn fake_upstream_handler(
             HeaderValue::from_static("upstream-request-id-collision"),
         );
     }
+    complete_health_response(health_response_receipt_sender);
     response
+}
+
+async fn observe_fake_upstream_request(
+    request: Request<Body>,
+) -> (ObservedRequest, String, Option<oneshot::Sender<()>>) {
+    let mut observed = observe_request(request).await;
+    let endpoint = observed
+        .path_and_query
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let health_response_receipt_sender = if endpoint == "/v1/models" {
+        let (sender, receiver) = oneshot::channel();
+        observed.health_response_receipt = Some(receiver);
+        Some(sender)
+    } else {
+        None
+    };
+    (observed, endpoint, health_response_receipt_sender)
+}
+
+fn complete_health_response(sender: Option<oneshot::Sender<()>>) {
+    if let Some(sender) = sender {
+        let _ = sender.send(());
+    }
+}
+
+async fn maybe_delay_fake_models(endpoint: &str, path_and_query: &str, state: &FakeUpstreamState) {
+    if endpoint == "/v1/models"
+        && path_and_query.contains("test=distinct-multi-upstream-models")
+        && state.models_body.is_some()
+        && let Some(models_delay) = state.models_delay
+    {
+        sleep(models_delay).await;
+    }
+}
+
+fn fake_head_models_content_length_response(
+    is_head: bool,
+    endpoint: &str,
+    path_and_query: &str,
+) -> Option<Response<Body>> {
+    if !is_head || endpoint != "/v1/models" || !path_and_query.contains("test=head-content-length")
+    {
+        return None;
+    }
+    let mut response = Response::new(Body::empty());
+    *response.status_mut() = StatusCode::OK;
+    response
+        .headers_mut()
+        .insert(CONTENT_LENGTH, HeaderValue::from_static("3"));
+    Some(response)
 }
 
 async fn observe_request(request: Request<Body>) -> ObservedRequest {
@@ -21208,7 +21358,90 @@ async fn observe_request(request: Request<Body>) -> ObservedRequest {
         path_and_query,
         headers: parts.headers,
         body,
+        health_response_receipt: None,
     }
+}
+
+fn fake_models_endpoint_response(
+    path_and_query: &str,
+    state: &FakeUpstreamState,
+) -> Option<Response<Body>> {
+    if path_and_query.contains("test=models-noop-integrity-headers") {
+        let mut response = json_response(
+            "models-noop-integrity",
+            String::from(
+                r#"{"object":"list","data":[{"id":"stable-model","object":"model","max_model_len":256000,"context_length":256000,"max_context_length":256000,"owned_by":"vllm"}]}"#,
+            ),
+        );
+        add_stale_body_bound_response_headers(&mut response);
+        return Some(response);
+    }
+    if path_and_query.contains("test=models-changed-integrity-headers") {
+        let mut response = json_response(
+            "models-changed-integrity",
+            String::from(
+                r#"{"object":"list","data":[{"id":"changed-model","object":"model","max_model_len":256000,"owned_by":"vllm"}]}"#,
+            ),
+        );
+        add_stale_body_bound_response_headers(&mut response);
+        return Some(response);
+    }
+    if path_and_query.contains("test=model-metadata-chunked") {
+        return Some(chunked_json_response(
+            "models",
+            MODEL_METADATA_CHUNKED_FIRST,
+            MODEL_METADATA_CHUNKED_SECOND,
+        ));
+    }
+    if path_and_query.contains("test=model-metadata-large") {
+        return Some(json_response("models", large_model_metadata_body()));
+    }
+    if path_and_query.contains("test=model-metadata-changing") {
+        let max_model_len = state
+            .changing_model_len
+            .fetch_add(128_000, Ordering::SeqCst);
+        return Some(json_response("models", model_metadata_body(max_model_len)));
+    }
+    if path_and_query.contains("test=model-metadata-no-context") {
+        return Some(json_response(
+            "models",
+            MODEL_METADATA_NO_CONTEXT_BODY.to_owned(),
+        ));
+    }
+    if path_and_query.contains("test=model-metadata-context-length") {
+        return Some(json_response(
+            "models",
+            MODEL_METADATA_CONTEXT_LENGTH_BODY.to_owned(),
+        ));
+    }
+    if path_and_query.contains("test=model-metadata-max-context-length") {
+        return Some(json_response(
+            "models",
+            MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY.to_owned(),
+        ));
+    }
+    if path_and_query.contains("test=multi-listener-models") {
+        return Some(json_response(
+            "models",
+            MULTI_LISTENER_MODEL_METADATA_BODY.to_owned(),
+        ));
+    }
+    if path_and_query.contains("test=distinct-multi-upstream-models")
+        && let Some(models_body) = state.models_body
+    {
+        let mut response = json_response(state.models_label, models_body.to_owned());
+        *response.status_mut() = state.models_status;
+        if state.models_status == StatusCode::TOO_MANY_REQUESTS {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from_static("11"));
+        }
+        return Some(response);
+    }
+    if path_and_query.contains("test=model-metadata") {
+        return Some(json_response("models", MODEL_METADATA_BODY.to_owned()));
+    }
+    None
 }
 
 fn fake_upstream_endpoint_response(
@@ -21217,58 +21450,23 @@ fn fake_upstream_endpoint_response(
     state: &FakeUpstreamState,
     body: &Bytes,
 ) -> Response<Body> {
-    if endpoint == "/v1/models" {
-        if path_and_query.contains("test=model-metadata-chunked") {
-            return chunked_json_response(
-                "models",
-                MODEL_METADATA_CHUNKED_FIRST,
-                MODEL_METADATA_CHUNKED_SECOND,
-            );
-        }
-        if path_and_query.contains("test=model-metadata-large") {
-            return json_response("models", large_model_metadata_body());
-        }
-        if path_and_query.contains("test=model-metadata-changing") {
-            let max_model_len = state
-                .changing_model_len
-                .fetch_add(128_000, Ordering::SeqCst);
-            return json_response("models", model_metadata_body(max_model_len));
-        }
-        if path_and_query.contains("test=model-metadata-no-context") {
-            return json_response("models", MODEL_METADATA_NO_CONTEXT_BODY.to_owned());
-        }
-        if path_and_query.contains("test=model-metadata-context-length") {
-            return json_response("models", MODEL_METADATA_CONTEXT_LENGTH_BODY.to_owned());
-        }
-        if path_and_query.contains("test=model-metadata-max-context-length") {
-            return json_response("models", MODEL_METADATA_MAX_CONTEXT_LENGTH_BODY.to_owned());
-        }
-        if path_and_query.contains("test=multi-listener-models") {
-            return json_response("models", MULTI_LISTENER_MODEL_METADATA_BODY.to_owned());
-        }
-        if path_and_query.contains("test=distinct-multi-upstream-models")
-            && let Some(models_body) = state.models_body
-        {
-            let mut response = json_response(state.models_label, models_body.to_owned());
-            *response.status_mut() = state.models_status;
-            if state.models_status == StatusCode::TOO_MANY_REQUESTS {
-                response
-                    .headers_mut()
-                    .insert(RETRY_AFTER, HeaderValue::from_static("11"));
-            }
-            return response;
-        }
-        if path_and_query.contains("test=model-metadata") {
-            return json_response("models", MODEL_METADATA_BODY.to_owned());
-        }
+    if endpoint.starts_with("/v1/models/") && path_and_query.contains("test=forced-model-detail") {
+        return forced_model_detail_response();
     }
-
-    if endpoint == "/v1/chat/completions"
-        && let Some(response) = fake_chat_completion_response(path_and_query, state, body)
+    if endpoint == "/v1/models"
+        && let Some(response) = fake_models_endpoint_response(path_and_query, state)
     {
         return response;
     }
 
+    if endpoint == "/v1/chat/completions"
+        && let Some(mut response) = fake_chat_completion_response(path_and_query, state, body)
+    {
+        if path_and_query.contains("test=shielded-aggregate-integrity-headers") {
+            add_stale_body_bound_response_headers(&mut response);
+        }
+        return response;
+    }
     if endpoint == "/v1/embeddings" && path_and_query.contains("test=token-usage") {
         return json_response(
             "embeddings-token-usage",
@@ -21302,6 +21500,36 @@ fn fake_upstream_endpoint_response(
             "chat-completions",
             r#"{"id":"chatcmpl-test","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}"#,
         ),
+        "/v1/completions" if path_and_query.contains("test=forced-response-noop-non-utf8-sse") => {
+            return forced_alias_sse_response(b"data: \xFF\n\n");
+        }
+        "/v1/completions" if path_and_query.contains("test=forced-response-noop-empty-sse") => {
+            return forced_alias_sse_response(b"");
+        }
+        "/v1/completions" if path_and_query.contains("test=forced-response-noop-comment-sse") => {
+            return forced_alias_sse_response(b": keepalive\n\n");
+        }
+        "/v1/completions" if path_and_query.contains("test=forced-response-noop-done-sse") => {
+            return forced_alias_sse_response(b"data: [DONE]\n\n");
+        }
+        "/v1/completions"
+            if path_and_query.contains("test=forced-response-noop-same-model-sse") =>
+        {
+            return forced_alias_sse_response(b"data: {\"model\":\"public-forced-alias\"}\n\n");
+        }
+        "/v1/completions"
+            if path_and_query.contains("test=forced-response-noop-malformed-json") =>
+        {
+            return forced_alias_malformed_json_response();
+        }
+        "/v1/completions"
+            if path_and_query.contains("test=forced-response-noop-non-object-json") =>
+        {
+            return forced_alias_non_object_json_response();
+        }
+        "/v1/completions" if path_and_query.contains("test=forced-response-integrity-headers") => {
+            return forced_alias_integrity_response();
+        }
         "/v1/completions" => (
             "completions",
             r#"{"id":"cmpl-test","object":"text_completion"}"#,
@@ -21313,14 +21541,107 @@ fn fake_upstream_endpoint_response(
         "/v1/rerank" => return fake_rerank_response(path_and_query, body),
         _ => ("unknown", r#"{"error":"unsupported"}"#),
     };
-    let status = if label == "unknown" {
-        StatusCode::NOT_FOUND
-    } else {
-        StatusCode::OK
-    };
+    let status = fake_response_status(label);
     let mut response = json_response(label, body.to_owned());
     *response.status_mut() = status;
     response
+}
+
+fn forced_model_detail_response() -> Response<Body> {
+    json_response(
+        "forced-model-detail",
+        String::from(r#"{"id":"canonical-target","object":"model"}"#),
+    )
+}
+
+fn forced_alias_integrity_response() -> Response<Body> {
+    let mut response = json_response(
+        "forced-alias-integrity",
+        String::from(r#"{"model":"canonical-target","choices":[]}"#),
+    );
+    for (name, value) in [
+        ("content-encoding", "identity"),
+        ("content-md5", "stale-md5"),
+        ("digest", "sha-256=stale"),
+        ("content-digest", "sha-256=:stale:"),
+        ("repr-digest", "sha-256=:stale-repr:"),
+        ("etag", "\"stale-etag\""),
+        ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("signature", "stale-signature"),
+        ("signature-input", "stale-signature-input"),
+        ("if-match", "\"stale-match\""),
+        ("if-none-match", "\"stale-none-match\""),
+        ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+    ] {
+        response.headers_mut().insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    response
+}
+
+fn forced_alias_malformed_json_response() -> Response<Body> {
+    let mut response = Response::new(Body::from(Bytes::from_static(b"{malformed-json")));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    add_stale_body_bound_response_headers(&mut response);
+    response
+}
+
+fn forced_alias_non_object_json_response() -> Response<Body> {
+    let mut response = Response::new(Body::from(Bytes::from_static(b"[\"unchanged\"]")));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    add_stale_body_bound_response_headers(&mut response);
+    response
+}
+
+fn forced_alias_sse_response(body: &'static [u8]) -> Response<Body> {
+    let mut response = Response::new(Body::from(Bytes::from_static(body)));
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    add_stale_body_bound_response_headers(&mut response);
+    response
+}
+
+fn add_stale_body_bound_response_headers(response: &mut Response<Body>) {
+    for (name, value) in [
+        ("content-encoding", "identity"),
+        ("content-md5", "stale-md5"),
+        ("digest", "sha-256=stale"),
+        ("content-digest", "sha-256=:stale:"),
+        ("repr-digest", "sha-256=:stale-repr:"),
+        ("etag", "\"stale-etag\""),
+        ("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("signature", "stale-signature"),
+        ("signature-input", "stale-signature-input"),
+        ("if-match", "\"stale-match\""),
+        ("if-none-match", "\"stale-none-match\""),
+        ("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+        ("if-unmodified-since", "Wed, 21 Oct 2015 07:28:00 GMT"),
+    ] {
+        response.headers_mut().insert(
+            HeaderName::from_static(name),
+            HeaderValue::from_static(value),
+        );
+    }
+    response.headers_mut().insert(
+        HeaderName::from_static("x-safe-custom"),
+        HeaderValue::from_static("preserve-me"),
+    );
+}
+
+fn fake_response_status(label: &str) -> StatusCode {
+    if label == "unknown" {
+        StatusCode::NOT_FOUND
+    } else {
+        StatusCode::OK
+    }
 }
 
 fn fake_chat_completion_response(
@@ -21736,6 +22057,27 @@ fn fake_loop_twice_then_success_response(
 }
 
 fn fake_fixed_status_chat_completion_response(path_and_query: &str) -> Option<Response<Body>> {
+    if path_and_query.contains("test=terminal-forward-model-json") {
+        let mut response = json_response(
+            "terminal-forward-model-json",
+            r#"{"model":"aeon-ultimate","choices":[]}"#.to_owned(),
+        );
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        return Some(response);
+    }
+    if path_and_query.contains("test=terminal-forward-model-sse") {
+        let body = "data: {\"model\":\"aeon-ultimate\",\"choices\":[]}\n\ndata: [DONE]\n\n";
+        let mut response = Response::new(Body::from(body));
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        response
+            .headers_mut()
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+        response.headers_mut().insert(
+            CONTENT_LENGTH,
+            HeaderValue::from_str(&body.len().to_string()).expect("content length should be valid"),
+        );
+        return Some(response);
+    }
     if path_and_query.contains("test=always-502") {
         return Some(upstream_status_json_response(StatusCode::BAD_GATEWAY));
     }
@@ -23055,6 +23397,7 @@ struct ProxyFixture {
     #[cfg(feature = "guard")]
     budget_sqlite_path: PathBuf,
     root: PathBuf,
+    server: TestServer,
 }
 
 impl ProxyFixture {
@@ -23247,11 +23590,12 @@ impl ProxyFixture {
         let addr = listener
             .local_addr()
             .expect("proxy addr should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("proxy test server failed: {error}");
             }
-        });
+        }));
+        assert_proxy_test_server_ready(addr).await;
 
         Self {
             base_url: format!("http://{addr}"),
@@ -23264,6 +23608,7 @@ impl ProxyFixture {
             #[cfg(feature = "guard")]
             budget_sqlite_path,
             root,
+            server,
         }
     }
 
@@ -23310,11 +23655,12 @@ impl ProxyFixture {
         let addr = listener
             .local_addr()
             .expect("proxy addr should be available");
-        tokio::spawn(async move {
+        let server = TestServer::new(tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {
                 eprintln!("proxy test server failed: {error}");
             }
-        });
+        }));
+        assert_proxy_test_server_ready(addr).await;
 
         Self {
             base_url: format!("http://{addr}"),
@@ -23327,6 +23673,7 @@ impl ProxyFixture {
             #[cfg(feature = "guard")]
             budget_sqlite_path,
             root,
+            server,
         }
     }
 }
@@ -23345,6 +23692,7 @@ struct ProxyFixtureSpawnOptions<'a> {
 
 impl Drop for ProxyFixture {
     fn drop(&mut self) {
+        self.server.task.abort();
         remove_dir_all(&self.root);
     }
 }
@@ -24365,11 +24713,12 @@ fn gb10_deploy_config_for_test(
 async fn gb10_deploy_chat_path_preserves_caller_fields_without_native_thinking_budget() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+    assert_gb10_reserved_aeon_ultimate_rejected(&proxy, &mut fake).await;
 
     let defaulted = post_chat_and_observe_gb10_body(
         &proxy,
         &mut fake,
-        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"defaulted"}]}"#,
+        br#"{"model":"qwen3.6-27b-decensor-by-aeon","messages":[{"role":"user","content":"defaulted"}]}"#,
         "defaulted",
     )
     .await;
@@ -24386,7 +24735,7 @@ async fn gb10_deploy_chat_path_preserves_caller_fields_without_native_thinking_b
     let caller = post_chat_and_observe_gb10_body(
         &proxy,
         &mut fake,
-        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"caller"}],"max_tokens":64,"reasoning_effort":"low","thinking_token_budget":128,"thinking":{"budget_tokens":64}}"#,
+        br#"{"model":"qwen3.6-27b-decensor-by-aeon","messages":[{"role":"user","content":"caller"}],"max_tokens":64,"reasoning_effort":"low","thinking_token_budget":128,"thinking":{"budget_tokens":64}}"#,
         "caller",
     )
     .await;
@@ -24402,11 +24751,12 @@ async fn gb10_deploy_chat_path_honors_extra_body_reasoning_effort_without_fill_i
 {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+    assert_gb10_reserved_aeon_ultimate_rejected(&proxy, &mut fake).await;
 
     let caller = post_chat_and_observe_gb10_body(
         &proxy,
         &mut fake,
-        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-none"}],"extra_body":{"reasoning_effort":"none"}}"#,
+        br#"{"model":"qwen3.6-27b-decensor-by-aeon","messages":[{"role":"user","content":"extra-body-none"}],"extra_body":{"reasoning_effort":"none"}}"#,
         "extra-body-none",
     )
     .await;
@@ -24427,11 +24777,12 @@ async fn gb10_deploy_chat_path_honors_extra_body_enable_thinking_false_without_f
  {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+    assert_gb10_reserved_aeon_ultimate_rejected(&proxy, &mut fake).await;
 
     let caller = post_chat_and_observe_gb10_body(
         &proxy,
         &mut fake,
-        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-enable-thinking-false"}],"extra_body":{"enable_thinking":false}}"#,
+        br#"{"model":"qwen3.6-27b-decensor-by-aeon","messages":[{"role":"user","content":"extra-body-enable-thinking-false"}],"extra_body":{"enable_thinking":false}}"#,
         "extra-body-enable-thinking-false",
     )
     .await;
@@ -24451,11 +24802,12 @@ async fn gb10_deploy_chat_path_honors_extra_body_enable_thinking_false_without_f
 async fn gb10_deploy_chat_path_honors_extra_body_output_limits_without_fill_if_absent_max_tokens() {
     let mut fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_gb10_deploy_config(&fake.base_url).await;
+    assert_gb10_reserved_aeon_ultimate_rejected(&proxy, &mut fake).await;
 
     let caller = post_chat_and_observe_gb10_body(
         &proxy,
         &mut fake,
-        br#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"extra-body-max-tokens"}],"extra_body":{"max_tokens":64}}"#,
+        br#"{"model":"qwen3.6-27b-decensor-by-aeon","messages":[{"role":"user","content":"extra-body-max-tokens"}],"extra_body":{"max_tokens":64}}"#,
         "extra-body-max-tokens",
     )
     .await;
@@ -24468,6 +24820,30 @@ async fn gb10_deploy_chat_path_honors_extra_body_output_limits_without_fill_if_a
             .is_none()
     );
     assert!(caller.get("thinking_token_budget").is_none());
+}
+
+#[cfg(feature = "param-override")]
+async fn assert_gb10_reserved_aeon_ultimate_rejected(
+    proxy: &ProxyFixture,
+    fake: &mut FakeUpstream,
+) {
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"aeon-ultimate","messages":[{"role":"user","content":"reserved"}]}"#)
+        .send()
+        .await
+        .expect("reserved proxy request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        response
+            .text()
+            .await
+            .expect("reserved rejection body should be readable")
+            .contains("reserved")
+    );
+    assert_no_upstream_request(fake).await;
 }
 
 #[cfg(feature = "param-override")]

@@ -61,6 +61,9 @@ pub(super) fn fake_deepinfra_score_response(path_and_query: &str) -> Response<Bo
 }
 
 pub(super) fn fake_rerank_response(path_and_query: &str, body: &Bytes) -> Response<Body> {
+    if let Some(response) = forced_alias_error_response(path_and_query) {
+        return response;
+    }
     if body_contains_text(body, "malformed-openai-failover") {
         return json_response(
             "rerank-malformed",
@@ -154,4 +157,39 @@ pub(super) fn fake_rerank_response(path_and_query: &str, body: &Bytes) -> Respon
         );
     }
     response
+}
+
+fn forced_alias_error_response(path_and_query: &str) -> Option<Response<Body>> {
+    if path_and_query.contains("test=heterogeneous-forced-json-error") {
+        let mut response = json_response(
+            "heterogeneous-forced-json-error",
+            r#"{"error":{"message":"bad rerank request"},"model":"aeon-ultimate"}"#.to_owned(),
+        );
+        *response.status_mut() = StatusCode::BAD_REQUEST;
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, HeaderValue::from_static("13"));
+        response.headers_mut().insert(
+            HeaderName::from_static("server"),
+            HeaderValue::from_static("private-rerank"),
+        );
+        response.headers_mut().insert(
+            HeaderName::from_static("x-upstream-only"),
+            HeaderValue::from_static("must-not-leak"),
+        );
+        return Some(response);
+    }
+    let (body, content_type) = if path_and_query.contains("test=heterogeneous-forced-plain-error") {
+        ("not JSON", "text/plain")
+    } else if path_and_query.contains("test=heterogeneous-forced-malformed-error") {
+        ("{\"model\":", "application/json")
+    } else {
+        return None;
+    };
+    let mut response = Response::new(Body::from(body));
+    *response.status_mut() = StatusCode::BAD_REQUEST;
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    Some(response)
 }

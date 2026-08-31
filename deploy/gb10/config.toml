@@ -99,6 +99,10 @@ base_url = "http://100.105.4.92:18010/v1"
 # Total request timeout including streaming (30 min).
 request_timeout_ms = 1800000
 
+# Internal upstream identities are never accepted at ingress or exposed by
+# model discovery; the three public aliases below remain client-visible.
+reserved_ingress_model_ids = ["abliterated-qwen-latest-27b-nvfp4", "aeon", "aeon-ultimate"]
+
 # Translate a caller first-evict KV-priority hint. Safe default is disabled.
 # cache_priority_engine = "disabled"
 
@@ -142,7 +146,7 @@ trigger_on_request_deadline = false
 restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash-n12.service"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
-readiness_body = {"model":"aeon-ultimate","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}
+readiness_body = "{\"model\":\"aeon-ultimate\",\"messages\":[{\"role\":\"user\",\"content\":\"1+1=?\"}],\"chat_template_kwargs\":{\"enable_thinking\":false},\"max_tokens\":1}"
 readiness_request_timeout_ms = 30000
 readiness_deadline_ms = 600000
 readiness_interval_ms = 5000
@@ -175,6 +179,62 @@ refresh_interval_secs = 60                 # Re-discover every 60s
 # context_length_override = 0             # Override detected context length (0 = auto)
 # max_model_len_override = 0              # Override detected max model length
 input_token_safety_margin = 512           # Tokens reserved for response
+
+## ───────────────────────── Forced model aliases ─────────────────────────────
+## Public aliases with immutable, hot-reloadable upstream request policies.
+# Safe default: omit this whole table unless an operator needs a reviewed alias.
+# BEGIN PARSEABLE EXAMPLE: forced-model-alias-profile
+#| [[forced_model_alias_profiles]]
+#| alias = "example-public-alias"              # Public client-visible alias; safe default is no alias table.
+#| upstream_model = "example-upstream-model"   # Canonical upstream model; safe default is no rewrite.
+#| thinking_mode = "force_disable"             # Force thinking mode; safe default is caller-controlled thinking.
+#| # thinking_budget = 65536                    # Required only for force_thinking; safe default is omitted.
+#| output_cap = 16384                           # Reserve answer tokens; safe default is no forced cap.
+#| temperature = 1.0                            # Sampling temperature; safe default is caller-controlled.
+#| top_p = 0.95                                 # Nucleus sampling; safe default is caller-controlled.
+#| top_k = 20                                   # Top-k sampling; safe default is caller-controlled.
+#| min_p = 0.0                                  # Minimum probability; safe default is caller-controlled.
+#| presence_penalty = 0.0                       # Presence penalty; safe default is caller-controlled.
+#| repetition_penalty = 1.0                     # Repetition penalty; safe default is caller-controlled.
+# END PARSEABLE EXAMPLE: forced-model-alias-profile
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-none"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
+thinking_mode = "force_disable"
+output_cap = 16384
+temperature = 0.7
+top_p = 0.80
+top_k = 20
+min_p = 0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-low"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
+thinking_mode = "force_thinking"
+thinking_budget = 65536
+output_cap = 16384
+temperature = 1
+top_p = 0.95
+top_k = 20
+min_p = 0
+presence_penalty = 0
+repetition_penalty = 1
+
+[[forced_model_alias_profiles]]
+alias = "abliterated-qwen-latest-27b-medium"
+upstream_model = "abliterated-qwen-latest-27b-nvfp4"
+thinking_mode = "force_thinking"
+thinking_budget = 65536
+output_cap = 16384
+temperature = 1
+top_p = 0.95
+top_k = 20
+min_p = 0
+presence_penalty = 0
+repetition_penalty = 1
 
 ## ───────────────────────── Upstream topology (multi-upstream) ───────────────
 ## Profiles are ordered routes. The first matching model wins; [upstream]
@@ -210,7 +270,7 @@ trigger_on_request_deadline = false
 restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash-n12.service"]
 restart_timeout_ms = 300000
 readiness_endpoint = "/v1/chat/completions"
-readiness_body = {"model":"aeon-ultimate","messages":[{"role":"user","content":"1+1=?"}],"chat_template_kwargs":{"enable_thinking":false},"max_tokens":1}
+readiness_body = "{\"model\":\"aeon-ultimate\",\"messages\":[{\"role\":\"user\",\"content\":\"1+1=?\"}],\"chat_template_kwargs\":{\"enable_thinking\":false},\"max_tokens\":1}"
 readiness_request_timeout_ms = 30000
 readiness_deadline_ms = 600000
 readiness_interval_ms = 5000

@@ -46,6 +46,7 @@ enum Section {
     UpstreamProfileLocalRecovery(usize),
     UpstreamProfileStuckWatchdog(usize),
     UpstreamProfileRestartQueue(usize),
+    ForcedModelAliasProfile(usize),
     UpstreamProfileThinking(usize),
     UpstreamProfileLoopGuard(usize),
     UpstreamProfileLoopGuardEmbedding(usize),
@@ -193,6 +194,14 @@ fn parse_section(
         config.listeners.push(ListenerConfig::default());
         let index = config.listeners.len() - 1;
         return Ok(Section::Listener(index));
+    }
+    if line == "[[forced_model_alias_profiles]]" {
+        config
+            .forced_model_alias_profiles
+            .push(super::ForcedModelAliasProfileConfig::default());
+        return Ok(Section::ForcedModelAliasProfile(
+            config.forced_model_alias_profiles.len() - 1,
+        ));
     }
     #[cfg(feature = "guard")]
     if line == "[[model_aliases]]" {
@@ -456,6 +465,12 @@ fn assign_value(
         Section::Listener(index) => {
             assign_listener(&mut config.listeners[*index], key, value, line_number)
         }
+        Section::ForcedModelAliasProfile(index) => assign_forced_model_alias_profile(
+            &mut config.forced_model_alias_profiles[*index],
+            key,
+            value,
+            line_number,
+        ),
         Section::Shielding => assign_shielding(&mut config.shielding, key, value, line_number),
         Section::Observability => {
             assign_observability(&mut config.observability, key, value, line_number)
@@ -524,6 +539,79 @@ fn assign_value(
             unreachable!("upstream profile param override is handled before this match")
         }
     }
+}
+
+fn assign_forced_model_alias_profile(
+    config: &mut super::ForcedModelAliasProfileConfig,
+    key: &str,
+    value: &str,
+    line_number: usize,
+) -> Result<(), ConfigParseError> {
+    match key {
+        "alias" => config.alias = parse_string(value, line_number)?,
+        "upstream_model" => config.upstream_model = parse_string(value, line_number)?,
+        "thinking_mode" => {
+            config.thinking_mode = Some(parse_thinking_mode(value, line_number)?);
+        }
+        "thinking_budget" => {
+            config.thinking_budget = Some(parse_u32(
+                value,
+                line_number,
+                "forced_model_alias_profiles.thinking_budget",
+            )?);
+        }
+        "output_cap" => {
+            config.output_cap = Some(parse_u32(
+                value,
+                line_number,
+                "forced_model_alias_profiles.output_cap",
+            )?);
+        }
+        "temperature" => {
+            config.temperature = Some(parse_f64(
+                value,
+                line_number,
+                "forced_model_alias_profiles.temperature",
+            )?);
+        }
+        "top_p" => {
+            config.top_p = Some(parse_f64(
+                value,
+                line_number,
+                "forced_model_alias_profiles.top_p",
+            )?);
+        }
+        "top_k" => {
+            config.top_k = Some(parse_u32(
+                value,
+                line_number,
+                "forced_model_alias_profiles.top_k",
+            )?);
+        }
+        "min_p" => {
+            config.min_p = Some(parse_f64(
+                value,
+                line_number,
+                "forced_model_alias_profiles.min_p",
+            )?);
+        }
+        "presence_penalty" => {
+            config.presence_penalty = Some(parse_f64(
+                value,
+                line_number,
+                "forced_model_alias_profiles.presence_penalty",
+            )?);
+        }
+        "repetition_penalty" => {
+            config.repetition_penalty = Some(parse_f64(
+                value,
+                line_number,
+                "forced_model_alias_profiles.repetition_penalty",
+            )?);
+        }
+        _ => return unknown_key("forced_model_alias_profiles", key, line_number),
+    }
+    Ok(())
 }
 
 fn assign_upstream_value(
@@ -1357,6 +1445,9 @@ fn assign_upstream(
         "request_timeout_ms" => {
             config.request_timeout_ms =
                 parse_u64(value, line_number, "upstream.request_timeout_ms")?;
+        }
+        "reserved_ingress_model_ids" => {
+            config.reserved_ingress_model_ids = parse_string_array(value, line_number)?;
         }
         _ => return unknown_key("upstream", key, line_number),
     }
@@ -2594,12 +2685,21 @@ fn parse_json_value(
     line_number: usize,
     field: &str,
 ) -> Result<serde_json::Value, ConfigParseError> {
-    serde_json::from_str(value).map_err(|error| {
+    let parsed = serde_json::from_str(value).map_err(|error| {
         ConfigParseError::new(
             line_number,
             format!("invalid JSON value for {field}: {error}"),
         )
-    })
+    })?;
+    if let serde_json::Value::String(value) = parsed {
+        return serde_json::from_str(&value).map_err(|error| {
+            ConfigParseError::new(
+                line_number,
+                format!("invalid JSON value for {field}: {error}"),
+            )
+        });
+    }
+    Ok(parsed)
 }
 
 fn parse_optional_json_value(
