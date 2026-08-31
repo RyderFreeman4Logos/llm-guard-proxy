@@ -1004,6 +1004,18 @@ impl PersistenceTasks {
         Arc::clone(LOCK.get_or_init(|| Arc::new(AsyncMutex::new(()))))
     }
 
+    #[cfg(test)]
+    fn test_runtime() -> &'static tokio::runtime::Runtime {
+        static RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+        // ponytail: one isolated dispatcher is enough for serialized fixtures; split per fixture
+        // only if persistence-worker coverage needs parallel test execution.
+        RUNTIME.get_or_init(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("persistence test runtime should build")
+        })
+    }
+
     fn track(self: &Arc<Self>) -> PersistenceTaskGuard {
         self.in_flight.fetch_add(1, Ordering::SeqCst);
         PersistenceTaskGuard {
@@ -1048,6 +1060,13 @@ impl PersistenceTasks {
         let tasks = Arc::clone(self);
         // The handle is intentionally detached: after its bounded shutdown wait expires,
         // persistence must not retain a waiter on a stalled blocking SQLite operation.
+        #[cfg(test)]
+        let _detached_task = Self::test_runtime().spawn_blocking(move || {
+            let _capacity_permit = capacity_permit;
+            let _guard = guard;
+            tasks.run(work);
+        });
+        #[cfg(not(test))]
         let _detached_task = tokio::task::spawn_blocking(move || {
             let _capacity_permit = capacity_permit;
             let _guard = guard;
