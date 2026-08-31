@@ -68,9 +68,50 @@ impl GenericEntry {
 }
 
 async fn drain_profile_health_checks(fake: &mut FakeUpstream) {
-    while let Some(observed) = fake.recv_within(Duration::from_millis(20)).await {
-        assert_eq!(observed.path_and_query, "/v1/models");
-    }
+    let observed = timeout(STREAM_COMPLETION_TIMEOUT, fake.recv_next())
+        .await
+        .expect("health request should arrive before the test deadline");
+    assert_eq!(
+        observed.path_and_query.split('?').next(),
+        Some("/v1/models")
+    );
+    timeout(
+        STREAM_COMPLETION_TIMEOUT,
+        observed
+            .health_response_receipt
+            .expect("health request should carry a response receipt"),
+    )
+    .await
+    .expect("health response receipt should arrive before the test deadline")
+    .expect("health response receipt sender should remain available");
+}
+
+#[tokio::test]
+async fn generic_health_drain_waits_for_health_response_receipt() {
+    let mut fake = FakeUpstream::spawn_with_models_body_and_delay(
+        MODEL_METADATA_BODY,
+        Duration::from_millis(100),
+    )
+    .await;
+    let request = tokio::spawn(reqwest::get(format!(
+        "{}/models?test=distinct-multi-upstream-models",
+        fake.base_url
+    )));
+
+    assert!(
+        timeout(
+            Duration::from_millis(20),
+            drain_profile_health_checks(&mut fake)
+        )
+        .await
+        .is_err(),
+        "health drain must wait for the delayed response receipt"
+    );
+    let response = request
+        .await
+        .expect("health request task should complete")
+        .expect("health request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 async fn recv_non_health_request(fake: &mut FakeUpstream) -> ObservedRequest {
@@ -406,8 +447,6 @@ max_per_window = 20
         &config,
     )
     .await;
-    drain_profile_health_checks(&mut primary).await;
-    drain_profile_health_checks(&mut sibling).await;
 
     let response = proxy
         .client
@@ -503,8 +542,6 @@ max_per_window = 20
         &config,
     )
     .await;
-    drain_profile_health_checks(&mut primary).await;
-    drain_profile_health_checks(&mut sibling).await;
 
     let response = proxy
         .client

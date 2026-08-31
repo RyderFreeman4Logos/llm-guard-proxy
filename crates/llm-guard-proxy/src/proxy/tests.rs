@@ -20653,6 +20653,7 @@ struct ObservedRequest {
     path_and_query: String,
     headers: HeaderMap,
     body: Bytes,
+    health_response_receipt: Option<oneshot::Receiver<()>>,
 }
 
 struct TestServer {
@@ -21190,7 +21191,8 @@ async fn fake_upstream_handler(
     State(state): State<FakeUpstreamState>,
     request: Request<Body>,
 ) -> Response<Body> {
-    let observed = observe_request(request).await;
+    let (observed, endpoint, health_response_receipt_sender) =
+        observe_fake_upstream_request(request).await;
     let path_and_query = observed.path_and_query.clone();
     let body = observed.body.clone();
     let is_head = observed.method == Method::HEAD;
@@ -21198,12 +21200,6 @@ async fn fake_upstream_handler(
         .headers
         .get("x-llm-guard-proxy-probe")
         .is_some_and(|value| value == "hot-restart");
-    let endpoint = observed
-        .path_and_query
-        .split('?')
-        .next()
-        .unwrap_or_default()
-        .to_owned();
     let is_sse_stream = observed.path_and_query.contains("test=sse");
     let is_long_json_stream = observed.path_and_query.contains("test=long-json");
     state
@@ -21215,6 +21211,7 @@ async fn fake_upstream_handler(
     if let Some(response) =
         fake_head_models_content_length_response(is_head, &endpoint, &path_and_query)
     {
+        complete_health_response(health_response_receipt_sender);
         return response;
     }
 
@@ -21290,7 +21287,34 @@ async fn fake_upstream_handler(
             HeaderValue::from_static("upstream-request-id-collision"),
         );
     }
+    complete_health_response(health_response_receipt_sender);
     response
+}
+
+async fn observe_fake_upstream_request(
+    request: Request<Body>,
+) -> (ObservedRequest, String, Option<oneshot::Sender<()>>) {
+    let mut observed = observe_request(request).await;
+    let endpoint = observed
+        .path_and_query
+        .split('?')
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let health_response_receipt_sender = if endpoint == "/v1/models" {
+        let (sender, receiver) = oneshot::channel();
+        observed.health_response_receipt = Some(receiver);
+        Some(sender)
+    } else {
+        None
+    };
+    (observed, endpoint, health_response_receipt_sender)
+}
+
+fn complete_health_response(sender: Option<oneshot::Sender<()>>) {
+    if let Some(sender) = sender {
+        let _ = sender.send(());
+    }
 }
 
 async fn maybe_delay_fake_models(endpoint: &str, path_and_query: &str, state: &FakeUpstreamState) {
@@ -21334,6 +21358,7 @@ async fn observe_request(request: Request<Body>) -> ObservedRequest {
         path_and_query,
         headers: parts.headers,
         body,
+        health_response_receipt: None,
     }
 }
 
