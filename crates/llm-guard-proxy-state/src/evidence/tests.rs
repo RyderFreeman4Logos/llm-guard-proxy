@@ -406,6 +406,68 @@ fn retention_accounting_stays_incremental_as_rows_grow() {
 }
 
 #[test]
+fn retention_prune_stays_incremental_and_skips_vacuum_on_the_write_path() {
+    let fixture = EvidenceFixture::new("retention-prune-hot-path");
+    let manager = fixture.manager(true, true, false, 4, Some(2));
+    let store = EvidenceStore::open(manager);
+    let full_table_count_queries_before = super::store::full_table_count_queries();
+    let full_table_sum_queries_before = super::store::full_table_sum_queries();
+    let vacuum_commands_before = super::store::vacuum_commands();
+
+    for index in 0..3 {
+        let group_id = format!("group-retention-hot-{index}");
+        let mut attempt = attempt_record(
+            &group_id,
+            1,
+            EvidenceAttemptRole::Primary,
+            EvidenceAttemptStatus::Accepted,
+            true,
+        );
+        attempt.raw_payloads = RawPayloads {
+            input: Some(format!("payload-{index}")),
+            output: None,
+            reasoning: None,
+            tool_calls: None,
+            chunks: Vec::new(),
+        };
+        store
+            .record_group(&group_record(&group_id, 1_000 + index), &[attempt])
+            .expect("retention prune write should succeed");
+    }
+
+    assert_eq!(
+        super::store::full_table_count_queries(),
+        full_table_count_queries_before,
+        "retention prune must not run full-table COUNT(*) queries",
+    );
+    assert_eq!(
+        super::store::full_table_sum_queries(),
+        full_table_sum_queries_before,
+        "retention prune must not run full-table SUM queries",
+    );
+    assert_eq!(
+        super::store::vacuum_commands(),
+        vacuum_commands_before,
+        "retention prune must not VACUUM on the request write path",
+    );
+
+    let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
+    assert_eq!(
+        count_rows(&connection, "SELECT COUNT(*) FROM evidence_groups"),
+        1
+    );
+    let counts: (i64, i64, i64) = connection
+        .query_row(
+            "SELECT group_count, attempt_count, chunk_count \
+             FROM evidence_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("incremental retention counters should exist");
+    assert_eq!(counts, (1, 1, 1));
+}
+
+#[test]
 fn repeated_shadow_attempt_preserves_retention_counts_and_groups() {
     let fixture = EvidenceFixture::new("repeated-shadow-retention");
     let manager = fixture.manager(true, false, false, 4, Some(2));
@@ -488,7 +550,7 @@ fn populated_v2_upgrade_initializes_retention_counters() {
         .expect("populated v2 database should upgrade and write");
 
     let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
-    assert_eq!(schema_version(&connection), 3);
+    assert_eq!(schema_version(&connection), 4);
     let counts: (i64, i64, i64) = connection
         .query_row(
             "SELECT group_count, attempt_count, chunk_count \
@@ -577,8 +639,8 @@ END;
         .expect("rolled-back v2 database should retry cleanly");
 
     let connection = Connection::open(&fixture.sqlite_path).expect("sqlite should open");
-    assert_eq!(schema_version(&connection), 3);
-    assert_eq!(retention_trigger_count(&connection), 6);
+    assert_eq!(schema_version(&connection), 4);
+    assert_eq!(retention_trigger_count(&connection), 11);
     let counts: (i64, i64, i64) = connection
         .query_row(
             "SELECT group_count, attempt_count, chunk_count \
@@ -853,13 +915,19 @@ fn downgrade_schema_to_v2(connection: &Connection) {
             "
 DROP TRIGGER IF EXISTS evidence_groups_retention_count_insert;
 DROP TRIGGER IF EXISTS evidence_groups_retention_count_delete;
+DROP TRIGGER IF EXISTS evidence_groups_retention_count_update;
 DROP TRIGGER IF EXISTS evidence_attempts_retention_count_insert;
 DROP TRIGGER IF EXISTS evidence_attempts_retention_count_delete;
+DROP TRIGGER IF EXISTS evidence_attempts_retention_count_update;
 DROP TRIGGER IF EXISTS evidence_chunks_retention_count_insert;
 DROP TRIGGER IF EXISTS evidence_chunks_retention_count_delete;
+DROP TRIGGER IF EXISTS evidence_raw_artifacts_retention_count_insert;
+DROP TRIGGER IF EXISTS evidence_raw_artifacts_retention_count_delete;
+DROP TRIGGER IF EXISTS evidence_raw_artifacts_retention_count_update;
 ALTER TABLE evidence_pruning_stats DROP COLUMN group_count;
 ALTER TABLE evidence_pruning_stats DROP COLUMN attempt_count;
 ALTER TABLE evidence_pruning_stats DROP COLUMN chunk_count;
+ALTER TABLE evidence_pruning_stats DROP COLUMN logical_bytes;
 PRAGMA user_version = 2;
 ",
         )

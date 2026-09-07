@@ -28,7 +28,7 @@ use llm_guard_proxy_core::{ConfigHandle, EvidenceConfig};
 
 use crate::RawPayloads;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const SHA256_HEX_LEN: usize = 64;
 const SECONDS_PER_DAY: u64 = 86_400;
 const SHA256_INITIAL_STATE: [u32; 8] = [
@@ -115,6 +115,8 @@ const EVIDENCE_SQLITE_MODE: u32 = 0o600;
 #[cfg(test)]
 thread_local! {
     static FULL_TABLE_COUNT_QUERIES: Cell<usize> = const { Cell::new(0) };
+    static FULL_TABLE_SUM_QUERIES: Cell<usize> = const { Cell::new(0) };
+    static VACUUM_COMMANDS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// SQLite-backed evidence ledger.
@@ -758,9 +760,14 @@ fn migrate(connection: &mut Connection) -> Result<(), EvidenceError> {
         0 => create_schema(connection),
         1 => {
             migrate_schema_v2(connection)?;
-            migrate_schema_v3(connection)
+            migrate_schema_v3(connection)?;
+            migrate_schema_v4(connection)
         }
-        2 => migrate_schema_v3(connection),
+        2 => {
+            migrate_schema_v3(connection)?;
+            migrate_schema_v4(connection)
+        }
+        3 => migrate_schema_v4(connection),
         _ => Ok(()),
     }
 }
@@ -876,7 +883,8 @@ CREATE TABLE IF NOT EXISTS evidence_pruning_stats (
     last_pruned_at_unix_ms INTEGER,
     group_count INTEGER NOT NULL,
     attempt_count INTEGER NOT NULL,
-    chunk_count INTEGER NOT NULL
+    chunk_count INTEGER NOT NULL,
+    logical_bytes INTEGER NOT NULL
 );
 
 INSERT OR IGNORE INTO evidence_pruning_stats (
@@ -888,8 +896,9 @@ INSERT OR IGNORE INTO evidence_pruning_stats (
     last_pruned_at_unix_ms,
     group_count,
     attempt_count,
-    chunk_count
-) VALUES ('global', 0, 0, 0, 0, NULL, 0, 0, 0);
+    chunk_count,
+    logical_bytes
+) VALUES ('global', 0, 0, 0, 0, NULL, 0, 0, 0, 0);
 
 ",
         )
@@ -901,7 +910,7 @@ INSERT OR IGNORE INTO evidence_pruning_stats (
     transaction
         .pragma_update(None, "user_version", SCHEMA_VERSION)
         .map_err(|source| EvidenceError::Sqlite {
-            action: "set SQLite evidence schema version to v3",
+            action: "set SQLite evidence schema version to v4",
             source,
         })?;
     transaction
@@ -1092,9 +1101,8 @@ ALTER TABLE evidence_pruning_stats ADD COLUMN chunk_count INTEGER NOT NULL DEFAU
             action: "initialize SQLite evidence retention counters",
             source,
         })?;
-    create_retention_count_triggers(&transaction)?;
     transaction
-        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .pragma_update(None, "user_version", 3)
         .map_err(|source| EvidenceError::Sqlite {
             action: "set SQLite evidence schema version to v3",
             source,
@@ -1107,7 +1115,50 @@ ALTER TABLE evidence_pruning_stats ADD COLUMN chunk_count INTEGER NOT NULL DEFAU
         })
 }
 
+fn migrate_schema_v4(connection: &mut Connection) -> Result<(), EvidenceError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "start SQLite evidence v4 migration transaction",
+            source,
+        })?;
+    let logical_bytes = scan_logical_observed_bytes(&transaction)?;
+    transaction
+        .execute_batch(
+            r"
+ALTER TABLE evidence_pruning_stats ADD COLUMN logical_bytes INTEGER NOT NULL DEFAULT 0;
+",
+        )
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "add SQLite evidence logical byte counter",
+            source,
+        })?;
+    transaction
+        .execute(
+            "UPDATE evidence_pruning_stats SET logical_bytes = ?1 WHERE stats_key = 'global'",
+            params![to_sqlite_i64(logical_bytes, "logical_bytes")?],
+        )
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "initialize SQLite evidence logical byte counter",
+            source,
+        })?;
+    create_retention_count_triggers(&transaction)?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "set SQLite evidence schema version to v4",
+            source,
+        })?;
+    transaction
+        .commit()
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "commit SQLite evidence v4 migration transaction",
+            source,
+        })
+}
+
 fn create_retention_count_triggers(connection: &Connection) -> Result<(), EvidenceError> {
+    drop_retention_count_triggers(connection)?;
     connection
         .execute_batch(
             r"
@@ -1115,48 +1166,112 @@ CREATE TRIGGER IF NOT EXISTS evidence_groups_retention_count_insert
 AFTER INSERT ON evidence_groups
 BEGIN
     UPDATE evidence_pruning_stats
-    SET group_count = group_count + 1
+    SET group_count = group_count + 1,
+        logical_bytes = logical_bytes + NEW.estimated_bytes
     WHERE stats_key = 'global';
 END;
 CREATE TRIGGER IF NOT EXISTS evidence_groups_retention_count_delete
 AFTER DELETE ON evidence_groups
 BEGIN
     UPDATE evidence_pruning_stats
-    SET group_count = group_count - 1
+    SET group_count = group_count - 1,
+        logical_bytes = logical_bytes - OLD.estimated_bytes
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_groups_retention_count_update
+AFTER UPDATE OF estimated_bytes ON evidence_groups
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET logical_bytes = logical_bytes - OLD.estimated_bytes + NEW.estimated_bytes
     WHERE stats_key = 'global';
 END;
 CREATE TRIGGER IF NOT EXISTS evidence_attempts_retention_count_insert
 AFTER INSERT ON evidence_attempts
 BEGIN
     UPDATE evidence_pruning_stats
-    SET attempt_count = attempt_count + 1
+    SET attempt_count = attempt_count + 1,
+        logical_bytes = logical_bytes + NEW.estimated_bytes
     WHERE stats_key = 'global';
 END;
 CREATE TRIGGER IF NOT EXISTS evidence_attempts_retention_count_delete
 AFTER DELETE ON evidence_attempts
 BEGIN
     UPDATE evidence_pruning_stats
-    SET attempt_count = attempt_count - 1
+    SET attempt_count = attempt_count - 1,
+        logical_bytes = logical_bytes - OLD.estimated_bytes
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_attempts_retention_count_update
+AFTER UPDATE OF estimated_bytes ON evidence_attempts
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET logical_bytes = logical_bytes - OLD.estimated_bytes + NEW.estimated_bytes
     WHERE stats_key = 'global';
 END;
 CREATE TRIGGER IF NOT EXISTS evidence_chunks_retention_count_insert
 AFTER INSERT ON evidence_chunks
 BEGIN
     UPDATE evidence_pruning_stats
-    SET chunk_count = chunk_count + 1
+    SET chunk_count = chunk_count + 1,
+        logical_bytes = logical_bytes + NEW.chunk_bytes
     WHERE stats_key = 'global';
 END;
 CREATE TRIGGER IF NOT EXISTS evidence_chunks_retention_count_delete
 AFTER DELETE ON evidence_chunks
 BEGIN
     UPDATE evidence_pruning_stats
-    SET chunk_count = chunk_count - 1
+    SET chunk_count = chunk_count - 1,
+        logical_bytes = logical_bytes - OLD.chunk_bytes
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_raw_artifacts_retention_count_insert
+AFTER INSERT ON evidence_raw_artifacts
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET logical_bytes = logical_bytes + NEW.bytes_stored
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_raw_artifacts_retention_count_delete
+AFTER DELETE ON evidence_raw_artifacts
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET logical_bytes = logical_bytes - OLD.bytes_stored
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_raw_artifacts_retention_count_update
+AFTER UPDATE OF bytes_stored ON evidence_raw_artifacts
+BEGIN
+    UPDATE evidence_pruning_stats
+    SET logical_bytes = logical_bytes - OLD.bytes_stored + NEW.bytes_stored
     WHERE stats_key = 'global';
 END;
 ",
         )
         .map_err(|source| EvidenceError::Sqlite {
             action: "create SQLite evidence retention counter triggers",
+            source,
+        })
+}
+
+fn drop_retention_count_triggers(connection: &Connection) -> Result<(), EvidenceError> {
+    connection
+        .execute_batch(
+            r"
+DROP TRIGGER IF EXISTS evidence_groups_retention_count_insert;
+DROP TRIGGER IF EXISTS evidence_groups_retention_count_delete;
+DROP TRIGGER IF EXISTS evidence_groups_retention_count_update;
+DROP TRIGGER IF EXISTS evidence_attempts_retention_count_insert;
+DROP TRIGGER IF EXISTS evidence_attempts_retention_count_delete;
+DROP TRIGGER IF EXISTS evidence_attempts_retention_count_update;
+DROP TRIGGER IF EXISTS evidence_chunks_retention_count_insert;
+DROP TRIGGER IF EXISTS evidence_chunks_retention_count_delete;
+DROP TRIGGER IF EXISTS evidence_raw_artifacts_retention_count_insert;
+DROP TRIGGER IF EXISTS evidence_raw_artifacts_retention_count_delete;
+DROP TRIGGER IF EXISTS evidence_raw_artifacts_retention_count_update;
+",
+        )
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "drop SQLite evidence retention counter triggers",
             source,
         })
 }
@@ -1537,11 +1652,9 @@ fn enforce_retention(
     config: &EvidenceConfig,
 ) -> Result<RetentionPruneOutcome, EvidenceError> {
     let mut outcome = enforce_raw_artifact_retention(connection, config)?;
-    if outcome.deleted_any() {
-        vacuum_database(connection)?;
-    }
     let mut usage = read_retention_usage(connection)?;
-    let target_bytes = if usage.observed_bytes > config.max_bytes {
+    let mut logical_bytes = read_logical_observed_bytes(connection)?;
+    let target_bytes = if logical_bytes > config.max_bytes {
         config.prune_to_bytes
     } else {
         config.max_bytes
@@ -1551,14 +1664,14 @@ fn enforce_retention(
     } else {
         config.max_records
     };
-    while usage.observed_bytes > target_bytes || usage.record_count > target_records {
+    while usage.record_count > target_records || logical_bytes > target_bytes {
         let batch = prune_retained_groups(connection, target_records, target_bytes)?;
         if !batch.deleted_any() {
             break;
         }
         outcome.add(batch);
-        vacuum_database(connection)?;
         usage = read_retention_usage(connection)?;
+        logical_bytes = read_logical_observed_bytes(connection)?;
         if usage.record_count == 0 {
             break;
         }
@@ -1781,10 +1894,7 @@ fn prune_retained_groups(
     let mut usage = read_retention_usage(&transaction)?;
     let mut logical_bytes = read_logical_observed_bytes(&transaction)?;
 
-    while usage.record_count > max_records
-        || logical_bytes > target_bytes
-        || (!outcome.deleted_any() && usage.group_count > 0)
-    {
+    while usage.record_count > max_records || logical_bytes > target_bytes {
         let Some(group_id) = oldest_group_id(&transaction)? else {
             break;
         };
@@ -1844,15 +1954,6 @@ WHERE stats_key = 'global'
         .map(|_updated| ())
         .map_err(|source| EvidenceError::Sqlite {
             action: "record evidence retention pruning stats",
-            source,
-        })
-}
-
-fn vacuum_database(connection: &Connection) -> Result<(), EvidenceError> {
-    connection
-        .execute_batch("VACUUM")
-        .map_err(|source| EvidenceError::Sqlite {
-            action: "vacuum SQLite evidence store",
             source,
         })
 }
@@ -1936,6 +2037,16 @@ fn read_count(
 #[cfg(test)]
 pub(super) fn full_table_count_queries() -> usize {
     FULL_TABLE_COUNT_QUERIES.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn full_table_sum_queries() -> usize {
+    FULL_TABLE_SUM_QUERIES.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn vacuum_commands() -> usize {
+    VACUUM_COMMANDS.with(Cell::get)
 }
 
 fn table_exists(connection: &Connection, table: &str) -> Result<bool, EvidenceError> {
@@ -2176,6 +2287,22 @@ WHERE attempt_id IN (
 }
 
 fn read_logical_observed_bytes(connection: &Connection) -> Result<u64, EvidenceError> {
+    let logical_bytes: i64 = connection
+        .query_row(
+            "SELECT logical_bytes FROM evidence_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| EvidenceError::Sqlite {
+            action: "read evidence logical bytes",
+            source,
+        })?;
+    Ok(nonnegative_i64_to_u64(logical_bytes))
+}
+
+fn scan_logical_observed_bytes(connection: &Connection) -> Result<u64, EvidenceError> {
+    #[cfg(test)]
+    FULL_TABLE_SUM_QUERIES.with(|queries| queries.set(queries.get() + 1));
     let group_bytes = read_sum_estimated_bytes(
         connection,
         "evidence_groups",
