@@ -29,7 +29,7 @@ fn creates_sqlite_schema_in_test_temp_directory() {
     let fixture = StoreFixture::new("schema");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
 
-    assert_eq!(store.schema_version().expect("schema version"), 3);
+    assert_eq!(store.schema_version().expect("schema version"), 4);
     assert!(fixture.sqlite_path.exists());
 
     let connection = store.lock_connection().expect("connection lock");
@@ -142,7 +142,7 @@ PRAGMA user_version = 2;
 
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
     let store = ObservabilityStore::open(manager).expect("legacy schema should migrate");
-    assert_eq!(store.schema_version().expect("schema version"), 3);
+    assert_eq!(store.schema_version().expect("schema version"), 4);
 
     let connection = store.lock_connection().expect("connection lock");
     let migrated_usage: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = connection
@@ -1085,6 +1085,50 @@ fn metrics_snapshot_work_is_independent_of_retained_row_count() {
 }
 
 #[test]
+fn retention_write_and_prune_stay_incremental_and_skip_vacuum() {
+    let fixture = StoreFixture::new("retention-write-prune-hot-path");
+    let manager =
+        fixture.manager_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 4);
+    let store = ObservabilityStore::open(manager).expect("store should open");
+    let full_table_count_queries_before = super::store::full_table_count_queries();
+    let full_table_sum_queries_before = super::store::full_table_sum_queries();
+    let vacuum_commands_before = super::store::vacuum_commands();
+
+    for index in 0_u64..6 {
+        store
+            .record_request(&request_record(
+                &format!("req-retention-hot-{index}"),
+                RequestStatus::Succeeded,
+                1_000 + index,
+            ))
+            .expect("retention write should succeed");
+    }
+
+    assert_eq!(
+        super::store::full_table_count_queries(),
+        full_table_count_queries_before,
+        "observability write/prune must not run full-table COUNT(*) queries",
+    );
+    assert_eq!(
+        super::store::full_table_sum_queries(),
+        full_table_sum_queries_before,
+        "observability prune must not run full-table SUM queries",
+    );
+    assert_eq!(
+        super::store::vacuum_commands(),
+        vacuum_commands_before,
+        "observability prune must not VACUUM on the request write path",
+    );
+
+    let usage = store
+        .retention_usage()
+        .expect("retention usage after prune");
+    assert_eq!(usage.request_count, 4);
+    assert_eq!(usage.attempt_count, 0);
+    assert_eq!(usage.record_count, 4);
+}
+
+#[test]
 fn heartbeat_metric_labels_use_a_closed_vocabulary() {
     let fixture = StoreFixture::new("metrics-closed-heartbeat-labels");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
@@ -1605,13 +1649,9 @@ fn redacts_common_raw_payload_secret_forms_before_persistence() {
 }
 
 #[test]
-fn retention_deletes_oldest_requests_until_actual_storage_under_prune_target() {
+fn retention_deletes_oldest_requests_until_logical_bytes_under_prune_target() {
     let fixture = StoreFixture::new("retention");
     let store = fixture.open_store(true, true, 120_000, 80_000);
-    let sqlite_floor_bytes = store
-        .retention_usage()
-        .expect("initial retention usage")
-        .observed_bytes;
 
     for index in 0..8 {
         let mut request = request_record(
@@ -1632,13 +1672,6 @@ fn retention_deletes_oldest_requests_until_actual_storage_under_prune_target() {
     }
 
     let usage = store.retention_usage().expect("retention usage");
-    let expected_cap = 80_000_u64.max(sqlite_floor_bytes);
-    assert!(
-        usage.observed_bytes <= expected_cap,
-        "actual SQLite bytes {} exceeded cap {}",
-        usage.observed_bytes,
-        expected_cap
-    );
     assert_eq!(
         usage.observed_bytes,
         fixture
@@ -1664,6 +1697,17 @@ fn retention_deletes_oldest_requests_until_actual_storage_under_prune_target() {
         0
     );
     assert!(count_rows(&connection, "SELECT COUNT(*) FROM requests") < 8);
+    let logical_bytes: i64 = connection
+        .query_row(
+            "SELECT logical_bytes FROM retention_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("logical bytes should exist");
+    assert!(
+        logical_bytes <= 80_000,
+        "logical bytes {logical_bytes} exceeded prune target"
+    );
 }
 
 #[test]
