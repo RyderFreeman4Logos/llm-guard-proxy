@@ -764,18 +764,24 @@ fn migrate_to_schema_v4(connection: &mut Connection) -> Result<(), Observability
     let attempt_count =
         scan_table_count(&transaction, "attempts", "read observability attempt count")?;
     let logical_bytes = scan_logical_observed_bytes(&transaction)?;
-    transaction
-        .execute_batch(
-            r"
+    if !table_has_columns(
+        &transaction,
+        "retention_pruning_stats",
+        &["request_count", "attempt_count", "logical_bytes"],
+    )? {
+        transaction
+            .execute_batch(
+                r"
 ALTER TABLE retention_pruning_stats ADD COLUMN request_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE retention_pruning_stats ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE retention_pruning_stats ADD COLUMN logical_bytes INTEGER NOT NULL DEFAULT 0;
 ",
-        )
-        .map_err(|source| ObservabilityError::Sqlite {
-            action: "add SQLite observability retention counters",
-            source,
-        })?;
+            )
+            .map_err(|source| ObservabilityError::Sqlite {
+                action: "add SQLite observability retention counters",
+                source,
+            })?;
+    }
     transaction
         .execute(
             "UPDATE retention_pruning_stats SET request_count = ?1, attempt_count = ?2, logical_bytes = ?3 WHERE stats_key = 'global'",
@@ -791,15 +797,15 @@ ALTER TABLE retention_pruning_stats ADD COLUMN logical_bytes INTEGER NOT NULL DE
         })?;
     create_retention_count_triggers(&transaction)?;
     transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "set schema version to 4",
+            source,
+        })?;
+    transaction
         .commit()
         .map_err(|source| ObservabilityError::Sqlite {
             action: "commit schema v4 migration",
-            source,
-        })?;
-    connection
-        .execute_batch("PRAGMA user_version = 4;")
-        .map_err(|source| ObservabilityError::Sqlite {
-            action: "set schema version to 4",
             source,
         })
 }
@@ -879,6 +885,52 @@ DROP TRIGGER IF EXISTS attempts_retention_count_update;
             action: "drop SQLite observability retention counter triggers",
             source,
         })
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, ObservabilityError> {
+    let exists: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get(0),
+        )
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "check observability table existence",
+            source,
+        })?;
+    Ok(exists > 0)
+}
+
+fn table_has_columns(
+    connection: &Connection,
+    table: &str,
+    required_columns: &[&str],
+) -> Result<bool, ObservabilityError> {
+    if !table_exists(connection, table)? {
+        return Ok(false);
+    }
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "inspect observability table columns",
+            source,
+        })?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "read observability table columns",
+            source,
+        })?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row.map_err(|source| ObservabilityError::Sqlite {
+            action: "decode observability table column",
+            source,
+        })?);
+    }
+    Ok(required_columns
+        .iter()
+        .all(|required| columns.iter().any(|column| column.as_str() == *required)))
 }
 
 fn read_schema_version(connection: &Connection) -> Result<i64, ObservabilityError> {

@@ -155,6 +155,30 @@ PRAGMA user_version = 2;
     assert_eq!(migrated_usage, (None, None, None, None));
 }
 
+#[test]
+fn reopens_interrupted_v4_schema_when_user_version_still_3() {
+    let fixture = StoreFixture::new("schema-v4-interrupted");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let store = ObservabilityStore::open(manager.clone()).expect("initial store should open");
+    assert_eq!(store.schema_version().expect("schema version"), 4);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&fixture.sqlite_path)
+        .expect("interrupted SQLite database should open");
+    connection
+        .execute_batch("PRAGMA user_version = 3;")
+        .expect("v4 objects should remain labeled as schema v3");
+    let labeled_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("interrupted schema version should be readable");
+    assert_eq!(labeled_version, 3);
+    drop(connection);
+
+    let store = ObservabilityStore::open(manager)
+        .expect("interrupted v4 schema should reopen without duplicate-column failure");
+    assert_eq!(store.schema_version().expect("schema version"), 4);
+}
+
 #[cfg(unix)]
 #[test]
 fn creates_sqlite_store_with_owner_only_permissions() {
