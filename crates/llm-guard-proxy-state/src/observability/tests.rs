@@ -1153,6 +1153,24 @@ fn retention_write_and_prune_stay_incremental_and_skip_vacuum() {
 }
 
 #[test]
+fn vacuum_command_counter_increments_when_write_connection_runs_vacuum() {
+    let fixture = StoreFixture::new("vacuum-oracle");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let vacuum_commands_before = super::store::vacuum_commands();
+    {
+        let connection = store.lock_connection().expect("connection lock");
+        connection
+            .execute("VACUUM", [])
+            .expect("VACUUM on the write connection should succeed");
+    }
+    assert_eq!(
+        super::store::vacuum_commands(),
+        vacuum_commands_before + 1,
+        "VACUUM through the write connection must be visible to the test oracle"
+    );
+}
+
+#[test]
 fn heartbeat_metric_labels_use_a_closed_vocabulary() {
     let fixture = StoreFixture::new("metrics-closed-heartbeat-labels");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);

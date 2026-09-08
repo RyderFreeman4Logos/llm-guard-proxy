@@ -468,6 +468,29 @@ fn retention_prune_stays_incremental_and_skips_vacuum_on_the_write_path() {
 }
 
 #[test]
+fn vacuum_command_counter_increments_when_write_connection_runs_vacuum() {
+    let fixture = EvidenceFixture::new("vacuum-oracle");
+    let manager = fixture.manager(true, true, false, 4, Some(2));
+    let store = EvidenceStore::open(manager);
+    store
+        .record_group(&group_record("group-vacuum-oracle", 1_000), &[])
+        .expect("write should open the sqlite connection");
+    let vacuum_commands_before = super::store::vacuum_commands();
+    {
+        let mut slot = store.lock_connection().expect("connection lock");
+        let connection = slot.as_mut().expect("write connection");
+        connection
+            .execute("VACUUM", [])
+            .expect("VACUUM on the write connection should succeed");
+    }
+    assert_eq!(
+        super::store::vacuum_commands(),
+        vacuum_commands_before + 1,
+        "VACUUM through the write connection must be visible to the test oracle"
+    );
+}
+
+#[test]
 fn repeated_shadow_attempt_preserves_retention_counts_and_groups() {
     let fixture = EvidenceFixture::new("repeated-shadow-retention");
     let manager = fixture.manager(true, false, false, 4, Some(2));

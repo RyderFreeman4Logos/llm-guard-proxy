@@ -13,7 +13,107 @@ use std::cell::Cell;
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 
-use rusqlite::{Connection, OpenFlags, TransactionBehavior, params};
+use rusqlite::{Connection as SqliteConnection, OpenFlags, TransactionBehavior, params};
+
+#[cfg(not(test))]
+use rusqlite::Connection;
+
+#[cfg(not(test))]
+use rusqlite::Transaction;
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct Connection {
+    inner: SqliteConnection,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for Connection {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for Connection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+#[cfg(test)]
+impl Connection {
+    fn open_with_flags(path: &Path, flags: OpenFlags) -> rusqlite::Result<Self> {
+        Ok(Self {
+            inner: SqliteConnection::open_with_flags(path, flags)?,
+        })
+    }
+
+    pub(super) fn execute<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> rusqlite::Result<usize> {
+        count_vacuum_command(sql);
+        self.inner.execute(sql, params)
+    }
+
+    fn transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {
+        self.transaction_with_behavior(TransactionBehavior::Deferred)
+    }
+
+    fn transaction_with_behavior(
+        &mut self,
+        behavior: TransactionBehavior,
+    ) -> rusqlite::Result<Transaction<'_>> {
+        Ok(Transaction {
+            inner: self.inner.transaction_with_behavior(behavior)?,
+        })
+    }
+}
+
+#[cfg(test)]
+struct Transaction<'conn> {
+    inner: rusqlite::Transaction<'conn>,
+}
+
+#[cfg(test)]
+impl Transaction<'_> {
+    fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        count_vacuum_command(sql);
+        self.inner.execute(sql, params)
+    }
+
+    fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        count_vacuum_command(sql);
+        self.inner.execute_batch(sql)
+    }
+
+    fn pragma_update(
+        &self,
+        schema_name: Option<rusqlite::DatabaseName<'_>>,
+        pragma_name: &str,
+        pragma_value: impl rusqlite::ToSql,
+    ) -> rusqlite::Result<()> {
+        self.inner
+            .pragma_update(schema_name, pragma_name, pragma_value)
+    }
+
+    fn commit(self) -> rusqlite::Result<()> {
+        self.inner.commit()
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for Transaction<'_> {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 
 use super::{
     error::EvidenceError,
@@ -922,7 +1022,7 @@ INSERT OR IGNORE INTO evidence_pruning_stats (
 }
 
 #[allow(clippy::too_many_lines)]
-fn migrate_schema_v2(connection: &Connection) -> Result<(), EvidenceError> {
+fn migrate_schema_v2(connection: &SqliteConnection) -> Result<(), EvidenceError> {
     connection
         .execute_batch(
             r"
@@ -1157,7 +1257,7 @@ ALTER TABLE evidence_pruning_stats ADD COLUMN logical_bytes INTEGER NOT NULL DEF
         })
 }
 
-fn create_retention_count_triggers(connection: &Connection) -> Result<(), EvidenceError> {
+fn create_retention_count_triggers(connection: &SqliteConnection) -> Result<(), EvidenceError> {
     drop_retention_count_triggers(connection)?;
     connection
         .execute_batch(
@@ -1253,7 +1353,7 @@ END;
         })
 }
 
-fn drop_retention_count_triggers(connection: &Connection) -> Result<(), EvidenceError> {
+fn drop_retention_count_triggers(connection: &SqliteConnection) -> Result<(), EvidenceError> {
     connection
         .execute_batch(
             r"
@@ -1276,7 +1376,7 @@ DROP TRIGGER IF EXISTS evidence_raw_artifacts_retention_count_update;
         })
 }
 
-fn read_schema_version(connection: &Connection) -> Result<i64, EvidenceError> {
+fn read_schema_version(connection: &SqliteConnection) -> Result<i64, EvidenceError> {
     connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|source| EvidenceError::Sqlite {
@@ -1328,7 +1428,7 @@ fn insert_attempt(
 }
 
 fn insert_group_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Transaction<'_>,
     group: &PreparedGroup,
 ) -> Result<(), EvidenceError> {
     transaction
@@ -1375,7 +1475,7 @@ ON CONFLICT(group_id) DO UPDATE SET
 }
 
 fn insert_attempt_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Transaction<'_>,
     attempt: &PreparedAttempt,
 ) -> Result<(), EvidenceError> {
     transaction
@@ -1481,7 +1581,7 @@ ON CONFLICT(attempt_id) DO UPDATE SET
 }
 
 fn insert_raw_chunks_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Transaction<'_>,
     attempt: &PreparedAttempt,
 ) -> Result<(), EvidenceError> {
     transaction
@@ -1544,7 +1644,7 @@ fn raw_chunks(raw_payloads: &RawPayloads) -> Vec<(&str, &str)> {
 }
 
 fn insert_raw_artifacts_in_transaction(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Transaction<'_>,
     attempt: &PreparedAttempt,
 ) -> Result<(), EvidenceError> {
     transaction
@@ -1729,7 +1829,7 @@ fn enforce_raw_artifact_retention(
 }
 
 fn read_content_raw_artifacts(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<Vec<RawArtifactPointer>, EvidenceError> {
     let mut statement = connection
         .prepare(
@@ -1828,7 +1928,7 @@ WHERE artifact_id = ?2
 }
 
 fn null_attempt_raw_column(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Transaction<'_>,
     attempt_id: &str,
     kind: &str,
 ) -> Result<(), EvidenceError> {
@@ -1850,7 +1950,7 @@ fn null_attempt_raw_column(
 }
 
 fn delete_chunks_for_attempts(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Transaction<'_>,
     attempt_ids: &[String],
 ) -> Result<u64, EvidenceError> {
     let mut deleted = 0_u64;
@@ -1958,7 +2058,7 @@ WHERE stats_key = 'global'
         })
 }
 
-fn oldest_group_id(connection: &Connection) -> Result<Option<String>, EvidenceError> {
+fn oldest_group_id(connection: &SqliteConnection) -> Result<Option<String>, EvidenceError> {
     let mut statement = connection
         .prepare(
             r"
@@ -1993,7 +2093,9 @@ LIMIT 1
         })
 }
 
-fn read_retention_usage(connection: &Connection) -> Result<EvidenceRetentionUsage, EvidenceError> {
+fn read_retention_usage(
+    connection: &SqliteConnection,
+) -> Result<EvidenceRetentionUsage, EvidenceError> {
     let (group_count, attempt_count, chunk_count): (i64, i64, i64) = connection
         .query_row(
             "SELECT group_count, attempt_count, chunk_count FROM evidence_pruning_stats WHERE stats_key = 'global'",
@@ -2021,7 +2123,7 @@ fn read_retention_usage(connection: &Connection) -> Result<EvidenceRetentionUsag
 }
 
 fn read_count(
-    connection: &Connection,
+    connection: &SqliteConnection,
     table: &'static str,
     action: &'static str,
 ) -> Result<u64, EvidenceError> {
@@ -2032,6 +2134,17 @@ fn read_count(
         .query_row(&sql, [], |row| row.get(0))
         .map_err(|source| EvidenceError::Sqlite { action, source })?;
     Ok(nonnegative_i64_to_u64(count))
+}
+
+#[cfg(test)]
+fn count_vacuum_command(sql: &str) {
+    if sql
+        .split_whitespace()
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("VACUUM"))
+    {
+        VACUUM_COMMANDS.with(|commands| commands.set(commands.get() + 1));
+    }
 }
 
 #[cfg(test)]
@@ -2049,7 +2162,7 @@ pub(super) fn vacuum_commands() -> usize {
     VACUUM_COMMANDS.with(Cell::get)
 }
 
-fn table_exists(connection: &Connection, table: &str) -> Result<bool, EvidenceError> {
+fn table_exists(connection: &SqliteConnection, table: &str) -> Result<bool, EvidenceError> {
     let exists: i64 = connection
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -2064,7 +2177,7 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool, EvidenceEr
 }
 
 fn table_has_columns(
-    connection: &Connection,
+    connection: &SqliteConnection,
     table: &str,
     required_columns: &[&str],
 ) -> Result<bool, EvidenceError> {
@@ -2095,7 +2208,9 @@ fn table_has_columns(
         .all(|required| columns.iter().any(|column| column.as_str() == *required)))
 }
 
-fn read_summary_rows(connection: &Connection) -> Result<Vec<EvidenceSummaryRow>, EvidenceError> {
+fn read_summary_rows(
+    connection: &SqliteConnection,
+) -> Result<Vec<EvidenceSummaryRow>, EvidenceError> {
     let mut statement = connection
         .prepare(
             r"
@@ -2143,7 +2258,7 @@ ORDER BY role, variant_name, artifact_kind
 }
 
 fn read_export_pairs(
-    connection: &Connection,
+    connection: &SqliteConnection,
     variants: &[String],
     include: &[EvidenceRawArtifactKind],
 ) -> Result<Vec<EvidenceExportPair>, EvidenceError> {
@@ -2247,7 +2362,7 @@ struct RawExportRow {
 }
 
 fn read_attempt_count_for_group(
-    connection: &Connection,
+    connection: &SqliteConnection,
     group_id: &str,
 ) -> Result<u64, EvidenceError> {
     let count: i64 = connection
@@ -2264,7 +2379,7 @@ fn read_attempt_count_for_group(
 }
 
 fn read_chunk_count_for_group(
-    connection: &Connection,
+    connection: &SqliteConnection,
     group_id: &str,
 ) -> Result<u64, EvidenceError> {
     let count: i64 = connection
@@ -2286,7 +2401,7 @@ WHERE attempt_id IN (
     Ok(nonnegative_i64_to_u64(count))
 }
 
-fn read_logical_observed_bytes(connection: &Connection) -> Result<u64, EvidenceError> {
+fn read_logical_observed_bytes(connection: &SqliteConnection) -> Result<u64, EvidenceError> {
     let logical_bytes: i64 = connection
         .query_row(
             "SELECT logical_bytes FROM evidence_pruning_stats WHERE stats_key = 'global'",
@@ -2300,7 +2415,7 @@ fn read_logical_observed_bytes(connection: &Connection) -> Result<u64, EvidenceE
     Ok(nonnegative_i64_to_u64(logical_bytes))
 }
 
-fn scan_logical_observed_bytes(connection: &Connection) -> Result<u64, EvidenceError> {
+fn scan_logical_observed_bytes(connection: &SqliteConnection) -> Result<u64, EvidenceError> {
     #[cfg(test)]
     FULL_TABLE_SUM_QUERIES.with(|queries| queries.set(queries.get() + 1));
     let group_bytes = read_sum_estimated_bytes(
@@ -2334,7 +2449,7 @@ fn scan_logical_observed_bytes(connection: &Connection) -> Result<u64, EvidenceE
         .saturating_add(raw_artifact_bytes))
 }
 
-fn read_sum_raw_artifact_bytes(connection: &Connection) -> Result<u64, EvidenceError> {
+fn read_sum_raw_artifact_bytes(connection: &SqliteConnection) -> Result<u64, EvidenceError> {
     let bytes: i64 = connection
         .query_row(
             "SELECT COALESCE(SUM(bytes_stored), 0) FROM evidence_raw_artifacts",
@@ -2349,7 +2464,7 @@ fn read_sum_raw_artifact_bytes(connection: &Connection) -> Result<u64, EvidenceE
 }
 
 fn read_sum_estimated_bytes(
-    connection: &Connection,
+    connection: &SqliteConnection,
     table: &'static str,
     action: &'static str,
 ) -> Result<u64, EvidenceError> {
@@ -2360,7 +2475,7 @@ fn read_sum_estimated_bytes(
     Ok(nonnegative_i64_to_u64(count))
 }
 
-fn read_sqlite_storage_bytes(connection: &Connection) -> Result<u64, EvidenceError> {
+fn read_sqlite_storage_bytes(connection: &SqliteConnection) -> Result<u64, EvidenceError> {
     let page_count: i64 = connection
         .query_row("PRAGMA page_count", [], |row| row.get(0))
         .map_err(|source| EvidenceError::Sqlite {
