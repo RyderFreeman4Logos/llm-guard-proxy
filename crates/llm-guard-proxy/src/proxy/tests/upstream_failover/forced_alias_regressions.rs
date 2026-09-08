@@ -98,6 +98,141 @@ async fn forced_alias_openai_to_deepinfra_failover_preserves_native_body_and_met
 }
 
 #[tokio::test]
+async fn forced_alias_in_flight_hot_reload_keeps_retry_snapshot() {
+    let (primary_base_url, _primary) = spawn_shielded_503_upstream().await;
+    let (backup_base_url, mut receiver, release, _backup) = spawn_retry_boundary_upstream().await;
+    let config = forced_alias_config(&shielded_openai_failover_profile_config(
+        &primary_base_url,
+        &backup_base_url,
+    ));
+    let proxy = spawn_observed_failover_proxy(&backup_base_url, &config).await;
+    let client = proxy.client.clone();
+    let url = format!("{}/v1/chat/completions", proxy.base_url);
+    let request = tokio::spawn(async move {
+        client
+            .post(url)
+            .json(&json!({
+                "model": FORCED_RERANK_ALIAS,
+                "stream": true,
+                "messages": [{"role": "user", "content": "retain profile A"}],
+            }))
+            .send()
+            .await
+    });
+
+    let probe = receiver
+        .recv()
+        .await
+        .expect("failover readiness probe should reach the boundary");
+    assert_eq!(probe.path_and_query, "/v1/models");
+    let current = fs::read_to_string(proxy.root.join("config.toml"))
+        .expect("current config should be readable");
+    let reloaded = current
+        .replace(
+            "upstream_model = \"aeon-ultimate\"",
+            "upstream_model = \"reloaded-canonical\"",
+        )
+        .replace("output_cap = 16", "output_cap = 8")
+        .replace("temperature = 0.7", "temperature = 0.2");
+    let replacement = proxy.root.join("config.next");
+    fs::write(&replacement, reloaded).expect("profile B should be written");
+    fs::rename(&replacement, proxy.root.join("config.toml"))
+        .expect("profile B should be published");
+    proxy.manager.reload().expect("profile B should hot reload");
+    let live = proxy
+        .manager
+        .handle()
+        .snapshot()
+        .expect("reloaded snapshot should be readable");
+    let live_profile = &live.forced_model_alias_profiles[0];
+    assert_eq!(live_profile.upstream_model, "reloaded-canonical");
+    assert_eq!(live_profile.output_cap, Some(8));
+    assert_eq!(live_profile.temperature, Some(0.2));
+    release
+        .send(())
+        .expect("failover readiness should still be paused");
+
+    let response = timeout(STREAM_COMPLETION_TIMEOUT, request)
+        .await
+        .expect("retried request should complete")
+        .expect("retried request task should not panic")
+        .expect("retried request should succeed");
+    let status = response.status();
+    let response_body = response.text().await.expect("response should be readable");
+    assert_eq!(status, StatusCode::OK, "{response_body}");
+    assert!(
+        openai_sse_json_chunks(&response_body)
+            .iter()
+            .filter_map(|chunk| chunk.get("model"))
+            .all(|model| model == FORCED_RERANK_ALIAS),
+        "the client-facing response must retain the requested public alias"
+    );
+    let retry = receiver
+        .recv()
+        .await
+        .expect("failover attempt should reach the backup");
+    assert_eq!(retry.path_and_query, "/v1/chat/completions");
+    let body: serde_json::Value =
+        serde_json::from_slice(&retry.body).expect("retry body should be JSON");
+    assert_eq!(body["model"], "aeon-ultimate");
+    assert_eq!(body["temperature"], 0.7);
+    assert_eq!(body["max_tokens"], 16);
+    assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+}
+
+async fn spawn_retry_boundary_upstream() -> (
+    String,
+    mpsc::Receiver<ObservedRequest>,
+    oneshot::Sender<()>,
+    TestServer,
+) {
+    let (sender, receiver) = mpsc::channel(2);
+    let (release, release_rx) = oneshot::channel();
+    let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+    let app = Router::new().fallback({
+        let release_rx = Arc::clone(&release_rx);
+        move |request: Request<Body>| {
+            let sender = sender.clone();
+            let release_rx = Arc::clone(&release_rx);
+            async move {
+                let observed = observe_request(request).await;
+                let path = observed.path_and_query.clone();
+                let body = observed.body.clone();
+                sender
+                    .send(observed)
+                    .await
+                    .expect("retry-boundary observation should send");
+                if path == "/v1/models" {
+                    let release_rx = release_rx
+                        .lock()
+                        .expect("retry-boundary release should lock")
+                        .take()
+                        .expect("failover readiness should pause once");
+                    release_rx
+                        .await
+                        .expect("test should release failover readiness");
+                    json_response("models", r#"{"object":"list","data":[]}"#.to_owned())
+                } else {
+                    chat_completion_sse_response(&body)
+                }
+            }
+        }
+    });
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("retry-boundary upstream should bind");
+    let addr = listener
+        .local_addr()
+        .expect("retry-boundary upstream address should be available");
+    let server = TestServer::new(tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("retry-boundary upstream should serve");
+    }));
+    (format!("http://{addr}/v1"), receiver, release, server)
+}
+
+#[tokio::test]
 async fn heterogeneous_openai_terminal_restores_forced_public_model_on_success_and_failover() {
     let mut openai = FakeUpstream::spawn().await;
     let mut deepinfra = FakeUpstream::spawn_with_deepinfra_response(
