@@ -4656,6 +4656,17 @@ fn gb10_forced_model_alias_profiles_are_complete() {
     config.validate().expect("GB10 config should validate");
     let profiles = &config.forced_model_alias_profiles;
     assert_eq!(profiles.len(), 3);
+    assert_eq!(
+        profiles
+            .iter()
+            .map(|profile| profile.alias.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "abliterated-qwen-latest-27b-nvfp4-none",
+            "abliterated-qwen-latest-27b-nvfp4-low",
+            "abliterated-qwen-latest-27b-nvfp4-medium",
+        ]
+    );
     assert!(
         profiles
             .iter()
@@ -4664,7 +4675,7 @@ fn gb10_forced_model_alias_profiles_are_complete() {
 
     let none = profiles
         .iter()
-        .find(|profile| profile.alias.ends_with("none"))
+        .find(|profile| profile.alias == "abliterated-qwen-latest-27b-nvfp4-none")
         .expect("none profile");
     assert_eq!(none.upstream_model, "abliterated-qwen-latest-27b-nvfp4");
     assert_eq!(none.thinking_mode, Some(ThinkingMode::ForceDisable));
@@ -4680,7 +4691,7 @@ fn gb10_forced_model_alias_profiles_are_complete() {
     for suffix in ["low", "medium"] {
         let profile = profiles
             .iter()
-            .find(|profile| profile.alias.ends_with(suffix))
+            .find(|profile| profile.alias == format!("abliterated-qwen-latest-27b-nvfp4-{suffix}"))
             .expect("configured thinking profile");
         assert_eq!(profile.upstream_model, "abliterated-qwen-latest-27b-nvfp4");
         assert_eq!(profile.thinking_mode, Some(ThinkingMode::ForceThinking));

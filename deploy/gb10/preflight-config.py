@@ -22,8 +22,13 @@ AEON_RESTART_COMMAND = [
     "vllm-aeon-27b-dflash-n12.service",
 ]
 RECOVERY_COMPLETION_GUARD_MS = 1_000
+RESERVED_INGRESS_MODEL_IDS = [
+    "abliterated-qwen-latest-27b-nvfp4",
+    "aeon",
+    "aeon-ultimate",
+]
 FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
-    "abliterated-qwen-latest-27b-none": {
+    "abliterated-qwen-latest-27b-nvfp4-none": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_disable",
         "output_cap": 16_384,
@@ -34,7 +39,7 @@ FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
         "presence_penalty": 1.5,
         "repetition_penalty": 1.0,
     },
-    "abliterated-qwen-latest-27b-low": {
+    "abliterated-qwen-latest-27b-nvfp4-low": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_thinking",
         "thinking_budget": 65_536,
@@ -46,7 +51,7 @@ FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
         "presence_penalty": 0,
         "repetition_penalty": 1,
     },
-    "abliterated-qwen-latest-27b-medium": {
+    "abliterated-qwen-latest-27b-nvfp4-medium": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_thinking",
         "thinking_budget": 65_536,
@@ -155,6 +160,15 @@ def _forced_alias_profile_errors(config: dict[str, JsonValue]) -> list[str]:
     )
 
 
+def _reserved_ingress_errors(config: dict[str, JsonValue]) -> list[str]:
+    reserved = _table(config, "upstream").get("reserved_ingress_model_ids")
+    return (
+        []
+        if reserved == RESERVED_INGRESS_MODEL_IDS
+        else ["upstream.reserved_ingress_model_ids must exactly match the reserved identities"]
+    )
+
+
 def minimum_downstream_idle_timeout_ms(config: dict[str, JsonValue]) -> int | None:
     """Return the strict byte-silent bound including recovery handoff and replay."""
     retry = _table(config, "retry")
@@ -190,6 +204,7 @@ def validate_snapshot(
 ) -> tuple[list[str], int | None]:
     errors: list[str] = []
     errors.extend(_forced_alias_profile_errors(config))
+    errors.extend(_reserved_ingress_errors(config))
     if "guard_workflows" in config:
         errors.append("guard_workflows must remain inactive in the reviewed snapshot")
 

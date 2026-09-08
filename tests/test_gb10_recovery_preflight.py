@@ -121,7 +121,7 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
         profiles = self.config["forced_model_alias_profiles"]
         self.assertEqual(len(profiles), 3)
         expected = {
-            "abliterated-qwen-latest-27b-none": {
+            "abliterated-qwen-latest-27b-nvfp4-none": {
                 "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                 "thinking_mode": "force_disable",
                 "output_cap": 16_384,
@@ -132,7 +132,7 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 "presence_penalty": 1.5,
                 "repetition_penalty": 1.0,
             },
-            "abliterated-qwen-latest-27b-low": {
+            "abliterated-qwen-latest-27b-nvfp4-low": {
                 "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                 "thinking_mode": "force_thinking",
                 "thinking_budget": 65_536,
@@ -144,7 +144,7 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 "presence_penalty": 0,
                 "repetition_penalty": 1,
             },
-            "abliterated-qwen-latest-27b-medium": {
+            "abliterated-qwen-latest-27b-nvfp4-medium": {
                 "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                 "thinking_mode": "force_thinking",
                 "thinking_budget": 65_536,
@@ -171,14 +171,14 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
             {profile["upstream_model"] for profile in profiles},
         )
         for alias, field in [
-            ("abliterated-qwen-latest-27b-low", "thinking_budget"),
-            ("abliterated-qwen-latest-27b-none", "output_cap"),
-            ("abliterated-qwen-latest-27b-none", "temperature"),
-            ("abliterated-qwen-latest-27b-none", "top_p"),
-            ("abliterated-qwen-latest-27b-none", "top_k"),
-            ("abliterated-qwen-latest-27b-none", "min_p"),
-            ("abliterated-qwen-latest-27b-none", "presence_penalty"),
-            ("abliterated-qwen-latest-27b-none", "repetition_penalty"),
+            ("abliterated-qwen-latest-27b-nvfp4-low", "thinking_budget"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "output_cap"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "temperature"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "top_p"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "top_k"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "min_p"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "presence_penalty"),
+            ("abliterated-qwen-latest-27b-nvfp4-none", "repetition_penalty"),
         ]:
             with self.subTest(boolean_numeric_field=field):
                 candidate = copy.deepcopy(self.config)
@@ -208,16 +208,16 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
         for mutation, alias, field, value in [
             ("absent", None, None, None),
             ("extra", None, None, None),
-            ("upstream", "abliterated-qwen-latest-27b-none", "upstream_model", "wrong"),
-            ("thinking mode", "abliterated-qwen-latest-27b-none", "thinking_mode", "force_thinking"),
-            ("thinking budget", "abliterated-qwen-latest-27b-low", "thinking_budget", 1),
-            ("output", "abliterated-qwen-latest-27b-none", "output_cap", 1),
-            ("temperature", "abliterated-qwen-latest-27b-none", "temperature", 1),
-            ("top_p", "abliterated-qwen-latest-27b-none", "top_p", 1),
-            ("top_k", "abliterated-qwen-latest-27b-none", "top_k", 1),
-            ("min_p", "abliterated-qwen-latest-27b-none", "min_p", 1),
-            ("presence_penalty", "abliterated-qwen-latest-27b-none", "presence_penalty", 0),
-            ("repetition_penalty", "abliterated-qwen-latest-27b-none", "repetition_penalty", 0.5),
+            ("upstream", "abliterated-qwen-latest-27b-nvfp4-none", "upstream_model", "wrong"),
+            ("thinking mode", "abliterated-qwen-latest-27b-nvfp4-none", "thinking_mode", "force_thinking"),
+            ("thinking budget", "abliterated-qwen-latest-27b-nvfp4-low", "thinking_budget", 1),
+            ("output", "abliterated-qwen-latest-27b-nvfp4-none", "output_cap", 1),
+            ("temperature", "abliterated-qwen-latest-27b-nvfp4-none", "temperature", 1),
+            ("top_p", "abliterated-qwen-latest-27b-nvfp4-none", "top_p", 1),
+            ("top_k", "abliterated-qwen-latest-27b-nvfp4-none", "top_k", 1),
+            ("min_p", "abliterated-qwen-latest-27b-nvfp4-none", "min_p", 1),
+            ("presence_penalty", "abliterated-qwen-latest-27b-nvfp4-none", "presence_penalty", 0),
+            ("repetition_penalty", "abliterated-qwen-latest-27b-nvfp4-none", "repetition_penalty", 0.5),
         ]:
             with self.subTest(mutation=mutation):
                 candidate = copy.deepcopy(self.config)
@@ -231,6 +231,30 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 else:
                     profile = next(profile for profile in candidate_profiles if profile["alias"] == alias)
                     profile[field] = value
+                errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
+                self.assertTrue(errors)
+
+    def test_reserved_ingress_identities_are_exact_and_fail_closed(self) -> None:
+        self.assertEqual(
+            self.config["upstream"]["reserved_ingress_model_ids"],
+            [
+                "abliterated-qwen-latest-27b-nvfp4",
+                "aeon",
+                "aeon-ultimate",
+            ],
+        )
+        for mutation in ("absent", "missing-aeon", "extra"):
+            with self.subTest(mutation=mutation):
+                candidate = copy.deepcopy(self.config)
+                if mutation == "absent":
+                    candidate["upstream"].pop("reserved_ingress_model_ids")
+                elif mutation == "missing-aeon":
+                    candidate["upstream"]["reserved_ingress_model_ids"] = [
+                        "abliterated-qwen-latest-27b-nvfp4",
+                        "aeon-ultimate",
+                    ]
+                else:
+                    candidate["upstream"]["reserved_ingress_model_ids"].append("extra")
                 errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
                 self.assertTrue(errors)
 

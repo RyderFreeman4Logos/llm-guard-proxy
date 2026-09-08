@@ -7,7 +7,7 @@ const FORCED_MODEL_ALIAS_PROFILES_CONFIG: &str = r#"
 reserved_ingress_model_ids = ["abliterated-qwen-latest-27b-nvfp4", "aeon", "aeon-ultimate"]
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-none"
+alias = "abliterated-qwen-latest-27b-nvfp4-none"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
@@ -19,7 +19,7 @@ presence_penalty = 1.5
 repetition_penalty = 1.0
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-low"
+alias = "abliterated-qwen-latest-27b-nvfp4-low"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
@@ -32,7 +32,7 @@ presence_penalty = 0.0
 repetition_penalty = 1.0
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-medium"
+alias = "abliterated-qwen-latest-27b-nvfp4-medium"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
@@ -105,7 +105,7 @@ async fn guard_listener_rejects_reserved_forced_alias_upstream_model_before_forw
         }
     }
 
-    let retired_alias = format!("{}-none", "abliterated-qwen-latest-27b-nvfp4");
+    let retired_alias = "abliterated-qwen-latest-27b-none";
     let response = proxy_handler(
         State(guard_state),
         Request::builder()
@@ -198,7 +198,7 @@ async fn forced_alias_is_rejected_on_responses_before_forwarding() {
             .uri("/v1/responses")
             .header(CONTENT_TYPE, "application/json")
             .body(Body::from(
-                r#"{"model":"abliterated-qwen-latest-27b-none","input":"ping"}"#,
+                r#"{"model":"abliterated-qwen-latest-27b-nvfp4-none","input":"ping"}"#,
             ))
             .expect("responses request should build"),
     )
@@ -270,9 +270,9 @@ async fn guard_listener_lists_forced_aliases_before_reserved_model_filtering() {
         vec![
             "unrelated-model",
             "pooling-model",
-            "abliterated-qwen-latest-27b-none",
-            "abliterated-qwen-latest-27b-low",
-            "abliterated-qwen-latest-27b-medium",
+            "abliterated-qwen-latest-27b-nvfp4-none",
+            "abliterated-qwen-latest-27b-nvfp4-low",
+            "abliterated-qwen-latest-27b-nvfp4-medium",
         ],
         "forced aliases must be materialized before reserved model filtering"
     );
@@ -918,20 +918,24 @@ async fn guard_listener_hot_reload_updates_reserved_identity_with_alias_generati
     let changed = std::fs::read_to_string(proxy.root.join("config.toml"))
         .expect("read fixture config")
         .replace(
-            "abliterated-qwen-latest-27b-none",
-            "abliterated-qwen-latest-27b-none-reloaded",
+            "abliterated-qwen-latest-27b-nvfp4-none",
+            "abliterated-qwen-latest-27b-nvfp4-none-reloaded",
         )
         .replace(
-            "abliterated-qwen-latest-27b-low",
-            "abliterated-qwen-latest-27b-low-reloaded",
+            "abliterated-qwen-latest-27b-nvfp4-low",
+            "abliterated-qwen-latest-27b-nvfp4-low-reloaded",
         )
         .replace(
-            "abliterated-qwen-latest-27b-medium",
-            "abliterated-qwen-latest-27b-medium-reloaded",
+            "abliterated-qwen-latest-27b-nvfp4-medium",
+            "abliterated-qwen-latest-27b-nvfp4-medium-reloaded",
         )
         .replace(
-            "abliterated-qwen-latest-27b-nvfp4",
-            "test-reloaded-canonical",
+            "reserved_ingress_model_ids = [\"abliterated-qwen-latest-27b-nvfp4\", \"aeon\", \"aeon-ultimate\"]",
+            "reserved_ingress_model_ids = [\"test-reloaded-canonical\", \"aeon\", \"aeon-ultimate\"]",
+        )
+        .replace(
+            "upstream_model = \"abliterated-qwen-latest-27b-nvfp4\"",
+            "upstream_model = \"test-reloaded-canonical\"",
         );
     std::fs::write(&replacement, &changed).expect("write changed generation");
     std::fs::rename(&replacement, proxy.root.join("config.toml"))
@@ -964,7 +968,7 @@ async fn guard_listener_hot_reload_updates_reserved_identity_with_alias_generati
 
     let response = proxy_handler(
         State(guard_state.clone()),
-        reserved("abliterated-qwen-latest-27b-none-reloaded"),
+        reserved("abliterated-qwen-latest-27b-nvfp4-none-reloaded"),
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -978,7 +982,7 @@ async fn guard_listener_hot_reload_updates_reserved_identity_with_alias_generati
     std::fs::write(
         &replacement,
         format!(
-            "{changed}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-none-reloaded\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
+            "{changed}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-nvfp4-none-reloaded\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
         ),
     )
     .expect("write invalid generation");
@@ -1392,7 +1396,7 @@ async fn forced_model_alias_policy_rewrites_streaming_and_non_streaming_requests
         &fake.base_url,
         r#"
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-none"
+alias = "abliterated-qwen-latest-27b-nvfp4-none"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
@@ -1411,12 +1415,13 @@ repetition_penalty = 1.0
             .post(format!("{}/v1/chat/completions", proxy.base_url))
             .header(CONTENT_TYPE, "application/json")
             .body(format!(
-                r#"{{"model":"abliterated-qwen-latest-27b-none","messages":[{{"role":"user","content":"ping"}}],"stream":{stream},"reasoning_effort":"high","model_reasoning_effort":"high","thinking_token_budget":999,"thinking_budget":999,"enable_thinking":false,"temperature":9,"top_p":9,"top_k":9,"min_p":9,"presence_penalty":9,"frequency_penalty":9,"repetition_penalty":9,"max_completion_tokens":9,"extra_body":{{"temperature":8,"max_tokens":8,"frequency_penalty":8,"thinking":{{"enabled":true,"budget_tokens":8}},"chat_template_kwargs":{{"enable_thinking":true,"thinking_budget":8}}}},"arbitrary":{{"reasoning_effort":"high","max_output_tokens":8,"frequency_penalty":8,"children":[{{"min_p":8,"output_tokens":8,"frequency_penalty":8}},[{{"frequency_penalty":8}}]]}}}}"#
+                r#"{{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[{{"role":"user","content":"ping"}}],"stream":{stream},"reasoning_effort":"high","model_reasoning_effort":"high","thinking_token_budget":999,"thinking_budget":999,"enable_thinking":false,"temperature":9,"top_p":9,"top_k":9,"min_p":9,"presence_penalty":9,"frequency_penalty":9,"repetition_penalty":9,"max_completion_tokens":9,"extra_body":{{"temperature":8,"max_tokens":8,"frequency_penalty":8,"thinking":{{"enabled":true,"budget_tokens":8}},"chat_template_kwargs":{{"enable_thinking":true,"thinking_budget":8}}}},"arbitrary":{{"reasoning_effort":"high","max_output_tokens":8,"frequency_penalty":8,"children":[{{"min_p":8,"output_tokens":8,"frequency_penalty":8}},[{{"frequency_penalty":8}}]]}}}}"#
             ))
             .send()
             .await
             .expect("forced policy request should complete");
-        assert_forced_response_model(response, stream, "abliterated-qwen-latest-27b-none").await;
+        assert_forced_response_model(response, stream, "abliterated-qwen-latest-27b-nvfp4-none")
+            .await;
         let observed = fake.recv_next().await;
         let body: serde_json::Value =
             serde_json::from_slice(&observed.body).expect("JSON upstream body");
@@ -1436,7 +1441,7 @@ repetition_penalty = 1.0
         .client
         .post(format!("{}/v1/chat/completions", proxy.base_url))
         .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"abliterated-qwen-latest-27b-none","messages":[],"stream":false}"#)
+        .body(r#"{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[],"stream":false}"#)
         .send()
         .await
         .expect("reloaded request should complete");
@@ -1448,7 +1453,7 @@ repetition_penalty = 1.0
     std::fs::write(
         &replacement,
         format!(
-            "{changed}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
+            "{changed}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-nvfp4-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
         ),
     )
     .expect("write colliding generation");
@@ -1462,7 +1467,7 @@ repetition_penalty = 1.0
         .client
         .post(format!("{}/v1/chat/completions", proxy.base_url))
         .header(CONTENT_TYPE, "application/json")
-        .body(r#"{"model":"abliterated-qwen-latest-27b-none","messages":[],"stream":false}"#)
+        .body(r#"{"model":"abliterated-qwen-latest-27b-nvfp4-none","messages":[],"stream":false}"#)
         .send()
         .await
         .expect("last-good request should complete");
@@ -1506,7 +1511,7 @@ max_tokens = 50000
 
     for (alias, thinking, budget, temperature, top_p, presence_penalty) in [
         (
-            "abliterated-qwen-latest-27b-none",
+            "abliterated-qwen-latest-27b-nvfp4-none",
             false,
             None,
             0.7,
@@ -1514,7 +1519,7 @@ max_tokens = 50000
             1.5,
         ),
         (
-            "abliterated-qwen-latest-27b-low",
+            "abliterated-qwen-latest-27b-nvfp4-low",
             true,
             Some(65536),
             1.0,
@@ -1522,7 +1527,7 @@ max_tokens = 50000
             0.0,
         ),
         (
-            "abliterated-qwen-latest-27b-medium",
+            "abliterated-qwen-latest-27b-nvfp4-medium",
             true,
             Some(65536),
             1.0,

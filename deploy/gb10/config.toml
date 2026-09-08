@@ -199,7 +199,7 @@ input_token_safety_margin = 512           # Tokens reserved for response
 # END PARSEABLE EXAMPLE: forced-model-alias-profile
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-none"
+alias = "abliterated-qwen-latest-27b-nvfp4-none"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
@@ -211,7 +211,7 @@ presence_penalty = 1.5
 repetition_penalty = 1.0
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-low"
+alias = "abliterated-qwen-latest-27b-nvfp4-low"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
@@ -224,7 +224,7 @@ presence_penalty = 0
 repetition_penalty = 1
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-medium"
+alias = "abliterated-qwen-latest-27b-nvfp4-medium"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
