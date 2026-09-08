@@ -15,6 +15,7 @@ JsonValue: TypeAlias = (
 )
 
 AEON_PROFILE = "aeon-chat"
+AEON_DEFAULT_NO_THINK = "aeon-default-no-think"
 AEON_RESTART_COMMAND = [
     "systemctl",
     "--user",
@@ -22,8 +23,13 @@ AEON_RESTART_COMMAND = [
     "vllm-aeon-27b-dflash-n12.service",
 ]
 RECOVERY_COMPLETION_GUARD_MS = 1_000
+RESERVED_INGRESS_MODEL_IDS = [
+    "abliterated-qwen-latest-27b-nvfp4",
+    "aeon",
+    "aeon-ultimate",
+]
 FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
-    "abliterated-qwen-latest-27b-none": {
+    "abliterated-qwen-latest-27b-nvfp4-none": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_disable",
         "output_cap": 16_384,
@@ -34,7 +40,7 @@ FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
         "presence_penalty": 1.5,
         "repetition_penalty": 1.0,
     },
-    "abliterated-qwen-latest-27b-low": {
+    "abliterated-qwen-latest-27b-nvfp4-low": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_thinking",
         "thinking_budget": 65_536,
@@ -46,7 +52,7 @@ FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
         "presence_penalty": 0,
         "repetition_penalty": 1,
     },
-    "abliterated-qwen-latest-27b-medium": {
+    "abliterated-qwen-latest-27b-nvfp4-medium": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_thinking",
         "thinking_budget": 65_536,
@@ -155,6 +161,77 @@ def _forced_alias_profile_errors(config: dict[str, JsonValue]) -> list[str]:
     )
 
 
+def _named_upstream_membership_errors(config: dict[str, JsonValue]) -> list[str]:
+    expected = list(FORCED_ALIAS_PROFILES)
+    profiles = config.get("upstreams")
+    if not isinstance(profiles, list):
+        return [f"{AEON_DEFAULT_NO_THINK} routing profile is missing"]
+    names: list[str] = []
+    typed_profiles: list[dict[str, JsonValue]] = []
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            return ["upstreams entries must be tables"]
+        name = profile.get("name")
+        match_models = profile.get("match_models")
+        if not isinstance(name, str) or not isinstance(match_models, list):
+            return ["upstreams entries must have string names and match_models lists"]
+        if not all(isinstance(model, str) for model in match_models):
+            return ["upstreams match_models entries must be strings"]
+        names.append(name)
+        typed_profiles.append(profile)
+    if len(set(names)) != len(names) or "default" in names:
+        return ["upstreams names must be unique and must not duplicate the implicit default profile"]
+    default_chat = next(
+        (
+            profile
+            for profile in typed_profiles
+            if profile.get("name") == AEON_DEFAULT_NO_THINK
+        ),
+        None,
+    )
+    if not isinstance(default_chat, dict):
+        return [f"{AEON_DEFAULT_NO_THINK} routing profile is missing"]
+    if default_chat.get("match_models") != expected:
+        return [
+            f"{AEON_DEFAULT_NO_THINK} match_models must exactly match the public NVFP4 aliases"
+        ]
+    canonical_targets = {
+        model
+        for settings in FORCED_ALIAS_PROFILES.values()
+        if isinstance(model := settings.get("upstream_model"), str)
+    }
+    membership = {alias: [] for alias in expected}
+    for profile in typed_profiles:
+        name = profile.get("name")
+        match_models = profile.get("match_models")
+        if not isinstance(name, str) or not isinstance(match_models, list):
+            return ["upstreams entries must have string names and match_models lists"]
+        for alias in expected:
+            if alias in match_models:
+                membership[alias].append(name)
+        if name != AEON_DEFAULT_NO_THINK and any(
+            isinstance(model, str) and model in canonical_targets
+            for model in match_models
+        ):
+            return ["forced canonical targets must not match competing upstream profiles"]
+    return (
+        []
+        if all(names == [AEON_DEFAULT_NO_THINK] for names in membership.values())
+        else [
+            f"public NVFP4 aliases must belong exclusively to {AEON_DEFAULT_NO_THINK}"
+        ]
+    )
+
+
+def _reserved_ingress_errors(config: dict[str, JsonValue]) -> list[str]:
+    reserved = _table(config, "upstream").get("reserved_ingress_model_ids")
+    return (
+        []
+        if reserved == RESERVED_INGRESS_MODEL_IDS
+        else ["upstream.reserved_ingress_model_ids must exactly match the reserved identities"]
+    )
+
+
 def minimum_downstream_idle_timeout_ms(config: dict[str, JsonValue]) -> int | None:
     """Return the strict byte-silent bound including recovery handoff and replay."""
     retry = _table(config, "retry")
@@ -190,6 +267,8 @@ def validate_snapshot(
 ) -> tuple[list[str], int | None]:
     errors: list[str] = []
     errors.extend(_forced_alias_profile_errors(config))
+    errors.extend(_reserved_ingress_errors(config))
+    errors.extend(_named_upstream_membership_errors(config))
     if "guard_workflows" in config:
         errors.append("guard_workflows must remain inactive in the reviewed snapshot")
 

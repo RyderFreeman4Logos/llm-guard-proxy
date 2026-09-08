@@ -51,12 +51,14 @@ recovery policy relative to the previously installed snapshot:
   recovery replay per downstream request. Named profiles do not inherit the
   default route's recovery table.
 - `[[forced_model_alias_profiles]]` carries exactly three hot-reloadable immutable aliases:
-  `abliterated-qwen-latest-27b-none` disables thinking with temperature
+  `abliterated-qwen-latest-27b-nvfp4-none` disables thinking with temperature
   `0.7`, `top_p 0.80`, presence penalty `1.5`, and a `16384` output cap;
-  `abliterated-qwen-latest-27b-low` and
-  `abliterated-qwen-latest-27b-medium` each force `65536` thinking tokens with
+  `abliterated-qwen-latest-27b-nvfp4-low` and
+  `abliterated-qwen-latest-27b-nvfp4-medium` each force `65536` thinking tokens with
   `1.0/0.95/20/0/0/1.0` sampler values and the same output cap. No `xhigh`
-  alias is configured.
+  alias is configured. `upstream.reserved_ingress_model_ids` hides and rejects
+  the internal identities `abliterated-qwen-latest-27b-nvfp4`, `aeon`, and
+  `aeon-ultimate` at listing and ingress.
 
 The guardian values must match the operational source of truth exactly. Do not
 replace current listener routing, per-upstream concurrency, timeouts, evidence
