@@ -29,7 +29,7 @@ RESERVED_INGRESS_MODEL_IDS = [
     "aeon-ultimate",
 ]
 FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
-    "abliterated-qwen-latest-27b-nvfp4-none": {
+    "abliterated-qwen-latest-27b-none": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_disable",
         "output_cap": 16_384,
@@ -40,10 +40,11 @@ FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
         "presence_penalty": 1.5,
         "repetition_penalty": 1.0,
     },
-    "abliterated-qwen-latest-27b-nvfp4-low": {
+    "abliterated-qwen-latest-27b-low": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_thinking",
         "thinking_budget": 65_536,
+        "reasoning_effort": "low",
         "output_cap": 16_384,
         "temperature": 1,
         "top_p": 0.95,
@@ -52,10 +53,11 @@ FORCED_ALIAS_PROFILES: dict[str, dict[str, JsonValue]] = {
         "presence_penalty": 0,
         "repetition_penalty": 1,
     },
-    "abliterated-qwen-latest-27b-nvfp4-medium": {
+    "abliterated-qwen-latest-27b-medium": {
         "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
         "thinking_mode": "force_thinking",
         "thinking_budget": 65_536,
+        "reasoning_effort": "medium",
         "output_cap": 16_384,
         "temperature": 1,
         "top_p": 0.95,
@@ -193,7 +195,7 @@ def _named_upstream_membership_errors(config: dict[str, JsonValue]) -> list[str]
         return [f"{AEON_DEFAULT_NO_THINK} routing profile is missing"]
     if default_chat.get("match_models") != expected:
         return [
-            f"{AEON_DEFAULT_NO_THINK} match_models must exactly match the public NVFP4 aliases"
+            f"{AEON_DEFAULT_NO_THINK} match_models must exactly match the public forced aliases"
         ]
     canonical_targets = {
         model
@@ -218,7 +220,7 @@ def _named_upstream_membership_errors(config: dict[str, JsonValue]) -> list[str]
         []
         if all(names == [AEON_DEFAULT_NO_THINK] for names in membership.values())
         else [
-            f"public NVFP4 aliases must belong exclusively to {AEON_DEFAULT_NO_THINK}"
+            f"public forced aliases must belong exclusively to {AEON_DEFAULT_NO_THINK}"
         ]
     )
 

@@ -674,7 +674,7 @@ mod tests {
 interval_secs = 4
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-none"
+alias = "abliterated-qwen-latest-27b-none"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
@@ -700,7 +700,7 @@ repetition_penalty = 1.0
         replace_config_atomically(
             &path,
             format!(
-                "{}\n[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-nvfp4-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n",
+                "{}\n[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n",
                 valid.replace("interval_secs = 4", "interval_secs = 6")
             ),
         );
