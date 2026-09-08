@@ -308,6 +308,35 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
                 self.assertTrue(errors)
 
+    def test_named_upstream_routing_rejects_competing_or_malformed_profiles(self) -> None:
+        canonical = "abliterated-qwen-latest-27b-nvfp4"
+        for mutation in ("competing-canonical", "duplicate-name", "string-match-models"):
+            with self.subTest(mutation=mutation):
+                candidate = copy.deepcopy(self.config)
+                if mutation == "competing-canonical":
+                    profile = next(
+                        item
+                        for item in candidate["upstreams"]
+                        if item["name"] == "aeon-chat"
+                    )
+                    profile["match_models"].append(canonical)
+                elif mutation == "duplicate-name":
+                    candidate["upstreams"].append(
+                        {
+                            "name": "aeon-default-no-think",
+                            "match_models": ["unrelated-model"],
+                        }
+                    )
+                else:
+                    profile = next(
+                        item
+                        for item in candidate["upstreams"]
+                        if item["name"] == "aeon-chat"
+                    )
+                    profile["match_models"] = "not-a-list"
+                errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
+                self.assertTrue(errors)
+
 
 if __name__ == "__main__":
     unittest.main()

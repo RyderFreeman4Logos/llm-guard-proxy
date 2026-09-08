@@ -166,11 +166,26 @@ def _named_upstream_membership_errors(config: dict[str, JsonValue]) -> list[str]
     profiles = config.get("upstreams")
     if not isinstance(profiles, list):
         return [f"{AEON_DEFAULT_NO_THINK} routing profile is missing"]
+    names: list[str] = []
+    typed_profiles: list[dict[str, JsonValue]] = []
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            return ["upstreams entries must be tables"]
+        name = profile.get("name")
+        match_models = profile.get("match_models")
+        if not isinstance(name, str) or not isinstance(match_models, list):
+            return ["upstreams entries must have string names and match_models lists"]
+        if not all(isinstance(model, str) for model in match_models):
+            return ["upstreams match_models entries must be strings"]
+        names.append(name)
+        typed_profiles.append(profile)
+    if len(set(names)) != len(names) or "default" in names:
+        return ["upstreams names must be unique and must not duplicate the implicit default profile"]
     default_chat = next(
         (
             profile
-            for profile in profiles
-            if isinstance(profile, dict) and profile.get("name") == AEON_DEFAULT_NO_THINK
+            for profile in typed_profiles
+            if profile.get("name") == AEON_DEFAULT_NO_THINK
         ),
         None,
     )
@@ -180,17 +195,25 @@ def _named_upstream_membership_errors(config: dict[str, JsonValue]) -> list[str]
         return [
             f"{AEON_DEFAULT_NO_THINK} match_models must exactly match the public NVFP4 aliases"
         ]
+    canonical_targets = {
+        model
+        for settings in FORCED_ALIAS_PROFILES.values()
+        if isinstance(model := settings.get("upstream_model"), str)
+    }
     membership = {alias: [] for alias in expected}
-    for profile in profiles:
-        if not isinstance(profile, dict):
-            continue
+    for profile in typed_profiles:
         name = profile.get("name")
         match_models = profile.get("match_models")
         if not isinstance(name, str) or not isinstance(match_models, list):
-            continue
+            return ["upstreams entries must have string names and match_models lists"]
         for alias in expected:
             if alias in match_models:
                 membership[alias].append(name)
+        if name != AEON_DEFAULT_NO_THINK and any(
+            isinstance(model, str) and model in canonical_targets
+            for model in match_models
+        ):
+            return ["forced canonical targets must not match competing upstream profiles"]
     return (
         []
         if all(names == [AEON_DEFAULT_NO_THINK] for names in membership.values())
