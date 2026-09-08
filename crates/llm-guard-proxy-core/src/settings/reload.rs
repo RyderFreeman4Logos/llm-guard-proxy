@@ -56,10 +56,10 @@ impl ConfigHandle {
         Ok(guard.guardian.clone())
     }
 
-    /// Atomically applies the reloadable portion of a validated config.
+    /// Atomically applies the reloadable portion of a config candidate.
     ///
     /// Restart-required changes are reported but remain unchanged in the live
-    /// snapshot.
+    /// snapshot. Invalid projected snapshots are rejected without publishing.
     ///
     /// # Errors
     ///
@@ -83,11 +83,22 @@ impl ConfigHandle {
 ///
 /// The returned configuration preserves every restart-required value from
 /// `current`; the outcome reports those requested changes to the service.
+/// Invalid projected snapshots are not published.
 #[must_use]
 pub fn apply_reloadable(current: &AppConfig, requested: &AppConfig) -> (AppConfig, ReloadOutcome) {
     let restart_required_changes = current.restart_required_changes(requested);
     let mut next = current.clone();
     next.apply_reloadable_from(requested);
+    if let Err(rejection) = next.validate() {
+        return (
+            current.clone(),
+            ReloadOutcome {
+                applied: false,
+                restart_required_changes,
+                rejection: Some(rejection),
+            },
+        );
+    }
     let applied = next != *current;
     (
         next,

@@ -4410,6 +4410,7 @@ fn guardian_reload_metadata_lists_all_policy_fields() {
 
 mod endpoint_reload;
 mod profile_policy;
+mod reload_validation;
 
 #[test]
 fn reload_metadata_lists_cover_expected_fields() {
