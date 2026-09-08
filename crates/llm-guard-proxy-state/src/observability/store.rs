@@ -200,6 +200,12 @@ impl ObservabilityStore {
                 action: "enable SQLite foreign keys",
                 source,
             })?;
+        connection
+            .pragma_update(None, "recursive_triggers", "ON")
+            .map_err(|source| ObservabilityError::Sqlite {
+                action: "enable SQLite recursive triggers",
+                source,
+            })?;
         migrate(&mut connection)?;
         let metrics = reconstruct_metrics_accumulator(&connection)?;
 

@@ -1153,6 +1153,72 @@ fn retention_write_and_prune_stay_incremental_and_skip_vacuum() {
 }
 
 #[test]
+fn replacing_an_attempt_keeps_retention_counters_exact() {
+    let fixture = StoreFixture::new("attempt-replace-retention");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let request = request_record("req-attempt-replace", RequestStatus::Succeeded, 1_000);
+    store.record_request(&request).expect("request write");
+
+    let original = attempt_record(
+        "attempt-replace-same-id",
+        &request.request_id,
+        AttemptStatus::Succeeded,
+        1,
+        1_010,
+    );
+    store
+        .record_attempt(&original)
+        .expect("original attempt write");
+
+    let same_id_replacement = AttemptRecord {
+        status: AttemptStatus::Failed,
+        retry_reason: Some("x".repeat(64)),
+        ..original
+    };
+    store
+        .record_attempt(&same_id_replacement)
+        .expect("same attempt_id replacement");
+    assert_attempt_retention_matches_surviving_row(&store, 1);
+
+    let unique_pair_replacement = AttemptRecord {
+        attempt_id: AttemptId::from_string("attempt-replace-unique-pair")
+            .expect("test attempt id should be valid"),
+        retry_reason: Some("y".repeat(128)),
+        ..same_id_replacement
+    };
+    store
+        .record_attempt(&unique_pair_replacement)
+        .expect("(request_id, attempt_number) replacement");
+    assert_attempt_retention_matches_surviving_row(&store, 1);
+}
+
+fn assert_attempt_retention_matches_surviving_row(
+    store: &ObservabilityStore,
+    expected_attempts: i64,
+) {
+    let connection = store.lock_connection().expect("connection lock");
+    let attempt_rows = count_rows(&connection, "SELECT COUNT(*) FROM attempts");
+    let stats: (i64, i64) = connection
+        .query_row(
+            "SELECT attempt_count, logical_bytes FROM retention_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("retention stats should exist");
+    let surviving_bytes: i64 = connection
+        .query_row(
+            "SELECT COALESCE((SELECT SUM(estimated_bytes) FROM requests), 0)
+             + COALESCE((SELECT SUM(estimated_bytes) FROM attempts), 0)",
+            [],
+            |row| row.get(0),
+        )
+        .expect("surviving estimated bytes");
+    assert_eq!(attempt_rows, expected_attempts);
+    assert_eq!(stats.0, expected_attempts);
+    assert_eq!(stats.1, surviving_bytes);
+}
+
+#[test]
 fn vacuum_command_counter_increments_when_write_connection_runs_vacuum() {
     let fixture = StoreFixture::new("vacuum-oracle");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
