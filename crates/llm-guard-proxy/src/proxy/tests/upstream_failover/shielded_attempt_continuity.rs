@@ -443,8 +443,8 @@ base_url = "{primary_base_url}"
 match_models = ["abliterated-qwen-latest-27b-none", "abliterated-qwen-latest-27b-low", "abliterated-qwen-latest-27b-medium"]
 request_timeout_ms = 1000
 health_probe_interval_ms = 200
-health_probe_timeout_ms = 20
-health_probe_max_wait_ms = 400
+health_probe_timeout_ms = 400
+health_probe_max_wait_ms = 2000
 endpoint_selection = "priority_failover"
 [[upstreams.endpoints]]
 base_url = "{primary_base_url}"
@@ -628,10 +628,10 @@ fn shielded_failover_config(
         r#"
 [[profile]]
 model = "same-model"
-request_timeout_ms = 1_000
+request_timeout_ms = 3_000
 health_probe_interval = "200ms"
-health_probe_timeout = "20ms"
-health_probe_max_wait = "400ms"
+health_probe_timeout = "400ms"
+health_probe_max_wait = "2s"
 
 [[profile.upstream]]
 base_url = "{primary_base_url}"

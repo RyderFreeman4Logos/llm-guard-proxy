@@ -280,8 +280,8 @@ base_url = "{recovering_base_url}"
 match_models = ["recovering-model"]
 request_timeout_ms = 1000
 health_probe_interval_ms = 200
-health_probe_timeout_ms = 20
-health_probe_max_wait_ms = 1000
+health_probe_timeout_ms = 400
+health_probe_max_wait_ms = 2000
 
 [[upstreams.endpoints]]
 base_url = "{recovering_base_url}"

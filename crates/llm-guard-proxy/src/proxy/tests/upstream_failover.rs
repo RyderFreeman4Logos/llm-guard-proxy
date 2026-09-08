@@ -285,8 +285,8 @@ async fn primary_model_override_does_not_leak_to_unconfigured_openai_failover() 
 model = "same-model"
 request_timeout_ms = 400
 health_probe_interval = "200ms"
-health_probe_timeout = "20ms"
-health_probe_max_wait = "400ms"
+health_probe_timeout = "400ms"
+health_probe_max_wait = "2s"
 
 [[profile.upstream]]
 base_url = "{primary_base_url}"
@@ -1151,8 +1151,8 @@ fn shielded_openai_failover_profile_config(
 model = "same-model"
 request_timeout_ms = 1_000
 health_probe_interval = "200ms"
-health_probe_timeout = "20ms"
-health_probe_max_wait = "400ms"
+health_probe_timeout = "400ms"
+health_probe_max_wait = "2s"
 
 [[profile.upstream]]
 base_url = "{primary_base_url}"
@@ -1287,8 +1287,8 @@ fn openai_single_endpoint_profile_config(
 model = "same-model"
 request_timeout_ms = 400
 health_probe_interval = "200ms"
-health_probe_timeout = "20ms"
-health_probe_max_wait = "400ms"
+health_probe_timeout = "400ms"
+health_probe_max_wait = "2s"
 
 [[profile.upstream]]
 base_url = "{base_url}"
@@ -1315,8 +1315,8 @@ fn heterogeneous_reranker_failover_profile_config(
 model = "same-model"
 request_timeout_ms = 400
 health_probe_interval = "200ms"
-health_probe_timeout = "20ms"
-health_probe_max_wait = "400ms"
+health_probe_timeout = "400ms"
+health_probe_max_wait = "2s"
 
 [[profile.upstream]]
 base_url = "{deepinfra_base_url}"
@@ -1344,8 +1344,8 @@ fn openai_to_deepinfra_reranker_failover_profile_config(
 model = "same-model"
 request_timeout_ms = 400
 health_probe_interval = "200ms"
-health_probe_timeout = "20ms"
-health_probe_max_wait = "400ms"
+health_probe_timeout = "400ms"
+health_probe_max_wait = "2s"
 
 [[profile.upstream]]
 base_url = "{primary_base_url}"

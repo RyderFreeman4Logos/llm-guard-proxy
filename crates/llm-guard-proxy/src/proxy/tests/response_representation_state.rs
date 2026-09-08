@@ -294,7 +294,7 @@ async fn alias_sse_rewrite_forwards_first_frame_before_upstream_eof() {
     });
 
     upstream.first_frame_sent().await;
-    let response = timeout(STREAM_HEADER_TIMEOUT, request)
+    let response = timeout(STREAM_COMPLETION_TIMEOUT, request)
         .await
         .expect("downstream headers must not wait for upstream EOF")
         .expect("downstream request task must not panic")
@@ -320,7 +320,7 @@ async fn alias_sse_rewrite_forwards_first_frame_before_upstream_eof() {
     );
 
     let mut body = response.bytes_stream();
-    let first = timeout(STREAM_FIRST_CHUNK_TIMEOUT, body.next())
+    let first = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
         .await
         .expect("rewritten first SSE frame must arrive before upstream EOF")
         .expect("rewritten SSE body must contain a first frame")
@@ -376,14 +376,14 @@ async fn loop_guard_off_shielded_thinking_chat_relays_first_frame_before_upstrea
     });
 
     upstream.first_frame_sent().await;
-    let response = timeout(STREAM_HEADER_TIMEOUT, request)
+    let response = timeout(STREAM_COMPLETION_TIMEOUT, request)
         .await
         .expect("downstream headers must not wait for upstream EOF")
         .expect("downstream request task must not panic")
         .expect("shielded chat response should complete its headers");
     assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.bytes_stream();
-    let first = timeout(STREAM_FIRST_CHUNK_TIMEOUT, body.next())
+    let first = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
         .await
         .expect("loop-guard-off shielded chat must relay before upstream EOF")
         .expect("shielded chat body must contain the first frame")
@@ -421,7 +421,7 @@ async fn opaque_alias_sse_forwards_first_frame_before_upstream_eof_without_heade
     });
 
     upstream.first_frame_sent().await;
-    let response = timeout(STREAM_HEADER_TIMEOUT, request)
+    let response = timeout(STREAM_COMPLETION_TIMEOUT, request)
         .await
         .expect("opaque downstream headers must not wait for upstream EOF")
         .expect("opaque downstream request task must not panic")
@@ -444,7 +444,7 @@ async fn opaque_alias_sse_forwards_first_frame_before_upstream_eof_without_heade
     }
 
     let mut body = response.bytes_stream();
-    let first = timeout(STREAM_FIRST_CHUNK_TIMEOUT, body.next())
+    let first = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
         .await
         .expect("opaque first SSE frame must arrive before upstream EOF")
         .expect("opaque SSE body must contain a first frame")

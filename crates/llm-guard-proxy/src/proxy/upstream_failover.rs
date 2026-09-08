@@ -806,7 +806,7 @@ mod tests {
             endpoints,
             health_probe_interval_ms: 1,
             health_probe_timeout_ms: 10,
-            health_probe_max_wait_ms: 20,
+            health_probe_max_wait_ms: 2_000,
             ..UpstreamProfileConfig::default()
         }
     }

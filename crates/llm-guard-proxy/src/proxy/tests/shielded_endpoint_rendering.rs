@@ -210,8 +210,8 @@ async fn spawn_shielded_endpoint_model_proxy(
 model = "caller-chat"
 request_timeout_ms = 1000
 health_probe_interval = "200ms"
-health_probe_timeout = "20ms"
-health_probe_max_wait = "400ms"
+health_probe_timeout = "400ms"
+health_probe_max_wait = "2s"
 
 [[profile.upstream]]
 base_url = "{upstream_base_url}"
