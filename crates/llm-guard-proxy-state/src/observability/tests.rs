@@ -29,7 +29,7 @@ fn creates_sqlite_schema_in_test_temp_directory() {
     let fixture = StoreFixture::new("schema");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
 
-    assert_eq!(store.schema_version().expect("schema version"), 3);
+    assert_eq!(store.schema_version().expect("schema version"), 4);
     assert!(fixture.sqlite_path.exists());
 
     let connection = store.lock_connection().expect("connection lock");
@@ -142,7 +142,7 @@ PRAGMA user_version = 2;
 
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
     let store = ObservabilityStore::open(manager).expect("legacy schema should migrate");
-    assert_eq!(store.schema_version().expect("schema version"), 3);
+    assert_eq!(store.schema_version().expect("schema version"), 4);
 
     let connection = store.lock_connection().expect("connection lock");
     let migrated_usage: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = connection
@@ -153,6 +153,30 @@ PRAGMA user_version = 2;
         )
         .expect("migrated attempt should be readable");
     assert_eq!(migrated_usage, (None, None, None, None));
+}
+
+#[test]
+fn reopens_interrupted_v4_schema_when_user_version_still_3() {
+    let fixture = StoreFixture::new("schema-v4-interrupted");
+    let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let store = ObservabilityStore::open(manager.clone()).expect("initial store should open");
+    assert_eq!(store.schema_version().expect("schema version"), 4);
+    drop(store);
+
+    let connection = rusqlite::Connection::open(&fixture.sqlite_path)
+        .expect("interrupted SQLite database should open");
+    connection
+        .execute_batch("PRAGMA user_version = 3;")
+        .expect("v4 objects should remain labeled as schema v3");
+    let labeled_version: i64 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .expect("interrupted schema version should be readable");
+    assert_eq!(labeled_version, 3);
+    drop(connection);
+
+    let store = ObservabilityStore::open(manager)
+        .expect("interrupted v4 schema should reopen without duplicate-column failure");
+    assert_eq!(store.schema_version().expect("schema version"), 4);
 }
 
 #[cfg(unix)]
@@ -1085,6 +1109,134 @@ fn metrics_snapshot_work_is_independent_of_retained_row_count() {
 }
 
 #[test]
+fn retention_write_and_prune_stay_incremental_and_skip_vacuum() {
+    let fixture = StoreFixture::new("retention-write-prune-hot-path");
+    let manager =
+        fixture.manager_with_max_records(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES, 4);
+    let store = ObservabilityStore::open(manager).expect("store should open");
+    let full_table_count_queries_before = super::store::full_table_count_queries();
+    let full_table_sum_queries_before = super::store::full_table_sum_queries();
+    let vacuum_commands_before = super::store::vacuum_commands();
+
+    for index in 0_u64..6 {
+        store
+            .record_request(&request_record(
+                &format!("req-retention-hot-{index}"),
+                RequestStatus::Succeeded,
+                1_000 + index,
+            ))
+            .expect("retention write should succeed");
+    }
+
+    assert_eq!(
+        super::store::full_table_count_queries(),
+        full_table_count_queries_before,
+        "observability write/prune must not run full-table COUNT(*) queries",
+    );
+    assert_eq!(
+        super::store::full_table_sum_queries(),
+        full_table_sum_queries_before,
+        "observability prune must not run full-table SUM queries",
+    );
+    assert_eq!(
+        super::store::vacuum_commands(),
+        vacuum_commands_before,
+        "observability prune must not VACUUM on the request write path",
+    );
+
+    let usage = store
+        .retention_usage()
+        .expect("retention usage after prune");
+    assert_eq!(usage.request_count, 4);
+    assert_eq!(usage.attempt_count, 0);
+    assert_eq!(usage.record_count, 4);
+}
+
+#[test]
+fn replacing_an_attempt_keeps_retention_counters_exact() {
+    let fixture = StoreFixture::new("attempt-replace-retention");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let request = request_record("req-attempt-replace", RequestStatus::Succeeded, 1_000);
+    store.record_request(&request).expect("request write");
+
+    let original = attempt_record(
+        "attempt-replace-same-id",
+        &request.request_id,
+        AttemptStatus::Succeeded,
+        1,
+        1_010,
+    );
+    store
+        .record_attempt(&original)
+        .expect("original attempt write");
+
+    let same_id_replacement = AttemptRecord {
+        status: AttemptStatus::Failed,
+        retry_reason: Some("x".repeat(64)),
+        ..original
+    };
+    store
+        .record_attempt(&same_id_replacement)
+        .expect("same attempt_id replacement");
+    assert_attempt_retention_matches_surviving_row(&store, 1);
+
+    let unique_pair_replacement = AttemptRecord {
+        attempt_id: AttemptId::from_string("attempt-replace-unique-pair")
+            .expect("test attempt id should be valid"),
+        retry_reason: Some("y".repeat(128)),
+        ..same_id_replacement
+    };
+    store
+        .record_attempt(&unique_pair_replacement)
+        .expect("(request_id, attempt_number) replacement");
+    assert_attempt_retention_matches_surviving_row(&store, 1);
+}
+
+fn assert_attempt_retention_matches_surviving_row(
+    store: &ObservabilityStore,
+    expected_attempts: i64,
+) {
+    let connection = store.lock_connection().expect("connection lock");
+    let attempt_rows = count_rows(&connection, "SELECT COUNT(*) FROM attempts");
+    let stats: (i64, i64) = connection
+        .query_row(
+            "SELECT attempt_count, logical_bytes FROM retention_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("retention stats should exist");
+    let surviving_bytes: i64 = connection
+        .query_row(
+            "SELECT COALESCE((SELECT SUM(estimated_bytes) FROM requests), 0)
+             + COALESCE((SELECT SUM(estimated_bytes) FROM attempts), 0)",
+            [],
+            |row| row.get(0),
+        )
+        .expect("surviving estimated bytes");
+    assert_eq!(attempt_rows, expected_attempts);
+    assert_eq!(stats.0, expected_attempts);
+    assert_eq!(stats.1, surviving_bytes);
+}
+
+#[test]
+fn vacuum_command_counter_increments_when_write_connection_runs_vacuum() {
+    let fixture = StoreFixture::new("vacuum-oracle");
+    let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
+    let vacuum_commands_before = super::store::vacuum_commands();
+    {
+        let connection = store.lock_connection().expect("connection lock");
+        connection
+            .execute_batch("VACUUM")
+            .expect("VACUUM on the write connection should succeed");
+    }
+    assert_eq!(
+        super::store::vacuum_commands(),
+        vacuum_commands_before + 1,
+        "VACUUM through the write connection must be visible to the test oracle"
+    );
+}
+
+#[test]
 fn heartbeat_metric_labels_use_a_closed_vocabulary() {
     let fixture = StoreFixture::new("metrics-closed-heartbeat-labels");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
@@ -1605,13 +1757,9 @@ fn redacts_common_raw_payload_secret_forms_before_persistence() {
 }
 
 #[test]
-fn retention_deletes_oldest_requests_until_actual_storage_under_prune_target() {
+fn retention_deletes_oldest_requests_until_logical_bytes_under_prune_target() {
     let fixture = StoreFixture::new("retention");
     let store = fixture.open_store(true, true, 120_000, 80_000);
-    let sqlite_floor_bytes = store
-        .retention_usage()
-        .expect("initial retention usage")
-        .observed_bytes;
 
     for index in 0..8 {
         let mut request = request_record(
@@ -1632,13 +1780,6 @@ fn retention_deletes_oldest_requests_until_actual_storage_under_prune_target() {
     }
 
     let usage = store.retention_usage().expect("retention usage");
-    let expected_cap = 80_000_u64.max(sqlite_floor_bytes);
-    assert!(
-        usage.observed_bytes <= expected_cap,
-        "actual SQLite bytes {} exceeded cap {}",
-        usage.observed_bytes,
-        expected_cap
-    );
     assert_eq!(
         usage.observed_bytes,
         fixture
@@ -1664,6 +1805,17 @@ fn retention_deletes_oldest_requests_until_actual_storage_under_prune_target() {
         0
     );
     assert!(count_rows(&connection, "SELECT COUNT(*) FROM requests") < 8);
+    let logical_bytes: i64 = connection
+        .query_row(
+            "SELECT logical_bytes FROM retention_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("logical bytes should exist");
+    assert!(
+        logical_bytes <= 80_000,
+        "logical bytes {logical_bytes} exceeded prune target"
+    );
 }
 
 #[test]

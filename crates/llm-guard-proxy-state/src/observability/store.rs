@@ -8,12 +8,110 @@ use std::{
 };
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    cell::Cell,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection as SqliteConnection, OpenFlags, OptionalExtension, params};
+
+#[cfg(not(test))]
+use rusqlite::Connection;
+
+#[cfg(test)]
+#[derive(Debug)]
+pub(super) struct Connection {
+    inner: SqliteConnection,
+}
+
+#[cfg(test)]
+impl std::ops::Deref for Connection {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+#[cfg(test)]
+impl std::ops::DerefMut for Connection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
+#[cfg(test)]
+impl Connection {
+    fn open_with_flags(path: &Path, flags: OpenFlags) -> rusqlite::Result<Self> {
+        Ok(Self {
+            inner: SqliteConnection::open_with_flags(path, flags)?,
+        })
+    }
+
+    pub(super) fn execute<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> rusqlite::Result<usize> {
+        count_vacuum_command(sql);
+        self.inner.execute(sql, params)
+    }
+
+    pub(super) fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        count_vacuum_command(sql);
+        self.inner.execute_batch(sql)
+    }
+
+    fn transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {
+        Ok(Transaction {
+            inner: self.inner.transaction()?,
+        })
+    }
+}
+
+#[cfg(test)]
+struct Transaction<'conn> {
+    inner: rusqlite::Transaction<'conn>,
+}
+
+#[cfg(test)]
+impl Transaction<'_> {
+    fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+        count_vacuum_command(sql);
+        self.inner.execute(sql, params)
+    }
+
+    fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        count_vacuum_command(sql);
+        self.inner.execute_batch(sql)
+    }
+
+    fn pragma_update(
+        &self,
+        schema_name: Option<rusqlite::DatabaseName<'_>>,
+        pragma_name: &str,
+        pragma_value: impl rusqlite::ToSql,
+    ) -> rusqlite::Result<()> {
+        self.inner
+            .pragma_update(schema_name, pragma_name, pragma_value)
+    }
+
+    fn commit(self) -> rusqlite::Result<()> {
+        self.inner.commit()
+    }
+}
+
+#[cfg(test)]
+impl std::ops::Deref for Transaction<'_> {
+    type Target = SqliteConnection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
 
 #[cfg(test)]
 use super::metrics_accumulator::{LoopGuardAttemptMetricKey, loop_guard_attempt_metric_key};
@@ -41,7 +139,14 @@ use super::{
 };
 use llm_guard_proxy_core::{ConfigHandle, RetentionConfig};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+
+#[cfg(test)]
+thread_local! {
+    static FULL_TABLE_COUNT_QUERIES: Cell<usize> = const { Cell::new(0) };
+    static FULL_TABLE_SUM_QUERIES: Cell<usize> = const { Cell::new(0) };
+    static VACUUM_COMMANDS: Cell<usize> = const { Cell::new(0) };
+}
 #[cfg(test)]
 const HISTOGRAM_BUCKETS_MS: &[u64] = &[
     10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000,
@@ -98,6 +203,12 @@ impl ObservabilityStore {
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(|source| ObservabilityError::Sqlite {
                 action: "enable SQLite foreign keys",
+                source,
+            })?;
+        connection
+            .pragma_update(None, "recursive_triggers", "ON")
+            .map_err(|source| ObservabilityError::Sqlite {
+                action: "enable SQLite recursive triggers",
                 source,
             })?;
         migrate(&mut connection)?;
@@ -307,7 +418,7 @@ impl ObservabilityStore {
     /// metrics; no code may hold metrics while acquiring the connection.
     fn finish_write(
         &self,
-        connection: &Connection,
+        connection: &SqliteConnection,
         result: Result<StoreMetricsUpdate, ObservabilityError>,
     ) -> Result<StoreWrite, ObservabilityError> {
         match result {
@@ -334,7 +445,7 @@ impl ObservabilityStore {
         }
     }
 
-    fn reconstruct_metrics(&self, connection: &Connection) -> Result<(), ObservabilityError> {
+    fn reconstruct_metrics(&self, connection: &SqliteConnection) -> Result<(), ObservabilityError> {
         #[cfg(test)]
         if self
             .fail_metrics_reconstruction
@@ -599,10 +710,13 @@ fn migrate(connection: &mut Connection) -> Result<(), ObservabilityError> {
     if version < 3 {
         migrate_to_schema_v3(connection)?;
     }
+    if version < 4 {
+        migrate_to_schema_v4(connection)?;
+    }
     Ok(())
 }
 
-fn create_initial_schema(connection: &Connection) -> Result<(), ObservabilityError> {
+fn create_initial_schema(connection: &SqliteConnection) -> Result<(), ObservabilityError> {
     connection
         .execute_batch(
             r"
@@ -672,7 +786,7 @@ CREATE INDEX IF NOT EXISTS attempts_status_idx
         })
 }
 
-fn migrate_to_schema_v2(connection: &Connection) -> Result<(), ObservabilityError> {
+fn migrate_to_schema_v2(connection: &SqliteConnection) -> Result<(), ObservabilityError> {
     connection
         .execute_batch(
             r"
@@ -739,7 +853,190 @@ ALTER TABLE attempts ADD COLUMN reasoning_tokens INTEGER;
         })
 }
 
-fn read_schema_version(connection: &Connection) -> Result<i64, ObservabilityError> {
+fn migrate_to_schema_v4(connection: &mut Connection) -> Result<(), ObservabilityError> {
+    let transaction = connection
+        .transaction()
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "begin transaction for schema v4 migration",
+            source,
+        })?;
+    let request_count =
+        scan_table_count(&transaction, "requests", "read observability request count")?;
+    let attempt_count =
+        scan_table_count(&transaction, "attempts", "read observability attempt count")?;
+    let logical_bytes = scan_logical_observed_bytes(&transaction)?;
+    if !table_has_columns(
+        &transaction,
+        "retention_pruning_stats",
+        &["request_count", "attempt_count", "logical_bytes"],
+    )? {
+        transaction
+            .execute_batch(
+                r"
+ALTER TABLE retention_pruning_stats ADD COLUMN request_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retention_pruning_stats ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE retention_pruning_stats ADD COLUMN logical_bytes INTEGER NOT NULL DEFAULT 0;
+",
+            )
+            .map_err(|source| ObservabilityError::Sqlite {
+                action: "add SQLite observability retention counters",
+                source,
+            })?;
+    }
+    transaction
+        .execute(
+            "UPDATE retention_pruning_stats SET request_count = ?1, attempt_count = ?2, logical_bytes = ?3 WHERE stats_key = 'global'",
+            params![
+                to_sqlite_i64(request_count, "request_count")?,
+                to_sqlite_i64(attempt_count, "attempt_count")?,
+                to_sqlite_i64(logical_bytes, "logical_bytes")?,
+            ],
+        )
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "initialize SQLite observability retention counters",
+            source,
+        })?;
+    create_retention_count_triggers(&transaction)?;
+    transaction
+        .pragma_update(None, "user_version", SCHEMA_VERSION)
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "set schema version to 4",
+            source,
+        })?;
+    transaction
+        .commit()
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "commit schema v4 migration",
+            source,
+        })
+}
+
+fn create_retention_count_triggers(
+    connection: &SqliteConnection,
+) -> Result<(), ObservabilityError> {
+    drop_retention_count_triggers(connection)?;
+    connection
+        .execute_batch(
+            r"
+CREATE TRIGGER IF NOT EXISTS requests_retention_count_insert
+AFTER INSERT ON requests
+BEGIN
+    UPDATE retention_pruning_stats
+    SET request_count = request_count + 1,
+        logical_bytes = logical_bytes + NEW.estimated_bytes
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS requests_retention_count_delete
+AFTER DELETE ON requests
+BEGIN
+    UPDATE retention_pruning_stats
+    SET request_count = request_count - 1,
+        logical_bytes = logical_bytes - OLD.estimated_bytes
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS requests_retention_count_update
+AFTER UPDATE OF estimated_bytes ON requests
+BEGIN
+    UPDATE retention_pruning_stats
+    SET logical_bytes = logical_bytes - OLD.estimated_bytes + NEW.estimated_bytes
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS attempts_retention_count_insert
+AFTER INSERT ON attempts
+BEGIN
+    UPDATE retention_pruning_stats
+    SET attempt_count = attempt_count + 1,
+        logical_bytes = logical_bytes + NEW.estimated_bytes
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS attempts_retention_count_delete
+AFTER DELETE ON attempts
+BEGIN
+    UPDATE retention_pruning_stats
+    SET attempt_count = attempt_count - 1,
+        logical_bytes = logical_bytes - OLD.estimated_bytes
+    WHERE stats_key = 'global';
+END;
+CREATE TRIGGER IF NOT EXISTS attempts_retention_count_update
+AFTER UPDATE OF estimated_bytes ON attempts
+BEGIN
+    UPDATE retention_pruning_stats
+    SET logical_bytes = logical_bytes - OLD.estimated_bytes + NEW.estimated_bytes
+    WHERE stats_key = 'global';
+END;
+",
+        )
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "create SQLite observability retention counter triggers",
+            source,
+        })
+}
+
+fn drop_retention_count_triggers(connection: &SqliteConnection) -> Result<(), ObservabilityError> {
+    connection
+        .execute_batch(
+            r"
+DROP TRIGGER IF EXISTS requests_retention_count_insert;
+DROP TRIGGER IF EXISTS requests_retention_count_delete;
+DROP TRIGGER IF EXISTS requests_retention_count_update;
+DROP TRIGGER IF EXISTS attempts_retention_count_insert;
+DROP TRIGGER IF EXISTS attempts_retention_count_delete;
+DROP TRIGGER IF EXISTS attempts_retention_count_update;
+",
+        )
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "drop SQLite observability retention counter triggers",
+            source,
+        })
+}
+
+fn table_exists(connection: &SqliteConnection, table: &str) -> Result<bool, ObservabilityError> {
+    let exists: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![table],
+            |row| row.get(0),
+        )
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "check observability table existence",
+            source,
+        })?;
+    Ok(exists > 0)
+}
+
+fn table_has_columns(
+    connection: &SqliteConnection,
+    table: &str,
+    required_columns: &[&str],
+) -> Result<bool, ObservabilityError> {
+    if !table_exists(connection, table)? {
+        return Ok(false);
+    }
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "inspect observability table columns",
+            source,
+        })?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "read observability table columns",
+            source,
+        })?;
+    let mut columns = Vec::new();
+    for row in rows {
+        columns.push(row.map_err(|source| ObservabilityError::Sqlite {
+            action: "decode observability table column",
+            source,
+        })?);
+    }
+    Ok(required_columns
+        .iter()
+        .all(|required| columns.iter().any(|column| column.as_str() == *required)))
+}
+
+fn read_schema_version(connection: &SqliteConnection) -> Result<i64, ObservabilityError> {
     connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(|source| ObservabilityError::Sqlite {
@@ -920,7 +1217,7 @@ INSERT OR REPLACE INTO attempts (
 }
 
 fn read_token_usage_by_endpoint(
-    connection: &Connection,
+    connection: &SqliteConnection,
     started_at_unix_ms: i64,
     ended_at_unix_ms: i64,
 ) -> Result<Vec<TokenUsageByEndpoint>, ObservabilityError> {
@@ -1009,7 +1306,7 @@ fn add_optional_token_total(total: &mut Option<u64>, usage: Option<u64>) {
 }
 
 fn read_request_metric_observation(
-    connection: &Connection,
+    connection: &SqliteConnection,
     request_id: &str,
 ) -> Result<Option<RequestMetricObservation>, ObservabilityError> {
     connection
@@ -1038,7 +1335,7 @@ WHERE request_id = ?1
 }
 
 fn reconstruct_metrics_accumulator(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<MetricsAccumulator, ObservabilityError> {
     let mut metrics = MetricsAccumulator::new(
         read_retention_usage(connection)?,
@@ -1113,7 +1410,7 @@ fn decode_request_metric_observation(
 }
 
 fn read_replaced_attempt_metric_observations(
-    connection: &Connection,
+    connection: &SqliteConnection,
     record: &PreparedAttempt,
 ) -> Result<Vec<AttemptMetricObservation>, ObservabilityError> {
     read_attempt_metric_observations(
@@ -1130,7 +1427,7 @@ ORDER BY attempt_id
 }
 
 fn read_attempt_metric_observations_for_request(
-    connection: &Connection,
+    connection: &SqliteConnection,
     request_id: &str,
 ) -> Result<Vec<AttemptMetricObservation>, ObservabilityError> {
     read_attempt_metric_observations(
@@ -1147,7 +1444,7 @@ ORDER BY attempt_id
 }
 
 fn read_attempt_metric_observations<P: rusqlite::Params>(
-    connection: &Connection,
+    connection: &SqliteConnection,
     sql: &str,
     params: P,
     action: &'static str,
@@ -1208,7 +1505,8 @@ fn enforce_retention(
     let max_bytes = retention.max_bytes;
     let prune_to_bytes = retention.prune_to_bytes;
     let mut usage = read_retention_usage(connection)?;
-    let target_bytes = if usage.observed_bytes > max_bytes {
+    let mut logical_bytes = read_logical_observed_bytes(connection)?;
+    let target_bytes = if logical_bytes > max_bytes {
         prune_to_bytes
     } else {
         max_bytes
@@ -1220,14 +1518,14 @@ fn enforce_retention(
     };
     let mut outcome = RetentionPruneOutcome::default();
 
-    while usage.observed_bytes > target_bytes || usage.record_count > target_records {
+    while usage.record_count > target_records || logical_bytes > target_bytes {
         let batch = prune_retained_rows(connection, target_records, target_bytes)?;
         if !batch.deleted_any() {
             break;
         }
         outcome.add(batch);
-        vacuum_database(connection)?;
         usage = read_retention_usage(connection)?;
+        logical_bytes = read_logical_observed_bytes(connection)?;
         if usage.record_count == 0 {
             break;
         }
@@ -1251,10 +1549,7 @@ fn prune_retained_rows(
     let mut usage = read_retention_usage(&transaction)?;
     let mut logical_bytes = read_logical_observed_bytes(&transaction)?;
 
-    while usage.record_count > max_records
-        || logical_bytes > target_bytes
-        || (!outcome.deleted_any() && usage.request_count > 0)
-    {
+    while usage.record_count > max_records || logical_bytes > target_bytes {
         let Some(request_id) = oldest_request_id(&transaction)? else {
             break;
         };
@@ -1290,16 +1585,7 @@ fn prune_retained_rows(
     Ok(outcome)
 }
 
-fn vacuum_database(connection: &Connection) -> Result<(), ObservabilityError> {
-    connection
-        .execute_batch("VACUUM")
-        .map_err(|source| ObservabilityError::Sqlite {
-            action: "vacuum SQLite observability store",
-            source,
-        })
-}
-
-fn oldest_request_id(connection: &Connection) -> Result<Option<String>, ObservabilityError> {
+fn oldest_request_id(connection: &SqliteConnection) -> Result<Option<String>, ObservabilityError> {
     let mut statement = connection
         .prepare(
             r"
@@ -1334,7 +1620,9 @@ LIMIT 1
         })
 }
 
-fn read_retention_usage(connection: &Connection) -> Result<RetentionUsage, ObservabilityError> {
+fn read_retention_usage(
+    connection: &SqliteConnection,
+) -> Result<RetentionUsage, ObservabilityError> {
     let request_count = read_request_count(connection)?;
     let attempt_count = read_attempt_count(connection)?;
     let record_count = request_count.saturating_add(attempt_count);
@@ -1348,9 +1636,13 @@ fn read_retention_usage(connection: &Connection) -> Result<RetentionUsage, Obser
     })
 }
 
-fn read_request_count(connection: &Connection) -> Result<u64, ObservabilityError> {
+fn read_request_count(connection: &SqliteConnection) -> Result<u64, ObservabilityError> {
     let request_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM requests", [], |row| row.get(0))
+        .query_row(
+            "SELECT request_count FROM retention_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| row.get(0),
+        )
         .map_err(|source| ObservabilityError::Sqlite {
             action: "read observability request count",
             source,
@@ -1358,9 +1650,13 @@ fn read_request_count(connection: &Connection) -> Result<u64, ObservabilityError
     Ok(nonnegative_i64_to_u64(request_count))
 }
 
-fn read_attempt_count(connection: &Connection) -> Result<u64, ObservabilityError> {
+fn read_attempt_count(connection: &SqliteConnection) -> Result<u64, ObservabilityError> {
     let attempt_count: i64 = connection
-        .query_row("SELECT COUNT(*) FROM attempts", [], |row| row.get(0))
+        .query_row(
+            "SELECT attempt_count FROM retention_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| row.get(0),
+        )
         .map_err(|source| ObservabilityError::Sqlite {
             action: "read observability attempt count",
             source,
@@ -1399,7 +1695,7 @@ WHERE stats_key = 'global'
 
 #[cfg(test)]
 fn read_metrics_snapshot(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<ObservabilityMetricsSnapshot, ObservabilityError> {
     Ok(ObservabilityMetricsSnapshot {
         request_counts: read_request_metric_counts(connection)?,
@@ -1419,7 +1715,7 @@ fn read_metrics_snapshot(
 
 #[cfg(test)]
 fn read_request_metric_counts(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<Vec<RequestMetricCount>, ObservabilityError> {
     let mut statement = connection
         .prepare(
@@ -1492,7 +1788,7 @@ ORDER BY status, downstream_mode, upstream_mode, http_status
 
 #[cfg(test)]
 fn read_request_terminal_metric_counts(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<Vec<RequestTerminalMetricCount>, ObservabilityError> {
     let mut statement = connection
         .prepare(
@@ -1558,7 +1854,7 @@ ORDER BY status, abort_reason, http_status
 
 #[cfg(test)]
 fn read_attempt_metric_counts(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<Vec<AttemptMetricCount>, ObservabilityError> {
     let mut statement = connection
         .prepare(
@@ -1619,7 +1915,7 @@ ORDER BY status, upstream_mode, http_status
 
 #[cfg(test)]
 fn read_loop_guard_attempt_metric_counts(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<Vec<LoopGuardAttemptMetricCount>, ObservabilityError> {
     let mut statement = connection
         .prepare("SELECT response_metadata_json FROM attempts")
@@ -1671,7 +1967,7 @@ fn read_loop_guard_attempt_metric_counts(
 }
 
 #[cfg(test)]
-fn read_retry_count(connection: &Connection) -> Result<u64, ObservabilityError> {
+fn read_retry_count(connection: &SqliteConnection) -> Result<u64, ObservabilityError> {
     let count: i64 = connection
         .query_row(
             r"
@@ -1690,7 +1986,7 @@ WHERE status = 'retried' OR retry_reason IS NOT NULL
 }
 
 #[cfg(test)]
-fn read_loop_abort_count(connection: &Connection) -> Result<u64, ObservabilityError> {
+fn read_loop_abort_count(connection: &SqliteConnection) -> Result<u64, ObservabilityError> {
     let count: i64 = connection
         .query_row(
             r"
@@ -1733,7 +2029,7 @@ fn request_terminal_reason(status: &str, abort_reason: Option<&str>) -> &'static
 
 #[cfg(test)]
 fn read_upstream_error_counts(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<Vec<UpstreamErrorMetricCount>, ObservabilityError> {
     let mut statement = connection
         .prepare(
@@ -1793,7 +2089,7 @@ ORDER BY status, http_status
 
 #[cfg(test)]
 fn read_first_token_latency_histogram(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<LatencyHistogram, ObservabilityError> {
     let mut statement = connection
         .prepare("SELECT response_metadata_json FROM attempts")
@@ -1825,7 +2121,7 @@ fn read_first_token_latency_histogram(
 
 #[cfg(test)]
 fn read_total_latency_histogram(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<LatencyHistogram, ObservabilityError> {
     let mut statement = connection
         .prepare("SELECT duration_ms FROM requests WHERE duration_ms IS NOT NULL")
@@ -1855,7 +2151,7 @@ fn read_total_latency_histogram(
 
 #[cfg(test)]
 fn read_heartbeat_mode_counts(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<Vec<HeartbeatModeMetricCount>, ObservabilityError> {
     let mut statement = connection
         .prepare("SELECT request_metadata_json, response_metadata_json FROM requests")
@@ -1899,7 +2195,7 @@ fn read_heartbeat_mode_counts(
 }
 
 fn read_pruning_stats(
-    connection: &Connection,
+    connection: &SqliteConnection,
 ) -> Result<RetentionPruningStats, ObservabilityError> {
     let (prune_events, pruned_requests, pruned_attempts, last_pruned_at_unix_ms): (
         i64,
@@ -1929,7 +2225,7 @@ WHERE stats_key = 'global'
 }
 
 fn read_recent_request_summaries(
-    connection: &Connection,
+    connection: &SqliteConnection,
     limit: u32,
 ) -> Result<Vec<DebugRequestSummary>, ObservabilityError> {
     let mut statement = connection
@@ -2173,14 +2469,14 @@ fn read_bool_column(
     Ok(value != 0)
 }
 
-fn read_sqlite_storage_bytes(connection: &Connection) -> Result<u64, ObservabilityError> {
+fn read_sqlite_storage_bytes(connection: &SqliteConnection) -> Result<u64, ObservabilityError> {
     let page_count = read_sqlite_pragma_u64(connection, "page_count")?;
     let page_size = read_sqlite_pragma_u64(connection, "page_size")?;
     Ok(page_count.saturating_mul(page_size))
 }
 
 fn read_sqlite_pragma_u64(
-    connection: &Connection,
+    connection: &SqliteConnection,
     pragma: &'static str,
 ) -> Result<u64, ObservabilityError> {
     let sql = format!("PRAGMA {pragma}");
@@ -2193,7 +2489,37 @@ fn read_sqlite_pragma_u64(
     Ok(nonnegative_i64_to_u64(value))
 }
 
-fn read_logical_observed_bytes(connection: &Connection) -> Result<u64, ObservabilityError> {
+fn read_logical_observed_bytes(connection: &SqliteConnection) -> Result<u64, ObservabilityError> {
+    let logical_bytes: i64 = connection
+        .query_row(
+            "SELECT logical_bytes FROM retention_pruning_stats WHERE stats_key = 'global'",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|source| ObservabilityError::Sqlite {
+            action: "read observability logical bytes",
+            source,
+        })?;
+    Ok(nonnegative_i64_to_u64(logical_bytes))
+}
+
+fn scan_table_count(
+    connection: &SqliteConnection,
+    table: &'static str,
+    action: &'static str,
+) -> Result<u64, ObservabilityError> {
+    #[cfg(test)]
+    FULL_TABLE_COUNT_QUERIES.with(|queries| queries.set(queries.get() + 1));
+    let sql = format!("SELECT COUNT(*) FROM {table}");
+    let count: i64 = connection
+        .query_row(&sql, [], |row| row.get(0))
+        .map_err(|source| ObservabilityError::Sqlite { action, source })?;
+    Ok(nonnegative_i64_to_u64(count))
+}
+
+fn scan_logical_observed_bytes(connection: &SqliteConnection) -> Result<u64, ObservabilityError> {
+    #[cfg(test)]
+    FULL_TABLE_SUM_QUERIES.with(|queries| queries.set(queries.get() + 1));
     let observed_bytes: i64 = connection
         .query_row(
             r"
@@ -2769,4 +3095,32 @@ fn restrict_directory_permissions(path: &Path) -> Result<(), ObservabilityError>
 #[cfg(not(unix))]
 fn restrict_directory_permissions(_path: &Path) -> Result<(), ObservabilityError> {
     Ok(())
+}
+
+#[cfg(test)]
+fn count_vacuum_command(sql: &str) {
+    for statement in sql.split(';') {
+        if statement
+            .split_whitespace()
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("VACUUM"))
+        {
+            VACUUM_COMMANDS.with(|commands| commands.set(commands.get() + 1));
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) fn full_table_count_queries() -> usize {
+    FULL_TABLE_COUNT_QUERIES.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn full_table_sum_queries() -> usize {
+    FULL_TABLE_SUM_QUERIES.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn vacuum_commands() -> usize {
+    VACUUM_COMMANDS.with(Cell::get)
 }
