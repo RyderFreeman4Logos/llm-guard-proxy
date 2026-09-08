@@ -480,7 +480,7 @@ fn vacuum_command_counter_increments_when_write_connection_runs_vacuum() {
         let mut slot = store.lock_connection().expect("connection lock");
         let connection = slot.as_mut().expect("write connection");
         connection
-            .execute("VACUUM", [])
+            .execute_batch("VACUUM")
             .expect("VACUUM on the write connection should succeed");
     }
     assert_eq!(

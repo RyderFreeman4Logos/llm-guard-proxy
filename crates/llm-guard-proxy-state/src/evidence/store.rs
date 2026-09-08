@@ -60,6 +60,11 @@ impl Connection {
         self.inner.execute(sql, params)
     }
 
+    pub(super) fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
+        count_vacuum_command(sql);
+        self.inner.execute_batch(sql)
+    }
+
     fn transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {
         self.transaction_with_behavior(TransactionBehavior::Deferred)
     }
@@ -2138,12 +2143,14 @@ fn read_count(
 
 #[cfg(test)]
 fn count_vacuum_command(sql: &str) {
-    if sql
-        .split_whitespace()
-        .next()
-        .is_some_and(|token| token.eq_ignore_ascii_case("VACUUM"))
-    {
-        VACUUM_COMMANDS.with(|commands| commands.set(commands.get() + 1));
+    for statement in sql.split(';') {
+        if statement
+            .split_whitespace()
+            .next()
+            .is_some_and(|token| token.eq_ignore_ascii_case("VACUUM"))
+        {
+            VACUUM_COMMANDS.with(|commands| commands.set(commands.get() + 1));
+        }
     }
 }
 

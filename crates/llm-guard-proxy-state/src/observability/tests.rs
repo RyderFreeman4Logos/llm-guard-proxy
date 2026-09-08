@@ -1226,7 +1226,7 @@ fn vacuum_command_counter_increments_when_write_connection_runs_vacuum() {
     {
         let connection = store.lock_connection().expect("connection lock");
         connection
-            .execute("VACUUM", [])
+            .execute_batch("VACUUM")
             .expect("VACUUM on the write connection should succeed");
     }
     assert_eq!(
