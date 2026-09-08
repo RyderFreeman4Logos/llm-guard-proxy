@@ -199,7 +199,7 @@ input_token_safety_margin = 512           # Tokens reserved for response
 # END PARSEABLE EXAMPLE: forced-model-alias-profile
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-none"
+alias = "abliterated-qwen-latest-27b-none"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
 output_cap = 16384
@@ -211,10 +211,11 @@ presence_penalty = 1.5
 repetition_penalty = 1.0
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-low"
+alias = "abliterated-qwen-latest-27b-low"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
+reasoning_effort = "low"
 output_cap = 16384
 temperature = 1
 top_p = 0.95
@@ -224,10 +225,11 @@ presence_penalty = 0
 repetition_penalty = 1
 
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-nvfp4-medium"
+alias = "abliterated-qwen-latest-27b-medium"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_thinking"
 thinking_budget = 65536
+reasoning_effort = "medium"
 output_cap = 16384
 temperature = 1
 top_p = 0.95
@@ -321,12 +323,12 @@ name = "no-thinking"
 thinking_mode = "passthrough"
 enabled = false
 
-# Public NVFP4 aliases must match this named AEON profile, not [upstream].
+# Public forced aliases must match this named AEON profile, not [upstream].
 [[upstreams]]
 name = "aeon-default-no-think"
 base_url = "http://100.105.4.92:18010/v1"
 upstream_model = "aeon-ultimate"
-match_models = ["abliterated-qwen-latest-27b-nvfp4-none", "abliterated-qwen-latest-27b-nvfp4-low", "abliterated-qwen-latest-27b-nvfp4-medium"]
+match_models = ["abliterated-qwen-latest-27b-none", "abliterated-qwen-latest-27b-low", "abliterated-qwen-latest-27b-medium"]
 request_timeout_ms = 1800000
 max_in_flight_requests = 4
 max_queued_generation_requests = 64

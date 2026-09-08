@@ -13,6 +13,7 @@ from types import ModuleType
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = REPO_ROOT / "deploy" / "gb10" / "config.toml"
 PREFLIGHT_PATH = REPO_ROOT / "deploy" / "gb10" / "preflight-config.py"
+SMOKE_PATH = REPO_ROOT / "scripts" / "smoke-gb10.sh"
 
 
 def load_preflight() -> ModuleType:
@@ -49,6 +50,13 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("result=ok mode=dry-run", result.stdout)
+
+    def test_smoke_defaults_to_public_none_alias(self) -> None:
+        smoke = SMOKE_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "LLM_GUARD_PROXY_SMOKE_MODEL:-abliterated-qwen-latest-27b-none",
+            smoke,
+        )
 
     def test_every_required_route_rejects_recovery_downgrades(self) -> None:
         for route in ("default", "aeon-chat"):
@@ -121,7 +129,7 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
         profiles = self.config["forced_model_alias_profiles"]
         self.assertEqual(len(profiles), 3)
         expected = {
-            "abliterated-qwen-latest-27b-nvfp4-none": {
+            "abliterated-qwen-latest-27b-none": {
                 "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                 "thinking_mode": "force_disable",
                 "output_cap": 16_384,
@@ -132,10 +140,11 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 "presence_penalty": 1.5,
                 "repetition_penalty": 1.0,
             },
-            "abliterated-qwen-latest-27b-nvfp4-low": {
+            "abliterated-qwen-latest-27b-low": {
                 "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                 "thinking_mode": "force_thinking",
                 "thinking_budget": 65_536,
+                "reasoning_effort": "low",
                 "output_cap": 16_384,
                 "temperature": 1,
                 "top_p": 0.95,
@@ -144,10 +153,11 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 "presence_penalty": 0,
                 "repetition_penalty": 1,
             },
-            "abliterated-qwen-latest-27b-nvfp4-medium": {
+            "abliterated-qwen-latest-27b-medium": {
                 "upstream_model": "abliterated-qwen-latest-27b-nvfp4",
                 "thinking_mode": "force_thinking",
                 "thinking_budget": 65_536,
+                "reasoning_effort": "medium",
                 "output_cap": 16_384,
                 "temperature": 1,
                 "top_p": 0.95,
@@ -171,14 +181,14 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
             {profile["upstream_model"] for profile in profiles},
         )
         for alias, field in [
-            ("abliterated-qwen-latest-27b-nvfp4-low", "thinking_budget"),
-            ("abliterated-qwen-latest-27b-nvfp4-none", "output_cap"),
-            ("abliterated-qwen-latest-27b-nvfp4-none", "temperature"),
-            ("abliterated-qwen-latest-27b-nvfp4-none", "top_p"),
-            ("abliterated-qwen-latest-27b-nvfp4-none", "top_k"),
-            ("abliterated-qwen-latest-27b-nvfp4-none", "min_p"),
-            ("abliterated-qwen-latest-27b-nvfp4-none", "presence_penalty"),
-            ("abliterated-qwen-latest-27b-nvfp4-none", "repetition_penalty"),
+            ("abliterated-qwen-latest-27b-low", "thinking_budget"),
+            ("abliterated-qwen-latest-27b-none", "output_cap"),
+            ("abliterated-qwen-latest-27b-none", "temperature"),
+            ("abliterated-qwen-latest-27b-none", "top_p"),
+            ("abliterated-qwen-latest-27b-none", "top_k"),
+            ("abliterated-qwen-latest-27b-none", "min_p"),
+            ("abliterated-qwen-latest-27b-none", "presence_penalty"),
+            ("abliterated-qwen-latest-27b-none", "repetition_penalty"),
         ]:
             with self.subTest(boolean_numeric_field=field):
                 candidate = copy.deepcopy(self.config)
@@ -208,16 +218,17 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
         for mutation, alias, field, value in [
             ("absent", None, None, None),
             ("extra", None, None, None),
-            ("upstream", "abliterated-qwen-latest-27b-nvfp4-none", "upstream_model", "wrong"),
-            ("thinking mode", "abliterated-qwen-latest-27b-nvfp4-none", "thinking_mode", "force_thinking"),
-            ("thinking budget", "abliterated-qwen-latest-27b-nvfp4-low", "thinking_budget", 1),
-            ("output", "abliterated-qwen-latest-27b-nvfp4-none", "output_cap", 1),
-            ("temperature", "abliterated-qwen-latest-27b-nvfp4-none", "temperature", 1),
-            ("top_p", "abliterated-qwen-latest-27b-nvfp4-none", "top_p", 1),
-            ("top_k", "abliterated-qwen-latest-27b-nvfp4-none", "top_k", 1),
-            ("min_p", "abliterated-qwen-latest-27b-nvfp4-none", "min_p", 1),
-            ("presence_penalty", "abliterated-qwen-latest-27b-nvfp4-none", "presence_penalty", 0),
-            ("repetition_penalty", "abliterated-qwen-latest-27b-nvfp4-none", "repetition_penalty", 0.5),
+            ("upstream", "abliterated-qwen-latest-27b-none", "upstream_model", "wrong"),
+            ("thinking mode", "abliterated-qwen-latest-27b-none", "thinking_mode", "force_thinking"),
+            ("thinking budget", "abliterated-qwen-latest-27b-low", "thinking_budget", 1),
+            ("reasoning effort", "abliterated-qwen-latest-27b-low", "reasoning_effort", "medium"),
+            ("output", "abliterated-qwen-latest-27b-none", "output_cap", 1),
+            ("temperature", "abliterated-qwen-latest-27b-none", "temperature", 1),
+            ("top_p", "abliterated-qwen-latest-27b-none", "top_p", 1),
+            ("top_k", "abliterated-qwen-latest-27b-none", "top_k", 1),
+            ("min_p", "abliterated-qwen-latest-27b-none", "min_p", 1),
+            ("presence_penalty", "abliterated-qwen-latest-27b-none", "presence_penalty", 0),
+            ("repetition_penalty", "abliterated-qwen-latest-27b-none", "repetition_penalty", 0.5),
         ]:
             with self.subTest(mutation=mutation):
                 candidate = copy.deepcopy(self.config)
@@ -226,7 +237,7 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                     candidate.pop("forced_model_alias_profiles")
                 elif mutation == "extra":
                     extra = copy.deepcopy(candidate_profiles[0])
-                    extra["alias"] = "abliterated-qwen-latest-27b-nvfp4-xhigh"
+                    extra["alias"] = "abliterated-qwen-latest-27b-xhigh"
                     candidate_profiles.append(extra)
                 else:
                     profile = next(profile for profile in candidate_profiles if profile["alias"] == alias)
@@ -258,11 +269,11 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
                 self.assertTrue(errors)
 
-    def test_nvfp4_aliases_have_exact_named_upstream_membership(self) -> None:
+    def test_public_aliases_have_exact_named_upstream_membership(self) -> None:
         expected_aliases = [
-            "abliterated-qwen-latest-27b-nvfp4-none",
-            "abliterated-qwen-latest-27b-nvfp4-low",
-            "abliterated-qwen-latest-27b-nvfp4-medium",
+            "abliterated-qwen-latest-27b-none",
+            "abliterated-qwen-latest-27b-low",
+            "abliterated-qwen-latest-27b-medium",
         ]
         expected_membership = ["aeon-default-no-think"]
         for alias in expected_aliases:

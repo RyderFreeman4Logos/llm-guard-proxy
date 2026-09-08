@@ -560,6 +560,9 @@ fn assign_forced_model_alias_profile(
                 "forced_model_alias_profiles.thinking_budget",
             )?);
         }
+        "reasoning_effort" => {
+            config.reasoning_effort = Some(parse_string(value, line_number)?);
+        }
         "output_cap" => {
             config.output_cap = Some(parse_u32(
                 value,

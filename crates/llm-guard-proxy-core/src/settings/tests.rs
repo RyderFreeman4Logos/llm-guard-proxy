@@ -1039,9 +1039,9 @@ fn assert_gb10_failover_topology(config: &AppConfig) {
     assert_eq!(
         default_no_think.match_models,
         [
-            "abliterated-qwen-latest-27b-nvfp4-none",
-            "abliterated-qwen-latest-27b-nvfp4-low",
-            "abliterated-qwen-latest-27b-nvfp4-medium"
+            "abliterated-qwen-latest-27b-none",
+            "abliterated-qwen-latest-27b-low",
+            "abliterated-qwen-latest-27b-medium"
         ]
     );
     assert_eq!(
@@ -4555,9 +4555,10 @@ fn _assert_error_types_are_send_sync() {
 fn forced_model_alias_policy_profiles_parse_validate_and_hot_reload() {
     let valid = r#"
 [[forced_model_alias_profiles]]
-alias = "abliterated-qwen-latest-27b-none"
+alias = "forced-public-alias"
 upstream_model = "abliterated-qwen-latest-27b-nvfp4"
 thinking_mode = "force_disable"
+reasoning_effort = "low"
 output_cap = 16384
 temperature = 0.7
 top_p = 0.8
@@ -4569,19 +4570,25 @@ repetition_penalty = 1.0
     let config = parse_config_text(valid).expect("forced policy should parse");
     config.validate().expect("forced policy should validate");
     assert_eq!(config.forced_model_alias_profiles.len(), 1);
+    assert_eq!(
+        config.forced_model_alias_profiles[0]
+            .reasoning_effort
+            .as_deref(),
+        Some("low")
+    );
     assert!(RELOADABLE_FIELDS.contains(&"forced_model_alias_profiles"));
 
     for invalid in [
-        valid.replace(
-            "alias = \"abliterated-qwen-latest-27b-none\"",
-            "alias = \" \"",
-        ),
+        valid.replace("alias = \"forced-public-alias\"", "alias = \" \""),
         format!(
-            "{valid}[[model_aliases]]\nid = \"abliterated-qwen-latest-27b-none\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
+            "{valid}[[model_aliases]]\nid = \"forced-public-alias\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n"
         ),
         valid.replace("temperature = 0.7", "temperature = nan"),
         valid.replace("top_p = 0.8", "top_p = 1.1"),
         valid.replace("top_k = 20\n", ""),
+        valid.replace("reasoning_effort = \"low\"", "reasoning_effort = \"\""),
+        valid.replace("reasoning_effort = \"low\"", "reasoning_effort = \" low\""),
+        valid.replace("reasoning_effort = \"low\"", "reasoning_effort = \"low \""),
         valid.replace(
             "thinking_mode = \"force_disable\"",
             "thinking_mode = \"xhigh\"",
@@ -4687,9 +4694,9 @@ fn gb10_forced_model_alias_profiles_are_complete() {
             .map(|profile| profile.alias.as_str())
             .collect::<Vec<_>>(),
         [
-            "abliterated-qwen-latest-27b-nvfp4-none",
-            "abliterated-qwen-latest-27b-nvfp4-low",
-            "abliterated-qwen-latest-27b-nvfp4-medium",
+            "abliterated-qwen-latest-27b-none",
+            "abliterated-qwen-latest-27b-low",
+            "abliterated-qwen-latest-27b-medium",
         ]
     );
     assert!(
@@ -4700,11 +4707,12 @@ fn gb10_forced_model_alias_profiles_are_complete() {
 
     let none = profiles
         .iter()
-        .find(|profile| profile.alias == "abliterated-qwen-latest-27b-nvfp4-none")
+        .find(|profile| profile.alias == "abliterated-qwen-latest-27b-none")
         .expect("none profile");
     assert_eq!(none.upstream_model, "abliterated-qwen-latest-27b-nvfp4");
     assert_eq!(none.thinking_mode, Some(ThinkingMode::ForceDisable));
     assert_eq!(none.thinking_budget, None);
+    assert_eq!(none.reasoning_effort, None);
     assert_eq!(none.temperature, Some(0.7));
     assert_eq!(none.top_p, Some(0.8));
     assert_eq!(none.top_k, Some(20));
@@ -4713,14 +4721,15 @@ fn gb10_forced_model_alias_profiles_are_complete() {
     assert_eq!(none.repetition_penalty, Some(1.0));
     assert_eq!(none.output_cap, Some(16_384));
 
-    for suffix in ["low", "medium"] {
+    for (suffix, reasoning_effort) in [("low", "low"), ("medium", "medium")] {
         let profile = profiles
             .iter()
-            .find(|profile| profile.alias == format!("abliterated-qwen-latest-27b-nvfp4-{suffix}"))
+            .find(|profile| profile.alias == format!("abliterated-qwen-latest-27b-{suffix}"))
             .expect("configured thinking profile");
         assert_eq!(profile.upstream_model, "abliterated-qwen-latest-27b-nvfp4");
         assert_eq!(profile.thinking_mode, Some(ThinkingMode::ForceThinking));
         assert_eq!(profile.thinking_budget, Some(65_536));
+        assert_eq!(profile.reasoning_effort.as_deref(), Some(reasoning_effort));
         assert_eq!(profile.temperature, Some(1.0));
         assert_eq!(profile.top_p, Some(0.95));
         assert_eq!(profile.top_k, Some(20));

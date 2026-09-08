@@ -2764,6 +2764,8 @@ pub struct ForcedModelAliasProfileConfig {
     pub thinking_mode: Option<ThinkingMode>,
     /// Required only for `force_thinking`.
     pub thinking_budget: Option<u32>,
+    /// Model-specific thinking intensity sent upstream when configured.
+    pub reasoning_effort: Option<String>,
     /// Visible-answer headroom used to derive the forced total generation cap.
     pub output_cap: Option<u32>,
     /// Forced sampler and penalty settings.
@@ -2802,6 +2804,13 @@ impl ForcedModelAliasProfileConfig {
             "forced_model_alias_profiles.upstream_model",
             "must not have leading or trailing whitespace",
         )?;
+        if let Some(reasoning_effort) = self.reasoning_effort.as_deref() {
+            require(
+                !reasoning_effort.trim().is_empty() && reasoning_effort == reasoning_effort.trim(),
+                "forced_model_alias_profiles.reasoning_effort",
+                "must be non-empty without surrounding whitespace",
+            )?;
+        }
         let output_cap = self.output_cap.ok_or_else(|| {
             ValidationError::new(
                 "forced_model_alias_profiles.output_cap",

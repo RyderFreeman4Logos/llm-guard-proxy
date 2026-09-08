@@ -5169,6 +5169,15 @@ fn forced_generation_total_cap(
     }
 }
 
+fn insert_reasoning_effort(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    reasoning_effort: Option<&str>,
+) {
+    if let Some(reasoning_effort) = reasoning_effort {
+        object.insert(String::from("reasoning_effort"), reasoning_effort.into());
+    }
+}
+
 fn apply_forced_model_alias_policy(body: &Bytes, policy: &ForcedModelAliasProfileConfig) -> Bytes {
     let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(body) else {
         return body.clone();
@@ -5246,6 +5255,7 @@ fn apply_forced_model_alias_policy(body: &Bytes, policy: &ForcedModelAliasProfil
         String::from("max_tokens"),
         serde_json::Value::Number(total_cap.into()),
     );
+    insert_reasoning_effort(object, policy.reasoning_effort.as_deref());
     let template = object
         .entry(String::from("chat_template_kwargs"))
         .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
@@ -5257,6 +5267,7 @@ fn apply_forced_model_alias_policy(body: &Bytes, policy: &ForcedModelAliasProfil
             String::from("enable_thinking"),
             serde_json::Value::Bool(thinking_mode == ThinkingMode::ForceThinking),
         );
+        insert_reasoning_effort(template, policy.reasoning_effort.as_deref());
     }
     if let Some(budget) = policy.thinking_budget {
         object.insert(
