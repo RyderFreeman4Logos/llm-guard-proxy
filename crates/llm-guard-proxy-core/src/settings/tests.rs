@@ -942,25 +942,6 @@ fn gb10_deploy_config_preserves_authoritative_topology_with_fill_if_absent_defau
     assert_eq!(config.listeners[2].name, "aggregate");
     assert_eq!(config.listeners[2].port, 18_005);
 
-    let profile_limits = config
-        .upstream_profiles
-        .iter()
-        .map(|profile| {
-            (
-                profile.name.as_str(),
-                profile.max_in_flight_requests,
-                profile.max_queued_generation_requests,
-            )
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        profile_limits,
-        vec![
-            ("aeon-chat", Some(4), Some(64)),
-            ("qwen3-embedding-8b", Some(8), Some(64)),
-            ("qwen3-reranker-8b", Some(8), Some(64)),
-        ]
-    );
     assert_gb10_failover_topology(&config);
     let chat_profile = &config.upstream_profiles[0];
     assert_eq!(chat_profile.thinking.mode, ThinkingMode::Passthrough);
@@ -1023,14 +1004,57 @@ fn assert_gb10_local_recovery(config: &AppConfig) {
 
 #[cfg(feature = "param-override")]
 fn assert_gb10_failover_topology(config: &AppConfig) {
+    let profile_limits = config
+        .upstream_profiles
+        .iter()
+        .map(|profile| {
+            (
+                profile.name.as_str(),
+                profile.max_in_flight_requests,
+                profile.max_queued_generation_requests,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        profile_limits,
+        vec![
+            ("aeon-chat", Some(4), Some(64)),
+            ("aeon-default-no-think", Some(4), Some(64)),
+            ("qwen3-embedding-8b", Some(8), Some(64)),
+            ("qwen3-reranker-8b", Some(8), Some(64)),
+        ]
+    );
+
     let chat = &config.upstream_profiles[0];
+    assert_eq!(chat.name, "aeon-chat");
     assert_eq!(chat.base_url, "http://100.105.4.92:18010/v1");
     assert!(
         chat.endpoints.is_empty(),
         "aeon-chat must remain single-endpoint"
     );
 
-    let embedding = &config.upstream_profiles[1];
+    let default_no_think = &config.upstream_profiles[1];
+    assert_eq!(default_no_think.name, "aeon-default-no-think");
+    assert_eq!(default_no_think.base_url, "http://100.105.4.92:18010/v1");
+    assert_eq!(
+        default_no_think.match_models,
+        [
+            "abliterated-qwen-latest-27b-nvfp4-none",
+            "abliterated-qwen-latest-27b-nvfp4-low",
+            "abliterated-qwen-latest-27b-nvfp4-medium"
+        ]
+    );
+    assert_eq!(
+        default_no_think.upstream_model.as_deref(),
+        Some("aeon-ultimate")
+    );
+    assert!(
+        default_no_think.endpoints.is_empty(),
+        "aeon-default-no-think must remain single-endpoint"
+    );
+
+    let embedding = &config.upstream_profiles[2];
+    assert_eq!(embedding.name, "qwen3-embedding-8b");
     assert_eq!(embedding.endpoints.len(), 2);
     assert_eq!(embedding.endpoints[0].priority, UpstreamPriority::Primary);
     assert_eq!(
@@ -1051,7 +1075,8 @@ fn assert_gb10_failover_topology(config: &AppConfig) {
         Some("Qwen/Qwen3-Embedding-8B")
     );
 
-    let reranker = &config.upstream_profiles[2];
+    let reranker = &config.upstream_profiles[3];
+    assert_eq!(reranker.name, "qwen3-reranker-8b");
     assert_eq!(reranker.endpoints.len(), 2);
     assert_eq!(
         reranker.endpoints[0].protocol,
