@@ -5663,16 +5663,6 @@ impl SseFrameScanner {
         self.frame_end
     }
 
-    fn advance_after_frame(&mut self) -> usize {
-        let frame_end = self
-            .frame_end
-            .take()
-            .expect("completed SSE frame must have an end offset");
-        self.line_start = frame_end;
-        self.pending_cr = None;
-        frame_end
-    }
-
     fn take_frame(&mut self, buffer: &mut BytesMut) -> Option<Bytes> {
         let frame_end = self.frame_end?;
         let frame = buffer.split_to(frame_end).freeze();
@@ -9455,89 +9445,6 @@ impl ShieldedRetryCause {
 
 type UpstreamBodyStream = Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>;
 
-fn replay_prefetched_upstream_body(
-    prefix: Bytes,
-    stream: UpstreamBodyStream,
-) -> UpstreamBodyStream {
-    let prefix = (!prefix.is_empty()).then_some(Ok(prefix));
-    Box::pin(futures_util::stream::iter(prefix).chain(stream))
-}
-
-async fn preclassify_sse_response_body(
-    stream: impl Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
-    mut shutdown: ShutdownSubscription,
-    client_model: &str,
-) -> Result<(UpstreamBodyStream, bool), ProxyError> {
-    let mut stream: UpstreamBodyStream = Box::pin(stream);
-    let mut prefetched = BytesMut::new();
-    let mut scanner = SseFrameScanner::default();
-    loop {
-        if let Some(frame_end) = scanner.frame_end {
-            let frame = Bytes::copy_from_slice(&prefetched[..frame_end]);
-            if std::str::from_utf8(&frame).is_err() {
-                return Ok((
-                    replay_prefetched_upstream_body(prefetched.freeze(), stream),
-                    false,
-                ));
-            }
-            if rewrite_sse_response_model_body(&frame, client_model).1 {
-                return Ok((
-                    replay_prefetched_upstream_body(prefetched.freeze(), stream),
-                    true,
-                ));
-            }
-            let frame_end = scanner.advance_after_frame();
-            scanner.scan_appended(&prefetched, frame_end);
-            continue;
-        }
-        let next = tokio::select! {
-            biased;
-            () = shutdown.cancelled() => return Err(ProxyError::server_shutdown()),
-            next = stream.next() => next,
-        };
-        match next {
-            Some(Ok(bytes)) => {
-                let remaining = SSE_REWRITE_FRAME_BYTE_LIMIT.saturating_sub(prefetched.len());
-                let accepted_len = bytes.len().min(remaining);
-                let start = prefetched.len();
-                prefetched.extend_from_slice(&bytes[..accepted_len]);
-                let frame_end = scanner.scan_appended(&prefetched, start);
-                if bytes.len() > remaining {
-                    if let Some(frame_end) = frame_end {
-                        let frame = Bytes::copy_from_slice(&prefetched[..frame_end]);
-                        let can_rewrite = std::str::from_utf8(&frame).is_ok()
-                            && rewrite_sse_response_model_body(&frame, client_model).1;
-                        let suffix = bytes.slice(remaining..);
-                        let tail =
-                            Box::pin(futures_util::stream::iter(Some(Ok(suffix))).chain(stream));
-                        return Ok((
-                            replay_prefetched_upstream_body(prefetched.freeze(), tail),
-                            can_rewrite,
-                        ));
-                    }
-                    return Err(ProxyError::upstream_body(format!(
-                        "upstream SSE frame exceeded {SSE_REWRITE_FRAME_BYTE_LIMIT} byte limit"
-                    )));
-                }
-            }
-            Some(Err(error)) => {
-                let prefix = prefetched.freeze();
-                let terminal = futures_util::stream::once(async move { Err(error) });
-                return Ok((
-                    replay_prefetched_upstream_body(prefix, Box::pin(terminal)),
-                    false,
-                ));
-            }
-            None => {
-                return Ok((
-                    replay_prefetched_upstream_body(prefetched.freeze(), stream),
-                    false,
-                ));
-            }
-        }
-    }
-}
-
 fn forwarded_response_body(
     upstream_headers: &mut HeaderMap,
     response_body: ObservedUpstreamBody,
@@ -9652,28 +9559,10 @@ async fn forward_upstream_response(
         )
         .await;
     }
-    let (upstream_stream, response_model_rewrite) = match response_model_rewrite {
-        Some((ResponseModelRewriteMode::OpenAiSse, client_model)) => {
-            let (stream, can_rewrite) = match preclassify_sse_response_body(
-                upstream_response.bytes_stream(),
-                response_parts.shutdown_subscription(),
-                &client_model,
-            )
-            .await
-            {
-                Ok(classified) => classified,
-                Err(error) => return Err(response_parts.into_body_read_error(error)),
-            };
-            let rewrite =
-                can_rewrite.then_some((ResponseModelRewriteMode::OpenAiSse, client_model));
-            (stream, rewrite)
-        }
-        None => (
-            Box::pin(upstream_response.bytes_stream()) as UpstreamBodyStream,
-            None,
-        ),
-        Some((ResponseModelRewriteMode::Json, _)) => unreachable!("JSON aliases return above"),
-    };
+    // Alias SSE may rewrite a later frame. Response headers commit before the first
+    // body poll, so treat the stream as maybe-transformed and strip body-bound
+    // representation headers now instead of preclassifying complete events.
+    let upstream_stream: UpstreamBodyStream = Box::pin(upstream_response.bytes_stream());
     let shutdown = response_parts.shutdown_subscription();
     let observer = response_parts.into_observer();
     let body_transformed = response_model_rewrite.is_some();
@@ -11696,6 +11585,16 @@ async fn run_shielded_attempts(
             );
         }
 
+        if should_direct_relay_first_attempt_force_thinking_alias_stream(&runtime, &started.info) {
+            return ShieldedRunOutcome::DirectRelay(
+                direct_relay_first_attempt_force_thinking_alias_stream_outcome(
+                    started,
+                    &attempt_records,
+                    runtime.request_deadline,
+                ),
+            );
+        }
+
         if should_direct_relay_no_thinking_stream(&runtime, &started.info, retry_cause) {
             return ShieldedRunOutcome::DirectRelay(direct_relay_no_thinking_stream_outcome(
                 started,
@@ -11909,6 +11808,19 @@ fn direct_relay_loop_guard_disabled_stream_outcome(
     }
 }
 
+fn direct_relay_first_attempt_force_thinking_alias_stream_outcome(
+    started: ShieldedStartedAttempt,
+    attempt_records: &[AttemptRecord],
+    request_deadline: RequestDeadline,
+) -> ShieldedDirectRelayOutcome {
+    ShieldedDirectRelayOutcome {
+        started,
+        prior_attempt_records: attempt_records.to_vec(),
+        response_metadata: first_attempt_force_thinking_alias_direct_relay_metadata(),
+        request_deadline,
+    }
+}
+
 fn should_direct_relay_no_thinking_stream(
     runtime: &ShieldedRetryRuntime,
     info: &ShieldedAttemptInfo,
@@ -11963,6 +11875,23 @@ fn should_direct_relay_loop_guard_disabled_stream(
             .is_none_or(|used| used != "true")
 }
 
+fn should_direct_relay_first_attempt_force_thinking_alias_stream(
+    runtime: &ShieldedRetryRuntime,
+    info: &ShieldedAttemptInfo,
+) -> bool {
+    runtime.chat_kind == ShieldedChatKind::Stream
+        && runtime.ordinary_attempt_number(info.attempt_number) == 1
+        && runtime.forced_model_alias_policy.is_some()
+        && info
+            .request_metadata
+            .get("cot_salvage_used")
+            .is_none_or(|used| used != "true")
+        && info
+            .request_metadata
+            .get("attempt_thinking_mode")
+            .is_some_and(|mode| mode == ThinkingMode::ForceThinking.as_str())
+}
+
 fn no_thinking_direct_relay_metadata() -> BTreeMap<String, String> {
     BTreeMap::from([
         (
@@ -12010,6 +11939,23 @@ fn loop_guard_disabled_direct_relay_metadata() -> BTreeMap<String, String> {
         (
             String::from("shielded_loop_inspection_skipped"),
             String::from("loop_guard_disabled_direct_streaming_relay"),
+        ),
+    ])
+}
+
+fn first_attempt_force_thinking_alias_direct_relay_metadata() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (
+            String::from("shielded_direct_streaming_relay"),
+            String::from("true"),
+        ),
+        (
+            String::from("shielded_direct_streaming_relay_deadline_bound"),
+            String::from("true"),
+        ),
+        (
+            String::from("shielded_loop_inspection_skipped"),
+            String::from("first_attempt_force_thinking_alias_direct_streaming_relay"),
         ),
     ])
 }
