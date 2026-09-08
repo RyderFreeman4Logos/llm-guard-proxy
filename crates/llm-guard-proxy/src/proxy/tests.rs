@@ -1627,20 +1627,19 @@ fn admin_token_matcher_accepts_only_exact_values() {
     assert!(!admin_token_matches("", "admin-token"));
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persistence_tasks_contain_spawn_blocking_panics() {
     let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
-    let (panic_published_tx, panic_published_rx) = oneshot::channel();
+    let (panic_published_tx, panic_published_rx) = std::sync::mpsc::channel();
     let tasks = Arc::new(PersistenceTasks::with_panic_publication_for_tests(
         panic_published_tx,
     ));
 
     tasks.spawn_blocking(|| panic!("simulated persistence store teardown failure"));
 
-    timeout(STREAM_COMPLETION_TIMEOUT, panic_published_rx)
-        .await
-        .expect("panic-safe persistence task should publish its panic")
-        .expect("panic publication sender should remain owned until the worker runs");
+    panic_published_rx
+        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
+        .expect("panic-safe persistence task should publish its panic");
     timeout(
         STREAM_COMPLETION_TIMEOUT,
         tasks.flush(STREAM_COMPLETION_TIMEOUT),
@@ -1654,8 +1653,8 @@ async fn persistence_tasks_contain_spawn_blocking_panics() {
 async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
     let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
     let tasks = Arc::new(PersistenceTasks::with_capacity_for_tests(1));
-    let (first_started_tx, first_started_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel();
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     let overflow_executed = Arc::new(AtomicBool::new(false));
 
     tasks.spawn_blocking(move || {
@@ -1663,13 +1662,12 @@ async fn persistence_tasks_drop_work_when_the_bounded_backlog_is_full() {
             .send(())
             .expect("first persistence task startup receiver should remain open");
         release_rx
-            .blocking_recv()
+            .recv()
             .expect("first persistence task should be released");
     });
-    timeout(STREAM_COMPLETION_TIMEOUT, first_started_rx)
-        .await
-        .expect("first persistence task should start")
-        .expect("first persistence task startup sender should remain owned until it runs");
+    first_started_rx
+        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
+        .expect("first persistence task should start");
 
     let overflow_executed_for_task = Arc::clone(&overflow_executed);
     tasks.spawn_blocking(move || {
@@ -1731,20 +1729,19 @@ async fn persistence_tasks_rate_limit_backlog_drop_logs_during_a_burst() {
         1,
         backlog_log_tx,
     ));
-    let (first_started_tx, first_started_rx) = oneshot::channel();
-    let (release_tx, release_rx) = oneshot::channel();
+    let (first_started_tx, first_started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
     tasks.spawn_blocking(move || {
         first_started_tx
             .send(())
             .expect("first persistence task startup receiver should remain open");
         release_rx
-            .blocking_recv()
+            .recv()
             .expect("first persistence task should be released");
     });
-    timeout(STREAM_COMPLETION_TIMEOUT, first_started_rx)
-        .await
-        .expect("first persistence task should start")
-        .expect("first persistence task startup sender should remain owned until it runs");
+    first_started_rx
+        .recv_timeout(STREAM_COMPLETION_TIMEOUT)
+        .expect("first persistence task should start");
 
     for _ in 0..OVERFLOW_BURST {
         tasks.spawn_blocking(|| {});

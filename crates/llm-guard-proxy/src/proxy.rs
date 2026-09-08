@@ -932,7 +932,7 @@ struct PersistenceTasks {
     #[cfg(test)]
     flush_wait_hook: Option<PersistenceFlushWaitHook>,
     #[cfg(test)]
-    panic_published: Mutex<Option<oneshot::Sender<()>>>,
+    panic_published: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     #[cfg(test)]
     backlog_drop_log_published: Mutex<Option<oneshot::Sender<()>>>,
 }
@@ -976,7 +976,7 @@ impl PersistenceTasks {
     }
 
     #[cfg(test)]
-    fn with_panic_publication_for_tests(panic_published: oneshot::Sender<()>) -> Self {
+    fn with_panic_publication_for_tests(panic_published: std::sync::mpsc::Sender<()>) -> Self {
         Self {
             panic_published: Mutex::new(Some(panic_published)),
             ..Self::default()

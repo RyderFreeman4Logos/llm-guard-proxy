@@ -234,8 +234,8 @@ base_url = "{primary_base_url}"
 match_models = ["first-model"]
 request_timeout_ms = 400
 health_probe_interval_ms = 200
-health_probe_timeout_ms = 20
-health_probe_max_wait_ms = 400
+health_probe_timeout_ms = 400
+health_probe_max_wait_ms = 2000
 
 [[upstreams.endpoints]]
 base_url = "{primary_base_url}"
@@ -626,8 +626,8 @@ fn openai_to_deepinfra_config_with_key_env(
 model = "same-model"
 request_timeout_ms = 400
 health_probe_interval = "200ms"
-health_probe_timeout = "20ms"
-health_probe_max_wait = "400ms"
+health_probe_timeout = "400ms"
+health_probe_max_wait = "2s"
 
 [[profile.upstream]]
 base_url = "{primary_base_url}"

@@ -409,7 +409,7 @@ request_deadline_ms = 3000
 name = "recovering-chat"
 base_url = "{}"
 match_models = ["test-chat"]
-request_timeout_ms = 1000
+request_timeout_ms = 3000
 endpoint_selection = "priority_failover"
 
 [[upstreams.endpoints]]
