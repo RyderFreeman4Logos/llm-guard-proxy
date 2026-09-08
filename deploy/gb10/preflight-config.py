@@ -164,25 +164,38 @@ def _forced_alias_profile_errors(config: dict[str, JsonValue]) -> list[str]:
 def _named_upstream_membership_errors(config: dict[str, JsonValue]) -> list[str]:
     expected = list(FORCED_ALIAS_PROFILES)
     profiles = config.get("upstreams")
-    default_chat = (
-        next(
-            (
-                profile
-                for profile in profiles
-                if isinstance(profile, dict) and profile.get("name") == AEON_DEFAULT_NO_THINK
-            ),
-            None,
-        )
-        if isinstance(profiles, list)
-        else None
+    if not isinstance(profiles, list):
+        return [f"{AEON_DEFAULT_NO_THINK} routing profile is missing"]
+    default_chat = next(
+        (
+            profile
+            for profile in profiles
+            if isinstance(profile, dict) and profile.get("name") == AEON_DEFAULT_NO_THINK
+        ),
+        None,
     )
     if not isinstance(default_chat, dict):
         return [f"{AEON_DEFAULT_NO_THINK} routing profile is missing"]
+    if default_chat.get("match_models") != expected:
+        return [
+            f"{AEON_DEFAULT_NO_THINK} match_models must exactly match the public NVFP4 aliases"
+        ]
+    membership = {alias: [] for alias in expected}
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        name = profile.get("name")
+        match_models = profile.get("match_models")
+        if not isinstance(name, str) or not isinstance(match_models, list):
+            continue
+        for alias in expected:
+            if alias in match_models:
+                membership[alias].append(name)
     return (
         []
-        if default_chat.get("match_models") == expected
+        if all(names == [AEON_DEFAULT_NO_THINK] for names in membership.values())
         else [
-            f"{AEON_DEFAULT_NO_THINK} match_models must exactly match the public NVFP4 aliases"
+            f"public NVFP4 aliases must belong exclusively to {AEON_DEFAULT_NO_THINK}"
         ]
     )
 

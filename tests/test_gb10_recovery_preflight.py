@@ -284,7 +284,7 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
         if default_chat is None:
             self.fail("aeon-default-no-think routing profile is missing")
         self.assertEqual(default_chat["match_models"], expected_aliases)
-        for mutation in ("empty", "missing-none", "extra"):
+        for mutation in ("empty", "missing-none", "extra", "foreign-membership"):
             with self.subTest(mutation=mutation):
                 candidate = copy.deepcopy(self.config)
                 profile = next(
@@ -296,8 +296,15 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                     profile["match_models"] = []
                 elif mutation == "missing-none":
                     profile["match_models"] = expected_aliases[1:]
-                else:
+                elif mutation == "extra":
                     profile["match_models"] = [*expected_aliases, "extra"]
+                else:
+                    foreign_profile = next(
+                        item
+                        for item in candidate["upstreams"]
+                        if item["name"] == "aeon-chat"
+                    )
+                    foreign_profile["match_models"].append(expected_aliases[0])
                 errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
                 self.assertTrue(errors)
 
