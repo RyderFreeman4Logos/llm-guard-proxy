@@ -4055,6 +4055,7 @@ fn named_upstream_watchdog_and_restart_queue_parse_and_hot_reload() {
 [[upstreams]]
 name = "named"
 base_url = "http://127.0.0.1:19000/v1"
+match_models = ["named-chat"]
 
 [upstreams.stuck_watchdog]
 enabled = false
@@ -4075,11 +4076,15 @@ name = "initial"
 "#,
     )
     .expect("named current config should parse");
+    current
+        .validate()
+        .expect("named current config should validate");
     let requested = AppConfig::parse(
         r#"
 [[upstreams]]
 name = "named"
 base_url = "http://127.0.0.1:19000/v1"
+match_models = ["named-chat"]
 
 [upstreams.stuck_watchdog]
 enabled = true
@@ -4100,6 +4105,9 @@ name = "replacement"
 "#,
     )
     .expect("named requested config should parse");
+    requested
+        .validate()
+        .expect("named requested config should validate");
     let handle = ConfigHandle::new(current);
 
     let outcome = handle
@@ -4410,6 +4418,7 @@ fn guardian_reload_metadata_lists_all_policy_fields() {
 
 mod endpoint_reload;
 mod profile_policy;
+mod reload_validation;
 
 #[test]
 fn reload_metadata_lists_cover_expected_fields() {
