@@ -258,6 +258,49 @@ class Gb10RecoveryPreflightTests(unittest.TestCase):
                 errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
                 self.assertTrue(errors)
 
+    def test_nvfp4_aliases_have_exact_named_upstream_membership(self) -> None:
+        expected_aliases = [
+            "abliterated-qwen-latest-27b-nvfp4-none",
+            "abliterated-qwen-latest-27b-nvfp4-low",
+            "abliterated-qwen-latest-27b-nvfp4-medium",
+        ]
+        expected_membership = ["aeon-default-no-think"]
+        for alias in expected_aliases:
+            with self.subTest(alias=alias):
+                membership = [
+                    profile["name"]
+                    for profile in self.config["upstreams"]
+                    if alias in (profile.get("match_models") or [])
+                ]
+                self.assertEqual(membership, expected_membership)
+        default_chat = next(
+            (
+                profile
+                for profile in self.config["upstreams"]
+                if profile.get("name") == "aeon-default-no-think"
+            ),
+            None,
+        )
+        if default_chat is None:
+            self.fail("aeon-default-no-think routing profile is missing")
+        self.assertEqual(default_chat["match_models"], expected_aliases)
+        for mutation in ("empty", "missing-none", "extra"):
+            with self.subTest(mutation=mutation):
+                candidate = copy.deepcopy(self.config)
+                profile = next(
+                    item
+                    for item in candidate["upstreams"]
+                    if item["name"] == "aeon-default-no-think"
+                )
+                if mutation == "empty":
+                    profile["match_models"] = []
+                elif mutation == "missing-none":
+                    profile["match_models"] = expected_aliases[1:]
+                else:
+                    profile["match_models"] = [*expected_aliases, "extra"]
+                errors, _ = self.preflight.validate_snapshot(candidate, 4_000_000)
+                self.assertTrue(errors)
+
 
 if __name__ == "__main__":
     unittest.main()

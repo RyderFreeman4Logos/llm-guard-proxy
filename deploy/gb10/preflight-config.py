@@ -15,6 +15,7 @@ JsonValue: TypeAlias = (
 )
 
 AEON_PROFILE = "aeon-chat"
+AEON_DEFAULT_NO_THINK = "aeon-default-no-think"
 AEON_RESTART_COMMAND = [
     "systemctl",
     "--user",
@@ -160,6 +161,32 @@ def _forced_alias_profile_errors(config: dict[str, JsonValue]) -> list[str]:
     )
 
 
+def _named_upstream_membership_errors(config: dict[str, JsonValue]) -> list[str]:
+    expected = list(FORCED_ALIAS_PROFILES)
+    profiles = config.get("upstreams")
+    default_chat = (
+        next(
+            (
+                profile
+                for profile in profiles
+                if isinstance(profile, dict) and profile.get("name") == AEON_DEFAULT_NO_THINK
+            ),
+            None,
+        )
+        if isinstance(profiles, list)
+        else None
+    )
+    if not isinstance(default_chat, dict):
+        return [f"{AEON_DEFAULT_NO_THINK} routing profile is missing"]
+    return (
+        []
+        if default_chat.get("match_models") == expected
+        else [
+            f"{AEON_DEFAULT_NO_THINK} match_models must exactly match the public NVFP4 aliases"
+        ]
+    )
+
+
 def _reserved_ingress_errors(config: dict[str, JsonValue]) -> list[str]:
     reserved = _table(config, "upstream").get("reserved_ingress_model_ids")
     return (
@@ -205,6 +232,7 @@ def validate_snapshot(
     errors: list[str] = []
     errors.extend(_forced_alias_profile_errors(config))
     errors.extend(_reserved_ingress_errors(config))
+    errors.extend(_named_upstream_membership_errors(config))
     if "guard_workflows" in config:
         errors.append("guard_workflows must remain inactive in the reviewed snapshot")
 

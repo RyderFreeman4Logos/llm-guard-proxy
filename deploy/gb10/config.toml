@@ -321,6 +321,59 @@ name = "no-thinking"
 thinking_mode = "passthrough"
 enabled = false
 
+# Public NVFP4 aliases must match this named AEON profile, not [upstream].
+[[upstreams]]
+name = "aeon-default-no-think"
+base_url = "http://100.105.4.92:18010/v1"
+upstream_model = "aeon-ultimate"
+match_models = ["abliterated-qwen-latest-27b-nvfp4-none", "abliterated-qwen-latest-27b-nvfp4-low", "abliterated-qwen-latest-27b-nvfp4-medium"]
+request_timeout_ms = 1800000
+max_in_flight_requests = 4
+max_queued_generation_requests = 64
+
+[upstreams.local_recovery]
+enabled = true
+trigger_on_request_deadline = false
+restart_command = ["systemctl", "--user", "restart", "vllm-aeon-27b-dflash-n12.service"]
+restart_timeout_ms = 300000
+readiness_endpoint = "/v1/chat/completions"
+readiness_body = "{\"model\":\"aeon-ultimate\",\"messages\":[{\"role\":\"user\",\"content\":\"1+1=?\"}],\"chat_template_kwargs\":{\"enable_thinking\":false},\"max_tokens\":1}"
+readiness_request_timeout_ms = 30000
+readiness_deadline_ms = 600000
+readiness_interval_ms = 5000
+max_attempts_per_request = 1
+cooldown_ms = 300000
+budget_window_ms = 900000
+max_per_window = 2
+
+[upstreams.thinking]
+mode = "passthrough"
+enabled = false
+force_disable = false
+budget_tokens = 32768
+
+[[upstreams.retry.ladder]]
+name = "max-thinking"
+thinking_mode = "passthrough"
+enabled = false
+
+[[upstreams.retry.ladder]]
+name = "bounded-thinking-deep"
+thinking_mode = "passthrough"
+enabled = false
+anti_loop_hint = "Previous attempt became repetitive. Do not repeat prior analysis; answer directly."
+
+[[upstreams.retry.ladder]]
+name = "bounded-thinking"
+thinking_mode = "passthrough"
+enabled = false
+anti_loop_hint = "Previous attempt became repetitive after a deeper retry. Use only the useful prior work and answer directly."
+
+[[upstreams.retry.ladder]]
+name = "no-thinking"
+thinking_mode = "passthrough"
+enabled = false
+
 # BEGIN PARSEABLE EXAMPLE: fill-if-absent-chat-defaults
 # Every default is optional; omitted fields pass through unchanged, and explicit
 # caller fields always win. This profile keeps thinking passthrough so the proxy
