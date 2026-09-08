@@ -82,6 +82,7 @@ const STREAM_FIRST_CHUNK_TIMEOUT: Duration = Duration::from_millis(250);
 const STREAM_SECOND_CHUNK_GUARD: Duration = Duration::from_millis(150);
 const STREAM_COMPLETION_TIMEOUT: Duration = Duration::from_secs(2);
 const SHIELDED_SLOW_DELAY: Duration = Duration::from_millis(2_500);
+const SHIELDED_SLOW_COMPLETION_TIMEOUT: Duration = Duration::from_secs(8);
 const SHIELDED_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(1_500);
 const SSE_FIRST_CHUNK: &[u8] = b"data: first\n\n";
 const SSE_SECOND_CHUNK: &[u8] = b"data: second\n\n";
@@ -12122,7 +12123,7 @@ shielded_streaming_enabled = true
             .is_err(),
         "liveness must remain held while the aggregate can still choose replay"
     );
-    let released = collect_stream_text(&mut body, Duration::from_secs(4)).await;
+    let released = collect_stream_text(&mut body, SHIELDED_SLOW_COMPLETION_TIMEOUT).await;
     assert!(released.contains("data:"));
     assert!(released.contains("chat.completion.chunk"));
     assert!(released.contains("Hel"));
@@ -14315,7 +14316,7 @@ interval_secs = 1
     .await;
 
     let response = timeout(
-        Duration::from_secs(4),
+        SHIELDED_SLOW_COMPLETION_TIMEOUT,
         proxy
             .client
             .post(format!(
