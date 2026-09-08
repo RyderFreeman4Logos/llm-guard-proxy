@@ -67,6 +67,38 @@ repetition_penalty = 1.0
 "#;
 
 #[cfg(feature = "guard")]
+const FORCED_THINKING_LOW_MEDIUM_CONFIG: &str = r#"
+[retry]
+shielded_streaming_enabled = true
+
+[[forced_model_alias_profiles]]
+alias = "public-forced-thinking-low"
+upstream_model = "canonical-target"
+thinking_mode = "force_thinking"
+thinking_budget = 16
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+
+[[forced_model_alias_profiles]]
+alias = "public-forced-thinking-medium"
+upstream_model = "canonical-target"
+thinking_mode = "force_thinking"
+thinking_budget = 16
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#;
+
+#[cfg(feature = "guard")]
 #[derive(Clone)]
 struct DelayedAliasSseState {
     first: Bytes,
@@ -156,6 +188,56 @@ impl Drop for DelayedAliasSseUpstream {
     fn drop(&mut self) {
         self.server.abort();
     }
+}
+
+#[cfg(feature = "guard")]
+fn assert_alias_sse_maybe_transformed_headers(response: &reqwest::Response) {
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("x-safe-custom"),
+        Some(&HeaderValue::from_static("preserve-me"))
+    );
+    for header in BODY_BOUND_HEADERS {
+        assert!(
+            response.headers().get(header).is_none(),
+            "alias SSE must strip stale {header} before any later rewrite"
+        );
+    }
+    assert_eq!(
+        response.headers().get(CONTENT_TYPE),
+        Some(&HeaderValue::from_static("text/event-stream"))
+    );
+    assert!(
+        response.headers().get(CONTENT_LENGTH).is_none(),
+        "alias SSE must strip stale Content-Length before any later rewrite"
+    );
+}
+
+#[cfg(feature = "guard")]
+async fn delayed_alias_sse_response(
+    upstream: &mut DelayedAliasSseUpstream,
+    extra_config: &str,
+    path: &str,
+    body: String,
+) -> (ProxyFixture, reqwest::Response) {
+    let proxy = ProxyFixture::spawn_with_extra_config(&upstream.base_url, extra_config).await;
+    let client = proxy.client.clone();
+    let url = format!("{}{path}", proxy.base_url);
+    let request = tokio::spawn(async move {
+        client
+            .post(url)
+            .header(CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .await
+    });
+    upstream.first_frame_sent().await;
+    let response = timeout(STREAM_COMPLETION_TIMEOUT, request)
+        .await
+        .expect("downstream headers must not wait for upstream EOF")
+        .expect("downstream request task must not panic")
+        .expect("alias SSE response should complete its headers");
+    (proxy, response)
 }
 
 #[cfg(feature = "guard")]
@@ -275,173 +357,146 @@ async fn shielded_non_alias_aggregation_sanitizes_body_bound_headers() {
 
 #[cfg(feature = "guard")]
 #[tokio::test]
-async fn alias_sse_rewrite_forwards_first_frame_before_upstream_eof() {
-    let mut upstream = DelayedAliasSseUpstream::spawn(
-        b"data: {\"model\":\"canonical-target\"}\r\r",
-        b"data: {\"model\":\"canonical-target\",\"done\":true}\n\n",
-    )
-    .await;
-    let proxy =
-        ProxyFixture::spawn_with_extra_config(&upstream.base_url, FORCED_ALIAS_CONFIG).await;
-    let client = proxy.client.clone();
-    let request = tokio::spawn(async move {
-        client
-            .post(format!("{}/v1/completions", proxy.base_url))
-            .header(CONTENT_TYPE, "application/json")
-            .body(r#"{"model":"public-forced-alias","prompt":"ping","stream":true}"#)
-            .send()
-            .await
-    });
+async fn forced_thinking_low_and_medium_alias_sse_rewrites_first_event_before_eof() {
+    for alias in [
+        "public-forced-thinking-low",
+        "public-forced-thinking-medium",
+    ] {
+        let mut upstream = DelayedAliasSseUpstream::spawn(
+            b"data: {\"model\":\"canonical-target\"}\r\r",
+            b"data: {\"model\":\"canonical-target\",\"done\":true}\n\n",
+        )
+        .await;
+        let body = format!(
+            r#"{{"model":"{alias}","messages":[{{"role":"user","content":"ping"}}],"stream":true}}"#
+        );
+        let (_proxy, response) = delayed_alias_sse_response(
+            &mut upstream,
+            FORCED_THINKING_LOW_MEDIUM_CONFIG,
+            "/v1/chat/completions",
+            body,
+        )
+        .await;
+        assert_alias_sse_maybe_transformed_headers(&response);
 
-    upstream.first_frame_sent().await;
-    let response = timeout(STREAM_COMPLETION_TIMEOUT, request)
-        .await
-        .expect("downstream headers must not wait for upstream EOF")
-        .expect("downstream request task must not panic")
-        .expect("alias SSE response should complete its headers");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get("x-safe-custom"),
-        Some(&HeaderValue::from_static("preserve-me"))
-    );
-    for header in BODY_BOUND_HEADERS {
-        assert!(
-            response.headers().get(header).is_none(),
-            "rewritten SSE must not retain {header}"
+        let mut body = response.bytes_stream();
+        let first = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
+            .await
+            .expect("forced-thinking first SSE event must arrive before upstream EOF")
+            .expect("forced-thinking SSE body must contain a first event")
+            .expect("forced-thinking first SSE event must be readable");
+        assert_eq!(
+            first.as_ref(),
+            format!("data: {{\"model\":\"{alias}\"}}\r\r").as_bytes(),
+            "{alias} must rewrite the first complete model-bearing event"
+        );
+        upstream.assert_second_frame_is_blocked();
+
+        upstream.release();
+        upstream.second_frame_started().await;
+        let second = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
+            .await
+            .expect("released terminal event must reach the client")
+            .expect("forced-thinking SSE body must contain the terminal event")
+            .expect("forced-thinking terminal event must be readable");
+        assert_eq!(
+            second.as_ref(),
+            format!("data: {{\"done\":true,\"model\":\"{alias}\"}}\n\n").as_bytes()
         );
     }
-    assert_eq!(
-        response.headers().get(CONTENT_TYPE),
-        Some(&HeaderValue::from_static("text/event-stream"))
-    );
-    assert!(
-        response.headers().get(CONTENT_LENGTH).is_none(),
-        "rewritten SSE must strip stale Content-Length"
-    );
+}
+
+#[cfg(feature = "guard")]
+#[tokio::test]
+async fn mixed_opaque_then_rewriteable_alias_sse_strips_stale_headers_upfront() {
+    let mut upstream = DelayedAliasSseUpstream::spawn(
+        b"data: \xFF\r\n\r\n",
+        b"data: {\"model\":\"canonical-target\"}\n\n",
+    )
+    .await;
+    let (_proxy, response) = delayed_alias_sse_response(
+        &mut upstream,
+        FORCED_ALIAS_CONFIG,
+        "/v1/completions",
+        r#"{"model":"public-forced-alias","prompt":"ping","stream":true}"#.to_owned(),
+    )
+    .await;
+    assert_alias_sse_maybe_transformed_headers(&response);
 
     let mut body = response.bytes_stream();
     let first = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
         .await
-        .expect("rewritten first SSE frame must arrive before upstream EOF")
-        .expect("rewritten SSE body must contain a first frame")
-        .expect("rewritten first SSE frame must be readable");
-    assert_eq!(
-        first.as_ref(),
-        b"data: {\"model\":\"public-forced-alias\"}\r\r"
-    );
+        .expect("opaque prefix must reach the client before upstream EOF")
+        .expect("mixed SSE body must contain the opaque prefix")
+        .expect("opaque prefix must be readable");
+    assert_eq!(first.as_ref(), b"data: \xFF\r\n\r\n");
     upstream.assert_second_frame_is_blocked();
 
     upstream.release();
     upstream.second_frame_started().await;
     let second = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
         .await
-        .expect("released second SSE frame must reach the client")
-        .expect("SSE body must contain the terminal frame")
-        .expect("terminal SSE frame must be readable");
+        .expect("later rewriteable event must reach the client")
+        .expect("mixed SSE body must contain the rewritten event")
+        .expect("rewritten event must be readable");
     assert_eq!(
         second.as_ref(),
-        b"data: {\"done\":true,\"model\":\"public-forced-alias\"}\n\n"
-    );
-    assert!(
-        timeout(STREAM_COMPLETION_TIMEOUT, body.next())
-            .await
-            .expect("SSE body must reach EOF after the released terminal frame")
-            .is_none()
+        b"data: {\"model\":\"public-forced-alias\"}\n\n"
     );
 }
 
 #[cfg(feature = "guard")]
 #[tokio::test]
-async fn loop_guard_off_shielded_thinking_chat_relays_first_frame_before_upstream_eof() {
+async fn keepalive_then_block_reaches_downstream_before_eof_including_loop_guard_off() {
     let mut upstream = DelayedAliasSseUpstream::spawn(
-        b"data: {\"model\":\"canonical-target\"}\r\r",
-        b"data: {\"model\":\"canonical-target\",\"done\":true}\n\n",
+        b": keepalive\n\n",
+        b"data: {\"model\":\"canonical-target\"}\n\n",
     )
     .await;
-    let proxy = ProxyFixture::spawn_with_extra_config(
-        &upstream.base_url,
+    let (_proxy, response) = delayed_alias_sse_response(
+        &mut upstream,
         FORCED_THINKING_ALIAS_LOOP_GUARD_OFF_CONFIG,
+        "/v1/chat/completions",
+        r#"{"model":"public-forced-thinking-alias","messages":[{"role":"user","content":"ping"}],"stream":true}"#.to_owned(),
     )
     .await;
-    let client = proxy.client.clone();
-    let request = tokio::spawn(async move {
-        client
-            .post(format!("{}/v1/chat/completions", proxy.base_url))
-            .header(CONTENT_TYPE, "application/json")
-            .body(
-                r#"{"model":"public-forced-thinking-alias","messages":[{"role":"user","content":"ping"}],"stream":true}"#,
-            )
-            .send()
-            .await
-    });
+    assert_alias_sse_maybe_transformed_headers(&response);
 
-    upstream.first_frame_sent().await;
-    let response = timeout(STREAM_COMPLETION_TIMEOUT, request)
-        .await
-        .expect("downstream headers must not wait for upstream EOF")
-        .expect("downstream request task must not panic")
-        .expect("shielded chat response should complete its headers");
-    assert_eq!(response.status(), StatusCode::OK);
     let mut body = response.bytes_stream();
     let first = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
         .await
-        .expect("loop-guard-off shielded chat must relay before upstream EOF")
-        .expect("shielded chat body must contain the first frame")
-        .expect("shielded chat first frame must be readable");
-    assert_eq!(
-        first.as_ref(),
-        b"data: {\"model\":\"public-forced-thinking-alias\"}\r\r"
-    );
+        .expect("keepalive must reach the client before later event/EOF")
+        .expect("loop-guard-off SSE body must contain the keepalive")
+        .expect("keepalive must be readable");
+    assert_eq!(first.as_ref(), b": keepalive\n\n");
     upstream.assert_second_frame_is_blocked();
 
     upstream.release();
     upstream.second_frame_started().await;
-    let _second = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
+    let second = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
         .await
-        .expect("released terminal frame must reach the client")
-        .expect("shielded chat body must contain the terminal frame")
-        .expect("shielded chat terminal frame must be readable");
+        .expect("released model event must reach the client")
+        .expect("loop-guard-off SSE body must contain the rewritten event")
+        .expect("rewritten event must be readable");
+    assert_eq!(
+        second.as_ref(),
+        b"data: {\"model\":\"public-forced-thinking-alias\"}\n\n"
+    );
 }
 
 #[cfg(feature = "guard")]
 #[tokio::test]
-async fn opaque_alias_sse_forwards_first_frame_before_upstream_eof_without_header_changes() {
+async fn opaque_alias_sse_forwards_exact_bytes_and_strips_stale_headers() {
     let mut upstream =
         DelayedAliasSseUpstream::spawn(b"data: \xFF\r\n\r\n", b"data: opaque-tail\n\n").await;
-    let proxy =
-        ProxyFixture::spawn_with_extra_config(&upstream.base_url, FORCED_ALIAS_CONFIG).await;
-    let client = proxy.client.clone();
-    let request = tokio::spawn(async move {
-        client
-            .post(format!("{}/v1/completions", proxy.base_url))
-            .header(CONTENT_TYPE, "application/json")
-            .body(r#"{"model":"public-forced-alias","prompt":"ping","stream":true}"#)
-            .send()
-            .await
-    });
-
-    upstream.first_frame_sent().await;
-    let response = timeout(STREAM_COMPLETION_TIMEOUT, request)
-        .await
-        .expect("opaque downstream headers must not wait for upstream EOF")
-        .expect("opaque downstream request task must not panic")
-        .expect("opaque alias SSE response should complete its headers");
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response.headers().get("x-safe-custom"),
-        Some(&HeaderValue::from_static("preserve-me"))
-    );
-    assert_eq!(
-        response.headers().get(CONTENT_LENGTH),
-        Some(&HeaderValue::from_static("30")),
-        "opaque streaming bytes must preserve the valid upstream Content-Length"
-    );
-    for header in BODY_BOUND_HEADERS {
-        assert!(
-            response.headers().get(header).is_some(),
-            "opaque no-op SSE must preserve {header}"
-        );
-    }
+    let (_proxy, response) = delayed_alias_sse_response(
+        &mut upstream,
+        FORCED_ALIAS_CONFIG,
+        "/v1/completions",
+        r#"{"model":"public-forced-alias","prompt":"ping","stream":true}"#.to_owned(),
+    )
+    .await;
+    assert_alias_sse_maybe_transformed_headers(&response);
 
     let mut body = response.bytes_stream();
     let first = timeout(STREAM_COMPLETION_TIMEOUT, body.next())
@@ -470,7 +525,7 @@ async fn opaque_alias_sse_forwards_first_frame_before_upstream_eof_without_heade
 
 #[cfg(feature = "guard")]
 #[tokio::test]
-async fn alias_response_noop_preserves_body_bound_headers_and_bytes() {
+async fn alias_json_noop_preserves_body_bound_headers_and_bytes() {
     let fake = FakeUpstream::spawn().await;
     let proxy = ProxyFixture::spawn_with_extra_config(&fake.base_url, FORCED_ALIAS_CONFIG).await;
 
@@ -487,36 +542,6 @@ async fn alias_response_noop_preserves_body_bound_headers_and_bytes() {
             "application/json",
             b"[\"unchanged\"]".as_slice(),
         ),
-        (
-            "non-utf8-sse",
-            r#"{"model":"public-forced-alias","messages":[],"stream":true}"#,
-            "text/event-stream",
-            b"data: \xFF\n\n".as_slice(),
-        ),
-        (
-            "empty-sse",
-            r#"{"model":"public-forced-alias","messages":[],"stream":true}"#,
-            "text/event-stream",
-            b"".as_slice(),
-        ),
-        (
-            "comment-sse",
-            r#"{"model":"public-forced-alias","messages":[],"stream":true}"#,
-            "text/event-stream",
-            b": keepalive\n\n".as_slice(),
-        ),
-        (
-            "done-sse",
-            r#"{"model":"public-forced-alias","messages":[],"stream":true}"#,
-            "text/event-stream",
-            b"data: [DONE]\n\n".as_slice(),
-        ),
-        (
-            "same-model-sse",
-            r#"{"model":"public-forced-alias","messages":[],"stream":true}"#,
-            "text/event-stream",
-            b"data: {\"model\":\"public-forced-alias\"}\n\n".as_slice(),
-        ),
     ];
     for (case, request_body, content_type, expected_body) in cases {
         let response = proxy
@@ -529,7 +554,7 @@ async fn alias_response_noop_preserves_body_bound_headers_and_bytes() {
             .body(request_body)
             .send()
             .await
-            .expect("no-op alias response should complete");
+            .expect("no-op alias JSON response should complete");
 
         assert_eq!(response.status(), StatusCode::OK, "case={case}");
         assert_eq!(
@@ -540,7 +565,7 @@ async fn alias_response_noop_preserves_body_bound_headers_and_bytes() {
         for header in BODY_BOUND_HEADERS {
             assert!(
                 response.headers().get(header).is_some(),
-                "no-op alias response must preserve {header}; case={case}"
+                "buffered JSON no-op must preserve {header}; case={case}"
             );
         }
         assert_eq!(
