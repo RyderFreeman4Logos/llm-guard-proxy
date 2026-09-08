@@ -1628,25 +1628,23 @@ fn admin_token_matcher_accepts_only_exact_values() {
     assert!(!admin_token_matches("", "admin-token"));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn persistence_tasks_contain_spawn_blocking_panics() {
-    let _worker_isolation = PersistenceTasks::worker_test_lock().lock_owned().await;
-    let (panic_published_tx, panic_published_rx) = std::sync::mpsc::channel();
-    let tasks = Arc::new(PersistenceTasks::with_panic_publication_for_tests(
-        panic_published_tx,
-    ));
+#[test]
+fn persistence_tasks_contain_spawn_blocking_panics() {
+    let _worker_isolation = PersistenceTasks::worker_test_lock().blocking_lock_owned();
+    let tasks = Arc::new(PersistenceTasks::default());
 
     tasks.spawn_blocking(|| panic!("simulated persistence store teardown failure"));
-
-    panic_published_rx
+    let worker = tasks
+        .take_spawned_worker_for_tests()
+        .expect("panic-safe persistence task should remain joinable");
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = finished_tx.send(worker.join());
+    });
+    finished_rx
         .recv_timeout(STREAM_COMPLETION_TIMEOUT)
-        .expect("panic-safe persistence task should publish its panic");
-    timeout(
-        STREAM_COMPLETION_TIMEOUT,
-        tasks.flush(STREAM_COMPLETION_TIMEOUT),
-    )
-    .await
-    .expect("published panic-safe persistence task should finish");
+        .expect("panic-safe persistence task should finish")
+        .expect("panic-safe persistence task should contain its panic");
     assert_eq!(tasks.panics.load(Ordering::SeqCst), 1);
 }
 

@@ -932,9 +932,9 @@ struct PersistenceTasks {
     #[cfg(test)]
     flush_wait_hook: Option<PersistenceFlushWaitHook>,
     #[cfg(test)]
-    panic_published: Mutex<Option<std::sync::mpsc::Sender<()>>>,
-    #[cfg(test)]
     backlog_drop_log_published: Mutex<Option<oneshot::Sender<()>>>,
+    #[cfg(test)]
+    spawned_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl Default for PersistenceTasks {
@@ -951,9 +951,9 @@ impl Default for PersistenceTasks {
             #[cfg(test)]
             flush_wait_hook: None,
             #[cfg(test)]
-            panic_published: Mutex::new(None),
-            #[cfg(test)]
             backlog_drop_log_published: Mutex::new(None),
+            #[cfg(test)]
+            spawned_worker: Mutex::new(None),
         }
     }
 }
@@ -976,14 +976,6 @@ impl PersistenceTasks {
     }
 
     #[cfg(test)]
-    fn with_panic_publication_for_tests(panic_published: std::sync::mpsc::Sender<()>) -> Self {
-        Self {
-            panic_published: Mutex::new(Some(panic_published)),
-            ..Self::default()
-        }
-    }
-
-    #[cfg(test)]
     fn with_backlog_drop_log_for_tests(
         capacity: usize,
         backlog_drop_log_published: oneshot::Sender<()>,
@@ -993,6 +985,14 @@ impl PersistenceTasks {
             backlog_drop_log_published: Mutex::new(Some(backlog_drop_log_published)),
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    fn take_spawned_worker_for_tests(&self) -> Option<std::thread::JoinHandle<()>> {
+        self.spawned_worker
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     #[cfg(test)]
@@ -1049,11 +1049,17 @@ impl PersistenceTasks {
         // The handle is intentionally detached: after its bounded shutdown wait expires,
         // persistence must not retain a waiter on a stalled blocking SQLite operation.
         #[cfg(test)]
-        let _detached_task = std::thread::spawn(move || {
-            let _capacity_permit = capacity_permit;
-            let _guard = guard;
-            tasks.run(work);
-        });
+        {
+            let worker = std::thread::spawn(move || {
+                let _capacity_permit = capacity_permit;
+                let _guard = guard;
+                tasks.run(work);
+            });
+            *self
+                .spawned_worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(worker);
+        }
         #[cfg(not(test))]
         let _detached_task = tokio::task::spawn_blocking(move || {
             let _capacity_permit = capacity_permit;
@@ -1070,15 +1076,6 @@ impl PersistenceTasks {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)).is_err() {
             eprintln!("persistence task panicked");
             self.panics.fetch_add(1, Ordering::SeqCst);
-            #[cfg(test)]
-            if let Some(panic_published) = self
-                .panic_published
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-            {
-                let _ignored_if_test_stops_waiting = panic_published.send(());
-            }
         }
     }
 
