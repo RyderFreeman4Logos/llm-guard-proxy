@@ -190,16 +190,28 @@ repetition_penalty = 1.0
 #[test]
 fn forced_aliases_follow_retained_routing_topology_generation() {
     let current = forced_alias_reload_config("current-canonical", "current-canonical");
+    let mut renamed_profile =
+        forced_alias_reload_config("requested-canonical", "requested-canonical");
+    renamed_profile.upstream_profiles[0].name = String::from("renamed-forced-target");
+    let mut changed_server =
+        forced_alias_reload_config("requested-canonical", "requested-canonical");
+    changed_server.server.port = 19000;
     let cases = [
         (
-            "named upstream profile",
-            forced_alias_reload_config("requested-canonical", "requested-canonical"),
+            "named upstream profile topology",
+            renamed_profile,
             Some("upstreams.topology"),
+        ),
+        ("server port", changed_server, Some("server.port")),
+        (
+            "match models",
+            forced_alias_reload_config("requested-canonical", "requested-canonical"),
+            None,
         ),
         (
             "legacy upstream",
             forced_alias_reload_config_with_routing(
-                "current-canonical",
+                "requested-canonical",
                 "requested-canonical",
                 "http://requested-legacy.example/v1",
                 None,
@@ -210,7 +222,7 @@ fn forced_aliases_follow_retained_routing_topology_generation() {
         (
             "listener policy",
             forced_alias_reload_config_with_extra(
-                "current-canonical",
+                "requested-canonical",
                 "requested-canonical",
                 "\n[[listeners]]\nname = \"routing-listener\"\nbind_host = \"127.0.0.1\"\nport = 18010\nallowed_upstreams = [\"default\"]\n",
             ),
@@ -219,7 +231,7 @@ fn forced_aliases_follow_retained_routing_topology_generation() {
         (
             "public model aliases",
             forced_alias_reload_config_with_extra(
-                "current-canonical",
+                "requested-canonical",
                 "requested-canonical",
                 "\n[[model_aliases]]\nid = \"public-routing-alias\"\nkind = \"upstream\"\nupstream_profile = \"default\"\n",
             ),
@@ -237,12 +249,14 @@ fn forced_aliases_follow_retained_routing_topology_generation() {
             .validate()
             .expect("requested routing fixture should validate");
         let (next, outcome) = apply_reloadable(&current, &requested);
+        let expected = restart_field.map_or(&requested, |_| &current);
         assert_eq!(
-            &next.forced_model_alias_profiles,
-            restart_field.map_or(&requested.forced_model_alias_profiles, |_| {
-                &current.forced_model_alias_profiles
-            }),
+            &next.forced_model_alias_profiles, &expected.forced_model_alias_profiles,
             "{name}: forced aliases must stay in the retained routing generation"
+        );
+        assert_eq!(
+            next.upstream_profiles[0].match_models, expected.upstream_profiles[0].match_models,
+            "{name}: match models must stay in the forced-alias generation"
         );
         assert_eq!(
             outcome
