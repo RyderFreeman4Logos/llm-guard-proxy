@@ -1020,6 +1020,13 @@ impl AppConfig {
                 .clone_from(&requested.upstream.reserved_ingress_model_ids);
             self.forced_model_alias_profiles
                 .clone_from(&requested.forced_model_alias_profiles);
+            for (active, requested) in self
+                .upstream_profiles
+                .iter_mut()
+                .zip(requested.upstream_profiles.iter())
+            {
+                active.match_models.clone_from(&requested.match_models);
+            }
         }
         if self.upstream_profiles_topology_matches(requested) {
             self.apply_reloadable_upstream_profile_fields(requested);
@@ -1136,7 +1143,6 @@ impl AppConfig {
             .iter_mut()
             .zip(requested.upstream_profiles.iter())
         {
-            active.match_models.clone_from(&requested.match_models);
             active.request_timeout_ms = requested.request_timeout_ms;
             active.cache_priority_engine = requested.cache_priority_engine;
             active.endpoint_selection = requested.endpoint_selection;
