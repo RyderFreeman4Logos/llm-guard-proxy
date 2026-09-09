@@ -1136,6 +1136,7 @@ impl AppConfig {
             .iter_mut()
             .zip(requested.upstream_profiles.iter())
         {
+            active.match_models.clone_from(&requested.match_models);
             active.request_timeout_ms = requested.request_timeout_ms;
             active.cache_priority_engine = requested.cache_priority_engine;
             active.endpoint_selection = requested.endpoint_selection;
@@ -1366,7 +1367,6 @@ impl From<&ListenerConfig> for ListenerTopology {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct UpstreamProfileTopology {
     name: String,
-    match_models: Vec<String>,
     upstream_model: Option<String>,
 }
 
@@ -1374,7 +1374,6 @@ impl From<&UpstreamProfileConfig> for UpstreamProfileTopology {
     fn from(profile: &UpstreamProfileConfig) -> Self {
         Self {
             name: profile.name.clone(),
-            match_models: profile.match_models.clone(),
             upstream_model: profile.upstream_model.clone(),
         }
     }

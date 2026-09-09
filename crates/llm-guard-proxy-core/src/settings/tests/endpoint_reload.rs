@@ -190,11 +190,19 @@ repetition_penalty = 1.0
 #[test]
 fn forced_aliases_follow_retained_routing_topology_generation() {
     let current = forced_alias_reload_config("current-canonical", "current-canonical");
+    let mut renamed_profile =
+        forced_alias_reload_config("current-canonical", "requested-canonical");
+    renamed_profile.upstream_profiles[0].name = String::from("renamed-forced-target");
     let cases = [
         (
-            "named upstream profile",
-            forced_alias_reload_config("requested-canonical", "requested-canonical"),
+            "named upstream profile topology",
+            renamed_profile,
             Some("upstreams.topology"),
+        ),
+        (
+            "match models",
+            forced_alias_reload_config("requested-canonical", "requested-canonical"),
+            None,
         ),
         (
             "legacy upstream",

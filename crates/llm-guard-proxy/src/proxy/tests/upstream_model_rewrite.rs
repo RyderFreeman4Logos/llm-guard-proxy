@@ -1491,6 +1491,155 @@ repetition_penalty = 1.0
     assert_eq!(body["temperature"], 0.3);
 }
 
+fn forced_alias_model_ids(config: &AppConfig) -> Vec<String> {
+    let (body, _changed) = prepare_models_body(
+        config,
+        &ListenerConfig::default(),
+        &config.upstream_profiles[0],
+        Bytes::from_static(MODEL_METADATA_BODY.as_bytes()),
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("model discovery should be JSON");
+    body["data"]
+        .as_array()
+        .expect("model discovery data")
+        .iter()
+        .filter_map(|model| model["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn assert_forced_alias_generation(
+    config: &AppConfig,
+    alias: &str,
+    absent_alias: &str,
+    reasoning_effort: &str,
+) -> UpstreamProfileConfig {
+    assert_eq!(config.upstream_profiles[0].match_models, [alias]);
+    let policy = &config.forced_model_alias_profiles[0];
+    assert_eq!(policy.alias, alias);
+    assert_eq!(policy.reasoning_effort.as_deref(), Some(reasoning_effort));
+    let model_ids = forced_alias_model_ids(config);
+    assert!(model_ids.iter().any(|id| id == alias));
+    assert!(!model_ids.iter().any(|id| id == absent_alias));
+    let listener = ListenerConfig::default();
+    let selected = select_allowed_upstream_profile(config, &listener, Some(alias))
+        .expect("current alias should resolve");
+    assert_eq!(selected.route_reason, UpstreamRouteReason::MatchedModel);
+    assert_eq!(
+        select_allowed_upstream_profile(config, &listener, Some(absent_alias))
+            .expect("absent alias should fall back")
+            .route_reason,
+        UpstreamRouteReason::DefaultUnmatchedModel
+    );
+    selected.profile
+}
+
+#[test]
+fn forced_alias_rename_reloads_discovery_and_chat_as_one_generation() {
+    const OLD_ALIAS: &str = "abliterated-qwen-latest-27b-none";
+    const NEW_ALIAS: &str = "abliterated-qwen-latest-27b-none-v2";
+
+    let root = unique_test_dir("forced-alias-rename-270");
+    fs::create_dir_all(&root).expect("test root should be created");
+    let path = root.join("config.toml");
+    let current = format!(
+        r#"
+[[upstreams]]
+name = "forced-alias-route"
+base_url = "http://profile.example/v1"
+upstream_model = "aeon-ultimate"
+match_models = ["{OLD_ALIAS}"]
+
+[[forced_model_alias_profiles]]
+alias = "{OLD_ALIAS}"
+upstream_model = "aeon-ultimate"
+thinking_mode = "force_thinking"
+thinking_budget = 64
+reasoning_effort = "low"
+output_cap = 16
+temperature = 0.7
+top_p = 0.8
+top_k = 20
+min_p = 0.0
+presence_penalty = 1.5
+repetition_penalty = 1.0
+"#
+    );
+    fs::write(&path, &current).expect("current generation should be written");
+    let manager = ConfigManager::from_explicit_path(&path).expect("current config should load");
+    assert_forced_alias_generation(
+        &manager.handle().snapshot().expect("current snapshot"),
+        OLD_ALIAS,
+        NEW_ALIAS,
+        "low",
+    );
+
+    let reloaded = current.replace(OLD_ALIAS, NEW_ALIAS).replace(
+        "reasoning_effort = \"low\"",
+        "reasoning_effort = \"medium\"",
+    );
+    let replacement = path.with_extension("next");
+    fs::write(&replacement, &reloaded).expect("renamed generation should be written");
+    fs::rename(&replacement, &path).expect("renamed generation should be published");
+    let outcome = manager.reload().expect("alias rename should reload");
+    assert!(outcome.applied);
+    assert!(outcome.restart_required_changes.is_empty());
+
+    let live = manager
+        .handle()
+        .snapshot()
+        .expect("reloaded snapshot should be readable");
+    let mut routed_profile = assert_forced_alias_generation(&live, NEW_ALIAS, OLD_ALIAS, "medium");
+    let (policy, body) = forced_model_alias_policy_body(
+        &live,
+        Some(NEW_ALIAS),
+        &Method::POST,
+        &"/v1/chat/completions".parse().expect("chat URI"),
+        &Bytes::from_static(br#"{"model":"abliterated-qwen-latest-27b-none-v2","messages":[]}"#),
+        &mut routed_profile,
+    );
+    assert_eq!(
+        policy
+            .expect("new forced alias policy")
+            .reasoning_effort
+            .as_deref(),
+        Some("medium")
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&body).expect("upstream chat body should be JSON");
+    assert_eq!(body["model"], "aeon-ultimate");
+    assert_eq!(body["reasoning_effort"], "medium");
+    assert_eq!(body["chat_template_kwargs"]["reasoning_effort"], "medium");
+
+    let before_invalid = manager
+        .reload_status()
+        .expect("reload status")
+        .expect("successful reload status");
+    fs::write(
+        &replacement,
+        reloaded.replace("reasoning_effort = \"medium\"", "reasoning_effort = \"\""),
+    )
+    .expect("invalid generation should be written");
+    fs::rename(&replacement, &path).expect("invalid generation should be published");
+    manager
+        .reload()
+        .expect_err("invalid generation should be rejected");
+    let after_invalid = manager
+        .reload_status()
+        .expect("reload status")
+        .expect("rejected reload status");
+    assert_eq!(
+        after_invalid.attempt_generation,
+        before_invalid.attempt_generation + 1
+    );
+    assert_eq!(
+        after_invalid.snapshot_generation,
+        before_invalid.snapshot_generation
+    );
+    assert_eq!(after_invalid.snapshot, before_invalid.snapshot);
+    remove_dir_all(&root);
+}
+
 #[tokio::test]
 async fn forced_model_alias_policy_survives_every_shielded_retry_attempt() {
     let mut fake = FakeUpstream::spawn().await;

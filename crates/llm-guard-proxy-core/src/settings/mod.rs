@@ -199,6 +199,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "upstream.restart_queue.queue_deadline_secs",
     "upstream.restart_queue.restart_timeout_secs",
     "upstreams.request_timeout_ms",
+    "upstreams.match_models",
     "upstreams.cache_priority_engine",
     "upstreams.health_probe_interval",
     "upstreams.health_probe_timeout",
