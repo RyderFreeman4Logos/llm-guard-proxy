@@ -2360,3 +2360,47 @@ upstream_model = "aeon-ultimate"
         "no alias records should be synthesized when upstream_model is missing upstream"
     );
 }
+
+async fn reject_padded_model_before_upstream(
+    fake: &mut FakeUpstream,
+    proxy: &ProxyFixture,
+    model: &str,
+) {
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(format!(r#"{{"model":"{model}","messages":[]}}"#))
+        .send()
+        .await
+        .expect("padded model request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let text = response
+        .text()
+        .await
+        .expect("padded model rejection body should be readable");
+    assert!(
+        text.contains("whitespace"),
+        "padded model {model:?} must reject surrounding whitespace, got {text}"
+    );
+    assert_no_upstream_request(fake).await;
+}
+
+#[tokio::test]
+async fn whitespace_padded_forced_alias_is_rejected_before_policy_and_routing() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy =
+        ProxyFixture::spawn_with_extra_config(&fake.base_url, FORCED_MODEL_ALIAS_PROFILES_CONFIG)
+            .await;
+    reject_padded_model_before_upstream(&mut fake, &proxy, " abliterated-qwen-latest-27b-low ")
+        .await;
+}
+
+#[tokio::test]
+async fn whitespace_padded_reserved_id_is_rejected_before_routing() {
+    let mut fake = FakeUpstream::spawn().await;
+    let proxy =
+        ProxyFixture::spawn_with_extra_config(&fake.base_url, FORCED_MODEL_ALIAS_PROFILES_CONFIG)
+            .await;
+    reject_padded_model_before_upstream(&mut fake, &proxy, " aeon-ultimate ").await;
+}

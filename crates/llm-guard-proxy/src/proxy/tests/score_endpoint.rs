@@ -1324,6 +1324,41 @@ fn score_model_extraction_uses_raw_fallback_before_policy_and_routing() {
     );
 }
 
+#[test]
+fn extract_model_id_rejects_surrounding_whitespace_on_sibling_paths() {
+    let cases = [
+        (
+            Method::POST,
+            "/v1/chat/completions",
+            r#"{"model":" aeon-ultimate ","messages":[]}"#,
+        ),
+        (
+            Method::POST,
+            "/v1/score",
+            r#"{"model":" score-model ","text_1":"q","text_2":"d"}"#,
+        ),
+        (Method::GET, "/v1/models/%20aeon-ultimate%20", ""),
+    ];
+    for (method, path, body) in cases {
+        let error = extract_model_id(&method, &Uri::from_static(path), &Bytes::from(body))
+            .expect_err("padded model must reject before policy and routing");
+        assert!(
+            error.to_string().contains("whitespace"),
+            "padded model on {path} must mention whitespace, got {error}"
+        );
+    }
+    assert_eq!(
+        extract_model_id(
+            &Method::POST,
+            &Uri::from_static("/v1/chat/completions"),
+            &Bytes::from(r#"{"model":"aeon-ultimate","messages":[]}"#)
+        )
+        .expect("unpadded model should extract")
+        .as_deref(),
+        Some("aeon-ultimate")
+    );
+}
+
 #[tokio::test]
 #[cfg(feature = "guard")]
 async fn arbitrary_precision_score_top_n_cannot_bypass_model_policy() {
