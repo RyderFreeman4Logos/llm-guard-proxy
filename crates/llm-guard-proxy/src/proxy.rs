@@ -3663,10 +3663,8 @@ async fn admit_generation_after_body(
         request.uri,
         request.request_started_at,
     );
-    let model_id_for_admission =
-        extract_model_id(request.method, request.uri, &body).map_err(|error| {
-            ProxyError::from(error).with_request_metadata(body_read_request_metadata.clone())
-        })?;
+    let model_id_for_admission = extract_model_id(request.method, request.uri, &body)
+        .map_err(|error| error.with_request_metadata(body_read_request_metadata.clone()))?;
     if let Some(model_id) = model_id_for_admission.as_deref()
         && config.upstream.is_reserved_ingress_model_id(model_id)
     {
@@ -17533,24 +17531,30 @@ fn extract_model_id(
     method: &Method,
     uri: &Uri,
     body: &Bytes,
-) -> Result<Option<String>, OpenAiPathError> {
-    if let Some(model) = model_detail_id_from_path(uri.path())? {
-        return Ok(Some(model));
+) -> Result<Option<String>, ProxyError> {
+    let model = if let Some(model) = model_detail_id_from_path(uri.path())? {
+        Some(model)
+    } else if let Some(model) = deepinfra_rerank_adapter::model_id_from_path(method, uri) {
+        Some(model.to_owned())
+    } else if score_adapter::is_score_request(method, uri) {
+        score_adapter::model_id_from_score_body(body)
+    } else {
+        serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("model")
+                    .and_then(|model| model.as_str())
+                    .map(str::to_owned)
+            })
+    };
+    if model
+        .as_deref()
+        .is_some_and(|model_id| model_id.trim() != model_id)
+    {
+        return Err(ProxyError::surrounding_model_whitespace());
     }
-    if let Some(model) = deepinfra_rerank_adapter::model_id_from_path(method, uri) {
-        return Ok(Some(model.to_owned()));
-    }
-    if score_adapter::is_score_request(method, uri) {
-        return Ok(score_adapter::model_id_from_score_body(body));
-    }
-    Ok(serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("model")
-                .and_then(|model| model.as_str())
-                .map(str::to_owned)
-        }))
+    Ok(model)
 }
 
 fn downstream_mode_from_headers(headers: &HeaderMap) -> DownstreamMode {
@@ -19383,6 +19387,16 @@ impl ProxyError {
                 String::from("model_reservation"),
                 String::from("reserved_ingress_model_id"),
             )])),
+            attempts: Vec::new(),
+        }
+    }
+
+    fn surrounding_model_whitespace() -> Self {
+        Self::ContextBudgetExceeded {
+            message: String::from("requested model must not have surrounding whitespace"),
+            param: "model",
+            code: "surrounding_model_whitespace",
+            request_metadata: None,
             attempts: Vec::new(),
         }
     }
