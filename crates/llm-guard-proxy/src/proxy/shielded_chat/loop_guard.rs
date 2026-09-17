@@ -56,7 +56,11 @@ impl AggregationFailureKind {
     pub(in crate::proxy) const fn is_transient_stream_failure(self) -> bool {
         matches!(
             self,
-            Self::BodyFailure | Self::TimeoutFailure | Self::ConnectFailure | Self::UnknownFailure
+            Self::BodyFailure
+                | Self::DecodeFailure
+                | Self::TimeoutFailure
+                | Self::ConnectFailure
+                | Self::UnknownFailure
         )
     }
 }
@@ -320,4 +324,20 @@ fn loop_detection_message(signal: &LoopSignal) -> String {
         signal.reason_code.as_str(),
         signal.channel.as_str(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AggregationFailureKind;
+
+    #[test]
+    fn decode_failure_is_classified_as_transient_stream_failure() {
+        assert!(
+            AggregationFailureKind::DecodeFailure.is_transient_stream_failure(),
+            "restart-killed SSE decode must retry like body_failure"
+        );
+        assert!(AggregationFailureKind::BodyFailure.is_transient_stream_failure());
+        assert!(!AggregationFailureKind::MalformedProtocol.is_transient_stream_failure());
+        assert!(!AggregationFailureKind::LoopDetected.is_transient_stream_failure());
+    }
 }

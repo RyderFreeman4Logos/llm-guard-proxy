@@ -10022,7 +10022,7 @@ impl ReqwestFailureKind {
     const fn is_transient(self) -> bool {
         matches!(
             self,
-            Self::Timeout | Self::Connect | Self::Body | Self::Other
+            Self::Timeout | Self::Connect | Self::Body | Self::Decode | Self::Other
         )
     }
 }
@@ -11762,7 +11762,13 @@ fn native_json_fallback_eligible(
         && runtime.chat_kind == ShieldedChatKind::NonStream
         && runtime.ordinary_attempt_number(failure.attempt_number) == 1
         && failure.wire_mode == ShieldedUpstreamWireMode::ShieldedSse
-        && failure.sse_failure_kind == Some(shielded_chat::AggregationFailureKind::BodyFailure)
+        && matches!(
+            failure.sse_failure_kind,
+            Some(
+                shielded_chat::AggregationFailureKind::BodyFailure
+                    | shielded_chat::AggregationFailureKind::DecodeFailure
+            )
+        )
 }
 
 fn shielded_accepted_outcome(
@@ -12000,6 +12006,7 @@ fn should_retry_after_shielded_failure(
     !is_server_shutdown_failure(failure)
         && failure.retry_cause.is_some()
         && !runtime.downstream_drop_signal.is_dropped()
+        && !runtime.downstream_commit_signal.is_committed()
         && runtime.allows_ordinary_retry(failure.attempt_number)
 }
 
@@ -13784,17 +13791,24 @@ fn forced_sse_body_failure_kind(
     error: &ProxyError,
     wire_mode: ShieldedUpstreamWireMode,
 ) -> Option<shielded_chat::AggregationFailureKind> {
-    (wire_mode == ShieldedUpstreamWireMode::ShieldedSse
-        && matches!(
-            error,
-            ProxyError::UpstreamTransport {
-                failure: ReqwestFailureKind::Body
-                    | ReqwestFailureKind::Request
-                    | ReqwestFailureKind::Other,
-                ..
-            } | ProxyError::UpstreamBody { .. }
-        ))
-    .then_some(shielded_chat::AggregationFailureKind::BodyFailure)
+    if wire_mode != ShieldedUpstreamWireMode::ShieldedSse {
+        return None;
+    }
+    match error {
+        ProxyError::UpstreamTransport {
+            failure: ReqwestFailureKind::Decode,
+            ..
+        } => Some(shielded_chat::AggregationFailureKind::DecodeFailure),
+        ProxyError::UpstreamTransport {
+            failure:
+                ReqwestFailureKind::Body | ReqwestFailureKind::Request | ReqwestFailureKind::Other,
+            ..
+        }
+        | ProxyError::UpstreamBody { .. } => {
+            Some(shielded_chat::AggregationFailureKind::BodyFailure)
+        }
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -15539,7 +15553,6 @@ impl ForwardedBodyObserver {
         let finished_at_unix_ms = unix_time_millis();
         let mut attempts = self.completed_attempt_records;
         let mut final_attempt = self.final_attempt;
-        let paired_shadow_runtime = self.paired_shadow_runtime;
         if matches!(
             completion,
             BodyCompletion::DownstreamDropped | BodyCompletion::Shutdown
@@ -15583,16 +15596,13 @@ impl ForwardedBodyObserver {
             finished_at_unix_ms.saturating_sub(self.started_at_unix_ms),
         );
         response_metadata.extend(self.extra_response_metadata);
-        if let Some(retry_observation) = self.retry_observation {
-            response_metadata.extend(retry_chain_metadata(
-                &attempts,
-                &retry_observation.policy,
-                completion.request_status().as_str(),
-            ));
-            response_metadata
-                .entry(String::from("shielded_terminal_reason"))
-                .or_insert_with(|| completion.metadata_reason().to_owned());
-        }
+        finalize_terminal_response_metadata(
+            &mut response_metadata,
+            self.retry_observation,
+            &attempts,
+            completion,
+            self.downstream_status,
+        );
         let request_record = RequestRecord {
             request_id: self.request_id,
             started_at_unix_ms: self.started_at_unix_ms,
@@ -15613,6 +15623,7 @@ impl ForwardedBodyObserver {
         let evidence_store = self.evidence_store.clone();
         let config = self.config.clone();
         let shadow_evidence = self.shadow_evidence.clone();
+        let paired_shadow_runtime = self.paired_shadow_runtime;
         let terminal_reason: &'static str = completion.terminal_reason();
         self.persistence_tasks.spawn_blocking(move || {
             record_observability_many(&store, &request_record, &attempts);
@@ -15768,6 +15779,31 @@ fn parse_token_usage_json(body: &[u8]) -> Option<TokenUsage> {
             .and_then(|details| details.get("reasoning_tokens"))
             .and_then(serde_json::Value::as_u64),
     })
+}
+
+fn finalize_terminal_response_metadata(
+    response_metadata: &mut BTreeMap<String, String>,
+    retry_observation: Option<RetryObservation>,
+    attempts: &[AttemptRecord],
+    completion: &BodyCompletion,
+    downstream_status: reqwest::StatusCode,
+) {
+    if let Some(retry_observation) = retry_observation {
+        response_metadata.extend(retry_chain_metadata(
+            attempts,
+            &retry_observation.policy,
+            completion.request_status().as_str(),
+        ));
+        response_metadata
+            .entry(String::from("shielded_terminal_reason"))
+            .or_insert_with(|| completion.metadata_reason().to_owned());
+    }
+    // Wire HTTP 200 can already be committed; terminal outcome still owns success metadata.
+    response_metadata.insert(
+        String::from("http_status_success"),
+        (completion.request_status() == RequestStatus::Succeeded && downstream_status.is_success())
+            .to_string(),
+    );
 }
 
 fn retry_chain_metadata(
