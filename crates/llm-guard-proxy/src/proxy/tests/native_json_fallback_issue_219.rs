@@ -162,6 +162,74 @@ async fn native_json_fallback_requires_remaining_attempt_budget() {
 }
 
 #[tokio::test]
+async fn true_stream_wire_200_body_death_is_failed_without_second_request() {
+    let mut upstream = NativeJsonFallbackUpstream::spawn_true_stream_post_header_death().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        true_stream_direct_relay_config(2),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"stream death"}],"stream":true}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "true-stream headers must keep the upstream wire 200"
+    );
+    let body = response
+        .bytes()
+        .await
+        .expect("true-stream body must reach error or EOF");
+    let body_text = std::str::from_utf8(&body).expect("true-stream body should be UTF-8");
+    assert!(
+        body_text.contains("event: error") || body_text.contains("llm_guard_upstream_error"),
+        "client must observe a terminal stream error after wire 200: {body_text}"
+    );
+
+    assert_eq!(upstream.recv_request().await["stream"], true);
+    assert!(
+        upstream
+            .recv_request_within(Duration::from_millis(250))
+            .await
+            .is_none(),
+        "direct-relay true-stream death must not send a second business request or native JSON fallback"
+    );
+
+    let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(request_row.status, "failed");
+    assert_eq!(request_row.http_status, 200);
+    assert_eq!(
+        request_row.response_metadata["http_status_success"], "false",
+        "failed true-stream request metadata must not advertise HTTP success from wire 200"
+    );
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].status, "failed");
+    assert_eq!(attempts[0].http_status, Some(200));
+    assert_eq!(
+        attempts[0].response_metadata["shielded_direct_streaming_relay"],
+        "true"
+    );
+    assert!(
+        attempts[0]
+            .response_metadata
+            .get("native_json_fallback_used")
+            .is_none(),
+        "true-stream direct relay must not record a native JSON fallback attempt"
+    );
+}
+
+#[tokio::test]
 async fn native_json_fallback_does_not_outlive_request_deadline() {
     // Delay past request_deadline_ms so the body failure is reclassified as a deadline
     // abort while still retaining sse_failure_class=body_failure (the F1 regression path).
@@ -380,6 +448,26 @@ idle_timeout_ms = 50
     assert_no_native_fallback(&read_attempt_chain_rows(&stalled_proxy.sqlite_path));
 }
 
+fn true_stream_direct_relay_config(max_attempts: u32) -> &'static str {
+    match max_attempts {
+        2 => {
+            r#"
+[heartbeat]
+mode = "disabled"
+
+[loop_guard]
+mode = "disabled"
+
+[retry]
+max_attempts = 2
+anti_loop_hint_enabled = false
+shielded_streaming_enabled = true
+"#
+        }
+        _ => panic!("true-stream contract only needs a remaining retry budget"),
+    }
+}
+
 fn native_json_fallback_config(max_attempts: u32) -> &'static str {
     match max_attempts {
         1 => {
@@ -495,6 +583,7 @@ struct NativeJsonFallbackUpstream {
 struct NativeJsonFallbackState {
     sender: mpsc::Sender<serde_json::Value>,
     forced_sse_error_delay: Duration,
+    fail_after_headers: bool,
 }
 
 impl NativeJsonFallbackUpstream {
@@ -502,13 +591,25 @@ impl NativeJsonFallbackUpstream {
         Self::spawn_with_forced_sse_error_delay(Duration::ZERO).await
     }
 
+    async fn spawn_true_stream_post_header_death() -> Self {
+        Self::spawn_with_options(Duration::ZERO, true).await
+    }
+
     async fn spawn_with_forced_sse_error_delay(forced_sse_error_delay: Duration) -> Self {
+        Self::spawn_with_options(forced_sse_error_delay, false).await
+    }
+
+    async fn spawn_with_options(
+        forced_sse_error_delay: Duration,
+        fail_after_headers: bool,
+    ) -> Self {
         let (sender, receiver) = mpsc::channel(4);
         let app = Router::new()
             .route("/v1/chat/completions", post(native_json_fallback_handler))
             .with_state(NativeJsonFallbackState {
                 sender,
                 forced_sse_error_delay,
+                fail_after_headers,
             });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -558,15 +659,23 @@ async fn native_json_fallback_handler(
 
     if upstream_streaming {
         let forced_sse_error_delay = state.forced_sse_error_delay;
-        let stream = stream::iter([Ok::<Bytes, io::Error>(Bytes::from_static(
-            b"data: {\"id\":\"partial\"}\n\n",
-        ))])
-        .chain(stream::once(async move {
-            if !forced_sse_error_delay.is_zero() {
-                sleep(forced_sse_error_delay).await;
-            }
-            Err(io::Error::other("synthetic truncated forced SSE body"))
-        }));
+        let fail_after_headers = state.fail_after_headers;
+        let first = if fail_after_headers {
+            Bytes::from_static(
+                b"data: {\"id\":\"partial\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n",
+            )
+        } else {
+            Bytes::from_static(b"data: {\"id\":\"partial\"}\n\n")
+        };
+        let stream =
+            stream::iter([Ok::<Bytes, io::Error>(first)]).chain(stream::once(async move {
+                if fail_after_headers {
+                    sleep(Duration::from_millis(50)).await;
+                } else if !forced_sse_error_delay.is_zero() {
+                    sleep(forced_sse_error_delay).await;
+                }
+                Err(io::Error::other("synthetic truncated forced SSE body"))
+            }));
         let mut response = Response::new(Body::from_stream(stream));
         response
             .headers_mut()
