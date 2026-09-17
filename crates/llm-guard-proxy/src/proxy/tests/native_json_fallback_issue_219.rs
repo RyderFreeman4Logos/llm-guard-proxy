@@ -162,6 +162,98 @@ async fn native_json_fallback_requires_remaining_attempt_budget() {
 }
 
 #[tokio::test]
+async fn native_json_fallback_retries_a_delayed_decode_failure_once() {
+    let mut upstream = NativeJsonFallbackUpstream::spawn_true_stream_post_header_death().await;
+    let proxy = ProxyFixture::spawn_with_options(
+        &upstream.base_url,
+        true,
+        AppConfig::default().server.max_in_flight_requests,
+        native_json_fallback_config(2),
+    )
+    .await;
+
+    let response = proxy
+        .client
+        .post(format!("{}/v1/chat/completions", proxy.base_url))
+        .header(CONTENT_TYPE, "application/json")
+        .body(r#"{"model":"test-chat","messages":[{"role":"user","content":"decode fallback"}],"stream":false}"#)
+        .send()
+        .await
+        .expect("proxy request should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        shielded_final_json(response).await["choices"][0]["message"]["content"],
+        "native fallback"
+    );
+
+    let first = upstream.recv_request().await;
+    let second = upstream.recv_request().await;
+    assert_eq!(first["stream"], true);
+    assert_eq!(
+        first["stream_options"]["include_usage"], true,
+        "the protected first attempt must request usage in SSE"
+    );
+    assert_eq!(body_thinking_budget_json(&first), Some(32_768));
+    assert_eq!(second["stream"], false);
+    assert!(
+        second.get("stream_options").is_none(),
+        "the native JSON fallback must not inject stream_options.include_usage"
+    );
+    assert_eq!(body_thinking_budget_json(&second), Some(8_192));
+
+    let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        attempts[0].response_metadata["upstream_wire_mode"],
+        "shielded_sse"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["upstream_stream_forced"],
+        "true"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["sse_failure_class"],
+        "decode_failure"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["native_json_fallback_eligible"],
+        "true"
+    );
+    assert_eq!(
+        attempts[0].response_metadata["native_json_fallback_used"],
+        "false"
+    );
+    assert_eq!(attempts[0].response_metadata["retry_budget_remaining"], "1");
+    assert_eq!(
+        attempts[0].response_metadata["loop_guard_coverage"],
+        "full_sse"
+    );
+    assert_eq!(
+        attempts[1].response_metadata["upstream_wire_mode"],
+        "native_json_fallback"
+    );
+    assert_eq!(
+        attempts[1].response_metadata["upstream_stream_forced"],
+        "false"
+    );
+    assert_eq!(attempts[1].response_metadata["sse_failure_class"], "none");
+    assert_eq!(
+        attempts[1].response_metadata["native_json_fallback_eligible"],
+        "false"
+    );
+    assert_eq!(
+        attempts[1].response_metadata["native_json_fallback_used"],
+        "true"
+    );
+    assert_eq!(attempts[1].response_metadata["retry_budget_remaining"], "0");
+    assert_eq!(
+        attempts[1].response_metadata["loop_guard_coverage"],
+        "unavailable_native_json"
+    );
+}
+
+#[tokio::test]
 async fn true_stream_wire_200_body_death_is_failed_without_second_request() {
     let mut upstream = NativeJsonFallbackUpstream::spawn_true_stream_post_header_death().await;
     let proxy = ProxyFixture::spawn_with_options(
@@ -192,8 +284,27 @@ async fn true_stream_wire_200_body_death_is_failed_without_second_request() {
         .expect("true-stream body must reach error or EOF");
     let body_text = std::str::from_utf8(&body).expect("true-stream body should be UTF-8");
     assert!(
+        body_text.contains(r#""content":"hi""#),
+        "true-stream must deliver the first committed delta: {body_text}"
+    );
+    assert!(
+        body_text.contains("decode_failure"),
+        "true-stream terminal error must be classified as decode_failure: {body_text}"
+    );
+    assert!(
         body_text.contains("event: error") || body_text.contains("llm_guard_upstream_error"),
         "client must observe a terminal stream error after wire 200: {body_text}"
+    );
+    let hi_at = body_text
+        .find(r#""content":"hi""#)
+        .expect("first delta already asserted");
+    let error_at = body_text
+        .find("event: error")
+        .or_else(|| body_text.find("llm_guard_upstream_error"))
+        .expect("terminal error marker already asserted");
+    assert!(
+        hi_at < error_at,
+        "first committed delta must precede the terminal error: {body_text}"
     );
 
     assert_eq!(upstream.recv_request().await["stream"], true);
