@@ -9782,6 +9782,10 @@ debug_summary_max_records = 5
     let attempt_row = read_single_forwarded_attempt_row(&proxy.sqlite_path);
     assert_eq!(request_row.status, "failed");
     assert_eq!(request_row.http_status, 502);
+    assert_eq!(
+        request_row.response_metadata["http_status_success"], "false",
+        "failed request metadata must not advertise HTTP success from an upstream 200"
+    );
     assert!(
         request_row
             .error_reason
@@ -24070,7 +24074,7 @@ async fn assert_body_error_debug_summary(proxy: &ProxyFixture) {
     );
     assert_eq!(
         request["response_metadata"]["http_status_success"].as_str(),
-        Some("true")
+        Some("false")
     );
     assert!(!body.contains("body-decode-secret"));
     assert!(!body.contains("admin-token"));
