@@ -99,10 +99,12 @@ def main() -> int:
                 or "ACTIONABLE_FINDINGS: 0" not in lines
                 or re.search(r"VERDICT:\s*FAIL", report)):
             raise ValueError("report is not a completed zero-finding PASS")
-        for line in (f"HEAD: {head}", f"TREE: {tree}", f"BASE: {base}",
+        for line in ("REVIEW_COMPLETE: true", "ACTIONABLE_FINDINGS: 0",
+                     f"HEAD: {head}", f"TREE: {tree}", f"BASE: {base}",
                      "RANGE: origin/main...HEAD", "REVIEWER: " + payload["reviewer"]):
-            if line not in lines:
-                raise ValueError("report provenance mismatch")
+            prefix = line.split(":", 1)[0] + ":"
+            if [item for item in lines if item.lstrip().startswith(prefix)] != [line]:
+                raise ValueError("report provenance missing, duplicate or contradictory")
         gate = payload["full_gate"]
         if not isinstance(gate, dict):
             raise ValueError("full_gate must be an object")

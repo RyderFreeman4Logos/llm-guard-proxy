@@ -175,6 +175,17 @@ class NativeReviewReceiptTests(unittest.TestCase):
         self.payload["report_sha256"] = digest(self.report.read_bytes())
         self.assertNotEqual(self.hook().returncode, 0)
 
+    def test_contradictory_or_duplicate_report_headers_rejected(self) -> None:
+        original = self.report.read_text()
+        for field in ("ACTIONABLE_FINDINGS: 1", "REVIEW_COMPLETE: false", "HEAD: " + "0" * 40,
+                      "TREE: " + "0" * 40, "BASE: " + "0" * 40, "RANGE: HEAD^...HEAD",
+                      "REVIEWER: different", "ACTIONABLE_FINDINGS: 0"):
+            with self.subTest(field=field):
+                self.report.write_text(original.replace("VERDICT: PASS\n", "VERDICT: PASS\n" + field + "\n", 1))
+                self.payload["report_sha256"] = digest(self.report.read_bytes())
+                self.assertNotEqual(self.hook().returncode, 0)
+        self.report.write_text(original)
+
     def test_missing_receipt_and_digest_do_not_fall_through(self) -> None:
         env = self.env.copy()
         env["LLM_GUARD_NATIVE_REVIEW_RECEIPT"] = str(self.root / "absent")
