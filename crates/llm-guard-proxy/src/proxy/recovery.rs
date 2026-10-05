@@ -152,24 +152,66 @@ fn recovery_group_quiescent(group: u32) -> std::io::Result<bool> {
         {
             continue;
         }
-        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+        let Some(stat) = read_recovery_stat(std::fs::File::open(entry.path().join("stat")))? else {
+            continue;
         };
-        let fields = stat
-            .rsplit_once(") ")
-            .ok_or_else(|| std::io::Error::other("invalid process stat"))?
-            .1;
-        let mut fields = fields.split_whitespace();
-        let state = fields.next();
-        let _parent = fields.next();
-        let pgid = fields.next().and_then(|field| field.parse::<u32>().ok());
-        if pgid == Some(group) && !matches!(state, Some("Z" | "X")) {
+        if recovery_stat_is_active_member(&stat, group)? {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+/// Both pathname-open and already-open procfs reads race ordinary process exit.
+#[cfg(target_os = "linux")]
+fn read_recovery_stat(file: std::io::Result<std::fs::File>) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let result = file.and_then(|mut file| {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        Ok(bytes)
+    });
+    match result {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(libc::ESRCH) =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// `comm` is an uninterpreted byte string; only the control fields must be ASCII.
+#[cfg(target_os = "linux")]
+fn recovery_stat_is_active_member(stat: &[u8], group: u32) -> std::io::Result<bool> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid process stat control fields",
+        )
+    };
+    let offset = stat
+        .windows(2)
+        .rposition(|pair| pair == b") ")
+        .ok_or_else(invalid)?
+        + 2;
+    let mut fields = stat[offset..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
+    let state = fields
+        .next()
+        .filter(|field| field.len() == 1 && field[0].is_ascii_alphabetic())
+        .ok_or_else(invalid)?;
+    let _parent = fields.next().ok_or_else(invalid)?;
+    let pgid = fields
+        .next()
+        .filter(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .and_then(|field| field.parse::<u32>().ok())
+        .ok_or_else(invalid)?;
+    Ok(pgid == group && !matches!(state, b"Z" | b"X"))
 }
 
 impl Drop for RecoveryProcessGuard {
@@ -369,6 +411,10 @@ fn observe_recovery_child_without_reaping(pid: u32) -> &'static str {
 fn observe_recovery_child_without_reaping(_pid: u32) -> &'static str {
     "child_state_unavailable_before_kill"
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "recovery_proc_tests.rs"]
+mod proc_tests;
 
 #[cfg(test)]
 mod tests {
