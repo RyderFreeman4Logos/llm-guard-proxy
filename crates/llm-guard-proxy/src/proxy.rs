@@ -9649,6 +9649,13 @@ async fn read_body_bytes_until_shutdown(
 async fn read_upstream_body_bytes(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
 ) -> Result<Bytes, ProxyError> {
+    read_upstream_body_bytes_limited(stream, MAX_PROXY_BODY_BYTES).await
+}
+
+async fn read_upstream_body_bytes_limited(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
+    max_bytes: usize,
+) -> Result<Bytes, ProxyError> {
     let mut stream = Box::pin(stream);
     let mut body = BytesMut::new();
     while let Some(chunk) = stream.next().await {
@@ -9662,9 +9669,9 @@ async fn read_upstream_body_bytes(
             .len()
             .checked_add(chunk.len())
             .ok_or_else(|| ProxyError::upstream_body(String::from("upstream body is too large")))?;
-        if next_len > MAX_PROXY_BODY_BYTES {
+        if next_len > max_bytes {
             return Err(ProxyError::upstream_body(format!(
-                "upstream body exceeded proxy limit: max_bytes={MAX_PROXY_BODY_BYTES}"
+                "upstream body exceeded proxy limit: max_bytes={max_bytes}"
             )));
         }
         body.extend_from_slice(&chunk);
@@ -13273,10 +13280,11 @@ async fn send_local_recovery_readiness_probe(
     if !response.status().is_success() {
         return Ok(false);
     }
-    let body = response
-        .bytes()
+    // One-token readiness must not aggregate a generation-sized response, even
+    // when chunked transport omits Content-Length.
+    let body = read_upstream_body_bytes_limited(response.bytes_stream(), 64 * 1024)
         .await
-        .map_err(|error| sanitized_reqwest_error(&error))?;
+        .map_err(|error| error.to_string())?;
     let value = serde_json::from_slice::<serde_json::Value>(&body)
         .map_err(|error| format!("readiness response JSON decode failed: {error}"))?;
     Ok(is_valid_chat_completion_probe_response(&value))
@@ -13286,7 +13294,39 @@ fn is_valid_chat_completion_probe_response(value: &serde_json::Value) -> bool {
     value
         .get("choices")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|choices| !choices.is_empty())
+        .is_some_and(|choices| {
+            !choices.is_empty()
+                && choices.iter().all(|choice| {
+                    choice.get("text").is_some_and(serde_json::Value::is_string)
+                        || choice.get("message").is_some_and(|message| {
+                            message
+                                .get("content")
+                                .is_some_and(serde_json::Value::is_string)
+                                || message
+                                    .get("tool_calls")
+                                    .and_then(serde_json::Value::as_array)
+                                    .is_some_and(|calls| {
+                                        !calls.is_empty()
+                                            && calls.iter().all(|call| {
+                                                call.get("function")
+                                                    .is_some_and(usable_probe_function_call)
+                                            })
+                                    })
+                                || message
+                                    .get("function_call")
+                                    .is_some_and(usable_probe_function_call)
+                        })
+                })
+        })
+}
+
+fn usable_probe_function_call(call: &serde_json::Value) -> bool {
+    call.get("name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| !name.is_empty())
+        && call
+            .get("arguments")
+            .is_some_and(serde_json::Value::is_string)
 }
 
 struct UpstreamStallRecoveryGate {
