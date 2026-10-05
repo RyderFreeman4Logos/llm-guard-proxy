@@ -641,7 +641,7 @@ fi
             vec![String::from("error"), category.to_owned()]
         );
         assert_eq!(result.replacement_messages, None);
-        assert!(!result.audit.notes.is_empty());
+        assert_ne!(result.audit.notes.len(), 0);
     }
 
     fn assert_process_exits(identity: TestProcessIdentity) {

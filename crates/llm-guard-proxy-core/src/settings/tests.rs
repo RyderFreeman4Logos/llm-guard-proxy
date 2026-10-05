@@ -284,11 +284,11 @@ fn defaults_match_issue_contract() {
         config.retry.downstream_drop_policy,
         DownstreamDropPolicy::Cancel
     );
-    assert!(config.retry.ladder.is_empty());
+    assert_eq!(config.retry.ladder.len(), 0);
     assert!(!config.upstream_stall.enabled);
     assert_eq!(config.upstream_stall.first_chunk_timeout_ms, 30_000);
     assert_eq!(config.upstream_stall.idle_timeout_ms, 30_000);
-    assert!(config.upstream_stall.recovery_command.is_empty());
+    assert_eq!(config.upstream_stall.recovery_command.len(), 0);
     assert_eq!(config.upstream_stall.recovery_timeout_ms, 300_000);
     assert_eq!(config.upstream_stall.recovery_cooldown_ms, 300_000);
     assert_eq!(config.upstream_stall.recovery_budget_window_ms, 900_000);
@@ -296,10 +296,10 @@ fn defaults_match_issue_contract() {
     assert_default_recovery_watchdog_and_restart_queue_configs(&config);
     assert_eq!(config.heartbeat.mode, HeartbeatMode::Sse);
     assert!(config.cloudflare.enabled);
-    assert!(config.upstream_profiles.is_empty());
+    assert_eq!(config.upstream_profiles.len(), 0);
     #[cfg(feature = "guard")]
     {
-        assert!(config.model_aliases.is_empty());
+        assert_eq!(config.model_aliases.len(), 0);
         assert!(config.workflows.is_empty());
     }
     assert_eq!(config.default_upstream_profile().name, "default");
@@ -308,7 +308,7 @@ fn defaults_match_issue_contract() {
 fn assert_default_recovery_watchdog_and_restart_queue_configs(config: &AppConfig) {
     assert!(!config.upstream.local_recovery.enabled);
     assert!(!config.upstream.local_recovery.trigger_on_request_deadline);
-    assert!(config.upstream.local_recovery.restart_command.is_empty());
+    assert_eq!(config.upstream.local_recovery.restart_command.len(), 0);
     assert_eq!(
         config.upstream.local_recovery.readiness_endpoint,
         "/v1/chat/completions"
@@ -1341,7 +1341,7 @@ fn assert_default_evidence_config(config: &AppConfig) {
     assert_eq!(config.evidence.shadow.max_shadow_attempts_per_request, 2);
     assert_eq!(config.evidence.shadow.max_global_shadow_in_flight, 2);
     assert_eq!(config.evidence.shadow.shadow_attempt_timeout_ms, 7_200_000);
-    assert!(config.evidence.shadow.compare_attempts.is_empty());
+    assert_eq!(config.evidence.shadow.compare_attempts.len(), 0);
     let paired = &config.evidence.shadow.paired_comparison;
     assert!(!paired.enabled);
     assert_eq!(
@@ -2010,7 +2010,7 @@ reasoning_effort = "high"
     let (next, outcome) = apply_reloadable(&current, &requested);
 
     assert!(outcome.applied);
-    assert!(outcome.restart_required_changes.is_empty());
+    assert_eq!(outcome.restart_required_changes.len(), 0);
     assert_eq!(
         next.upstream_profiles[0].param_override.temperature,
         Some(0.8)
@@ -4061,7 +4061,7 @@ probe_chat_template_kwargs = {"enable_thinking":false}
     let snapshot = handle.snapshot().expect("snapshot should succeed");
 
     assert!(outcome.applied);
-    assert!(outcome.restart_required_changes.is_empty());
+    assert_eq!(outcome.restart_required_changes.len(), 0);
     assert_eq!(snapshot.upstream.hot_restart.probe_interval_secs, 45);
     assert_eq!(
         snapshot.upstream.hot_restart.probe_messages,
@@ -4388,7 +4388,7 @@ systemd_unit = "replacement-vllm.service"
     let snapshot = handle.snapshot().expect("snapshot should succeed");
 
     assert!(outcome.applied);
-    assert!(outcome.restart_required_changes.is_empty());
+    assert_eq!(outcome.restart_required_changes.len(), 0);
     assert_eq!(snapshot.guardian, requested.guardian);
     assert_eq!(
         handle.guardian_snapshot().expect("guardian snapshot"),

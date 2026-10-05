@@ -10,6 +10,7 @@ mod ids;
 mod live_registry;
 mod metrics_accumulator;
 mod model;
+mod recovery_receipt;
 mod redaction;
 mod store;
 
@@ -28,4 +29,5 @@ pub use model::{
     RequestStatus, RequestTerminalMetricCount, RetentionPruningStats, RetentionUsage, StoreWrite,
     TokenUsage, TokenUsageByEndpoint, UpstreamErrorMetricCount, UpstreamMode,
 };
+pub use recovery_receipt::LocalRecoveryReceipt;
 pub use store::ObservabilityStore;

@@ -844,7 +844,7 @@ mod tests {
         let records = vec![record];
         let calibration = CalibrationResult::from_results(&results, &records);
         let summary = calibration.summary_text();
-        assert!(!summary.is_empty());
+        assert_ne!(summary.len(), 0);
         assert!(
             summary.contains("replay calibration"),
             "summary should contain header: {summary}"

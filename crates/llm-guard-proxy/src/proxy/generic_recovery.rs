@@ -115,6 +115,14 @@ async fn recover_and_replay(
         }
         _ => None,
     };
+    let attempt_id = match &first {
+        Ok(sent) => Some(&sent.attempt_id),
+        Err(ProxyError::UpstreamTransport {
+            observability: Some(observability),
+            ..
+        }) => Some(&observability.attempt_record.attempt_id),
+        _ => None,
+    };
     let Some(cause) = cause else {
         return first;
     };
@@ -129,6 +137,20 @@ async fn recover_and_replay(
         .coordinator_for(&context.upstream_profile.name);
     let gate = precommit_recovery::gate(
         precommit_recovery::Context {
+            receipt: super::recovery_receipt::Context::new(
+                context.state.store.clone(),
+                &context.upstream_profile,
+                super::Arc::clone(&context.state.persistence_tasks),
+            )
+            .stall(
+                context.config.upstream_stall.first_chunk_timeout_ms,
+                context.config.upstream_stall.idle_timeout_ms,
+            )
+            .request(
+                context.request_id,
+                Duration::from_millis(context.config.retry.request_deadline_ms),
+            )
+            .attempt(attempt_id),
             policy: &policy,
             coordinator: &coordinator,
             client: context.state.client.clone(),

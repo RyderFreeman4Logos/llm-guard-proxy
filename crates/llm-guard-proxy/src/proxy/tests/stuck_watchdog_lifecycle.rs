@@ -1855,6 +1855,7 @@ async fn watchdog_recovery_preclosed_shutdown_does_not_spawn_restart_command() {
             Some(Duration::from_secs(1)),
             Arc::clone(&coordinator),
             LocalRecoveryEndpoint {
+                receipt: test_recovery_receipt_context(),
                 client: client.clone(),
                 base_url: fake.base_url.clone(),
             },
@@ -2244,6 +2245,7 @@ async fn stop_watchdog(proxy: &ProxyFixture, watchdog: tokio::task::JoinHandle<(
         .await
         .expect("watchdog task should stop after shutdown")
         .expect("watchdog task should join cleanly");
+    proxy.state.flush_persistence().await;
 }
 
 async fn wait_for_path(path: &Path, wait: Duration) -> bool {

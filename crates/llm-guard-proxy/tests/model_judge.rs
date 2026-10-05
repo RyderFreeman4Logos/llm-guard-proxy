@@ -12,7 +12,7 @@ use llm_guard_proxy_core::model_judge::{
 #[test]
 fn judge_system_prompt_mentions_loop_detector() {
     let prompt = JudgePromptBuilder::system_prompt();
-    assert!(!prompt.is_empty());
+    assert_ne!(prompt.len(), 0);
     assert!(
         prompt.to_lowercase().contains("loop detector"),
         "system prompt must mention 'loop detector': {prompt}"

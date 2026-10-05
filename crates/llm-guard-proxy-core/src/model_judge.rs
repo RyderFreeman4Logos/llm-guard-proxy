@@ -365,7 +365,7 @@ mod tests {
     #[test]
     fn system_prompt_is_non_empty_and_mentions_loop_detector() {
         let prompt = JudgePromptBuilder::system_prompt();
-        assert!(!prompt.is_empty());
+        assert_ne!(prompt.len(), 0);
         assert!(
             prompt.to_lowercase().contains("loop detector"),
             "system prompt must mention 'loop detector': {prompt}"
@@ -569,9 +569,9 @@ mod tests {
         let result: LoopJudgeResult =
             serde_json::from_value(json).expect("minimal LoopJudgeResult should deserialize");
         assert!(!result.is_loop);
-        assert!(result.loop_types.is_empty());
-        assert!(result.keep_span_ids.is_empty());
-        assert!(result.drop_span_ids.is_empty());
+        assert_eq!(result.loop_types.len(), 0);
+        assert_eq!(result.keep_span_ids.len(), 0);
+        assert_eq!(result.drop_span_ids.len(), 0);
         assert!(result.loop_start_span_id.is_none());
     }
 }

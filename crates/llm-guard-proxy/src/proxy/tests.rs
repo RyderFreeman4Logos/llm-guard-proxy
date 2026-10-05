@@ -41,6 +41,8 @@ mod cot_salvage_issue_211;
 mod first_evict_kv_priority_issue_242;
 #[path = "tests/listener_profile_policy.rs"]
 mod listener_profile_policy;
+#[path = "tests/local_recovery_receipt.rs"]
+mod local_recovery_receipt;
 #[path = "tests/native_json_fallback_issue_219.rs"]
 mod native_json_fallback_issue_219;
 #[path = "tests/quality_first_timeouts_issue_222.rs"]
@@ -7288,6 +7290,20 @@ recovery_max_per_window = 1
     );
 }
 
+pub(super) fn test_recovery_receipt_context() -> recovery_receipt::Context {
+    let root = unique_test_dir("recovery-receipt");
+    fs::create_dir_all(&root).expect("receipt root");
+    set_owner_only_dir(&root);
+    let mut config = AppConfig::default();
+    config.observability.sqlite_path = root.join("receipt.sqlite3");
+    let store = ObservabilityStore::open(ConfigHandle::new(config.clone())).expect("receipt store");
+    recovery_receipt::Context::new(
+        store,
+        &config.default_upstream_profile(),
+        Arc::new(PersistenceTasks::default()),
+    )
+}
+
 #[tokio::test]
 async fn local_recovery_restart_command() {
     assert!(!LocalRecoveryPolicy::from_config(&LocalRecoveryConfig::default()).is_configured());
@@ -7308,8 +7324,15 @@ async fn local_recovery_restart_command() {
         max_per_window: 1,
     };
     let success_ran = AtomicBool::new(false);
-    let success = run_local_recovery_restart_command(&success_policy, &success_ran).await;
+    let success = run_local_recovery_restart_command(
+        &success_policy,
+        &success_ran,
+        &test_recovery_receipt_context(),
+        None,
+    )
+    .await;
     assert_eq!(success["local_recovery_restart_status"], "succeeded");
+    assert!(success.contains_key("local_recovery_receipt_id"));
 
     let timeout_policy = LocalRecoveryPolicy {
         restart_command: vec![String::from("/bin/sleep"), String::from("30")],
@@ -7317,7 +7340,13 @@ async fn local_recovery_restart_command() {
         ..success_policy
     };
     let timeout_ran = AtomicBool::new(false);
-    let timeout = run_local_recovery_restart_command(&timeout_policy, &timeout_ran).await;
+    let timeout = run_local_recovery_restart_command(
+        &timeout_policy,
+        &timeout_ran,
+        &test_recovery_receipt_context(),
+        None,
+    )
+    .await;
     assert_eq!(timeout["local_recovery_restart_status"], "timeout_killed");
     assert_eq!(timeout["local_recovery_status"], "timeout_killed");
 }
@@ -15482,7 +15511,7 @@ mode = "passthrough"
         .reload()
         .expect("profile safety margin reload should succeed");
     assert!(outcome.applied);
-    assert!(outcome.restart_required_changes.is_empty());
+    assert_eq!(outcome.restart_required_changes.len(), 0);
 
     let rejected = proxy
         .client
@@ -24627,7 +24656,7 @@ debug_summary_admin_token = "admin-token"
     let body_text = response.text().await.expect("body should be text");
     let body: serde_json::Value = serde_json::from_str(&body_text).expect("body should be JSON");
     assert_eq!(body["request_count"], 0);
-    assert!(body["requests"].as_array().unwrap().is_empty());
+    assert_eq!(body["requests"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
