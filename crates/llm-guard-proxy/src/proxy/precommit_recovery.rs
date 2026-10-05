@@ -169,7 +169,10 @@ pub(super) async fn gate(
         context.base_url.to_owned(),
         cause,
         LocalRecoveryRunOptions {
-            receipt: context.receipt,
+            receipt: context
+                .receipt
+                .deadline(context.request_deadline.instant())
+                .downstream_drop(context.downstream_drop_signal.cloned()),
             episode_timeout: context.episode_timeout,
             caller_timeout: Some(remaining_request_budget),
             recovery_episode_observer: None,

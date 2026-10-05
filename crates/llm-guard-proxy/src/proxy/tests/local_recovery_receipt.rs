@@ -322,6 +322,159 @@ async fn local_recovery_receipt_late_acknowledgment_never_spawns() {
 }
 
 #[tokio::test]
+async fn local_recovery_receipt_shutdown_during_write_never_spawns() {
+    let (store, path, profile, tasks) = fixture();
+    let marker = path.with_extension("shutdown-during-write-forbidden");
+    let policy = policy(vec![
+        String::from("/usr/bin/touch"),
+        marker.display().to_string(),
+    ]);
+    let shutdown = Arc::new(ShutdownGate::new());
+    let context = recovery_receipt::Context::new(store, &profile, Arc::clone(&tasks))
+        .episode(1, LocalRecoveryCause::StuckWatchdog, &policy)
+        .shutdown(Arc::clone(&shutdown));
+    let ran = AtomicBool::new(false);
+    let lock = Connection::open(&path).expect("shutdown fixture lock");
+    lock.execute_batch("BEGIN EXCLUSIVE")
+        .expect("hold first poll");
+    let mut restart = Box::pin(run_local_recovery_restart_command(
+        &policy, &ran, &context, None,
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(restart.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    lock.execute_batch("ROLLBACK")
+        .expect("release first-poll lock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while tasks.in_flight.load(Ordering::SeqCst) != 0 {
+        assert!(std::time::Instant::now() < deadline, "bounded writer");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(receipt_row(&path, context.id()).1.is_none());
+    shutdown.begin_shutdown();
+    let result = restart.await;
+    assert!(
+        !ran.load(Ordering::Relaxed),
+        "shutdown owner must not launch a child"
+    );
+    assert!(!marker.exists());
+    assert_eq!(
+        result.get("local_recovery_status").map(String::as_str),
+        Some("shutdown_cancelled")
+    );
+}
+
+#[tokio::test]
+async fn local_recovery_receipt_downstream_drop_during_write_never_spawns() {
+    let (store, path, profile, tasks) = fixture();
+    let marker = path.with_extension("drop-during-write-forbidden");
+    let policy = policy(vec![
+        String::from("/usr/bin/touch"),
+        marker.display().to_string(),
+    ]);
+    let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
+    let dropped = DownstreamDropSignal::default();
+    let attempts = AtomicU64::new(0);
+    let lock = Connection::open(&path).expect("drop fixture lock");
+    lock.execute_batch("BEGIN EXCLUSIVE").expect("hold writer");
+    let mut recovery = Box::pin(precommit_recovery::gate(
+        precommit_recovery::Context {
+            receipt: recovery_receipt::Context::new(store, &profile, Arc::clone(&tasks)),
+            policy: &policy,
+            coordinator: &coordinator,
+            client: build_http_client().expect("client"),
+            base_url: "http://127.0.0.1:1/v1",
+            profile_name: "default",
+            attempts: &attempts,
+            downstream_commit_signal: None,
+            downstream_drop_signal: Some(&dropped),
+            request_deadline: RequestDeadline::from_started_at(
+                Instant::now(),
+                Duration::from_secs(2),
+            ),
+            post_await_self_test: None,
+            episode_timeout: None,
+        },
+        true,
+        LocalRecoveryCause::TransientTransport,
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(recovery.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    timeout(Duration::from_secs(1), async {
+        while tasks.in_flight.load(Ordering::SeqCst) < 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("writer plus terminalizer pending");
+    dropped.mark_dropped();
+    lock.execute_batch("ROLLBACK").expect("release writer");
+    let _ = recovery.await;
+    tasks.flush(Duration::from_secs(1)).await;
+    assert!(!marker.exists(), "dropped owner must not launch restart");
+}
+
+#[tokio::test]
+async fn local_recovery_receipt_short_owner_deadline_never_spawns() {
+    let (store, path, profile, tasks) = fixture();
+    let marker = path.with_extension("owner-deadline-forbidden");
+    let policy = policy(vec![
+        String::from("/usr/bin/touch"),
+        marker.display().to_string(),
+    ]);
+    let context = recovery_receipt::Context::new(store, &profile, Arc::clone(&tasks)).episode(
+        1,
+        LocalRecoveryCause::TransientTransport,
+        &policy,
+    );
+    let lock = Connection::open(&path).expect("owner-deadline fixture lock");
+    lock.execute_batch("BEGIN EXCLUSIVE")
+        .expect("hold first poll");
+    let mut recovery = Box::pin(run_local_recovery_task(
+        policy,
+        build_http_client().expect("client"),
+        String::from("http://127.0.0.1:1/v1"),
+        LocalRecoveryCause::TransientTransport,
+        Some(Duration::from_millis(80)),
+        LocalRecoveryTaskContext {
+            downstream_commit_signal: None,
+            post_await_self_test: None,
+            receipt: context.clone(),
+        },
+    ));
+    let started = std::time::Instant::now();
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(recovery.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    lock.execute_batch("ROLLBACK")
+        .expect("release first-poll lock");
+    while tasks.in_flight.load(Ordering::SeqCst) != 0 {
+        assert!(started.elapsed() < Duration::from_secs(2), "bounded writer");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(receipt_row(&path, context.id()).1.is_none());
+    std::thread::sleep(Duration::from_millis(120));
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "resume before independent receipt deadline"
+    );
+    let result = recovery.await;
+    assert_ne!(
+        result.get("local_recovery_restart_ran").map(String::as_str),
+        Some("true"),
+        "expired owner must not launch a child"
+    );
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
 async fn local_recovery_receipt_terminalizer_joins_command_and_readiness() {
     let (store, path, profile, tasks) = fixture();
     let fake = FakeUpstream::spawn().await;

@@ -9031,7 +9031,7 @@ async fn run_watchdog_recovery(
             endpoint.base_url,
             watchdog_recovery_cause(),
             LocalRecoveryRunOptions {
-                receipt: endpoint.receipt,
+                receipt: endpoint.receipt.shutdown(Arc::clone(&recovery_shutdown)),
                 episode_timeout,
                 caller_timeout: None,
                 recovery_episode_observer: Some(&recovery_episode_observer),
@@ -12659,10 +12659,11 @@ async fn run_local_recovery_for_profile_observing(
     state.recovery_started = Some(now);
     let recovery_timeout = local_recovery_completion_timeout(policy);
     let task_timeout = minimum_optional_timeout(options.episode_timeout, options.caller_timeout);
-    state.recovery_deadline = Some(checked_instant_add(
+    let recovery_deadline = checked_instant_add(
         now,
         task_timeout.map_or(recovery_timeout, |timeout| recovery_timeout.min(timeout)),
-    ));
+    );
+    state.recovery_deadline = Some(recovery_deadline);
     state.runs_in_window = state.runs_in_window.saturating_add(1);
     let recovery_policy = policy.clone();
     let recovery_commit_signal = options.downstream_commit_signal.clone();
@@ -12670,7 +12671,8 @@ async fn run_local_recovery_for_profile_observing(
     let receipt = options
         .receipt
         .clone()
-        .episode(recovery_episode_id, cause, policy);
+        .episode(recovery_episode_id, cause, policy)
+        .deadline(recovery_deadline);
     let task_receipt = receipt.clone();
     let recovery_task = tokio::spawn(async move {
         run_local_recovery_task(
@@ -12885,6 +12887,11 @@ async fn run_local_recovery_task(
         post_await_self_test,
         receipt,
     } = context;
+    let receipt = if let Some(duration) = episode_timeout {
+        receipt.deadline(checked_instant_add(Instant::now(), duration))
+    } else {
+        receipt
+    };
     let trigger_cause = cause.as_str().to_owned();
     let recovery_trigger_cause = trigger_cause.clone();
     let restart_ran = Arc::new(AtomicBool::new(false));
@@ -13093,6 +13100,11 @@ async fn run_local_recovery_restart_command(
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     configure_recovery_command(&mut command);
+    if receipt.owner_cancelled(&mut metadata)
+        || local_recovery_downstream_commit_observed(downstream_commit_signal, &mut metadata)
+    {
+        return metadata;
+    }
     let mut child = match command.spawn() {
         Ok(child) => RecoveryProcessGuard::new(child),
         Err(error) => {
