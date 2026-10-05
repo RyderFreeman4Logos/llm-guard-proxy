@@ -404,6 +404,10 @@ pub enum GuardianIteration {
     Waiting,
     /// The target became empty after Tier 1, but memory has not rearmed yet.
     Verified,
+    /// The target is empty without a successful direct write in this generation.
+    AlreadyEmpty,
+    /// The retained cgroup.kill descriptor rejected the action with this errno.
+    KillFailed(i32),
     /// Memory recovered and a new reserve was allocated.
     Rearmed,
 }
@@ -655,6 +659,8 @@ impl MemoryGuardian {
         };
         match outcome {
             AttemptOutcome::Verified => GuardianIteration::Verified,
+            AttemptOutcome::AlreadyEmpty => GuardianIteration::AlreadyEmpty,
+            AttemptOutcome::WriteFailed(errno) => GuardianIteration::KillFailed(errno),
             AttemptOutcome::Waiting | AttemptOutcome::Retry if entering => GuardianIteration::Shed,
             AttemptOutcome::Waiting | AttemptOutcome::Retry => GuardianIteration::Waiting,
         }
@@ -919,6 +925,7 @@ mod tests {
         ConfigHandle::new(guardian_config(registration_file, cgroup_root))
     }
 
+    mod action_result;
     mod target_reconciliation;
 
     #[test]
