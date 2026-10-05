@@ -13,13 +13,21 @@ const WRITE_BUDGET: Duration = Duration::from_millis(250);
 #[derive(Clone)]
 pub(super) struct Context {
     store: ObservabilityStore,
+    tasks: super::Arc<super::PersistenceTasks>,
+    acknowledged: super::Arc<super::AtomicBool>,
     receipt: LocalRecoveryReceipt,
 }
 
 impl Context {
-    pub(super) fn new(store: ObservabilityStore, profile: &UpstreamProfileConfig) -> Self {
+    pub(super) fn new(
+        store: ObservabilityStore,
+        profile: &UpstreamProfileConfig,
+        tasks: super::Arc<super::PersistenceTasks>,
+    ) -> Self {
         Self {
             store,
+            tasks,
+            acknowledged: super::Arc::new(super::AtomicBool::new(false)),
             receipt: LocalRecoveryReceipt {
                 receipt_id: format!("recovery-{}-{}", std::process::id(), RequestId::generate()),
                 generated_at_unix_ms: 0,
@@ -84,6 +92,16 @@ impl Context {
         self
     }
 
+    pub(super) fn track(&self) -> super::PersistenceTaskGuard {
+        self.tasks.track()
+    }
+
+    pub(super) fn acknowledged_id(&self) -> Option<&str> {
+        self.acknowledged
+            .load(super::Ordering::Acquire)
+            .then(|| self.id())
+    }
+
     pub(super) fn id(&self) -> &str {
         &self.receipt.receipt_id
     }
@@ -118,19 +136,36 @@ impl Context {
         Ok(metadata)
     }
 
-    pub(super) async fn persist(&self) -> Result<(), &'static str> {
-        let store = self.store.clone();
-        let mut receipt = self.receipt.clone();
-        receipt.generated_at_unix_ms = unix_time_millis();
+    async fn write(
+        &self,
+        work: impl FnOnce(std::time::Instant) -> Result<(), &'static str> + Send + 'static,
+    ) -> Result<(), &'static str> {
         let deadline = std::time::Instant::now() + WRITE_BUDGET;
-        // Cancellation only abandons the acknowledgment; the writer never spawns a child.
+        let permit = super::Arc::clone(&self.tasks.capacity)
+            .try_acquire_owned()
+            .map_err(|_| "writer_busy")?;
+        let guard = self.track();
+        // Cancellation abandons the acknowledgment, not ownership. Shutdown's existing
+        // persistence drain observes this worker; neither the worker nor its guard can spawn.
         let writer = tokio::task::spawn_blocking(move || {
-            store.record_local_recovery_receipt(&receipt, deadline)
+            let _permit = permit;
+            let _guard = guard;
+            work(deadline)
         });
         tokio::time::timeout(WRITE_BUDGET, writer)
             .await
             .map_err(|_| "write_timeout")?
             .map_err(|_| "writer_failed")?
+    }
+
+    pub(super) async fn persist(&self) -> Result<(), &'static str> {
+        let store = self.store.clone();
+        let mut receipt = self.receipt.clone();
+        receipt.generated_at_unix_ms = unix_time_millis();
+        self.write(move |deadline| store.record_local_recovery_receipt(&receipt, deadline))
+            .await?;
+        self.acknowledged.store(true, super::Ordering::Release);
+        Ok(())
     }
 
     pub(super) async fn finish(
@@ -145,8 +180,7 @@ impl Context {
         let readiness = metadata.get("local_recovery_readiness_status").cloned();
         let store = self.store.clone();
         let id = self.id().to_owned();
-        let deadline = std::time::Instant::now() + WRITE_BUDGET;
-        let writer = tokio::task::spawn_blocking(move || {
+        self.write(move |deadline| {
             store.finish_local_recovery_receipt(
                 &id,
                 &outcome,
@@ -154,10 +188,7 @@ impl Context {
                 readiness.as_deref(),
                 deadline,
             )
-        });
-        tokio::time::timeout(WRITE_BUDGET, writer)
-            .await
-            .map_err(|_| "write_timeout")?
-            .map_err(|_| "writer_failed")?
+        })
+        .await
     }
 }

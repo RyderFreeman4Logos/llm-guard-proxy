@@ -140,6 +140,7 @@ async fn recover_and_replay(
             receipt: super::recovery_receipt::Context::new(
                 context.state.store.clone(),
                 &context.upstream_profile,
+                super::Arc::clone(&context.state.persistence_tasks),
             )
             .stall(
                 context.config.upstream_stall.first_chunk_timeout_ms,

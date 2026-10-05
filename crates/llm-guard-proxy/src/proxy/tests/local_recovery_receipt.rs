@@ -1,6 +1,11 @@
 use super::*;
 
-fn fixture() -> (ObservabilityStore, PathBuf, UpstreamProfileConfig) {
+fn fixture() -> (
+    ObservabilityStore,
+    PathBuf,
+    UpstreamProfileConfig,
+    Arc<PersistenceTasks>,
+) {
     let root = unique_test_dir("pre-action-receipt");
     fs::create_dir_all(&root).expect("receipt root");
     set_owner_only_dir(&root);
@@ -13,6 +18,7 @@ fn fixture() -> (ObservabilityStore, PathBuf, UpstreamProfileConfig) {
         store,
         config.observability.sqlite_path.clone(),
         config.default_upstream_profile(),
+        Arc::new(PersistenceTasks::default()),
     )
 }
 
@@ -40,7 +46,7 @@ fn receipt_row(path: &Path, id: &str) -> (serde_json::Value, Option<String>) {
 
 #[tokio::test]
 async fn local_recovery_receipt_precedes_child_and_keeps_causes_private() {
-    let (store, path, mut profile) = fixture();
+    let (store, path, mut profile, tasks) = fixture();
     profile.name = String::from("https://private-user:private-password@host");
     let marker = path.with_extension("accepted");
     let child = "import sqlite3,sys,pathlib,json; c=sqlite3.connect(sys.argv[1]); r=c.execute('SELECT receipt_json FROM local_recovery_receipts WHERE receipt_id=?',(sys.argv[2],)).fetchone(); assert r is not None; assert json.loads(r[0])['cause']==sys.argv[4]; pathlib.Path(sys.argv[3]).write_text('accepted')";
@@ -51,7 +57,8 @@ async fn local_recovery_receipt_precedes_child_and_keeps_causes_private() {
         LocalRecoveryCause::UpstreamStall,
         LocalRecoveryCause::StuckWatchdog,
     ] {
-        let context = recovery_receipt::Context::new(store.clone(), &profile).stall(123, 456);
+        let context = recovery_receipt::Context::new(store.clone(), &profile, Arc::clone(&tasks))
+            .stall(123, 456);
         let policy = policy(vec![
             String::from("python3"),
             String::from("-c"),
@@ -107,7 +114,7 @@ async fn local_recovery_receipt_precedes_child_and_keeps_causes_private() {
 
 #[tokio::test]
 async fn local_recovery_receipt_write_failure_and_cancel_never_spawn() {
-    let (store, path, profile) = fixture();
+    let (store, path, profile, tasks) = fixture();
     let marker = path.with_extension("forbidden");
     let policy = policy(vec![
         String::from("/usr/bin/touch"),
@@ -116,11 +123,8 @@ async fn local_recovery_receipt_write_failure_and_cancel_never_spawn() {
     let lock = Connection::open(&path).expect("external writer");
     lock.execute_batch("BEGIN EXCLUSIVE")
         .expect("hold SQLite lock");
-    let context = recovery_receipt::Context::new(store.clone(), &profile).episode(
-        1,
-        LocalRecoveryCause::TransientTransport,
-        &policy,
-    );
+    let context = recovery_receipt::Context::new(store.clone(), &profile, Arc::clone(&tasks))
+        .episode(1, LocalRecoveryCause::TransientTransport, &policy);
     let ran = AtomicBool::new(false);
     let responsive = Arc::new(AtomicBool::new(false));
     let tick = Arc::clone(&responsive);
@@ -142,7 +146,7 @@ async fn local_recovery_receipt_write_failure_and_cancel_never_spawn() {
     assert_eq!(result["local_recovery_restart_status"], "receipt_failed");
     assert!(!ran.load(Ordering::Relaxed));
     assert!(!marker.exists());
-    let context = recovery_receipt::Context::new(store, &profile).episode(
+    let context = recovery_receipt::Context::new(store, &profile, Arc::clone(&tasks)).episode(
         2,
         LocalRecoveryCause::RequestDeadline,
         &policy,
@@ -155,14 +159,15 @@ async fn local_recovery_receipt_write_failure_and_cancel_never_spawn() {
     assert!(cancelled.is_err());
     lock.execute_batch("ROLLBACK").expect("release SQLite lock");
     // The abandoned writer may still commit; it owns no restart authority.
-    sleep(Duration::from_millis(300)).await;
+    tasks.flush(Duration::from_secs(1)).await;
+    assert_eq!(tasks.in_flight.load(Ordering::SeqCst), 0);
     assert!(!ran.load(Ordering::Relaxed));
     assert!(!marker.exists());
 }
 
 #[tokio::test]
 async fn local_recovery_receipt_child_cancellation_keeps_durable_attribution() {
-    let (store, path, profile) = fixture();
+    let (store, path, profile, tasks) = fixture();
     let marker = path.with_extension("child-pid");
     let forbidden = path.with_extension("after-sleep");
     let child = "import os,pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30); pathlib.Path(sys.argv[2]).write_text('forbidden')";
@@ -174,7 +179,7 @@ async fn local_recovery_receipt_child_cancellation_keeps_durable_attribution() {
         forbidden.display().to_string(),
     ]);
     policy.restart_timeout = Duration::from_secs(40);
-    let context = recovery_receipt::Context::new(store, &profile);
+    let context = recovery_receipt::Context::new(store, &profile, Arc::clone(&tasks));
     let id = context.id().to_owned();
     let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
     let task_coordinator = Arc::clone(&coordinator);
@@ -224,6 +229,8 @@ async fn local_recovery_receipt_child_cancellation_keeps_durable_attribution() {
         .expect("recovery waiter");
     assert_eq!(result["local_recovery_status"], "cancelled");
     assert_eq!(result["local_recovery_receipt_id"], id);
+    tasks.flush(Duration::from_secs(1)).await;
+    assert_eq!(tasks.in_flight.load(Ordering::SeqCst), 0);
     let (_, outcome) = receipt_row(&path, &id);
     assert_eq!(outcome.as_deref(), Some("cancelled"));
     timeout(Duration::from_secs(2), async {
@@ -238,10 +245,10 @@ async fn local_recovery_receipt_child_cancellation_keeps_durable_attribution() {
 
 #[tokio::test]
 async fn local_recovery_receipt_terminalizer_joins_command_and_readiness() {
-    let (store, path, profile) = fixture();
+    let (store, path, profile, tasks) = fixture();
     let fake = FakeUpstream::spawn().await;
     let policy = policy(vec![String::from("/bin/true")]);
-    let context = recovery_receipt::Context::new(store, &profile);
+    let context = recovery_receipt::Context::new(store, &profile, Arc::clone(&tasks));
     let id = context.id().to_owned();
     let coordinator = Arc::new(UpstreamStallRecoveryCoordinator::default());
     let result = run_local_recovery_for_profile_observing(
@@ -262,6 +269,8 @@ async fn local_recovery_receipt_terminalizer_joins_command_and_readiness() {
     .await;
     assert_eq!(result["local_recovery_status"], "succeeded");
     assert_eq!(result["local_recovery_receipt_id"], id);
+    tasks.flush(Duration::from_secs(1)).await;
+    assert_eq!(tasks.in_flight.load(Ordering::SeqCst), 0);
     let (_, outcome) = receipt_row(&path, &id);
     assert_eq!(outcome.as_deref(), Some("succeeded"));
     let joined = completed_local_recovery_metadata(Some(&result), true);

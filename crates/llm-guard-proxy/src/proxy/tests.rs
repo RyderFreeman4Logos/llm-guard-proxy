@@ -7297,7 +7297,11 @@ pub(super) fn test_recovery_receipt_context() -> recovery_receipt::Context {
     let mut config = AppConfig::default();
     config.observability.sqlite_path = root.join("receipt.sqlite3");
     let store = ObservabilityStore::open(ConfigHandle::new(config.clone())).expect("receipt store");
-    recovery_receipt::Context::new(store, &config.default_upstream_profile())
+    recovery_receipt::Context::new(
+        store,
+        &config.default_upstream_profile(),
+        Arc::new(PersistenceTasks::default()),
+    )
 }
 
 #[tokio::test]

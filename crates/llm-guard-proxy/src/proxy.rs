@@ -8741,6 +8741,7 @@ impl WatchdogSchedule {
 async fn run_stuck_engine_watchdog(
     config: ConfigHandle,
     store: ObservabilityStore,
+    persistence_tasks: Arc<PersistenceTasks>,
     client: Client,
     local_recovery: Arc<LocalRecoveryCoordinatorSet>,
     tokens: Arc<StuckWatchdogTokenTracker>,
@@ -8812,7 +8813,12 @@ async fn run_stuck_engine_watchdog(
                 episode_timeout,
                 coordinator,
                 LocalRecoveryEndpoint {
-                    receipt: recovery_receipt::Context::new(store.clone(), &profile).stall(
+                    receipt: recovery_receipt::Context::new(
+                        store.clone(),
+                        &profile,
+                        Arc::clone(&persistence_tasks),
+                    )
+                    .stall(
                         snapshot.upstream_stall.first_chunk_timeout_ms,
                         snapshot.upstream_stall.idle_timeout_ms,
                     ),
@@ -9164,6 +9170,7 @@ pub(crate) fn spawn_stuck_engine_watchdog(state: &ProxyState) -> tokio::task::Jo
     tokio::spawn(run_stuck_engine_watchdog(
         state.config.clone(),
         state.store.clone(),
+        Arc::clone(&state.persistence_tasks),
         state.client.clone(),
         Arc::clone(&state.local_recovery),
         Arc::clone(&state.stuck_watchdog_tokens),
@@ -12440,6 +12447,7 @@ async fn local_recovery_gate(
             receipt: recovery_receipt::Context::new(
                 runtime.store.clone(),
                 &runtime.upstream_profile,
+                Arc::clone(&runtime.persistence_tasks),
             )
             .stall(
                 duration_millis_u64(runtime.upstream_stall_policy.first_chunk_timeout),
@@ -12793,7 +12801,9 @@ fn spawn_local_recovery_terminalizer(
     receipt: recovery_receipt::Context,
 ) -> tokio::task::JoinHandle<()> {
     let coordinator = Arc::clone(coordinator);
+    let guard = receipt.track();
     tokio::spawn(async move {
+        let _guard = guard;
         let mut metadata = match recovery_task.await {
             Ok(metadata) => metadata,
             Err(error) => BTreeMap::from([(
@@ -12805,19 +12815,18 @@ fn spawn_local_recovery_terminalizer(
                 },
             )]),
         };
-        if let Err(category) = receipt.finish(&metadata).await {
-            metadata.insert(
-                String::from("local_recovery_receipt_finish_error"),
-                category.to_owned(),
-            );
-        } else {
-            metadata.insert(
-                String::from("local_recovery_receipt_id"),
-                receipt.id().to_owned(),
-            );
+        if let Some(id) = receipt.acknowledged_id() {
+            metadata.insert(String::from("local_recovery_receipt_id"), id.to_owned());
         }
+        // Terminal settlement must not consume the recovery/join deadline or delay readiness.
         let _published =
-            finish_local_recovery_episode(&coordinator, recovery_episode_id, metadata).await;
+            finish_local_recovery_episode(&coordinator, recovery_episode_id, metadata.clone())
+                .await;
+        if receipt.acknowledged_id().is_some()
+            && let Err(category) = receipt.finish(&metadata).await
+        {
+            eprintln!("local recovery receipt completion unavailable category={category}");
+        }
     })
 }
 
