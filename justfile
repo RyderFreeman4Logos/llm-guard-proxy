@@ -52,8 +52,10 @@ clippy-feature-matrix:
     {{_io_prefix}} cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features param-override -- -D warnings
     {{_io_prefix}} cargo clippy -p llm-guard-proxy --all-targets --no-default-features --features upstream-hot-restart -- -D warnings
 
+# Required resource-isolated durability acceptance; neither phase is optional.
 test:
-    {{_io_prefix}} env RUST_TEST_THREADS={{local_test_threads}} cargo test --workspace --all-features
+    {{_io_prefix}} env RUST_TEST_THREADS={{local_test_threads}} cargo test --workspace --all-features -- --skip proxy::tests::guardian_recovery::
+    {{_io_prefix}} env RUST_TEST_THREADS=1 cargo test --workspace --all-features proxy::tests::guardian_recovery::
 
 # Focused workspace test runner for TDD and local reproduction.
 test-filter filter:

@@ -412,8 +412,8 @@ async fn tier2_cancel_ack_follows_actual_owned_process_reap() {
     }
 }
 
-async fn owned_cancellation_case(case: &str) {
-    let (_upstream, proxy, runtime) = fixture(vec![String::from("/usr/bin/true")]).await;
+async fn owned_process_fixture() -> (FakeUpstream, ProxyFixture, PathBuf, PathBuf) {
+    let (upstream, proxy, runtime) = fixture(vec![String::from("/usr/bin/true")]).await;
     let marker = runtime.join("pid");
     let mut config = proxy.state.config.snapshot().expect("config");
     config.upstream.local_recovery.restart_command = vec![
@@ -430,6 +430,57 @@ async fn owned_cancellation_case(case: &str) {
         .config
         .apply_reloadable(&config)
         .expect("policy");
+    (upstream, proxy, runtime, marker)
+}
+
+// A failed finite cleanup retains the whole fixture: deleting its database would
+// race a tracked blocking writer. Never call an abandoned worker a joined worker.
+async fn settle_owned_fixture(
+    mut proxy: ProxyFixture,
+    upstream: FakeUpstream,
+    mut worker: tokio::task::JoinHandle<()>,
+) -> ProxyFixture {
+    let joined = tokio::time::timeout(Duration::from_secs(6), &mut worker).await;
+    proxy.server.task.abort();
+    let _ = (&mut proxy.server.task).await;
+    let FakeUpstream {
+        _server: mut server,
+        ..
+    } = upstream;
+    server.task.abort();
+    let _ = (&mut server.task).await;
+    let drained = tokio::time::timeout(
+        Duration::from_secs(6),
+        proxy.state.flush_persistence_checked(),
+    )
+    .await;
+    if !joined.is_ok_and(|result| result.is_ok()) || !drained.is_ok_and(|result| result.is_ok()) {
+        let root = proxy.root.clone();
+        std::mem::forget(worker);
+        std::mem::forget(proxy);
+        panic!("owned cleanup incomplete; preserved fixture {root:?}");
+    }
+    proxy
+}
+
+async fn owned_child_pid(marker: &std::path::Path) -> Option<String> {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(pid) = fs::read_to_string(marker)
+                && pid.parse::<u32>().is_ok()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .ok()
+}
+
+async fn owned_cancellation_case(case: &str) {
+    let (upstream, proxy, runtime, marker) = owned_process_fixture().await;
+    let mut config = proxy.state.config.snapshot().expect("config");
     let timeout = if case == "deadline" {
         Duration::from_millis(500)
     } else {
@@ -439,16 +490,14 @@ async fn owned_cancellation_case(case: &str) {
     let authority = Arc::clone(&request.authority);
     let (sender, worker) = proxy.state.spawn_guardian_recovery();
     sender.send(request).await.expect("handoff");
-    tokio::time::timeout(Duration::from_secs(3), async {
-        while !marker.exists() {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("child started");
-    let pid = fs::read_to_string(marker).expect("pid");
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).expect("owned child instance");
-    eprintln!("tier2 owned {case} pid={pid} stat={stat}");
+    let pid = owned_child_pid(&marker).await;
+    let stat = pid
+        .as_ref()
+        .and_then(|pid| fs::read_to_string(format!("/proc/{pid}/stat")).ok());
+    eprintln!("tier2 owned {case} pid={pid:?} stat={stat:?}");
+    if pid.is_none() {
+        authority.cancel();
+    }
     match case {
         "cancel" => authority.cancel(),
         "reload" => {
@@ -466,19 +515,16 @@ async fn owned_cancellation_case(case: &str) {
     } else {
         RecoveryOutcome::Cancelled
     };
-    assert_eq!(
-        tokio::time::timeout(Duration::from_secs(4), receiver)
-            .await
-            .expect("bounded cleanup")
-            .expect("ack"),
-        expected
-    );
-    assert!(
-        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-        "done means direct child already reaped"
-    );
+    let owner = tokio::time::timeout(Duration::from_secs(4), receiver).await;
+    let reaped_at_ack = pid
+        .as_ref()
+        .is_some_and(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists());
+    authority.cancel();
     drop(sender);
-    worker.await.expect("worker joined");
+    let proxy = settle_owned_fixture(proxy, upstream, worker).await;
+    assert!(stat.is_some(), "actual owned child instance started");
+    assert_eq!(owner.expect("bounded cleanup").expect("ack"), expected);
+    assert!(reaped_at_ack, "done means direct child already reaped");
     let database = rusqlite::Connection::open(&proxy.sqlite_path).expect("database");
     let (json, outcome): (String, String) = database
         .query_row(
@@ -506,6 +552,173 @@ async fn owned_cancellation_case(case: &str) {
             .await
             .running
     );
+}
+
+fn assert_guardian_preaction(
+    preaction: (String, Option<String>, String, String, String),
+) -> String {
+    let (id, pending, json, boot, claim_id) = preaction;
+    assert_eq!(pending, None);
+    assert_eq!(claim_id, id);
+    assert_eq!(
+        boot,
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .expect("boot")
+            .trim()
+    );
+    let json: serde_json::Value = serde_json::from_str(&json).expect("receipt JSON");
+    assert_eq!(json["detector"], "memory_guardian");
+    assert_eq!(json["guardian"]["boot_id"], boot);
+    assert!(!json.to_string().contains("secret-argv-marker"));
+    id
+}
+
+struct TerminalSqlBarrier {
+    entered: oneshot::Receiver<(String, bool)>,
+    release: std::sync::mpsc::Sender<()>,
+    released: Arc<super::AtomicBool>,
+    sql_finished: Arc<super::AtomicBool>,
+}
+
+fn terminal_sql_barrier(proxy: &ProxyFixture, marker: &std::path::Path) -> TerminalSqlBarrier {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let entered_tx = std::sync::Mutex::new(Some(entered_tx));
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let release_rx = std::sync::Mutex::new(release_rx);
+    let released = Arc::new(super::AtomicBool::new(false));
+    let observed_release = Arc::clone(&released);
+    let sql_finished = Arc::new(super::AtomicBool::new(false));
+    let observed_finish = Arc::clone(&sql_finished);
+    let observed_marker = marker.to_path_buf();
+    proxy
+        .store
+        .set_recovery_receipt_test_hook(move |stage, id| {
+            if stage == "terminal_sql_start" {
+                let reaped = fs::read_to_string(&observed_marker)
+                    .is_ok_and(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists());
+                if let Some(sender) = entered_tx.lock().expect("entry lock").take() {
+                    let _ = sender.send((id.to_owned(), reaped));
+                }
+                // Only this real terminal writer is held, after physical cleanup and
+                // before UPDATE. Finite even if its async owner/fixture fails.
+                let explicit = release_rx
+                    .lock()
+                    .expect("release lock")
+                    .recv_timeout(Duration::from_secs(5))
+                    .is_ok();
+                observed_release.store(explicit, super::Ordering::SeqCst);
+            } else if stage == "terminal_sql_end" {
+                observed_finish.store(true, super::Ordering::SeqCst);
+            }
+        });
+    TerminalSqlBarrier {
+        entered: entered_rx,
+        release: release_tx,
+        released,
+        sql_finished,
+    }
+}
+
+#[tokio::test]
+async fn tier2_terminal_sql_timeout_keeps_reaped_cancellation_unconfirmed() {
+    let (upstream, proxy, runtime, marker) = owned_process_fixture().await;
+    let TerminalSqlBarrier {
+        entered: entered_rx,
+        release: release_tx,
+        released,
+        sql_finished,
+    } = terminal_sql_barrier(&proxy, &marker);
+    let (request, receiver) =
+        make_request(proxy.state.config.clone(), &runtime, Duration::from_secs(5));
+    let authority = Arc::clone(&request.authority);
+    let coordinator = proxy.state.local_recovery.coordinator_for(&request.profile);
+    let (sender, worker) = proxy.state.spawn_guardian_recovery();
+    sender.send(request).await.expect("handoff");
+    let pid = owned_child_pid(&marker).await;
+    let stat = pid
+        .as_ref()
+        .and_then(|pid| fs::read_to_string(format!("/proc/{pid}/stat")).ok());
+    let database = rusqlite::Connection::open(&proxy.sqlite_path).expect("database");
+    let preaction = database.query_row(
+        "SELECT r.receipt_id, r.outcome, r.receipt_json, c.boot_id, c.receipt_id FROM local_recovery_receipts r JOIN guardian_boot_claim c ON c.singleton = 1",
+        [], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)),
+    );
+    let episode = coordinator.state.lock().await.active_recovery_episode_id;
+    authority.cancel();
+    let entered = tokio::time::timeout(Duration::from_secs(3), entered_rx).await;
+    let owner = tokio::time::timeout(Duration::from_secs(2), receiver).await;
+    let held_at_ack =
+        !released.load(super::Ordering::SeqCst) && !sql_finished.load(super::Ordering::SeqCst);
+    let in_flight_at_ack = proxy
+        .state
+        .persistence_tasks
+        .in_flight
+        .load(super::Ordering::SeqCst);
+    let state = coordinator.state.lock().await;
+    let running_at_ack = state.running;
+    let completed_at_ack =
+        episode.and_then(|episode| state.completed_recovery_result(episode).cloned());
+    drop(state);
+    // Release, close and join the owner, then checked-drain actual blocking work
+    // before any assertion/readback can unwind and delete fixture storage.
+    let explicit_release = release_tx.send(()).is_ok();
+    drop(sender);
+    let proxy = settle_owned_fixture(proxy, upstream, worker).await;
+    let in_flight = proxy
+        .state
+        .persistence_tasks
+        .in_flight
+        .load(super::Ordering::SeqCst);
+    let state = coordinator.state.lock().await;
+    let completed_after_drain =
+        episode.and_then(|episode| state.completed_recovery_result(episode).cloned());
+    drop(state);
+    let terminal: (String, String) = database
+        .query_row(
+            "SELECT receipt_id, outcome FROM local_recovery_receipts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("actual durable terminal row after checked drain");
+
+    eprintln!(
+        "terminal SQL timeout owner={owner:?} held_at_ack={held_at_ack} in_flight_at_ack={in_flight_at_ack} entered={entered:?} terminal={terminal:?} in_flight={in_flight}"
+    );
+    assert!(
+        stat.is_some(),
+        "real owned child started after durable pre-action"
+    );
+    let id = assert_guardian_preaction(preaction.expect("real pre-action and boot claim"));
+    let (terminal_id, reaped_before_sql) = entered.expect("bounded SQL entry").expect("SQL entry");
+    assert_eq!(terminal_id, id);
+    assert!(
+        reaped_before_sql,
+        "actual child reaped before terminal SQL release"
+    );
+    assert_eq!(
+        owner
+            .expect("bounded owner while blocked")
+            .expect("owner ACK"),
+        RecoveryOutcome::Unconfirmed
+    );
+    assert!(
+        held_at_ack && in_flight_at_ack > 0,
+        "terminal SQL still blocked at owner ACK"
+    );
+    assert!(!running_at_ack);
+    let completed = completed_at_ack.expect("shared failure projection before release");
+    assert_eq!(completed["local_recovery_status"], "receipt_failed");
+    assert_eq!(completed["local_recovery_receipt_error"], "write_timeout");
+    assert!(!super::local_recovery_permits_retry(&completed));
+    assert_eq!(
+        completed_after_drain.as_ref(),
+        Some(&completed),
+        "late durable write must not release replay"
+    );
+    assert!(explicit_release && released.load(super::Ordering::SeqCst));
+    assert!(sql_finished.load(super::Ordering::SeqCst));
+    assert_eq!(in_flight, 0);
+    assert_eq!(terminal, (id, String::from("cancelled")));
 }
 
 #[tokio::test]
