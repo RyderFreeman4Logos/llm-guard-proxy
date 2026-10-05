@@ -1,6 +1,62 @@
 use super::*;
 use std::{future::Future, task::Poll};
 
+#[tokio::test]
+async fn tier2_denies_ordinary_unconfirmed_physical_cleanup() {
+    let (_upstream, proxy, runtime) = fixture(vec![String::from("/usr/bin/true")]).await;
+    let profile = proxy
+        .state
+        .config
+        .snapshot()
+        .expect("config")
+        .default_upstream_profile();
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    let _failed = super::super::recovery_physical_fence::external_reap_recovery(&coordinator).await;
+    let (request, receiver) =
+        make_request(proxy.state.config.clone(), &runtime, Duration::from_secs(5));
+    assert_eq!(
+        run(&proxy, request, receiver).await,
+        RecoveryOutcome::NotAdmitted,
+        "Guardian cannot bypass an ordinary unconfirmed physical owner"
+    );
+}
+
+#[tokio::test]
+async fn tier2_admits_after_ordinary_timeout_physically_settles() {
+    let (_upstream, proxy, runtime) = fixture(vec![String::from("/usr/bin/true")]).await;
+    let profile = proxy
+        .state
+        .config
+        .snapshot()
+        .expect("config")
+        .default_upstream_profile();
+    let coordinator = proxy.state.local_recovery.coordinator_for(&profile.name);
+    let mut policy = super::super::LocalRecoveryPolicy::from_config(&profile.local_recovery);
+    policy.restart_command = vec![String::from("/usr/bin/sleep"), String::from("30")];
+    policy.restart_timeout = Duration::from_millis(100);
+    let failed = super::super::run_local_recovery_for_profile(
+        &policy,
+        &coordinator,
+        super::super::Client::new(),
+        profile.base_url.clone(),
+        super::super::LocalRecoveryCause::UpstreamStall,
+        None,
+    )
+    .await;
+    assert_eq!(
+        failed["upstream_stall_recovery_timeout_cleanup_status"],
+        "terminated_after_kill"
+    );
+    tokio::time::sleep(policy.cooldown).await;
+    let (request, receiver) =
+        make_request(proxy.state.config.clone(), &runtime, Duration::from_secs(5));
+    assert_eq!(
+        run(&proxy, request, receiver).await,
+        RecoveryOutcome::Succeeded,
+        "confirmed ordinary timeout must permit Guardian admission"
+    );
+}
+
 async fn poll_once<F: Future>(future: std::pin::Pin<&mut F>) -> Poll<F::Output> {
     let mut future = future;
     std::future::poll_fn(|cx| Poll::Ready(future.as_mut().poll(cx))).await

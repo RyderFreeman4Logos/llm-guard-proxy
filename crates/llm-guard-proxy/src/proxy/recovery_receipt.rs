@@ -15,6 +15,7 @@ pub(super) struct Context {
     store: ObservabilityStore,
     tasks: super::Arc<super::PersistenceTasks>,
     acknowledged: super::Arc<super::AtomicBool>,
+    pub(super) physical_owner: super::Arc<super::AtomicUsize>,
     receipt: LocalRecoveryReceipt,
     owner_deadline: Option<super::Instant>,
     downstream_drop: Option<super::DownstreamDropSignal>,
@@ -33,6 +34,7 @@ impl Context {
             owner_deadline: None,
             downstream_drop: None,
             shutdown: None,
+            physical_owner: super::Arc::new(super::AtomicUsize::new(0)),
             acknowledged: super::Arc::new(super::AtomicBool::new(false)),
             receipt: LocalRecoveryReceipt {
                 guardian: None,
@@ -58,6 +60,11 @@ impl Context {
                     .min_output_progress_units_in_window,
             },
         }
+    }
+
+    pub(super) fn physical_owner(mut self, owner: super::Arc<super::AtomicUsize>) -> Self {
+        self.physical_owner = owner;
+        self
     }
 
     pub(super) fn stall(mut self, first_chunk_ms: u64, idle_ms: u64) -> Self {

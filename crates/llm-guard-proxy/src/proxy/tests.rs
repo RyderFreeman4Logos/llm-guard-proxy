@@ -50,6 +50,8 @@ mod local_recovery_receipt;
 mod native_json_fallback_issue_219;
 #[path = "tests/quality_first_timeouts_issue_222.rs"]
 mod quality_first_timeouts_issue_222;
+#[path = "tests/recovery_physical_fence.rs"]
+mod recovery_physical_fence;
 #[path = "tests/recovery_readiness_bounds.rs"]
 mod recovery_readiness_bounds;
 #[path = "tests/residual_guard_polish.rs"]
@@ -8321,7 +8323,7 @@ async fn upstream_stall_recovery_command_wiring_times_out_and_cleans_process_gro
 
     let metadata = timeout(
         recovery_join_timeout(policy.recovery_timeout),
-        run_upstream_stall_recovery_command(&policy),
+        run_upstream_stall_recovery_command(&policy, Arc::new(AtomicUsize::new(0))),
     )
     .await
     .expect("production recovery command cleanup should complete within its bounded grace");

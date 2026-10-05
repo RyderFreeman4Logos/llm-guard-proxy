@@ -1,6 +1,13 @@
 #[cfg(unix)]
 use std::time::Instant;
-use std::{collections::BTreeMap, time::Duration};
+use std::{
+    collections::BTreeMap,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 #[cfg(any(
     target_os = "android",
@@ -67,13 +74,24 @@ pub(super) const fn recovery_result_poll_interval() -> Duration {
 /// a bounded OS thread so async executor workers never block during cancellation.
 pub(super) struct RecoveryProcessGuard {
     child: Option<tokio::process::Child>,
+    physical_owner: Arc<AtomicUsize>,
     #[cfg(unix)]
     process_group_id: Option<u32>,
 }
 
 impl RecoveryProcessGuard {
+    #[cfg(test)]
     pub(super) fn new(child: tokio::process::Child) -> Self {
+        Self::new_owned(child, Arc::new(AtomicUsize::new(0)))
+    }
+
+    pub(super) fn new_owned(
+        child: tokio::process::Child,
+        physical_owner: Arc<AtomicUsize>,
+    ) -> Self {
+        physical_owner.fetch_add(1, Ordering::AcqRel);
         Self {
+            physical_owner,
             #[cfg(unix)]
             process_group_id: child.id(),
             child: Some(child),
@@ -134,7 +152,9 @@ impl RecoveryProcessGuard {
         {
             self.process_group_id = None;
         }
-        let _reaped_child = self.child.take();
+        if self.child.take().is_some() {
+            self.physical_owner.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -220,16 +240,22 @@ impl Drop for RecoveryProcessGuard {
             return;
         };
         #[cfg(unix)]
-        if let Some(process_group_id) = self.process_group_id.take() {
+        let process_group_id = self.process_group_id.take();
+        #[cfg(unix)]
+        if let Some(process_group_id) = process_group_id {
             let _group_kill_sent =
                 send_recovery_process_group_signal(process_group_id, Signal::SIGKILL);
         }
         let _child_kill_started = child.start_kill();
-        spawn_recovery_child_reaper(child);
+        spawn_recovery_child_reaper(child, process_group_id, Arc::clone(&self.physical_owner));
     }
 }
 
-fn spawn_recovery_child_reaper(mut child: tokio::process::Child) {
+fn spawn_recovery_child_reaper(
+    mut child: tokio::process::Child,
+    process_group_id: Option<u32>,
+    physical_owner: Arc<AtomicUsize>,
+) {
     // Tokio documents orphan-queue cleanup as best-effort with no speed or frequency guarantee.
     // Retaining the owned child here gives cancellation a bounded `try_wait` loop; on Unix,
     // `try_wait` reaps an exited child. If thread creation fails, `kill_on_drop` still requests
@@ -240,8 +266,35 @@ fn spawn_recovery_child_reaper(mut child: tokio::process::Child) {
             let deadline = std::time::Instant::now()
                 + RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET.kill_and_final_reap;
             loop {
+                // Do not reap the leader before confirming its pinned group is
+                // quiescent. A failed census/identity or exhausted reaper retains
+                // fail-closed ownership independently of waiter/audit completion.
+                #[cfg(target_os = "linux")]
+                if let Some(group) = process_group_id {
+                    match observe_recovery_child_without_reaping(group) {
+                        "child_exited_unreaped_after_term" => match recovery_group_quiescent(group)
+                        {
+                            Ok(true) => {}
+                            Ok(false) if std::time::Instant::now() < deadline => {
+                                std::thread::sleep(Duration::from_millis(10));
+                                continue;
+                            }
+                            Ok(false) | Err(_) => return,
+                        },
+                        "child_still_running_after_term"
+                            if std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                            continue;
+                        }
+                        _ => return,
+                    }
+                }
                 match child.try_wait() {
-                    Ok(Some(_status)) => return,
+                    Ok(Some(_status)) => {
+                        physical_owner.fetch_sub(1, Ordering::AcqRel);
+                        return;
+                    }
                     Ok(None) if std::time::Instant::now() < deadline => {
                         std::thread::sleep(Duration::from_millis(10));
                     }

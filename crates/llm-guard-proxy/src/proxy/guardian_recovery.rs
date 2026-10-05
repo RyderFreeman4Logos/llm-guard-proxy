@@ -66,6 +66,7 @@ impl ProxyState {
         let Some(identity) = identity(request) else {
             return RecoveryOutcome::NotAdmitted;
         };
+        let physical_owner = Arc::clone(&state.physical_recovery_owners);
         state.running = true;
         state.active_guardian_recovery = true;
         state.recovery_started = Some(Instant::now());
@@ -79,6 +80,7 @@ impl ProxyState {
         )
         .episode(episode, LocalRecoveryCause::UpstreamStall, &policy)
         .guardian(identity)
+        .physical_owner(physical_owner)
         .deadline(request.authority.deadline.into())
         .shutdown(Arc::clone(&self.shutdown));
         let _tracked = receipt.track();
@@ -147,7 +149,9 @@ impl ProxyState {
         // Cancellation and the actual spawn are serialized by the owner fence.
         let child = request.authority.dispatch(|| command.spawn());
         let mut child = match child {
-            Some(Ok(child)) => RecoveryProcessGuard::new(child),
+            Some(Ok(child)) => {
+                RecoveryProcessGuard::new_owned(child, Arc::clone(&receipt.physical_owner))
+            }
             Some(Err(_)) => return RecoveryOutcome::Failed,
             None => return cancelled_outcome(request),
         };

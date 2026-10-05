@@ -1,6 +1,34 @@
 use super::*;
 
+#[cfg(feature = "upstream-hot-restart")]
+#[tokio::test]
+async fn hot_probe_rejects_unusable_choices_through_shared_decoder() {
+    assert!(
+        !probe_body_kind(Body::from(r#"{"choices":[null]}"#), true)
+            .await
+            .expect("JSON probe")
+    );
+}
+
+#[cfg(feature = "upstream-hot-restart")]
+#[tokio::test]
+async fn hot_probe_rejects_chunked_overflow_through_shared_bound() {
+    let chunks = vec![
+        Bytes::from_static(b"{\"choices\":[{\"message\":{\"content\":\"ready\"}}],\"padding\":\""),
+        Bytes::from(vec![b'x'; 64 * 1024]),
+        Bytes::from_static(b"\"}"),
+    ];
+    let body = Body::from_stream(stream::iter(
+        chunks.into_iter().map(Ok::<_, std::io::Error>),
+    ));
+    assert!(probe_body_kind(body, true).await.is_err());
+}
+
 async fn probe_body(body: Body) -> Result<bool, String> {
+    probe_body_kind(body, false).await
+}
+
+async fn probe_body_kind(body: Body, hot: bool) -> Result<bool, String> {
     let body = Arc::new(Mutex::new(Some(body)));
     let app = Router::new().fallback(move || {
         let body = Arc::clone(&body);
@@ -10,6 +38,25 @@ async fn probe_body(body: Body) -> Result<bool, String> {
     let address = listener.local_addr().expect("address");
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let policy = LocalRecoveryPolicy::from_config(&LocalRecoveryConfig::default());
+    #[cfg(feature = "upstream-hot-restart")]
+    let result = if hot {
+        send_hot_restart_probe(
+            &Client::new(),
+            &format!("http://{address}/v1"),
+            &HotRestartConfig::default(),
+        )
+        .await
+    } else {
+        send_local_recovery_readiness_probe(
+            &Client::new(),
+            &format!("http://{address}/v1"),
+            &policy,
+        )
+        .await
+    };
+    #[cfg(not(feature = "upstream-hot-restart"))]
+    assert!(!hot, "hot-restart probe requires its feature");
+    #[cfg(not(feature = "upstream-hot-restart"))]
     let result = send_local_recovery_readiness_probe(
         &Client::new(),
         &format!("http://{address}/v1"),
@@ -58,6 +105,7 @@ async fn readiness_rejects_unusable_choices_and_preserves_supported_variants() {
     for choice in [
         json!({"message":{"role":"assistant","content":"ready"},"vendor_extension":true}),
         json!({"text":"ready"}),
+        json!({"message":{"content":[{"type":"text","text":"ready","vendor":true}]}}),
         json!({"message":{"content":null,"tool_calls":[{"id":"call","type":"function","function":{"name":"ready","arguments":"{}"}}]}}),
         json!({"message":{"function_call":{"name":"ready","arguments":"{}"}}}),
     ] {

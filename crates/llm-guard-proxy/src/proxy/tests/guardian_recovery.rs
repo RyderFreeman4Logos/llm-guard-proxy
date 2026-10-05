@@ -483,6 +483,18 @@ async fn owned_child_pid(marker: &std::path::Path) -> Option<String> {
 
 async fn owned_cancellation_case(case: &str) {
     let (upstream, proxy, runtime, marker) = owned_process_fixture().await;
+    let receipt_events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&receipt_events);
+    let clock = std::time::Instant::now();
+    proxy
+        .state
+        .store
+        .set_recovery_receipt_test_hook(move |stage, _id| {
+            observed
+                .lock()
+                .expect("receipt events")
+                .push((stage, clock.elapsed()));
+        });
     let mut config = proxy.state.config.snapshot().expect("config");
     let timeout = if case == "deadline" {
         Duration::from_millis(500)
@@ -525,6 +537,10 @@ async fn owned_cancellation_case(case: &str) {
     authority.cancel();
     drop(sender);
     let proxy = settle_owned_fixture(proxy, upstream, worker).await;
+    eprintln!(
+        "owned {case} receipt boundary timings={:?}",
+        receipt_events.lock().expect("receipt events")
+    );
     assert!(stat.is_some(), "actual owned child instance started");
     assert_eq!(owner.expect("bounded cleanup").expect("ack"), expected);
     assert!(reaped_at_ack, "done means direct child already reaped");
