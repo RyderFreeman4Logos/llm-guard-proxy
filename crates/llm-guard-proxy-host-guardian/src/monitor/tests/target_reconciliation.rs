@@ -239,6 +239,10 @@ fn same_registration_recreation_reopens_and_rearms_new_cgroup_generation() {
     let cgroup = root.join(format!(
         "user.slice/user-{uid}.slice/user@{uid}.service/app.slice/docker-{id}.scope"
     ));
+    assert_eq!(
+        guardian.attempt_emergency(false),
+        GuardianIteration::Waiting
+    );
     fs::write(cgroup.join("cgroup.events"), b"populated 0\n").expect("mark original empty");
     assert_eq!(
         guardian.attempt_emergency(false),
@@ -300,6 +304,10 @@ fn same_cgroup_inode_repopulation_rearms_verified_controller() {
     let cgroup = root.join(format!(
         "user.slice/user-{uid}.slice/user@{uid}.service/app.slice/docker-{id}.scope"
     ));
+    assert_eq!(
+        guardian.attempt_emergency(false),
+        GuardianIteration::Waiting
+    );
     fs::write(cgroup.join("cgroup.events"), b"populated 0\n").expect("mark target empty");
     assert_eq!(
         guardian.attempt_emergency(false),

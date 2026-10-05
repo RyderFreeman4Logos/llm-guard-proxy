@@ -146,6 +146,10 @@ pub enum AttemptOutcome {
     Waiting,
     /// The target became empty after the direct write attempt.
     Verified,
+    /// The target was already empty before any successful write in this generation.
+    AlreadyEmpty,
+    /// The direct write failed; the numeric errno is retained without allocation.
+    WriteFailed(i32),
     /// The target is still populated or its state could not be observed.
     Retry,
 }
@@ -178,6 +182,9 @@ pub fn kill_direct(
         if written == 1 {
             return Ok(());
         }
+        if written == 0 {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(libc::EINTR) {
             return Err(error);
@@ -193,6 +200,7 @@ pub struct EmergencyController {
     retry_millis: u64,
     next_attempt_millis: u64,
     verified: bool,
+    last_write: Option<Result<(), i32>>,
 }
 
 impl EmergencyController {
@@ -204,6 +212,7 @@ impl EmergencyController {
             retry_millis,
             next_attempt_millis: 0,
             verified: false,
+            last_write: None,
         }
     }
 
@@ -229,6 +238,16 @@ impl EmergencyController {
     pub fn reset_for_target_generation(&mut self) {
         self.next_attempt_millis = 0;
         self.verified = false;
+        self.last_write = None;
+    }
+
+    /// Returns the latest direct-write result for the currently installed generation.
+    ///
+    /// `None` means no write was attempted. A later empty observation does not
+    /// erase a failed action; only a successful retry or generation reset does.
+    #[must_use]
+    pub const fn last_write_result(&self) -> Option<Result<(), i32>> {
+        self.last_write
     }
 
     pub(crate) const fn target_is_verified(&self) -> bool {
@@ -238,15 +257,36 @@ impl EmergencyController {
     /// Performs one error-tolerant retained-descriptor attempt.
     #[must_use]
     pub fn attempt(&mut self, now_millis: u64, target: &CgroupTarget) -> AttemptOutcome {
-        if self.verified || now_millis < self.next_attempt_millis {
+        if self.verified {
             return AttemptOutcome::Waiting;
         }
-        let _write_error = kill_direct(&mut self.reserve, target);
+        if matches!(target.is_empty(), Ok(true)) {
+            return match self.last_write {
+                Some(Ok(())) => {
+                    self.verified = true;
+                    AttemptOutcome::Verified
+                }
+                Some(Err(errno)) => AttemptOutcome::WriteFailed(errno),
+                None => {
+                    self.verified = true;
+                    AttemptOutcome::AlreadyEmpty
+                }
+            };
+        }
+        if now_millis < self.next_attempt_millis {
+            return AttemptOutcome::Waiting;
+        }
+        self.next_attempt_millis = now_millis.saturating_add(self.retry_millis);
+        if let Err(error) = kill_direct(&mut self.reserve, target) {
+            let errno = error.raw_os_error().unwrap_or(libc::EIO);
+            self.last_write = Some(Err(errno));
+            return AttemptOutcome::WriteFailed(errno);
+        }
+        self.last_write = Some(Ok(()));
         if matches!(target.is_empty(), Ok(true)) {
             self.verified = true;
             return AttemptOutcome::Verified;
         }
-        self.next_attempt_millis = now_millis.saturating_add(self.retry_millis);
         AttemptOutcome::Retry
     }
 }
