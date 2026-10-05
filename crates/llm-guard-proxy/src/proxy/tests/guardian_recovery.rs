@@ -1,3 +1,6 @@
+#[path = "guardian_stage_deadlines.rs"]
+mod stage_deadlines;
+
 use super::{Arc, ConfigHandle, Duration, FakeUpstream, ProxyFixture, fs};
 use llm_guard_proxy_host_guardian::{
     CgroupTarget,

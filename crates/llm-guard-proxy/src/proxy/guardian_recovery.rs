@@ -128,7 +128,7 @@ impl ProxyState {
         effective_outcome
     }
 
-    async fn guardian_owned_action(
+    pub(super) async fn guardian_owned_action(
         &self,
         request: &RecoveryRequest,
         profile: &UpstreamProfileConfig,
@@ -160,6 +160,11 @@ impl ProxyState {
             result = tokio::time::timeout_at(action_deadline, child.wait()) => Some(result),
         };
         match status {
+            // Tokio polls a ready inner result before its timer. A reaped child
+            // is settled, but late observation cannot satisfy the action budget.
+            Some(Ok(Ok(_))) if Instant::now() >= action_deadline => {
+                return RecoveryOutcome::TimedOut;
+            }
             Some(Ok(Ok(status))) if status.success() => {}
             Some(Ok(Ok(_))) => return RecoveryOutcome::Failed,
             _ => {
@@ -194,6 +199,9 @@ impl ProxyState {
             };
             if request.authority.dispatch(|| ()).is_none() {
                 return cancelled_outcome(request);
+            }
+            if Instant::now() >= deadline {
+                return RecoveryOutcome::TimedOut;
             }
             if matches!(ready, Ok(Ok(true))) {
                 return RecoveryOutcome::Succeeded;
