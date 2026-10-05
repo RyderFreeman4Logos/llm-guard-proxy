@@ -244,6 +244,53 @@ async fn local_recovery_receipt_child_cancellation_keeps_durable_attribution() {
 }
 
 #[tokio::test]
+async fn local_recovery_receipt_late_acknowledgment_never_spawns() {
+    let (store, path, profile, tasks) = fixture();
+    let marker = path.with_extension("late-spawn-forbidden");
+    let policy = policy(vec![
+        String::from("/usr/bin/touch"),
+        marker.display().to_string(),
+    ]);
+    let context = recovery_receipt::Context::new(store, &profile, Arc::clone(&tasks)).episode(
+        1,
+        LocalRecoveryCause::TransientTransport,
+        &policy,
+    );
+    let ran = AtomicBool::new(false);
+    let lock = Connection::open(&path).expect("late-ack fixture lock");
+    lock.execute_batch("BEGIN EXCLUSIVE")
+        .expect("hold first poll");
+    let mut restart = Box::pin(run_local_recovery_restart_command(
+        &policy, &ran, &context, None,
+    ));
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(restart.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    lock.execute_batch("ROLLBACK")
+        .expect("release first-poll lock");
+    // Deliberately stop this current-thread executor from receiving the acknowledgment.
+    // The tracked blocking writer completes independently, making its result ready first.
+    let worker_deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while tasks.in_flight.load(Ordering::SeqCst) != 0 {
+        assert!(
+            std::time::Instant::now() < worker_deadline,
+            "bounded synthetic writer"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(receipt_row(&path, context.id()).1.is_none());
+    std::thread::sleep(Duration::from_millis(300));
+    let result = restart.await;
+    assert_eq!(result["local_recovery_restart_status"], "receipt_failed");
+    assert_eq!(result["local_recovery_receipt_error"], "write_timeout");
+    assert_eq!(context.acknowledged_id(), None);
+    assert!(!ran.load(Ordering::Relaxed));
+    assert!(!marker.exists());
+}
+
+#[tokio::test]
 async fn local_recovery_receipt_terminalizer_joins_command_and_readiness() {
     let (store, path, profile, tasks) = fixture();
     let fake = FakeUpstream::spawn().await;

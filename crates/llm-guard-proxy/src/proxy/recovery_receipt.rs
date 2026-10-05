@@ -152,10 +152,15 @@ impl Context {
             let _guard = guard;
             work(deadline)
         });
-        tokio::time::timeout(WRITE_BUDGET, writer)
+        let result = tokio::time::timeout(WRITE_BUDGET, writer)
             .await
             .map_err(|_| "write_timeout")?
-            .map_err(|_| "writer_failed")?
+            .map_err(|_| "writer_failed")?;
+        // Timeout polls a ready writer first; late acknowledgment cannot grant spawn authority.
+        if std::time::Instant::now() >= deadline {
+            return Err("write_timeout");
+        }
+        result
     }
 
     pub(super) async fn persist(&self) -> Result<(), &'static str> {
