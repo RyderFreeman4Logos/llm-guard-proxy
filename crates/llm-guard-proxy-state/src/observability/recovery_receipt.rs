@@ -72,7 +72,21 @@ impl ObservabilityStore {
             let synchronous: u32 = connection
                 .query_row("PRAGMA synchronous", [], |row| row.get(0))
                 .map_err(|_| "write_failed")?;
-            if synchronous < 2 {
+            // Inspect the opened database: :memory: reports synchronous=FULL too.
+            let database_file: String = connection
+                .query_row(
+                    "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "write_failed")?;
+            let journal_mode: String = connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .map_err(|_| "write_failed")?;
+            if synchronous < 2
+                || database_file.is_empty()
+                || matches!(journal_mode.as_str(), "memory" | "off")
+            {
                 return Err("durability_disabled");
             }
             let transaction = connection.transaction().map_err(|_| "write_failed")?;

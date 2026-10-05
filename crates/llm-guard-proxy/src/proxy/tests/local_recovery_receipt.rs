@@ -113,6 +113,37 @@ async fn local_recovery_receipt_precedes_child_and_keeps_causes_private() {
 }
 
 #[tokio::test]
+async fn local_recovery_receipt_volatile_store_never_spawns() {
+    let (_, path, profile, tasks) = fixture();
+    let marker = path.with_extension("volatile-spawn-forbidden");
+    let mut config = AppConfig::default();
+    config.observability.enabled = false;
+    config.observability.sqlite_path = PathBuf::from(":memory:");
+    let store = ObservabilityStore::open(ConfigHandle::new(config)).expect("memory store");
+    let policy = policy(vec![
+        String::from("/usr/bin/touch"),
+        marker.display().to_string(),
+    ]);
+    let context = recovery_receipt::Context::new(store, &profile, Arc::clone(&tasks)).episode(
+        1,
+        LocalRecoveryCause::TransientTransport,
+        &policy,
+    );
+    let ran = AtomicBool::new(false);
+    let result = run_local_recovery_restart_command(&policy, &ran, &context, None).await;
+    assert_eq!(result["local_recovery_restart_status"], "receipt_failed");
+    assert_eq!(
+        result["local_recovery_receipt_error"],
+        "durability_disabled"
+    );
+    assert_eq!(context.acknowledged_id(), None);
+    assert!(!ran.load(Ordering::Relaxed));
+    assert!(!marker.exists());
+    tasks.flush(Duration::from_secs(1)).await;
+    assert_eq!(tasks.in_flight.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn local_recovery_receipt_write_failure_and_cancel_never_spawn() {
     let (store, path, profile, tasks) = fixture();
     let marker = path.with_extension("forbidden");
