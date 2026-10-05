@@ -7,8 +7,15 @@ use std::{os::unix::fs::PermissionsExt, path::PathBuf};
 use tokio::sync::oneshot;
 
 async fn fixture(command: Vec<String>) -> (FakeUpstream, ProxyFixture, PathBuf) {
+    fixture_with_base(command, None).await
+}
+
+async fn fixture_with_base(
+    command: Vec<String>,
+    base_url: Option<&str>,
+) -> (FakeUpstream, ProxyFixture, PathBuf) {
     let upstream = FakeUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn(&upstream.base_url, false).await;
+    let proxy = ProxyFixture::spawn(base_url.unwrap_or(&upstream.base_url), false).await;
     let mut config = proxy.state.config.snapshot().expect("config");
     config.guardian.enabled = true;
     config.guardian.target_label = String::from("test");
@@ -170,6 +177,232 @@ async fn tier2_owned_success_has_durable_native_receipt_and_boot_claim() {
         })
         .expect("no second preaction");
     assert_eq!(receipts, 0);
+}
+
+struct ReadinessBarrier {
+    entered: tokio::sync::watch::Receiver<bool>,
+    release: tokio::sync::watch::Sender<bool>,
+    wire: Arc<super::AtomicU64>,
+    server: tokio::task::JoinHandle<std::io::Result<()>>,
+}
+
+async fn terminal_failure_fixture() -> (FakeUpstream, ProxyFixture, PathBuf, ReadinessBarrier) {
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+    let generation_wire = Arc::new(super::AtomicU64::new(0));
+    let observed_wire = Arc::clone(&generation_wire);
+    let app = super::Router::new().fallback(move |request: super::Request<super::Body>| {
+        let ready_tx = ready_tx.clone();
+        let mut release = release_rx.clone();
+        let wire = Arc::clone(&observed_wire);
+        async move {
+            if request.uri().query() == Some("test=r1-ready") {
+                ready_tx.send_replace(true);
+                let _ = release.wait_for(|value| *value).await;
+            } else {
+                wire.fetch_add(1, super::Ordering::SeqCst);
+            }
+            axum::Json(super::json!({"choices":[{"message":{"role":"assistant","content":"ready"},"finish_reason":"stop"}]}))
+        }
+    });
+    let listener = super::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("readiness bind");
+    let addr = listener.local_addr().expect("readiness address");
+    let readiness_server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let (upstream, proxy, runtime) = fixture_with_base(
+        vec![String::from("/usr/bin/true")],
+        Some(&format!("http://{addr}/v1")),
+    )
+    .await;
+    let mut config = proxy.state.config.snapshot().expect("config");
+    config.upstream.local_recovery.readiness_endpoint =
+        String::from("/v1/chat/completions?test=r1-ready");
+    config.upstream.local_recovery.readiness_request_timeout_ms = 3000;
+    config.upstream.local_recovery.readiness_deadline_ms = 3000;
+    config.upstream.restart_queue.enabled = true;
+    config.upstream.restart_queue.queue_deadline_secs = 5;
+    config.upstream.restart_queue.restart_timeout_secs = 5;
+    config.validate().expect("valid public queue policy");
+    proxy
+        .state
+        .config
+        .apply_reloadable(&config)
+        .expect("queue policy");
+    (
+        upstream,
+        proxy,
+        runtime,
+        ReadinessBarrier {
+            entered: ready_rx,
+            release: release_tx,
+            wire: generation_wire,
+            server: readiness_server,
+        },
+    )
+}
+
+fn install_terminal_failure(database: &rusqlite::Connection) -> (String, Option<String>, u32) {
+    let (id, preaction): (String, Option<String>) = database
+        .query_row(
+            "SELECT receipt_id, outcome FROM local_recovery_receipts",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("real pre-action receipt committed before readiness");
+    let claims: u32 = database
+        .query_row("SELECT count(*) FROM guardian_boot_claim", [], |row| {
+            row.get(0)
+        })
+        .expect("real boot claim");
+    database.execute_batch(&format!(
+        "CREATE TRIGGER r1_terminal_failure BEFORE UPDATE ON local_recovery_receipts WHEN OLD.receipt_id = '{}' BEGIN SELECT RAISE(FAIL, 'r1 terminal failure'); END;",
+        id.replace('\'', "''")
+    )).expect("scoped terminal failure trigger");
+    (id, preaction, claims)
+}
+
+fn assert_failed_public_completion(
+    completed: &super::BTreeMap<String, String>,
+    response: &(super::StatusCode, String),
+    wire: u64,
+) {
+    assert_ne!(
+        completed["local_recovery_status"], "succeeded",
+        "failed terminal acknowledgment must not publish success"
+    );
+    assert_eq!(completed["local_recovery_status"], "receipt_failed");
+    assert_eq!(completed["local_recovery_receipt_error"], "write_failed");
+    assert!(!super::local_recovery_permits_retry(completed));
+    assert_eq!(
+        response.0,
+        super::StatusCode::SERVICE_UNAVAILABLE,
+        "public waiter must not release as success: {}",
+        response.1
+    );
+    assert_eq!(
+        wire, 0,
+        "failed recovery must send no generation wire request"
+    );
+}
+
+fn capture_pending_receipt(database: &rusqlite::Connection, id: &str) -> Option<String> {
+    let pending = database
+        .query_row(
+            "SELECT outcome FROM local_recovery_receipts WHERE receipt_id = ?1",
+            [id],
+            |row| row.get(0),
+        )
+        .expect("captured failed terminal state");
+    database
+        .execute_batch("DROP TRIGGER r1_terminal_failure")
+        .expect("remove trigger only after capture");
+    pending
+}
+
+#[tokio::test]
+async fn tier2_terminal_receipt_failure_denies_public_restart_queue() {
+    let (upstream, mut proxy, runtime, mut barrier) = terminal_failure_fixture().await;
+    let (request, receiver) =
+        make_request(proxy.state.config.clone(), &runtime, Duration::from_secs(5));
+    let coordinator = proxy.state.local_recovery.coordinator_for(&request.profile);
+    let (sender, worker) = proxy.state.spawn_guardian_recovery();
+    sender.send(request).await.expect("handoff");
+    let readiness_seen = tokio::time::timeout(
+        Duration::from_secs(2),
+        barrier.entered.wait_for(|value| *value),
+    )
+    .await
+    .is_ok();
+    let database = rusqlite::Connection::open(&proxy.sqlite_path).expect("database");
+    let (id, preaction, claims) = install_terminal_failure(&database);
+    let episode = coordinator
+        .state
+        .lock()
+        .await
+        .active_recovery_episode_id
+        .expect("owned episode");
+    let client = proxy.client.clone();
+    let url = format!("{}/v1/chat/completions", proxy.base_url);
+    let mut public = tokio::spawn(async move {
+        let response = client
+            .post(url)
+            .json(&super::json!({"model":"test-chat","messages":[]}))
+            .send()
+            .await?;
+        let status = response.status();
+        let body = response.text().await?;
+        Ok::<_, reqwest::Error>((status, body))
+    });
+    let queued = tokio::time::timeout(Duration::from_secs(2), async {
+        while coordinator
+            .restart_queue_depth
+            .load(super::Ordering::Acquire)
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await;
+    // Explicitly release and join every actor before asserting the captured failure, including RED.
+    barrier.release.send_replace(true);
+    let owner = tokio::time::timeout(Duration::from_secs(4), receiver).await;
+    drop(sender);
+    let worker_join = tokio::time::timeout(Duration::from_secs(2), worker).await;
+    let response = tokio::time::timeout(Duration::from_secs(3), &mut public).await;
+    if response.is_err() {
+        public.abort();
+        let _ = public.await;
+    }
+    let drained =
+        tokio::time::timeout(Duration::from_secs(2), proxy.state.flush_persistence()).await;
+    let state = coordinator.state.lock().await;
+    let running = state.running;
+    let completed = state.completed_recovery_result(episode).cloned();
+    drop(state);
+    let pending = capture_pending_receipt(&database, &id);
+    proxy.server.task.abort();
+    let _ = (&mut proxy.server.task).await;
+    let FakeUpstream {
+        _server: mut fake_server,
+        ..
+    } = upstream;
+    fake_server.task.abort();
+    let _ = (&mut fake_server.task).await;
+    barrier.server.abort();
+    let _ = barrier.server.await;
+    let wire = barrier.wire.load(super::Ordering::SeqCst);
+
+    assert!(readiness_seen, "real readiness barrier reached");
+    assert!(
+        queued.is_ok(),
+        "real public request acquired the episode queue permit"
+    );
+    assert!(
+        worker_join.is_ok_and(|result| result.is_ok()),
+        "worker cleanup joined"
+    );
+    assert!(drained.is_ok(), "tracked persistence drained");
+    assert_eq!(
+        owner.expect("bounded owner").expect("owner ACK"),
+        RecoveryOutcome::Unconfirmed
+    );
+    assert_eq!(preaction, None, "pending receipts have NULL outcome");
+    assert_eq!(claims, 1);
+    assert_eq!(
+        pending, None,
+        "failed terminal write leaves the receipt pending"
+    );
+    assert!(
+        !running,
+        "settled child with audit failure must not stay running"
+    );
+    let completed = completed.expect("terminal shared result");
+    let response = response
+        .expect("bounded public request")
+        .expect("joined public request")
+        .expect("HTTP response");
+    assert_failed_public_completion(&completed, &response, wire);
 }
 
 #[tokio::test]

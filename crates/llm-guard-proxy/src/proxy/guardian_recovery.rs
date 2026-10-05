@@ -106,16 +106,26 @@ impl ProxyState {
         let terminal = receipt.finish(&metadata).await;
         #[cfg(test)]
         eprintln!("guardian terminal outcome={outcome:?} durability={terminal:?}");
-        let durable = terminal.is_ok();
-        // Failed cleanup retains the coordinator fence. Do not release admission to another actor.
+        let effective_outcome = match terminal {
+            Ok(()) => outcome,
+            Err(category) => {
+                metadata.insert(
+                    String::from("local_recovery_status"),
+                    String::from("receipt_failed"),
+                );
+                metadata.insert(
+                    String::from("local_recovery_receipt_error"),
+                    category.to_owned(),
+                );
+                RecoveryOutcome::Unconfirmed
+            }
+        };
+        // Only physically unconfirmed cleanup retains the admission fence; a settled
+        // child with failed terminal durability publishes failure and wakes waiters.
         if outcome != RecoveryOutcome::Unconfirmed {
             finish_local_recovery_episode(&coordinator, episode, metadata).await;
         }
-        if durable {
-            outcome
-        } else {
-            RecoveryOutcome::Unconfirmed
-        }
+        effective_outcome
     }
 
     async fn guardian_owned_action(
