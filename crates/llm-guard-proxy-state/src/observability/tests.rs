@@ -29,7 +29,7 @@ fn creates_sqlite_schema_in_test_temp_directory() {
     let fixture = StoreFixture::new("schema");
     let store = fixture.open_store(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
 
-    assert_eq!(store.schema_version().expect("schema version"), 4);
+    assert_eq!(store.schema_version().expect("schema version"), 5);
     assert!(fixture.sqlite_path.exists());
 
     let connection = store.lock_connection().expect("connection lock");
@@ -142,7 +142,7 @@ PRAGMA user_version = 2;
 
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
     let store = ObservabilityStore::open(manager).expect("legacy schema should migrate");
-    assert_eq!(store.schema_version().expect("schema version"), 4);
+    assert_eq!(store.schema_version().expect("schema version"), 5);
 
     let connection = store.lock_connection().expect("connection lock");
     let migrated_usage: (Option<i64>, Option<i64>, Option<i64>, Option<i64>) = connection
@@ -160,7 +160,7 @@ fn reopens_interrupted_v4_schema_when_user_version_still_3() {
     let fixture = StoreFixture::new("schema-v4-interrupted");
     let manager = fixture.manager(true, false, TEST_MAX_BYTES, TEST_PRUNE_TO_BYTES);
     let store = ObservabilityStore::open(manager.clone()).expect("initial store should open");
-    assert_eq!(store.schema_version().expect("schema version"), 4);
+    assert_eq!(store.schema_version().expect("schema version"), 5);
     drop(store);
 
     let connection = rusqlite::Connection::open(&fixture.sqlite_path)
@@ -176,7 +176,7 @@ fn reopens_interrupted_v4_schema_when_user_version_still_3() {
 
     let store = ObservabilityStore::open(manager)
         .expect("interrupted v4 schema should reopen without duplicate-column failure");
-    assert_eq!(store.schema_version().expect("schema version"), 4);
+    assert_eq!(store.schema_version().expect("schema version"), 5);
 }
 
 #[cfg(unix)]

@@ -2246,13 +2246,14 @@ mod tests {
 
         // First reasoning window: establishes history (no match possible yet).
         let stanza = "brave ravens approach carefully drafting each frozen stanza verbatim lines\n";
-        assert!(
+        assert_eq!(
             detector
                 .observe(LoopDetectorInput::fragment(
                     StreamChannel::Reasoning,
                     stanza,
                 ))
-                .is_empty()
+                .len(),
+            0
         );
 
         // Second near-identical structural stanza: this is legitimate
@@ -2355,13 +2356,14 @@ mod tests {
         let repeated =
             "brave ravens approach carefully drafting each frozen stanza verbatim lines\n";
 
-        assert!(
+        assert_eq!(
             detector
                 .observe(LoopDetectorInput::fragment(
                     StreamChannel::Reasoning,
                     repeated,
                 ))
-                .is_empty()
+                .len(),
+            0
         );
         let signals = detector.observe(LoopDetectorInput::fragment(
             StreamChannel::Reasoning,
@@ -2609,23 +2611,25 @@ mod tests {
             .sum::<usize>();
 
         for fragment in pre_loop {
-            assert!(
+            assert_eq!(
                 detector
                     .observe(LoopDetectorInput::fragment(
                         StreamChannel::Reasoning,
                         fragment
                     ))
-                    .is_empty()
+                    .len(),
+                0
             );
         }
         for _ in 0..7 {
-            assert!(
+            assert_eq!(
                 detector
                     .observe(LoopDetectorInput::fragment(
                         StreamChannel::Reasoning,
                         repeated_tail,
                     ))
-                    .is_empty()
+                    .len(),
+                0
             );
         }
         let signals = detector.observe(LoopDetectorInput::fragment(
@@ -2651,8 +2655,8 @@ mod tests {
         let s2 = detector.observe_fingerprint(fp.clone());
         let s3 = detector.observe_fingerprint(fp.clone());
 
-        assert!(s1.is_empty());
-        assert!(s2.is_empty());
+        assert_eq!(s1.len(), 0);
+        assert_eq!(s2.len(), 0);
         assert_eq!(s3.len(), 1);
         assert_eq!(s3[0].reason_code, LoopReasonCode::ToolFingerprintRepeat);
         assert_eq!(s3[0].fingerprint_hash, 100);
@@ -2724,7 +2728,7 @@ mod tests {
         let first = detector.observe_tool_output(output_hash);
         let second = detector.observe_tool_output(output_hash);
 
-        assert!(first.is_empty());
+        assert_eq!(first.len(), 0);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].reason_code, LoopReasonCode::ToolOutputBlockedEcho);
         assert_eq!(second[0].repeat_count, 2);

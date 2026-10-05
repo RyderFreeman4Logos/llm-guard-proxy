@@ -1583,7 +1583,7 @@ repetition_penalty = 1.0
     fs::rename(&replacement, &path).expect("renamed generation should be published");
     let outcome = manager.reload().expect("alias rename should reload");
     assert!(outcome.applied);
-    assert!(outcome.restart_required_changes.is_empty());
+    assert_eq!(outcome.restart_required_changes.len(), 0);
 
     let live = manager
         .handle()

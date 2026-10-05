@@ -1855,6 +1855,7 @@ async fn watchdog_recovery_preclosed_shutdown_does_not_spawn_restart_command() {
             Some(Duration::from_secs(1)),
             Arc::clone(&coordinator),
             LocalRecoveryEndpoint {
+                receipt: test_recovery_receipt_context(),
                 client: client.clone(),
                 base_url: fake.base_url.clone(),
             },

@@ -87,6 +87,7 @@ mod post_await_self_test;
 mod precommit_recovery;
 mod prose_constraints;
 mod recovery;
+mod recovery_receipt;
 mod reranker_protocol;
 mod retry_after;
 mod score_adapter;
@@ -8686,6 +8687,7 @@ struct WatchdogRecoveryTask {
 }
 
 struct LocalRecoveryEndpoint {
+    receipt: recovery_receipt::Context,
     client: Client,
     base_url: String,
 }
@@ -8738,6 +8740,7 @@ impl WatchdogSchedule {
 
 async fn run_stuck_engine_watchdog(
     config: ConfigHandle,
+    store: ObservabilityStore,
     client: Client,
     local_recovery: Arc<LocalRecoveryCoordinatorSet>,
     tokens: Arc<StuckWatchdogTokenTracker>,
@@ -8794,16 +8797,8 @@ async fn run_stuck_engine_watchdog(
             if shutdown.is_shutting_down() {
                 break;
             }
-            eprintln!(
-                "llm_guard_proxy_stuck_watchdog profile={} event=detected detection_window_secs={} min_output_progress_units={}",
-                profile.name,
-                watchdog.detection_window_secs,
-                watchdog.min_output_progress_units_in_window,
-            );
             let coordinator = local_recovery.coordinator_for(&profile.name);
-            coordinator
-                .watchdog_detections
-                .fetch_add(1, Ordering::Relaxed);
+            record_watchdog_detection(&coordinator, &profile);
             let profile_name = profile.name.clone();
             recovering_profiles.insert(profile_name.clone());
             let episode_timeout = profile
@@ -8817,6 +8812,10 @@ async fn run_stuck_engine_watchdog(
                 episode_timeout,
                 coordinator,
                 LocalRecoveryEndpoint {
+                    receipt: recovery_receipt::Context::new(store.clone(), &profile).stall(
+                        snapshot.upstream_stall.first_chunk_timeout_ms,
+                        snapshot.upstream_stall.idle_timeout_ms,
+                    ),
                     client: client.clone(),
                     base_url: profile.primary_base_url().to_owned(),
                 },
@@ -8844,6 +8843,21 @@ async fn run_stuck_engine_watchdog(
         &local_recovery,
     )
     .await;
+}
+
+fn record_watchdog_detection(
+    coordinator: &UpstreamStallRecoveryCoordinator,
+    profile: &UpstreamProfileConfig,
+) {
+    eprintln!(
+        "llm_guard_proxy_stuck_watchdog profile={} event=detected detection_window_secs={} min_output_progress_units={}",
+        profile.name,
+        profile.stuck_watchdog.detection_window_secs,
+        profile.stuck_watchdog.min_output_progress_units_in_window,
+    );
+    coordinator
+        .watchdog_detections
+        .fetch_add(1, Ordering::Relaxed);
 }
 
 async fn wait_for_watchdog_interval(shutdown: &ShutdownGate, interval: Duration) -> bool {
@@ -9011,6 +9025,7 @@ async fn run_watchdog_recovery(
             endpoint.base_url,
             watchdog_recovery_cause(),
             LocalRecoveryRunOptions {
+                receipt: endpoint.receipt,
                 episode_timeout,
                 caller_timeout: None,
                 recovery_episode_observer: Some(&recovery_episode_observer),
@@ -9148,6 +9163,7 @@ fn record_watchdog_recovery_result(
 pub(crate) fn spawn_stuck_engine_watchdog(state: &ProxyState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(run_stuck_engine_watchdog(
         state.config.clone(),
+        state.store.clone(),
         state.client.clone(),
         Arc::clone(&state.local_recovery),
         Arc::clone(&state.stuck_watchdog_tokens),
@@ -11207,8 +11223,13 @@ async fn shielded_retryable_status_step(
     let (failure, can_retry) = {
         let mut failure = failure;
         let mut can_retry = can_retry;
-        let local_recovery_gate =
-            local_recovery_gate_for_status(runtime, can_retry, info.upstream_status).await;
+        let local_recovery_gate = local_recovery_gate_for_status(
+            runtime,
+            can_retry,
+            info.upstream_status,
+            &info.attempt_id,
+        )
+        .await;
         if local_recovery_gate.applied {
             if local_recovery_gate.permits_replay {
                 runtime.claim_recovery_replay(info.attempt_number);
@@ -12355,7 +12376,7 @@ async fn local_recovery_gate_for_attempt_failure(
     } else {
         local_recovery_transport_cause(failure)
     };
-    local_recovery_gate(runtime, can_retry, cause).await
+    local_recovery_gate(runtime, can_retry, cause, Some(&failure.attempt_id)).await
 }
 
 fn local_recovery_transport_cause(failure: &ShieldedAttemptFailure) -> Option<LocalRecoveryCause> {
@@ -12382,32 +12403,50 @@ async fn local_recovery_gate_for_status(
     runtime: &ShieldedRetryRuntime,
     can_retry: bool,
     status: reqwest::StatusCode,
+    attempt_id: &AttemptId,
 ) -> LocalRecoveryGate {
     let cause = if matches!(status.as_u16(), 502..=504) {
         Some(LocalRecoveryCause::TransientStatus)
     } else {
         None
     };
-    local_recovery_gate(runtime, can_retry, cause).await
+    local_recovery_gate(runtime, can_retry, cause, Some(attempt_id)).await
 }
 
 async fn local_recovery_gate_for_upstream_stall(
     runtime: &ShieldedRetryRuntime,
     can_retry: bool,
 ) -> LocalRecoveryGate {
-    local_recovery_gate(runtime, can_retry, Some(LocalRecoveryCause::UpstreamStall)).await
+    local_recovery_gate(
+        runtime,
+        can_retry,
+        Some(LocalRecoveryCause::UpstreamStall),
+        None,
+    )
+    .await
 }
 
 async fn local_recovery_gate(
     runtime: &ShieldedRetryRuntime,
     can_retry: bool,
     cause: Option<LocalRecoveryCause>,
+    attempt_id: Option<&AttemptId>,
 ) -> LocalRecoveryGate {
     let Some(cause) = cause else {
         return unapplied_local_recovery_gate();
     };
     precommit_recovery::gate(
         precommit_recovery::Context {
+            receipt: recovery_receipt::Context::new(
+                runtime.store.clone(),
+                &runtime.upstream_profile,
+            )
+            .stall(
+                duration_millis_u64(runtime.upstream_stall_policy.first_chunk_timeout),
+                duration_millis_u64(runtime.upstream_stall_policy.idle_timeout),
+            )
+            .request(&runtime.request_id, runtime.request_deadline.max_duration)
+            .attempt(attempt_id),
             policy: &runtime.local_recovery_policy,
             coordinator: &runtime.local_recovery,
             client: runtime.client.clone(),
@@ -12528,6 +12567,7 @@ fn local_recovery_completed_ready(metadata: &BTreeMap<String, String>) -> bool {
 }
 
 struct LocalRecoveryRunOptions<'a> {
+    receipt: recovery_receipt::Context,
     episode_timeout: Option<Duration>,
     caller_timeout: Option<Duration>,
     recovery_episode_observer: Option<&'a AtomicU64>,
@@ -12551,6 +12591,7 @@ async fn run_local_recovery_for_profile(
         base_url,
         cause,
         LocalRecoveryRunOptions {
+            receipt: tests::test_recovery_receipt_context(),
             episode_timeout,
             caller_timeout: None,
             recovery_episode_observer: None,
@@ -12618,6 +12659,11 @@ async fn run_local_recovery_for_profile_observing(
     let recovery_policy = policy.clone();
     let recovery_commit_signal = options.downstream_commit_signal.clone();
     let recovery_self_test = options.post_await_self_test.clone();
+    let receipt = options
+        .receipt
+        .clone()
+        .episode(recovery_episode_id, cause, policy);
+    let task_receipt = receipt.clone();
     let recovery_task = tokio::spawn(async move {
         run_local_recovery_task(
             recovery_policy,
@@ -12625,8 +12671,11 @@ async fn run_local_recovery_for_profile_observing(
             base_url,
             cause,
             task_timeout,
-            recovery_commit_signal,
-            recovery_self_test,
+            LocalRecoveryTaskContext {
+                downstream_commit_signal: recovery_commit_signal,
+                post_await_self_test: recovery_self_test,
+                receipt: task_receipt,
+            },
         )
         .await
     });
@@ -12637,7 +12686,7 @@ async fn run_local_recovery_for_profile_observing(
     drop(state);
 
     let terminalizer =
-        spawn_local_recovery_terminalizer(coordinator, recovery_episode_id, recovery_task);
+        spawn_local_recovery_terminalizer(coordinator, recovery_episode_id, recovery_task, receipt);
     if let Some(self_test) = options.post_await_self_test.as_ref() {
         self_test.register_owned_producer(terminalizer);
     } else {
@@ -12741,10 +12790,11 @@ fn spawn_local_recovery_terminalizer(
     coordinator: &Arc<UpstreamStallRecoveryCoordinator>,
     recovery_episode_id: u64,
     recovery_task: tokio::task::JoinHandle<BTreeMap<String, String>>,
+    receipt: recovery_receipt::Context,
 ) -> tokio::task::JoinHandle<()> {
     let coordinator = Arc::clone(coordinator);
     tokio::spawn(async move {
-        let metadata = match recovery_task.await {
+        let mut metadata = match recovery_task.await {
             Ok(metadata) => metadata,
             Err(error) => BTreeMap::from([(
                 String::from("local_recovery_status"),
@@ -12755,6 +12805,17 @@ fn spawn_local_recovery_terminalizer(
                 },
             )]),
         };
+        if let Err(category) = receipt.finish(&metadata).await {
+            metadata.insert(
+                String::from("local_recovery_receipt_finish_error"),
+                category.to_owned(),
+            );
+        } else {
+            metadata.insert(
+                String::from("local_recovery_receipt_id"),
+                receipt.id().to_owned(),
+            );
+        }
         let _published =
             finish_local_recovery_episode(&coordinator, recovery_episode_id, metadata).await;
     })
@@ -12796,15 +12857,25 @@ pub(crate) async fn post_await_no_replay_self_test_report() -> Result<serde_json
     post_await_self_test::run().await
 }
 
+struct LocalRecoveryTaskContext {
+    downstream_commit_signal: Option<DownstreamCommitSignal>,
+    post_await_self_test: Option<post_await_self_test::Context>,
+    receipt: recovery_receipt::Context,
+}
+
 async fn run_local_recovery_task(
     policy: LocalRecoveryPolicy,
     client: Client,
     base_url: String,
     cause: LocalRecoveryCause,
     episode_timeout: Option<Duration>,
-    downstream_commit_signal: Option<DownstreamCommitSignal>,
-    post_await_self_test: Option<post_await_self_test::Context>,
+    context: LocalRecoveryTaskContext,
 ) -> BTreeMap<String, String> {
+    let LocalRecoveryTaskContext {
+        downstream_commit_signal,
+        post_await_self_test,
+        receipt,
+    } = context;
     let trigger_cause = cause.as_str().to_owned();
     let recovery_trigger_cause = trigger_cause.clone();
     let restart_ran = Arc::new(AtomicBool::new(false));
@@ -12823,8 +12894,15 @@ async fn run_local_recovery_task(
         if let Some(self_test) = &post_await_self_test {
             metadata.extend(self_test.restart_metadata().await);
         } else {
-            metadata
-                .extend(run_local_recovery_restart_command(&policy, &recovery_restart_ran).await);
+            metadata.extend(
+                run_local_recovery_restart_command(
+                    &policy,
+                    &recovery_restart_ran,
+                    &receipt,
+                    downstream_commit_signal.as_ref(),
+                )
+                .await,
+            );
         }
         finish_local_recovery_after_restart(
             client,
@@ -12976,6 +13054,9 @@ fn completed_local_recovery_metadata(
         String::from("local_recovery_status"),
         String::from("joined_inflight"),
     )]);
+    if let Some(id) = result.get("local_recovery_receipt_id") {
+        joined.insert(String::from("local_recovery_receipt_id"), id.clone());
+    }
     if let Some(status) = result.get("local_recovery_status") {
         joined.insert(String::from("local_recovery_joined_status"), status.clone());
     }
@@ -12985,11 +13066,17 @@ fn completed_local_recovery_metadata(
 async fn run_local_recovery_restart_command(
     policy: &LocalRecoveryPolicy,
     restart_ran: &AtomicBool,
+    receipt: &recovery_receipt::Context,
+    downstream_commit_signal: Option<&DownstreamCommitSignal>,
 ) -> BTreeMap<String, String> {
-    let mut metadata = BTreeMap::new();
+    let mut metadata = match receipt.pre_spawn(downstream_commit_signal).await {
+        Ok(metadata) => metadata,
+        Err(metadata) => return metadata,
+    };
     let program = &policy.restart_command[0];
     let args = &policy.restart_command[1..];
     let mut command = Command::new(program);
+    command.env("LLM_GUARD_RECOVERY_RECEIPT_ID", receipt.id());
     command
         .args(args)
         .kill_on_drop(true)

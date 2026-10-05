@@ -150,6 +150,20 @@ The shielded chat core is enabled by default for non-streaming chat completions:
 - Downstream `stream=true` chat requests currently stay on the generic streaming path to preserve first-chunk timing and backpressure behavior while later issues add release-after-inspection streaming.
 - Set `[shielding] enabled = false` and hot reload the config to fall back to generic forwarding for rollback or compatibility testing.
 
+## Local recovery attribution
+
+Configured local recovery commits a content-free row in SQLite
+`local_recovery_receipts` before spawning any restart command, including watchdog
+recovery and when ordinary observability is disabled. Failure to acknowledge the
+write within 250 ms prevents the restart (`receipt_failed`). The row records the
+actual detector/cause, profile, available request/attempt identity, thresholds,
+process and episode identity, and generation timestamp. Command identity is a
+fixed config slot plus a process-keyed opaque generation, never argv or environment
+contents. The child receives `LLM_GUARD_RECOVERY_RECEIPT_ID` for audit correlation.
+Command/readiness completion updates the same row; a missing completion remains
+unknown, not success. Retention keeps at most 1,024 receipts independently of
+completed requests. Historical stops without receipts remain trigger-unproven.
+
 ## DeepInfra Qwen3 reranker compatibility
 
 `POST /v1/inference/Qwen/Qwen3-Reranker-8B` accepts DeepInfra's native

@@ -362,7 +362,7 @@ mod tests {
         let risk = combiner.combine();
         assert_approx(risk.overall_risk, 0.0);
         assert_eq!(risk.severity, LoopSeverity::Observe);
-        assert!(risk.contributing_detectors.is_empty());
+        assert_eq!(risk.contributing_detectors.len(), 0);
         assert_approx(risk.synergy_bonus, 0.0);
         assert!(risk.signals.is_empty());
         assert_eq!(combiner.signal_count(), 0);

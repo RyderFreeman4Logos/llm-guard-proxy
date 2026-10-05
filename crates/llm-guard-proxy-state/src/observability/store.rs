@@ -65,7 +65,7 @@ impl Connection {
         self.inner.execute_batch(sql)
     }
 
-    fn transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {
+    pub(super) fn transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {
         Ok(Transaction {
             inner: self.inner.transaction()?,
         })
@@ -73,13 +73,17 @@ impl Connection {
 }
 
 #[cfg(test)]
-struct Transaction<'conn> {
+pub(super) struct Transaction<'conn> {
     inner: rusqlite::Transaction<'conn>,
 }
 
 #[cfg(test)]
 impl Transaction<'_> {
-    fn execute<P: rusqlite::Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
+    pub(super) fn execute<P: rusqlite::Params>(
+        &self,
+        sql: &str,
+        params: P,
+    ) -> rusqlite::Result<usize> {
         count_vacuum_command(sql);
         self.inner.execute(sql, params)
     }
@@ -99,7 +103,7 @@ impl Transaction<'_> {
             .pragma_update(schema_name, pragma_name, pragma_value)
     }
 
-    fn commit(self) -> rusqlite::Result<()> {
+    pub(super) fn commit(self) -> rusqlite::Result<()> {
         self.inner.commit()
     }
 }
@@ -139,7 +143,7 @@ use super::{
 };
 use llm_guard_proxy_core::{ConfigHandle, RetentionConfig};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[cfg(test)]
 thread_local! {
@@ -161,7 +165,7 @@ const OBSERVABILITY_SQLITE_MODE: u32 = 0o600;
 #[derive(Clone, Debug)]
 pub struct ObservabilityStore {
     config: ConfigHandle,
-    connection: Arc<Mutex<Connection>>,
+    pub(super) connection: Arc<Mutex<Connection>>,
     metrics: Arc<Mutex<MetricsCache>>,
     _writer_ownership: Option<Arc<WriterOwnership>>,
     #[cfg(test)]
@@ -712,6 +716,26 @@ fn migrate(connection: &mut Connection) -> Result<(), ObservabilityError> {
     }
     if version < 4 {
         migrate_to_schema_v4(connection)?;
+    }
+    if version < 5 {
+        connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+CREATE TABLE IF NOT EXISTS local_recovery_receipts (
+    receipt_id TEXT PRIMARY KEY,
+    generated_at_unix_ms INTEGER NOT NULL,
+    receipt_json TEXT NOT NULL,
+    outcome TEXT,
+    restart_status TEXT,
+    readiness_status TEXT
+);
+PRAGMA user_version = 5;
+COMMIT;",
+            )
+            .map_err(|source| ObservabilityError::Sqlite {
+                action: "migrate local recovery receipts",
+                source,
+            })?;
     }
     Ok(())
 }

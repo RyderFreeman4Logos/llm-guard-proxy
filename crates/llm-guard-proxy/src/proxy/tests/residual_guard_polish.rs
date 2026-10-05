@@ -373,7 +373,7 @@ async fn generic_entry_matrix_never_replays_after_first_nonempty_body_byte() {
                 .bytes()
                 .await
                 .expect_err("body reset after a committed byte must reach the client");
-            assert!(!body_error.to_string().is_empty());
+            assert_ne!(body_error.to_string().len(), 0);
         } else {
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
             response
@@ -1329,6 +1329,7 @@ async fn singleflight_joiner_deadline_expires_without_late_replay_permit() {
     let started = Instant::now();
     let gate = precommit_recovery::gate(
         precommit_recovery::Context {
+            receipt: test_recovery_receipt_context(),
             policy: &policy,
             coordinator: &coordinator,
             client: build_http_client().expect("test client should build"),

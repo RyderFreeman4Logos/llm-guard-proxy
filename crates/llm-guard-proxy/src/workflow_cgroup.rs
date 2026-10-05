@@ -1372,10 +1372,11 @@ mod tests {
             parse_cgroup_procs("17\n23\n").expect("kernel process list should parse"),
             vec![17, 23]
         );
-        assert!(
+        assert_eq!(
             parse_cgroup_procs("")
                 .expect("empty cgroup should parse")
-                .is_empty()
+                .len(),
+            0
         );
         for invalid in ["0\n", "-1\n", "not-a-pid\n", "4294967295\n"] {
             assert!(
