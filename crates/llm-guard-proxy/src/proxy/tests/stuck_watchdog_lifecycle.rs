@@ -1032,12 +1032,34 @@ enabled = false
             r#"{"model":"test-chat","prompt":"pending","stream":true}"#,
         ))
         .expect("stalled streaming request should build");
-    let _unread_stalled_response = proxy_handler(State(proxy.state.clone()), stalled_request).await;
+    let unread_stalled_response = proxy_handler(State(proxy.state.clone()), stalled_request).await;
 
-    // Mature the stalled attempt before the healthy non-stream response reaches
-    // upstream EOF, so a fresh upstream-time sample is the only reason recovery
-    // can be suppressed.
-    sleep(Duration::from_millis(2_100)).await;
+    let detection_window = Duration::from_secs(2);
+    {
+        let mut windows = proxy
+            .state
+            .stuck_watchdog_tokens
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let window = windows.get_mut("default").expect("stalled request window");
+        assert_eq!(window.attempts.len(), 1);
+        let attempt = window
+            .attempts
+            .values_mut()
+            .next()
+            .expect("stalled attempt");
+        assert!(attempt.completed.is_none());
+        attempt.started_at = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("test Instant supports deterministic watchdog maturation");
+    }
+    assert!(
+        proxy
+            .state
+            .stuck_watchdog_tokens
+            .has_too_few_output_progress_units("default", detection_window, 1,)
+    );
 
     let completed_request = Request::builder()
         .method(Method::POST)
@@ -1063,16 +1085,21 @@ enabled = false
         1,
         "complete non-stream upstream EOF must record exactly one progress sample"
     );
-    let watchdog = spawn_stuck_engine_watchdog(&proxy.state);
-    sleep(Duration::from_millis(1_100)).await;
+    let detections = check_watchdog_once(&proxy).await;
     let restarted = marker.exists();
-    stop_watchdog(&proxy, watchdog).await;
     let _drained_completed_response = to_bytes(completed_response.into_body(), 1024 * 1024)
         .await
         .expect("completed non-stream downstream response should drain");
+    let progress_after_drain = proxy.state.stuck_watchdog_tokens.sample_count("default");
+    drop(unread_stalled_response);
+    let drained = proxy.state.flush_persistence_checked().await;
     assert_eq!(
-        proxy.state.stuck_watchdog_tokens.sample_count("default"),
-        1,
+        detections, 0,
+        "fresh upstream EOF must suppress the actual watchdog check"
+    );
+    drained.expect("request cleanup persistence should drain");
+    assert_eq!(
+        progress_after_drain, 1,
         "downstream draining must not add a second progress sample after upstream EOF"
     );
     assert!(
@@ -2237,6 +2264,40 @@ restart_timeout_secs = 1
         script = script.display(),
         marker = marker.display(),
     )
+}
+
+async fn check_watchdog_once(proxy: &ProxyFixture) -> u64 {
+    // An empty recovery JoinSet cannot yield: the first poll reaches the due
+    // profile check before the interval wait, without aging out real EOF progress.
+    let watchdog = run_stuck_engine_watchdog(
+        proxy.state.config.clone(),
+        proxy.state.store.clone(),
+        Arc::clone(&proxy.state.persistence_tasks),
+        proxy.state.client.clone(),
+        Arc::clone(&proxy.state.local_recovery),
+        Arc::clone(&proxy.state.stuck_watchdog_tokens),
+        Arc::clone(&proxy.state.shutdown),
+    );
+    tokio::pin!(watchdog);
+    let first_poll = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(std::future::Future::poll(watchdog.as_mut(), cx))
+    })
+    .await;
+    let detections = proxy
+        .state
+        .local_recovery
+        .coordinator_for("default")
+        .watchdog_detections
+        .load(Ordering::Relaxed);
+    proxy.state.begin_shutdown();
+    timeout(WATCHDOG_TASK_TIMEOUT, watchdog)
+        .await
+        .expect("watchdog should stop after its checked first poll");
+    assert!(
+        first_poll.is_pending(),
+        "first check must reach its interval wait"
+    );
+    detections
 }
 
 async fn stop_watchdog(proxy: &ProxyFixture, watchdog: tokio::task::JoinHandle<()>) {
