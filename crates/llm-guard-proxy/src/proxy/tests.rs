@@ -63,6 +63,8 @@ mod shielded_endpoint_rendering;
 mod stuck_watchdog_lifecycle;
 #[path = "tests/stuck_watchdog_terminalization.rs"]
 mod stuck_watchdog_terminalization;
+#[path = "tests/terminal_receipt_overlap.rs"]
+mod terminal_receipt_overlap;
 #[path = "tests/upstream_model_rewrite.rs"]
 mod upstream_model_rewrite;
 #[path = "tests/watchdog_sse_event_framing.rs"]

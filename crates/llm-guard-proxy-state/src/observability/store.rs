@@ -166,6 +166,8 @@ const OBSERVABILITY_SQLITE_MODE: u32 = 0o600;
 pub struct ObservabilityStore {
     config: ConfigHandle,
     pub(super) connection: Arc<Mutex<Connection>>,
+    #[cfg(feature = "recovery-receipt-test-hooks")]
+    pub(super) recovery_receipt_test_hook: Arc<Mutex<Option<super::recovery_receipt::TestHook>>>,
     metrics: Arc<Mutex<MetricsCache>>,
     _writer_ownership: Option<Arc<WriterOwnership>>,
     #[cfg(test)]
@@ -221,6 +223,8 @@ impl ObservabilityStore {
         Ok(Self {
             config,
             connection: Arc::new(Mutex::new(connection)),
+            #[cfg(feature = "recovery-receipt-test-hooks")]
+            recovery_receipt_test_hook: Arc::new(Mutex::new(None)),
             metrics: Arc::new(Mutex::new(MetricsCache {
                 accumulator: metrics,
                 valid: true,

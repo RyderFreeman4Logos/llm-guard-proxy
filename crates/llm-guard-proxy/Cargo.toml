@@ -45,6 +45,7 @@ libc = "0.2"
 rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
+llm-guard-proxy-state = { path = "../llm-guard-proxy-state", features = ["recovery-receipt-test-hooks"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [lints]

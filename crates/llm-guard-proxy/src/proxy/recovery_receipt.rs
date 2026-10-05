@@ -249,10 +249,20 @@ impl Context {
         let deadline = self
             .owner_deadline
             .map_or(deadline, |owner| deadline.min(owner.into_std()));
-        self.write(deadline, move |deadline| {
-            store.record_local_recovery_receipt(&receipt, deadline)
-        })
-        .await?;
+        #[cfg(test)]
+        self.store
+            .observe_recovery_receipt_test("record_submit", self.id());
+        let result = self
+            .write(deadline, move |deadline| {
+                #[cfg(test)]
+                store.observe_recovery_receipt_test("record_worker_start", &receipt.receipt_id);
+                store.record_local_recovery_receipt(&receipt, deadline)
+            })
+            .await;
+        #[cfg(test)]
+        self.store
+            .observe_recovery_receipt_test("record_ack", self.id());
+        result?;
         self.acknowledged.store(true, super::Ordering::Release);
         Ok(())
     }
@@ -269,15 +279,25 @@ impl Context {
         let readiness = metadata.get("local_recovery_readiness_status").cloned();
         let store = self.store.clone();
         let id = self.id().to_owned();
-        self.write(std::time::Instant::now() + WRITE_BUDGET, move |deadline| {
-            store.finish_local_recovery_receipt(
-                &id,
-                &outcome,
-                restart.as_deref(),
-                readiness.as_deref(),
-                deadline,
-            )
-        })
-        .await
+        #[cfg(test)]
+        self.store
+            .observe_recovery_receipt_test("terminal_submit", self.id());
+        let result = self
+            .write(std::time::Instant::now() + WRITE_BUDGET, move |deadline| {
+                #[cfg(test)]
+                store.observe_recovery_receipt_test("terminal_worker_start", &id);
+                store.finish_local_recovery_receipt(
+                    &id,
+                    &outcome,
+                    restart.as_deref(),
+                    readiness.as_deref(),
+                    deadline,
+                )
+            })
+            .await;
+        #[cfg(test)]
+        self.store
+            .observe_recovery_receipt_test("terminal_ack", self.id());
+        result
     }
 }

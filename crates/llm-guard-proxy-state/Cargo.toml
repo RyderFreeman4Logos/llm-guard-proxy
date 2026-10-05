@@ -10,6 +10,8 @@ description = "Operational state and persistence for llm-guard-proxy."
 [features]
 default = []
 guard = []
+# Fixture-local recovery writer boundary instrumentation; enabled by test consumers only.
+recovery-receipt-test-hooks = []
 
 [dependencies]
 fs2 = "0.4.3"
