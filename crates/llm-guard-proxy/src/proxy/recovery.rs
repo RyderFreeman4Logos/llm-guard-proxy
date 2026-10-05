@@ -86,6 +86,24 @@ impl RecoveryProcessGuard {
     }
 
     pub(super) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = self.process_group_id {
+            // Keep the leader unreaped until its group is stopped: reaping first
+            // permits PID reuse and makes any later negative-PID signal unsafe.
+            loop {
+                match observe_recovery_child_without_reaping(pid) {
+                    "child_exited_unreaped_after_term" => break,
+                    "child_still_running_after_term" => {
+                        tokio::time::sleep(RECOVERY_PROCESS_GROUP_TERM_POLL_INTERVAL).await;
+                    }
+                    _ => return Err(std::io::Error::other("recovery child identity unavailable")),
+                }
+            }
+            let _sent = send_recovery_process_group_signal(pid, Signal::SIGKILL);
+            while !recovery_group_quiescent(pid)? {
+                tokio::time::sleep(RECOVERY_PROCESS_GROUP_TERM_POLL_INTERVAL).await;
+            }
+        }
         let Some(child) = self.child.as_mut() else {
             return Err(std::io::Error::other("recovery child was already reaped"));
         };
@@ -118,6 +136,40 @@ impl RecoveryProcessGuard {
         }
         let _reaped_child = self.child.take();
     }
+}
+
+/// Observes group quiescence while its unreaped leader still pins the PGID.
+/// Zombies cannot execute; their parents retain responsibility for reaping.
+#[cfg(target_os = "linux")]
+fn recovery_group_quiescent(group: u32) -> std::io::Result<bool> {
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let fields = stat
+            .rsplit_once(") ")
+            .ok_or_else(|| std::io::Error::other("invalid process stat"))?
+            .1;
+        let mut fields = fields.split_whitespace();
+        let state = fields.next();
+        let _parent = fields.next();
+        let pgid = fields.next().and_then(|field| field.parse::<u32>().ok());
+        if pgid == Some(group) && !matches!(state, Some("Z" | "X")) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 impl Drop for RecoveryProcessGuard {
@@ -217,7 +269,12 @@ pub(super) async fn terminate_timed_out_recovery_child(
     .await
     {
         Ok(Ok(_status)) => "terminated_after_kill",
-        Ok(Err(_error)) => "wait_failed_after_kill",
+        Ok(Err(error)) => {
+            #[cfg(test)]
+            eprintln!("recovery cleanup wait error={error:?}");
+            drop(error);
+            "wait_failed_after_kill"
+        }
         Err(_elapsed) => "wait_timeout_after_kill",
     };
     metadata.insert(
@@ -317,6 +374,64 @@ fn observe_recovery_child_without_reaping(_pid: u32) -> &'static str {
 mod tests {
     use super::{RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET, recovery_join_timeout};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn owned_recovery_completion_cannot_leave_a_running_descendant() {
+        if std::env::var_os("GUARDIAN_DESCENDANT_TEST").is_none() {
+            let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", "proxy::recovery::tests::owned_recovery_completion_cannot_leave_a_running_descendant", "--nocapture"])
+                .env("GUARDIAN_DESCENDANT_TEST", "1")
+                .kill_on_drop(true).spawn().expect("isolated subreaper fixture");
+            let result = tokio::time::timeout(Duration::from_secs(15), child.wait()).await;
+            if result.is_err() {
+                child.kill().await.expect("kill timed out fixture");
+            }
+            assert!(
+                result
+                    .expect("bounded fixture")
+                    .expect("fixture wait")
+                    .success()
+            );
+            return;
+        }
+        nix::sys::prctl::set_child_subreaper(true).expect("isolated fixture subreaper");
+        let root =
+            std::env::temp_dir().join(format!("owned-recovery-completion-{}", std::process::id()));
+        std::fs::create_dir_all(&root).expect("fixture directory");
+        let marker = root.join("descendant");
+        let mut command = tokio::process::Command::new("python3");
+        command.args(["-c", "import os,time,sys,pathlib; p=os.fork(); pathlib.Path(sys.argv[1]).write_text(str(p)) if p else time.sleep(30)"]);
+        command.arg(&marker).kill_on_drop(true);
+        super::configure_recovery_command(&mut command);
+        let mut owned = super::RecoveryProcessGuard::new(command.spawn().expect("owned fixture"));
+        let status = tokio::time::timeout(Duration::from_secs(5), owned.wait())
+            .await
+            .expect("bounded completion")
+            .expect("reaped leader");
+        assert!(status.success());
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .expect("child identity")
+            .parse()
+            .expect("pid");
+        let identity = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        eprintln!("fixture descendant pid={pid} stat={identity:?}");
+        let running =
+            identity.is_ok_and(|stat| !stat.rsplit_once(") ").expect("stat").1.starts_with('Z'));
+        // The isolated subreaper owns this descendant, including on behavioral RED.
+        let _cleanup = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let reaped = nix::sys::wait::waitpid(nix::unistd::Pid::from_raw(pid), None)
+            .expect("reap descendant");
+        eprintln!("fixture descendant reaped={reaped:?}");
+        assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
+        std::fs::remove_dir_all(root).expect("fixture cleanup");
+        assert!(
+            !running,
+            "completion acknowledged while owned recovery descendant remained running"
+        );
+    }
 
     #[test]
     fn public_join_timeout_covers_every_bounded_process_group_cleanup_phase() {

@@ -2619,6 +2619,20 @@ fn assign_guardian(
         "cgroup_root" => {
             config.cgroup_root = PathBuf::from(parse_string(value, line_number)?);
         }
+        "escalation_enabled" => config.escalation_enabled = parse_bool(value, line_number)?,
+        "escalation_profile" => config.escalation_profile = parse_string(value, line_number)?,
+        "escalation_grace_secs" => {
+            config.escalation_grace_secs =
+                parse_u64(value, line_number, "guardian.escalation_grace_secs")?;
+        }
+        "escalation_timeout_secs" => {
+            config.escalation_timeout_secs =
+                parse_u64(value, line_number, "guardian.escalation_timeout_secs")?;
+        }
+        "escalation_mem_threshold_gib" => {
+            config.escalation_mem_threshold_gib =
+                parse_u64(value, line_number, "guardian.escalation_mem_threshold_gib")?;
+        }
         _ => return unknown_key("guardian", key, line_number),
     }
     Ok(())

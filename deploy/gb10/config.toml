@@ -868,6 +868,25 @@ reserve_mib = 64                            # Pre-touched emergency reserve
 retry_interval_secs = 5                     # Retry while pressure remains latched
 cgroup_root = "/sys/fs/cgroup"             # cgroup-v2 root
 
+## Tier 2 is source-only opt-in; none of these examples activate production.
+## Combined proxy mode only. Requires successful direct write + exact retained
+## empty generation + continuous lower-threshold pressure through grace.
+## The named existing local_recovery profile supplies cooldown_ms, budget,
+## foreground restart_command and readiness endpoint/body. Its command must be
+## an absolute trusted foreground executable: no daemonizing, setsid, shells,
+## systemctl/systemd-run, Docker launcher, or delegation outside its process group.
+## The executor owns that child/group, not an external service. This is NOT a
+## full-stack service coordinator and does not authorize restart or Tier-2 rollout.
+## Registration/config replacement or recovered memory cancels the old owner.
+## One durable boot claim survives proxy restart and receipt-ring pruning in the
+## configured observability SQLite database; do not change/delete that database
+## during a boot to reset admission. No action follows failed durable admission.
+# escalation_enabled = false                # Safe default; explicit operator opt-in only
+# escalation_profile = "default"            # Existing reviewed foreground local_recovery profile
+# escalation_grace_secs = 60                 # Continuous verified low-memory dwell, 30..60 seconds
+# escalation_timeout_secs = 120              # One action/readiness deadline; cleanup may add 3 seconds
+# escalation_mem_threshold_gib = 1           # Higher pressure than Mode 1; must be <= Mode-1 threshold
+
 ## ───────────────────────── Host telemetry sampler ──────────────────────────
 ## `host-telemetry` is a default-on compile-time feature that ports the GB10
 ## sysmon and swap-guard observer role. It reads procfs plus an optional

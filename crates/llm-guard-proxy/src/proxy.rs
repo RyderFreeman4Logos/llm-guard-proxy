@@ -82,6 +82,8 @@ mod buffered_adapter;
 mod deepinfra_rerank_adapter;
 mod effective_liveness;
 mod generic_recovery;
+#[cfg(feature = "memory-guardian")]
+mod guardian_recovery;
 mod model_metadata;
 mod post_await_self_test;
 mod precommit_recovery;
@@ -7982,6 +7984,8 @@ struct UpstreamStallRecoveryState {
     active_recovery_episode_id: Option<u64>,
     active_recovery_episode_permits: Option<Arc<AtomicUsize>>,
     active_local_recovery_task: Option<AbortHandle>,
+    #[cfg(feature = "memory-guardian")]
+    active_guardian_recovery: bool,
     completed_recovery_episodes: VecDeque<CompletedRecoveryEpisode>,
 }
 
@@ -8038,6 +8042,10 @@ impl UpstreamStallRecoveryState {
     fn finish_recovery(&mut self, result: BTreeMap<String, String>) {
         let episode_id = self.active_recovery_episode_id.take();
         self.active_local_recovery_task = None;
+        #[cfg(feature = "memory-guardian")]
+        {
+            self.active_guardian_recovery = false;
+        }
         let permit_references = self
             .active_recovery_episode_permits
             .take()
@@ -12854,6 +12862,11 @@ async fn abort_local_recovery_episode(
     let recovery_task = {
         let state = coordinator.state.lock().await;
         if state.active_recovery_episode_id != Some(recovery_episode_id) {
+            return false;
+        }
+        #[cfg(feature = "memory-guardian")]
+        if state.active_guardian_recovery {
+            // Only its generation-bound owner can cancel and acknowledge this worker.
             return false;
         }
         state.active_local_recovery_task.clone()

@@ -39,6 +39,9 @@ mod constraint_repair;
 mod cot_salvage_issue_211;
 #[path = "tests/first_evict_kv_priority_issue_242.rs"]
 mod first_evict_kv_priority_issue_242;
+#[cfg(feature = "memory-guardian")]
+#[path = "tests/guardian_recovery.rs"]
+mod guardian_recovery;
 #[path = "tests/listener_profile_policy.rs"]
 mod listener_profile_policy;
 #[path = "tests/local_recovery_receipt.rs"]

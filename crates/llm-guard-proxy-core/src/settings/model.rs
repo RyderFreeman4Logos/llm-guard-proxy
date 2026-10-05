@@ -159,6 +159,16 @@ pub struct GuardianConfig {
     pub retry_interval_secs: u64,
     /// Cgroup v2 mount used to validate an operator-published registration.
     pub cgroup_root: PathBuf,
+    /// Enables generation-bound Tier 2; requires an in-process recovery executor.
+    pub escalation_enabled: bool,
+    /// Existing local-recovery profile whose foreground command is owned by Tier 2.
+    pub escalation_profile: String,
+    /// Continuous lower-threshold dwell after verified Tier 1.
+    pub escalation_grace_secs: u64,
+    /// Absolute action/readiness budget, excluding bounded cancellation cleanup.
+    pub escalation_timeout_secs: u64,
+    /// Tier 2 requires pressure at or below this lower `MemAvailable` threshold.
+    pub escalation_mem_threshold_gib: u64,
 }
 
 impl GuardianConfig {
@@ -232,6 +242,22 @@ impl GuardianConfig {
             "must be an absolute path",
         )?;
 
+        require(
+            (30..=60).contains(&self.escalation_grace_secs)
+                && (1..=3600).contains(&self.escalation_timeout_secs)
+                && self.escalation_mem_threshold_gib > 0
+                && self.escalation_mem_threshold_gib <= self.mem_threshold_gib,
+            "guardian.escalation_grace_secs",
+            "Tier 2 requires 30..60 seconds grace, 1..3600 seconds timeout and a positive lower memory threshold",
+        )?;
+        if self.escalation_enabled {
+            require(
+                self.enabled && self.kill_action == GuardianKillAction::CgroupKill,
+                "guardian.escalation_enabled",
+                "requires enabled direct-cgroup Tier 1",
+            )?;
+            validate_guardian_label(&self.escalation_profile)?;
+        }
         if self.enabled || !self.target_label.is_empty() {
             validate_guardian_label(&self.target_label)?;
         }
@@ -269,6 +295,11 @@ impl Default for GuardianConfig {
             reserve_mib: 64,
             retry_interval_secs: 5,
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
+            escalation_enabled: false,
+            escalation_profile: String::new(),
+            escalation_grace_secs: 60,
+            escalation_timeout_secs: 120,
+            escalation_mem_threshold_gib: 1,
         }
     }
 }

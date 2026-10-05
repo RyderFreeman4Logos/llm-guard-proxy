@@ -35,6 +35,7 @@ impl Context {
             shutdown: None,
             acknowledged: super::Arc::new(super::AtomicBool::new(false)),
             receipt: LocalRecoveryReceipt {
+                guardian: None,
                 receipt_id: format!("recovery-{}-{}", std::process::id(), RequestId::generate()),
                 generated_at_unix_ms: 0,
                 process_id: std::process::id(),
@@ -95,6 +96,18 @@ impl Context {
         };
         self.receipt.restart_timeout_ms = duration_millis_u64(policy.restart_timeout);
         self.receipt.readiness_deadline_ms = duration_millis_u64(policy.readiness_deadline);
+        self
+    }
+
+    #[cfg(feature = "memory-guardian")]
+    pub(super) fn guardian(
+        mut self,
+        identity: llm_guard_proxy_state::GuardianRecoveryIdentity,
+    ) -> Self {
+        self.receipt.guardian = Some(identity);
+        self.receipt.detector = "memory_guardian";
+        self.receipt.cause = "memory_pressure";
+        self.receipt.command_id = "guardian.foreground_recovery";
         self
     }
 

@@ -22,6 +22,8 @@ use std::{
 };
 use thiserror::Error;
 
+pub mod tier2;
+
 const MEMINFO_BUFFER_BYTES: usize = 8 * 1024;
 const REGISTRATION_MAX_BYTES: usize = 1024;
 const EVENTS_BUFFER_BYTES: usize = 512;
@@ -261,29 +263,7 @@ impl CgroupTarget {
         cgroup_root: &Path,
         expected_uid: u32,
     ) -> Result<Self, GuardianError> {
-        let mut registration_file = OpenOptions::new()
-            .read(true)
-            .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
-            .open(registration_path)
-            .map_err(|source| GuardianError::Io {
-                operation: "open registration",
-                source,
-            })?;
-        validate_registration_metadata(&registration_file, expected_uid)?;
-        let mut bytes = [0_u8; REGISTRATION_MAX_BYTES];
-        let length = registration_file
-            .read(&mut bytes)
-            .map_err(|source| GuardianError::Io {
-                operation: "read registration",
-                source,
-            })?;
-        if length == bytes.len() {
-            return Err(GuardianError::InvalidRegistration(String::from(
-                "registration exceeds fixed buffer",
-            )));
-        }
-        let registration = parse_registration(&bytes[..length], expected_uid)
-            .map_err(|error| GuardianError::InvalidRegistration(error.to_string()))?;
+        let registration = read_registration(registration_path, expected_uid)?;
         let cgroup_path = cgroup_root.join(registration.control_group.trim_start_matches('/'));
         let directory = OpenOptions::new()
             .read(true)
@@ -368,6 +348,36 @@ fn open_cgroup_control(
         .custom_flags(OFlag::O_NOFOLLOW.bits())
         .open(descriptor_path)
         .map_err(|source| GuardianError::Io { operation, source })
+}
+
+fn read_registration(
+    registration_path: &Path,
+    expected_uid: u32,
+) -> Result<Registration, GuardianError> {
+    let mut registration_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(registration_path)
+        .map_err(|source| GuardianError::Io {
+            operation: "open registration",
+            source,
+        })?;
+    validate_registration_metadata(&registration_file, expected_uid)?;
+    let mut bytes = [0_u8; REGISTRATION_MAX_BYTES];
+    let length = registration_file
+        .read(&mut bytes)
+        .map_err(|source| GuardianError::Io {
+            operation: "read registration",
+            source,
+        })?;
+    if length == bytes.len() {
+        return Err(GuardianError::InvalidRegistration(String::from(
+            "registration exceeds fixed buffer",
+        )));
+    }
+    let registration = parse_registration(&bytes[..length], expected_uid)
+        .map_err(|error| GuardianError::InvalidRegistration(error.to_string()))?;
+    Ok(registration)
 }
 
 fn validate_registration_metadata(file: &File, expected_uid: u32) -> Result<(), GuardianError> {
@@ -468,6 +478,7 @@ pub struct MemoryGuardian {
     systemd_verified: bool,
     observer_pressure_reported: bool,
     last_rejected_policy: Option<GuardianConfig>,
+    escalation: tier2::GuardianEscalation,
 }
 
 impl MemoryGuardian {
@@ -515,6 +526,7 @@ impl MemoryGuardian {
             systemd_verified: false,
             observer_pressure_reported: false,
             last_rejected_policy: None,
+            escalation: tier2::GuardianEscalation::default(),
         })
     }
 
@@ -540,10 +552,13 @@ impl MemoryGuardian {
     /// Recoverable meminfo, cgroup, and reload failures are retained in the
     /// guardian state and never terminate the monitoring task.
     pub fn tick(&mut self) -> Result<GuardianIteration, GuardianError> {
-        if self.latched {
-            return Ok(self.latched_iteration());
-        }
-        Ok(self.healthy_iteration())
+        let iteration = if self.latched {
+            self.latched_iteration()
+        } else {
+            self.healthy_iteration()
+        };
+        self.update_escalation();
+        Ok(iteration)
     }
 
     /// Runs until the supplied shutdown future resolves.
@@ -558,6 +573,11 @@ impl MemoryGuardian {
     {
         tokio::pin!(shutdown);
         loop {
+            tokio::select! {
+                biased;
+                () = &mut shutdown => { self.escalation.shutdown().await; return Ok(()); }
+                () = std::future::ready(()) => {}
+            }
             self.tick()?;
             let delay = if self.latched {
                 self.retry_interval
@@ -566,17 +586,17 @@ impl MemoryGuardian {
             };
             let mut remaining = delay;
             while !remaining.is_zero() {
-                let slice = if self.latched {
-                    remaining
-                } else {
-                    remaining.min(CONFIG_SYNC_INTERVAL)
-                };
+                let slice = remaining.min(CONFIG_SYNC_INTERVAL);
                 let wait_started = Instant::now();
                 tokio::select! {
-                    () = &mut shutdown => return Ok(()),
+                    () = &mut shutdown => {
+                        self.escalation.shutdown().await;
+                        return Ok(());
+                    },
                     () = tokio::time::sleep(slice) => {}
                 }
                 remaining = remaining.saturating_sub(wait_started.elapsed());
+                self.escalation.revalidate();
                 if !self.latched && self.reconcile_healthy_target() {
                     break;
                 }
@@ -927,6 +947,7 @@ mod tests {
 
     mod action_result;
     mod target_reconciliation;
+    mod tier2;
 
     #[test]
     fn parses_mem_available() {

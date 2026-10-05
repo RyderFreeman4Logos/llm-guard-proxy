@@ -1,4 +1,7 @@
-use std::sync::{Arc, RwLock};
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicU64, Ordering},
+};
 
 use super::{AppConfig, GuardianConfig, RestartRequiredChange, ValidationError};
 
@@ -8,12 +11,16 @@ pub enum ConfigHandleError {
     /// Shared config state was poisoned by a panic.
     #[error("config state lock is poisoned")]
     LockPoisoned,
+    /// Configuration ownership revisions must never wrap.
+    #[error("config revision exhausted")]
+    RevisionExhausted,
 }
 
 /// Thread-safe handle used by request-serving code to read current settings.
 #[derive(Clone, Debug)]
 pub struct ConfigHandle {
     current: Arc<RwLock<AppConfig>>,
+    revision: Arc<AtomicU64>,
 }
 
 impl ConfigHandle {
@@ -22,7 +29,21 @@ impl ConfigHandle {
     pub fn new(config: AppConfig) -> Self {
         Self {
             current: Arc::new(RwLock::new(config)),
+            revision: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Returns the monotonic installed-policy revision (including A→B→A changes).
+    #[must_use]
+    pub fn revision(&self) -> u64 {
+        self.revision.load(Ordering::Acquire)
+    }
+
+    /// Dispatches synchronously under the config read lock only at this revision.
+    /// The callback must not reload configuration or await.
+    pub fn at_revision<T>(&self, revision: u64, action: impl FnOnce() -> T) -> Option<T> {
+        let _snapshot = self.current.read().ok()?;
+        (self.revision() == revision).then(action)
     }
 
     /// Returns a point-in-time copy of the validated config.
@@ -74,6 +95,13 @@ impl ConfigHandle {
             .write()
             .map_err(|_error| ConfigHandleError::LockPoisoned)?;
         let (next, outcome) = apply_reloadable(&current, requested);
+        if outcome.applied {
+            let next_revision = self
+                .revision()
+                .checked_add(1)
+                .ok_or(ConfigHandleError::RevisionExhausted)?;
+            self.revision.store(next_revision, Ordering::Release);
+        }
         *current = next;
         Ok(outcome)
     }

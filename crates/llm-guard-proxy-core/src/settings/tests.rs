@@ -4242,6 +4242,43 @@ fn rejects_unbounded_watchdog_and_restart_queue_durations() {
 }
 
 #[test]
+fn tier2_policy_is_explicit_default_off_and_bounds_pressure_and_grace() {
+    assert!(!AppConfig::default().guardian.escalation_enabled);
+    let config = AppConfig::parse(
+        r#"
+[guardian]
+enabled = true
+target_label = "test"
+escalation_enabled = true
+escalation_profile = "default"
+escalation_grace_secs = 30
+escalation_timeout_secs = 10
+escalation_mem_threshold_gib = 1
+"#,
+    )
+    .expect("parse Tier 2");
+    config.validate().expect("valid Tier 2 policy");
+    assert!(config.guardian.escalation_enabled);
+    for field in [
+        "disabled_mode1",
+        "wrong_action",
+        "pressure",
+        "grace",
+        "timeout",
+    ] {
+        let mut invalid = config.clone();
+        match field {
+            "disabled_mode1" => invalid.guardian.enabled = false,
+            "wrong_action" => invalid.guardian.kill_action = GuardianKillAction::SystemctlRestart,
+            "pressure" => invalid.guardian.escalation_mem_threshold_gib = 3,
+            "grace" => invalid.guardian.escalation_grace_secs = 0,
+            _ => invalid.guardian.escalation_timeout_secs = 0,
+        }
+        assert!(invalid.validate().is_err(), "{field}");
+    }
+}
+
+#[test]
 fn parses_and_validates_guardian_policy_from_the_shared_config() {
     let config = AppConfig::parse(
         r#"

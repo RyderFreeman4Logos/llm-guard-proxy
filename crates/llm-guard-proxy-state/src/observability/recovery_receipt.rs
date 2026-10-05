@@ -27,6 +27,25 @@ pub struct LocalRecoveryReceipt {
     pub request_deadline_ms: Option<u64>,
     pub detection_window_secs: u64,
     pub min_output_progress_units: u64,
+    /// Guardian-only ownership facts; absent for request/watchdog recovery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guardian: Option<GuardianRecoveryIdentity>,
+}
+
+/// Fixed-schema guardian facts, independent of prompts, argv and environment.
+#[derive(Clone, Debug, Serialize)]
+pub struct GuardianRecoveryIdentity {
+    pub boot_id: String,
+    pub guardian_episode: u64,
+    pub config_revision: u64,
+    pub target_device: u64,
+    pub target_inode: u64,
+    pub container_id: String,
+    pub available_bytes: u64,
+    pub threshold_bytes: u64,
+    pub grace_secs: u64,
+    pub binary_device: u64,
+    pub binary_inode: u64,
 }
 
 impl ObservabilityStore {
@@ -39,15 +58,43 @@ impl ObservabilityStore {
         receipt: &LocalRecoveryReceipt,
         deadline: Instant,
     ) -> Result<(), &'static str> {
-        if !matches!(
-            receipt.cause,
-            "stuck_watchdog"
-                | "upstream_stall"
-                | "transient_status"
-                | "transient_transport"
-                | "request_deadline"
-        ) || !matches!(receipt.detector, "stuck_watchdog" | "precommit_recovery")
-            || receipt.command_id != "local_recovery.restart_command"
+        let guardian = receipt.guardian.as_ref();
+        if let Some(identity) = guardian {
+            let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .map_err(|_| "boot_unavailable")?;
+            if identity.boot_id != boot.trim() {
+                return Err("invalid_boot");
+            }
+        }
+        let guardian_labels = guardian.is_some()
+            && receipt.cause == "memory_pressure"
+            && receipt.detector == "memory_guardian"
+            && receipt.command_id == "guardian.foreground_recovery"
+            && receipt.request_id.is_none()
+            && receipt.attempt_id.is_none();
+        if guardian.is_some_and(|identity| {
+            identity.boot_id.len() != 36
+                || !identity
+                    .boot_id
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() || b == b'-')
+                || identity.container_id.len() != 64
+                || !identity.container_id.bytes().all(|b| b.is_ascii_hexdigit())
+        }) {
+            return Err("invalid_receipt");
+        }
+        if !guardian_labels
+            && (guardian.is_some()
+                || !matches!(
+                    receipt.cause,
+                    "stuck_watchdog"
+                        | "upstream_stall"
+                        | "transient_status"
+                        | "transient_transport"
+                        | "request_deadline"
+                )
+                || !matches!(receipt.detector, "stuck_watchdog" | "precommit_recovery")
+                || receipt.command_id != "local_recovery.restart_command")
         {
             return Err("invalid_receipt");
         }
@@ -90,6 +137,18 @@ impl ObservabilityStore {
                 return Err("durability_disabled");
             }
             let transaction = connection.transaction().map_err(|_| "write_failed")?;
+            if let Some(identity) = guardian {
+                // The singleton survives receipt-ring retention and proxy restarts.
+                transaction.execute_batch("CREATE TABLE IF NOT EXISTS guardian_boot_claim (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), boot_id TEXT NOT NULL, receipt_id TEXT NOT NULL)")
+                    .map_err(|_| "write_failed")?;
+                let claimed = transaction.execute(
+                    "INSERT INTO guardian_boot_claim(singleton, boot_id, receipt_id) VALUES (1, ?1, ?2) ON CONFLICT(singleton) DO UPDATE SET boot_id=excluded.boot_id, receipt_id=excluded.receipt_id WHERE guardian_boot_claim.boot_id != excluded.boot_id",
+                    params![identity.boot_id, safe.receipt_id],
+                ).map_err(|_| "write_failed")?;
+                if claimed != 1 {
+                    return Err("boot_already_claimed");
+                }
+            }
             transaction.execute(
                 "INSERT INTO local_recovery_receipts(receipt_id, generated_at_unix_ms, receipt_json) VALUES (?1, ?2, ?3)",
                 params![safe.receipt_id, safe.generated_at_unix_ms, json],
