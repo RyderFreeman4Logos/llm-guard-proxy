@@ -1592,8 +1592,12 @@ interval_secs = 1
     assert!(!models_body.is_empty(), "models returned 0 bytes");
 
     drop(downstreams);
+    let mut drop_events = Vec::new();
     for _ in 0..4 {
-        let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+        drop_events.push(upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await);
+    }
+    upstream.release_bodies();
+    for drop_event in drop_events {
         assert_eq!(drop_event.label, "cancellable-chat-sse");
     }
     wait_for_generation_metrics(&proxy, 0, 0, STREAM_COMPLETION_TIMEOUT).await;
@@ -12551,6 +12555,7 @@ thinking_mode = "force_disable"
     assert_eq!(body_thinking_budget(&third_attempt.body), Some(0));
 
     let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+    upstream.release_bodies();
     assert_eq!(drop_event.label, "cancellable-chat-sse");
 
     let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
@@ -13387,6 +13392,7 @@ async fn streaming_chat_downstream_drop_cancels_upstream_relay() {
     drop(downstream);
 
     let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+    upstream.release_bodies();
     assert_eq!(drop_event.label, "cancellable-chat-sse");
     assert_forwarded_abort_recorded(&proxy);
 }
@@ -13437,6 +13443,7 @@ enabled = false
     drop(response);
 
     let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+    upstream.release_bodies();
     assert_eq!(drop_event.label, "cancellable-chat-json");
     assert_forwarded_abort_recorded(&proxy);
 }
@@ -13483,6 +13490,7 @@ mode = "json-whitespace"
     drop(response);
 
     let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+    upstream.release_bodies();
     assert_eq!(drop_event.label, "cancellable-chat-sse");
     assert_forwarded_abort_recorded(&proxy);
 }
@@ -13520,11 +13528,9 @@ idle_timeout_ms = 200
 
     assert_eq!(response.status(), StatusCode::OK);
     let mut downstream = response.bytes_stream();
-    assert!(
-        timeout(Duration::from_millis(100), downstream.next())
-            .await
-            .is_err()
-    );
+    let withheld = timeout(Duration::from_millis(100), downstream.next())
+        .await
+        .is_err();
     let observed = upstream.recv_request().await;
     let observed_body: serde_json::Value =
         serde_json::from_slice(&observed.body).expect("upstream body should be JSON");
@@ -13532,15 +13538,30 @@ idle_timeout_ms = 200
 
     drop(downstream);
 
+    let immediate_drop = upstream
+        .recv_drop_optional_within(Duration::from_millis(50))
+        .await;
+    let drop_event = upstream
+        .recv_drop_optional_within(STREAM_COMPLETION_TIMEOUT)
+        .await;
+    upstream.release_bodies();
+    let drained = proxy.state.flush_persistence_checked().await;
+
     assert!(
-        upstream
-            .recv_drop_optional_within(Duration::from_millis(50))
-            .await
-            .is_none(),
+        withheld,
+        "shielding must withhold the unfinished upstream body"
+    );
+    assert!(
+        immediate_drop.is_none(),
         "detach mode should not cancel upstream immediately on downstream drop"
     );
-    let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
-    assert_eq!(drop_event.label, "cancellable-chat-sse");
+    drained.expect("detached attempt persistence should drain before assertions");
+    assert_eq!(
+        drop_event
+            .expect("unfinished upstream body must drop at its unchanged deadline")
+            .label,
+        "cancellable-chat-sse"
+    );
 
     let request_row = read_single_forwarded_request_row(&proxy.sqlite_path);
     let attempts = read_attempt_chain_rows(&proxy.sqlite_path);
@@ -19264,8 +19285,12 @@ interval_secs = 1
         "server should finish within the configured drain budget plus scheduler margin"
     );
 
+    let mut drop_events = Vec::new();
     for _ in 0..4 {
-        let drop_event = upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await;
+        drop_events.push(upstream.recv_drop_within(STREAM_COMPLETION_TIMEOUT).await);
+    }
+    upstream.release_bodies();
+    for drop_event in drop_events {
         assert_eq!(drop_event.label, "cancellable-chat-sse");
     }
     let admission = proxy.state.admission_metrics_snapshot();
@@ -20750,6 +20775,7 @@ struct CancellableUpstream {
     base_url: String,
     receiver: mpsc::Receiver<ObservedRequest>,
     drop_receiver: mpsc::Receiver<UpstreamDropEvent>,
+    body_releases: mpsc::Receiver<oneshot::Sender<()>>,
     _server: TestServer,
 }
 
@@ -20757,6 +20783,7 @@ struct CancellableUpstream {
 struct CancellableUpstreamState {
     request_sender: mpsc::Sender<ObservedRequest>,
     drop_sender: mpsc::Sender<UpstreamDropEvent>,
+    release_sender: mpsc::Sender<oneshot::Sender<()>>,
     attempt_counts: Arc<Mutex<HashMap<String, u64>>>,
 }
 
@@ -20764,11 +20791,13 @@ impl CancellableUpstream {
     async fn spawn() -> Self {
         let (request_sender, receiver) = mpsc::channel(10);
         let (drop_sender, drop_receiver) = mpsc::channel(10);
+        let (release_sender, body_releases) = mpsc::channel(10);
         let app = Router::new()
             .fallback(cancellable_upstream_handler)
             .with_state(CancellableUpstreamState {
                 request_sender,
                 drop_sender,
+                release_sender,
                 attempt_counts: Arc::new(Mutex::new(HashMap::new())),
             });
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -20787,6 +20816,7 @@ impl CancellableUpstream {
             base_url: format!("http://{addr}/v1"),
             receiver,
             drop_receiver,
+            body_releases,
             _server: server,
         }
     }
@@ -20807,6 +20837,13 @@ impl CancellableUpstream {
             .await
             .expect("upstream response body should be dropped before timeout")
             .expect("upstream drop channel should stay open")
+    }
+
+    fn release_bodies(&mut self) {
+        while let Ok(release) = self.body_releases.try_recv() {
+            // An incomplete physical Drop closes its receiver before fixture cleanup.
+            let _released = release.send(());
+        }
     }
 
     async fn recv_drop_optional_within(&mut self, wait: Duration) -> Option<UpstreamDropEvent> {
@@ -21198,16 +21235,23 @@ async fn cancellable_upstream_handler(
         );
     }
 
+    // Cancellation tests own the unfinished-body precondition, not a wall-clock race.
+    let (release, released) = oneshot::channel();
+    state
+        .release_sender
+        .try_send(release)
+        .expect("body release should fit");
     if body_requests_stream(&body) {
         if path_and_query.contains("test=connection-storm") {
             return cancellable_chat_sse_response_with_delay(
                 state.drop_sender,
+                released,
                 STREAM_COMPLETION_TIMEOUT,
             );
         }
-        cancellable_chat_sse_response(state.drop_sender)
+        cancellable_chat_sse_response(state.drop_sender, released)
     } else {
-        cancellable_chat_json_response(state.drop_sender)
+        cancellable_chat_json_response(state.drop_sender, released)
     }
 }
 
@@ -22308,12 +22352,16 @@ fn parked_stream_response(
     response
 }
 
-fn cancellable_chat_sse_response(drop_sender: mpsc::Sender<UpstreamDropEvent>) -> Response<Body> {
-    cancellable_chat_sse_response_with_delay(drop_sender, STREAM_DELAY)
+fn cancellable_chat_sse_response(
+    drop_sender: mpsc::Sender<UpstreamDropEvent>,
+    released: oneshot::Receiver<()>,
+) -> Response<Body> {
+    cancellable_chat_sse_response_with_delay(drop_sender, released, STREAM_DELAY)
 }
 
 fn cancellable_chat_sse_response_with_delay(
     drop_sender: mpsc::Sender<UpstreamDropEvent>,
+    released: oneshot::Receiver<()>,
     delay_after_first: Duration,
 ) -> Response<Body> {
     let chunks = vec![
@@ -22327,11 +22375,15 @@ fn cancellable_chat_sse_response_with_delay(
         "text/event-stream",
         chunks,
         drop_sender,
+        Some(released),
         delay_after_first,
     )
 }
 
-fn cancellable_chat_json_response(drop_sender: mpsc::Sender<UpstreamDropEvent>) -> Response<Body> {
+fn cancellable_chat_json_response(
+    drop_sender: mpsc::Sender<UpstreamDropEvent>,
+    released: oneshot::Receiver<()>,
+) -> Response<Body> {
     let chunks = vec![
         Bytes::from_static(br#"{"id":"chatcmpl-cancellable","#),
         Bytes::from_static(
@@ -22343,6 +22395,7 @@ fn cancellable_chat_json_response(drop_sender: mpsc::Sender<UpstreamDropEvent>) 
         "application/json",
         chunks,
         drop_sender,
+        Some(released),
         STREAM_DELAY,
     )
 }
@@ -22352,12 +22405,14 @@ fn cancellable_stream_response(
     content_type: &'static str,
     chunks: Vec<Bytes>,
     drop_sender: mpsc::Sender<UpstreamDropEvent>,
+    released: Option<oneshot::Receiver<()>>,
     delay_after_first: Duration,
 ) -> Response<Body> {
     let body = Body::from_stream(CancellableResponseStream::new(
         label,
         chunks,
         drop_sender,
+        released,
         delay_after_first,
     ));
     let mut response = Response::new(body);
@@ -22376,6 +22431,7 @@ struct CancellableResponseStream {
     label: &'static str,
     chunks: Vec<Bytes>,
     next_index: usize,
+    released: Option<oneshot::Receiver<()>>,
     delay_after_first: Option<Pin<Box<tokio::time::Sleep>>>,
     drop_sender: mpsc::Sender<UpstreamDropEvent>,
     completed: bool,
@@ -22386,12 +22442,14 @@ impl CancellableResponseStream {
         label: &'static str,
         chunks: Vec<Bytes>,
         drop_sender: mpsc::Sender<UpstreamDropEvent>,
+        released: Option<oneshot::Receiver<()>>,
         delay_after_first: Duration,
     ) -> Self {
         Self {
             label,
             chunks,
             next_index: 0,
+            released,
             delay_after_first: Some(Box::pin(sleep(delay_after_first))),
             drop_sender,
             completed: false,
@@ -22407,6 +22465,15 @@ impl Stream for CancellableResponseStream {
         if this.next_index >= this.chunks.len() {
             this.completed = true;
             return Poll::Ready(None);
+        }
+
+        if this.next_index > 0
+            && let Some(released) = &mut this.released
+        {
+            if Pin::new(released).poll(cx).is_pending() {
+                return Poll::Pending;
+            }
+            this.released = None;
         }
 
         if this.next_index > 0
@@ -22822,6 +22889,7 @@ fn cancellable_repeated_reasoning_line_sse_response(
         "text/event-stream",
         delta_vec_sse_chunks(deltas),
         drop_sender,
+        None,
         delay_after_first,
     )
 }
