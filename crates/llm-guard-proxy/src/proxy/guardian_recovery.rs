@@ -44,7 +44,7 @@ impl ProxyState {
         };
         let policy = LocalRecoveryPolicy::from_config(&profile.local_recovery);
         if !policy.is_configured()
-            || !foreground_command(&policy.restart_command)
+            || !profile.local_recovery.is_usable_for_guardian_tier2()
             || request.authority.dispatch(|| ()).is_none()
             || self.shutdown.is_shutting_down()
         {
@@ -251,19 +251,5 @@ fn identity(request: &RecoveryRequest) -> Option<GuardianRecoveryIdentity> {
         grace_secs: request.grace_secs,
         binary_device: binary.dev(),
         binary_inode: binary.ino(),
-    })
-}
-
-fn foreground_command(command: &[String]) -> bool {
-    // These launchers transfer the work outside the owned process group. Arbitrary
-    // configured helpers remain trusted: they must stay foreground and must not setsid/daemonize.
-    command.first().is_some_and(|program| {
-        std::path::Path::new(program).is_absolute()
-            && !matches!(
-                std::path::Path::new(program)
-                    .file_name()
-                    .and_then(|name| name.to_str()),
-                Some("systemctl" | "systemd-run" | "docker" | "sh" | "bash" | "sudo")
-            )
     })
 }

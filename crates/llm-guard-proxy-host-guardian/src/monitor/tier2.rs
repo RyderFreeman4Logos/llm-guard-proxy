@@ -193,6 +193,12 @@ pub(super) struct GuardianEscalation {
 }
 
 impl GuardianEscalation {
+    pub(super) fn has_open_executor(&self) -> bool {
+        self.sender
+            .as_ref()
+            .is_some_and(|sender| !sender.is_closed())
+    }
+
     pub(super) fn revalidate(&mut self) {
         if let Some(invocation) = &mut self.invocation {
             if invocation.authority.dispatch(|| ()).is_none() {

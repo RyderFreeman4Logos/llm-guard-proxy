@@ -362,7 +362,27 @@ impl AppConfig {
         self.upstream_stall.validate()?;
         self.validate_upstream_stall_timeout_order()?;
         self.heartbeat.validate()?;
-        self.guardian.validate()
+        self.validate_guardian_recovery_profile()
+    }
+
+    fn validate_guardian_recovery_profile(&self) -> Result<(), ValidationError> {
+        self.guardian.validate()?;
+        if self.guardian.escalation_enabled {
+            let recovery = if self.guardian.escalation_profile == DEFAULT_UPSTREAM_PROFILE_NAME {
+                Some(&self.upstream.local_recovery)
+            } else {
+                self.upstream_profiles
+                    .iter()
+                    .find(|profile| profile.name == self.guardian.escalation_profile)
+                    .map(|profile| &profile.local_recovery)
+            };
+            require(
+                recovery.is_some_and(LocalRecoveryConfig::is_usable_for_guardian_tier2),
+                "guardian.escalation_profile",
+                "must reference an existing profile with enabled local recovery and a supported foreground restart command",
+            )?;
+        }
+        Ok(())
     }
 
     fn validate_upstream_profiles(&self) -> Result<(), ValidationError> {
@@ -1823,6 +1843,23 @@ pub struct LocalRecoveryConfig {
 }
 
 impl LocalRecoveryConfig {
+    /// Returns whether this profile declares a recovery command the Guardian
+    /// can own as a foreground child process. The command must use an absolute
+    /// path and avoid known launchers that transfer work outside that process.
+    /// Custom executables are trusted to remain in the foreground.
+    #[must_use]
+    pub fn is_usable_for_guardian_tier2(&self) -> bool {
+        self.enabled
+            && self.restart_command.first().is_some_and(|program| {
+                let path = Path::new(program);
+                path.is_absolute()
+                    && !matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some("systemctl" | "systemd-run" | "docker" | "sh" | "bash" | "sudo")
+                    )
+            })
+    }
+
     fn validate(&self, fields: LocalRecoveryValidationFields) -> Result<(), ValidationError> {
         require(
             self.restart_command

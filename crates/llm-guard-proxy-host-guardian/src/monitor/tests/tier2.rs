@@ -17,6 +17,8 @@ fn fixture() -> (
     let mut config = guardian_config("target.v1", &root);
     config.guardian.escalation_enabled = true;
     config.guardian.escalation_profile = String::from("default");
+    config.upstream.local_recovery.enabled = true;
+    config.upstream.local_recovery.restart_command = vec![String::from("/usr/bin/true")];
     let meminfo = root.join("meminfo");
     fs::write(&meminfo, b"MemAvailable: 0 kB\n").expect("synthetic pressure");
     let mut guardian =
@@ -50,6 +52,51 @@ fn elapse_grace(guardian: &mut MemoryGuardian) {
             .checked_sub(Duration::from_secs(61))
             .expect("elapsed fixture grace"),
     );
+}
+
+#[test]
+fn tier2_reload_requires_executor_and_remains_retryable() {
+    let (root, _) = target_tree();
+    let handle = ConfigHandle::new(guardian_config("target.v1", &root));
+    let mut guardian =
+        MemoryGuardian::open(handle.clone(), root.join("runtime")).expect("open guardian");
+    guardian.reconcile_healthy_target();
+    let original_policy = guardian.active_policy().clone();
+
+    let mut requested = guardian_config("target.v1", &root);
+    requested.guardian.escalation_enabled = true;
+    requested.guardian.escalation_profile = String::from("default");
+    requested.upstream.local_recovery.enabled = true;
+    requested.upstream.local_recovery.restart_command = vec![String::from("/usr/bin/true")];
+    let reload = handle
+        .apply_reloadable(&requested)
+        .expect("valid policy reload should return an outcome");
+    let requested_snapshot = handle.guardian_snapshot();
+
+    let applied_without_executor = guardian.reconcile_healthy_target();
+    let policy_without_executor = guardian.active_policy().clone();
+    let rejected_policy = guardian.last_rejected_policy.clone();
+
+    let (sender, receiver) = mpsc::channel(1);
+    guardian.set_recovery_sender(sender);
+    let applied_with_executor = guardian.reconcile_healthy_target();
+    let policy_with_executor = guardian.active_policy().clone();
+    drop(receiver);
+
+    fs::remove_dir_all(root).expect("cleanup fixture");
+    assert!(reload.applied, "valid requested policy should be published");
+    assert_eq!(
+        requested_snapshot.expect("snapshot should succeed"),
+        requested.guardian
+    );
+    assert!(
+        !applied_without_executor,
+        "standalone mode must reject Tier 2"
+    );
+    assert_eq!(policy_without_executor, original_policy);
+    assert_eq!(rejected_policy, Some(requested.guardian.clone()));
+    assert!(applied_with_executor, "combined mode should admit Tier 2");
+    assert_eq!(policy_with_executor, requested.guardian);
 }
 
 #[test]

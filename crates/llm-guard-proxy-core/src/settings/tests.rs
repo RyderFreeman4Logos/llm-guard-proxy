@@ -4254,6 +4254,10 @@ escalation_profile = "default"
 escalation_grace_secs = 30
 escalation_timeout_secs = 10
 escalation_mem_threshold_gib = 1
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/true"]
 "#,
     )
     .expect("parse Tier 2");

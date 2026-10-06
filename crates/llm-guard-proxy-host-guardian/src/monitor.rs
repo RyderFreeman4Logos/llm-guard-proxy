@@ -755,6 +755,13 @@ impl MemoryGuardian {
     }
 
     fn try_apply_policy(&mut self, requested: GuardianConfig) -> bool {
+        if requested.escalation_enabled && !self.escalation.has_open_executor() {
+            self.note_policy_rejection(
+                &requested,
+                &"Tier 2 requires combined proxy mode and its owned recovery executor",
+            );
+            return false;
+        }
         let thresholds = match thresholds_from_policy(&requested) {
             Ok(thresholds) => thresholds,
             Err(error) => {
