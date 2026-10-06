@@ -112,8 +112,6 @@ use buffered_adapter::{
 use precommit_recovery::UpstreamResponse;
 use reranker_protocol::{CanonicalRerankerRequest, RenderedEndpointRequest};
 
-#[cfg(all(test, unix))]
-use recovery::send_recovery_process_group_signal;
 use recovery::{
     RecoveryProcessGuard, configure_recovery_command, recovery_join_timeout,
     recovery_result_poll_interval, terminate_timed_out_recovery_child,

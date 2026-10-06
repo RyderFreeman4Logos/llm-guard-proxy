@@ -68,15 +68,79 @@ pub(super) const fn recovery_result_poll_interval() -> Duration {
     RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET.coordinator_handoff
 }
 
-/// Owns a recovery child and its process group until the direct child is reaped.
+/// Owns a recovery child and its process group until settlement is proven.
 ///
-/// Dropping an armed guard synchronously kills the group, then transfers direct-child reaping to
-/// a bounded OS thread so async executor workers never block during cancellation.
+/// Dropping an armed guard signals only while the captured leader identity still matches, then
+/// transfers group census and reaping to a bounded OS thread. Unknown identity keeps ownership
+/// fenced and suppresses cached-PID/PGID signals.
 pub(super) struct RecoveryProcessGuard {
     child: Option<tokio::process::Child>,
     physical_owner: Arc<AtomicUsize>,
     #[cfg(unix)]
     process_group_id: Option<u32>,
+    #[cfg(unix)]
+    process_group_identity: Option<RecoveryProcessGroupIdentity>,
+}
+
+/// Captured group-leader instance; a numeric PGID alone is never signal authority.
+#[derive(Clone, Copy)]
+struct RecoveryProcessGroupIdentity {
+    process_group_id: u32,
+    #[cfg(target_os = "linux")]
+    start_time_ticks: u64,
+}
+
+#[cfg(unix)]
+impl RecoveryProcessGroupIdentity {
+    fn capture(process_group_id: u32) -> Option<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            if !recovery_child_is_unreaped(process_group_id) {
+                return None;
+            }
+            let stat = read_recovery_stat(std::fs::File::open(format!(
+                "/proc/{process_group_id}/stat"
+            )))
+            .ok()??;
+            let (observed_group, start_time_ticks, state) =
+                recovery_stat_process_group_identity(&stat).ok()?;
+            (observed_group == process_group_id && state.is_ascii_alphabetic()).then_some(Self {
+                process_group_id,
+                start_time_ticks,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = process_group_id;
+            None
+        }
+    }
+
+    fn is_current(self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            if !recovery_child_is_unreaped(self.process_group_id) {
+                return false;
+            }
+            let Ok(Some(stat)) = read_recovery_stat(std::fs::File::open(format!(
+                "/proc/{}/stat",
+                self.process_group_id
+            ))) else {
+                return false;
+            };
+            recovery_stat_process_group_identity(&stat).is_ok_and(
+                |(group, start_time_ticks, state)| {
+                    group == self.process_group_id
+                        && start_time_ticks == self.start_time_ticks
+                        && state.is_ascii_alphabetic()
+                },
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
+    }
 }
 
 impl RecoveryProcessGuard {
@@ -90,10 +154,17 @@ impl RecoveryProcessGuard {
         physical_owner: Arc<AtomicUsize>,
     ) -> Self {
         physical_owner.fetch_add(1, Ordering::AcqRel);
+        #[cfg(unix)]
+        let process_group_id = child.id();
+        #[cfg(unix)]
+        let process_group_identity =
+            process_group_id.and_then(RecoveryProcessGroupIdentity::capture);
         Self {
             physical_owner,
             #[cfg(unix)]
-            process_group_id: child.id(),
+            process_group_id,
+            #[cfg(unix)]
+            process_group_identity,
             child: Some(child),
         }
     }
@@ -103,11 +174,32 @@ impl RecoveryProcessGuard {
         self.process_group_id
     }
 
+    #[cfg(unix)]
+    fn process_group_identity(&self) -> Option<RecoveryProcessGroupIdentity> {
+        self.process_group_identity
+    }
+
+    #[cfg(unix)]
+    pub(super) fn signal_process_group(&self, signal: Signal) -> bool {
+        self.process_group_identity
+            .is_some_and(|identity| send_recovery_process_group_signal(identity, signal))
+    }
+
     pub(super) async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        #[cfg(unix)]
+        if self.process_group_id.is_some() && self.process_group_identity.is_none() {
+            return Err(std::io::Error::other("recovery child identity unavailable"));
+        }
         #[cfg(target_os = "linux")]
         if let Some(pid) = self.process_group_id {
+            let Some(identity) = self.process_group_identity else {
+                return Err(std::io::Error::other("recovery child identity unavailable"));
+            };
             // Keep the leader unreaped until its group is stopped: reaping first
             // permits PID reuse and makes any later negative-PID signal unsafe.
+            if !identity.is_current() {
+                return Err(std::io::Error::other("recovery child identity unavailable"));
+            }
             loop {
                 match observe_recovery_child_without_reaping(pid) {
                     "child_exited_unreaped_after_term" => break,
@@ -117,8 +209,17 @@ impl RecoveryProcessGuard {
                     _ => return Err(std::io::Error::other("recovery child identity unavailable")),
                 }
             }
-            let _sent = send_recovery_process_group_signal(pid, Signal::SIGKILL);
-            while !recovery_group_quiescent(pid)? {
+            let _sent = self.signal_process_group(Signal::SIGKILL);
+            if !identity.is_current() {
+                return Err(std::io::Error::other("recovery child identity unavailable"));
+            }
+            loop {
+                if !identity.is_current() {
+                    return Err(std::io::Error::other("recovery child identity unavailable"));
+                }
+                if recovery_group_quiescent(pid)? {
+                    break;
+                }
                 tokio::time::sleep(RECOVERY_PROCESS_GROUP_TERM_POLL_INTERVAL).await;
             }
         }
@@ -132,16 +233,27 @@ impl RecoveryProcessGuard {
         result
     }
 
-    /// Kills only the direct child when no validated process-group identity is available.
+    /// Kills and reaps the direct child on platforms without Unix process-group ownership.
     ///
-    /// The normal Unix timeout path signals the entire process group before waiting. This fallback
-    /// is used only for a missing group ID or on platforms without recovery process groups.
+    /// Unix cleanup requires a current leader identity; an unknown identity returns an error and
+    /// leaves physical ownership fenced instead of signaling a possibly recycled PID.
     async fn kill_direct_child(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if !self
+            .process_group_identity
+            .is_some_and(RecoveryProcessGroupIdentity::is_current)
+        {
+            return Err(std::io::Error::other("recovery child identity unavailable"));
+        }
         let Some(child) = self.child.as_mut() else {
             return Ok(());
         };
         let result = child.kill().await;
         if result.is_ok() {
+            #[cfg(unix)]
+            if self.process_group_id.is_some() {
+                return result;
+            }
             self.disarm_after_reap();
         }
         result
@@ -151,6 +263,7 @@ impl RecoveryProcessGuard {
         #[cfg(unix)]
         {
             self.process_group_id = None;
+            self.process_group_identity = None;
         }
         if self.child.take().is_some() {
             self.physical_owner.fetch_sub(1, Ordering::AcqRel);
@@ -234,6 +347,45 @@ fn recovery_stat_is_active_member(stat: &[u8], group: u32) -> std::io::Result<bo
     Ok(pgid == group && !matches!(state, b"Z" | b"X"))
 }
 
+#[cfg(target_os = "linux")]
+/// Returns `(process_group_id, start_time_ticks, state)` from one proc stat row.
+/// Keep the validated state in the contract so callers cannot accidentally skip it.
+fn recovery_stat_process_group_identity(stat: &[u8]) -> std::io::Result<(u32, u64, u8)> {
+    let invalid = || {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid process stat identity fields",
+        )
+    };
+    let offset = stat
+        .windows(2)
+        .rposition(|pair| pair == b") ")
+        .ok_or_else(invalid)?
+        + 2;
+    let mut fields = stat[offset..]
+        .split(u8::is_ascii_whitespace)
+        .filter(|field| !field.is_empty());
+    let state = fields
+        .next()
+        .filter(|field| field.len() == 1 && field[0].is_ascii_alphabetic())
+        .ok_or_else(invalid)?;
+    let _parent = fields.next().ok_or_else(invalid)?;
+    let process_group_id = fields
+        .next()
+        .filter(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .and_then(|field| field.parse::<u32>().ok())
+        .ok_or_else(invalid)?;
+    // After field 5 (pgrp), starttime is field 22, with sixteen fields between.
+    let start_time_ticks = fields
+        .nth(16)
+        .filter(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
+        .and_then(|field| std::str::from_utf8(field).ok())
+        .and_then(|field| field.parse::<u64>().ok())
+        .ok_or_else(invalid)?;
+    Ok((process_group_id, start_time_ticks, state[0]))
+}
+
 impl Drop for RecoveryProcessGuard {
     fn drop(&mut self) {
         let Some(mut child) = self.child.take() else {
@@ -242,24 +394,45 @@ impl Drop for RecoveryProcessGuard {
         #[cfg(unix)]
         let process_group_id = self.process_group_id.take();
         #[cfg(unix)]
-        if let Some(process_group_id) = process_group_id {
-            let _group_kill_sent =
-                send_recovery_process_group_signal(process_group_id, Signal::SIGKILL);
+        let process_group_identity = self.process_group_identity.take();
+        #[cfg(unix)]
+        if let Some(identity) = process_group_identity {
+            let _group_kill_sent = send_recovery_process_group_signal(identity, Signal::SIGKILL);
         }
+        #[cfg(unix)]
+        let _child_kill_started =
+            if process_group_identity.is_some_and(RecoveryProcessGroupIdentity::is_current) {
+                child.start_kill()
+            } else {
+                Ok(())
+            };
+        #[cfg(not(unix))]
+        let process_group_id = None;
+        #[cfg(not(unix))]
+        let process_group_identity = None;
+        #[cfg(not(unix))]
         let _child_kill_started = child.start_kill();
-        spawn_recovery_child_reaper(child, process_group_id, Arc::clone(&self.physical_owner));
+        spawn_recovery_child_reaper(
+            child,
+            process_group_id,
+            process_group_identity,
+            Arc::clone(&self.physical_owner),
+        );
     }
 }
 
 fn spawn_recovery_child_reaper(
     mut child: tokio::process::Child,
     process_group_id: Option<u32>,
+    process_group_identity: Option<RecoveryProcessGroupIdentity>,
     physical_owner: Arc<AtomicUsize>,
 ) {
+    if process_group_id.is_some() && process_group_identity.is_none() {
+        return;
+    }
     // Tokio documents orphan-queue cleanup as best-effort with no speed or frequency guarantee.
     // Retaining the owned child here gives cancellation a bounded `try_wait` loop; on Unix,
-    // `try_wait` reaps an exited child. If thread creation fails, `kill_on_drop` still requests
-    // direct-child termination and Tokio's orphan queue remains the best-effort fallback.
+    // `try_wait` reaps an exited child. Failed thread creation never releases physical ownership.
     let _reaper = std::thread::Builder::new()
         .name(String::from("llm-guard-recovery-reaper"))
         .spawn(move || {
@@ -271,6 +444,12 @@ fn spawn_recovery_child_reaper(
                 // fail-closed ownership independently of waiter/audit completion.
                 #[cfg(target_os = "linux")]
                 if let Some(group) = process_group_id {
+                    let Some(identity) = process_group_identity else {
+                        return;
+                    };
+                    if identity.process_group_id != group || !identity.is_current() {
+                        return;
+                    }
                     match observe_recovery_child_without_reaping(group) {
                         "child_exited_unreaped_after_term" => match recovery_group_quiescent(group)
                         {
@@ -312,11 +491,16 @@ fn spawn_recovery_child_reaper(
 
 #[cfg(unix)]
 pub(super) fn configure_recovery_command(command: &mut Command) {
+    // RecoveryProcessGuard must validate ownership before every signal; Tokio's cached-PID
+    // kill_on_drop fallback is unsafe after an external reaper and possible PID reuse.
+    command.kill_on_drop(false);
     command.process_group(0);
 }
 
 #[cfg(not(unix))]
-pub(super) fn configure_recovery_command(_command: &mut Command) {}
+pub(super) fn configure_recovery_command(command: &mut Command) {
+    command.kill_on_drop(false);
+}
 
 #[cfg(unix)]
 pub(super) async fn terminate_timed_out_recovery_child(
@@ -336,27 +520,71 @@ pub(super) async fn terminate_timed_out_recovery_child(
     };
 
     metadata.insert(
-        String::from("upstream_stall_recovery_timeout_term_sent"),
-        send_recovery_process_group_signal(pid, Signal::SIGTERM).to_string(),
+        String::from("upstream_stall_recovery_timeout_cleanup_status"),
+        String::from("group_identity_unconfirmed"),
     );
-    // WNOWAIT keeps the leader PID reserved until the final group signal, so
-    // numeric PID reuse cannot redirect SIGKILL to an unrelated process group.
+    let Some(_identity) = child.process_group_identity() else {
+        metadata.insert(
+            String::from("upstream_stall_recovery_timeout_term_sent"),
+            String::from("false"),
+        );
+        metadata.insert(
+            String::from("upstream_stall_recovery_timeout_term_child_wait_status"),
+            String::from("child_identity_unavailable"),
+        );
+        metadata.insert(
+            String::from("upstream_stall_recovery_timeout_kill_sent"),
+            String::from("false"),
+        );
+        return metadata;
+    };
+
+    let term_sent = child.signal_process_group(Signal::SIGTERM);
+    metadata.insert(
+        String::from("upstream_stall_recovery_timeout_term_sent"),
+        term_sent.to_string(),
+    );
+    if !term_sent {
+        metadata.insert(
+            String::from("upstream_stall_recovery_timeout_term_child_wait_status"),
+            String::from("child_identity_unavailable"),
+        );
+        metadata.insert(
+            String::from("upstream_stall_recovery_timeout_kill_sent"),
+            String::from("false"),
+        );
+        return metadata;
+    }
+
+    let term_wait_status = wait_for_term_child_exit_or_deadline(
+        pid,
+        RECOVERY_PROCESS_GROUP_TERM_GRACE,
+        RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET.term_observation,
+    )
+    .await;
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_term_child_wait_status"),
-        String::from(
-            wait_for_term_child_exit_or_deadline(
-                pid,
-                RECOVERY_PROCESS_GROUP_TERM_GRACE,
-                RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET.term_observation,
-            )
-            .await,
-        ),
+        String::from(term_wait_status),
     );
+    if !matches!(
+        term_wait_status,
+        "child_still_running_after_term" | "child_exited_unreaped_after_term"
+    ) {
+        metadata.insert(
+            String::from("upstream_stall_recovery_timeout_kill_sent"),
+            String::from("false"),
+        );
+        return metadata;
+    }
 
+    let kill_sent = child.signal_process_group(Signal::SIGKILL);
     metadata.insert(
         String::from("upstream_stall_recovery_timeout_kill_sent"),
-        send_recovery_process_group_signal(pid, Signal::SIGKILL).to_string(),
+        kill_sent.to_string(),
     );
+    if !kill_sent {
+        return metadata;
+    }
     let cleanup_status = match timeout(
         RECOVERY_PROCESS_GROUP_CLEANUP_BUDGET.kill_and_final_reap,
         child.wait(),
@@ -395,8 +623,14 @@ pub(super) async fn terminate_timed_out_recovery_child(
 }
 
 #[cfg(unix)]
-pub(super) fn send_recovery_process_group_signal(pid: u32, signal: Signal) -> bool {
-    let Ok(process_group_id) = i32::try_from(pid) else {
+fn send_recovery_process_group_signal(
+    identity: RecoveryProcessGroupIdentity,
+    signal: Signal,
+) -> bool {
+    if !identity.is_current() {
+        return false;
+    }
+    let Ok(process_group_id) = i32::try_from(identity.process_group_id) else {
         return false;
     };
     if process_group_id == 0 {
@@ -463,6 +697,14 @@ fn observe_recovery_child_without_reaping(pid: u32) -> &'static str {
 ))]
 fn observe_recovery_child_without_reaping(_pid: u32) -> &'static str {
     "child_state_unavailable_before_kill"
+}
+
+#[cfg(unix)]
+fn recovery_child_is_unreaped(pid: u32) -> bool {
+    matches!(
+        observe_recovery_child_without_reaping(pid),
+        "child_still_running_after_term" | "child_exited_unreaped_after_term"
+    )
 }
 
 #[cfg(all(test, target_os = "linux"))]
