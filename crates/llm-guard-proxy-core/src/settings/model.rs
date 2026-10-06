@@ -159,6 +159,16 @@ pub struct GuardianConfig {
     pub retry_interval_secs: u64,
     /// Cgroup v2 mount used to validate an operator-published registration.
     pub cgroup_root: PathBuf,
+    /// Enables generation-bound Tier 2; requires an in-process recovery executor.
+    pub escalation_enabled: bool,
+    /// Existing local-recovery profile whose foreground command is owned by Tier 2.
+    pub escalation_profile: String,
+    /// Continuous lower-threshold dwell after verified Tier 1.
+    pub escalation_grace_secs: u64,
+    /// Absolute action/readiness budget, excluding bounded cancellation cleanup.
+    pub escalation_timeout_secs: u64,
+    /// Tier 2 requires pressure at or below this lower `MemAvailable` threshold.
+    pub escalation_mem_threshold_gib: u64,
 }
 
 impl GuardianConfig {
@@ -232,6 +242,22 @@ impl GuardianConfig {
             "must be an absolute path",
         )?;
 
+        require(
+            (30..=60).contains(&self.escalation_grace_secs)
+                && (1..=3600).contains(&self.escalation_timeout_secs)
+                && self.escalation_mem_threshold_gib > 0
+                && self.escalation_mem_threshold_gib <= self.mem_threshold_gib,
+            "guardian.escalation_grace_secs",
+            "Tier 2 requires 30..60 seconds grace, 1..3600 seconds timeout and a positive lower memory threshold",
+        )?;
+        if self.escalation_enabled {
+            require(
+                self.enabled && self.kill_action == GuardianKillAction::CgroupKill,
+                "guardian.escalation_enabled",
+                "requires enabled direct-cgroup Tier 1",
+            )?;
+            validate_guardian_label(&self.escalation_profile)?;
+        }
         if self.enabled || !self.target_label.is_empty() {
             validate_guardian_label(&self.target_label)?;
         }
@@ -269,6 +295,11 @@ impl Default for GuardianConfig {
             reserve_mib: 64,
             retry_interval_secs: 5,
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
+            escalation_enabled: false,
+            escalation_profile: String::new(),
+            escalation_grace_secs: 60,
+            escalation_timeout_secs: 120,
+            escalation_mem_threshold_gib: 1,
         }
     }
 }
@@ -331,7 +362,27 @@ impl AppConfig {
         self.upstream_stall.validate()?;
         self.validate_upstream_stall_timeout_order()?;
         self.heartbeat.validate()?;
-        self.guardian.validate()
+        self.validate_guardian_recovery_profile()
+    }
+
+    fn validate_guardian_recovery_profile(&self) -> Result<(), ValidationError> {
+        self.guardian.validate()?;
+        if self.guardian.escalation_enabled {
+            let recovery = if self.guardian.escalation_profile == DEFAULT_UPSTREAM_PROFILE_NAME {
+                Some(&self.upstream.local_recovery)
+            } else {
+                self.upstream_profiles
+                    .iter()
+                    .find(|profile| profile.name == self.guardian.escalation_profile)
+                    .map(|profile| &profile.local_recovery)
+            };
+            require(
+                recovery.is_some_and(LocalRecoveryConfig::is_usable_for_guardian_tier2),
+                "guardian.escalation_profile",
+                "must reference an existing profile with enabled local recovery and a supported foreground restart command",
+            )?;
+        }
+        Ok(())
     }
 
     fn validate_upstream_profiles(&self) -> Result<(), ValidationError> {
@@ -1792,6 +1843,31 @@ pub struct LocalRecoveryConfig {
 }
 
 impl LocalRecoveryConfig {
+    /// Returns whether this profile declares a recovery command the Guardian
+    /// can own as a foreground child process. The command must use an absolute
+    /// path and avoid known launchers that transfer work outside that process.
+    /// Custom executables are trusted to remain in the foreground.
+    #[must_use]
+    pub fn is_usable_for_guardian_tier2(&self) -> bool {
+        self.enabled
+            && self.restart_command.first().is_some_and(|program| {
+                let path = Path::new(program);
+                path.is_absolute()
+                    && !matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some(
+                            "systemctl"
+                                | "systemd-run"
+                                | "docker"
+                                | "sh"
+                                | "bash"
+                                | "sudo"
+                                | "setsid"
+                        )
+                    )
+            })
+    }
+
     fn validate(&self, fields: LocalRecoveryValidationFields) -> Result<(), ValidationError> {
         require(
             self.restart_command

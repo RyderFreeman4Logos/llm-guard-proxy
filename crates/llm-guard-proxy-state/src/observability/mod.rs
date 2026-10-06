@@ -29,5 +29,5 @@ pub use model::{
     RequestStatus, RequestTerminalMetricCount, RetentionPruningStats, RetentionUsage, StoreWrite,
     TokenUsage, TokenUsageByEndpoint, UpstreamErrorMetricCount, UpstreamMode,
 };
-pub use recovery_receipt::LocalRecoveryReceipt;
+pub use recovery_receipt::{GuardianRecoveryIdentity, LocalRecoveryReceipt};
 pub use store::ObservabilityStore;

@@ -82,6 +82,8 @@ mod buffered_adapter;
 mod deepinfra_rerank_adapter;
 mod effective_liveness;
 mod generic_recovery;
+#[cfg(feature = "memory-guardian")]
+mod guardian_recovery;
 mod model_metadata;
 mod post_await_self_test;
 mod precommit_recovery;
@@ -7982,6 +7984,10 @@ struct UpstreamStallRecoveryState {
     active_recovery_episode_id: Option<u64>,
     active_recovery_episode_permits: Option<Arc<AtomicUsize>>,
     active_local_recovery_task: Option<AbortHandle>,
+    // Independent of waiter completion and terminal audit: task + owned group.
+    physical_recovery_owners: Arc<AtomicUsize>,
+    #[cfg(feature = "memory-guardian")]
+    active_guardian_recovery: bool,
     completed_recovery_episodes: VecDeque<CompletedRecoveryEpisode>,
 }
 
@@ -8038,6 +8044,10 @@ impl UpstreamStallRecoveryState {
     fn finish_recovery(&mut self, result: BTreeMap<String, String>) {
         let episode_id = self.active_recovery_episode_id.take();
         self.active_local_recovery_task = None;
+        #[cfg(feature = "memory-guardian")]
+        {
+            self.active_guardian_recovery = false;
+        }
         let permit_references = self
             .active_recovery_episode_permits
             .take()
@@ -9641,6 +9651,13 @@ async fn read_body_bytes_until_shutdown(
 async fn read_upstream_body_bytes(
     stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
 ) -> Result<Bytes, ProxyError> {
+    read_upstream_body_bytes_limited(stream, MAX_PROXY_BODY_BYTES).await
+}
+
+async fn read_upstream_body_bytes_limited(
+    stream: impl Stream<Item = Result<Bytes, reqwest::Error>>,
+    max_bytes: usize,
+) -> Result<Bytes, ProxyError> {
     let mut stream = Box::pin(stream);
     let mut body = BytesMut::new();
     while let Some(chunk) = stream.next().await {
@@ -9654,9 +9671,9 @@ async fn read_upstream_body_bytes(
             .len()
             .checked_add(chunk.len())
             .ok_or_else(|| ProxyError::upstream_body(String::from("upstream body is too large")))?;
-        if next_len > MAX_PROXY_BODY_BYTES {
+        if next_len > max_bytes {
             return Err(ProxyError::upstream_body(format!(
-                "upstream body exceeded proxy limit: max_bytes={MAX_PROXY_BODY_BYTES}"
+                "upstream body exceeded proxy limit: max_bytes={max_bytes}"
             )));
         }
         body.extend_from_slice(&chunk);
@@ -12292,16 +12309,7 @@ async fn send_hot_restart_probe(
         .send()
         .await
         .map_err(|error| sanitized_reqwest_error(&error))?;
-    if !response.status().is_success() {
-        return Ok(false);
-    }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| sanitized_reqwest_error(&error))?;
-    let value = serde_json::from_slice::<serde_json::Value>(&body)
-        .map_err(|error| format!("probe response JSON decode failed: {error}"))?;
-    Ok(is_valid_hot_restart_completion(&value))
+    decode_readiness_probe_response(response).await
 }
 
 #[cfg(feature = "upstream-hot-restart")]
@@ -12323,14 +12331,6 @@ fn hot_restart_probe_body(config: &HotRestartConfig) -> serde_json::Value {
         );
     }
     serde_json::Value::Object(body)
-}
-
-#[cfg(feature = "upstream-hot-restart")]
-fn is_valid_hot_restart_completion(value: &serde_json::Value) -> bool {
-    value
-        .get("choices")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|choices| !choices.is_empty())
 }
 
 #[cfg(feature = "upstream-hot-restart")]
@@ -12672,8 +12672,12 @@ async fn run_local_recovery_for_profile_observing(
         .receipt
         .clone()
         .episode(recovery_episode_id, cause, policy)
+        .physical_owner(Arc::clone(&state.physical_recovery_owners))
         .deadline(recovery_deadline);
     let task_receipt = receipt.clone();
+    state
+        .physical_recovery_owners
+        .fetch_add(1, Ordering::AcqRel);
     let recovery_task = tokio::spawn(async move {
         run_local_recovery_task(
             recovery_policy,
@@ -12719,6 +12723,13 @@ fn local_recovery_admission_failure(
     now: Instant,
 ) -> Option<BTreeMap<String, String>> {
     let mut metadata = BTreeMap::new();
+    if state.physical_recovery_owners.load(Ordering::Acquire) != 0 {
+        metadata.insert(
+            String::from("local_recovery_status"),
+            String::from("cleanup_unconfirmed"),
+        );
+        return Some(metadata);
+    }
     if let Some(last_finished) = state.last_finished {
         let elapsed = now.saturating_duration_since(last_finished);
         if elapsed < policy.cooldown {
@@ -12817,6 +12828,9 @@ fn spawn_local_recovery_terminalizer(
                 },
             )]),
         };
+        // Join confirms the task has dropped its child guard. Any still-owned
+        // group keeps its separate count until the real reaper confirms settlement.
+        receipt.physical_owner.fetch_sub(1, Ordering::AcqRel);
         if let Some(id) = receipt.acknowledged_id() {
             metadata.insert(String::from("local_recovery_receipt_id"), id.to_owned());
         }
@@ -12854,6 +12868,11 @@ async fn abort_local_recovery_episode(
     let recovery_task = {
         let state = coordinator.state.lock().await;
         if state.active_recovery_episode_id != Some(recovery_episode_id) {
+            return false;
+        }
+        #[cfg(feature = "memory-guardian")]
+        if state.active_guardian_recovery {
+            // Only its generation-bound owner can cancel and acknowledge this worker.
             return false;
         }
         state.active_local_recovery_task.clone()
@@ -13106,7 +13125,7 @@ async fn run_local_recovery_restart_command(
         return metadata;
     }
     let mut child = match command.spawn() {
-        Ok(child) => RecoveryProcessGuard::new(child),
+        Ok(child) => RecoveryProcessGuard::new_owned(child, Arc::clone(&receipt.physical_owner)),
         Err(error) => {
             metadata.insert(
                 String::from("local_recovery_restart_status"),
@@ -13257,13 +13276,18 @@ async fn send_local_recovery_readiness_probe(
         .send()
         .await
         .map_err(|error| sanitized_reqwest_error(&error))?;
+    decode_readiness_probe_response(response).await
+}
+
+async fn decode_readiness_probe_response(response: reqwest::Response) -> Result<bool, String> {
     if !response.status().is_success() {
         return Ok(false);
     }
-    let body = response
-        .bytes()
+    // One-token readiness must not aggregate a generation-sized response, even
+    // when chunked transport omits Content-Length.
+    let body = read_upstream_body_bytes_limited(response.bytes_stream(), 64 * 1024)
         .await
-        .map_err(|error| sanitized_reqwest_error(&error))?;
+        .map_err(|error| error.to_string())?;
     let value = serde_json::from_slice::<serde_json::Value>(&body)
         .map_err(|error| format!("readiness response JSON decode failed: {error}"))?;
     Ok(is_valid_chat_completion_probe_response(&value))
@@ -13273,7 +13297,43 @@ fn is_valid_chat_completion_probe_response(value: &serde_json::Value) -> bool {
     value
         .get("choices")
         .and_then(serde_json::Value::as_array)
-        .is_some_and(|choices| !choices.is_empty())
+        .is_some_and(|choices| {
+            !choices.is_empty()
+                && choices.iter().all(|choice| {
+                    choice
+                        .get("text")
+                        .and_then(prose_constraints::content_text)
+                        .is_some()
+                        || choice.get("message").is_some_and(|message| {
+                            message
+                                .get("content")
+                                .and_then(prose_constraints::content_text)
+                                .is_some()
+                                || message
+                                    .get("tool_calls")
+                                    .and_then(serde_json::Value::as_array)
+                                    .is_some_and(|calls| {
+                                        !calls.is_empty()
+                                            && calls.iter().all(|call| {
+                                                call.get("function")
+                                                    .is_some_and(usable_probe_function_call)
+                                            })
+                                    })
+                                || message
+                                    .get("function_call")
+                                    .is_some_and(usable_probe_function_call)
+                        })
+                })
+        })
+}
+
+fn usable_probe_function_call(call: &serde_json::Value) -> bool {
+    call.get("name")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|name| !name.is_empty())
+        && call
+            .get("arguments")
+            .is_some_and(serde_json::Value::is_string)
 }
 
 struct UpstreamStallRecoveryGate {
@@ -13352,6 +13412,13 @@ async fn run_upstream_stall_recovery(
     }
 
     let now = Instant::now();
+    if state.physical_recovery_owners.load(Ordering::Acquire) != 0 {
+        metadata.insert(
+            String::from("upstream_stall_recovery_status"),
+            String::from("cleanup_unconfirmed"),
+        );
+        return metadata;
+    }
     if let Some(last_finished) = state.last_finished {
         let elapsed = now.saturating_duration_since(last_finished);
         if elapsed < policy.recovery_cooldown {
@@ -13403,13 +13470,18 @@ async fn run_upstream_stall_recovery(
         return metadata;
     };
     state.runs_in_window = state.runs_in_window.saturating_add(1);
+    let physical_owner = Arc::clone(&state.physical_recovery_owners);
+    physical_owner.fetch_add(1, Ordering::AcqRel);
     drop(state);
 
     let task_policy = policy.clone();
     let task_coordinator = Arc::clone(coordinator);
     tokio::spawn(async move {
         let mut metadata = upstream_stall_recovery_metadata(true);
-        metadata.extend(run_upstream_stall_recovery_command(&task_policy).await);
+        metadata.extend(
+            run_upstream_stall_recovery_command(&task_policy, Arc::clone(&physical_owner)).await,
+        );
+        physical_owner.fetch_sub(1, Ordering::AcqRel);
         let _published =
             finish_upstream_stall_recovery(&task_coordinator, recovery_episode_id, metadata).await;
     });
@@ -13534,6 +13606,7 @@ fn upstream_stall_recovery_metadata(configured: bool) -> BTreeMap<String, String
 
 async fn run_upstream_stall_recovery_command(
     policy: &UpstreamStallPolicy,
+    physical_owner: Arc<AtomicUsize>,
 ) -> BTreeMap<String, String> {
     let mut metadata = BTreeMap::from([(
         String::from("upstream_stall_recovery_ran"),
@@ -13550,7 +13623,7 @@ async fn run_upstream_stall_recovery_command(
         .stderr(Stdio::null());
     configure_recovery_command(&mut command);
     let mut child = match command.spawn() {
-        Ok(child) => RecoveryProcessGuard::new(child),
+        Ok(child) => RecoveryProcessGuard::new_owned(child, physical_owner),
         Err(error) => {
             metadata.insert(
                 String::from("upstream_stall_recovery_status"),

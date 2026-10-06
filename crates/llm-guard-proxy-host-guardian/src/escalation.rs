@@ -32,6 +32,20 @@ impl EscalationEpisode {
         self.attempted = false;
     }
 
+    /// Claims this episode after one continuous grace window. Durable boot-once
+    /// admission belongs to the in-process executor, not this local latch.
+    pub(crate) fn take_due(&mut self, grace: Duration, now: Instant) -> bool {
+        if self.attempted
+            || self
+                .armed_at
+                .is_none_or(|at| now.saturating_duration_since(at) < grace)
+        {
+            return false;
+        }
+        self.attempted = true;
+        true
+    }
+
     /// Starts the configured service once after its grace period elapsed.
     ///
     /// # Errors

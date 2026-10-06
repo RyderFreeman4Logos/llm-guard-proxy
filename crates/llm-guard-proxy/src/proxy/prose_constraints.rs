@@ -193,7 +193,7 @@ fn append_up_to_char_limit(output: &mut String, value: &str, max_chars: usize) {
     output.extend(value.chars().take(remaining));
 }
 
-fn content_text(value: &Value) -> Option<String> {
+pub(super) fn content_text(value: &Value) -> Option<String> {
     match value {
         Value::String(text) => Some(text.clone()),
         Value::Array(parts) => {

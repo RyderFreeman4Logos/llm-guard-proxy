@@ -239,6 +239,11 @@ async fn run_guardian_command(command: GuardianCommand) -> Result<(), String> {
         .map_err(|error| error.to_string())?;
     let mut guardian = MemoryGuardian::open(manager.handle(), command.runtime_dir)
         .map_err(|error| error.to_string())?;
+    if guardian.active_policy().escalation_enabled {
+        return Err(String::from(
+            "Tier 2 requires combined proxy mode and its owned recovery executor",
+        ));
+    }
     guardian
         .run_until(shutdown_signal())
         .await
@@ -253,13 +258,23 @@ async fn serve_with_guardian(
         std::net::SocketAddr,
     )>,
     state: proxy::ProxyState,
-    guardian: MemoryGuardian,
+    mut guardian: MemoryGuardian,
 ) -> Result<(), String> {
+    let (sender, recovery_worker) = state.spawn_guardian_recovery();
+    guardian.set_recovery_sender(sender);
+    let guardian_shutdown = state.clone();
     let cleanup_state = state.clone();
     let mut server = tokio::spawn(serve_bound_listeners(bound_listeners, state));
     let mut guardian = tokio::spawn(async move {
         let mut guardian = guardian;
-        guardian.run_until(shutdown_signal()).await
+        guardian
+            .run_until(async {
+                tokio::select! {
+                    () = shutdown_signal() => {},
+                    () = guardian_shutdown.wait_for_shutdown() => {},
+                }
+            })
+            .await
     });
     let result = tokio::select! {
         server_result = &mut server => match server_result {
@@ -291,7 +306,14 @@ async fn serve_with_guardian(
             }
         },
     };
-    guardian.abort();
+    cleanup_state.begin_shutdown();
+    if !guardian.is_finished() {
+        let _settled = guardian.await;
+    }
+    recovery_worker
+        .await
+        .map_err(|_| String::from("guardian recovery worker failed"))?;
+    cleanup_state.flush_persistence().await;
     result
 }
 

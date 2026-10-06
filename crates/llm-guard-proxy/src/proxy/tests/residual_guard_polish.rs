@@ -742,7 +742,7 @@ max_per_window = 20
     remove_dir_all(&recovery_root);
 }
 
-fn multi_recovery_max_attempts_two_config(marker: &std::path::Path) -> String {
+pub(super) fn multi_recovery_max_attempts_two_config(marker: &std::path::Path) -> String {
     format!(
         r#"
 [heartbeat]

@@ -15,6 +15,7 @@ pub(super) struct Context {
     store: ObservabilityStore,
     tasks: super::Arc<super::PersistenceTasks>,
     acknowledged: super::Arc<super::AtomicBool>,
+    pub(super) physical_owner: super::Arc<super::AtomicUsize>,
     receipt: LocalRecoveryReceipt,
     owner_deadline: Option<super::Instant>,
     downstream_drop: Option<super::DownstreamDropSignal>,
@@ -33,8 +34,10 @@ impl Context {
             owner_deadline: None,
             downstream_drop: None,
             shutdown: None,
+            physical_owner: super::Arc::new(super::AtomicUsize::new(0)),
             acknowledged: super::Arc::new(super::AtomicBool::new(false)),
             receipt: LocalRecoveryReceipt {
+                guardian: None,
                 receipt_id: format!("recovery-{}-{}", std::process::id(), RequestId::generate()),
                 generated_at_unix_ms: 0,
                 process_id: std::process::id(),
@@ -57,6 +60,11 @@ impl Context {
                     .min_output_progress_units_in_window,
             },
         }
+    }
+
+    pub(super) fn physical_owner(mut self, owner: super::Arc<super::AtomicUsize>) -> Self {
+        self.physical_owner = owner;
+        self
     }
 
     pub(super) fn stall(mut self, first_chunk_ms: u64, idle_ms: u64) -> Self {
@@ -95,6 +103,18 @@ impl Context {
         };
         self.receipt.restart_timeout_ms = duration_millis_u64(policy.restart_timeout);
         self.receipt.readiness_deadline_ms = duration_millis_u64(policy.readiness_deadline);
+        self
+    }
+
+    #[cfg(feature = "memory-guardian")]
+    pub(super) fn guardian(
+        mut self,
+        identity: llm_guard_proxy_state::GuardianRecoveryIdentity,
+    ) -> Self {
+        self.receipt.guardian = Some(identity);
+        self.receipt.detector = "memory_guardian";
+        self.receipt.cause = "memory_pressure";
+        self.receipt.command_id = "guardian.foreground_recovery";
         self
     }
 
@@ -236,10 +256,20 @@ impl Context {
         let deadline = self
             .owner_deadline
             .map_or(deadline, |owner| deadline.min(owner.into_std()));
-        self.write(deadline, move |deadline| {
-            store.record_local_recovery_receipt(&receipt, deadline)
-        })
-        .await?;
+        #[cfg(test)]
+        self.store
+            .observe_recovery_receipt_test("record_submit", self.id());
+        let result = self
+            .write(deadline, move |deadline| {
+                #[cfg(test)]
+                store.observe_recovery_receipt_test("record_worker_start", &receipt.receipt_id);
+                store.record_local_recovery_receipt(&receipt, deadline)
+            })
+            .await;
+        #[cfg(test)]
+        self.store
+            .observe_recovery_receipt_test("record_ack", self.id());
+        result?;
         self.acknowledged.store(true, super::Ordering::Release);
         Ok(())
     }
@@ -256,15 +286,25 @@ impl Context {
         let readiness = metadata.get("local_recovery_readiness_status").cloned();
         let store = self.store.clone();
         let id = self.id().to_owned();
-        self.write(std::time::Instant::now() + WRITE_BUDGET, move |deadline| {
-            store.finish_local_recovery_receipt(
-                &id,
-                &outcome,
-                restart.as_deref(),
-                readiness.as_deref(),
-                deadline,
-            )
-        })
-        .await
+        #[cfg(test)]
+        self.store
+            .observe_recovery_receipt_test("terminal_submit", self.id());
+        let result = self
+            .write(std::time::Instant::now() + WRITE_BUDGET, move |deadline| {
+                #[cfg(test)]
+                store.observe_recovery_receipt_test("terminal_worker_start", &id);
+                store.finish_local_recovery_receipt(
+                    &id,
+                    &outcome,
+                    restart.as_deref(),
+                    readiness.as_deref(),
+                    deadline,
+                )
+            })
+            .await;
+        #[cfg(test)]
+        self.store
+            .observe_recovery_receipt_test("terminal_ack", self.id());
+        result
     }
 }
