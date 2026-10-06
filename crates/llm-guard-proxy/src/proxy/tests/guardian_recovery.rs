@@ -740,6 +740,111 @@ async fn tier2_terminal_sql_timeout_keeps_reaped_cancellation_unconfirmed() {
     assert_eq!(terminal, (id, String::from("cancelled")));
 }
 
+async fn run_acknowledged_preaction_cancellation_case(case: &'static str) {
+    let (_upstream, proxy, runtime) = fixture(vec![String::from("/usr/bin/true")]).await;
+    let marker = runtime.join("must-not-spawn");
+    let mut config = proxy.state.config.snapshot().expect("config");
+    config.upstream.local_recovery.restart_command =
+        vec![String::from("/usr/bin/touch"), marker.display().to_string()];
+    proxy
+        .state
+        .config
+        .apply_reloadable(&config)
+        .expect("policy");
+
+    let database = rusqlite::Connection::open(&proxy.sqlite_path).expect("database");
+    if case == "terminal_failure" {
+        database
+                .execute_batch(
+                    "CREATE TRIGGER r1_preaction_terminal_failure BEFORE UPDATE ON local_recovery_receipts BEGIN SELECT RAISE(FAIL, 'r1 preaction terminal failure'); END;",
+                )
+                .expect("scoped terminal write failure");
+    }
+
+    let timeout = if case == "deadline" {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_secs(5)
+    };
+    let (request, receiver) = make_request(proxy.state.config.clone(), &runtime, timeout);
+    let deadline = request.authority.deadline;
+    let state = proxy.state.clone();
+    let stages = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+    let observed_stages = Arc::clone(&stages);
+    proxy
+        .state
+        .store
+        .set_recovery_receipt_test_hook(move |stage, _id| {
+            observed_stages.lock().expect("receipt stages").push(stage);
+            if stage == "record_ack" {
+                if case == "deadline" {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    std::thread::sleep(remaining + Duration::from_millis(5));
+                } else {
+                    state.begin_shutdown();
+                }
+            }
+        });
+
+    let outcome = run(&proxy, request, receiver).await;
+    let (receipt_id, terminal, claim_id, claim_count): (
+            String,
+            Option<String>,
+            Option<String>,
+            u32,
+        ) = database
+            .query_row(
+                "SELECT r.receipt_id, r.outcome, c.receipt_id, (SELECT count(*) FROM guardian_boot_claim) FROM local_recovery_receipts r LEFT JOIN guardian_boot_claim c ON c.singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .expect("durably acknowledged pre-action receipt and boot claim");
+    let expected_terminal = match case {
+        "shutdown" => Some("shutdown_cancelled"),
+        "deadline" => Some("episode_timeout"),
+        _ => None,
+    };
+    let expected_outcome = if case == "terminal_failure" {
+        RecoveryOutcome::Unconfirmed
+    } else {
+        RecoveryOutcome::NotAdmitted
+    };
+    assert_eq!(
+        terminal.as_deref(),
+        expected_terminal,
+        "{case} terminal row"
+    );
+    assert_eq!(outcome, expected_outcome, "{case} Guardian outcome");
+    assert_eq!(
+        claim_id.as_deref(),
+        Some(receipt_id.as_str()),
+        "{case} claim"
+    );
+    assert_eq!(claim_count, 1, "{case} boot claim is retained");
+    assert!(!marker.exists(), "{case} cancellation spawned the command");
+    let stages = stages.lock().expect("receipt stages");
+    assert!(stages.contains(&"record_ack"), "{case} reached durable ACK");
+    assert!(
+        stages.contains(&"terminal_submit"),
+        "{case} attempted the existing bounded terminal writer"
+    );
+}
+
+#[tokio::test]
+async fn tier2_acknowledged_shutdown_terminalizes_without_admitting_action() {
+    run_acknowledged_preaction_cancellation_case("shutdown").await;
+}
+
+#[tokio::test]
+async fn tier2_acknowledged_deadline_terminalizes_without_admitting_action() {
+    run_acknowledged_preaction_cancellation_case("deadline").await;
+}
+
+#[tokio::test]
+async fn tier2_acknowledged_terminal_write_failure_is_unconfirmed() {
+    run_acknowledged_preaction_cancellation_case("terminal_failure").await;
+}
+
 #[tokio::test]
 async fn tier2_stale_expired_busy_and_receipt_failure_do_not_act() {
     for case in ["stale", "expired", "busy", "receipt"] {

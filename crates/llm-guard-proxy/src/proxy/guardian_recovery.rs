@@ -89,8 +89,13 @@ impl ProxyState {
             Err(metadata) => {
                 #[cfg(test)]
                 eprintln!("guardian admission failure={metadata:?}");
-                finish_local_recovery_episode(&coordinator, episode, metadata).await;
-                return RecoveryOutcome::NotAdmitted;
+                return finish_guardian_pre_spawn_failure(
+                    &receipt,
+                    &coordinator,
+                    episode,
+                    metadata,
+                )
+                .await;
             }
         };
         let outcome = self
@@ -220,6 +225,35 @@ impl ProxyState {
             }
         }
     }
+}
+
+async fn finish_guardian_pre_spawn_failure(
+    receipt: &recovery_receipt::Context,
+    coordinator: &super::UpstreamStallRecoveryCoordinator,
+    episode: u64,
+    mut metadata: std::collections::BTreeMap<String, String>,
+) -> RecoveryOutcome {
+    // A durable ACK must be paired with the existing bounded terminal write.
+    let outcome = if receipt.acknowledged_id().is_some() {
+        match receipt.finish(&metadata).await {
+            Ok(()) => RecoveryOutcome::NotAdmitted,
+            Err(category) => {
+                metadata.insert(
+                    String::from("local_recovery_status"),
+                    String::from("receipt_failed"),
+                );
+                metadata.insert(
+                    String::from("local_recovery_receipt_error"),
+                    category.to_owned(),
+                );
+                RecoveryOutcome::Unconfirmed
+            }
+        }
+    } else {
+        RecoveryOutcome::NotAdmitted
+    };
+    finish_local_recovery_episode(coordinator, episode, metadata).await;
+    outcome
 }
 
 fn cancelled_outcome(request: &RecoveryRequest) -> RecoveryOutcome {

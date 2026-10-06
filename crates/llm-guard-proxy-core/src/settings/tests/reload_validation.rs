@@ -162,3 +162,36 @@ fn tier2_requires_existing_enabled_usable_recovery_profile_at_startup_and_reload
     );
     assert_eq!(handle.snapshot().expect("snapshot should succeed"), current);
 }
+
+#[test]
+fn tier2_rejects_known_launchers_but_trusts_custom_foreground_executables() {
+    for launcher in [
+        "systemctl",
+        "systemd-run",
+        "docker",
+        "sh",
+        "bash",
+        "sudo",
+        "setsid",
+    ] {
+        let restart_command = if launcher == "setsid" {
+            String::from(
+                "restart_command = [\"/usr/bin/setsid\", \"--fork\", \"/usr/bin/sleep\", \"30\"]",
+            )
+        } else {
+            format!("restart_command = [\"/usr/bin/{launcher}\"]")
+        };
+        let recovery = format!("[upstream.local_recovery]\nenabled = true\n{restart_command}");
+        let error = tier2_config("default", &recovery)
+            .validate()
+            .expect_err(launcher);
+        assert_eq!(error.field(), "guardian.escalation_profile", "{launcher}");
+    }
+
+    tier2_config(
+        "default",
+        "[upstream.local_recovery]\nenabled = true\nrestart_command = [\"/opt/vendor/restart-agent\"]",
+    )
+    .validate()
+    .expect("custom absolute foreground executables remain trusted");
+}

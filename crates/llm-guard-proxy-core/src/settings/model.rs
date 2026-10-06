@@ -1855,7 +1855,15 @@ impl LocalRecoveryConfig {
                 path.is_absolute()
                     && !matches!(
                         path.file_name().and_then(|name| name.to_str()),
-                        Some("systemctl" | "systemd-run" | "docker" | "sh" | "bash" | "sudo")
+                        Some(
+                            "systemctl"
+                                | "systemd-run"
+                                | "docker"
+                                | "sh"
+                                | "bash"
+                                | "sudo"
+                                | "setsid"
+                        )
                     )
             })
     }
