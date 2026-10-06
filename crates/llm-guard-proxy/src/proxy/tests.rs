@@ -8356,10 +8356,7 @@ async fn recovery_fixture_helpers_are_raii_bounded() {
 async fn recovery_process_group_signal_uses_typed_in_process_api() {
     let fixture = RecoveryProcessFixture::spawn_shell("while :; do sleep 1; done");
 
-    assert!(send_recovery_process_group_signal(
-        fixture.process_group_id,
-        Signal::SIGTERM,
-    ));
+    assert!(fixture.child.signal_process_group(Signal::SIGTERM));
 }
 
 #[cfg(target_os = "linux")]
