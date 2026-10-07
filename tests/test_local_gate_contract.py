@@ -1,5 +1,6 @@
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -36,8 +37,53 @@ class LocalGateContractTests(unittest.TestCase):
         )
         self.assertIn("review-check:", lefthook)
         self.assertIn("run: scripts/hooks/review-check.sh", lefthook)
-        self.assertIn("run: just pre-push", lefthook)
+        self.assertIn("run: just pre-push-hook\n", lefthook)
         self.assertIn("CSA_SKIP_REVIEW_CHECK", review_check)
+
+    def test_pre_push_hook_routes_native_evidence_without_full_gate_fallback(self) -> None:
+        # Controlled validator exit tests routing only, not native acceptance.
+        # The separate native receipt suite exercises the real trust boundary.
+        launcher = shutil.which("just")
+        assert launcher is not None, "Just is required for hook routing controls"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            hooks = root / "scripts" / "hooks"
+            hooks.mkdir(parents=True)
+            shutil.copy(REVIEW_CHECK, hooks / "review-check.sh")
+            for name, body in (
+                ("just", 'printf "full:%s\\n" "$*" >> "$HOOK_TRACE"\nexit "$FULL_RC"\n'),
+                ("python3", 'printf "native:%s\\n" "$*" >> "$HOOK_TRACE"\nexit "$NATIVE_RC"\n'),
+            ):
+                executable = root / name
+                executable.write_text("#!/bin/sh\n" + body)
+                executable.chmod(0o700)
+            trace = root / "trace"
+            cases = (
+                ("valid", "receipt", "digest", "0", "0", 0, ["native:scripts/hooks/native-review-receipt.py receipt"]),
+                ("invalid", "receipt", "digest", "1", "0", 1, ["native:scripts/hooks/native-review-receipt.py receipt"]),
+                ("absent", "", "", "0", "0", 0, ["full:pre-push"]),
+                ("full_failure", "", "", "0", "1", 1, ["full:pre-push"]),
+                ("digest_without_receipt", "", "digest", "0", "0", 1, []),
+            )
+            for name, receipt, digest, native_rc, full_rc, expected_rc, expected_trace in cases:
+                with self.subTest(case=name):
+                    trace.write_text("")
+                    environment = {
+                        k: v for k, v in os.environ.items()
+                        if not k.startswith(("CSA_", "LLM_GUARD_NATIVE_"))
+                    }
+                    environment.update(
+                        PATH=str(root) + os.pathsep + os.environ["PATH"],
+                        HOOK_TRACE=str(trace), NATIVE_RC=native_rc, FULL_RC=full_rc,
+                        LLM_GUARD_NATIVE_REVIEW_RECEIPT=receipt,
+                        LLM_GUARD_NATIVE_REVIEW_SHA256=digest,
+                    )
+                    result = subprocess.run(
+                        [launcher, "--justfile", str(JUSTFILE), "--working-directory", str(root), "--set", "_repo_root", str(root), "pre-push-hook"],
+                        env=environment, capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(result.returncode == 0, expected_rc == 0, result.stderr)
+                    self.assertEqual(trace.read_text().splitlines(), expected_trace)
 
     def test_guardian_durability_phase_is_required_and_failure_propagates(self) -> None:
         justfile = JUSTFILE.read_text()
