@@ -47,6 +47,7 @@ fn receipt_row(path: &Path, id: &str) -> (serde_json::Value, Option<String>) {
 #[tokio::test]
 async fn local_recovery_receipt_precedes_child_and_keeps_causes_private() {
     let (store, path, mut profile, tasks) = fixture();
+    let trace = recovery_diagnostics::ReceiptTrace::install(&store);
     profile.name = String::from("https://private-user:private-password@host");
     let marker = path.with_extension("accepted");
     let child = "import sqlite3,sys,pathlib,json; c=sqlite3.connect(sys.argv[1]); r=c.execute('SELECT receipt_json FROM local_recovery_receipts WHERE receipt_id=?',(sys.argv[2],)).fetchone(); assert r is not None; assert json.loads(r[0])['cause']==sys.argv[4]; pathlib.Path(sys.argv[3]).write_text('accepted')";
@@ -72,7 +73,13 @@ async fn local_recovery_receipt_precedes_child_and_keeps_causes_private() {
         let context = context.episode(7, cause, &policy);
         let ran = AtomicBool::new(false);
         let result = run_local_recovery_restart_command(&policy, &ran, &context, None).await;
-        assert_eq!(result["local_recovery_restart_status"], "succeeded");
+        assert_eq!(
+            result["local_recovery_restart_status"],
+            "succeeded",
+            "recovery={} receipt_stages_us={:?}; historical_GF1=UNKNOWN",
+            recovery_diagnostics::recovery_metadata(&json!(result)),
+            trace.snapshot()
+        );
         assert!(marker.exists());
         fs::remove_file(&marker).expect("remove accepted marker");
         let (receipt, outcome) = receipt_row(&path, context.id());
@@ -114,12 +121,14 @@ async fn local_recovery_receipt_precedes_child_and_keeps_causes_private() {
 
 #[tokio::test]
 async fn local_recovery_receipt_volatile_store_never_spawns() {
-    let (_, path, profile, tasks) = fixture();
+    let (isolated_store, path, profile, tasks) = fixture();
+    let isolated_trace = recovery_diagnostics::ReceiptTrace::install(&isolated_store);
     let marker = path.with_extension("volatile-spawn-forbidden");
     let mut config = AppConfig::default();
     config.observability.enabled = false;
     config.observability.sqlite_path = PathBuf::from(":memory:");
     let store = ObservabilityStore::open(ConfigHandle::new(config)).expect("memory store");
+    let trace = recovery_diagnostics::ReceiptTrace::install(&store);
     let policy = policy(vec![
         String::from("/usr/bin/touch"),
         marker.display().to_string(),
@@ -139,6 +148,26 @@ async fn local_recovery_receipt_volatile_store_never_spawns() {
     assert_eq!(context.acknowledged_id(), None);
     assert!(!ran.load(Ordering::Relaxed));
     assert!(!marker.exists());
+    assert_eq!(
+        recovery_diagnostics::recovery_metadata(&json!(result))["local_recovery_receipt_error"],
+        "durability_disabled"
+    );
+    let stages = trace.snapshot();
+    assert_eq!(
+        stages.iter().map(|(stage, _)| *stage).collect::<Vec<_>>(),
+        vec![
+            "record_submit",
+            "record_worker_start",
+            "record_sql_start",
+            "record_sql_end",
+            "record_ack"
+        ]
+    );
+    assert!(stages.windows(2).all(|pair| pair[0].1 <= pair[1].1));
+    assert!(
+        isolated_trace.snapshot().is_empty(),
+        "observer is store-local"
+    );
     tasks.flush(Duration::from_secs(1)).await;
     assert_eq!(tasks.in_flight.load(Ordering::SeqCst), 0);
 }
