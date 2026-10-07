@@ -119,7 +119,7 @@ fn install_overlap_hook(
     (trace, events_rx, release_tx)
 }
 
-async fn setup_overlap_arm(hold: Option<Duration>) -> OverlapFixture {
+async fn setup_overlap_arm(overlap: bool) -> OverlapFixture {
     let root = unique_test_dir("terminal-receipt-overlap");
     fs::create_dir_all(&root).expect("owned recovery root");
     let marker = root.join("restart-ran");
@@ -137,7 +137,7 @@ async fn setup_overlap_arm(hold: Option<Duration>) -> OverlapFixture {
     )
     .await;
     let (trace, events_rx, release_tx) =
-        install_overlap_hook(&proxy, hold.is_some(), ready_tx, std::time::Instant::now());
+        install_overlap_hook(&proxy, overlap, ready_tx, std::time::Instant::now());
     OverlapFixture {
         root,
         proxy,
@@ -149,7 +149,7 @@ async fn setup_overlap_arm(hold: Option<Duration>) -> OverlapFixture {
     }
 }
 
-async fn run_overlap_request(fixture: &mut OverlapFixture, hold: Option<Duration>) -> ArmResponse {
+async fn run_overlap_request(fixture: &mut OverlapFixture, overlap: bool) -> ArmResponse {
     let client = fixture.proxy.client.clone();
     let url = format!(
         "{}/v1/chat/completions?test=shielded-429-then-two-503-then-success",
@@ -165,24 +165,12 @@ async fn run_overlap_request(fixture: &mut OverlapFixture, hold: Option<Duration
         response.bytes().await?;
         Ok::<_, reqwest::Error>(status)
     });
-    if let Some(hold) = hold {
-        // Release after observing the second actual worker; a short bounded hold lets
-        // the contender report immediate busy (RED) or wait for settlement (GREEN).
+    if overlap {
+        // Release at actual mutex contention, not worker dispatch or a fixed delay.
+        // The finite guard only fails the fixture; it cannot authorize a recovery.
         let _ = timeout(Duration::from_secs(2), async {
-            let mut workers = 0;
             while let Some(stage) = fixture.events_rx.recv().await {
-                if stage == "record_worker_start" {
-                    workers += 1;
-                    if workers == 2 {
-                        break;
-                    }
-                }
-            }
-        })
-        .await;
-        let _ = timeout(hold, async {
-            while let Some(stage) = fixture.events_rx.recv().await {
-                if stage == "record_busy" || stage == "record_locked" {
+                if stage == "record_busy" {
                     break;
                 }
             }
@@ -235,15 +223,18 @@ async fn finish_overlap_arm(fixture: OverlapFixture, response: ArmResponse, over
         "bounded barrier must be explicitly released"
     );
     if overlap {
+        assert!(
+            stages.iter().any(|event| event.0 == "record_busy"),
+            "second writer must witness real mutex contention: {stages:?}"
+        );
         let locked = stages
             .iter()
             .find(|event| event.0 == "terminal_locked")
             .expect("actual writer mutex");
         let second = stages
             .iter()
-            .filter(|event| event.0 == "record_worker_start")
-            .nth(1)
-            .expect("actual second worker");
+            .find(|event| event.0 == "record_busy")
+            .expect("actual contended mutex");
         let release = stages
             .iter()
             .find(|event| event.0 == "terminal_release")
@@ -263,17 +254,16 @@ async fn finish_overlap_arm(fixture: OverlapFixture, response: ArmResponse, over
     (status, attempts, stages, wire_count)
 }
 
-async fn overlap_arm(hold: Option<Duration>) -> Arm {
-    let overlap = hold.is_some();
-    let mut fixture = setup_overlap_arm(hold).await;
-    let response = run_overlap_request(&mut fixture, hold).await;
+async fn overlap_arm(overlap: bool) -> Arm {
+    let mut fixture = setup_overlap_arm(overlap).await;
+    let response = run_overlap_request(&mut fixture, overlap).await;
     finish_overlap_arm(fixture, response, overlap).await
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_required_recovery_survives_first_terminal_audit_overlap() {
-    let control = overlap_arm(None).await;
-    let overlap = overlap_arm(Some(Duration::from_millis(50))).await;
+    let control = overlap_arm(false).await;
+    let overlap = overlap_arm(true).await;
     for (name, arm) in [("control", &control), ("overlap", &overlap)] {
         eprintln!(
             "E1 {name} status={} attempts={} wire={} stages={:?} recovery={:?}",

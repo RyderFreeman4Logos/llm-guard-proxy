@@ -175,6 +175,13 @@ impl ObservabilityStore {
         safe.attempt_id = safe.attempt_id.map(|id| safe_label(&id));
         safe.receipt_id = safe_label(&safe.receipt_id);
         let json = serde_json::to_string(&safe).map_err(|_| "invalid_receipt")?;
+        #[cfg(feature = "recovery-receipt-test-hooks")]
+        if matches!(
+            self.connection.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ) {
+            self.observe_recovery_receipt_test("record_busy", &safe.receipt_id);
+        }
         let mut connection = self.connection.lock().map_err(|_| "store_busy")?;
         let remaining = deadline
             .checked_duration_since(Instant::now())
