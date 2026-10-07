@@ -182,6 +182,89 @@ async fn tier2_owned_success_has_durable_native_receipt_and_boot_claim() {
     assert_eq!(receipts, 0);
 }
 
+#[tokio::test]
+async fn tier2_worker_panic_terminalizes_receipt_and_keeps_episode_fenced() {
+    let (upstream, mut proxy, runtime) = fixture(vec![String::from("/usr/bin/true")]).await;
+    let mut config = proxy.state.config.snapshot().expect("config");
+    config.upstream.local_recovery.restart_command = vec![
+        String::from("/dev/null"),
+        String::from(super::super::guardian_recovery::PANIC_AFTER_RECEIPT_TEST_ARG),
+    ];
+    config.validate().expect("valid fixture policy");
+    proxy
+        .state
+        .config
+        .apply_reloadable(&config)
+        .expect("policy");
+    let (request, receiver) =
+        make_request(proxy.state.config.clone(), &runtime, Duration::from_secs(5));
+    let coordinator = proxy.state.local_recovery.coordinator_for(&request.profile);
+    let (sender, worker) = proxy.state.spawn_guardian_recovery();
+    let first_sent = sender.send(request).await.is_ok();
+    let first_completion = tokio::time::timeout(Duration::from_secs(3), receiver).await;
+
+    let (second_request, second_receiver) =
+        make_request(proxy.state.config.clone(), &runtime, Duration::from_secs(3));
+    let second_sent = sender.send(second_request).await.is_ok();
+    let second_completion = tokio::time::timeout(Duration::from_secs(3), second_receiver).await;
+    drop(sender);
+    let worker_join = tokio::time::timeout(Duration::from_secs(3), worker).await;
+    let persistence_drained =
+        tokio::time::timeout(Duration::from_secs(3), proxy.state.flush_persistence()).await;
+    let (running, active_episode, completed, physical_owners) = {
+        let state = coordinator.state.lock().await;
+        (
+            state.running,
+            state.active_recovery_episode_id,
+            state
+                .active_recovery_episode_id
+                .and_then(|episode| state.completed_recovery_result(episode).cloned()),
+            state
+                .physical_recovery_owners
+                .load(super::Ordering::Acquire),
+        )
+    };
+    let database = rusqlite::Connection::open(&proxy.sqlite_path).expect("database");
+    let receipt = database
+        .query_row(
+            "SELECT count(*), max(outcome) FROM local_recovery_receipts",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .ok();
+
+    proxy.server.task.abort();
+    let _ = (&mut proxy.server.task).await;
+    let FakeUpstream {
+        _server: mut server,
+        ..
+    } = upstream;
+    server.task.abort();
+    let _ = (&mut server.task).await;
+
+    assert!(first_sent, "first request was handed to its worker");
+    assert!(
+        matches!(&first_completion, Ok(Ok(RecoveryOutcome::Unconfirmed)))
+            && receipt == Some((1, Some(String::from("cleanup_unconfirmed")))),
+        "panic must be completed and terminalized: completion={first_completion:?}, receipt={receipt:?}"
+    );
+    assert!(
+        second_sent,
+        "the worker remains available after a caught panic"
+    );
+    assert!(matches!(
+        second_completion,
+        Ok(Ok(RecoveryOutcome::NotAdmitted))
+    ));
+    assert!(worker_join.is_ok_and(|result| result.is_ok()));
+    assert!(persistence_drained.is_ok());
+    assert!(running, "unknown cleanup must retain the episode fence");
+    assert!(active_episode.is_some());
+    assert!(completed.is_none(), "unconfirmed cleanup is not settled");
+    // This synthetic panic runs before command spawn; zero owners is not a reap claim.
+    assert_eq!(physical_owners, 0);
+}
+
 struct ReadinessBarrier {
     entered: tokio::sync::watch::Receiver<bool>,
     release: tokio::sync::watch::Sender<bool>,
