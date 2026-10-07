@@ -5,10 +5,14 @@ use super::{
     local_recovery_admission_failure, recovery_receipt, send_local_recovery_readiness_probe,
     terminate_timed_out_recovery_child, watchdog_upstream_profiles,
 };
+use futures_util::FutureExt;
 use llm_guard_proxy_host_guardian::monitor::tier2::{RecoveryOutcome, RecoveryRequest};
 use llm_guard_proxy_state::GuardianRecoveryIdentity;
 use std::os::unix::fs::MetadataExt;
 use tokio::{process::Command, sync::mpsc};
+
+#[cfg(test)]
+pub(super) const PANIC_AFTER_RECEIPT_TEST_ARG: &str = "__llm_guard_test_panic_after_receipt";
 
 impl ProxyState {
     /// One bounded worker, sharing the existing profile coordinator and persistence drain.
@@ -98,9 +102,13 @@ impl ProxyState {
                 .await;
             }
         };
-        let outcome = self
-            .guardian_owned_action(request, &profile, &policy, &receipt)
-            .await;
+        // The action may own a child; after panic, cleanup is unknown and must stay fenced.
+        let outcome = std::panic::AssertUnwindSafe(
+            self.guardian_owned_action(request, &profile, &policy, &receipt),
+        )
+        .catch_unwind()
+        .await
+        .unwrap_or(RecoveryOutcome::Unconfirmed);
         let label = match outcome {
             RecoveryOutcome::Succeeded => "succeeded",
             RecoveryOutcome::NotAdmitted => "not_admitted",
@@ -142,6 +150,14 @@ impl ProxyState {
         policy: &LocalRecoveryPolicy,
         receipt: &recovery_receipt::Context,
     ) -> RecoveryOutcome {
+        #[cfg(test)]
+        if policy
+            .restart_command
+            .iter()
+            .any(|arg| arg == PANIC_AFTER_RECEIPT_TEST_ARG)
+        {
+            panic!("injected Guardian worker panic after durable pre-action receipt");
+        }
         let mut command = Command::new(&policy.restart_command[0]);
         command
             .args(&policy.restart_command[1..])
