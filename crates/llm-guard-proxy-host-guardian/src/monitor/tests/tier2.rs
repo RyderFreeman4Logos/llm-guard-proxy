@@ -240,3 +240,24 @@ fn tier2_config_aba_invalidates_previously_admitted_owner() {
         .expect("ack");
     fs::remove_dir_all(root).expect("cleanup");
 }
+
+#[test]
+fn supplied_meminfo_drives_observer_without_host_pressure() {
+    let root = super::temporary_tree();
+    let meminfo = root.join("synthetic-meminfo");
+    fs::write(&meminfo, b"MemAvailable: 0 kB\n").expect("synthetic input");
+    let mut config = guardian_config("missing.v1", &root);
+    config.guardian.enabled = false;
+    let mut guardian = MemoryGuardian::open_with_meminfo_for_test(
+        ConfigHandle::new(config),
+        &root,
+        File::open(meminfo).expect("input descriptor"),
+    )
+    .expect("guardian");
+    assert_eq!(
+        guardian.tick().expect("tick"),
+        GuardianIteration::ObserverOnly
+    );
+    assert!(!guardian.is_latched());
+    fs::remove_dir_all(root).expect("cleanup");
+}

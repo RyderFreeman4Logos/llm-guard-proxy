@@ -153,8 +153,21 @@ async fn local_recovery_receipt_volatile_store_never_spawns() {
         "durability_disabled"
     );
     let stages = trace.snapshot();
+    for phase in ["synchronous_check", "database_check", "journal_check"] {
+        assert!(
+            stages
+                .iter()
+                .any(|(stage, _)| *stage == format!("{phase}_end")),
+            "missing real SQL phase {phase}"
+        );
+    }
+    assert!(!stages.iter().any(|(stage, _)| *stage == "commit_ok"));
     assert_eq!(
-        stages.iter().map(|(stage, _)| *stage).collect::<Vec<_>>(),
+        stages
+            .iter()
+            .map(|(stage, _)| *stage)
+            .filter(|stage| stage.starts_with("record_"))
+            .collect::<Vec<_>>(),
         vec![
             "record_submit",
             "record_worker_start",
@@ -301,6 +314,102 @@ async fn local_recovery_receipt_child_cancellation_keeps_durable_attribution() {
     .await
     .expect("synthetic child reaped");
     assert!(!forbidden.exists());
+}
+
+#[tokio::test]
+async fn local_recovery_receipt_real_insert_failure_has_phase_end_without_commit() {
+    let (store, path, profile, tasks) = fixture();
+    let trace = recovery_diagnostics::ReceiptTrace::install(&store);
+    Connection::open(&path)
+        .expect("failure fixture connection")
+        .execute_batch("DROP TABLE local_recovery_receipts")
+        .expect("real missing table");
+    let context = recovery_receipt::Context::new(store, &profile, Arc::clone(&tasks));
+    assert_eq!(context.persist().await, Err("write_failed"));
+    tasks.flush(Duration::from_secs(1)).await;
+    let stages = trace.snapshot();
+    for required in [
+        "receipt_insert_end",
+        "receipt_insert_error",
+        "record_sql_end",
+        "busy_timeout_restore_ok",
+        "record_ack",
+    ] {
+        assert!(
+            stages.iter().any(|(stage, _)| *stage == required),
+            "missing {required}"
+        );
+    }
+    assert!(!stages.iter().any(|(stage, _)| stage.starts_with("commit_")));
+    assert_eq!(context.acknowledged_id(), None);
+    assert_eq!(tasks.in_flight.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn local_recovery_receipt_blocked_precommit_timeout_stays_owned() {
+    let (store, path, profile, tasks) = fixture();
+    let marker = path.with_extension("precommit-spawn-forbidden");
+    let policy = policy(vec![
+        String::from("/usr/bin/touch"),
+        marker.display().to_string(),
+    ]);
+    let (entered, mut entry) = tokio::sync::mpsc::channel(1);
+    let (release, released) = std::sync::mpsc::channel();
+    let released = Mutex::new(released);
+    let events = Arc::new(Mutex::new(Vec::with_capacity(32)));
+    let observed = Arc::clone(&events);
+    store.set_recovery_receipt_test_hook(move |stage, _| {
+        observed.lock().expect("control events").push(stage);
+        if stage == "commit_start" {
+            entered.try_send(()).expect("one precommit entry");
+            // Disconnect releases on assertion failure; the ceiling prevents a stuck fixture.
+            let _ = released
+                .lock()
+                .expect("release channel")
+                .recv_timeout(Duration::from_secs(3));
+        }
+    });
+    let context = recovery_receipt::Context::new(store, &profile, Arc::clone(&tasks)).episode(
+        1,
+        LocalRecoveryCause::TransientTransport,
+        &policy,
+    );
+    let ran = AtomicBool::new(false);
+    let restart = run_local_recovery_restart_command(&policy, &ran, &context, None);
+    tokio::pin!(restart);
+    tokio::select! {
+        entered = entry.recv() => assert_eq!(entered, Some(())),
+        _ = &mut restart => panic!("caller returned without reaching real precommit"),
+        () = sleep(Duration::from_secs(1)) => panic!("missing precommit boundary"),
+    }
+    let result = timeout(Duration::from_secs(1), &mut restart)
+        .await
+        .expect("original admission timeout");
+    assert_eq!(result["local_recovery_receipt_error"], "write_timeout");
+    assert_eq!(result["local_recovery_restart_status"], "receipt_failed");
+    assert_eq!(context.acknowledged_id(), None);
+    assert!(!ran.load(Ordering::Relaxed) && !marker.exists());
+    assert_eq!(
+        tasks.in_flight.load(Ordering::SeqCst),
+        1,
+        "timed-out worker remains owned"
+    );
+    assert!(!events.lock().expect("events").contains(&"commit_ok"));
+    release
+        .send(())
+        .expect("release actual commit after caller rejection");
+    tasks.flush(Duration::from_secs(2)).await;
+    assert_eq!(tasks.in_flight.load(Ordering::SeqCst), 0);
+    assert!(events.lock().expect("events").contains(&"commit_ok"));
+    assert!(
+        receipt_row(&path, context.id()).1.is_none(),
+        "independent connection sees real commit"
+    );
+    assert_eq!(context.acknowledged_id(), None);
+    assert!(
+        !ran.load(Ordering::Relaxed) && !marker.exists(),
+        "late commit cannot retroactively spawn"
+    );
 }
 
 #[tokio::test]

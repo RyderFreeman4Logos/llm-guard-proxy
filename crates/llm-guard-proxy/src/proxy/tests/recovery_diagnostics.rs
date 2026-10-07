@@ -2,24 +2,90 @@
 use super::*;
 
 #[derive(Clone)]
-pub(super) struct ReceiptTrace(Arc<Mutex<Vec<(&'static str, u128)>>>);
+pub(super) struct ReceiptTrace(Arc<Mutex<TraceData>>);
+
+struct TraceData {
+    events: Vec<(&'static str, u128, usize)>,
+    ids: Vec<String>,
+    overflow: bool,
+}
+
+impl Default for TraceData {
+    fn default() -> Self {
+        Self {
+            events: Vec::with_capacity(512),
+            ids: Vec::with_capacity(16),
+            overflow: false,
+        }
+    }
+}
 
 impl ReceiptTrace {
     pub(super) fn install(store: &ObservabilityStore) -> Self {
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let observed = Arc::clone(&events);
+        let trace = Self(Arc::new(Mutex::new(TraceData::default())));
+        let observed = trace.clone();
         let started = std::time::Instant::now();
-        store.set_recovery_receipt_test_hook(move |stage, _id| {
-            observed
-                .lock()
-                .expect("diagnostic trace")
-                .push((stage, started.elapsed().as_micros()));
+        store.set_recovery_receipt_test_hook(move |stage, id| {
+            let time = started.elapsed().as_micros();
+            observed.record(stage, id, time);
         });
-        Self(events)
+        trace
+    }
+
+    fn record(&self, stage: &'static str, id: &str, time: u128) {
+        let mut trace = self.0.lock().expect("diagnostic trace");
+        if trace.events.len() == 512
+            || (!trace.ids.iter().any(|old| old == id) && trace.ids.len() == 16)
+        {
+            trace.overflow = true;
+            return;
+        }
+        let ordinal = trace
+            .ids
+            .iter()
+            .position(|old| old == id)
+            .unwrap_or_else(|| {
+                trace.ids.push(id.to_owned());
+                trace.ids.len() - 1
+            });
+        trace.events.push((stage, time, ordinal));
     }
 
     pub(super) fn snapshot(&self) -> Vec<(&'static str, u128)> {
-        self.0.lock().expect("diagnostic trace").clone()
+        self.0
+            .lock()
+            .expect("diagnostic trace")
+            .events
+            .iter()
+            .map(|(stage, time, _)| (*stage, *time))
+            .collect()
+    }
+
+    fn summary(&self) -> serde_json::Value {
+        let trace = self.0.lock().expect("diagnostic trace");
+        let events: Vec<_> = trace
+            .events
+            .iter()
+            .map(|(stage, time, receipt)| {
+                let stage = if *stage == "record_ack" {
+                    "write_result_observed"
+                } else {
+                    stage
+                };
+                json!({"stage":stage, "us":time, "receipt":receipt})
+            })
+            .collect();
+        json!({"events":events, "overflow":trace.overflow, "kernel_cause":"UNKNOWN"})
+    }
+
+    fn report(&self, http_status: u16) {
+        use std::io::Write;
+        // Outside SQLite and its timed worker; expose success too under normal libtest capture.
+        let _ = writeln!(
+            std::io::stderr(),
+            "receipt_phase_measurement http_status={http_status} {}",
+            self.summary()
+        );
     }
 }
 
@@ -158,6 +224,7 @@ pub(super) async fn assert_ok(
     let status = response.status();
     if status == StatusCode::OK {
         response.bytes().await.expect("response should drain");
+        trace.report(status.as_u16());
         return;
     }
     let body = timeout(
@@ -181,6 +248,13 @@ pub(super) async fn assert_ok(
         "UNKNOWN"
     };
     let attempts = attempts.unwrap_or_default();
+    // Observe late real completion after HTTP failure, never extend admission or retry.
+    proxy
+        .state
+        .persistence_tasks
+        .flush(Duration::from_secs(1))
+        .await;
+    trace.report(status.as_u16());
     assert_eq!(
         status,
         StatusCode::OK,
@@ -331,6 +405,26 @@ async fn failure_database_diagnostics_cannot_mask_http_status() {
             );
         }
     }
+}
+
+#[test]
+fn receipt_trace_is_bounded_and_correlates_ordinals() {
+    let trace = ReceiptTrace(Arc::new(Mutex::new(TraceData::default())));
+    trace.record("commit_start", "private-first", 1);
+    trace.record("commit_end", "private-first", 3);
+    trace.record("commit_ok", "private-first", 4);
+    trace.record("record_ack", "private-second", 5);
+    for time in 0..512 {
+        trace.record("record_worker_start", "private-second", time);
+    }
+    let summary = trace.summary();
+    assert_eq!(summary["overflow"], true);
+    assert_eq!(summary["events"].as_array().expect("events").len(), 512);
+    assert_eq!(summary["events"][0]["receipt"], 0);
+    assert_eq!(summary["events"][3]["receipt"], 1);
+    assert_eq!(summary["events"][3]["stage"], "write_result_observed");
+    assert!(!summary.to_string().contains("private-"));
+    assert_eq!(summary["kernel_cause"], "UNKNOWN");
 }
 
 #[test]

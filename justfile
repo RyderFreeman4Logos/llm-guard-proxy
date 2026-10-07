@@ -92,6 +92,18 @@ pre-push:
     just clippy
     just test
 
+# Synthetic MemAvailable only; real owned kernel kill + worker + SQLite, never host OOM.
+# The normal test gate ignores this host-dependent leaf.
+test-real-tier2:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    unit="llm-guard-real-tier2-test-$(python3 -c 'import secrets; print(secrets.token_hex(16))').scope"
+    exec {{_io_prefix}} systemd-run --user --scope --quiet --collect \
+        --unit="${unit}" --property=Delegate=yes -- \
+        env RUST_TEST_THREADS=1 cargo test -p llm-guard-proxy --all-features --bin llm-guard-proxy \
+        proxy::tests::guardian_recovery::real_kernel::tier2_real_kernel_admission_action_durable_receipt -- \
+        --ignored --exact --nocapture
+
 # Explicit host-dependent kernel cgroup regression; never part of default gates.
 test-real-cgroup:
     #!/usr/bin/env bash

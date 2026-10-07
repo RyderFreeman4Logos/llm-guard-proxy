@@ -33,6 +33,16 @@ const STARTUP_AUTHORITY_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[test]
 fn unavailable_startup_identity_cleanup_kills_same_group_descendant_before_admission_reopens() {
+    run_startup_identity_cleanup(Duration::ZERO);
+}
+
+#[test]
+fn delayed_controller_release_preserves_startup_identity_cleanup() {
+    // Hold the controller past the old 300ms descendant setup deadline.
+    run_startup_identity_cleanup(Duration::from_millis(400));
+}
+
+fn run_startup_identity_cleanup(release_delay: Duration) {
     let deadline = Instant::now() + STARTUP_AUTHORITY_HELPER_TIMEOUT;
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -57,7 +67,7 @@ fn unavailable_startup_identity_cleanup_kills_same_group_descendant_before_admis
         .env(STARTUP_AUTHORITY_CLEANUP_IDENTITY_ENV, marker_path)
         .env(
             STARTUP_AUTHORITY_CLEANUP_DESCENDANT_ENV,
-            descendant_marker_path,
+            &descendant_marker_path,
         )
         .env(STARTUP_AUTHORITY_RELEASE_ENV, &release_path);
     configure_process_group(&mut command);
@@ -70,6 +80,22 @@ fn unavailable_startup_identity_cleanup_kills_same_group_descendant_before_admis
     helper.set_signal_authority(SignalAuthority::new(identity));
     wait_for_current_published_identity(nested_cleanup.marker_path(), deadline)
         .expect("nested startup leader should publish before scenario release");
+    let descendant = wait_for_current_published_identity(&descendant_marker_path, deadline)
+        .expect("descendant should be ready before identity-failure release");
+    std::thread::sleep(release_delay);
+    assert_eq!(
+        helper
+            .child_mut()
+            .expect("helper should remain armed")
+            .try_wait()
+            .expect("helper status should resolve"),
+        None,
+        "prepared helper must wait for controller release"
+    );
+    assert!(
+        descendant.is_live(),
+        "prepared descendant must still be live"
+    );
     super::test_support::publish_file_atomically(&release_path, b"release");
 
     loop {
@@ -80,6 +106,7 @@ fn unavailable_startup_identity_cleanup_kills_same_group_descendant_before_admis
         {
             Ok(Some(status)) => {
                 helper.disarm();
+                super::test_support::remove_atomic_marker(&release_path);
                 assert!(
                     status.success(),
                     "startup authority helper failed: {status}"
@@ -112,9 +139,10 @@ fn recursive_startup_fixture_killed_before_release_leaves_no_nested_child() {
     ));
     let descendant_path = PathBuf::from(format!("{}.descendant", marker_path.display()));
     let release_path = PathBuf::from(format!("{}.release", marker_path.display()));
-    let nested_cleanup = PublishedProcessCleanup::new_process_group(
+    let nested_cleanup = PublishedProcessCleanup::new_process_group_with_descendants(
         marker_path.clone(),
         deadline + Duration::from_secs(2),
+        vec![descendant_path.clone()],
     );
     let mut command =
         Command::new(std::env::current_exe().expect("test executable should resolve"));
@@ -122,7 +150,7 @@ fn recursive_startup_fixture_killed_before_release_leaves_no_nested_child() {
         .args(["--exact", STARTUP_AUTHORITY_HELPER_TEST, "--nocapture"])
         .env(STARTUP_AUTHORITY_HELPER_ENV, "1")
         .env(STARTUP_AUTHORITY_CLEANUP_IDENTITY_ENV, marker_path)
-        .env(STARTUP_AUTHORITY_CLEANUP_DESCENDANT_ENV, descendant_path)
+        .env(STARTUP_AUTHORITY_CLEANUP_DESCENDANT_ENV, &descendant_path)
         .env(STARTUP_AUTHORITY_RELEASE_ENV, release_path);
     configure_process_group(&mut command);
     let child = command
@@ -136,8 +164,16 @@ fn recursive_startup_fixture_killed_before_release_leaves_no_nested_child() {
         wait_for_current_published_identity(nested_cleanup.marker_path(), deadline)
             .expect("supervisor should publish startup leader before release");
 
+    let descendant_identity = wait_for_current_published_identity(&descendant_path, deadline)
+        .expect("descendant should prepare without controller release");
+
     drop(helper);
     drop(nested_cleanup);
+
+    assert!(
+        descendant_identity.wait_until_not_live(Instant::now() + Duration::from_secs(1)),
+        "prepared pre-release descendant must not remain"
+    );
 
     assert!(
         nested_identity.wait_until_not_live(Instant::now() + Duration::from_secs(1)),
@@ -159,6 +195,7 @@ fn unavailable_startup_identity_subprocess_helper() {
         |leader_pid| {
             fixture.record_leader(leader_pid);
             fixture.await_and_record_descendant();
+            fixture.await_release();
             Err(ProcessGroupSignalError::IdentityUnavailable)
         },
     );
@@ -415,6 +452,7 @@ struct StartupGroupFixture {
     cleanup_identity_path: Option<PathBuf>,
     cleanup_descendant_identity_path: Option<PathBuf>,
     release_path: Option<PathBuf>,
+    preparation_deadline: Instant,
     leader_identity: Cell<Option<LinuxProcessIdentity>>,
     descendant_identity: Cell<Option<LinuxProcessIdentity>>,
 }
@@ -441,6 +479,7 @@ impl StartupGroupFixture {
             )
             .map(PathBuf::from),
             release_path: std::env::var_os(STARTUP_AUTHORITY_RELEASE_ENV).map(PathBuf::from),
+            preparation_deadline: Instant::now() + STARTUP_AUTHORITY_HELPER_TIMEOUT,
             leader_identity: Cell::new(None),
             descendant_identity: Cell::new(None),
         }
@@ -453,15 +492,10 @@ impl StartupGroupFixture {
             args: vec![
                 String::from("-c"),
                 String::from(
-                    "release=$2; attempts=0; while [ ! -f \"$release\" ]; do attempts=$((attempts + 1)); if [ \"$attempts\" -ge 1000 ]; then exit 91; fi; sleep 0.005; done; rm -f \"$release\"; sleep 30 & child=$!; start=$(awk '{print $22}' /proc/$child/stat); marker=$1; tmp=\"${marker}.tmp.$$\"; if [ \"$child\" -le 0 ] || [ -z \"$start\" ] || [ \"$start\" -le 0 ]; then exit 90; fi; printf '%s %s\\n' \"$child\" \"$start\" > \"$tmp\"; mv -f \"$tmp\" \"$marker\"; wait",
+                    "sleep 30 & child=$!; start=$(awk '{print $22}' /proc/$child/stat); marker=$1; tmp=\"${marker}.tmp.$$\"; if [ \"$child\" -le 0 ] || [ -z \"$start\" ] || [ \"$start\" -le 0 ]; then exit 90; fi; printf '%s %s\\n' \"$child\" \"$start\" > \"$tmp\"; mv -f \"$tmp\" \"$marker\"; wait",
                 ),
                 String::from("workflow-startup-authority"),
                 self.descendant_identity_path.display().to_string(),
-                self.release_path
-                    .as_deref()
-                    .expect("recursive startup fixture should configure release path")
-                    .display()
-                    .to_string(),
             ],
             timeout_ms: 30,
             max_stdout_bytes: 4096,
@@ -485,10 +519,28 @@ impl StartupGroupFixture {
         if self.descendant_identity.get().is_some() {
             return;
         }
-        let deadline = Instant::now() + Duration::from_millis(300);
-        let published =
-            wait_for_current_published_identity(&self.descendant_identity_path, deadline)
-                .expect("same-PGID descendant should publish a current exact identity");
+        // Preparation is independent of controller scheduling; the outer fixture guard
+        // bounds readiness and release, not the production 30ms cleanup contract.
+        let published = wait_for_current_published_identity(
+            &self.descendant_identity_path,
+            self.preparation_deadline,
+        )
+        .expect("same-PGID descendant should publish a current exact identity");
+        assert_eq!(
+            nix::unistd::getpgid(Some(nix::unistd::Pid::from_raw(
+                i32::try_from(published.pid.get()).expect("descendant PID should fit i32"),
+            )))
+            .expect("prepared descendant process group should resolve")
+            .as_raw(),
+            i32::try_from(
+                self.leader_identity
+                    .get()
+                    .expect("leader should be recorded")
+                    .pid
+            )
+            .expect("leader PID should fit i32"),
+            "prepared descendant must share the owned leader process group"
+        );
         if let Some(path) = self.cleanup_descendant_identity_path.as_deref() {
             published.publish(path);
         }
@@ -496,6 +548,20 @@ impl StartupGroupFixture {
             pid: published.pid.get(),
             start_time_ticks: published.start_time_ticks.get(),
         }));
+    }
+
+    fn await_release(&self) {
+        let release_path = self
+            .release_path
+            .as_deref()
+            .expect("recursive startup fixture should configure release path");
+        while !release_path.is_file() {
+            assert!(
+                Instant::now() < self.preparation_deadline,
+                "controller should release the prepared identity-failure scenario"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn disarm(&self) {

@@ -1,7 +1,7 @@
 use std::{
     process::{Child, Command},
     sync::{
-        Arc, Barrier,
+        Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -105,17 +105,19 @@ fn workflow_admission_failure_respects_guard_fail_policy() {
     ));
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sixteen_callers_overlap_without_exceeding_workflow_execution_bound() {
     const CALLERS: usize = 16;
     const LIMIT: usize = 4;
+    const BOUND: Duration = Duration::from_secs(10);
     let limiter = Arc::new(InFlightLimiter::default());
     let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS + 1));
     let entered = Arc::new(AtomicUsize::new(0));
     let active = Arc::new(AtomicUsize::new(0));
     let max_active = Arc::new(AtomicUsize::new(0));
-    let release = Arc::new(Barrier::new(LIMIT + 1));
-    let mut callers = Vec::new();
+    let (events_tx, mut events_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut senders = Vec::new();
+    let mut callers = tokio::task::JoinSet::new();
 
     for _ in 0..CALLERS {
         let limiter = Arc::clone(&limiter);
@@ -123,40 +125,67 @@ async fn sixteen_callers_overlap_without_exceeding_workflow_execution_bound() {
         let entered = Arc::clone(&entered);
         let active = Arc::clone(&active);
         let max_active = Arc::clone(&max_active);
-        let release = Arc::clone(&release);
-        callers.push(tokio::spawn(async move {
-            barrier.wait().await;
-            run_workflow_execution(limiter, LIMIT, move |_lease| {
+        let events = events_tx.clone();
+        let started = events.clone();
+        let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+        senders.push(release_tx);
+        callers.spawn(async move {
+            tokio::time::timeout(BOUND, barrier.wait())
+                .await
+                .expect("start rendezvous");
+            let result = run_workflow_execution(limiter, LIMIT, move |_lease| {
                 entered.fetch_add(1, Ordering::SeqCst);
                 let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
                 max_active.fetch_max(now_active, Ordering::SeqCst);
-                release.wait();
+                let _ = started.send(false);
+                let released = release_rx.recv_timeout(BOUND);
                 active.fetch_sub(1, Ordering::SeqCst);
+                released
             })
-            .await
-        }));
+            .await;
+            if matches!(result, Err(WorkflowExecutionTaskError::AtCapacity { .. })) {
+                let _ = events.send(true);
+            }
+            result
+        });
     }
-
-    barrier.wait().await;
-    let deadline = Instant::now() + Duration::from_secs(1);
-    while entered.load(Ordering::SeqCst) < LIMIT {
-        assert!(
-            Instant::now() < deadline,
-            "all admitted closures should enter"
-        );
-        tokio::task::yield_now().await;
-    }
-    release.wait();
-
-    let mut rejected = 0;
-    for caller in callers {
-        let result = caller.await.expect("overlap caller should join");
-        rejected += usize::from(matches!(
-            result,
-            Err(WorkflowExecutionTaskError::AtCapacity { .. })
-        ));
-    }
-    assert!(rejected >= CALLERS - LIMIT);
+    drop(events_tx);
+    let admissions = tokio::time::timeout(BOUND, async {
+        barrier.wait().await;
+        let mut rejected = 0;
+        for _ in 0..CALLERS {
+            rejected += usize::from(events_rx.recv().await.expect("admission event"));
+        }
+        rejected
+    })
+    .await;
+    // Hold every execution until all callers have crossed admission. Dropping the
+    // senders also unblock workers on failure; no reusable barrier wave.
+    drop(senders);
+    let settled = tokio::time::timeout(BOUND, async {
+        while let Some(caller) = callers.join_next().await {
+            match caller.expect("overlap caller should join") {
+                Ok(released) => assert!(matches!(
+                    released,
+                    Err(mpsc::RecvTimeoutError::Disconnected)
+                )),
+                Err(WorkflowExecutionTaskError::AtCapacity {
+                    max_in_flight_executions,
+                }) => {
+                    assert_eq!(max_in_flight_executions, LIMIT);
+                }
+                Err(error) => panic!("unexpected execution failure: {error}"),
+            }
+        }
+    })
+    .await;
+    assert!(settled.is_ok(), "all owned callers must settle");
+    assert_eq!(
+        admissions.expect("all admissions must be observed"),
+        CALLERS - LIMIT
+    );
     assert_eq!(entered.load(Ordering::SeqCst), LIMIT);
-    assert!(max_active.load(Ordering::SeqCst) <= LIMIT);
+    assert_eq!(max_active.load(Ordering::SeqCst), LIMIT);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
+    assert_eq!(limiter.snapshot_counts().active, 0);
 }

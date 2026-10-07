@@ -22,6 +22,7 @@ use std::{
 };
 use thiserror::Error;
 
+mod open;
 pub mod tier2;
 
 const MEMINFO_BUFFER_BYTES: usize = 8 * 1024;
@@ -482,54 +483,6 @@ pub struct MemoryGuardian {
 }
 
 impl MemoryGuardian {
-    /// Opens a guardian backed by the proxy's shared validated configuration.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the shared config, an enabled reserve mapping, or
-    /// `/proc/meminfo` cannot be opened. Missing cgroup registrations are
-    /// retried by the healthy loop without taking down the proxy.
-    pub fn open(
-        config_handle: ConfigHandle,
-        runtime_dir: impl Into<PathBuf>,
-    ) -> Result<Self, GuardianError> {
-        let snapshot = config_handle.snapshot()?;
-        snapshot.validate()?;
-        let active_policy = snapshot.guardian;
-        let thresholds = thresholds_from_policy(&active_policy)?;
-        let runtime_dir = runtime_dir.into();
-        let controller = if active_policy.enabled {
-            Some(EmergencyController::new(
-                EmergencyReserve::new(thresholds.reserve_bytes())?,
-                active_policy.retry_interval_secs.saturating_mul(1000),
-            ))
-        } else {
-            None
-        };
-        let proc_meminfo = File::open("/proc/meminfo").map_err(|source| GuardianError::Io {
-            operation: "open /proc/meminfo",
-            source,
-        })?;
-        Ok(Self {
-            config_handle,
-            poll_interval: Duration::from_secs(active_policy.poll_interval_secs),
-            retry_interval: Duration::from_secs(active_policy.retry_interval_secs),
-            active_policy,
-            thresholds,
-            runtime_dir,
-            target: None,
-            proc_meminfo,
-            controller,
-            started: Instant::now(),
-            latched: false,
-            systemd_next_attempt_millis: 0,
-            systemd_verified: false,
-            observer_pressure_reported: false,
-            last_rejected_policy: None,
-            escalation: tier2::GuardianEscalation::default(),
-        })
-    }
-
     /// Returns the policy currently armed by the guardian.
     ///
     /// A shared configuration update is exposed here only after any required
