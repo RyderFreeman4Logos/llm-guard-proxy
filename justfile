@@ -100,4 +100,4 @@ test-real-cgroup:
     exec {{_io_prefix}} systemd-run --user --scope --quiet --collect \
         --unit="${unit}" --property=Delegate=yes -- \
         cargo test -p llm-guard-proxy-host-guardian --test real_cgroup -- \
-        --ignored --exact registered_scope_kill_reaps_only_the_task_owned_child --nocapture
+        --ignored --exact registered_cgroup_kill_reaps_only_the_task_owned_child --nocapture

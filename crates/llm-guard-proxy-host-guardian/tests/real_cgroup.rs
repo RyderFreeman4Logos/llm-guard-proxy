@@ -2,7 +2,11 @@ use llm_guard_proxy_host_guardian::{CgroupTarget, EmergencyReserve, kill_direct}
 use nix::{
     fcntl::{FcntlArg, OFlag, fcntl},
     poll::{PollFd, PollFlags, PollTimeout, poll},
-    sys::signal::{Signal, killpg},
+    sys::{
+        prctl,
+        signal::{Signal, kill, killpg},
+        wait::{WaitPidFlag, WaitStatus, waitpid},
+    },
     unistd::{Pid, Uid},
 };
 use std::{
@@ -18,7 +22,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, ChildStdout, Command, ExitStatus, Stdio},
-    sync::mpsc::{SyncSender, sync_channel},
+    sync::mpsc::sync_channel,
     thread,
     time::{Duration, Instant},
 };
@@ -56,81 +60,68 @@ impl Drop for Scratch {
     }
 }
 
-struct OwnedScope {
-    unit: String,
-    control_group: String,
-    cgroup_path: PathBuf,
-    launcher: Child,
-    target: Option<ProcessIdentity>,
+// The parent owns collection: an empty kernel cgroup is not a transient systemd unit.
+// Held FDs alone cannot fence systemd's removal of an empty scope.
+struct OwnedCgroup {
+    path: PathBuf,
+    directory: File,
+    child: Option<Child>,
 }
 
-impl OwnedScope {
-    fn wait(&mut self) -> io::Result<ExitStatus> {
-        wait_for_exit(&mut self.launcher, DEADLINE)
-    }
-
-    fn act_on_scope(&self, arguments: &[&str]) {
-        if !self.contains_only_target()
-            || systemd_property(&self.unit, "ControlGroup").ok().as_deref()
-                != Some(self.control_group.as_str())
+impl OwnedCgroup {
+    fn create(path: PathBuf) -> io::Result<Self> {
+        fs::create_dir(&path)?;
+        let directory = match OpenOptions::new()
+            .read(true)
+            .custom_flags((OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC).bits())
+            .open(&path)
         {
-            return;
-        }
-        let Ok(mut action) = Command::new("/usr/bin/systemctl")
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            return;
+            Ok(directory) => directory,
+            Err(error) => {
+                let _ = fs::remove_dir(&path);
+                return Err(error);
+            }
         };
-        if wait_for_exit(&mut action, DEADLINE.saturating_sub(CHILD_REAP_GRACE)).is_err() {
-            let _ = action.kill();
-            let _ = wait_for_exit(&mut action, CHILD_REAP_GRACE);
-        }
+        let mut owned = Self {
+            path,
+            directory,
+            child: None,
+        };
+        owned.child = Some(
+            Command::new("/bin/sh")
+                .args([
+                    "-ec",
+                    "printf '%s\\n' $$ > \"$1/cgroup.procs\"; exec /usr/bin/sleep \"$2\"",
+                    "owned-cgroup",
+                ])
+                .arg(&owned.path)
+                .arg(CHILD_SECONDS)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0)
+                .spawn()?,
+        );
+        Ok(owned)
     }
 
-    fn contains_only_target(&self) -> bool {
-        let Ok(members) = cgroup_members(&self.cgroup_path) else {
-            return false;
-        };
-        if members.len() != 1 {
-            return false;
+    fn remove(&self) -> io::Result<()> {
+        let original = self.directory.metadata()?;
+        let current = fs::symlink_metadata(&self.path)?;
+        if (original.dev(), original.ino()) != (current.dev(), current.ino()) {
+            return Err(io::Error::other("owned cgroup identity changed"));
         }
-        let pid = members[0];
-        let Ok(current) = process_identity(pid) else {
-            return false;
-        };
-        let Ok(cgroup) = fs::read_to_string(format!("/proc/{pid}/cgroup")) else {
-            return false;
-        };
-        let Ok(command) = process_command(pid) else {
-            return false;
-        };
-        let identity_matches = match self.target {
-            Some(expected) => current == expected,
-            None => true,
-        };
-        identity_matches
-            && cgroup
-                .lines()
-                .any(|line| line == format!("0::{}", self.control_group))
-            && command == ["/usr/bin/sleep", CHILD_SECONDS]
+        fs::remove_dir(&self.path)
     }
 }
 
-impl Drop for OwnedScope {
+impl Drop for OwnedCgroup {
     fn drop(&mut self) {
-        self.act_on_scope(&["--user", "stop", &self.unit]);
-        let needs_kill = wait_for_exit(&mut self.launcher, DEADLINE).is_err();
-        if needs_kill {
-            self.act_on_scope(&["--user", "kill", "--signal=KILL", &self.unit]);
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = wait_for_exit(child, DEADLINE);
         }
-        if wait_for_exit(&mut self.launcher, DEADLINE).is_err() {
-            let _ = self.launcher.kill();
-            let _ = wait_for_exit(&mut self.launcher, CHILD_REAP_GRACE);
-        }
+        let _ = self.remove();
     }
 }
 
@@ -146,6 +137,10 @@ fn random_id() -> io::Result<String> {
 
 fn process_identity(pid: u32) -> io::Result<ProcessIdentity> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    process_identity_from(pid, &stat)
+}
+
+fn process_identity_from(pid: u32, stat: &str) -> io::Result<ProcessIdentity> {
     let fields = stat
         .rsplit_once(')')
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "malformed proc stat"))?
@@ -286,7 +281,7 @@ impl CgroupObservation {
         Ok(())
     }
 
-    fn wait_until_empty(&self, mut ready: Option<SyncSender<()>>) -> io::Result<()> {
+    fn wait_until_empty(&self) -> io::Result<()> {
         let deadline = Instant::now() + DEADLINE;
         loop {
             let is_populated = self.is_populated().map_err(|error| {
@@ -304,18 +299,13 @@ impl CgroupObservation {
                     "cgroup did not empty",
                 ));
             }
-            if let Some(ready) = ready.take() {
-                ready.send(()).map_err(|error| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, error.to_string())
-                })?;
-            }
             self.wait_for_population_change(deadline.saturating_duration_since(Instant::now()))?;
         }
     }
 }
 
 fn wait_until_empty(path: &Path) -> io::Result<()> {
-    CgroupObservation::open(path)?.wait_until_empty(None)
+    CgroupObservation::open(path)?.wait_until_empty()
 }
 
 fn wait_until_populated(path: &Path, launcher: &mut Child) -> io::Result<ProcessIdentity> {
@@ -333,7 +323,9 @@ fn wait_until_populated(path: &Path, launcher: &mut Child) -> io::Result<Process
         };
         if is_populated {
             let members = cgroup_members(path)?;
-            if members.len() == 1 {
+            if members.len() == 1
+                && process_command(members[0])? == ["/usr/bin/sleep", CHILD_SECONDS]
+            {
                 return process_identity(members[0]);
             }
             if members.len() > 1 {
@@ -471,21 +463,42 @@ fn systemd_property_rejects_oversized_output() {
 
 #[test]
 fn systemd_property_deadline_cleans_retained_stdout_descendant() {
-    let scratch =
-        Scratch::create("systemd-retained-stdout").expect("scratch directory should be created");
-    let pid_file = scratch.0.join("descendant.pid");
+    const WORKER: &str = "LLM_GUARD_RETAINED_STDOUT_WORKER";
+    if std::env::var_os(WORKER).is_none() {
+        let mut worker = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "systemd_property_deadline_cleans_retained_stdout_descendant",
+                "--nocapture",
+            ])
+            .env(WORKER, "1")
+            .spawn()
+            .expect("isolated fixture worker");
+        let result = wait_for_exit(&mut worker, Duration::from_secs(15));
+        if result.is_err() {
+            let _ = worker.kill();
+            let _ = wait_for_exit(&mut worker, CHILD_REAP_GRACE);
+        }
+        assert!(
+            result.is_ok_and(|status| status.success()),
+            "isolated fixture failed"
+        );
+        return;
+    }
+    prctl::set_child_subreaper(true).expect("isolated worker owns adopted descendant");
+    let scratch = Scratch::create("systemd-retained-stdout").expect("scratch directory");
+    let descendant = OwnedDescendant(scratch.0.join("descendant.stat"));
     let fake_systemctl = scratch.0.join("systemctl");
     fs::write(
         &fake_systemctl,
         format!(
-            "#!/bin/sh\n/usr/bin/sleep 2 &\nprintf '%s\\n' \"$!\" > '{}'\nexit 0\n",
-            pid_file.display()
+            "#!/bin/sh\n/usr/bin/sleep 120 &\n/usr/bin/cat /proc/$!/stat > '{}'\nexit 0\n",
+            descendant.0.display()
         ),
     )
     .expect("fake systemctl should be written");
     fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o700))
         .expect("fake systemctl should be executable");
-
     let started = Instant::now();
     let result = systemd_property_with(
         &fake_systemctl,
@@ -494,48 +507,87 @@ fn systemd_property_deadline_cleans_retained_stdout_descendant() {
         Duration::from_millis(500),
     );
     let elapsed = started.elapsed();
-    let descendant = fs::read_to_string(pid_file)
-        .expect("fake systemctl should publish its descendant pid")
-        .trim()
-        .parse::<u32>()
-        .expect("descendant pid should parse");
-    wait_until_not_running(descendant, Duration::from_secs(3))
-        .expect("owned stdout descendant should stop before fixture exit");
+    let identity = descendant
+        .identity()
+        .expect("published descendant identity");
+    let pid = Pid::from_raw(i32::try_from(identity.pid).expect("valid descendant PID"));
+    let at_return = process_identity(identity.pid);
+    let immediate_status = waitpid(pid, Some(WaitPidFlag::WNOHANG));
+    let status = match immediate_status {
+        Ok(WaitStatus::StillAlive) => OwnedDescendant::reap(pid, CHILD_REAP_GRACE),
+        result => result.map_err(io::Error::other),
+    };
+    // Capture the oracle before emergency Drop cleanup; cleanup cannot turn RED into GREEN.
+    println!(
+        "retained-stdout helper_return identity={identity:?} observed={at_return:?} immediate_status={immediate_status:?} status={status:?} elapsed={elapsed:?}"
+    );
+    assert_eq!(
+        at_return.expect("owned descendant remains waitable"),
+        identity
+    );
+    assert_eq!(
+        status.expect("exact descendant must be reaped"),
+        WaitStatus::Signaled(pid, Signal::SIGKILL, false)
+    );
     assert!(
         elapsed < Duration::from_millis(1500),
-        "retained stdout exceeded the 500ms deadline: {elapsed:?}"
+        "query took {elapsed:?}"
     );
     assert_eq!(
         result.expect_err("retained stdout must time out").kind(),
         io::ErrorKind::TimedOut
     );
+    assert_eq!(
+        process_identity(identity.pid)
+            .expect_err("descendant reaped")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
 }
 
-fn wait_until_not_running(pid: u32, timeout: Duration) -> io::Result<()> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        match fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => {
-                let state = stat
-                    .rsplit_once(')')
-                    .and_then(|(_, rest)| rest.split_whitespace().next())
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidData, "malformed proc stat")
-                    })?;
-                if state == "Z" {
-                    return Ok(());
+struct OwnedDescendant(PathBuf);
+
+impl OwnedDescendant {
+    fn identity(&self) -> io::Result<ProcessIdentity> {
+        let stat = fs::read_to_string(&self.0)?;
+        let pid = stat
+            .split_whitespace()
+            .next()
+            .ok_or_else(|| io::Error::other("missing descendant pid"))?
+            .parse::<u32>()
+            .map_err(io::Error::other)?;
+        process_identity_from(pid, &stat)
+    }
+
+    fn reap(pid: Pid, timeout: Duration) -> io::Result<WaitStatus> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                Ok(WaitStatus::StillAlive) if Instant::now() < deadline => thread::sleep(POLL),
+                Ok(WaitStatus::StillAlive) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "descendant still alive",
+                    ));
                 }
+                Ok(status) => return Ok(status),
+                Err(nix::errno::Errno::EINTR) if Instant::now() < deadline => {}
+                Err(error) => return Err(io::Error::other(error)),
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error),
         }
-        if Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "fixture descendant was still running",
-            ));
+    }
+}
+
+impl Drop for OwnedDescendant {
+    fn drop(&mut self) {
+        if let Ok(identity) = self.identity()
+            && process_identity(identity.pid).ok() == Some(identity)
+            && let Ok(pid) = i32::try_from(identity.pid)
+        {
+            let pid = Pid::from_raw(pid);
+            let _ = kill(pid, Signal::SIGKILL);
+            let _ = Self::reap(pid, CHILD_REAP_GRACE);
         }
-        thread::sleep(POLL);
     }
 }
 
@@ -705,8 +757,8 @@ fn systemd_property_with(
 }
 
 #[test]
-#[ignore = "requires a disposable user-systemd delegated scope; run just test-real-cgroup"]
-fn registered_scope_kill_reaps_only_the_task_owned_child() -> Result<(), Box<dyn std::error::Error>>
+#[ignore = "requires writable user-systemd delegated app.slice; run just test-real-cgroup"]
+fn registered_cgroup_kill_reaps_only_the_task_owned_child() -> Result<(), Box<dyn std::error::Error>>
 {
     let id = random_id()?;
     let uid = Uid::effective().as_raw();
@@ -715,29 +767,12 @@ fn registered_scope_kill_reaps_only_the_task_owned_child() -> Result<(), Box<dyn
     let cgroup_path = Path::new(CGROUP_ROOT).join(control_group.trim_start_matches('/'));
     assert_eq!(systemd_property(&unit, "LoadState")?, "not-found");
 
-    let launcher = Command::new("/usr/bin/systemd-run")
-        .args(["--user", "--scope", "--quiet", "--collect"])
-        .arg(format!("--unit={unit}"))
-        .args([
-            "--property=Delegate=yes",
-            "--",
-            "/usr/bin/sleep",
-            CHILD_SECONDS,
-        ])
-        .stdout(Stdio::null())
-        .spawn()?;
-    let mut scope = OwnedScope {
-        unit: unit.clone(),
-        control_group: control_group.clone(),
-        cgroup_path: cgroup_path.clone(),
-        launcher,
-        target: None,
-    };
-    let identity = wait_until_populated(&cgroup_path, &mut scope.launcher)?;
-    scope.target = Some(identity);
-
-    assert_eq!(systemd_property(&unit, "ControlGroup")?, control_group);
-    assert_eq!(systemd_property(&unit, "Delegate")?, "yes");
+    // Use the user's delegated app.slice, but do not ask systemd to own this leaf.
+    // Keeping collection in this parent permits an arbitrarily delayed empty observer.
+    let mut owned = OwnedCgroup::create(cgroup_path.clone())?;
+    let child = owned.child.as_mut().expect("owned child was spawned");
+    let identity = wait_until_populated(&cgroup_path, child)?;
+    assert_eq!(identity.pid, child.id());
     assert_eq!(cgroup_members(&cgroup_path)?, [identity.pid]);
     assert!(populated(&cgroup_path)?);
     assert_eq!(
@@ -752,11 +787,8 @@ fn registered_scope_kill_reaps_only_the_task_owned_child() -> Result<(), Box<dyn
     let observation = CgroupObservation::open(&cgroup_path)?;
     assert_eq!(observation.directory.metadata()?.uid(), uid);
     println!(
-        "real-cgroup fixture unit={unit} launcher_pid={} target_pid={} pgid={} starttime={} populated_before=1",
-        scope.launcher.id(),
-        identity.pid,
-        identity.pgid,
-        identity.starttime
+        "kernel-cgroup fixture name={unit} launcher_pid={} target_pid={} pgid={} starttime={} populated_before=1",
+        identity.pid, identity.pid, identity.pgid, identity.starttime
     );
 
     let scratch = Scratch::create(&id)?;
@@ -770,17 +802,23 @@ fn registered_scope_kill_reaps_only_the_task_owned_child() -> Result<(), Box<dyn
         .open(&registration)?;
     file.write_all(contents.as_bytes())?;
     drop(file);
-    fs::set_permissions(&registration, fs::Permissions::from_mode(0o600))?;
 
     let target = CgroupTarget::open_registered(&registration, Path::new(CGROUP_ROOT))?;
     assert_eq!(cgroup_members(&cgroup_path)?, [identity.pid]);
     assert!(populated(&cgroup_path)?);
     let mut reserve = EmergencyReserve::with_page_size(4096, 4096)?;
     let (observer_ready, observer_started) = sync_channel(1);
+    let (observer_release, observer_released) = sync_channel(1);
     thread::scope(|scope| -> Result<(), Box<dyn std::error::Error>> {
         let observation_for_waiter = &observation;
-        let observer =
-            scope.spawn(move || observation_for_waiter.wait_until_empty(Some(observer_ready)));
+        let observer = scope.spawn(move || {
+            assert!(observation_for_waiter.is_populated()?);
+            observer_ready.send(()).map_err(io::Error::other)?;
+            observer_released
+                .recv_timeout(DEADLINE)
+                .map_err(io::Error::other)?;
+            observation_for_waiter.wait_until_empty()
+        });
         observer_started.recv_timeout(DEADLINE).map_err(|error| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
@@ -789,26 +827,43 @@ fn registered_scope_kill_reaps_only_the_task_owned_child() -> Result<(), Box<dyn
         })?;
         kill_direct(&mut reserve, &target)?;
         println!("real-cgroup fixture cgroup.kill issued");
+        let status = wait_for_exit(owned.child.as_mut().expect("owned child"), DEADLINE)?;
+        assert_eq!(
+            std::os::unix::process::ExitStatusExt::signal(&status),
+            Some(9)
+        );
+        assert!(
+            cgroup_path.exists(),
+            "parent must retain empty cgroup until observer joins"
+        );
+        observer_release.send(()).map_err(io::Error::other)?;
         observer
             .join()
             .map_err(|_| io::Error::other("empty-state observer panicked"))??;
         Ok(())
     })?;
-    drop(observation);
-    let _launcher_status = scope.wait()?;
     drop(target);
 
     match process_identity(identity.pid) {
         Ok(current) => assert_ne!(current.starttime, identity.starttime),
         Err(error) => assert_eq!(error.kind(), io::ErrorKind::NotFound),
     }
+    owned.remove()?;
+    assert_eq!(
+        observation
+            .is_populated()
+            .expect_err("removed kernfs node must not mean empty")
+            .raw_os_error(),
+        Some(nix::errno::Errno::ENODEV as i32)
+    );
+    drop(observation);
     wait_until_removed(&cgroup_path)?;
     assert_eq!(systemd_property(&unit, "LoadState")?, "not-found");
     let scratch_path = scratch.0.clone();
     drop(scratch);
     assert!(!scratch_path.exists());
     println!(
-        "registration opened; populated=1 -> cgroup.kill -> observed populated=0 and empty cgroup.procs; exact child reaped; scope removed"
+        "registration opened; populated=1 -> cgroup.kill -> observed populated=0 and empty cgroup.procs; exact child reaped; parent-owned kernel cgroup removed (not a systemd unit)"
     );
     Ok(())
 }
