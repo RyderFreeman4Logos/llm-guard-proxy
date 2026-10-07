@@ -1832,9 +1832,17 @@ fn process_start_time_ticks(stat: &str, expected_pid: u32) -> Option<u64> {
     if stat_pid.parse::<u32>().ok()? != expected_pid {
         return None;
     }
-    let mut fields = rest.rsplit_once(')')?.1.split_whitespace();
-    let state = fields.next()?;
-    if state.len() != 1 || !state.as_bytes()[0].is_ascii_alphabetic() {
+    let mut fields = rest
+        .strip_prefix('(')?
+        .rsplit_once(')')?
+        .1
+        .strip_prefix(' ')?
+        .split_whitespace();
+    // Linux proc_pid_stat(5): current and historical kernel task-state codes.
+    if !matches!(
+        fields.next()?,
+        "R" | "S" | "D" | "Z" | "T" | "t" | "X" | "x" | "K" | "W" | "P" | "I"
+    ) {
         return None;
     }
     // Starttime is field 22; `nth` bounds-checks the post-state fields.

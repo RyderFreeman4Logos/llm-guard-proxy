@@ -1117,6 +1117,14 @@ fn process_start_time_parser_checks_pid_fields_and_nonzero_ticks() {
     let stat = format!("321 (worker with ) spaces) S {numeric_fields} 777 999");
 
     assert_eq!(process_start_time_ticks(&stat, 321), Some(777));
+    assert_eq!(
+        process_start_time_ticks(&stat.replace("321 (", "321 "), 321),
+        None
+    );
+    assert_eq!(
+        process_start_time_ticks(&stat.replace(") S ", ") Q "), 321),
+        None
+    );
     assert_eq!(process_start_time_ticks(&stat, 322), None);
     assert_eq!(process_start_time_ticks("321 (worker) S 1 2", 321), None);
     assert_eq!(
