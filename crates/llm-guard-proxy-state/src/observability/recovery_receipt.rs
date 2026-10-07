@@ -63,6 +63,24 @@ impl std::fmt::Debug for TestHook {
 
 // Keep fixture instrumentation outside the admission function's production logic.
 macro_rules! receipt_sql {
+    ($store:expr, $id:expr, $phase:literal, $work:expr) => {{
+        #[cfg(feature = "recovery-receipt-test-hooks")]
+        $store.observe_recovery_receipt_test(concat!($phase, "_start"), $id);
+        let result = $work;
+        #[cfg(feature = "recovery-receipt-test-hooks")]
+        {
+            $store.observe_recovery_receipt_test(concat!($phase, "_end"), $id);
+            $store.observe_recovery_receipt_test(
+                if result.is_ok() {
+                    concat!($phase, "_ok")
+                } else {
+                    concat!($phase, "_error")
+                },
+                $id,
+            );
+        }
+        result
+    }};
     ($store:expr, $id:expr, $work:expr) => {{
         #[cfg(feature = "recovery-receipt-test-hooks")]
         $store.observe_recovery_receipt_test("record_sql_start", $id);
@@ -171,53 +189,91 @@ impl ObservabilityStore {
         let result = receipt_sql!(
             self,
             &safe.receipt_id,
-            (|| {
-                let synchronous: u32 = connection
-                    .query_row("PRAGMA synchronous", [], |row| row.get(0))
-                    .map_err(|_| "write_failed")?;
-                // Inspect the opened database: :memory: reports synchronous=FULL too.
-                let database_file: String = connection
-                    .query_row(
-                        "SELECT file FROM pragma_database_list WHERE name = 'main'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|_| "write_failed")?;
-                let journal_mode: String = connection
-                    .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-                    .map_err(|_| "write_failed")?;
-                if synchronous < 2
-                    || database_file.is_empty()
-                    || matches!(journal_mode.as_str(), "memory" | "off")
-                {
-                    return Err("durability_disabled");
-                }
-                let transaction = connection.transaction().map_err(|_| "write_failed")?;
-                if let Some(identity) = guardian {
-                    // The singleton survives receipt-ring retention and proxy restarts.
-                    transaction.execute_batch("CREATE TABLE IF NOT EXISTS guardian_boot_claim (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), boot_id TEXT NOT NULL, receipt_id TEXT NOT NULL)")
-                    .map_err(|_| "write_failed")?;
-                    let claimed = transaction.execute(
-                    "INSERT INTO guardian_boot_claim(singleton, boot_id, receipt_id) VALUES (1, ?1, ?2) ON CONFLICT(singleton) DO UPDATE SET boot_id=excluded.boot_id, receipt_id=excluded.receipt_id WHERE guardian_boot_claim.boot_id != excluded.boot_id",
-                    params![identity.boot_id, safe.receipt_id],
-                ).map_err(|_| "write_failed")?;
-                    if claimed != 1 {
-                        return Err("boot_already_claimed");
-                    }
-                }
-                transaction.execute(
-                "INSERT INTO local_recovery_receipts(receipt_id, generated_at_unix_ms, receipt_json) VALUES (?1, ?2, ?3)",
-                params![safe.receipt_id, safe.generated_at_unix_ms, json],
-            ).map_err(|_| "write_failed")?;
-                // ponytail: fixed 1024-row content-free ring; configurable retention only if needed.
-                transaction.execute("DELETE FROM local_recovery_receipts WHERE rowid IN (SELECT rowid FROM local_recovery_receipts ORDER BY rowid DESC LIMIT -1 OFFSET 1024)", []).map_err(|_| "write_failed")?;
-                transaction.commit().map_err(|_| "write_failed")
-            })()
+            self.record_local_recovery_sql(&mut connection, &safe, &json)
         );
-        connection
-            .busy_timeout(std::time::Duration::from_millis(previous))
-            .map_err(|_| "write_failed")?;
+        receipt_sql!(
+            self,
+            &safe.receipt_id,
+            "busy_timeout_restore",
+            connection
+                .busy_timeout(std::time::Duration::from_millis(previous))
+                .map_err(|_| "write_failed")
+        )?;
         result
+    }
+
+    fn record_local_recovery_sql(
+        &self,
+        connection: &mut rusqlite::Connection,
+        safe: &LocalRecoveryReceipt,
+        json: &str,
+    ) -> Result<(), &'static str> {
+        let guardian = safe.guardian.as_ref();
+        let synchronous: u32 = receipt_sql!(
+            self,
+            &safe.receipt_id,
+            "synchronous_check",
+            connection
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .map_err(|_| "write_failed")
+        )?;
+        // Inspect the opened database: :memory: reports synchronous=FULL too.
+        let database_file: String = receipt_sql!(
+            self,
+            &safe.receipt_id,
+            "database_check",
+            connection
+                .query_row(
+                    "SELECT file FROM pragma_database_list WHERE name = 'main'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|_| "write_failed")
+        )?;
+        let journal_mode: String = receipt_sql!(
+            self,
+            &safe.receipt_id,
+            "journal_check",
+            connection
+                .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+                .map_err(|_| "write_failed")
+        )?;
+        if synchronous < 2
+            || database_file.is_empty()
+            || matches!(journal_mode.as_str(), "memory" | "off")
+        {
+            return Err("durability_disabled");
+        }
+        let transaction = receipt_sql!(
+            self,
+            &safe.receipt_id,
+            "transaction_begin",
+            connection.transaction().map_err(|_| "write_failed")
+        )?;
+        if let Some(identity) = guardian {
+            // The singleton survives receipt-ring retention and proxy restarts.
+            transaction.execute_batch("CREATE TABLE IF NOT EXISTS guardian_boot_claim (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), boot_id TEXT NOT NULL, receipt_id TEXT NOT NULL)")
+        .map_err(|_| "write_failed")?;
+            let claimed = transaction.execute(
+        "INSERT INTO guardian_boot_claim(singleton, boot_id, receipt_id) VALUES (1, ?1, ?2) ON CONFLICT(singleton) DO UPDATE SET boot_id=excluded.boot_id, receipt_id=excluded.receipt_id WHERE guardian_boot_claim.boot_id != excluded.boot_id",
+        params![identity.boot_id, safe.receipt_id],
+    ).map_err(|_| "write_failed")?;
+            if claimed != 1 {
+                return Err("boot_already_claimed");
+            }
+        }
+        receipt_sql!(self, &safe.receipt_id, "receipt_insert", transaction.execute(
+    "INSERT INTO local_recovery_receipts(receipt_id, generated_at_unix_ms, receipt_json) VALUES (?1, ?2, ?3)",
+    params![safe.receipt_id, safe.generated_at_unix_ms, json],
+).map_err(|_| "write_failed"))?;
+        // ponytail: fixed 1024-row content-free ring; configurable retention only if needed.
+        receipt_sql!(self, &safe.receipt_id, "retention_delete", transaction.execute("DELETE FROM local_recovery_receipts WHERE rowid IN (SELECT rowid FROM local_recovery_receipts ORDER BY rowid DESC LIMIT -1 OFFSET 1024)", []).map_err(|_| "write_failed"))?;
+        receipt_sql!(
+            self,
+            &safe.receipt_id,
+            "commit",
+            transaction.commit().map_err(|_| "write_failed")
+        )
     }
 
     /// Joins a terminal recovery outcome to its pre-action receipt.
