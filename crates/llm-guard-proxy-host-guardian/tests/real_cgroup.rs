@@ -1,8 +1,9 @@
 use llm_guard_proxy_host_guardian::{CgroupTarget, EmergencyReserve, kill_direct};
 use nix::{
-    fcntl::OFlag,
+    fcntl::{FcntlArg, OFlag, fcntl},
     poll::{PollFd, PollFlags, PollTimeout, poll},
-    unistd::Uid,
+    sys::signal::{Signal, killpg},
+    unistd::{Pid, Uid},
 };
 use std::{
     fmt::Write as _,
@@ -10,10 +11,13 @@ use std::{
     io::{self, Read, Write},
     os::{
         fd::{AsFd, AsRawFd},
-        unix::fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        unix::{
+            fs::{FileExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+            process::CommandExt,
+        },
     },
     path::{Path, PathBuf},
-    process::{Child, Command, ExitStatus, Stdio},
+    process::{Child, ChildStdout, Command, ExitStatus, Stdio},
     sync::mpsc::{SyncSender, sync_channel},
     thread,
     time::{Duration, Instant},
@@ -465,8 +469,169 @@ fn systemd_property_rejects_oversized_output() {
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 
+#[test]
+fn systemd_property_deadline_cleans_retained_stdout_descendant() {
+    let scratch =
+        Scratch::create("systemd-retained-stdout").expect("scratch directory should be created");
+    let pid_file = scratch.0.join("descendant.pid");
+    let fake_systemctl = scratch.0.join("systemctl");
+    fs::write(
+        &fake_systemctl,
+        format!(
+            "#!/bin/sh\n/usr/bin/sleep 2 &\nprintf '%s\\n' \"$!\" > '{}'\nexit 0\n",
+            pid_file.display()
+        ),
+    )
+    .expect("fake systemctl should be written");
+    fs::set_permissions(&fake_systemctl, fs::Permissions::from_mode(0o700))
+        .expect("fake systemctl should be executable");
+
+    let started = Instant::now();
+    let result = systemd_property_with(
+        &fake_systemctl,
+        "retained.stdout.scope",
+        "ControlGroup",
+        Duration::from_millis(500),
+    );
+    let elapsed = started.elapsed();
+    let descendant = fs::read_to_string(pid_file)
+        .expect("fake systemctl should publish its descendant pid")
+        .trim()
+        .parse::<u32>()
+        .expect("descendant pid should parse");
+    wait_until_not_running(descendant, Duration::from_secs(3))
+        .expect("owned stdout descendant should stop before fixture exit");
+    assert!(
+        elapsed < Duration::from_millis(1500),
+        "retained stdout exceeded the 500ms deadline: {elapsed:?}"
+    );
+    assert_eq!(
+        result.expect_err("retained stdout must time out").kind(),
+        io::ErrorKind::TimedOut
+    );
+}
+
+fn wait_until_not_running(pid: u32, timeout: Duration) -> io::Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                let state = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().next())
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "malformed proc stat")
+                    })?;
+                if state == "Z" {
+                    return Ok(());
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "fixture descendant was still running",
+            ));
+        }
+        thread::sleep(POLL);
+    }
+}
+
 fn systemd_property(unit: &str, property: &str) -> io::Result<String> {
     systemd_property_with(Path::new("/usr/bin/systemctl"), unit, property, DEADLINE)
+}
+
+fn read_systemd_stdout(stdout: &mut ChildStdout, deadline: Instant) -> io::Result<Vec<u8>> {
+    let flags = fcntl(stdout.as_raw_fd(), FcntlArg::F_GETFL).map_err(io::Error::other)?;
+    fcntl(
+        stdout.as_raw_fd(),
+        FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+    )
+    .map_err(io::Error::other)?;
+
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; SYSTEMCTL_OUTPUT_LIMIT + 1];
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "systemctl stdout did not close before deadline",
+            ));
+        }
+        let mut descriptor = [PollFd::new(
+            stdout.as_fd(),
+            PollFlags::POLLIN | PollFlags::POLLHUP,
+        )];
+        let ready = match poll(
+            &mut descriptor,
+            PollTimeout::try_from(remaining).unwrap_or(PollTimeout::MAX),
+        ) {
+            Ok(ready) => ready,
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(error) => return Err(io::Error::other(error)),
+        };
+        if ready == 0 {
+            continue;
+        }
+        let events = descriptor[0].revents().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unknown systemctl stdout poll flags",
+            )
+        })?;
+        if events.contains(PollFlags::POLLNVAL) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "systemctl stdout descriptor is invalid",
+            ));
+        }
+        match stdout.read(&mut buffer[..SYSTEMCTL_OUTPUT_LIMIT + 1 - output.len()]) {
+            Ok(0) => return Ok(output),
+            Ok(length) => {
+                output.extend_from_slice(&buffer[..length]);
+                if output.len() > SYSTEMCTL_OUTPUT_LIMIT {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "systemctl output exceeded limit",
+                    ));
+                }
+            }
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock
+                    || error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn terminate_owned_systemctl(
+    child: &mut Child,
+    identity: ProcessIdentity,
+    deadline: Instant,
+) -> io::Result<()> {
+    let group_kill = match process_identity(identity.pid) {
+        Ok(current)
+            if current == identity && identity.pgid == identity.pid && identity.pgid > 1 =>
+        {
+            i32::try_from(identity.pgid)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                .and_then(|pgid| match killpg(Pid::from_raw(pgid), Signal::SIGKILL) {
+                    Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+                    Err(error) => Err(io::Error::other(error)),
+                })
+        }
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "owned systemctl process identity changed",
+        )),
+        Err(error) => Err(error),
+    };
+    let _ = child.kill();
+    wait_for_exit(child, deadline.saturating_duration_since(Instant::now()))?;
+    group_kill
 }
 
 fn systemd_property_with(
@@ -475,37 +640,66 @@ fn systemd_property_with(
     property: &str,
     timeout: Duration,
 ) -> io::Result<String> {
-    let deadline = Instant::now() + timeout;
-    let mut child = Command::new(systemctl)
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let work_deadline = started + timeout.saturating_sub(CHILD_REAP_GRACE);
+    let mut command = Command::new(systemctl);
+    command
         .args(["--user", "show", unit, "--property", property, "--value"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .spawn()?;
-    let status = match wait_for_exit(&mut child, timeout.saturating_sub(CHILD_REAP_GRACE)) {
-        Ok(status) => status,
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let identity = match process_identity(child.id()) {
+        Ok(identity) if identity.pgid == child.id() => identity,
+        Ok(_) => {
+            let error = io::Error::new(
+                io::ErrorKind::InvalidData,
+                "systemctl did not enter its owned process group",
+            );
+            let _ = child.kill();
+            wait_for_exit(
+                &mut child,
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+            return Err(error);
+        }
         Err(error) => {
             let _ = child.kill();
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            wait_for_exit(&mut child, remaining)?;
+            wait_for_exit(
+                &mut child,
+                deadline.saturating_duration_since(Instant::now()),
+            )?;
+            return Err(error);
+        }
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        let error = io::Error::other("systemctl stdout was not captured");
+        terminate_owned_systemctl(&mut child, identity, deadline)?;
+        return Err(error);
+    };
+    let output = read_systemd_stdout(&mut stdout, work_deadline);
+    drop(stdout);
+    let output = match output {
+        Ok(output) => output,
+        Err(error) => {
+            terminate_owned_systemctl(&mut child, identity, deadline)?;
+            return Err(error);
+        }
+    };
+    let status = match wait_for_exit(
+        &mut child,
+        work_deadline.saturating_duration_since(Instant::now()),
+    ) {
+        Ok(status) => status,
+        Err(error) => {
+            terminate_owned_systemctl(&mut child, identity, deadline)?;
             return Err(error);
         }
     };
     if !status.success() {
         return Err(io::Error::other("systemctl show failed"));
-    }
-    let mut output = Vec::new();
-    child
-        .stdout
-        .take()
-        .ok_or_else(|| io::Error::other("systemctl stdout was not captured"))?
-        .take((SYSTEMCTL_OUTPUT_LIMIT + 1) as u64)
-        .read_to_end(&mut output)?;
-    if output.len() > SYSTEMCTL_OUTPUT_LIMIT {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "systemctl output exceeded limit",
-        ));
     }
     Ok(String::from_utf8_lossy(&output).trim().to_owned())
 }
