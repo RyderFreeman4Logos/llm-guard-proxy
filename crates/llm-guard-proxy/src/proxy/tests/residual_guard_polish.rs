@@ -614,6 +614,7 @@ max_per_window = 20
         &config,
     )
     .await;
+    let trace = recovery_diagnostics::ReceiptTrace::install(&proxy.store);
     let client = proxy.client.clone();
     let request_url = format!(
         "{}/v1/chat/completions?test=generic-429-then-timeout-then-success",
@@ -637,8 +638,7 @@ max_per_window = 20
         .await
         .expect("request task should join")
         .expect("recovered request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-    response.bytes().await.expect("response should drain");
+    recovery_diagnostics::assert_ok(response, &proxy, &trace).await;
 
     let timed_out = fake.recv_next().await;
     let readiness = fake.recv_next().await;
@@ -845,6 +845,7 @@ async fn shielded_max_attempts_one_keeps_ordinary_flat_across_two_recovery_repla
         &multi_recovery_max_attempts_two_config(&marker),
     )
     .await;
+    let trace = recovery_diagnostics::ReceiptTrace::install(&proxy.store);
     let response = proxy
         .client
         .post(format!(
@@ -855,8 +856,7 @@ async fn shielded_max_attempts_one_keeps_ordinary_flat_across_two_recovery_repla
         .send()
         .await
         .expect("multi-recovery shielded request should complete");
-    assert_eq!(response.status(), StatusCode::OK);
-    response.bytes().await.expect("response should drain");
+    recovery_diagnostics::assert_ok(response, &proxy, &trace).await;
     assert!(marker.exists());
     assert_two_recovery_replays_keep_ordinary_flat(&proxy);
     remove_dir_all(&recovery_root);

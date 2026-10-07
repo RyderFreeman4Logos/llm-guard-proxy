@@ -50,6 +50,8 @@ mod local_recovery_receipt;
 mod native_json_fallback_issue_219;
 #[path = "tests/quality_first_timeouts_issue_222.rs"]
 mod quality_first_timeouts_issue_222;
+#[path = "tests/recovery_diagnostics.rs"]
+mod recovery_diagnostics;
 #[path = "tests/recovery_physical_fence.rs"]
 mod recovery_physical_fence;
 #[path = "tests/recovery_readiness_bounds.rs"]
