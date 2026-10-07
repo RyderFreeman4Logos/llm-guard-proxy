@@ -190,9 +190,18 @@ async fn run_server_with_config(
         bound_listeners.push((listener_config, listener, local_addr));
     }
     let request_id = RequestId::generate();
+    let (summary_config, summary_revision) = manager
+        .handle()
+        .snapshot_with_revision()
+        .map_err(|error| error.to_string())?;
     eprintln!(
         "{}",
-        proxy::render_health(&config, manager.path(), &request_id)
+        proxy::render_health(
+            &summary_config,
+            summary_revision,
+            manager.path(),
+            &request_id
+        )
     );
     for (listener_config, _listener, local_addr) in &bound_listeners {
         eprintln!(
@@ -1067,10 +1076,9 @@ mod tests {
         let request_id =
             RequestId::from_string("req-health").expect("test request id should be valid");
 
-        assert_eq!(
-            render_health(&config, Path::new("/tmp/config.toml"), &request_id),
-            "llm-guard-proxy request_id=req-health readiness=ready license=Apache-2.0 config_path=/tmp/config.toml heartbeat_configured_mode=json-whitespace shielded_precommit_liveness_mode=held heartbeat_interval_secs=7 observability_enabled=false"
-        );
+        assert!(render_health(&config, 0, Path::new("/tmp/config.toml"), &request_id).starts_with(
+            "llm-guard-proxy request_id=req-health readiness=ready license=Apache-2.0 config_path=/tmp/config.toml heartbeat_configured_mode=json-whitespace shielded_precommit_liveness_mode=held heartbeat_interval_secs=7 observability_enabled=false guardian.escalation_enabled=false config_revision=0 serving_process_generation="
+        ));
     }
 
     #[test]
