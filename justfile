@@ -91,3 +91,13 @@ pre-push:
     just fmt-check
     just clippy
     just test
+
+# Explicit host-dependent kernel cgroup regression; never part of default gates.
+test-real-cgroup:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    unit="llm-guard-real-cgroup-test-$(python3 -c 'import secrets; print(secrets.token_hex(16))').scope"
+    exec {{_io_prefix}} systemd-run --user --scope --quiet --collect \
+        --unit="${unit}" --property=Delegate=yes -- \
+        cargo test -p llm-guard-proxy-host-guardian --test real_cgroup -- \
+        --ignored --exact registered_cgroup_kill_reaps_only_the_task_owned_child --nocapture
