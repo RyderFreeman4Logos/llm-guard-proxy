@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "GB10 host-memory emergency guardian for llm-guard-proxy."
 
+[features]
+synthetic-pressure-test-inputs = []
+
 [dependencies]
 libc = "0.2"
 llm-guard-proxy-core = { path = "../llm-guard-proxy-core" }

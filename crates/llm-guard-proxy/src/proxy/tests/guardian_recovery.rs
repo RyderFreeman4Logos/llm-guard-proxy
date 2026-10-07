@@ -1,3 +1,5 @@
+#[path = "guardian_real_kernel.rs"]
+mod real_kernel;
 #[path = "guardian_stage_deadlines.rs"]
 mod stage_deadlines;
 
