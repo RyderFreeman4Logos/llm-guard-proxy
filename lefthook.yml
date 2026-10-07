@@ -18,4 +18,4 @@ pre-push:
     branch-protection:
       run: scripts/hooks/branch-protection.sh
     quality-gates:
-      run: just pre-push
+      run: just pre-push-hook

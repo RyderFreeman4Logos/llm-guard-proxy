@@ -60,6 +60,20 @@ impl ConfigHandle {
         Ok(guard.clone())
     }
 
+    /// Returns the active config and its revision from one coherent read snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigHandleError::LockPoisoned`] if another thread panicked
+    /// while mutating the config.
+    pub fn snapshot_with_revision(&self) -> Result<(AppConfig, u64), ConfigHandleError> {
+        let guard = self
+            .current
+            .read()
+            .map_err(|_error| ConfigHandleError::LockPoisoned)?;
+        Ok((guard.clone(), self.revision()))
+    }
+
     /// Returns only the host guardian policy from the current coherent snapshot.
     ///
     /// This avoids cloning unrelated routing, evidence, and workflow state from

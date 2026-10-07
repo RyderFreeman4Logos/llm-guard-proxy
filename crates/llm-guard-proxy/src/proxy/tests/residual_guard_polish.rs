@@ -1052,6 +1052,22 @@ enabled = false
             .await
             .expect("config summary should be text");
         assert!(summary.contains(&format!("heartbeat_configured_mode={configured}")));
+        assert!(summary.contains("guardian.escalation_enabled=false"));
+        assert!(summary.contains("config_revision=0"));
+        let process_generation = summary
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("serving_process_generation="))
+            .expect("summary should expose the serving process generation");
+        let (pid, start_time_ticks) = process_generation
+            .split_once(':')
+            .expect("process generation should bind PID to start time");
+        assert_eq!(
+            pid.parse::<u32>().expect("PID should be numeric"),
+            std::process::id()
+        );
+        assert!(start_time_ticks.parse::<u64>().is_ok());
+        assert!(!summary.contains("escalation_profile"));
+        assert!(!summary.contains("restart_command"));
 
         let response = proxy
             .client
@@ -1090,6 +1106,56 @@ enabled = false
             framing
         );
     }
+}
+
+#[test]
+fn process_start_time_parser_checks_pid_fields_and_nonzero_ticks() {
+    let numeric_fields = (1..=18)
+        .map(|field| field.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let stat = format!("321 (worker with ) spaces) S {numeric_fields} 777 999");
+
+    assert_eq!(process_start_time_ticks(&stat, 321), Some(777));
+    assert_eq!(
+        process_start_time_ticks(&stat.replace("321 (", "321 "), 321),
+        None
+    );
+    assert_eq!(
+        process_start_time_ticks(&stat.replace(") S ", ") Q "), 321),
+        None
+    );
+    assert_eq!(process_start_time_ticks(&stat, 322), None);
+    assert_eq!(process_start_time_ticks("321 (worker) S 1 2", 321), None);
+    assert_eq!(
+        process_start_time_ticks(&stat.replace(" 777 999", " 0 999"), 321),
+        None
+    );
+}
+
+#[test]
+fn config_summary_reports_enabled_guardian_escalation() {
+    let config = AppConfig::parse(
+        r#"
+[guardian]
+enabled = true
+target_label = "test"
+escalation_enabled = true
+escalation_profile = "default"
+escalation_grace_secs = 30
+escalation_timeout_secs = 10
+escalation_mem_threshold_gib = 1
+
+[upstream.local_recovery]
+enabled = true
+restart_command = ["/usr/bin/true"]
+"#,
+    )
+    .expect("Tier 2 config should parse");
+    config.validate().expect("Tier 2 config should be valid");
+
+    let summary = render_health(&config, 0, Path::new("config.toml"), &RequestId::generate());
+    assert!(summary.contains("guardian.escalation_enabled=true"));
 }
 
 #[tokio::test]

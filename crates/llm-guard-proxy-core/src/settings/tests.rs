@@ -4426,9 +4426,12 @@ systemd_unit = "replacement-vllm.service"
     let outcome = handle
         .apply_reloadable(&requested)
         .expect("guardian policy should hot reload");
-    let snapshot = handle.snapshot().expect("snapshot should succeed");
+    let (snapshot, revision) = handle
+        .snapshot_with_revision()
+        .expect("revisioned snapshot should succeed");
 
     assert!(outcome.applied);
+    assert_eq!(revision, 1);
     assert_eq!(outcome.restart_required_changes.len(), 0);
     assert_eq!(snapshot.guardian, requested.guardian);
     assert_eq!(
@@ -4443,6 +4446,26 @@ systemd_unit = "replacement-vllm.service"
         snapshot.guardian.effective_systemd_unit(),
         "replacement-vllm.service"
     );
+}
+
+#[test]
+fn config_handle_revisioned_snapshot_keeps_revision_after_rejected_reload() {
+    let current = AppConfig::default();
+    let handle = ConfigHandle::new(current.clone());
+    let mut invalid = current.clone();
+    invalid.guardian.mem_threshold_gib = 0;
+
+    let outcome = handle
+        .apply_reloadable(&invalid)
+        .expect("invalid candidate should return a reload outcome");
+    let (snapshot, revision) = handle
+        .snapshot_with_revision()
+        .expect("revisioned snapshot should succeed");
+
+    assert!(!outcome.applied);
+    assert!(outcome.rejection.is_some());
+    assert_eq!(snapshot, current);
+    assert_eq!(revision, 0);
 }
 
 #[test]

@@ -75,6 +75,15 @@ pre-commit:
     just pre-commit-fast
     just test
 
+# Publication reuses validated native evidence; generation always uses pre-push.
+pre-push-hook:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    if [ -n "${LLM_GUARD_NATIVE_REVIEW_RECEIPT:-}" ] || [ -n "${LLM_GUARD_NATIVE_REVIEW_SHA256:-}" ]; then
+        exec scripts/hooks/review-check.sh
+    fi
+    exec just pre-push
+
 # Authoritative committed-HEAD gate replacing hosted CI.
 pre-push:
     just check-branch

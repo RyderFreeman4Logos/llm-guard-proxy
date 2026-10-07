@@ -1794,7 +1794,12 @@ impl HealthUpstreamStatus {
 
 /// Renders the compact health/config summary kept from the bootstrap binary.
 #[must_use]
-pub(crate) fn render_health(config: &AppConfig, path: &Path, request_id: &RequestId) -> String {
+pub(crate) fn render_health(
+    config: &AppConfig,
+    revision: u64,
+    path: &Path,
+    request_id: &RequestId,
+) -> String {
     let health = Health::current();
     let name = SERVICE_NAME;
     let license = LICENSE;
@@ -1803,17 +1808,58 @@ pub(crate) fn render_health(config: &AppConfig, path: &Path, request_id: &Reques
     let heartbeat_configured_mode = config.heartbeat.mode.as_str();
     let heartbeat_interval_secs = config.heartbeat.interval_secs;
     let observability_enabled = config.observability.enabled;
+    let guardian_escalation_enabled = config.guardian.escalation_enabled;
+    let process_generation = serving_process_generation();
 
     format!(
-        "{name} request_id={request_id} readiness={readiness} license={license} config_path={config_path} heartbeat_configured_mode={heartbeat_configured_mode} shielded_precommit_liveness_mode=held heartbeat_interval_secs={heartbeat_interval_secs} observability_enabled={observability_enabled}"
+        "{name} request_id={request_id} readiness={readiness} license={license} config_path={config_path} heartbeat_configured_mode={heartbeat_configured_mode} shielded_precommit_liveness_mode=held heartbeat_interval_secs={heartbeat_interval_secs} observability_enabled={observability_enabled} guardian.escalation_enabled={guardian_escalation_enabled} config_revision={revision} serving_process_generation={process_generation}"
     )
 }
 
+fn serving_process_generation() -> String {
+    let pid = std::process::id();
+    let start_time_ticks = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| process_start_time_ticks(&stat, pid));
+    start_time_ticks.map_or_else(
+        || format!("{pid}:unavailable"),
+        |start_time_ticks| format!("{pid}:{start_time_ticks}"),
+    )
+}
+
+fn process_start_time_ticks(stat: &str, expected_pid: u32) -> Option<u64> {
+    let (stat_pid, rest) = stat.split_once(' ')?;
+    if stat_pid.parse::<u32>().ok()? != expected_pid {
+        return None;
+    }
+    let mut fields = rest
+        .strip_prefix('(')?
+        .rsplit_once(')')?
+        .1
+        .strip_prefix(' ')?
+        .split_whitespace();
+    // Linux proc_pid_stat(5): current and historical kernel task-state codes.
+    if !matches!(
+        fields.next()?,
+        "R" | "S" | "D" | "Z" | "T" | "t" | "X" | "x" | "K" | "W" | "P" | "I"
+    ) {
+        return None;
+    }
+    // Starttime is field 22; `nth` bounds-checks the post-state fields.
+    let start_time_ticks = fields.nth(18)?.parse::<u64>().ok()?;
+    (start_time_ticks != 0).then_some(start_time_ticks)
+}
+
 async fn config_summary_handler(State(state): State<ProxyState>) -> Response<Body> {
-    match state.config.snapshot() {
-        Ok(config) => text_response(
+    match state.config.snapshot_with_revision() {
+        Ok((config, revision)) => text_response(
             StatusCode::OK,
-            render_health(&config, &state.config_path, &RequestId::generate()),
+            render_health(
+                &config,
+                revision,
+                &state.config_path,
+                &RequestId::generate(),
+            ),
         ),
         Err(error) => proxy_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
