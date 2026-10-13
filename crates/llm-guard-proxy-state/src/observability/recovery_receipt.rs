@@ -145,7 +145,10 @@ impl ObservabilityStore {
         let guardian_labels = guardian.is_some()
             && receipt.cause == "memory_pressure"
             && receipt.detector == "memory_guardian"
-            && receipt.command_id == "guardian.foreground_recovery"
+            && matches!(
+                receipt.command_id,
+                "guardian.foreground_recovery" | "guardian.systemd_recovery"
+            )
             && receipt.request_id.is_none()
             && receipt.attempt_id.is_none();
         if guardian.is_some_and(|identity| {

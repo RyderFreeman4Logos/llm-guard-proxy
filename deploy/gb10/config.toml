@@ -882,6 +882,7 @@ cgroup_root = "/sys/fs/cgroup"             # cgroup-v2 root
 ## configured observability SQLite database; do not change/delete that database
 ## during a boot to reset admission. No action follows failed durable admission.
 # escalation_enabled = false                # Safe default; explicit operator opt-in only
+# escalation_unit = "gb10-stack-recovery@.service" # Optional two-phase systemd transaction; absent uses foreground recovery
 # escalation_profile = "default"            # Existing reviewed foreground local_recovery profile
 # escalation_grace_secs = 60                 # Continuous verified low-memory dwell, 30..60 seconds
 # escalation_timeout_secs = 120              # One action/readiness deadline; cleanup may add 3 seconds

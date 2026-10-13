@@ -31,7 +31,7 @@ pub enum RecoveryOutcome {
 /// immediately before dispatch and continuously by the owning guardian.
 #[derive(Debug)]
 pub struct RecoveryAuthority {
-    cancelled: Mutex<bool>,
+    state: Mutex<AuthorityState>,
     notify: Notify,
     target: CgroupTarget,
     config: ConfigHandle,
@@ -41,6 +41,12 @@ pub struct RecoveryAuthority {
     meminfo: File,
     /// One absolute deadline for admission, action and readiness.
     pub deadline: Instant,
+}
+
+#[derive(Debug, Default)]
+struct AuthorityState {
+    cancelled: bool,
+    unit_owned: bool,
 }
 
 impl RecoveryAuthority {
@@ -56,7 +62,7 @@ impl RecoveryAuthority {
         deadline: Instant,
     ) -> Self {
         Self {
-            cancelled: Mutex::new(false),
+            state: Mutex::new(AuthorityState::default()),
             notify: Notify::new(),
             target,
             revision: config.revision(),
@@ -113,17 +119,59 @@ impl RecoveryAuthority {
 
     /// Runs a synchronous dispatch only while the exact owner remains valid.
     pub fn dispatch<T>(&self, action: impl FnOnce() -> T) -> Option<T> {
-        let cancelled = self.cancelled.lock().ok()?;
-        if *cancelled || !self.valid() {
+        let state = self.state.lock().ok()?;
+        if state.cancelled
+            || Instant::now() >= self.deadline
+            || (!state.unit_owned && !self.valid())
+        {
             return None;
         }
         self.config.at_revision(self.revision, action)
     }
 
+    /// Publishes the verified unit's startup permit after the final complete admission check.
+    /// Ownership transfers only if publication succeeds. The executor must settle that unit
+    /// on cancellation; expected target turnover and memory recovery no longer revoke it.
+    pub fn grant_unit<T, E>(&self, publish: impl FnOnce() -> Result<T, E>) -> Option<Result<T, E>> {
+        let mut state = self.state.lock().ok()?;
+        if state.cancelled || state.unit_owned || !self.valid() {
+            return None;
+        }
+        let result = self.config.at_revision(self.revision, publish)?;
+        if result.is_ok() {
+            state.unit_owned = true;
+        }
+        Some(result)
+    }
+
+    /// Whether a verified systemd transaction accepted this authority's permit.
+    #[must_use]
+    pub fn owns_unit(&self) -> bool {
+        self.state.lock().is_ok_and(|state| state.unit_owned)
+    }
+
+    /// Runtime directory supplied to the guardian at startup.
+    #[must_use]
+    pub fn runtime_dir(&self) -> &std::path::Path {
+        &self.runtime_dir
+    }
+
+    /// Retained registered cgroup path before the owned recovery begins.
+    #[must_use]
+    pub fn control_group(&self) -> &str {
+        &self.target.registration.control_group
+    }
+
+    /// Optional explicitly configured systemd transaction template.
+    #[must_use]
+    pub fn recovery_unit(&self) -> Option<&str> {
+        self.policy.escalation_unit.as_deref()
+    }
+
     /// Revokes future actions and wakes the executor to settle its actual child.
     pub fn cancel(&self) {
-        if let Ok(mut cancelled) = self.cancelled.lock() {
-            *cancelled = true;
+        if let Ok(mut state) = self.state.lock() {
+            state.cancelled = true;
         }
         self.notify.notify_waiters();
     }
@@ -291,7 +339,9 @@ impl MemoryGuardian {
                         .saturating_mul(1024 * 1024 * 1024)
             });
         if !eligible || generation != self.escalation.generation {
-            if let Some(invocation) = &self.escalation.invocation {
+            if let Some(invocation) = &self.escalation.invocation
+                && !invocation.authority.owns_unit()
+            {
                 invocation.authority.cancel();
             }
             self.escalation.episode.clear();

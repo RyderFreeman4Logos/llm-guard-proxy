@@ -84,6 +84,8 @@ mod effective_liveness;
 mod generic_recovery;
 #[cfg(feature = "memory-guardian")]
 mod guardian_recovery;
+#[cfg(feature = "memory-guardian")]
+mod guardian_unit;
 mod model_metadata;
 mod post_await_self_test;
 mod precommit_recovery;

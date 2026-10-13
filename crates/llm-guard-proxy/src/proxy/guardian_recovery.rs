@@ -83,7 +83,7 @@ impl ProxyState {
             Arc::clone(&self.persistence_tasks),
         )
         .episode(episode, LocalRecoveryCause::UpstreamStall, &policy)
-        .guardian(identity)
+        .guardian(identity, request.authority.recovery_unit())
         .physical_owner(physical_owner)
         .deadline(request.authority.deadline.into())
         .shutdown(Arc::clone(&self.shutdown));
@@ -150,6 +150,9 @@ impl ProxyState {
         policy: &LocalRecoveryPolicy,
         receipt: &recovery_receipt::Context,
     ) -> RecoveryOutcome {
+        if request.authority.recovery_unit().is_some() {
+            return self.guardian_unit_action(request, receipt).await;
+        }
         #[cfg(test)]
         if policy
             .restart_command
@@ -272,7 +275,7 @@ async fn finish_guardian_pre_spawn_failure(
     outcome
 }
 
-fn cancelled_outcome(request: &RecoveryRequest) -> RecoveryOutcome {
+pub(super) fn cancelled_outcome(request: &RecoveryRequest) -> RecoveryOutcome {
     if std::time::Instant::now() >= request.authority.deadline {
         RecoveryOutcome::TimedOut
     } else {

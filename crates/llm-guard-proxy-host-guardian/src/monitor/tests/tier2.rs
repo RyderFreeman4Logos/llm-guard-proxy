@@ -261,3 +261,58 @@ fn supplied_meminfo_drives_observer_without_host_pressure() {
     assert!(!guardian.is_latched());
     fs::remove_dir_all(root).expect("cleanup");
 }
+
+#[test]
+fn owned_unit_survives_expected_turnover_but_not_configuration_change() {
+    let (root, mut guardian, mut receiver) = fixture();
+    guardian.tick().expect("kill");
+    mark_empty(&guardian);
+    guardian.tick().expect("verify");
+    elapse_grace(&mut guardian);
+    guardian.tick().expect("escalate");
+    let request = receiver.try_recv().expect("request");
+    assert!(matches!(
+        request.authority.grant_unit(|| Ok::<_, std::io::Error>(())),
+        Some(Ok(()))
+    ));
+    fs::remove_file(root.join("runtime/target.v1")).expect("owned stop removes registration");
+    fs::write(root.join("meminfo"), b"MemAvailable: 2097152 kB\n")
+        .expect("owned stop frees memory");
+    guardian.tick().expect("rearm during owned action");
+    assert!(request.authority.dispatch(|| ()).is_some());
+    let mut changed = guardian.config_handle.snapshot().expect("config");
+    changed.guardian.escalation_timeout_secs += 1;
+    guardian
+        .config_handle
+        .apply_reloadable(&changed)
+        .expect("change policy");
+    assert!(request.authority.dispatch(|| ()).is_none());
+    fs::remove_dir_all(root).expect("cleanup");
+}
+
+#[test]
+fn unit_permit_preserves_last_moment_admission_and_failed_publication() {
+    let (root, mut guardian, mut receiver) = fixture();
+    guardian.tick().expect("kill");
+    mark_empty(&guardian);
+    guardian.tick().expect("verify");
+    elapse_grace(&mut guardian);
+    guardian.tick().expect("escalate");
+    let request = receiver.try_recv().expect("request");
+    assert!(
+        request
+            .authority
+            .grant_unit(|| Err::<(), _>(std::io::Error::other("disk")))
+            .expect("admitted")
+            .is_err()
+    );
+    fs::remove_file(root.join("runtime/target.v1")).expect("external turnover");
+    assert!(
+        request
+            .authority
+            .grant_unit(|| Ok::<_, std::io::Error>(()))
+            .is_none()
+    );
+    assert!(request.authority.dispatch(|| ()).is_none());
+    fs::remove_dir_all(root).expect("cleanup");
+}

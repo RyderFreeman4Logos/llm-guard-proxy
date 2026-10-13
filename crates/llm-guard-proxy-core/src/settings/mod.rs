@@ -58,6 +58,7 @@ pub const RELOADABLE_FIELDS: &[&str] = &[
     "guardian.cgroup_root",
     "guardian.escalation_enabled",
     "guardian.escalation_profile",
+    "guardian.escalation_unit",
     "guardian.escalation_grace_secs",
     "guardian.escalation_timeout_secs",
     "guardian.escalation_mem_threshold_gib",

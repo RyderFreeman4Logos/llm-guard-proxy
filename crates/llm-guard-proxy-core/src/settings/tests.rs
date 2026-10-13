@@ -4803,3 +4803,27 @@ fn gb10_forced_model_alias_profiles_are_complete() {
         assert_eq!(profile.output_cap, Some(16_384));
     }
 }
+
+#[test]
+fn tier2_systemd_template_is_optional_and_rejects_arbitrary_unit_names() {
+    assert!(AppConfig::default().guardian.escalation_unit.is_none());
+    let config =
+        AppConfig::parse("[guardian]\nescalation_unit = \"gb10-stack-recovery@.service\"\n")
+            .expect("template parses");
+    config.validate().expect("disabled opt-in template");
+    assert_eq!(
+        config.guardian.escalation_unit.as_deref(),
+        Some("gb10-stack-recovery@.service")
+    );
+    for unit in [
+        "x.service",
+        "@.service",
+        "../x@.service",
+        "x@y@.service",
+        "x y@.service",
+    ] {
+        let mut invalid = config.clone();
+        invalid.guardian.escalation_unit = Some(unit.to_owned());
+        assert!(invalid.validate().is_err(), "{unit}");
+    }
+}
