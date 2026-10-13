@@ -163,6 +163,8 @@ pub struct GuardianConfig {
     pub escalation_enabled: bool,
     /// Existing local-recovery profile whose foreground command is owned by Tier 2.
     pub escalation_profile: String,
+    /// Optional user-service template implementing the two-phase recovery contract.
+    pub escalation_unit: Option<String>,
     /// Continuous lower-threshold dwell after verified Tier 1.
     pub escalation_grace_secs: u64,
     /// Absolute action/readiness budget, excluding bounded cancellation cleanup.
@@ -250,6 +252,18 @@ impl GuardianConfig {
             "guardian.escalation_grace_secs",
             "Tier 2 requires 30..60 seconds grace, 1..3600 seconds timeout and a positive lower memory threshold",
         )?;
+        if let Some(unit) = &self.escalation_unit {
+            require(
+                unit.ends_with("@.service")
+                    && unit.len() > "@.service".len()
+                    && unit.len() <= 120
+                    && unit[..unit.len() - "@.service".len()]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+                "guardian.escalation_unit",
+                "must be a simple user-service template ending in @.service",
+            )?;
+        }
         if self.escalation_enabled {
             require(
                 self.enabled && self.kill_action == GuardianKillAction::CgroupKill,
@@ -297,6 +311,7 @@ impl Default for GuardianConfig {
             cgroup_root: PathBuf::from("/sys/fs/cgroup"),
             escalation_enabled: false,
             escalation_profile: String::new(),
+            escalation_unit: None,
             escalation_grace_secs: 60,
             escalation_timeout_secs: 120,
             escalation_mem_threshold_gib: 1,

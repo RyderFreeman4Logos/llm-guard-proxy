@@ -110,11 +110,19 @@ impl Context {
     pub(super) fn guardian(
         mut self,
         identity: llm_guard_proxy_state::GuardianRecoveryIdentity,
+        unit: Option<&str>,
     ) -> Self {
         self.receipt.guardian = Some(identity);
         self.receipt.detector = "memory_guardian";
         self.receipt.cause = "memory_pressure";
-        self.receipt.command_id = "guardian.foreground_recovery";
+        self.receipt.command_id = if let Some(unit) = unit {
+            self.receipt.command_generation = COMMAND_KEY
+                .get_or_init(std::hash::RandomState::new)
+                .hash_one(unit);
+            "guardian.systemd_recovery"
+        } else {
+            "guardian.foreground_recovery"
+        };
         self
     }
 

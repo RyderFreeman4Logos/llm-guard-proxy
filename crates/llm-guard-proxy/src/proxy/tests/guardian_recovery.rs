@@ -2,6 +2,8 @@
 mod real_kernel;
 #[path = "guardian_stage_deadlines.rs"]
 mod stage_deadlines;
+#[path = "guardian_unit.rs"]
+mod unit;
 
 use super::{Arc, ConfigHandle, Duration, FakeUpstream, ProxyFixture, fs};
 use llm_guard_proxy_host_guardian::{

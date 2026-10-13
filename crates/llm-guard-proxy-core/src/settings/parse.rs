@@ -2621,6 +2621,7 @@ fn assign_guardian(
         }
         "escalation_enabled" => config.escalation_enabled = parse_bool(value, line_number)?,
         "escalation_profile" => config.escalation_profile = parse_string(value, line_number)?,
+        "escalation_unit" => config.escalation_unit = parse_optional_string(value, line_number)?,
         "escalation_grace_secs" => {
             config.escalation_grace_secs =
                 parse_u64(value, line_number, "guardian.escalation_grace_secs")?;
