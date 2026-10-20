@@ -38,7 +38,7 @@ pub(super) fn fake_deepinfra_score_response(path_and_query: &str) -> Response<Bo
     let body = if path_and_query.contains("test=deepinfra-rerank-malformed") {
         r#"{"id":"score-native-malformed","data":[{"index":0,"score":0.0},{"index":0,"score":0.5},{"index":2,"score":1.0}],"usage":{"prompt_tokens":19}}"#
     } else {
-        r#"{"id":"score-native-123","object":"list","model":"qwen3-reranker-8b","data":[{"index":2,"object":"score","score":0.0},{"index":0,"object":"score","score":-1.0},{"index":1,"object":"score","score":1.0}],"usage":{"prompt_tokens":19,"total_tokens":19,"completion_tokens":0}}"#
+        r#"{"id":"score-native-123","object":"list","model":"qwen3-reranker-8b","data":[{"index":2,"object":"score","score":0.5},{"index":0,"object":"score","score":0.0},{"index":1,"object":"score","score":1.0}],"usage":{"prompt_tokens":19,"total_tokens":19,"completion_tokens":0}}"#
     };
     let mut response = json_response("deepinfra-score", body.to_owned());
     response.headers_mut().insert(

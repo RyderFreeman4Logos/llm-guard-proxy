@@ -173,12 +173,17 @@ contain only strings, and contain at most 1,024 items. Request bodies are
 limited to 1 MiB before JSON validation.
 
 The documented default `instruction` may be omitted or supplied explicitly.
-Other instructions fail locally because the current deployment score template
-does not consume vLLM's forwarded instruction variable. A non-null `webhook`
+This compatibility endpoint uses the deployed model's default prompt; custom
+instructions remain unsupported. A non-null `webhook`
 also fails locally because the adapter is synchronous. `service_tier` accepts
 `default`, `priority`, and `flex`, but all three are compatibility no-ops: the
 adapter has a local single scheduling tier, so these values affect only
 observability metadata and never local scheduling.
+
+The native upstream must return probabilities in `[0, 1]`. The adapter validates
+and preserves them; it does not apply another sigmoid or signed-margin mapping.
+Upgrade an old signed-margin backend together with this adapter. The endpoint
+name is a compatibility route, not proof of the deployed weights' identity.
 
 Successful responses contain `scores`, trusted upstream `input_tokens`, and an
 optional `request_id`. The optional cloud `inference_status` object is omitted:

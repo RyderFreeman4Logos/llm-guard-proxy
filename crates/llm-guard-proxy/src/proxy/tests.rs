@@ -1519,18 +1519,22 @@ async fn metrics_expose_generation_active_and_queued_gauges() {
 #[tokio::test]
 async fn connection_storm_disconnects_do_not_hide_control_plane() {
     let mut upstream = CancellableUpstream::spawn().await;
-    let proxy = ProxyFixture::spawn_with_full_options(
-        &upstream.base_url,
-        true,
-        4,
-        "max_queued_generation_requests = 8\ngeneration_queue_timeout_ms = 5000\n",
-        r#"
+    let proxy = ProxyFixture::spawn_with_persistence(
+        ProxyFixtureSpawnOptions {
+            upstream_base_url: &upstream.base_url,
+            observability_enabled: true,
+            max_in_flight_requests: 4,
+            server_config: "max_queued_generation_requests = 8\ngeneration_queue_timeout_ms = 5000\n",
+            metadata_config: r#"
 [heartbeat]
 mode = "json-whitespace"
 interval_secs = 1
 "#,
-        "",
-        "",
+            observability_config: "",
+            evidence_config: "",
+            extra_config: "",
+        },
+        Arc::new(PersistenceTasks::default()),
     )
     .await;
 
@@ -1580,22 +1584,7 @@ interval_secs = 1
         .expect("health body should read");
     assert!(!health_body.is_empty(), "health returned 0 bytes");
 
-    let models = timeout(
-        STREAM_HEADER_TIMEOUT,
-        proxy
-            .client
-            .get(format!("{}/v1/models", proxy.base_url))
-            .send(),
-    )
-    .await
-    .expect("models should not time out behind generation storm")
-    .expect("models request should complete");
-    assert!(models.status().is_success());
-    let models_body = timeout(STREAM_HEADER_TIMEOUT, models.text())
-        .await
-        .expect("models body should be bounded")
-        .expect("models body should read");
-    assert!(!models_body.is_empty(), "models returned 0 bytes");
+    assert_models_available_during_storage_contention(&proxy).await;
 
     drop(downstreams);
     let mut drop_events = Vec::new();
@@ -1607,6 +1596,11 @@ interval_secs = 1
         assert_eq!(drop_event.label, "cancellable-chat-sse");
     }
     wait_for_generation_metrics(&proxy, 0, 0, STREAM_COMPLETION_TIMEOUT).await;
+    proxy
+        .state
+        .flush_persistence_checked()
+        .await
+        .expect("storm terminal records must be durable before checking retained counts");
     let metrics = fetch_metrics(&proxy).await;
     assert_eq!(
         labelled_metric_value(
@@ -1620,6 +1614,53 @@ interval_secs = 1
         ),
         4
     );
+}
+
+async fn assert_models_available_during_storage_contention(proxy: &ProxyFixture) {
+    // Hold only this fixture's SQLite writer lock. The release thread is independent of the
+    // runtime so an accidental inline persistence call fails boundedly instead of deadlocking.
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let sqlite_path = proxy.sqlite_path.clone();
+    let blocker = std::thread::spawn(move || {
+        let connection = Connection::open(sqlite_path).expect("contention connection should open");
+        connection
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("contention lock should be acquired");
+        locked_tx.send(()).expect("lock waiter should remain live");
+        let released = release_rx.recv_timeout(STREAM_COMPLETION_TIMEOUT).is_ok();
+        connection
+            .execute_batch("ROLLBACK")
+            .expect("contention lock should release");
+        released
+    });
+    locked_rx.await.expect("contention lock should be ready");
+    let models_started = Instant::now();
+    let models_result = timeout(
+        STREAM_HEADER_TIMEOUT,
+        proxy
+            .client
+            .get(format!("{}/v1/models", proxy.base_url))
+            .send(),
+    )
+    .await;
+    let models_elapsed = models_started.elapsed();
+    let _released_if_worker_is_waiting = release_tx.send(());
+    let released = blocker.join().expect("contention worker should join");
+    assert!(
+        released,
+        "models must progress before the contention watchdog releases SQLite"
+    );
+    assert!(models_elapsed < STREAM_HEADER_TIMEOUT);
+    let models = models_result
+        .expect("models should not time out behind generation storm")
+        .expect("models request should complete");
+    assert!(models.status().is_success());
+    let models_body = timeout(STREAM_HEADER_TIMEOUT, models.text())
+        .await
+        .expect("models body should be bounded")
+        .expect("models body should read");
+    assert!(!models_body.is_empty(), "models returned 0 bytes");
 }
 
 #[tokio::test]
@@ -23647,6 +23688,14 @@ impl ProxyFixture {
     }
 
     async fn spawn_with_full_options_and_extra(options: ProxyFixtureSpawnOptions<'_>) -> Self {
+        Self::spawn_with_persistence(options, Arc::new(PersistenceTasks::synchronous_for_tests()))
+            .await
+    }
+
+    async fn spawn_with_persistence(
+        options: ProxyFixtureSpawnOptions<'_>,
+        persistence_tasks: Arc<PersistenceTasks>,
+    ) -> Self {
         let root = unique_test_dir("proxy");
         fs::create_dir_all(&root).expect("test root should be created");
         set_owner_only_dir(&root);
@@ -23679,7 +23728,7 @@ impl ProxyFixture {
             BudgetStore::open(&budget_sqlite_path.display().to_string())
                 .expect("budget store should open"),
         );
-        let state = ProxyState::new(
+        let mut state = ProxyState::new(
             manager.handle(),
             manager.path().to_path_buf(),
             store.clone(),
@@ -23688,6 +23737,8 @@ impl ProxyFixture {
             budget_store,
             build_http_client().expect("client should build"),
         );
+        // Cadence fixtures must dispatch storage off-executor, as production does.
+        state.persistence_tasks = persistence_tasks;
         let app = router(state.clone());
         let listener = TcpListener::bind("127.0.0.1:0")
             .await

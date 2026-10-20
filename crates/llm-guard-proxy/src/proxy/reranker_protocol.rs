@@ -843,10 +843,7 @@ fn score_response(
             let mut result = serde_json::Map::from_iter([
                 (String::from("index"), Value::from(index)),
                 (String::from("object"), Value::String(String::from("score"))),
-                (
-                    String::from("score"),
-                    Value::from(probability.mul_add(2.0, -1.0)),
-                ),
+                (String::from("score"), Value::from(probability)),
             ]);
             if return_documents {
                 result.insert(
@@ -1143,25 +1140,28 @@ mod tests {
     }
 
     #[test]
-    fn converts_deepinfra_probability_to_signed_score() {
-        let body = Bytes::from_static(br#"{"scores":[0.9],"input_tokens":19}"#);
+    fn preserves_deepinfra_probabilities_in_score_response() {
+        let body = Bytes::from_static(br#"{"scores":[0.0,0.5,0.9,1.0],"input_tokens":19}"#);
         let response = rewrite_response(
             &body,
             ResponseContract::Score {
-                document_count: 1,
-                top_n: 1,
+                document_count: 4,
+                top_n: 4,
                 expected: Some(score_adapter::ScoreExpectations {
-                    result_count: 1,
-                    document_count: 1,
+                    result_count: 4,
+                    document_count: 4,
                 }),
-                documents: vec![String::from("d")],
+                documents: vec![String::from("d"); 4],
                 return_documents: false,
             },
             Some("qwen3-reranker-8b"),
         )
         .expect("valid DeepInfra response should convert");
         let response: Value = serde_json::from_slice(&response).expect("response should be JSON");
-        assert_eq!(response["data"][0]["score"], 0.8);
+        for (index, probability) in [0.0, 0.5, 0.9, 1.0].into_iter().enumerate() {
+            assert_eq!(response["data"][index]["index"], index);
+            assert_eq!(response["data"][index]["score"], probability);
+        }
     }
 
     #[test]
