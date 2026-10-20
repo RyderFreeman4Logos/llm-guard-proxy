@@ -221,9 +221,9 @@ fn rejects_non_null_webhook_as_unsupported_async_behavior() {
 }
 
 #[test]
-fn maps_scalar_head_endpoints_order_and_ties_to_probabilities() {
+fn preserves_probability_endpoints_order_and_ties() {
     let body = score_body(
-        r#"[{"index":3,"score":0.0},{"index":1,"score":1.0},{"index":0,"score":-1.0},{"index":2,"score":0.0}]"#,
+        r#"[{"index":3,"score":0.5},{"index":1,"score":1.0},{"index":0,"score":0.0},{"index":2,"score":0.5}]"#,
         r#"{"prompt_tokens":27,"total_tokens":27,"completion_tokens":0}"#,
         r#","id":"score-upstream-123""#,
     );
@@ -236,32 +236,24 @@ fn maps_scalar_head_endpoints_order_and_ties_to_probabilities() {
 }
 
 #[test]
-fn clamps_only_tiny_f32_domain_roundoff() {
-    let body = score_body(
-        r#"[{"index":0,"score":-1.0000005},{"index":1,"score":1.0000005}]"#,
-        r#"{"prompt_tokens":2}"#,
-        "",
-    );
-    let value = response_json(&body, 2).expect("tiny roundoff should adapt");
-    assert_eq!(value["scores"], json!([0.0, 1.0]));
-
-    for score in [-1.000_01, 1.000_01] {
+fn rejects_scores_outside_probability_domain() {
+    for score in [-1.0, -0.000_000_5, 1.000_000_5, 1.000_01] {
         let body = score_body(
             &format!(r#"[{{"index":0,"score":{score}}}]"#),
             r#"{"prompt_tokens":1}"#,
             "",
         );
         let error = response_json(&body, 1).expect_err("material domain violation should fail");
-        assert!(error.contains("[-1, 1]"), "{error}");
+        assert!(error.contains("[0, 1]"), "{error}");
     }
 }
 
 #[test]
 fn rejects_nonfinite_scalar_scores() {
     for score in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
-        let error = scalar_score_to_probability(score)
-            .expect_err("non-finite scalar score must fail closed");
-        assert!(error.contains("[-1, 1]"), "{error}");
+        let error =
+            validate_probability(score).expect_err("non-finite scalar score must fail closed");
+        assert!(error.contains("[0, 1]"), "{error}");
     }
 }
 

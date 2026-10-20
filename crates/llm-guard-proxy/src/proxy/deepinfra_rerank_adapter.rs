@@ -17,9 +17,6 @@ pub(crate) const DEFAULT_INSTRUCTION: &str =
     "Given a web search query, retrieve relevant passages that answer the query";
 const MAX_PAIR_COUNT: usize = 1_024;
 const MAX_INSTRUCTION_CHARS: usize = 2_048;
-// The converted scalar head is evaluated in f32. Eight ULPs at |s|=1 tolerate
-// representation noise without accepting a materially invalid scalar score.
-const SCORE_DOMAIN_TOLERANCE: f64 = f32::EPSILON as f64 * 8.0;
 
 /// Validated `DeepInfra` scheduling hint; local inference has one scheduling tier.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -308,7 +305,7 @@ pub(crate) fn score_response_to_deepinfra_response(
             .ok_or_else(|| {
                 format!("vLLM score response data[{entry_index}].score must be finite")
             })?;
-        probabilities[index] = Some(scalar_score_to_probability(score)?);
+        probabilities[index] = Some(validate_probability(score)?);
     }
     let probabilities = probabilities
         .into_iter()
@@ -330,14 +327,14 @@ pub(crate) fn score_response_to_deepinfra_response(
         .map_err(|error| format!("serialize DeepInfra rerank response failed: {error}"))
 }
 
-fn scalar_score_to_probability(score: f64) -> Result<f64, String> {
-    if !(-1.0 - SCORE_DOMAIN_TOLERANCE..=1.0 + SCORE_DOMAIN_TOLERANCE).contains(&score) {
+fn validate_probability(score: f64) -> Result<f64, String> {
+    if !(0.0..=1.0).contains(&score) {
         return Err(format!(
-            "vLLM scalar score {score} is outside expected [-1, 1] domain"
+            "vLLM probability {score} is outside expected [0, 1] domain"
         ));
     }
-    // This midpoint is the overflow-safe equivalent of p_yes = (s + 1) / 2.
-    Ok(f64::midpoint(score.clamp(-1.0, 1.0), 1.0))
+    // Activation belongs to the model; applying it again changes the probability.
+    Ok(score)
 }
 
 fn trusted_prompt_tokens(object: &serde_json::Map<String, Value>) -> Result<u64, String> {

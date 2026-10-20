@@ -180,6 +180,11 @@ also fails locally because the adapter is synchronous. `service_tier` accepts
 adapter has a local single scheduling tier, so these values affect only
 observability metadata and never local scheduling.
 
+The native upstream must return probabilities in `[0, 1]`. The adapter validates
+and preserves them; it does not apply another sigmoid or signed-margin mapping.
+Upgrade an old signed-margin backend together with this adapter. The endpoint
+name is a compatibility route, not proof of the deployed weights' identity.
+
 Successful responses contain `scores`, trusted upstream `input_tokens`, and an
 optional `request_id`. The optional cloud `inference_status` object is omitted:
 the local adapter does not fabricate DeepInfra runtime or billing metrics.
