@@ -95,10 +95,8 @@ pub(crate) fn model_id_from_path(method: &Method, uri: &Uri) -> Option<&'static 
 
 /// Validate and convert one synchronous `DeepInfra` request to one vLLM N:N score batch.
 ///
-/// vLLM forwards its per-request instruction into the score template. This adapter
-/// requires the deployed template to implement `DeepInfra`'s documented default; the
-/// deployment canary must prove that precondition. Any custom instruction fails closed
-/// while the current Qwen/Querit templates ignore that forwarded variable.
+/// The documented default selects the deployed model's default prompt. Custom
+/// instructions are not forwarded by this compatibility endpoint and fail closed.
 pub(crate) fn adapt_request(uri: &Uri, body: &Bytes) -> Result<AdaptedRequest, RequestError> {
     let value: Value = serde_json::from_slice(body).map_err(|error| {
         RequestError::Invalid(format!("invalid DeepInfra rerank JSON: {error}"))
@@ -203,7 +201,7 @@ fn validate_instruction(instruction: Option<&Value>) -> Result<(), RequestError>
     }
     if instruction != DEFAULT_INSTRUCTION {
         return Err(RequestError::Unsupported(String::from(
-            "custom instruction is unsupported because the current deployment score template does not consume vLLM's forwarded instruction variable",
+            "custom instruction is unsupported by this compatibility endpoint",
         )));
     }
     Ok(())

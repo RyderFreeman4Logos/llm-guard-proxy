@@ -80,17 +80,7 @@ fn rejects_custom_instruction_instead_of_ignoring_it() {
 
     assert!(error.to_string().contains("custom instruction"), "{error}");
     assert!(
-        error.to_string().contains("deployment score template"),
-        "{error}"
-    );
-    assert!(
-        error.to_string().contains("forwarded instruction"),
-        "{error}"
-    );
-    assert!(
-        !error
-            .to_string()
-            .contains("no per-request instruction field"),
+        error.to_string().contains("compatibility endpoint"),
         "{error}"
     );
 }
