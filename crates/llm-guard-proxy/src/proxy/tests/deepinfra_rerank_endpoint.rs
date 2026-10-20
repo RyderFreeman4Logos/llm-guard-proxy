@@ -136,8 +136,8 @@ async fn deepinfra_rerank_rejects_unsupported_instruction_before_upstream() {
     assert!(
         value["error"]["message"]
             .as_str()
-            .is_some_and(|message| message.contains("deployment score template")
-                && message.contains("forwarded instruction"))
+            .is_some_and(|message| message.contains("custom instruction")
+                && message.contains("compatibility endpoint"))
     );
     assert_no_upstream_request(&mut fake).await;
     let connection = rusqlite::Connection::open(&proxy.sqlite_path).expect("sqlite open");
